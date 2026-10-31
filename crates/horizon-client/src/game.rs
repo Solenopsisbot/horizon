@@ -292,7 +292,7 @@ use horizon_client::{
     environment::Environment,
     first_person::{Hand, SwingAnimation},
     furnace::FurnaceCooking,
-    gfx::{Frame, Renderer},
+    gfx::{Frame, Renderer, Target},
     hud::{HudAtlas, HudBatch, rgba},
     hud_layout, hud_overlays,
     items::{ItemStack, Items},
@@ -12229,20 +12229,25 @@ impl Game<'_> {
     }
     /// The renderer for the window, with the current block sprites, GUI
     /// atlas and world border texture.
-    fn new_renderer(&self, window: Arc<Window>) -> Result<Renderer> {
-        self.renderer_for(window, &self.pack, &self.gui)
+    /// Where a renderer made now would draw: the window, or for a headless game with vision
+    /// (`set_vision`) a texture the size of the one it has. `None` with neither.
+    pub(super) fn render_target(&self) -> Option<Target> {
+        match &self.window {
+            Some(window) => Some(Target::Window {
+                window: window.clone(),
+                offscreen: self.options.offscreen,
+            }),
+            None => self.renderer.as_ref().map(|r| Target::Texture {
+                width: r.config.width,
+                height: r.config.height,
+            }),
+        }
     }
-    fn renderer_for(
-        &self,
-        window: Arc<Window>,
-        pack: &PackResources,
-        gui: &UiResources,
-    ) -> Result<Renderer> {
+    pub(super) fn new_renderer(&self, target: Target) -> Result<Renderer> {
         build_renderer(
-            window,
-            self.options.offscreen,
-            pack,
-            gui,
+            target,
+            &self.pack,
+            &self.gui,
             self.renderer.as_ref(),
             None,
             self.settings.horizon.api,
@@ -14371,7 +14376,10 @@ impl ApplicationHandler for Game<'_> {
             }
         };
         horizon_client::telemetry::note_display(&window);
-        match self.new_renderer(window.clone()) {
+        match self.new_renderer(Target::Window {
+            window: window.clone(),
+            offscreen: self.options.offscreen,
+        }) {
             Ok(r) => {
                 self.renderer = Some(r);
                 self.world_renderer_ready = true;
@@ -16797,8 +16805,7 @@ fn prepare_renderer_textures(pack: &PackResources) -> horizon_client::gfx::Prepa
 
 /// Upload pack textures and create the renderer on the window's device.
 fn build_renderer(
-    window: Arc<Window>,
-    offscreen: bool,
+    target: Target,
     pack: &PackResources,
     gui: &UiResources,
     previous: Option<&Renderer>,
@@ -16816,8 +16823,7 @@ fn build_renderer(
     // over to the game.
     atlas.font.reset_cache();
     let mut renderer = pollster::block_on(Renderer::new(
-        window,
-        offscreen,
+        target,
         &assets.pixels,
         assets.sprite_size,
         assets.sprite_minimum_size,
@@ -16879,8 +16885,7 @@ fn loading_renderer(
         atlas.font.reset_cache();
     }
     let mut renderer = pollster::block_on(Renderer::new(
-        window,
-        offscreen,
+        Target::Window { window, offscreen },
         &[255, 255, 255, 255],
         1,
         1,
@@ -17362,8 +17367,10 @@ impl Loading {
         }
         let renderer_at = Instant::now();
         let renderer = build_renderer(
-            window.clone(),
-            options.offscreen,
+            Target::Window {
+                window: window.clone(),
+                offscreen: options.offscreen,
+            },
             &loaded.pack,
             &gui,
             self.renderer.as_ref(),

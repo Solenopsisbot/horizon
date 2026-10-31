@@ -580,8 +580,21 @@ impl Game<'_> {
                 }
                 ok()
             }
+            "vision" => {
+                let on = match arg(1)? {
+                    "on" => true,
+                    "off" => false,
+                    other => return Err(format!("vision on or off, not {other}").into()),
+                };
+                self.set_vision(on)?;
+                Ok(Some(json!({ "ok": true, "vision": on })))
+            }
             "screenshot" => {
-                let renderer = self.renderer.as_mut().ok_or("no renderer yet")?;
+                let renderer = self.renderer.as_mut().ok_or(if self.options.headless {
+                    "no renderer: a headless game sees only with `vision on`"
+                } else {
+                    "no renderer yet"
+                })?;
                 if self.pending_screenshot.is_some() {
                     return Err("a screenshot is already pending".into());
                 }

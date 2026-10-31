@@ -20,6 +20,7 @@ Every command `horizon-ctl` takes, its MCP tool in `horizon-ctl mcp` (the launch
 | `save` | `save` | Save the world | none |
 | `quit` | `quit` | Save and exit the game | none |
 | `screenshot PATH` | `screenshot` | Write the next rendered frame as a PNG | none |
+| `vision on\|off` | `vision` | A headless game's renderer: on for screenshots and clicks at GUI points, off to free the GPU | `state` (on, off, required): on or off |
 
 ## Observe (JSON state)
 

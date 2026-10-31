@@ -781,6 +781,11 @@ impl Streaming {
     /// were made with the old resources; their results are dropped.
     pub fn reload_resources(&mut self, world: &mut World, context: Arc<WorkerContext>) {
         *self.shared.context.write().unwrap() = context;
+        self.remesh_all(world);
+    }
+    /// Rebuild every loaded, lit section; meshes in flight are dropped. A headless client's
+    /// vision (#4951) starts with this: it meshed nothing while it had no renderer.
+    pub fn remesh_all(&mut self, world: &mut World) {
         self.meshing.clear();
         self.compile_started.clear();
         for &(x, z) in world.chunks.keys() {

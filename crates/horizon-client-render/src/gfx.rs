@@ -456,7 +456,8 @@ pub struct Renderer {
     display: DisplayWatch,
     /// The watch was just made: the settings' Auto values take what it reported.
     display_fresh: bool,
-    window: Arc<Window>,
+    /// `None` for a `Target::Texture` renderer.
+    window: Option<Arc<Window>>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
@@ -1046,11 +1047,46 @@ fn surface_format(
     .or_else(|| formats.iter().copied().find(|f| !f.is_srgb()))
     .unwrap_or(default)
 }
+/// Where a renderer draws.
+pub enum Target {
+    /// A window: its swapchain, or with `offscreen` (`--offscreen`) a texture its size while
+    /// the window stays hidden.
+    Window {
+        window: Arc<Window>,
+        offscreen: bool,
+    },
+    /// A texture of this size and no window at all: a headless client's vision (#4951).
+    Texture { width: u32, height: u32 },
+}
+impl Target {
+    fn window(&self) -> Option<&Arc<Window>> {
+        match self {
+            Target::Window { window, .. } => Some(window),
+            Target::Texture { .. } => None,
+        }
+    }
+    /// Draws into a texture, not a swapchain.
+    fn offscreen(&self) -> bool {
+        !matches!(
+            self,
+            Target::Window {
+                offscreen: false,
+                ..
+            }
+        )
+    }
+    fn size(&self) -> winit::dpi::PhysicalSize<u32> {
+        match self {
+            Target::Window { window, .. } => window.inner_size(),
+            &Target::Texture { width, height } => winit::dpi::PhysicalSize::new(width, height),
+        }
+    }
+}
 /// Opens a device on the first of `backend_order`'s backends that gives one.
 /// Offscreen rendering needs no surface, so it can use a GPU the window's
 /// display cannot present from (a headless compositor).
 async fn open_device(
-    window: &Arc<Window>,
+    window: Option<&Arc<Window>>,
     offscreen: bool,
     api: GraphicsApi,
     layers: u32,
@@ -1087,7 +1123,7 @@ enum NoDevice {
 /// all they get). Returns why the backend gave no device.
 async fn open_with_retry(
     backends: wgpu::Backends,
-    window: &Arc<Window>,
+    window: Option<&Arc<Window>>,
     offscreen: bool,
     layers: u32,
 ) -> std::result::Result<Opened, String> {
@@ -1118,24 +1154,20 @@ async fn open_with_retry(
 /// stopped it. `allow_nonconformant` is `open_with_retry`'s second try.
 async fn open_backend(
     backends: wgpu::Backends,
-    window: &Arc<Window>,
+    window: Option<&Arc<Window>>,
     offscreen: bool,
     allow_nonconformant: bool,
     layers: u32,
 ) -> std::result::Result<Opened, NoDevice> {
     let name = backends_name(backends);
-    let instance = wgpu::Instance::new(instance_descriptor(
-        backends,
-        Some(window),
-        allow_nonconformant,
-    ));
-    let surface = if offscreen {
-        None
-    } else {
-        match instance.create_surface(window.clone()) {
+    let instance = wgpu::Instance::new(instance_descriptor(backends, window, allow_nonconformant));
+    // Only a window that is shown has a surface (`Target::offscreen`).
+    let surface = match window.filter(|_| !offscreen) {
+        None => None,
+        Some(window) => match instance.create_surface(window.clone()) {
             Ok(surface) => Some(surface),
             Err(e) => return Err(NoDevice::Failed(format!("{name} surface: {e}"))),
-        }
+        },
     };
     let adapter = match instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -1265,8 +1297,7 @@ impl Renderer {
 }
 impl Renderer {
     pub async fn new(
-        window: Arc<Window>,
-        offscreen: bool,
+        target: Target,
         sprite_pixels: &[u8],
         sprite_size: u32,
         sprite_minimum_size: u32,
@@ -1282,6 +1313,9 @@ impl Renderer {
         previous: Option<&Self>,
         api: GraphicsApi,
     ) -> Result<Self> {
+        let offscreen = target.offscreen();
+        let size = target.size();
+        let window = target.window().cloned();
         let split = sprite_split();
         if layers > split * SPRITE_ARRAYS {
             return Err(format!(
@@ -1314,7 +1348,9 @@ impl Renderer {
                             .take();
                         Some(match spare {
                             Some(surface) => surface,
-                            None => renderer.instance.create_surface(window.clone())?,
+                            None => renderer
+                                .instance
+                                .create_surface(window.clone().ok_or("no window to draw on")?)?,
                         })
                     },
                     instance: renderer.instance.clone(),
@@ -1323,11 +1359,10 @@ impl Renderer {
                     queue: renderer.queue.clone(),
                 }
             }
-            None => open_device(&window, offscreen, api, layers).await?,
+            None => open_device(window.as_ref(), offscreen, api, layers).await?,
         };
         let info = adapter.get_info();
         crate::graphics::suggest_reduced_far_detail(crate::graphics::lod_capped(&info));
-        let size = window.inner_size();
         let max_side = device.limits().max_texture_dimension_2d;
         let (config, present_modes, hdr_output) = if let Some(surface) = &surface {
             let mut config = surface
@@ -3026,7 +3061,9 @@ impl Renderer {
         self.surface = None;
         let surface = match spare {
             Some(surface) => surface,
-            None => self.instance.create_surface(self.window.clone())?,
+            None => self
+                .instance
+                .create_surface(self.window.clone().ok_or("no window to draw on")?)?,
         };
         Self::configure(
             &self.device,
@@ -3616,9 +3653,8 @@ impl Renderer {
             }
             // Only HDR output asks the system about the display, so with HDR off the
             // game never waits on the compositor for it.
-            self.display = if output.is_some() {
-                let (watch, now) =
-                    DisplayWatch::new(&self.window, self.surface.as_ref(), &self.adapter);
+            self.display = if let (Some(_), Some(window)) = (&output, &self.window) {
+                let (watch, now) = DisplayWatch::new(window, self.surface.as_ref(), &self.adapter);
                 crate::graphics::report(now);
                 self.display_fresh = true;
                 watch
@@ -6092,8 +6128,10 @@ impl Renderer {
             // On Wayland this ties RedrawRequested to the compositor's frame
             // callbacks, one per refresh. Only VSync (Fifo) waits for the
             // display: with it off, vanilla's window draws uncapped.
-            if self.config.present_mode == wgpu::PresentMode::Fifo {
-                self.window.pre_present_notify();
+            if self.config.present_mode == wgpu::PresentMode::Fifo
+                && let Some(window) = &self.window
+            {
+                window.pre_present_notify();
             }
             if first_frame {
                 startup_step(format_args!("presenting the first frame"));

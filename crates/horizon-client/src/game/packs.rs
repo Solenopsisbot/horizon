@@ -261,12 +261,10 @@ impl Game<'_> {
             renderer.release_surface();
         }
         let renderer = match self
-            .window
-            .clone()
-            .map(|window| {
+            .render_target()
+            .map(|target| {
                 build_renderer(
-                    window,
-                    self.options.offscreen,
+                    target,
                     &pack,
                     &gui,
                     self.renderer.as_ref(),

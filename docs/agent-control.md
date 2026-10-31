@@ -176,8 +176,9 @@ turn the switch off.
 - **Headless:** `horizon-ctl launch --headless` (`horizon-client --headless --control`) starts a
   game with no display, no window and no GPU: it runs where no display server is (an SSH session,
   a server) and runs its own loop instead of winit's (`game/headless.rs`), one frame a tick. It
-  plays through these commands only; commands that need the screen's pixels (`screenshot`, clicks
-  at GUI points) answer with an error ([#4951](https://github.com/horizon-rust/horizon/issues/4951)).
+  plays through these commands only, and meshes and draws nothing until `vision on` gives it an
+  offscreen renderer (`--width` x `--height`, on the best GPU) for `screenshot` and clicks at GUI
+  points; `vision off` frees it again ([#4951](https://github.com/horizon-rust/horizon/issues/4951)).
 
 ## Design rules for a new command
 

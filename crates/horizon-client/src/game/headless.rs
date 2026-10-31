@@ -69,6 +69,43 @@ impl Game<'_> {
     }
 }
 
+impl Game<'_> {
+    /// `horizon-ctl vision on|off`: a headless game's renderer. It starts with none: nothing
+    /// is drawn and no section is meshed (see `update_world`). On makes an offscreen renderer
+    /// of `--width` x `--height` on the best GPU and meshes the loaded terrain again; off drops
+    /// it, its video memory and its meshes. Either way the GPU-side state the game keeps for a
+    /// renderer starts over, as after a resource pack reload (`apply_staged_pack`).
+    pub(super) fn set_vision(&mut self, on: bool) -> horizon_client::Result<()> {
+        if !self.options.headless {
+            return Err("vision is for a game started with --headless".into());
+        }
+        if on == self.renderer.is_some() {
+            return Ok(());
+        }
+        let renderer = if on {
+            let [width, height] = self.options.window_size;
+            Some(self.new_renderer(horizon_client::gfx::Target::Texture { width, height })?)
+        } else {
+            None
+        };
+        // The skin and map slots, the LOD tiles and the uploads waiting were the old
+        // renderer's (or none): nothing of them is on the new one.
+        self.skin_slots.forget();
+        self.maps.slots.forget();
+        self.clear_lod();
+        self.pending_uploads.clear();
+        horizon_client::ui_theme::reset_atlas();
+        self.renderer = renderer;
+        if on {
+            self.streaming.mesh = true;
+            self.streaming.remesh_all(&mut self.world);
+            self.apply_ui_settings();
+        }
+        log::info!("Horizon: headless vision {}", if on { "on" } else { "off" });
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

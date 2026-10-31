@@ -235,6 +235,9 @@ pub const COMMANDS: &[Cmd] = &[
     cmd!("screenshot", Session, "screenshot PATH", "write the next rendered frame as a PNG",
         "Relative paths are taken from horizon-ctl's directory. Over MCP the image is returned directly.",
         ["horizon-ctl screenshot view.png"], &[], mcp: true, local: false),
+    cmd!("vision", Session, "vision on|off", "a headless game's renderer: on for screenshots and clicks at GUI points, off to free the GPU",
+        "Only for a game started with --headless (horizon-ctl launch --headless), which starts without one. On makes an offscreen renderer the size of --width and --height (1280x720) and meshes the loaded terrain again, so the first screenshot after it may still be missing far sections; off drops it and its video memory. Replies with whether vision is on.",
+        ["horizon-ctl vision on", "horizon-ctl vision off"], &[p("state", Ty::Enum(&["on", "off"]), "on or off")], mcp: true, local: false),
     // Observe
     cmd!("state", Observe, "state", "player, world, screen and crosshair target in one reply",
         "position, block_pos, eye, yaw, pitch, velocity, on_ground, health, food, saturation, xp, effects, gamemode, dimension, time, weather, the screen or title menu, the held item, what the crosshair points at and whether an action is running.",
