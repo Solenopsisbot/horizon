@@ -20,6 +20,8 @@ Every command `horizon-ctl` takes, its MCP tool in `horizon-ctl mcp` (the launch
 | `save` | `save` | Save the world | none |
 | `quit` | `quit` | Save and exit the game | none |
 | `screenshot PATH` | `screenshot` | Write the next rendered frame as a PNG | none |
+| `spawn NAME [--server HOST[:PORT]] [--session-file PATH] [--render-distance N]` | `spawn` | Add a player to a headless game's process, sharing its tables: far less memory than another game | `name` (string, required): the player's name<br>`--server` (string): the server to join<br>`--session-file` (string): a session file from the launcher<br>`--render-distance` (integer): chunks around the player to ask the server for, 2 to 32 (default: this game's); most of a player's memory is its chunks |
+| `players` | `players` | The players spawn added to this game and still playing | none |
 | `vision on\|off` | `vision` | A headless game's renderer: on for screenshots and clicks at GUI points, off to free the GPU | `state` (on, off, required): on or off |
 
 ## Observe (JSON state)

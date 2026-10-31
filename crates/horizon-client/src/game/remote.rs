@@ -622,7 +622,7 @@ impl Game<'_> {
         let mut streaming = Streaming::new(
             Arc::new(NoTerrain),
             self.pack.context.clone(),
-            self.res.threads(),
+            self.remote_workers(),
         );
         streaming.remote = true;
         streaming.radius = self.settings.render_distance;
@@ -1629,7 +1629,7 @@ impl Game<'_> {
             let mut streaming = Streaming::new(
                 Arc::new(NoTerrain),
                 self.pack.context.clone(),
-                self.res.threads(),
+                self.remote_workers(),
             );
             streaming.remote = true;
             streaming.radius = self.streaming.radius;

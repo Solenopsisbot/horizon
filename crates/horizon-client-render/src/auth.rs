@@ -105,12 +105,28 @@ impl AuthSession {
 
 static CURRENT: OnceLock<Arc<AuthSession>> = OnceLock::new();
 
+std::thread_local! {
+    /// The account of a game running on this thread beside the process's own: a player
+    /// `horizon-ctl spawn` added (#4952). `Some(None)` plays offline, whatever account the
+    /// process started with.
+    static THREAD: std::cell::RefCell<Option<Option<Arc<AuthSession>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The account this game was started with (set once at start).
 pub fn set_current(session: AuthSession) {
     let _ = CURRENT.set(Arc::new(session));
 }
+/// The account of the game on this thread, for the rest of the thread: `None` plays offline.
+/// Every reader of [`current`] runs on its game's thread (title, joining, LAN, single player).
+pub fn set_for_thread(session: Option<AuthSession>) {
+    THREAD.with(|t| *t.borrow_mut() = Some(session.map(Arc::new)));
+}
+/// The account the game on this thread plays as, if signed in.
 pub fn current() -> Option<Arc<AuthSession>> {
-    CURRENT.get().cloned()
+    THREAD
+        .with(|t| t.borrow().clone())
+        .unwrap_or_else(|| CURRENT.get().cloned())
 }
 
 /// Why joining a server through the session service failed, like the
@@ -356,6 +372,22 @@ pub fn parse_joined(body: &str) -> Option<JoinedProfile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_thread_plays_as_its_own_account_or_offline() {
+        // A spawned player (`horizon-ctl spawn`) never plays as the process's account: on its
+        // thread, its own session or, without one, none at all.
+        let own = std::thread::spawn(|| {
+            set_for_thread(Some(AuthSession::new("Alex", 7, "token")));
+            current().map(|s| s.name.clone())
+        });
+        assert_eq!(own.join().unwrap().as_deref(), Some("Alex"));
+        let offline = std::thread::spawn(|| {
+            set_for_thread(None);
+            current().is_none()
+        });
+        assert!(offline.join().unwrap());
+    }
 
     const UUID: u128 = 0x069a79f444e94726a5befca90e38aaf5;
 

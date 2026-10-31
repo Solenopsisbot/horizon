@@ -233,6 +233,7 @@ mod shield;
 mod shoulders;
 mod sign_edit;
 mod sniffers;
+mod spawn;
 mod spawner;
 mod spear;
 mod spectator;
@@ -391,6 +392,9 @@ struct Options {
     /// is (an SSH session, a server). It counts as `offscreen` for everything else (an
     /// automated run that never shows a window or grabs the pointer).
     headless: bool,
+    /// A player `horizon-ctl spawn` added to a headless game, on its own thread (not a
+    /// command-line option): blind (fonts only, no `vision`).
+    spawned: bool,
     /// `--width` and `--height` (vanilla's own arguments): the window's
     /// starting size, 1280x720 by default.
     window_size: [u32; 2],
@@ -531,6 +535,7 @@ impl Options {
             control: None,
             offscreen: false,
             headless: false,
+            spawned: false,
             window_size: [1280, 720],
             spikes: std::env::var("HORIZON_SPIKES")
                 .ok()

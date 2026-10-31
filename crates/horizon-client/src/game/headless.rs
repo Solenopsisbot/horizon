@@ -79,6 +79,11 @@ impl Game<'_> {
         if !self.options.headless {
             return Err("vision is for a game started with --headless".into());
         }
+        if self.options.spawned {
+            return Err(
+                "a spawned player is blind: only the game's first player has vision".into(),
+            );
+        }
         if on == self.renderer.is_some() {
             return Ok(());
         }

@@ -580,6 +580,29 @@ impl Game<'_> {
                 }
                 ok()
             }
+            "spawn" => {
+                let name = arg(1)?;
+                let flag = |f: &str| {
+                    words
+                        .iter()
+                        .position(|w| *w == f)
+                        .and_then(|i| words.get(i + 1))
+                        .copied()
+                };
+                let socket = self.add_player(
+                    name,
+                    flag("--server"),
+                    flag("--session-file").map(std::path::Path::new),
+                    flag("--render-distance")
+                        .map(|d| {
+                            d.parse()
+                                .map_err(|_| format!("--render-distance {d}: a number"))
+                        })
+                        .transpose()?,
+                )?;
+                Ok(Some(json!({ "ok": true, "name": name, "socket": socket })))
+            }
+            "players" => Ok(Some(json!({ "spawned": Game::spawned_players() }))),
             "vision" => {
                 let on = match arg(1)? {
                     "on" => true,

@@ -179,6 +179,14 @@ turn the switch off.
   plays through these commands only, and meshes and draws nothing until `vision on` gives it an
   offscreen renderer (`--width` x `--height`, on the best GPU) for `screenshot` and clicks at GUI
   points; `vision off` frees it again ([#4951](https://github.com/horizon-rust/horizon/issues/4951)).
+- **Many players in one process:** `horizon-ctl spawn NAME [--server] [--session-file]
+  [--render-distance N]` adds a player to a headless game, on its own thread with its own control
+  socket (`ctl-NAME.sock` beside the first). Players share the game's tables (about 370 MB), so each
+  costs tens of MB instead of a game's 400: measured on a Ryzen 7 3700X joined to a local server,
+  50 players took 1.9 GB and 37% of one core at render distance 3. Each plays as its own account
+  (its session file) or offline under its name, never as the process's; spawned players are blind
+  (no `vision`). `players` lists them and `quit` on a player's socket removes it
+  ([#4952](https://github.com/horizon-rust/horizon/issues/4952)).
 
 ## Design rules for a new command
 

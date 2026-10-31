@@ -104,7 +104,12 @@ impl Game<'_> {
             }
             return;
         }
-        let hardware = self.pad.read();
+        // A headless game has no controllers: only `horizon-ctl pad`'s, and no gilrs threads.
+        let hardware = if self.options.headless {
+            PadState::default()
+        } else {
+            self.pad.read()
+        };
         self.ui.options.pad_style = self.settings.controller.glyphs.resolve(self.pad.style);
         let state = hardware.merge(&self.pad.injected);
         self.pad.virtual_input = self.pad.injected != PadState::default();
