@@ -2093,6 +2093,31 @@ pub fn client_command(tag: &str) -> Command {
     cmd
 }
 
+/// Whether the game of `tag` takes the command-line option `option`, as its `--launch-api`
+/// reply lists them (docs/api/launch.md): a version older than an option refuses a command line
+/// that has it, so the launcher passes newer options only to versions that know them.
+pub fn game_takes(tag: &str, option: &str) -> bool {
+    Command::new(client_program(tag))
+        .arg("--launch-api")
+        .output()
+        .is_ok_and(|out| launch_api_takes(&out.stdout, option))
+}
+
+/// [`game_takes`] for a `--launch-api` reply.
+fn launch_api_takes(reply: &[u8], option: &str) -> bool {
+    serde_json::from_slice::<serde_json::Value>(reply)
+        .ok()
+        .and_then(|api| {
+            let options = api.get("options")?.as_array()?;
+            Some(
+                options
+                    .iter()
+                    .any(|o| o.get("name").and_then(|n| n.as_str()) == Some(option)),
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// The game's program: on macOS the one inside the version's Horizon.app, so the Dock and Cmd+Tab
 /// show Horizon's name and icon (game_app.rs); the bare binary elsewhere, or if that fails.
 fn client_program(tag: &str) -> PathBuf {
@@ -3149,6 +3174,20 @@ mod java_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_launch_api_reply_says_which_options_the_game_takes() {
+        let reply = br#"{"launch_api":"0.1.1","options":[{"name":"--home","value":"DIR"},{"name":"--player-dir","value":"DIR"}]}"#;
+        assert!(super::launch_api_takes(reply, "--player-dir"));
+        assert!(super::launch_api_takes(reply, "--home"));
+        assert!(!super::launch_api_takes(reply, "--headless"));
+        // A version from before the Launch API prints no JSON (or no options).
+        assert!(!super::launch_api_takes(b"Horizon 0.1.0", "--home"));
+        assert!(!super::launch_api_takes(
+            br#"{"launch_api":"0.1.0"}"#,
+            "--home"
+        ));
+    }
+
     use super::*;
     use std::cmp::Ordering::*;
 

@@ -1310,9 +1310,29 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             if let Some(who) = &who {
                 accounts.play_as(account::store(), who.clone())?;
             }
-            let mut cmd =
-                backend::client_as(&instance.resolve_version(version.as_deref())?, who.as_ref())?;
+            let tag = instance.resolve_version(version.as_deref())?;
+            let mut cmd = backend::client_as(&tag, who.as_ref())?;
             instances::apply(&mut cmd, &instance)?;
+            // Played as someone for this launch, so maybe beside another game of the instance:
+            // this player's own options, logs and name go in players/<name>/ (#4952). Packs,
+            // mods and saves stay the instance's.
+            if who.is_some() {
+                let name = accounts
+                    .selected()
+                    .map(|a| a.name.clone())
+                    .or_else(|| accounts.name_arg().map(str::to_owned));
+                match name {
+                    Some(name) if backend::game_takes(&tag, "--player-dir") => {
+                        cmd.arg("--player-dir")
+                            .arg(instance.home.join("players").join(name));
+                    }
+                    Some(_) => eprintln!(
+                        "{tag} has no --player-dir: two of its games at once share the \
+                         instance's options.txt and logs."
+                    ),
+                    None => {}
+                }
+            }
             if let Some(code) = join {
                 backend::join_friend(&mut cmd, &code)?;
             }
