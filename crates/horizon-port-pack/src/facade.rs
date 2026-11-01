@@ -1127,6 +1127,12 @@ fn render(
             "    protected java.util.Map<String, Object> horizonValues = new java.util.LinkedHashMap<>();"
         );
     }
+    if class.name == "net/minecraft/nbt/ListTag" {
+        let _ = writeln!(
+            out,
+            "    protected java.util.List<net.minecraft.nbt.Tag> horizonValues = new java.util.ArrayList<>();"
+        );
+    }
     if matches!(
         class.name.as_str(),
         "net/minecraft/world/level/Level" | "net/minecraft/server/level/ServerLevel"
@@ -2271,6 +2277,17 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             "putLong" if descriptor == "(Ljava/lang/String;J)V" => {
                 return "horizonValues.put(p0, p1);".to_owned();
             }
+            _ if matches!(method, "putByte" | "putShort" | "putFloat" | "putDouble")
+                && matches!(
+                    descriptor,
+                    "(Ljava/lang/String;B)V"
+                        | "(Ljava/lang/String;S)V"
+                        | "(Ljava/lang/String;F)V"
+                        | "(Ljava/lang/String;D)V"
+                ) =>
+            {
+                return "horizonValues.put(p0, p1);".to_owned();
+            }
             "put"
                 if descriptor
                     == "(Ljava/lang/String;Lnet/minecraft/nbt/Tag;)Lnet/minecraft/nbt/Tag;" =>
@@ -2289,6 +2306,18 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             "getLong" if descriptor == "(Ljava/lang/String;)J" => {
                 return "return horizonValues.get(p0) instanceof Long ? ((Long) horizonValues.get(p0)).longValue() : 0L;".to_owned();
             }
+            "getByte" if descriptor == "(Ljava/lang/String;)B" => {
+                return "return horizonValues.get(p0) instanceof Number ? ((Number) horizonValues.get(p0)).byteValue() : 0;".to_owned();
+            }
+            "getShort" if descriptor == "(Ljava/lang/String;)S" => {
+                return "return horizonValues.get(p0) instanceof Number ? ((Number) horizonValues.get(p0)).shortValue() : 0;".to_owned();
+            }
+            "getFloat" if descriptor == "(Ljava/lang/String;)F" => {
+                return "return horizonValues.get(p0) instanceof Number ? ((Number) horizonValues.get(p0)).floatValue() : 0.0f;".to_owned();
+            }
+            "getDouble" if descriptor == "(Ljava/lang/String;)D" => {
+                return "return horizonValues.get(p0) instanceof Number ? ((Number) horizonValues.get(p0)).doubleValue() : 0.0d;".to_owned();
+            }
             "get" if descriptor == "(Ljava/lang/String;)Lnet/minecraft/nbt/Tag;" => {
                 return "Object value = horizonValues.get(p0); return value instanceof net.minecraft.nbt.Tag ? (net.minecraft.nbt.Tag) value : null;".to_owned();
             }
@@ -2296,6 +2325,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
                 if descriptor == "(Ljava/lang/String;)Lnet/minecraft/nbt/CompoundTag;" =>
             {
                 return "Object value = horizonValues.get(p0); return value instanceof net.minecraft.nbt.CompoundTag ? (net.minecraft.nbt.CompoundTag) value : new net.minecraft.nbt.CompoundTag();".to_owned();
+            }
+            "getList" if descriptor == "(Ljava/lang/String;I)Lnet/minecraft/nbt/ListTag;" => {
+                return "Object value = horizonValues.get(p0); return value instanceof net.minecraft.nbt.ListTag ? (net.minecraft.nbt.ListTag) value : new net.minecraft.nbt.ListTag();".to_owned();
             }
             "contains" if descriptor == "(Ljava/lang/String;)Z" => {
                 return "return horizonValues.containsKey(p0);".to_owned();
@@ -2309,8 +2341,11 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             "size" if descriptor == "()I" => {
                 return "return horizonValues.size();".to_owned();
             }
+            "getAllKeys" if descriptor == "()Ljava/util/Set;" => {
+                return "return horizonValues.keySet();".to_owned();
+            }
             "remove" if descriptor == "(Ljava/lang/String;)Lnet/minecraft/nbt/Tag;" => {
-                return "horizonValues.remove(p0); return null;".to_owned();
+                return "Object previous = horizonValues.remove(p0); return previous instanceof net.minecraft.nbt.Tag ? (net.minecraft.nbt.Tag) previous : null;".to_owned();
             }
             "copy" if descriptor == "()Lnet/minecraft/nbt/CompoundTag;" => {
                 return "net.minecraft.nbt.CompoundTag value = new net.minecraft.nbt.CompoundTag(); value.horizonValues.putAll(horizonValues); return value;".to_owned();
@@ -2322,6 +2357,18 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
                 return "if (p0 != null) horizonValues.putAll(p0.horizonValues); return this;"
                     .to_owned();
             }
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/nbt/ListTag" {
+        match method {
+            "add" if descriptor == "(Lnet/minecraft/nbt/Tag;)Z" => return "return horizonValues.add(p0);".to_owned(),
+            "add" if descriptor == "(ILnet/minecraft/nbt/Tag;)V" => return "horizonValues.add(p0, p1);".to_owned(),
+            "get" if descriptor == "(I)Lnet/minecraft/nbt/Tag;" => return "return horizonValues.get(p0);".to_owned(),
+            "size" if descriptor == "()I" => return "return horizonValues.size();".to_owned(),
+            "isEmpty" if descriptor == "()Z" => return "return horizonValues.isEmpty();".to_owned(),
+            "getCompound" if descriptor == "(I)Lnet/minecraft/nbt/CompoundTag;" => return "Object value = horizonValues.get(p0); return value instanceof net.minecraft.nbt.CompoundTag ? (net.minecraft.nbt.CompoundTag) value : new net.minecraft.nbt.CompoundTag();".to_owned(),
+            "getString" if descriptor == "(I)Ljava/lang/String;" => return "Object value = horizonValues.get(p0); return value instanceof String ? (String) value : value == null ? \"\" : value.toString();".to_owned(),
             _ => {}
         }
     }
@@ -4191,6 +4238,12 @@ mod tests {
                     kind: MemberKind::Method,
                 },
                 Declared {
+                    name: "getAllKeys".to_owned(),
+                    descriptor: "()Ljava/util/Set;".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
                     name: "remove".to_owned(),
                     descriptor: "(Ljava/lang/String;)Lnet/minecraft/nbt/Tag;".to_owned(),
                     access: 0x0001,
@@ -4219,6 +4272,7 @@ mod tests {
                 ),
                 ("getInt".to_owned(), "(Ljava/lang/String;)I".to_owned()),
                 ("contains".to_owned(), "(Ljava/lang/String;)Z".to_owned()),
+                ("getAllKeys".to_owned(), "()Ljava/util/Set;".to_owned()),
                 (
                     "remove".to_owned(),
                     "(Ljava/lang/String;)Lnet/minecraft/nbt/Tag;".to_owned(),
@@ -4238,7 +4292,7 @@ mod tests {
         assert!(source.contains("protected java.util.Map<String, Object> horizonValues"));
         assert!(source.contains("horizonValues.put(p0, p1);"));
         assert!(source.contains("horizonValues.containsKey(p0)"));
-        assert!(source.contains("horizonValues.remove(p0); return null;"));
+        assert!(source.contains("horizonValues.remove(p0);"));
         assert!(source.contains("value.horizonValues.putAll(horizonValues)"));
         assert_eq!(
             runtime_body_with_descriptor(
@@ -4285,6 +4339,90 @@ mod tests {
             ),
             "return horizonValues.get(p0) instanceof Integer ? ((Integer) horizonValues.get(p0)).intValue() : 0;"
         );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/nbt/CompoundTag",
+                "getAllKeys",
+                "java.util.Set",
+                "()Ljava/util/Set;",
+            ),
+            "return horizonValues.keySet();"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/nbt/CompoundTag",
+                "remove",
+                "net.minecraft.nbt.Tag",
+                "(Ljava/lang/String;)Lnet/minecraft/nbt/Tag;",
+            ),
+            "Object previous = horizonValues.remove(p0); return previous instanceof net.minecraft.nbt.Tag ? (net.minecraft.nbt.Tag) previous : null;"
+        );
+    }
+
+    #[test]
+    fn compound_and_list_tags_preserve_numeric_and_list_contracts() {
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/nbt/CompoundTag",
+                "putDouble",
+                "void",
+                "(Ljava/lang/String;D)V",
+            ),
+            "horizonValues.put(p0, p1);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/nbt/CompoundTag",
+                "getFloat",
+                "float",
+                "(Ljava/lang/String;)F",
+            ),
+            "return horizonValues.get(p0) instanceof Number ? ((Number) horizonValues.get(p0)).floatValue() : 0.0f;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/nbt/CompoundTag",
+                "getList",
+                "net.minecraft.nbt.ListTag",
+                "(Ljava/lang/String;I)Lnet/minecraft/nbt/ListTag;",
+            ),
+            "Object value = horizonValues.get(p0); return value instanceof net.minecraft.nbt.ListTag ? (net.minecraft.nbt.ListTag) value : new net.minecraft.nbt.ListTag();"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/nbt/ListTag",
+                "add",
+                "boolean",
+                "(Lnet/minecraft/nbt/Tag;)Z",
+            ),
+            "return horizonValues.add(p0);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/nbt/ListTag",
+                "getCompound",
+                "net.minecraft.nbt.CompoundTag",
+                "(I)Lnet/minecraft/nbt/CompoundTag;",
+            ),
+            "Object value = horizonValues.get(p0); return value instanceof net.minecraft.nbt.CompoundTag ? (net.minecraft.nbt.CompoundTag) value : new net.minecraft.nbt.CompoundTag();"
+        );
+        let class = Class {
+            name: "net/minecraft/nbt/ListTag".to_owned(),
+            superclass: "net/minecraft/nbt/Tag".to_owned(),
+            ..Class::default()
+        };
+        let mut report = Report::default();
+        let source = render(
+            &class,
+            Some(&BTreeSet::new()),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut report,
+            false,
+            &[],
+        );
+        assert!(source.contains("protected java.util.List<net.minecraft.nbt.Tag> horizonValues"));
     }
 
     #[test]

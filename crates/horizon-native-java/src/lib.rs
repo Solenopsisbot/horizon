@@ -181,6 +181,11 @@ pub struct StdHost {
     payload_registrations: Vec<PayloadRegistration>,
     holders: BTreeMap<String, Value>,
     mutable_collections: BTreeMap<String, Vec<Value>>,
+    /// Callback-local values returned by NeoForge's `LazyOptional` façade.
+    /// The marker is intentionally host-owned: an opaque Java object must not
+    /// become a live native capability until a game adapter supplies it.
+    lazy_optionals: BTreeMap<String, Option<Value>>,
+    next_lazy_optional: usize,
     next_fabric_event: usize,
 }
 
@@ -203,6 +208,8 @@ impl StdHost {
             payload_registrations: Vec::new(),
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
+            lazy_optionals: BTreeMap::new(),
+            next_lazy_optional: 0,
             next_fabric_event: 0,
         }
     }
@@ -247,6 +254,18 @@ impl StdHost {
         {
             self.mutable_collections.entry(marker.clone()).or_default();
         }
+    }
+
+    fn lazy_optional(&mut self, value: Option<Value>) -> Value {
+        let marker = format!("lazy-optional/{}", self.next_lazy_optional);
+        self.next_lazy_optional = self.next_lazy_optional.saturating_add(1);
+        self.lazy_optionals.insert(marker.clone(), value);
+        Value::Ref(Some(marker))
+    }
+
+    fn lazy_contents(&self, receiver: &Value) -> Option<Option<Value>> {
+        let marker = expect_ref(receiver)?;
+        self.lazy_optionals.get(marker).cloned()
     }
 
     pub fn calls(&self) -> &[MethodRef] {
@@ -386,6 +405,38 @@ impl Host for StdHost {
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            ("net/neoforged/neoforge/capabilities/CapabilityManager", "get", descriptor)
+                if descriptor.ends_with("Lnet/neoforged/neoforge/capabilities/Capability;") =>
+            {
+                Ok(Value::Ref(Some(format!(
+                    "capability/{}",
+                    args.first()
+                        .map(value_marker)
+                        .unwrap_or_else(|| "token/null".into())
+                ))))
+            }
+            ("net/neoforged/neoforge/common/util/LazyOptional", "empty", descriptor)
+                if descriptor.ends_with("Lnet/neoforged/neoforge/common/util/LazyOptional;") =>
+            {
+                Ok(self.lazy_optional(None))
+            }
+            ("net/neoforged/neoforge/common/util/LazyOptional", "ofNullable", descriptor)
+                if descriptor.ends_with("Lnet/neoforged/neoforge/common/util/LazyOptional;") =>
+            {
+                Ok(self.lazy_optional(match Self::argument(r, args, 0)? {
+                    Value::Ref(None) => None,
+                    value => Some(value.clone()),
+                }))
+            }
+            ("net/neoforged/neoforge/common/util/LazyOptional", "of", descriptor)
+                if descriptor.ends_with("Lnet/neoforged/neoforge/common/util/LazyOptional;") =>
+            {
+                // A Supplier callback belongs to the loaded jar and is
+                // executed by NativeJar when a callback dispatch is
+                // available. Keep this optional empty until then rather
+                // than treating the callback marker as a game value.
+                Ok(self.lazy_optional(None))
+            }
             ("net/neoforged/neoforge/registries/DeferredRegister", "create", descriptor)
                 if descriptor.ends_with("Lnet/neoforged/neoforge/registries/DeferredRegister;") =>
             {
@@ -677,6 +728,61 @@ impl Host for StdHost {
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
         let receiver_marker = expect_ref(receiver).cloned();
+        if r.owner == "net/neoforged/neoforge/capabilities/Capability"
+            && r.name == "isRegistered"
+            && r.descriptor == "()Z"
+        {
+            return Ok(Value::Int(1));
+        }
+        if r.owner == "net/neoforged/neoforge/common/util/LazyOptional" {
+            let contents = self.lazy_contents(receiver).flatten();
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("isPresent", "()Z") => return Ok(Value::Int(contents.is_some() as i32)),
+                ("isEmpty", "()Z") => return Ok(Value::Int(contents.is_none() as i32)),
+                ("resolve", "()Ljava/lang/Object;") | ("get", "()Ljava/lang/Object;") => {
+                    return Ok(contents.unwrap_or(Value::Ref(None)));
+                }
+                ("orElse", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
+                    return Ok(contents.unwrap_or(Self::argument(r, args, 0)?.clone()));
+                }
+                ("orElseGet", "(Ljava/util/function/Supplier;)Ljava/lang/Object;") => {
+                    // The supplier callback is retained as an explicit host
+                    // marker; native callback dispatch can resolve it later.
+                    return Ok(contents.unwrap_or(Value::Ref(None)));
+                }
+                (
+                    "map",
+                    "(Ljava/util/function/Function;)Lnet/neoforged/neoforge/common/util/LazyOptional;",
+                ) => {
+                    return Ok(match contents {
+                        Some(value) => self.lazy_optional(Some(value)),
+                        None => self.lazy_optional(None),
+                    });
+                }
+                ("cast", "()Lnet/neoforged/neoforge/common/util/LazyOptional;") => {
+                    return Ok(receiver.clone());
+                }
+                ("ifPresent", "(Ljava/util/function/Consumer;)V") => return Ok(Value::Void),
+                (
+                    "addListener",
+                    "(Ljava/util/function/Consumer;)Lnet/neoforged/neoforge/common/util/LazyOptional;",
+                ) => {
+                    return Ok(receiver.clone());
+                }
+                ("invalidate", "()V") => {
+                    if let Some(marker) = receiver_marker.as_deref()
+                        && let Some(value) = self.lazy_optionals.get_mut(marker)
+                    {
+                        *value = None;
+                    }
+                    return Ok(Value::Void);
+                }
+                ("resolveOptional", "()Ljava/util/Optional;") => {
+                    return Ok(contents.map_or(Value::Ref(None), optional_wrap));
+                }
+                _ => {}
+            }
+        }
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
@@ -7695,6 +7801,88 @@ mandatory = true
                 codec: Value::Ref(Some("stream-codec".into())),
                 handler: Value::Ref(Some("handler".into())),
             }]
+        );
+    }
+
+    #[test]
+    fn standard_host_tracks_capability_and_lazy_optional_values() {
+        let mut host = StdHost::new();
+        let capability = host
+            .invoke(
+                &MethodRef {
+                    owner: "net/neoforged/neoforge/capabilities/CapabilityManager".into(),
+                    name: "get".into(),
+                    descriptor: "(Lnet/neoforged/neoforge/capabilities/CapabilityToken;)Lnet/neoforged/neoforge/capabilities/Capability;".into(),
+                },
+                &[Value::Ref(Some("token/items".into()))],
+            )
+            .unwrap();
+        assert!(
+            matches!(capability, Value::Ref(Some(ref marker)) if marker.starts_with("capability/"))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/neoforged/neoforge/capabilities/Capability".into(),
+                    name: "isRegistered".into(),
+                    descriptor: "()Z".into(),
+                },
+                &capability,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+
+        let optional = host
+            .invoke(
+                &MethodRef {
+                    owner: "net/neoforged/neoforge/common/util/LazyOptional".into(),
+                    name: "ofNullable".into(),
+                    descriptor:
+                        "(Ljava/lang/Object;)Lnet/neoforged/neoforge/common/util/LazyOptional;"
+                            .into(),
+                },
+                &[Value::Ref(Some("handler/items".into()))],
+            )
+            .unwrap();
+        let present = MethodRef {
+            owner: "net/neoforged/neoforge/common/util/LazyOptional".into(),
+            name: "isPresent".into(),
+            descriptor: "()Z".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&present, &optional, &[]).unwrap(),
+            Value::Int(1)
+        );
+        let or_else = MethodRef {
+            owner: "net/neoforged/neoforge/common/util/LazyOptional".into(),
+            name: "orElse".into(),
+            descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&or_else, &optional, &[Value::Ref(Some("fallback".into()))],)
+                .unwrap(),
+            Value::Ref(Some("handler/items".into()))
+        );
+        host.invoke_instance(
+            &MethodRef {
+                owner: "net/neoforged/neoforge/common/util/LazyOptional".into(),
+                name: "invalidate".into(),
+                descriptor: "()V".into(),
+            },
+            &optional,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            host.invoke_instance(&present, &optional, &[]).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            host.invoke_instance(&or_else, &optional, &[Value::Ref(Some("fallback".into()))],)
+                .unwrap(),
+            Value::Ref(Some("fallback".into()))
         );
     }
 

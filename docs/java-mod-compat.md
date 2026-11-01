@@ -270,11 +270,13 @@ neutral default. `Vec3` retains double coordinates with common vector arithmetic
 six bounds with size, containment, center, inflation, and directional expansion queries.
 Component factories now preserve literal and translatable text in `MutableComponent` values; `getString`,
 `append`, and `copy` keep the common display-name bootstrap path alive.
-`CompoundTag` now has a bounded value path for scalar `putString`, `putInt`, `putBoolean`, and
-`putLong`, matching reads, `contains`, `isEmpty`, `size`, `remove`, and `copy`, backed by a Java-owned
-map. `put`/`get` preserve nested `Tag` references, and `getCompound` returns the nested value or an
-empty façade tag. Scalar values remain Java boxed values; lists, numeric coercion, and the Rust NBT
-bridge remain follow-up work.
+`CompoundTag` now has a bounded value path for scalar `putString`, `putInt`, `putBoolean`, `putLong`,
+`putByte`, `putShort`, `putFloat`, and `putDouble`, with matching reads, `contains`, `isEmpty`, `size`,
+`remove`, `copy`, and `getAllKeys`, backed by a Java-owned map. Numeric reads accept any boxed
+`Number`, so common NBT bootstrap code can read a value written with a narrower type. `put`/`get`
+preserve nested `Tag` references, `getCompound` returns the nested value or an empty façade tag, and
+`getList` plus the generated `ListTag` retain bounded add/get/size/string/compound operations. These
+collections remain callback-local until the Rust NBT bridge is wired through the native boundary.
 `Level` and `ServerLevel` now retain a game-time and dimension marker and answer the common
 `getGameTime`, `dimension`, `getBlockState`, `getBlockEntity`, side, and build-height queries. Their
 bounded coordinate-keyed maps also preserve `setBlock`, `setBlockAndUpdate`, `setBlockEntity`, and
@@ -691,8 +693,10 @@ registration and optional lookups linkable without copying NeoForge implementati
 side, and item transfer remains a native ABI boundary rather than a fabricated Java result.
 The handler façade now keeps a bounded one-slot state per handler: reads return copies, inserts cap the
 stack at 64 and honor simulation, extraction decrements state, and the modifiable variant can replace the
-slot. This value layer is only for bootstrap code that needs a stable inventory shape; it is not connected to
-the live block/side capability table, which remains the explicit native boundary.
+slot. The native `StdHost` also preserves capability markers and callback-local `LazyOptional` values
+through presence, fallback, mapping, and invalidation queries. These value layers are only for bootstrap code
+that needs a stable inventory shape; they are not connected to the live block/side capability table, which
+remains the explicit native boundary.
 
 ## Mixin
 
