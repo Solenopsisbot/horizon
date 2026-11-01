@@ -359,7 +359,7 @@ lifecycle call, which lets FabricProxy-Lite initialize its config. NeoForge
 classes without a Fabric lifecycle method are accepted after construction so their constructor-driven
 registration can be probed.
 
-The native CLI's `--json` form returns `{status,kind,class,method,host_calls}` on success and a structured
+The native CLI's `--json` form returns `{status,kind,entrypoints,host_calls}` on success and a structured
 `{status,error,stage}` object on load, discovery, or execution failure. A launcher can use that verdict to
 select the native path or fall back to `horizon-jvm` without parsing human diagnostics. `cargo horizon-mod
 check` runs the same bounded probe as an optional `native` field in its JSON report, trying Fabric `main`,
@@ -501,7 +501,9 @@ work-item surface. This keeps Fabric callback registration observable without pr
 an arbitrary event combiner in the bounded host. NeoForge `IEventBus.post` also records posted event
 values and returns a deterministic cancellation result for the explicit `event/cancelled/...`,
 `cancelled/...`, and `@cancelled:...` markers; full event hierarchy and mutable cancellation state
-remain a native hook boundary.
+remain a native hook boundary. `PayloadRegistrar` calls now retain a bounded direction/type/codec/handler
+record through `StdHost::payload_registrations`, leaving byte encoding and channel ownership to Horizon's
+network boundary.
 The generated NeoForge `DeferredHolder` façade now retains its id, registry key, and lazy supplier: `get`,
 `value`, `isPresent`, `getOptional`, `getId`, and `getKey` agree on one holder state. The matching
 `DeferredRegister` shim binds the namespace and supplier when `register` is called, so common registry

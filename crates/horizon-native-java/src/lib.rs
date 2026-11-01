@@ -52,6 +52,18 @@ pub struct RegistryEntry {
     pub declaration: Option<RegistryDeclaration>,
 }
 
+/// A bounded native record for NeoForge payload registration.  The actual
+/// network channel remains a game-owned boundary; retaining the direction and
+/// values lets the launcher validate that bootstrap reached the registration
+/// stage without pretending to encode arbitrary packet bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PayloadRegistration {
+    pub direction: String,
+    pub payload_type: Value,
+    pub codec: Value,
+    pub handler: Value,
+}
+
 impl RegistryEntry {
     pub fn key(&self) -> String {
         format!("{}/{}", self.registry, self.id)
@@ -166,6 +178,7 @@ pub struct StdHost {
     invocations: Vec<HostInvocation>,
     posted_events: Vec<Value>,
     registrations: Vec<RegistryEntry>,
+    payload_registrations: Vec<PayloadRegistration>,
     holders: BTreeMap<String, Value>,
     mutable_collections: BTreeMap<String, Vec<Value>>,
     next_fabric_event: usize,
@@ -187,6 +200,7 @@ impl StdHost {
             invocations: Vec::new(),
             posted_events: Vec::new(),
             registrations: Vec::new(),
+            payload_registrations: Vec::new(),
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             next_fabric_event: 0,
@@ -253,6 +267,10 @@ impl StdHost {
 
     pub fn registrations(&self) -> &[RegistryEntry] {
         &self.registrations
+    }
+
+    pub fn payload_registrations(&self) -> &[PayloadRegistration] {
+        &self.payload_registrations
     }
 
     pub fn apply_registrations<S: RegistrySink>(&self, sink: &mut S) -> Result<usize, String> {
@@ -1958,6 +1976,18 @@ impl Host for StdHost {
                     "Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
                 ) =>
             {
+                if matches!(
+                    r.name.as_str(),
+                    "playToServer" | "playToClient" | "playBidirectional"
+                ) && args.len() >= 3
+                {
+                    self.payload_registrations.push(PayloadRegistration {
+                        direction: r.name.clone(),
+                        payload_type: args[0].clone(),
+                        codec: args[1].clone(),
+                        handler: args[2].clone(),
+                    });
+                }
                 Ok(receiver.clone())
             }
             _ => Ok(Value::default_for(&r.descriptor)),
@@ -7575,6 +7605,39 @@ mandatory = true
         };
         let result = jar.execute_dispatch(&dispatch, &mut NullHost).unwrap();
         assert_eq!(result, Value::Void);
+    }
+
+    #[test]
+    fn standard_host_records_payload_registrations() {
+        let mut host = StdHost::new();
+        let registrar = Value::Ref(Some("payload-registrar".into()));
+        let method = MethodRef {
+            owner: "net/neoforged/neoforge/network/registration/PayloadRegistrar".into(),
+            name: "playToServer".into(),
+            descriptor: "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &method,
+                &registrar,
+                &[
+                    Value::Ref(Some("payload-type".into())),
+                    Value::Ref(Some("stream-codec".into())),
+                    Value::Ref(Some("handler".into())),
+                ],
+            )
+            .unwrap(),
+            registrar
+        );
+        assert_eq!(
+            host.payload_registrations(),
+            &[PayloadRegistration {
+                direction: "playToServer".into(),
+                payload_type: Value::Ref(Some("payload-type".into())),
+                codec: Value::Ref(Some("stream-codec".into())),
+                handler: Value::Ref(Some("handler".into())),
+            }]
+        );
     }
 
     #[test]
