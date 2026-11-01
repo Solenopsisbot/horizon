@@ -81,6 +81,9 @@ pub struct NativeProbe {
     /// NeoForge listener registrations recorded by the deterministic host.
     #[serde(default)]
     pub listeners: usize,
+    /// NeoForge payload registrations recorded by the deterministic host.
+    #[serde(default)]
+    pub payloads: usize,
     pub error: Option<String>,
 }
 
@@ -123,6 +126,7 @@ fn native_probe(jar_path: &Path) -> NativeProbe {
                 calls: 0,
                 registrations: 0,
                 listeners: 0,
+                payloads: 0,
                 error: Some(error.to_string()),
             };
         }
@@ -139,6 +143,7 @@ fn native_probe(jar_path: &Path) -> NativeProbe {
             calls: 0,
             registrations: 0,
             listeners: 0,
+            payloads: 0,
             error: Some("no Fabric main/client/server or NeoForge entrypoint".into()),
         };
     };
@@ -172,6 +177,7 @@ fn native_probe(jar_path: &Path) -> NativeProbe {
         calls,
         registrations: host.registrations().len(),
         listeners: host.listener_registrations().count(),
+        payloads: host.payload_registrations().len(),
         error: (!errors.is_empty()).then(|| errors.join("; ")),
     }
 }

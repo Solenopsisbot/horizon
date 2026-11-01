@@ -904,6 +904,39 @@ impl Host for StdHost {
                     | "java/util/AbstractMap"
                     | "java/util/HashMap"
                     | "java/util/LinkedHashMap",
+                    "computeIfAbsent",
+                    "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+                ) => {
+                    let key = Self::argument(r, args, 0)?.clone();
+                    let function = Self::argument(r, args, 1)?;
+                    let values = self
+                        .mutable_collections
+                        .entry(marker.to_owned())
+                        .or_default();
+                    if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key) {
+                        return Ok(values[index * 2 + 1].clone());
+                    }
+                    let computed = match function {
+                        Value::Ref(Some(callback)) if callback.starts_with("@indy:") => {
+                            Value::Ref(Some(format!("computed/{}", value_marker(&key))))
+                        }
+                        Value::Ref(None) => Value::Ref(None),
+                        other => Value::Ref(Some(format!(
+                            "computed/{}/{}",
+                            value_marker(&key),
+                            value_marker(other)
+                        ))),
+                    };
+                    if !matches!(computed, Value::Ref(None)) {
+                        values.extend([key, computed.clone()]);
+                    }
+                    return Ok(computed);
+                }
+                (
+                    "java/util/Map"
+                    | "java/util/AbstractMap"
+                    | "java/util/HashMap"
+                    | "java/util/LinkedHashMap",
                     "putIfAbsent",
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                 ) => {
@@ -5828,6 +5861,31 @@ mandatory = true
             host.invoke_instance(&map_get, &map, &[Value::Ref(Some("key".into()))])
                 .unwrap(),
             Value::Ref(Some("value".into()))
+        );
+        let compute = MethodRef {
+            owner: "java/util/Map".into(),
+            name: "computeIfAbsent".into(),
+            descriptor: "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;"
+                .into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &compute,
+                &map,
+                &[
+                    Value::Ref(Some("computed-key".into())),
+                    Value::Ref(Some(
+                        "@indy:demo#0:0:demo/Factory#make()Ljava/lang/Object;:".into()
+                    )),
+                ],
+            )
+            .unwrap(),
+            Value::Ref(Some("computed/rcomputed-key".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(&map_get, &map, &[Value::Ref(Some("computed-key".into()))])
+                .unwrap(),
+            Value::Ref(Some("computed/rcomputed-key".into()))
         );
         let put_if_absent = MethodRef {
             owner: "java/util/Map".into(),

@@ -292,9 +292,9 @@ keep common block-entity registration and synchronization code linked. `saveAddi
 round-trip a bounded callback-local `CompoundTag` payload, while persistence outside the callback and live
 level writes remain native-boundary work.
 `LivingEntity` now retains bounded health, main/off-hand stack values, and an identity-keyed effect map;
-health, death-state, armor-value, effect-presence, effect lookup/removal, and hand-stack queries keep common
-mob and player inspection code linked while effect application and equipment synchronization remain
-native-boundary work.
+health mutation/healing, death-state, armor-value, effect-presence, effect application/lookup/removal, and
+hand-stack reads/writes keep common mob and player inspection code linked while equipment synchronization
+outside the façade remains native-boundary work.
 `Mob` now retains bounded `isNoAi`/`isAggressive` flags and a target reference, so common AI gates and
 target-selection callbacks can round-trip their state inside one façade callback. `MobEffectInstance`
 retains its effect, duration, amplifier, ambient/visibility/icon flags, infinite-duration query, and
@@ -365,7 +365,7 @@ select the native path or fall back to `horizon-jvm` without parsing human diagn
 check` runs the same bounded probe as an optional `native` field in its JSON report, trying Fabric `main`,
 `client`, and `server` entrypoints before a NeoForge `@Mod` entrypoint. The launcher prints the selected kind,
 executes every declaration for that selected kind (retaining the first as the compatibility `entrypoint`),
-and reports the attempted `entrypoints`, seeded mod ids, call count, recorded registrations/listeners, and all bounded-interpreter errors alongside the
+and reports the attempted `entrypoints`, seeded mod ids, call count, recorded registrations/listeners/payloads, and all bounded-interpreter errors alongside the
 content-port result, so a client-only or server-only jar is diagnosed without an extra command.
 When the CLI kind argument is omitted, it makes the same ordered discovery attempt; passing `main`, `client`,
 `server`, or `neoforge` keeps selection strict for reproducible diagnostics.

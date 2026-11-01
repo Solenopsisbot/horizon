@@ -2620,6 +2620,11 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         match (method, ret, descriptor) {
             ("getHealth", "float", "()F") => return "return horizonHealth;".to_owned(),
             ("getMaxHealth", "float", "()F") => return "return horizonMaxHealth;".to_owned(),
+            ("setHealth", "void", "(F)V") => return "horizonHealth = p0;".to_owned(),
+            ("heal", "void", "(F)V") => {
+                return "horizonHealth = Math.min(horizonMaxHealth, horizonHealth + p0);"
+                    .to_owned();
+            }
             ("isDeadOrDying", "boolean", "()Z") => {
                 return "return horizonHealth <= 0.0f;".to_owned();
             }
@@ -2640,7 +2645,24 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ) => {
                 return "return horizonOffhand;".to_owned();
             }
+            (
+                "getItemInHand",
+                "net.minecraft.world.item.ItemStack",
+                "(Lnet/minecraft/world/InteractionHand;)Lnet/minecraft/world/item/ItemStack;",
+            ) => {
+                return "return p0 == net.minecraft.world.InteractionHand.OFF_HAND ? horizonOffhand : horizonMainHand;".to_owned();
+            }
+            (
+                "setItemInHand",
+                "void",
+                "(Lnet/minecraft/world/InteractionHand;Lnet/minecraft/world/item/ItemStack;)V",
+            ) => {
+                return "if (p0 == net.minecraft.world.InteractionHand.OFF_HAND) horizonOffhand = p1; else horizonMainHand = p1;".to_owned();
+            }
             ("getArmorValue", "int", "()I") => return "return horizonArmorValue;".to_owned(),
+            ("addEffect", "boolean", "(Lnet/minecraft/world/effect/MobEffectInstance;)Z") => {
+                return "if (p0 == null) return false; horizonEffects.put(p0.getEffect(), p0); return true;".to_owned();
+            }
             ("hasEffect", "boolean", "(Lnet/minecraft/world/effect/MobEffect;)Z") => {
                 return "return horizonEffects.containsKey(p0);".to_owned();
             }
@@ -4928,11 +4950,47 @@ mod tests {
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/world/entity/LivingEntity",
+                "setHealth",
+                "void",
+                "(F)V",
+            ),
+            "horizonHealth = p0;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/LivingEntity",
+                "heal",
+                "void",
+                "(F)V",
+            ),
+            "horizonHealth = Math.min(horizonMaxHealth, horizonHealth + p0);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/LivingEntity",
                 "getMainHandItem",
                 "net.minecraft.world.item.ItemStack",
                 "()Lnet/minecraft/world/item/ItemStack;",
             ),
             "return horizonMainHand;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/LivingEntity",
+                "getItemInHand",
+                "net.minecraft.world.item.ItemStack",
+                "(Lnet/minecraft/world/InteractionHand;)Lnet/minecraft/world/item/ItemStack;",
+            ),
+            "return p0 == net.minecraft.world.InteractionHand.OFF_HAND ? horizonOffhand : horizonMainHand;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/LivingEntity",
+                "addEffect",
+                "boolean",
+                "(Lnet/minecraft/world/effect/MobEffectInstance;)Z",
+            ),
+            "if (p0 == null) return false; horizonEffects.put(p0.getEffect(), p0); return true;"
         );
         assert_eq!(
             runtime_body_with_descriptor(
