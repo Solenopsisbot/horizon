@@ -2377,8 +2377,16 @@ pub fn need_prepared(tag: &str) -> Result<(), String> {
 /// the gate, a sign-in that can't be renewed (no network, expired) still lets the game start,
 /// offline.
 pub fn client(tag: &str) -> Result<Command, String> {
-    let (session, offline) = account::session_for_game(&game_home(), false)
-        .map_err(|refused| format!("{refused} Sign in with `horizon-launcher account sign-in`."))?;
+    client_as(tag, None)
+}
+
+/// [`client`], playing as `who` for this launch only (`play --account`, `--offline-name`).
+pub fn client_as(tag: &str, who: Option<&account::Player>) -> Result<Command, String> {
+    let (session, offline) = match who {
+        None => account::session_for_game(&game_home(), false).map_err(|e| e.to_string()),
+        Some(who) => account::session_for_game_as(&game_home(), who),
+    }
+    .map_err(|refused| format!("{refused} Sign in with `horizon-launcher account sign-in`."))?;
     need_prepared(tag)?;
     complete_assets(tag);
     crate::browser::horizon::before_play(&game_home());

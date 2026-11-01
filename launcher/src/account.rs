@@ -1428,12 +1428,61 @@ pub fn session_for_game(
         offline_without_owner,
     )?;
     let _ = accounts.save();
+    Ok(session_file(game_home, pass))
+}
+
+/// [`session_for_game`] for one launch as `who` (`play --account`, a signed-in account): who
+/// plays changes for this launch only, so several games can play as several accounts at once
+/// (#4952). What the services renewed (tokens, names, skins) is still kept; which account
+/// `account select` picked is not touched.
+pub fn session_for_game_as(
+    game_home: &Path,
+    who: &Player,
+) -> Result<(Option<PathBuf>, Option<String>), String> {
+    let mut accounts = Accounts::load();
+    let pass = launch_as(
+        &Endpoints::live(),
+        client_id().as_deref(),
+        store(),
+        &mut accounts,
+        who,
+    );
+    let _ = accounts.save();
+    Ok(session_file(game_home, pass?))
+}
+
+/// The owner gate as `who`, on `accounts`, which keeps its choice of player.
+fn launch_as(
+    ep: &Endpoints,
+    client_id: Option<&str>,
+    store: &dyn SecretStore,
+    accounts: &mut Accounts,
+    who: &Player,
+) -> Result<Launch, String> {
+    let chosen = (
+        accounts.selected.clone(),
+        accounts.offline_selected.clone(),
+        accounts.offline.clone(),
+    );
+    let pass = accounts
+        .play_as(store, who.clone())
+        .and_then(|()| launch(ep, client_id, store, accounts).map_err(|e| e.to_string()));
+    (
+        accounts.selected,
+        accounts.offline_selected,
+        accounts.offline,
+    ) = chosen;
+    pass
+}
+
+/// The game's session file for a launch that passed the gate, or why it plays offline.
+fn session_file(game_home: &Path, pass: Launch) -> (Option<PathBuf>, Option<String>) {
     let Some((account, secrets)) = pass.session else {
-        return Ok((None, pass.offline));
+        return (None, pass.offline);
     };
     match write_session_file(&game_home.join("sessions"), &account, &secrets) {
-        Ok(file) => Ok((Some(file), None)),
-        Err(e) => Ok((None, Some(e))),
+        Ok(file) => (Some(file), None),
+        Err(e) => (None, Some(e)),
     }
 }
 

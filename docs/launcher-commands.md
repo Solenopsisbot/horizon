@@ -67,6 +67,7 @@ Start the client (needs a signed-in Microsoft account that owns Minecraft: Java 
 - `--join`: Join a friend's world with its invite code
 - `--server`: Join this server at once: an address, or a server of the list by name or position
 - `--arg`: An extra argument for the game, passed through as-is (repeatable), for example --server-thread
+- `--account`: Play this launch as this signed-in account (its name or UUID), without changing the one `account select` picked: several games can play as several accounts at once
 
 MCP: `play`, then the `game_*` tools.
 

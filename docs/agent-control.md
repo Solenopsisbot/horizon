@@ -66,7 +66,7 @@ passes on without checking it).
 | Install, remove a version | Play | yes | yes | yes | yes | `remove` needs `confirm` in MCP |
 | Pick the version that plays | Play | no | no | yes | yes | `settings selected-version TAG` |
 | Prepare resources | Play | yes | yes | yes | yes | |
-| Start the game | Play | yes | yes | yes | yes | `play --world --creative --join --arg`; MCP `play` adds `offscreen` |
+| Start the game | Play | yes | yes | yes | yes | `play --world --creative --join --arg --account`; MCP `play` adds `offscreen` |
 | Join a friend by invite code | Play | yes | no | yes | yes | `play --join CODE` |
 | Dedicated server here: start, console, log, stop | Servers | yes | yes | yes | yes | `server`; MCP `server`, `server_command`, `server_log`, `server_stop` |
 | Hosted servers: list, create, set up, run a command, forget | Servers | yes | no | yes | yes | `servers ...`; `servers_forget` needs `confirm` |

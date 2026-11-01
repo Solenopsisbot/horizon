@@ -1026,3 +1026,44 @@ fn the_java_edition_plays_as_an_owner_even_offline() {
         NoOwner.to_string()
     );
 }
+
+#[test]
+fn a_launch_as_another_account_leaves_the_selected_one() {
+    let store = MemoryStore::default();
+    // Notch is signed in, owns the game and is selected; Alex is listed but no longer has
+    // tokens in the keychain.
+    let mut accounts = signed_in(&store, &secrets("mc-token", true));
+    let alex = "0f22b7ed5e3d4a2c9bfe2f6f8f1f6a01";
+    accounts.accounts.push(Account {
+        uuid: alex.into(),
+        name: "Alex".into(),
+        skin: None,
+        cape: None,
+    });
+    // This launch plays as Alex: Notch's ownership opens the gate, and it is Alex who is told
+    // to sign in again, so Alex played. Notch is still the one `account select` picked.
+    let pass = launch_as(
+        &offline(),
+        Some("test-client"),
+        &store,
+        &mut accounts,
+        &Player::Microsoft(alex.into()),
+    )
+    .unwrap();
+    assert!(pass.session.is_none());
+    assert!(pass
+        .offline
+        .unwrap()
+        .starts_with("Alex is no longer signed in"));
+    assert_eq!(accounts.player(), Player::Microsoft(UUID.into()));
+    // An account that isn't in the launcher is refused, and changes nothing either.
+    let gone = launch_as(
+        &offline(),
+        Some("test-client"),
+        &store,
+        &mut accounts,
+        &Player::Microsoft("not-signed-in".into()),
+    );
+    assert_eq!(gone.unwrap_err(), "That account isn't signed in.");
+    assert_eq!(accounts.player(), Player::Microsoft(UUID.into()));
+}

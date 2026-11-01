@@ -735,6 +735,10 @@ enum Cmd {
         /// --server-thread
         #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
         arg: Vec<String>,
+        /// Play this launch as this signed-in account (its name or UUID), without changing
+        /// the one `account select` picked: several games can play as several accounts at once
+        #[arg(long, value_name = "WHO")]
+        account: Option<String>,
     },
     /// Run a dedicated server here; type commands into its console
     Server {
@@ -1296,16 +1300,22 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             join,
             server,
             arg,
+            account,
         } => {
             let instance = match instance {
                 Some(name) => instances::find(&name)?,
                 None => instances::selected(),
             };
             if instance.java.is_some() {
-                if version.is_some() || world.is_some() || join.is_some() || creative {
+                if version.is_some()
+                    || world.is_some()
+                    || join.is_some()
+                    || creative
+                    || account.is_some()
+                {
                     return Err(format!(
-                        "{} plays Minecraft: Java Edition: --version, --world, --creative and \
-                         --join are for Horizon instances.",
+                        "{} plays Minecraft: Java Edition: --version, --world, --creative, \
+                         --join and --account are for Horizon instances.",
                         instance.name
                     ));
                 }
@@ -1329,7 +1339,26 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                 after_exit(&instance, &vars);
                 return played;
             }
-            let mut cmd = backend::client(&instance.resolve_version(version.as_deref())?)?;
+            // Who plays this launch; the accounts below choose it in memory only, for its
+            // `--name` and look.
+            let mut accounts = Accounts::load();
+            let who = match account {
+                Some(who) => Some(account::Player::Microsoft(
+                    accounts
+                        .find(&who)
+                        .ok_or_else(|| {
+                            format!("No signed-in account {who}. See `horizon-launcher account`.")
+                        })?
+                        .uuid
+                        .clone(),
+                )),
+                None => None,
+            };
+            if let Some(who) = &who {
+                accounts.play_as(account::store(), who.clone())?;
+            }
+            let mut cmd =
+                backend::client_as(&instance.resolve_version(version.as_deref())?, who.as_ref())?;
             instances::apply(&mut cmd, &instance)?;
             if let Some(code) = join {
                 backend::join_friend(&mut cmd, &code)?;
@@ -1347,7 +1376,6 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             }
             cmd.args(arg);
             let started = std::time::Instant::now();
-            let accounts = Accounts::load();
             if let Some(name) = accounts.name_arg() {
                 cmd.arg("--name").arg(name);
             }
@@ -3481,6 +3509,15 @@ mod tests {
         );
         set_setting(&mut settings, "language", "system").unwrap();
         assert_eq!(settings.language, None);
+    }
+
+    #[test]
+    fn play_takes_an_account_for_one_launch() {
+        let cli = Cli::try_parse_from(["horizon-launcher", "play", "--account", "Alex"]).unwrap();
+        match cli.command {
+            Some(Cmd::Play { account, .. }) => assert_eq!(account.as_deref(), Some("Alex")),
+            _ => panic!("not play"),
+        }
     }
 
     #[test]
