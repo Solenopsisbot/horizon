@@ -552,7 +552,7 @@ docs, nothing read or copied from their source.
 The single most important design decision, because it decides whether the boundary is 30 ns or 30 µs.
 Three classes of object, defined by who owns the truth:
 
-**1. Values.** `ResourceLocation`, `BlockPos`, `Vec3`, `AABB`, `Component`, `CompoundTag`, `ItemStack`,
+**1. Values.** `ResourceLocation`, `Direction`, `BlockPos`, `Vec3`, `AABB`, `Component`, `CompoundTag`, `ItemStack`,
 `BlockState`. Java owns the value; Rust reads it back at the boundary. `BlockState` is a singleton per
 registry id (no allocation per read, as vanilla caches them); `ItemStack` is Java-owned with a dirty flag
 and is pushed to Rust at the points where the simulation can see it (use, menu click, container transfer,

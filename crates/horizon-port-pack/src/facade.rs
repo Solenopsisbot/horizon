@@ -1838,6 +1838,79 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             _ => {}
         }
     }
+    if class == "net/minecraft/core/Direction" {
+        match (method, ret, descriptor) {
+            ("getName" | "getSerializedName", "java.lang.String", _) => {
+                return "return name().toLowerCase(java.util.Locale.ROOT);".to_owned();
+            }
+            ("get3DDataValue", "int", _) => return "return ordinal();".to_owned(),
+            ("getStepX", "int", _) => {
+                return "return this == WEST ? -1 : this == EAST ? 1 : 0;".to_owned();
+            }
+            ("getStepY", "int", _) => {
+                return "return this == DOWN ? -1 : this == UP ? 1 : 0;".to_owned();
+            }
+            ("getStepZ", "int", _) => {
+                return "return this == NORTH ? -1 : this == SOUTH ? 1 : 0;".to_owned();
+            }
+            ("getAxis", "net.minecraft.core.Direction.Axis", _) => {
+                return "return (this == UP || this == DOWN) ? Axis.Y : (this == EAST || this == WEST) ? Axis.X : Axis.Z;".to_owned();
+            }
+            ("getAxisDirection", "net.minecraft.core.Direction.AxisDirection", _) => {
+                return "return (this == UP || this == SOUTH || this == EAST) ? AxisDirection.POSITIVE : AxisDirection.NEGATIVE;".to_owned();
+            }
+            ("getOpposite", "net.minecraft.core.Direction", _) => {
+                return "return switch (this) { case DOWN -> UP; case UP -> DOWN; case NORTH -> SOUTH; case SOUTH -> NORTH; case WEST -> EAST; case EAST -> WEST; };".to_owned();
+            }
+            ("getClockWise", "net.minecraft.core.Direction", _) => {
+                return "return switch (this) { case NORTH -> EAST; case EAST -> SOUTH; case SOUTH -> WEST; case WEST -> NORTH; default -> this; };".to_owned();
+            }
+            ("getCounterClockWise", "net.minecraft.core.Direction", _) => {
+                return "return switch (this) { case NORTH -> WEST; case WEST -> SOUTH; case SOUTH -> EAST; case EAST -> NORTH; default -> this; };".to_owned();
+            }
+            ("getNormal", "net.minecraft.core.Vec3i", _) => {
+                return "return new net.minecraft.core.Vec3i(getStepX(), getStepY(), getStepZ());"
+                    .to_owned();
+            }
+            ("from3DDataValue", "net.minecraft.core.Direction", _) => {
+                return "return values()[Math.floorMod(p0, values().length)];".to_owned();
+            }
+            ("byName", "net.minecraft.core.Direction", _) => {
+                return "if (p0 == null) return null; for (Direction value : values()) if (value.getName().equals(p0)) return value; return null;".to_owned();
+            }
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/core/Direction$Axis" {
+        match (method, ret) {
+            ("getName" | "getSerializedName", "java.lang.String") => {
+                return "return name().toLowerCase(java.util.Locale.ROOT);".to_owned();
+            }
+            ("isVertical", "boolean") => return "return this == Y;".to_owned(),
+            ("isHorizontal", "boolean") => return "return this != Y;".to_owned(),
+            ("getPlane", "net.minecraft.core.Direction.Plane") => {
+                return "return this == Y ? Direction.Plane.VERTICAL : Direction.Plane.HORIZONTAL;"
+                    .to_owned();
+            }
+            ("choose", "int") => {
+                return "return this == X ? p0 : this == Y ? p1 : p2;".to_owned();
+            }
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/core/Direction$AxisDirection" {
+        match (method, ret) {
+            ("getStep", "int") => return "return this == POSITIVE ? 1 : -1;".to_owned(),
+            ("isPositive", "boolean") => return "return this == POSITIVE;".to_owned(),
+            ("getName" | "getSerializedName", "java.lang.String") => {
+                return "return name().toLowerCase(java.util.Locale.ROOT);".to_owned();
+            }
+            ("opposite", "net.minecraft.core.Direction.AxisDirection") => {
+                return "return this == POSITIVE ? NEGATIVE : POSITIVE;".to_owned();
+            }
+            _ => {}
+        }
+    }
     if class == "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type"
         && method == "id"
         && ret == "net.minecraft.resources.Identifier"
@@ -3486,6 +3559,22 @@ mod tests {
         assert_eq!(
             runtime_body("net/minecraft/core/Vec3i", "getX", "int"),
             "return horizonX;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/core/Direction",
+                "getOpposite",
+                "net.minecraft.core.Direction"
+            ),
+            "return switch (this) { case DOWN -> UP; case UP -> DOWN; case NORTH -> SOUTH; case SOUTH -> NORTH; case WEST -> EAST; case EAST -> WEST; };"
+        );
+        assert_eq!(
+            runtime_body("net/minecraft/core/Direction", "getStepX", "int"),
+            "return this == WEST ? -1 : this == EAST ? 1 : 0;"
+        );
+        assert_eq!(
+            runtime_body("net/minecraft/core/Direction$Axis", "isVertical", "boolean"),
+            "return this == Y;"
         );
         assert_eq!(
             runtime_body(
