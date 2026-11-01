@@ -138,11 +138,11 @@ pub use bonemeal::TemplateSettings;
 pub use buckets::BucketContent;
 pub use data::{BlockData, ItemBinding, ItemKind, Named, Props, PushReaction, StateFacts, Tags};
 pub use falling::Landing;
-pub use interact::{InteractionResult, PlayerContext, PlayerEffect, hit_slot};
+pub use interact::{InteractionResult, PlayerContext, PlayerEffect, UseBranch, hit_slot};
 pub use pistons::{BlockEventData, MovingPiston};
 pub use place::{PlaceContext, PlaceOutcome};
 pub use states::{BlockId, PropKey, StateTable};
-pub use tick::{Precipitation, PrecipitationKind};
+pub use tick::{Precipitation, PrecipitationKind, RandomTickMask};
 pub use ticks::Ticks;
 
 /// `Block.UPDATE_*` flags accepted by [`Behaviours::set_block`].
@@ -150,6 +150,8 @@ pub mod flags {
     pub const UPDATE_NEIGHBORS: i32 = 1;
     pub const UPDATE_CLIENTS: i32 = 2;
     pub const UPDATE_INVISIBLE: i32 = 4;
+    /// Read only by a client's level, which rebuilds the section at once.
+    pub const UPDATE_IMMEDIATE: i32 = 8;
     pub const UPDATE_KNOWN_SHAPE: i32 = 16;
     pub const UPDATE_SUPPRESS_DROPS: i32 = 32;
     pub const UPDATE_MOVE_BY_PISTON: i32 = 64;
@@ -346,6 +348,52 @@ pub trait LevelAccess {
         _moved: bool,
     ) {
     }
+    /// `BlockState.randomTick` from `ServerLevel.tickChunk`, before the block
+    /// handles it. The level may change the block (`Behaviours::set_block`
+    /// with `ticks`); setting `handled` skips the block's own random tick. A
+    /// level that changed the block without setting `handled` must put the
+    /// block's state as it is now in `state`: the block's own random tick
+    /// runs on it. The default does nothing.
+    fn before_random_tick(
+        &mut self,
+        _ticks: &mut Ticks,
+        _pos: BlockPos,
+        _state: &mut BlockStateId,
+        _handled: &mut bool,
+    ) {
+    }
+    /// `BlockState.tick` from `ServerLevel.tickBlock` (a due scheduled tick
+    /// whose block is still there), before the block handles it. The level
+    /// may change the block (`Behaviours::set_block` with `ticks`); setting
+    /// `handled` skips the block's own tick. A level that changed the block
+    /// without setting `handled` must put the block's state as it is now in
+    /// `state`: the block's own tick runs on it. The default does nothing.
+    fn before_tick_block(
+        &mut self,
+        _ticks: &mut Ticks,
+        _pos: BlockPos,
+        _state: &mut BlockStateId,
+        _handled: &mut bool,
+    ) {
+    }
+    /// `BlockState.updateShape` for `state` at `pos` after its neighbour in
+    /// `direction` became `neighbour`, before the block computes it. `state`
+    /// may not be in the level yet (a piston landing it). A state put in
+    /// `new` is the result, and the block's own `updateShape` doesn't run;
+    /// the level may schedule ticks through `ticks`, as that would. The
+    /// default does nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn before_update_shape(
+        &self,
+        _ticks: &mut Ticks,
+        _pos: BlockPos,
+        _state: BlockStateId,
+        _direction: Direction,
+        _neighbour_pos: BlockPos,
+        _neighbour: BlockStateId,
+        _new: &mut Option<BlockStateId>,
+    ) {
+    }
     /// `Level.isClientSide`: this level is a client's copy (false on a
     /// server, a host or the test harness).
     fn is_client_side(&self) -> bool {
@@ -457,6 +505,40 @@ pub trait LevelAccess {
     /// `PotentSulfurBlockEntity.resetCountdown` for the potent sulfur block
     /// entity at `pos` (`PotentSulfurBlock.validBlockState`).
     fn reset_potent_sulfur_countdown(&mut self, _pos: BlockPos) {}
+    /// `BlockState.isSignalSource` once the library answered `vanilla`: the
+    /// answer to use. The default keeps it.
+    fn adjust_signal_source(&self, _state: BlockStateId, vanilla: bool) -> bool {
+        vanilla
+    }
+    /// `BlockState.hasAnalogOutputSignal` once the library answered `vanilla`:
+    /// whether comparators read the block. The default keeps it.
+    fn adjust_has_analog_output(&self, _state: BlockStateId, vanilla: bool) -> bool {
+        vanilla
+    }
+    /// `BlockState.getAnalogOutputSignal(level, pos, direction)` once the
+    /// library answered `vanilla`, `direction` pointing from the block to the
+    /// comparator reading it: the output to use. The default keeps it.
+    fn adjust_analog_output(
+        &self,
+        _pos: BlockPos,
+        _state: BlockStateId,
+        _direction: Direction,
+        vanilla: i32,
+    ) -> i32 {
+        vanilla
+    }
+    /// `BlockState.getSignal` (or `getDirectSignal` when `direct`) once the
+    /// library answered `vanilla`: the signal to use. The default keeps it.
+    fn adjust_signal(
+        &self,
+        _pos: BlockPos,
+        _state: BlockStateId,
+        _direction: Direction,
+        _direct: bool,
+        vanilla: i32,
+    ) -> i32 {
+        vanilla
+    }
     /// Weak/strong signal of a block-entity-driven source (trapped chest
     /// openers); other sources are evaluated by the library.
     fn block_entity_signal(
@@ -546,6 +628,7 @@ pub struct Behaviours {
     pub fluid_tags: data::FluidTags,
     blocks: Vec<BlockData>,
     items: HashMap<String, ItemBinding>,
+    potted_by_content: HashMap<BlockId, BlockId>,
     liquid_blocks: FluidBlockBindings,
     /// Uncached (position- or block-entity-dependent) collision shapes.
     dynamic: HashMap<BlockStateId, crate::dynamic_support::DynamicSupport>,
@@ -596,6 +679,11 @@ impl Behaviours {
     }
     pub fn item_binding(&self, item: &str) -> Option<&ItemBinding> {
         self.items.get(item)
+    }
+    /// FlowerPotBlock.POTTED_BY_CONTENT: the potted flower pot block that
+    /// holds plant, if any.
+    pub fn potted_block(&self, plant: BlockId) -> Option<BlockId> {
+        self.potted_by_content.get(&plant).copied()
     }
     pub fn tag(&self, name: &str) -> Option<&data::BlockSet> {
         self.all_tags.get(name).map(|s| &**s)

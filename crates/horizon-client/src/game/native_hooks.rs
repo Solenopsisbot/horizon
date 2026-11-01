@@ -6,6 +6,125 @@
 //! Horizon's own HUD extras do, and keep a mod's settings where the
 //! WebAssembly mod of the same id kept them.
 //!
+//! API 62 adds nicknames for server mods: `native_set_nickname` shows a name in place of a player's in chat and
+//! the Tab list (the real one on hover), and `native_text_allowed` asks the server's chat filter, in
+//! `native_server.rs`.
+//!
+//! API 61 adds mods' own sound events in `native_play_sound`: another
+//! namespace's event is sent by name, as vanilla sends an unregistered sound.
+//!
+//! API 60 adds the small bar under an item (`native_item_bar`): `GuiGraphicsExtractor.itemDecorations`
+//! hands it vanilla's choice (the damage bar, or a bundle's fullness already applied), to replace or hide.
+//!
+//! API 59 adds entities for server mods (`native_summon`, `native_move_entity`,
+//! `native_set_display`, `native_remove_entity`, in `native_entities.rs`).
+//!
+//! API 58 adds the renderer's hook points, in `horizon-client-render`'s
+//! `gfx/native_render.rs`: `native_world_drawn` (draw with the world's colour,
+//! depth, matrices and entity geometry before the hand and the HUD) and
+//! `native_render_needs` (entity runs and the world's depth without a pack).
+//!
+//! API 57 adds chunks and players coming and going (`native_chunk_load`,
+//! `native_chunk_unload`, `native_player_logged_in`, `native_player_logged_out`).
+//!
+//! API 56 adds what a content mod's mob effects do: their effect tick
+//! (`native_should_apply_effect_tick_this_tick`, `native_apply_effect_tick`)
+//! and their being given (`native_on_effect_added`,
+//! `native_mob_effect_added`).
+//!
+//! API 55 adds moving a block's fluids to another block (`native_move_fluids`, in
+//! `machines/native_fluids.rs`: what the target refuses goes back into the
+//! source, whole thirds kept).
+//!
+//! API 54 adds fluid tanks on a mod block's block entity
+//! (`native_block_entity_fluids`), and the fluid helpers in
+//! `machines/native_fluids.rs`: `native_fluid_tanks`,
+//! `native_fluid_insert`, `native_fluid_extract`, which also read and
+//! change a cauldron.
+//!
+//! API 53 adds entities leaving a level (`native_entity_leave_level`), for
+//! item entities and experience orbs so far.
+//!
+//! API 52 adds `native_block_entity_sync`: a mod block entity's block and update tag
+//! sent to clients again (`Level.sendBlockUpdated`).
+//!
+//! API 51 adds `native_menu_button_v2`: a mod container's menu button with the clicking player's cursor stack (`clickMenuButton(Player, int)`).
+//!
+//! API 50 adds damage a mod can change or cancel (`native_living_incoming_damage`).
+//!
+//! API 49 adds, in `native_server.rs`, a sidebar and Tab list lines for one
+//! player (`native_sidebar`, `native_tab_list`), the server's tick times
+//! (`native_tick_stats`), players left out of the sleep count
+//! (`native_sleep_ignored`), and where players look (`yaw`, `pitch`).
+//!
+//! API 48 adds a block's items for server mods (`native_container_slots`,
+//! `native_extract_item`, `native_move_items`, and `native_dimension` for a
+//! machine's tick, in `machines/native_items.rs`).
+//!
+//! API 47 adds entities joining a level (`native_entity_join_level`), for
+//! item entities and experience orbs so far.
+//!
+//! API 46 adds bounded world-space rim and colored-light requests
+//! (`native_visuals`) and opt-in texture-matched emissive material
+//! requests (`native_emissive`).
+//!
+//! API 45 sends mod block entities to clients (`native_block_entity_update_tag`).
+//!
+//! API 44 adds the server starting and stopping (`native_server_about_to_start`,
+//! `native_server_stopping`).
+//!
+//! API 43 adds the server level's random (`native_level_random`).
+//!
+//! API 42 adds the item entities near a block (`native_item_entities`,
+//! `native_set_item_entity`).
+//!
+//! API 41 adds bundles' data files: `horizon_client::native_data!` compiles a file of a
+//! bundle's `data/` folder in, and `native_built_data` is the folder its post-build step wrote.
+//!
+//! API 40 adds mod messages between a mod's server and client halves
+//! (`native_net_from_client`, `native_net_from_server`, and
+//! `native_net_send_to_player`, `native_net_send_to_server` in
+//! `native_net.rs`), and hearing players and mobs: `native_player_died`,
+//! `native_mob_spawned`, `native_mob_killed`, `native_item_dropped`,
+//! `native_item_picked_up`.
+//!
+//! API 39 adds item behaviour: a held item's hit on a mob
+//! (`native_hurt_enemy`), a carried stack's tick (`native_inventory_tick`) and
+//! an equipment slot taking a different item (`native_on_equip`).
+//!
+//! API 38 adds redstone from a mod's block (`native_block_signal`,
+//! `native_is_signal_source`, and the helper `native_update_signal_neighbors`).
+//!
+//! API 37 adds mobs for server mods (`native_spawn_mob`, `native_mob`,
+//! `native_mobs`, `native_teleport_mob`, `native_push_mob`,
+//! `native_set_mob_health`, `native_kill_mob`, `native_remove_mob`... in
+//! `native_mobs.rs`).
+//!
+//! API 36 adds recipes of a mod's own types (`native_recipes_of_type`,
+//! `native_recipe_ingredient`, `native_recipe_result`).
+//!
+//! API 35 adds the commands a mod owns on the client (`native_commands`), so
+//! that the chat box colours, completes and lists them like the game's own.
+//!
+//! API 34 adds scheduled block ticks a mod can handle (`native_tick_block`).
+//!
+//! API 33 adds random ticks a mod can handle (`native_random_tick`), and
+//! `native_set_block_property` on the level, which takes `Level.setBlock`'s
+//! `flags` as `Game::native_set_block_property_with` does.
+//!
+//! API 32 adds shape updates a mod can answer (`native_update_shape`), and
+//! `native_schedule_block_tick` and `native_schedule_fluid_tick` on the
+//! level for the ticks a block's shape update schedules.
+//!
+//! API 31 adds a player's server tick (`native_player_tick`).
+//!
+//! API 30 adds left-clicking a block (`native_left_click_block`).
+//!
+//! API 29 adds right-clicking an entity (`native_interact_entity`).
+//!
+//! API 28 adds block and item tag reads for server tick hooks (`native_block_in_tag`,
+//! `native_item_in_tag`). API @API:server_tag_reads@ adds context-free tag reads for any server hook.
+//!
 //! API 27 adds the player-health HUD rows (`native_health_hud`).
 //!
 //! API 26 adds the game's shared config folder (`native_config_dir`).
@@ -103,24 +222,33 @@ use super::{
     native_server::{NativeCommand, NativeServerPlayer},
 };
 use horizon_client::{
+    atlas_sources::qualified,
     block_entities::Pos,
     chat::ChatSource,
-    containers::{BlockEntity, MOD_MENUS, ModBlockEntity, ModContainer},
+    containers::{BlockEntity, MOD_MENUS, ModBlockEntity, ModContainer, ModFluidTanks},
+    crafting::{CustomRecipe, Ingredient, recipe_result},
     extras::Corner,
     extras_hud::Corners,
     fast_hash::FxHashMap,
+    health::{HurtSource, Hurting},
     hud::{HudBatch, rgba},
     items::ItemStack,
     keybinds,
+    mobs::{Damage, Who},
     mod_list::{self, Installed, NativePage},
     particles::{ParticleOptions, ParticleType},
     text::Text,
 };
-use horizon_core::{geometry::Direction, position::BlockPos};
+use horizon_core::{
+    geometry::Direction,
+    position::BlockPos,
+    ticks::{ScheduleResult, TickPriority},
+};
 use horizon_world::{
-    level::{BlockId, flags},
+    fluid::FluidKind,
+    level::{BlockId, LevelAccess, Ticks},
     nbt::Compound,
-    registry::BlockStateId,
+    registry::{BlockRegistry, BlockStateId},
 };
 use std::{
     fs,
@@ -130,10 +258,17 @@ use std::{
 };
 use winit::{event::MouseButton, keyboard::KeyCode};
 
+/// `Level.setBlock`'s flags, for the `native_set_block_property` helpers:
+/// `flags::UPDATE_CLIENTS` as a vanilla crop grows, `flags::UPDATE_ALL` as a
+/// furnace sets its `lit`. Horizon sends every write to players, so
+/// `UPDATE_CLIENTS`, `UPDATE_INVISIBLE` and `UPDATE_IMMEDIATE` change nothing
+/// yet.
+pub(super) use horizon_world::level::flags;
+
 /// The hook points' API version. The launcher reads this line from the
 /// source it builds; keep its form.
 #[allow(dead_code)]
-pub(crate) const NATIVE_HOOKS_API: u32 = 27;
+pub(crate) const NATIVE_HOOKS_API: u32 = 62;
 
 impl GameLevel<'_> {
     /// An authoritative server committed a changed state through `Level.setBlock`.
@@ -199,6 +334,162 @@ impl GameLevel<'_> {
     ) {
         let _ = (dimension, piston, direction, push, destroy, canceled);
     }
+    /// The redstone signal the block `state` at `pos` gives on its `face`, the
+    /// side that touches the block reading it: `BlockState.getDirectSignal`
+    /// when `direct` (what passes through a block it touches, as a lever's
+    /// does), else `getSignal`. `signal` holds vanilla's answer: change it when
+    /// the block is yours (0 to 15; anything else is clamped). Asked very often,
+    /// from inside the level's update, so answer from your own state: check the
+    /// block first, and don't read or change the world here. When the answer
+    /// changes, and once the block is placed, call
+    /// `native_update_signal_neighbors`. Authoritative servers only. API 38.
+    #[inline(always)]
+    pub(super) fn native_block_signal(
+        &self,
+        dimension: LevelDimension,
+        pos: BlockPos,
+        state: BlockStateId,
+        face: Direction,
+        direct: bool,
+        signal: &mut i32,
+    ) {
+        let _ = (dimension, pos, state, face, direct, signal);
+    }
+
+    /// `BlockState.isSignalSource`: set `source` for a block of yours that
+    /// gives a signal, so redstone wire beside it connects to it. Authoritative
+    /// servers only. API 38.
+    #[inline(always)]
+    pub(super) fn native_is_signal_source(&self, state: BlockStateId, source: &mut bool) {
+        let _ = (state, source);
+    }
+
+    /// `BlockState.hasAnalogOutputSignal`: set `output` for a block of yours
+    /// that comparators read (how full or far along it is, as a composter's
+    /// level), so they ask `native_analog_output`. Asked from inside the
+    /// level's update: answer from `state` alone. Authoritative servers only.
+    /// API @API:analog_output@.
+    #[inline(always)]
+    pub(super) fn native_has_analog_output(&self, state: BlockStateId, output: &mut bool) {
+        let _ = (state, output);
+    }
+
+    /// `BlockState.getAnalogOutputSignal`: the signal a comparator reads from
+    /// the block `state` at `pos`, `face` the side that touches the comparator
+    /// (or the conductor in front of it). `output` holds vanilla's answer:
+    /// change it when the block is yours (0 to 15; anything else is clamped).
+    /// Asked only for blocks `native_has_analog_output` answered for, from
+    /// inside the level's update: don't change the world here. When the
+    /// answer changes without the block's state changing, call
+    /// `native_update_output_neighbors`; a change of state through
+    /// `native_set_block` or `native_set_block_property` (neighbour updates
+    /// on) tells the comparators itself, as vanilla's `Level.setBlock` does.
+    /// Authoritative servers only. API @API:analog_output@.
+    #[inline(always)]
+    pub(super) fn native_analog_output(
+        &self,
+        dimension: LevelDimension,
+        pos: BlockPos,
+        state: BlockStateId,
+        face: Direction,
+        output: &mut i32,
+    ) {
+        let _ = (dimension, pos, state, face, output);
+    }
+
+    /// An authoritative server's `ServerLevel.tickChunk` is about to
+    /// random-tick the block `state` at `pos` (`BlockState.randomTick`):
+    /// only blocks that tick randomly, a mod's as its vanilla template block
+    /// does. Bone meal's random ticks (`StemBlock.performBonemeal`) don't
+    /// fire it. Change the block with `native_set_block_property` and set
+    /// `handled` to skip the block's own random tick (a mod crop growing its
+    /// own way); a block changed without `handled` takes its own random tick
+    /// as it is now, if it still ticks randomly. Lava's fluid random tick
+    /// runs either way.
+    #[inline(always)]
+    pub(super) fn native_random_tick(
+        &mut self,
+        ticks: &mut Ticks,
+        dimension: LevelDimension,
+        pos: BlockPos,
+        state: BlockStateId,
+        handled: &mut bool,
+    ) {
+        let _ = (ticks, dimension, pos, state, handled);
+    }
+
+    /// An authoritative server is about to compute the state the block
+    /// `state` at `pos` takes now that its neighbour in `direction` is
+    /// `neighbour` (`BlockBehaviour.updateShape`). `state` may not be in the
+    /// world yet (a piston landing it): decide from `state`, not from the
+    /// block at `pos`. Answer only for your own blocks: put the new state in
+    /// `new` (`state` keeps the block as it is; air breaks it, with its drops,
+    /// on a neighbour update) and the block's own `updateShape` doesn't run,
+    /// nor the ticks it would schedule. The level is read-only, as vanilla's
+    /// `LevelReader`; ticks go through `native_schedule_block_tick` and
+    /// `native_schedule_fluid_tick` with `ticks` (`ScheduledTickAccess`). It
+    /// runs often, at least six times per `setBlock` that updates shapes
+    /// (more for redstone wire's diagonals and knock-on updates): keep it
+    /// short.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn native_update_shape(
+        &self,
+        ticks: &mut Ticks,
+        dimension: LevelDimension,
+        pos: BlockPos,
+        state: BlockStateId,
+        direction: Direction,
+        neighbour_pos: BlockPos,
+        neighbour: BlockStateId,
+        new: &mut Option<BlockStateId>,
+    ) {
+        let _ = (
+            ticks,
+            dimension,
+            pos,
+            state,
+            direction,
+            neighbour_pos,
+            neighbour,
+            new,
+        );
+    }
+
+    /// An authoritative server's `ServerLevel.tickBlock` is about to run a
+    /// due scheduled tick of the block `state` at `pos` (`BlockState.tick`):
+    /// the block is still the one the tick was scheduled for. Change the
+    /// block with `native_set_block_property` and set `handled` to skip the
+    /// block's own tick; a block changed without `handled` takes its own
+    /// tick as it is now, if it is still the tick's block.
+    #[inline(always)]
+    pub(super) fn native_tick_block(
+        &mut self,
+        ticks: &mut Ticks,
+        dimension: LevelDimension,
+        pos: BlockPos,
+        state: BlockStateId,
+        handled: &mut bool,
+    ) {
+        let _ = (ticks, dimension, pos, state, handled);
+    }
+}
+
+/// A depth-tested outline of the client's block selection shape.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NativeBlockRim {
+    pub(crate) pos: [i32; 3],
+    pub(crate) argb: u32,
+    pub(crate) width: f32,
+}
+
+/// A camera-local visual light, with no gameplay light or shadow writes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NativeColoredLight {
+    pub(crate) at: [f64; 3],
+    pub(crate) rgb: u32,
+    pub(crate) radius: f32,
+    pub(crate) intensity: f32,
 }
 
 /// The zoom a native mod asks for (`native_zoom`): the factor (1 is none),
@@ -482,6 +773,21 @@ impl Game<'_> {
     /// and on servers), and the server's own (`native_window` is false
     /// there: the single player server thread, a dedicated server).
     pub(super) fn native_tick(&mut self) {}
+    /// The world frame's local visual sources. Push requests; Horizon validates
+    /// and limits them before rendering. Called only while a world is visible.
+    pub(super) fn native_visuals(
+        &self,
+        rims: &mut Vec<NativeBlockRim>,
+        lights: &mut Vec<NativeColoredLight>,
+    ) {
+        let _ = (rims, lights);
+    }
+    /// At most 32 pairs of already-loaded base and transparent overlay sprites.
+    /// Per-pixel alpha in the overlay marks full-bright material, without
+    /// illuminating the surrounding block or changing gameplay light.
+    pub(super) fn native_emissive(&self, layers: &mut Vec<(&'static str, &'static str)>) {
+        let _ = layers;
+    }
     /// The world's phases, read-only; `error_text` carries the engine's
     /// own open-failure text, empty otherwise. Server-side; the deprecated
     /// in-frame path delivers no lifecycle events. A server loop or final
@@ -493,6 +799,26 @@ impl Game<'_> {
         error_text: &str,
     ) {
         let _ = (context, phase, error_text);
+    }
+    /// The server is about to open its worlds: nothing of the world is
+    /// loaded yet (NeoForge's `ServerAboutToStartEvent`, "called before the
+    /// server begins loading anything"). Vanilla's `MinecraftServer.loadLevel`
+    /// start. Server-side: the single player server thread once Play is
+    /// pressed, a dedicated server once its settings are read. Each is
+    /// followed by `native_world_lifecycle`'s `WorldOpenReady` or
+    /// `WorldOpenFailed`. `dedicated` tells a dedicated server from the single
+    /// player one. API 44.
+    pub(super) fn native_server_about_to_start(&mut self, dedicated: bool) {
+        let _ = dedicated;
+    }
+    /// The server begins an orderly stop (NeoForge's `ServerStoppingEvent`):
+    /// the start of vanilla's `MinecraftServer.stopServer`, with the worlds
+    /// still loaded and the players still connected and not yet saved, so a
+    /// mod can save its own data or tell them. `native_world_lifecycle`'s
+    /// `WorldCloseFinal` follows once the worlds are saved. A server whose loop
+    /// fails stops without this (`WorldCloseFailed` reports it). API 44.
+    pub(super) fn native_server_stopping(&mut self, dedicated: bool) {
+        let _ = dedicated;
     }
     /// The authoritative server tick's phases: `ServerTickStart` before any
     /// level is ticked (NeoForge's `ServerTickEvent.Pre`), `ServerTickEnd`
@@ -522,6 +848,45 @@ impl Game<'_> {
     pub(super) fn native_hud(&mut self, batch: &mut HudBatch, corners: &mut Corners) {
         let _ = (batch, corners);
     }
+    /// A player right-clicks the entity `entity` (`Entity.getId`) of type
+    /// `kind` (`minecraft:cow`) with `self.hand`, holding `stack` (none in an
+    /// empty hand): where `Player.interactOn` starts, before the entity's own
+    /// `interact` and the item's `interactLivingEntity`. Set `claimed` to take
+    /// the click: the hand swings and neither runs. Asked once per hand, as
+    /// vanilla tries the main hand then the off hand. Server-side, for every
+    /// player of the world (the helpers read the acting one). API 29.
+    pub(super) fn native_interact_entity(
+        &mut self,
+        entity: i32,
+        kind: &str,
+        stack: Option<&ItemStack>,
+        claimed: &mut bool,
+    ) {
+        let _ = (entity, kind, stack, claimed);
+    }
+    /// A player left-clicks the block `state` at `pos`, `face` the face hit
+    /// (`[0, 1, 0]` is the top): where `ServerPlayerGameMode.handleBlockBreakAction`
+    /// takes a dig's start, after its reach, spawn protection and world border
+    /// checks, before `Block.attack` (a note block plays) or a creative break.
+    /// Set `canceled` to ignore the click: the block isn't attacked, dug or
+    /// broken on the server, and the player's client gets it back (its own
+    /// predicted crack still shows to the clicking player). Server-side, for
+    /// every player of the world (the helpers read the acting one). API 30.
+    pub(super) fn native_left_click_block(
+        &mut self,
+        pos: [i32; 3],
+        face: [i32; 3],
+        state: BlockStateId,
+        canceled: &mut bool,
+    ) {
+        let _ = (pos, face, state, canceled);
+    }
+    /// A living player's server tick ends (`ServerPlayer.tick`): once a tick
+    /// for every player in the world, after their digging, item use,
+    /// cooldowns, statistics and advancements. The helpers read that player.
+    /// Players still tick under `/tick freeze`; a dead player doesn't, nor
+    /// does one killed earlier in the same tick. API 31.
+    pub(super) fn native_player_tick(&mut self) {}
     /// The player-health HUD rows, once a frame the HUD draws them
     /// (`HealthHud::layout`, not under F1): `inputs` carries the health,
     /// food, air and vehicle state the layout reads, `wi`/`hi` the screen's
@@ -552,6 +917,14 @@ impl Game<'_> {
     /// server and Horizon's commands see it: set `ran` when the mod ran it.
     pub(super) fn native_command(&mut self, command: &str, ran: &mut bool) {
         let _ = (command, ran);
+    }
+    /// The commands `native_command` runs, by name and without their slash:
+    /// push the ones that are yours. Asked when a connection starts and
+    /// again when the server sends its own tree, so the chat box colours,
+    /// completes and lists them as the game's own; a name the game already
+    /// has keeps that command's behaviour. API 35.
+    pub(super) fn native_commands(&mut self, commands: &mut Vec<&'static str>) {
+        let _ = commands;
     }
     /// The zoom a native mod asks for, applied while playing (the spyglass's
     /// own view wins): set `zoom` when it is none yet.
@@ -585,7 +958,7 @@ impl Game<'_> {
     /// (`EntityBlock.newBlockEntity`): set `entity` to its id and saved
     /// compound when the block is yours and `entity` is none yet. The block's
     /// template must have a block entity (a chest, a furnace...), so that
-    /// breaking the block removes it. API 15.
+    /// breaking the block removes it; on another template it gets none. API 15.
     pub(super) fn native_block_entity(
         &mut self,
         block: &str,
@@ -613,6 +986,21 @@ impl Game<'_> {
     ) {
         let _ = (block, container);
     }
+    /// Block `block`'s block entity has fluid tanks: set `fluids` when the
+    /// block is yours, in the container's shape — each tank's capacity in
+    /// millibuckets, the tanks each face reaches, and the tanks a fill may
+    /// reach and a drain may take. Asked once for each mod block when the
+    /// ticking table is built; at most 16 tanks, capacities clamped to
+    /// 1..=1 000 000, and tank numbers past the count are left out. The tanks'
+    /// contents are kept in the entity's saved compound, under `fluids`, and
+    /// the fluid helpers below read and write them. API 54.
+    pub(super) fn native_block_entity_fluids(
+        &self,
+        block: &str,
+        fluids: &mut Option<ModFluidTanks>,
+    ) {
+        let _ = (block, fluids);
+    }
     /// A server tick of the block entity at `pos`, in vanilla's order among
     /// the others (`Level.tickBlockEntities`), when its `id` is yours: read
     /// and change its saved compound `nbt`, its item slots `items` (keep
@@ -620,10 +1008,25 @@ impl Game<'_> {
     /// data slots its menu shows (`data`). It is out of the world during the
     /// call (the block entity at `pos` reads as a `Mod` with an empty id, and
     /// a save leaves it out); if the call removes or replaces it, `entity` is
-    /// dropped. Clients, the window's own in single player included, don't
-    /// get it yet. API 17.
+    /// dropped. Clients, the window's own in single player included, get
+    /// what `native_block_entity_update_tag` gives when its chunk is sent or
+    /// its block changes. API 17.
     pub(super) fn native_block_entity_tick(&mut self, pos: [i32; 3], entity: &mut ModBlockEntity) {
         let _ = (pos, entity);
+    }
+    /// What clients get of the block entity at `pos` when its `id` is
+    /// yours (`BlockEntity.getUpdateTag`): set `tag` to it, read from
+    /// `entity` alone. Asked on the server whenever a chunk holding it is
+    /// sent and whenever its block changes, on the server thread or, for a
+    /// saved chunk sent past the view distance (`lan::far`), another one; a client's copy of the block
+    /// entity (made by `native_block_entity` there) merges it into its `nbt`.
+    /// Leave it unset to send nothing. API 45.
+    pub(super) fn native_block_entity_update_tag(
+        pos: [i32; 3],
+        entity: &ModBlockEntity,
+        tag: &mut Option<Compound>,
+    ) {
+        let _ = (pos, entity, tag);
     }
     /// A menu opens on this client for block `block`, a mod's: set `screen`
     /// when the block is yours, to lay its screen out (`native_screen_draw`
@@ -687,6 +1090,20 @@ impl Game<'_> {
     ) {
         let _ = (pos, entity, id);
     }
+    /// `AbstractContainerMenu.clickMenuButton(Player, int)`'s other half:
+    /// the acting player's cursor stack, `getCarried()`/`setCarried()`,
+    /// which `native_menu_button` cannot reach. Fires right after it, same
+    /// moment, same `pos`/`entity`/`id`; change `carried` when its id is
+    /// yours. On the server. API 51.
+    pub(super) fn native_menu_button_v2(
+        &mut self,
+        pos: [i32; 3],
+        entity: &mut ModBlockEntity,
+        id: i32,
+        carried: &mut Option<ItemStack>,
+    ) {
+        let _ = (pos, entity, id, carried);
+    }
     /// The commands native mods add to the server's command tree: push
     /// yours. Asked once when a world opens to players (a dedicated
     /// server, a LAN host, single player's server thread); every player's
@@ -738,6 +1155,14 @@ impl Game<'_> {
     /// hides. API 12.
     pub(super) fn native_tooltip(&self, stack: &ItemStack, lines: &mut Vec<(Text, u32)>) {
         let _ = (stack, lines);
+    }
+    /// The small bar `GuiGraphicsExtractor.itemDecorations` draws under an
+    /// item, wherever the game shows one: `bar` arrives holding vanilla's value
+    /// (the damage bar, or a bundle's fullness already applied) and may be
+    /// replaced (width `0..=13`, colour `rgb`) or set to `None` to hide it.
+    /// Asked each frame a stack is drawn. Client-side. 60.
+    pub(super) fn native_item_bar(&self, stack: &ItemStack, bar: &mut Option<(i32, u32)>) {
+        let _ = (stack, bar);
     }
     /// A player uses `stack` (right click) with `self.hand` on the block at
     /// `pos`, `face` the face clicked (`[0, 1, 0]` is the top), once the
@@ -845,6 +1270,307 @@ impl Game<'_> {
     ) {
         let _ = (entity, kind, pos, canceled);
     }
+    /// A message from `player`'s client on `channel` (`mod_id:name`), within
+    /// the caps (`native_net.rs`): check `channel`, and treat `data` as the
+    /// player's own bytes, checked by nothing. Runs in the tick after it
+    /// arrives, with no player's state swapped in. Server-side. API 40.
+    pub(super) fn native_net_from_client(&mut self, player: u128, channel: &str, data: &[u8]) {
+        let _ = (player, channel, data);
+    }
+    /// A message from the server on `channel` (`mod_id:name`), whose `data`
+    /// is the sender's own bytes. The window's game only. API 40.
+    pub(super) fn native_net_from_server(&mut self, channel: &str, data: &[u8]) {
+        let _ = (channel, data);
+    }
+    /// Chunk `chunk` (`[x, z]`, in chunks) of `dimension` came into the world
+    /// (NeoForge's `ChunkEvent.Load`): `new` when it was just generated, false
+    /// when read from the save. A flat world's chunk that leaves before it's
+    /// first lit isn't saved, so it's generated, and new, again; one generated
+    /// as the players left is new when it next comes, unless the server
+    /// restarts first, or the level closes for being empty, which drops its
+    /// memory of what never saved. Its blocks and block entities are there,
+    /// but its saved entities join afterwards and its light may not be ready:
+    /// change the world from a later tick. The chunks around the spawn come
+    /// before `WorldOpenReady`. Not told of a chunk a client receives.
+    /// Server-side. API 57.
+    pub(super) fn native_chunk_load(&mut self, dimension: &str, chunk: [i32; 2], new: bool) {
+        let _ = (dimension, chunk, new);
+    }
+    /// Chunk `chunk` of `dimension` left the world (NeoForge's
+    /// `ChunkEvent.Unload`), with a level that closes for being empty too. Don't
+    /// read its blocks. Its block entities are still there for this call, so
+    /// `native_with_mod_block_entity` can change one and it's saved with the
+    /// chunk. Not told when the world closes, which `native_world_lifecycle`
+    /// tells. Server-side. API 57.
+    pub(super) fn native_chunk_unload(&mut self, dimension: &str, chunk: [i32; 2]) {
+        let _ = (dimension, chunk);
+    }
+    /// `player` (`name`) joined the game (NeoForge's
+    /// `PlayerLoggedInEvent`): placed in the world and listed in
+    /// `native_server_players`, so `native_net_send_to_player` reaches them.
+    /// Once a join, with no player's state swapped in. Server-side. API 57.
+    pub(super) fn native_player_logged_in(&mut self, player: u128, name: &str) {
+        let _ = (player, name);
+    }
+    /// `player` (`name`) left the game (NeoForge's `PlayerLoggedOutEvent`), by
+    /// any path: a lost connection, a kick, the server stopping or failing.
+    /// Once for each player `native_player_logged_in` told of. They've already
+    /// left `native_server_players`, except when the server stops, which tells
+    /// before it saves, with them still listed and able to get a last message.
+    /// Server-side. API 57.
+    pub(super) fn native_player_logged_out(&mut self, player: u128, name: &str) {
+        let _ = (player, name);
+    }
+    /// `player` died: where `ServerPlayer.die` starts, with the death
+    /// message's key when the game knows it (`death.attack.lava`; none for a
+    /// message it builds from the combat). It only hears. Server-side, for
+    /// every player of the world, whether death messages are shown or not.
+    /// API 40.
+    pub(super) fn native_player_died(&mut self, player: u128, cause: Option<&str>) {
+        let _ = (player, cause);
+    }
+    /// A new mob of `kind` joined `dimension` at `pos`: `natural` when the
+    /// world's spawning made it, false when something else did (a breed, a
+    /// raid, a spawner, a conversion, `/summon`, and the second mob of a
+    /// jockey the world spawned). One call a mob: a `/summon` with passengers
+    /// tells each. Not told of a mob loaded with its chunk, leaving a hive or
+    /// changing level. It only hears; the mob is already among the game's
+    /// mobs. Server-side. API 40.
+    pub(super) fn native_mob_spawned(
+        &mut self,
+        dimension: &str,
+        kind: &str,
+        pos: [f64; 3],
+        natural: bool,
+    ) {
+        let _ = (dimension, kind, pos, natural);
+    }
+    /// An entity leaves the server level `dimension` (NeoForge's
+    /// `EntityLeaveLevelEvent`): vanilla's `onTrackingEnd`, when it is removed
+    /// for any reason (picked up, merged, despawned, burnt, blown up, killed,
+    /// taken by a hopper or a mob, gone through a portal) or its chunk unloads,
+    /// a level closing with nobody in it included. Not for the entities still
+    /// loaded when the server stops, as in vanilla. `entity` is its ID and
+    /// `kind` its type (`minecraft:item`); it is no longer in the level's lists.
+    /// It only hears. 53 tells item entities and experience orbs; later
+    /// APIs add other kinds, so check `kind`. Server-side.
+    pub(super) fn native_entity_leave_level(&mut self, dimension: &str, entity: u32, kind: &str) {
+        let _ = (dimension, entity, kind);
+    }
+    /// An entity joins the server level `dimension` (NeoForge's
+    /// `EntityJoinLevelEvent`): vanilla's `PersistentEntitySectionManager.addEntity`.
+    /// `loaded_from_disk` is true for an entity coming back with its chunk,
+    /// false for one added fresh (`addFreshEntity`: a drop, an orb, `/summon`,
+    /// an arrival through a portal). `entity` is its ID and `kind` its type
+    /// (`minecraft:item`). It is already in the level's lists, so helpers that
+    /// take an entity ID find it. Set `canceled` to keep it out: it is taken
+    /// back out as if never added, and a `/summon` of it fails. 47 tells
+    /// item entities and experience orbs; later APIs add other kinds, so check
+    /// `kind`. Server-side.
+    pub(super) fn native_entity_join_level(
+        &mut self,
+        dimension: &str,
+        entity: u32,
+        kind: &str,
+        pos: [f64; 3],
+        loaded_from_disk: bool,
+        canceled: &mut bool,
+    ) {
+        let _ = (dimension, entity, kind, pos, loaded_from_disk, canceled);
+    }
+    /// `player`'s melee blow killed the mob `entity` of `kind` (other deaths
+    /// aren't told yet). It only hears, after the blow landed. Server-side.
+    /// API 40.
+    pub(super) fn native_mob_killed(&mut self, player: u128, entity: u32, kind: &str) {
+        let _ = (player, entity, kind);
+    }
+    /// `player` threw `count` of `item` (`Player.drop`: the drop key, a
+    /// menu's throw...), not what scatters when they die. It only hears.
+    /// Server-side. API 40.
+    pub(super) fn native_item_dropped(&mut self, player: u128, item: &str, count: u32) {
+        let _ = (player, item, count);
+    }
+    /// `player` is about to take `count` of `item` from the ground
+    /// (`ItemEntity.playerTouch`). Set `canceled` to leave it there: the
+    /// stack isn't offered again for 10 ticks. Server-side. API 40.
+    pub(super) fn native_item_picked_up(
+        &mut self,
+        player: u128,
+        item: &str,
+        count: u32,
+        canceled: &mut bool,
+    ) {
+        let _ = (player, item, count, canceled);
+    }
+    /// A player's hit landed on the mob `entity` of type `kind`
+    /// (`minecraft:zombie`), holding `stack`: where `Item.hurtEnemy` is called,
+    /// before the post-attack enchantments and the weapon's wear. It only
+    /// hears. Another player as the target isn't told yet. Server-side, for
+    /// every player of the world (the helpers read the acting one). API 39.
+    pub(super) fn native_hurt_enemy(&mut self, stack: &ItemStack, entity: u32, kind: &str) {
+        let _ = (stack, entity, kind);
+    }
+    /// A server tick of the stack a player carries in `slot`: where
+    /// `Inventory.tick` calls `Item.inventoryTick`, for every stack, each tick,
+    /// `/tick freeze` included (it stops the world, not the player). `slot` is
+    /// as `Inventory` saves it (0 to 35; the armour 100 feet to 103 head; -106
+    /// the off hand), and `selected` says it is the held slot.
+    /// `native_carried_stack` reads and changes the stack, which stays in its
+    /// slot, so the item helpers see it: a count of 0 empties the slot, and the
+    /// player's client gets the change. This runs often, so check the item
+    /// first. Server-side, for every living player of the world (the helpers
+    /// read the acting one). API 39.
+    pub(super) fn native_inventory_tick(&mut self, slot: i32, selected: bool) {
+        let _ = (slot, selected);
+    }
+    /// A player's equipment slot `slot` (`head`, `chest`, `legs`, `feet`,
+    /// `offhand`, and `mainhand` on a swap of the hands or `/item`) took a different
+    /// item, `new` (none when it was emptied): `LivingEntity.onEquipItem`,
+    /// before the equip sound. It only hears. Never for a spectator.
+    /// Server-side, for every player of the world (the helpers read the
+    /// acting one). API 39.
+    pub(super) fn native_on_equip(&mut self, slot: &str, new: Option<&ItemStack>) {
+        let _ = (slot, new);
+    }
+    /// `MobEffect.shouldApplyEffectTickThisTick` for a content mod's effect
+    /// `effect` (`ruby:bleeding`), each tick a player or a mob has it, in
+    /// `MobEffectInstance.tickServer` before it counts down: `tick_count` is
+    /// the ticks left (the entity's tick count when infinite). Set `apply`
+    /// and `native_apply_effect_tick` follows. Server-side. API 56.
+    pub(super) fn native_should_apply_effect_tick_this_tick(
+        &self,
+        effect: &str,
+        tick_count: i32,
+        amplifier: i32,
+        apply: &mut bool,
+    ) {
+        let _ = (effect, tick_count, amplifier, apply);
+    }
+    /// `MobEffect.applyEffectTick`: the content mod's effect `effect` acts on
+    /// `entity` in `dimension` (`minecraft:overworld`). Clear `keep` and the
+    /// effect ends now, before it counts down. `entity` is a mob's
+    /// `Entity.getId`, None for a player (`native_acting_player` says who).
+    /// It runs inside the entity's tick: a mob's world borrows the game
+    /// there, so the game is read-only, and it does not hold the ticking
+    /// mobs, nor the player's effects. Server-side. API 56.
+    pub(super) fn native_apply_effect_tick(
+        &self,
+        effect: &str,
+        dimension: &str,
+        entity: Option<i32>,
+        amplifier: i32,
+        keep: &mut bool,
+    ) {
+        let _ = (effect, dimension, entity, amplifier, keep);
+    }
+    /// `MobEffect.onEffectAdded`: `LivingEntity.addEffect` gave `entity`
+    /// (as in `native_apply_effect_tick`) the content mod's effect `effect`,
+    /// which it didn't have. Server-side. API 56.
+    pub(super) fn native_on_effect_added(
+        &mut self,
+        effect: &str,
+        entity: Option<i32>,
+        amplifier: i32,
+    ) {
+        let _ = (effect, entity, amplifier);
+    }
+    /// NeoForge's `MobEffectEvent.Added`, vanilla's `MobEffect.onEffectStarted`:
+    /// every `LivingEntity.addEffect` of the content mod's effect `effect`,
+    /// new or not, changed or not, after `native_on_effect_added`.
+    /// Server-side. API 56.
+    pub(super) fn native_mob_effect_added(
+        &mut self,
+        effect: &str,
+        entity: Option<i32>,
+        amplifier: i32,
+    ) {
+        let _ = (effect, entity, amplifier);
+    }
+    /// `LivingEntity.hurtServer`, past its guards (invulnerable, dead, fire
+    /// with fire resistance), is about to hurt entity `entity` of type `kind`
+    /// (`minecraft:zombie`, `minecraft:player`) by `amount` of `damage_type`
+    /// (`minecraft:fall`), from the source's `causing` entity
+    /// (`DamageSource.getEntity`: the shooter of an arrow) and `direct` one
+    /// (`getDirectEntity`: the arrow), 0 for none or not known yet
+    /// (docs/native-mods.md, API 50). Change `amount`, or set `canceled`,
+    /// and nothing of `hurtServer` itself happens (no damage, hurt sound,
+    /// knockback, invulnerable time, statistics or criteria); the caller acts
+    /// as on a refused hit, except that a canceled hit on the ender dragon
+    /// still counts as landed (`EnderDragon.hurt` returns true whatever
+    /// `reallyHurt` did: the arrow is spent, the melee effects run). It runs
+    /// on the thread that ticks the world (the server thread; the window's
+    /// in-frame): state shared with render thread hooks needs synchronising.
+    /// No `self`: the game is in the middle of the hit. API 50.
+    pub(super) fn native_living_incoming_damage(
+        entity: i32,
+        kind: &str,
+        damage_type: &str,
+        causing: i32,
+        direct: i32,
+        amount: &mut f32,
+        canceled: &mut bool,
+    ) {
+        let _ = (entity, kind, damage_type, causing, direct, amount, canceled);
+    }
+}
+
+/// `native_living_incoming_damage` for the damage code (`health::HURT_SERVER`): whether
+/// it canceled the hit. Its one caller.
+pub(super) fn hurt_server(hurting: Hurting<'_>, amount: &mut f32) -> bool {
+    let (entity, kind, source) = hurt_server_args(hurting);
+    let HurtSource {
+        damage_type,
+        causing,
+        direct,
+    } = source;
+    let mut canceled = false;
+    Game::native_living_incoming_damage(
+        entity,
+        kind,
+        damage_type,
+        causing,
+        direct,
+        amount,
+        &mut canceled,
+    );
+    canceled
+}
+/// `native_living_incoming_damage`'s entity, entity type and source for a hit.
+fn hurt_server_args(hurting: Hurting<'_>) -> (i32, &str, HurtSource<'_>) {
+    match hurting {
+        Hurting::Player(entity, source) => (entity, "minecraft:player", source),
+        Hurting::Mob(mob, damage) => (mob.id as i32, mob.kind.id.as_str(), mob_source(damage)),
+        Hurting::Dragon(entity, source) => (entity, "minecraft:ender_dragon", source),
+    }
+}
+/// A mob's damage as its `DamageSource`: the causing entity is known when it
+/// is a mob, and is the direct one too when it deals the damage itself.
+fn mob_source(damage: &Damage) -> HurtSource<'static> {
+    let causing = match damage.attacker {
+        Some(Who::Mob(id)) => id as i32,
+        _ => 0,
+    };
+    let melee = super::creatures::melee(damage.kind);
+    HurtSource {
+        damage_type: super::creatures::source_damage_type(*damage),
+        causing,
+        direct: if melee { causing } else { 0 },
+    }
+}
+
+/// Whether `id` is a sound event's id, `namespace:path` as `Identifier`
+/// allows: the namespace of `[a-z0-9_.-]`, the path also with `/`.
+fn sound_id(id: &str) -> bool {
+    let Some((namespace, path)) = id.split_once(':') else {
+        return false;
+    };
+    let allowed = |c: char, slash: bool| {
+        c.is_ascii_lowercase() || c.is_ascii_digit() || "_.-".contains(c) || (slash && c == '/')
+    };
+    !namespace.is_empty()
+        && !path.is_empty()
+        && namespace.chars().all(|c| allowed(c, false))
+        && path.chars().all(|c| allowed(c, true))
 }
 
 fn dimension_id(dimension: LevelDimension) -> &'static str {
@@ -858,9 +1584,13 @@ fn dimension_id(dimension: LevelDimension) -> &'static str {
 /// Server-level helpers for native mods.
 #[allow(dead_code)]
 impl GameLevel<'_> {
-    /// Play a registered vanilla sound for nearby players in this server level.
-    /// The return value means queued, not heard. Unknown sound events are
-    /// rejected at dispatch when the server registry is available.
+    /// Play a sound event for nearby players in this server level. The return
+    /// value means queued, not heard. A `minecraft:` event must be registered:
+    /// an unknown one is dropped at dispatch. Another namespace's event (a
+    /// mod's, `mymod:machine_hum`) is sent by name, as vanilla sends a sound
+    /// that isn't in its registry (`Holder.direct`, a variable range): players
+    /// hear it if their resources define it (`assets/mymod/sounds.json`, a
+    /// content mod's). API 61.
     pub(super) fn native_play_sound(
         &mut self,
         sound: &str,
@@ -869,7 +1599,7 @@ impl GameLevel<'_> {
         volume: f32,
         pitch: f32,
     ) -> bool {
-        if !self.native_authoritative || !sound.starts_with("minecraft:") {
+        if !self.native_authoritative || !sound_id(sound) {
             return false;
         }
         if source >= horizon_client::settings::SOUND_SOURCES.len() {
@@ -943,12 +1673,128 @@ impl GameLevel<'_> {
             });
         true
     }
+    /// Sets property `key` of the block at `pos` to `value` with
+    /// `Level.setBlock(pos, state, flags)`, from a hook that gets the level's
+    /// `ticks` (`native_random_tick`, `native_tick_block`). A crop's random
+    /// tick grows it with `flags::UPDATE_CLIENTS`: neighbours' shapes update,
+    /// but no neighbour gets `neighborChanged` and comparators aren't told;
+    /// `flags::UPDATE_ALL` does both. Horizon sends every write to players
+    /// whatever the flags: `UPDATE_CLIENTS`, `UPDATE_INVISIBLE` and
+    /// `UPDATE_IMMEDIATE` change nothing yet. Any loaded position, not only
+    /// the hook's; true when the block changed, false off an authoritative
+    /// server, when the block has no such property or value, `pos` is not
+    /// loaded, or the property already has `value` (no write, as
+    /// `Level.setBlock` returns false for an unchanged state). Elsewhere,
+    /// `Game::native_set_block_property_with` does the same. API 33.
+    pub(super) fn native_set_block_property(
+        &mut self,
+        ticks: &mut Ticks,
+        pos: [i32; 3],
+        key: &str,
+        value: &str,
+        flags: i32,
+    ) -> bool {
+        if !self.native_authoritative {
+            return false;
+        }
+        let at = BlockPos::new(pos[0], pos[1], pos[2]);
+        let state = self.block_state(at);
+        let Some(id) = property_change(self.registry, state, key, value) else {
+            return false;
+        };
+        let b = self.behaviours;
+        b.set_block(self, ticks, at, id, flags)
+    }
+    /// Schedules a tick of `block` (a block name) at `pos` in `delay` game
+    /// ticks, as a falling block's shape update schedules its fall
+    /// (`ScheduledTickAccess.scheduleTick(pos, block, delay)`, normal
+    /// priority); false for an unknown block or a position that isn't
+    /// loaded. A tick of that block already queued there is kept and counts
+    /// as scheduled. `ticks` is the hook's. API 32.
+    pub(super) fn native_schedule_block_tick(
+        &self,
+        ticks: &mut Ticks,
+        pos: [i32; 3],
+        block: &str,
+        delay: i32,
+    ) -> bool {
+        let Some(state) = self.registry.default_state(block) else {
+            return false;
+        };
+        let at = BlockPos::new(pos[0], pos[1], pos[2]);
+        let block = self.behaviours.block(state);
+        let time = self.game_time();
+        ticks.schedule_block(time, at, block, delay, TickPriority::Normal)
+            != ScheduleResult::MissingChunk
+    }
+    /// Schedules a tick of `fluid` (`minecraft:water`, `minecraft:lava`,
+    /// `minecraft:flowing_water`...) at `pos` in `delay` game ticks, as a
+    /// waterlogged block's shape update schedules its water in 5
+    /// (`ScheduledTickAccess.scheduleTick(pos, fluid, delay)`); false for
+    /// an unknown fluid or a position that isn't loaded. A tick of that
+    /// fluid already queued there is kept and counts as scheduled. `ticks` is
+    /// the hook's. API 32.
+    pub(super) fn native_schedule_fluid_tick(
+        &self,
+        ticks: &mut Ticks,
+        pos: [i32; 3],
+        fluid: &str,
+        delay: i32,
+    ) -> bool {
+        let Some(kind) = FluidKind::from_name(fluid) else {
+            return false;
+        };
+        let at = BlockPos::new(pos[0], pos[1], pos[2]);
+        let time = self.game_time();
+        ticks.schedule_fluid(time, at, kind, delay) != ScheduleResult::MissingChunk
+    }
 }
 
 /// Helpers for native mods, kept as stable as the hook points.
 // Native mods use these; nothing in Horizon does.
 #[allow(dead_code)]
 impl Game<'_> {
+    /// Read a loaded, light-emitting block. No implicit chunk loading.
+    pub(super) fn native_lit_block_name(&self, pos: [i32; 3]) -> Option<&str> {
+        self.world
+            .chunks
+            .contains_key(&(pos[0].div_euclid(16), pos[2].div_euclid(16)))
+            .then(|| {
+                self.res
+                    .facts()
+                    .get(self.world.block(pos[0], pos[1], pos[2]))
+            })
+            .filter(|f| f.emission > 0)
+            .map(|f| f.name.as_ref())
+    }
+    /// A small local vanilla particle; caller should rate-limit emission.
+    pub(super) fn native_flame_particle(&mut self, at: [f64; 3], soul: bool) {
+        use horizon_client::particles::{ParticleOptions, ParticleType};
+        if !self.native_window() || at.iter().any(|v| !v.is_finite()) {
+            return;
+        }
+        let Some(p) = self.native_player() else {
+            return;
+        };
+        if (at[0] - p.x).powi(2) + (at[1] - p.y).powi(2) + (at[2] - p.z).powi(2) > 1024.0 {
+            return;
+        }
+        let kind = if soul {
+            ParticleType::SoulFireFlame
+        } else {
+            ParticleType::Flame
+        };
+        self.particles
+            .add(&ParticleOptions::simple(kind), at, [0.0, 0.01, 0.0]);
+    }
+    /// The stack the acting player carries in `slot`, by
+    /// `native_inventory_tick`'s numbers: none for an empty slot or another
+    /// number. Change it as you like: a count of 0 empties the slot at the end
+    /// of `native_inventory_tick`, and the player's client gets the change.
+    /// API 39.
+    pub(super) fn native_carried_stack(&mut self, slot: i32) -> Option<&mut ItemStack> {
+        self.native_carried_slot(slot)?.as_mut()
+    }
     /// Whether the player left mod `mod_id` on in Options > Mods. A mod
     /// turned off does nothing (check this first in each hook) until the
     /// launcher's next build leaves it out.
@@ -991,32 +1837,178 @@ impl Game<'_> {
         let _ = self.process_level_events();
         changed
     }
+    /// The random of the server level `dimension`: vanilla's `Level.random`
+    /// (`level.getRandom()`), the one its explosions, block drops and other
+    /// level draws use, so a mod's draws move vanilla's later ones as a Java
+    /// mod's do. Draw with `horizon_core::random::RandomSource` (`next_int_bound`,
+    /// `next_float`...). `None` on a client of a server, and for a level not
+    /// open: the Nether and the End open when someone first goes there and
+    /// close after 300 ticks with nobody in them (`close_idle_levels`). API 43.
+    pub(super) fn native_level_random(
+        &mut self,
+        dimension: &str,
+    ) -> Option<&mut horizon_core::random::LegacyRandom> {
+        if self.serving.is_none() && self.options.dedicated.is_none() {
+            return None;
+        }
+        let dim = match dimension {
+            "minecraft:overworld" => super::Dim::Overworld,
+            "minecraft:the_nether" => super::Dim::Nether,
+            "minecraft:the_end" => super::Dim::End,
+            _ => return None,
+        };
+        if dim == self.dim {
+            Some(&mut self.world.random)
+        } else {
+            self.levels
+                .parked_world_mut(dim)
+                .map(|world| &mut world.random)
+        }
+    }
+    /// The item entities of the server level `dimension` whose box meets
+    /// the box `min`..`max`, in the level's order: vanilla's
+    /// `Level.getEntitiesOfClass(ItemEntity.class, box, ENTITY_STILL_ALIVE)`, as a
+    /// hopper's `getItemsAtAndAbove` asks for its block and the one above
+    /// (`[x, y, z]`..`[x + 1, y + 2, z + 1]`). Empty for a level not in place
+    /// (as `native_set_block`) and on a client of a server. API 42.
+    pub(super) fn native_item_entities(
+        &self,
+        dimension: &str,
+        min: [f64; 3],
+        max: [f64; 3],
+    ) -> Vec<NativeItemEntity> {
+        if (self.serving.is_none() && self.options.dedicated.is_none())
+            || dimension != self.dim.id()
+        {
+            return Vec::new();
+        }
+        self.dropped
+            .iter()
+            .filter(|e| e.stack.count > 0 && box_meets(&e.bounds(), min, max))
+            .map(|e| NativeItemEntity {
+                id: e.id,
+                position: [e.position.x, e.position.y, e.position.z],
+                stack: e.stack.clone(),
+                pickup_delay: e.pickup_delay,
+            })
+            .collect()
+    }
+    /// Sets the stack of item entity `id` in the server level `dimension`, as
+    /// a hopper's `addItem` leaves what it couldn't take (`ItemEntity.setItem`);
+    /// an empty stack (count 0) removes the entity (`setItem(EMPTY)`, then
+    /// `discard`). Players see it on their next tracker update. False when the
+    /// level in place has no such item entity, or on a client. API 42.
+    pub(super) fn native_set_item_entity(
+        &mut self,
+        dimension: &str,
+        id: u32,
+        stack: ItemStack,
+    ) -> bool {
+        if (self.serving.is_none() && self.options.dedicated.is_none())
+            || dimension != self.dim.id()
+        {
+            return false;
+        }
+        let Some(i) = self.dropped.iter().position(|e| e.id == id) else {
+            return false;
+        };
+        if stack.count == 0 {
+            self.remove_dropped(i);
+        } else {
+            self.dropped[i].stack = stack;
+        }
+        true
+    }
     /// Sets property `key` of the block at `pos` to `value`, as a furnace's
     /// tick sets its `lit` (`Level.setBlock` with `UPDATE_ALL`: neighbours
-    /// and clients are told); false when the block has no such property or
-    /// value. The block entity stays. API 18.
+    /// and clients are told); true when the block changed, false when the
+    /// block has no such property or value, or the property already has
+    /// `value` (as `Level.setBlock` for an unchanged state). The block
+    /// entity stays. API 18.
     pub(super) fn native_set_block_property(
         &mut self,
         pos: [i32; 3],
         key: &str,
         value: &str,
     ) -> bool {
-        let registry = self.pack.assets.registry;
-        let state = self.world.block(pos[0], pos[1], pos[2]);
-        let Some(mut s) = registry.state(state).cloned() else {
+        self.native_set_block_property_with(pos, key, value, flags::UPDATE_ALL)
+    }
+    /// `native_set_block_property` with `Level.setBlock`'s `flags`, as a
+    /// brewing stand's tick sets its bottles with `flags::UPDATE_CLIENTS`.
+    /// Players get the write whatever the flags (`flags`); false when this
+    /// window isn't a server, and in each case `native_set_block_property`
+    /// returns false. API 33.
+    pub(super) fn native_set_block_property_with(
+        &mut self,
+        pos: [i32; 3],
+        key: &str,
+        value: &str,
+        flags: i32,
+    ) -> bool {
+        // As `native_set_block`: a window that isn't a server holds a copy.
+        if self.serving.is_none() && self.options.dedicated.is_none() {
             return false;
-        };
-        match s.properties.get(key) {
-            Some(v) if v == value => return true,
-            Some(_) => {}
-            None => return false,
         }
-        s.properties.insert(key.into(), value.into());
-        let Ok(id) = registry.resolve(&s) else {
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let Some(id) = property_change(self.pack.assets.registry, state, key, value) else {
             return false;
         };
         let at = BlockPos::new(pos[0], pos[1], pos[2]);
-        self.with_level(|b, level, ticks| b.set_block(level, ticks, at, id, flags::UPDATE_ALL))
+        self.with_level(|b, level, ticks| b.set_block(level, ticks, at, id, flags))
+    }
+    /// The block at `pos` changed its comparator output
+    /// (`native_analog_output`) without changing its state: the comparators
+    /// beside it, or behind a conductor there, read it again
+    /// (`Level.updateNeighbourForOutputSignal`). Acts on the level in place:
+    /// false (and nothing happens) when `dimension` is another, or this
+    /// window isn't a server. API @API:analog_output@.
+    pub(super) fn native_update_output_neighbors(
+        &mut self,
+        dimension: &str,
+        pos: [i32; 3],
+    ) -> bool {
+        if (self.serving.is_none() && self.options.dedicated.is_none())
+            || dimension != self.dim.id()
+        {
+            return false;
+        }
+        let at = BlockPos::new(pos[0], pos[1], pos[2]);
+        self.with_level(|b, level, ticks| b.update_neighbour_for_output_signal(level, ticks, at));
+        true
+    }
+    /// The block at `pos` changed the signal it gives: its neighbours, and
+    /// theirs (a block it powers passes the signal on), read it again, as
+    /// around a lever (`Level.updateNeighborsAt`). Call it when the answer
+    /// changes and once the block is placed. Acts on the level in place:
+    /// false (and nothing happens) when `dimension` is another, or this
+    /// window isn't a server. API 38.
+    pub(super) fn native_update_signal_neighbors(
+        &mut self,
+        dimension: &str,
+        pos: [i32; 3],
+    ) -> bool {
+        if (self.serving.is_none() && self.options.dedicated.is_none())
+            || dimension != self.dim.id()
+        {
+            return false;
+        }
+        let at = BlockPos::new(pos[0], pos[1], pos[2]);
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        self.with_level(|b, level, ticks| {
+            let block = b.block(state);
+            b.update_neighbors_at(level, ticks, at, block);
+            for [x, y, z] in [
+                [0, -1, 0],
+                [0, 1, 0],
+                [0, 0, -1],
+                [0, 0, 1],
+                [-1, 0, 0],
+                [1, 0, 0],
+            ] {
+                b.update_neighbors_at(level, ticks, at.offset(x, y, z), block);
+            }
+        });
+        true
     }
     /// Runs `change` on the mod block entity at `pos` (a generator charging
     /// the machine beside it) and returns what it returns; none for any
@@ -1043,6 +2035,23 @@ impl Game<'_> {
             self.container_changed(key);
         }
         Some(out)
+    }
+    /// Sends clients the block at `pos` and its block entity's update tag
+    /// (`native_block_entity_update_tag`) again, as `Level.sendBlockUpdated`
+    /// does: with the level's other block changes, to the players who see its
+    /// chunk, once however often it is called before then. Changes made in a
+    /// block entity's tick go out at the start of the next tick, as vanilla's
+    /// do (`ServerLevel.tick` broadcasts chunks before it ticks block
+    /// entities). Call it when what clients show changed (a machine started),
+    /// not for every tick's progress: a menu's data slots carry that. Nothing
+    /// happens for an unloaded block. API 52.
+    pub(super) fn native_block_entity_sync(&mut self, pos: [i32; 3]) {
+        if !self.world.loaded(pos[0], pos[2]) {
+            return;
+        }
+        if let Some(log) = self.world.block_log.as_mut() {
+            log.push((pos[0], pos[1], pos[2]));
+        }
     }
     /// Playing, with nothing over the world: keys and zoom apply.
     pub(super) fn native_playing(&self) -> bool {
@@ -1146,15 +2155,16 @@ impl Game<'_> {
             .cloned()
     }
     /// Puts `stack` into the container at `pos` (a chest, a furnace, a mod
-    /// container) through its side `face`, as a hopper would, and returns
-    /// what did not fit: a machine's auto-output. API 20.
+    /// container) through its side `face`, as a hopper would, one by one, and
+    /// returns what did not fit: a machine's auto-output. A composter takes
+    /// one a call, and a client's copy of the world none. API 20.
     pub(super) fn native_insert_item(
         &mut self,
         pos: [i32; 3],
         face: Direction,
         stack: ItemStack,
     ) -> Option<ItemStack> {
-        self.insert_into_container((pos[0], pos[1], pos[2]), stack, face)
+        self.insert_stack_through(pos, face, stack)
     }
     /// Where the mouse is, in GUI pixels. API 20.
     pub(super) fn native_cursor(&self) -> [f32; 2] {
@@ -1239,6 +2249,12 @@ impl Game<'_> {
         let mods = Self::options_path().with_file_name(mod_list::DIR);
         mods.join(".horizon-mod-data").join(mod_id)
     }
+    /// The folder mod `mod_id`'s post-build step wrote into when the launcher built the game
+    /// (`native-data/<id>/` in the build's version folder); None when the game's own path is
+    /// unknown. API 41.
+    pub(super) fn native_built_data(&self, mod_id: &str) -> Option<PathBuf> {
+        horizon_client::native_data::built(mod_id)
+    }
     /// A mod's setting `key` (one file per key in `native_data_dir`).
     pub(super) fn native_setting(&self, mod_id: &str, key: &str) -> Option<String> {
         let path = self.native_data_dir(mod_id).join(key);
@@ -1283,6 +2299,72 @@ impl Game<'_> {
         let page = RecipePage::new(title, tabs, tab, views);
         self.panel.show_recipes(mod_id, page);
     }
+    /// The recipes of type `kind` (`mymod:crusher`), a type outside `minecraft`,
+    /// from `data/<namespace>/recipe/*.json` of the content mods (`.hmod`) and
+    /// the world's data packs, in file order: each one's id and its file as
+    /// JSON, for the mod to read as it likes. A data pack changes them on
+    /// `/reload`, so look them up again when you need them. Empty for a type
+    /// nobody uses and outside a world. These are the server's table on the
+    /// server thread, a dedicated server or a LAN host; a client, the
+    /// single-player window included, sees only the content mods' recipes, not
+    /// the world's data packs'. API 36.
+    pub(super) fn native_recipes_of_type(&self, kind: &str) -> &[CustomRecipe] {
+        if self.outside_world() {
+            return &[];
+        }
+        self.recipes().custom.get(kind).map_or(&[], Vec::as_slice)
+    }
+    /// An ingredient as a recipe's JSON names it: an item, a `#tag`, or a list
+    /// of them, a bare id as `minecraft:` (as vanilla reads it); `test` says
+    /// whether a stack fits. Items the game doesn't know are left out; None
+    /// when nothing is left (an unknown or empty tag, for one) and outside a
+    /// world. API 36.
+    pub(super) fn native_recipe_ingredient(&self, json: &serde_json::Value) -> Option<Ingredient> {
+        if self.outside_world() {
+            return None;
+        }
+        let qualify = |s: &str| match s.strip_prefix('#') {
+            Some(tag) => String::from("#") + &qualified(tag),
+            None => qualified(s),
+        };
+        let json = match json {
+            serde_json::Value::String(s) => serde_json::Value::String(qualify(s)),
+            serde_json::Value::Array(a) => serde_json::Value::Array(
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(|s| serde_json::Value::String(qualify(s)))
+                    .collect(),
+            ),
+            _ => return None,
+        };
+        let items = self.items();
+        let known: Vec<String> = Ingredient::parse(&json, items)?
+            .1
+            .into_iter()
+            .filter(|item| items.get(item).is_some())
+            .collect();
+        (!known.is_empty()).then(|| Ingredient::of(known))
+    }
+    /// A stack as a recipe's `result` names it: `id` (a bare one as
+    /// `minecraft:`), `count` (1 by default, up to 99) and `components`. None
+    /// without an `id`, for an item the game doesn't know or a count outside
+    /// that, and outside a world. API 36.
+    pub(super) fn native_recipe_result(&self, json: &serde_json::Value) -> Option<ItemStack> {
+        if self.outside_world() {
+            return None;
+        }
+        let mut json = json.clone();
+        if let Some(id) = json["id"].as_str() {
+            json["id"] = qualified(id).into();
+        }
+        recipe_result(&json).filter(|s| self.items().get(&s.item).is_some())
+    }
+    /// No world is open: a client without a player (the title screen). A
+    /// server's `Game` (the server thread, a dedicated server, a LAN host)
+    /// has no player of its own, and is always in its world.
+    fn outside_world(&self) -> bool {
+        self.player.is_none() && self.options.execution_role.is_client()
+    }
     /// Every item and recipe the game knows, made once (the same for every
     /// call); none outside a world. They are the window's own: the world's
     /// in single player, vanilla's on a server, which sends a client no
@@ -1316,8 +2398,197 @@ impl Game<'_> {
     }
 }
 
+/// A mob's kind as the hook points name it (`minecraft:zombie`).
+pub(super) fn mob_kind(mob: &horizon_client::mobs::Mob) -> String {
+    ["minecraft:", mob.kind.id.trim_start_matches("minecraft:")].concat()
+}
+
 /// Where the game calls the hook points.
 impl Game<'_> {
+    /// The acting player as the hook points name one: the guest whose turn
+    /// it is, else the host.
+    pub(super) fn native_acting_id(&mut self) -> u128 {
+        horizon_client::lan::playerdata::ints_uuid(self.acting_player_uuid())
+    }
+    /// Whether a native mod keeps the acting player from taking `stack`.
+    pub(super) fn native_pickup_refused(&mut self, stack: &ItemStack) -> bool {
+        let player = self.native_acting_id();
+        let mut canceled = false;
+        self.native_item_picked_up(player, &stack.item, stack.count, &mut canceled);
+        canceled
+    }
+    /// Tells the mods of the chunks that came and went in this level.
+    pub(super) fn native_chunks_changed(
+        &mut self,
+        unloaded: &[std::sync::Arc<horizon_client::chunk::Chunk>],
+    ) {
+        let loaded = std::mem::take(&mut self.world.loaded_chunks);
+        if self.remote.is_some() {
+            return;
+        }
+        let dimension = self.dim.id();
+        for (x, z, new) in loaded {
+            self.native_chunk_load(dimension, [x, z], new);
+        }
+        for chunk in unloaded {
+            self.native_chunk_unload(dimension, [chunk.x, chunk.z]);
+        }
+    }
+    /// The players still here leave with the server (`PlayerList.removeAll`):
+    /// the mods hear it once, whichever path closes it.
+    pub(super) fn native_players_leaving(&mut self) {
+        let Some(host) = self.lan.as_mut() else {
+            return;
+        };
+        if std::mem::replace(&mut host.players_told_left, true) {
+            return;
+        }
+        let players: Vec<(u128, String)> = host
+            .hub
+            .guests
+            .iter()
+            .filter(|g| g.placed)
+            .map(|g| (g.uuid, g.name.clone()))
+            .collect();
+        for (player, name) in players {
+            self.native_player_logged_out(player, &name);
+        }
+        // No tick follows to send what they said.
+        if let Some(mut host) = self.lan.take() {
+            self.flush_native_net(&mut host);
+            self.lan = Some(host);
+        }
+    }
+    /// The mobs from index `from` on are new in the world.
+    pub(super) fn native_mobs_joined(&mut self, from: usize, natural: bool) {
+        for i in from..self.mobs.len() {
+            let m = &self.mobs[i];
+            let (kind, pos) = (mob_kind(m), [m.position.x, m.position.y, m.position.z]);
+            self.native_mob_spawned(self.dim.id(), &kind, pos, natural);
+        }
+    }
+    /// `native_entity_leave_level` for each of `entities`, of `kind`, gone
+    /// from the level in place. A client of a server tells nothing.
+    pub(super) fn native_entities_left(&mut self, kind: &str, entities: &[u32]) {
+        if self.remote.is_some() {
+            return;
+        }
+        let dimension = self.dim.id();
+        for &entity in entities {
+            self.native_entity_leave_level(dimension, entity, kind);
+        }
+    }
+    /// The IDs of the level's item entities, for `native_items_left_since`
+    /// (none on a client of a server, which tells nothing).
+    pub(super) fn dropped_ids(&self) -> Vec<u32> {
+        if self.remote.is_some() {
+            return Vec::new();
+        }
+        self.dropped.iter().map(|e| e.id).collect()
+    }
+    /// The IDs of the level's experience orbs, for `native_orbs_left_since`.
+    pub(super) fn orb_ids(&self) -> Vec<u32> {
+        if self.remote.is_some() {
+            return Vec::new();
+        }
+        self.orbs.iter().map(|o| o.id).collect()
+    }
+    /// The item entities of `before` gone since have left the level.
+    pub(super) fn native_items_left_since(&mut self, before: &[u32]) {
+        let now: std::collections::HashSet<u32> = self.dropped.iter().map(|e| e.id).collect();
+        let gone: Vec<u32> = before
+            .iter()
+            .copied()
+            .filter(|id| !now.contains(id))
+            .collect();
+        self.native_entities_left("minecraft:item", &gone);
+    }
+    /// The experience orbs of `before` gone since have left the level.
+    pub(super) fn native_orbs_left_since(&mut self, before: &[u32]) {
+        let now: std::collections::HashSet<u32> = self.orbs.iter().map(|o| o.id).collect();
+        let gone: Vec<u32> = before
+            .iter()
+            .copied()
+            .filter(|id| !now.contains(id))
+            .collect();
+        self.native_entities_left("minecraft:experience_orb", &gone);
+    }
+    /// `native_entity_join_level` for `entity`, just put at the end of its
+    /// list: false when a mod canceled, and the caller takes it back out.
+    /// A client of a server tells nothing.
+    pub(super) fn native_entity_joins(
+        &mut self,
+        entity: u32,
+        kind: &str,
+        pos: [f64; 3],
+        loaded_from_disk: bool,
+    ) -> bool {
+        if self.remote.is_some() {
+            return true;
+        }
+        let mut canceled = false;
+        let dimension = self.dim.id();
+        self.native_entity_join_level(
+            dimension,
+            entity,
+            kind,
+            pos,
+            loaded_from_disk,
+            &mut canceled,
+        );
+        if canceled {
+            self.persist.joins_canceled += 1;
+        }
+        !canceled
+    }
+    /// The acting player's blow killed mob `index`.
+    pub(super) fn native_kill_event(&mut self, index: usize) {
+        let (entity, kind) = (self.mobs[index].id, mob_kind(&self.mobs[index]));
+        let player = self.native_acting_id();
+        self.native_mob_killed(player, entity, &kind);
+    }
+    /// The acting player's hit landed on mob `index`, holding `stack`.
+    pub(super) fn native_hurt_enemy_event(&mut self, stack: &ItemStack, index: usize) {
+        let mob = &self.mobs[index];
+        let kind = ["minecraft:", mob.kind.id.trim_start_matches("minecraft:")].concat();
+        self.native_hurt_enemy(stack, mob.id, &kind);
+    }
+    /// `Inventory.tick` for the acting player: each carried stack goes through
+    /// `native_inventory_tick`.
+    pub(super) fn native_inventory_ticks(&mut self) {
+        if self.player.is_none() {
+            return;
+        }
+        for i in 0..self.inventory.len() {
+            self.native_slot_tick(i as i32, i == self.selected);
+        }
+        // Head first here; `Inventory` saves feet as 100 and head as 103.
+        for i in 0..self.armor.len() {
+            self.native_slot_tick(103 - i as i32, false);
+        }
+        self.native_slot_tick(-106, false);
+    }
+    fn native_slot_tick(&mut self, slot: i32, selected: bool) {
+        if self.native_carried_slot(slot).is_none_or(|s| s.is_none()) {
+            return;
+        }
+        self.native_inventory_tick(slot, selected);
+        if let Some(stack) = self.native_carried_slot(slot)
+            && stack.as_ref().is_some_and(|s| s.count == 0)
+        {
+            *stack = None;
+        }
+    }
+    /// The slot a player's carried stack is in, by `native_inventory_tick`'s
+    /// numbers: none for another number.
+    fn native_carried_slot(&mut self, slot: i32) -> Option<&mut Option<ItemStack>> {
+        match slot {
+            0.. if (slot as usize) < self.inventory.len() => self.inventory.get_mut(slot as usize),
+            100..=103 => self.armor.get_mut(103 - slot as usize),
+            -106 => Some(&mut self.offhand),
+            _ => None,
+        }
+    }
     /// `EntityBlock.newBlockEntity` of block `name`: Horizon's own, else a
     /// native mod's.
     pub(super) fn new_block_entity(&mut self, name: &str) -> Option<BlockEntity> {
@@ -1327,6 +2598,12 @@ impl Game<'_> {
         let mut entity = None;
         self.native_block_entity(name, &mut entity);
         let (id, nbt) = entity?;
+        // A template with no block entity (stone) never removes one, so it would stay in the save.
+        let state = self.pack.assets.registry.default_state(name)?;
+        if !self.res.facts().get(state).block_entity {
+            super::mods::warn_no_block_entity(name, &id);
+            return None;
+        }
         Some(BlockEntity::Mod(Box::new(ModBlockEntity {
             id,
             nbt,
@@ -1363,6 +2640,42 @@ impl Game<'_> {
             });
             if let Some(c) = container {
                 out.insert(i, Arc::clone(c));
+            }
+        }
+        out
+    }
+    /// The fluid tanks of the mod blocks' block entities, by block state
+    /// (`native_block_entity_fluids`), checked as the containers are.
+    pub(super) fn native_fluid_tables(&self) -> FxHashMap<u32, Arc<ModFluidTanks>> {
+        let registry = self.pack.assets.registry;
+        let mut by_block: FxHashMap<String, Option<Arc<ModFluidTanks>>> = FxHashMap::default();
+        let mut out = FxHashMap::default();
+        for i in 0..registry.len() as u32 {
+            let Some(state) = registry.state(horizon_world::registry::BlockStateId(i)) else {
+                continue;
+            };
+            if state.name.starts_with("minecraft:") {
+                continue;
+            }
+            let tanks = by_block.entry(state.name.clone()).or_insert_with(|| {
+                let mut fluids = None;
+                self.native_block_entity_fluids(&state.name, &mut fluids);
+                fluids.map(|mut f| {
+                    f.tanks.truncate(16);
+                    // Clamped, not dropped: the face and fill lists name
+                    // tanks by number, which must not shift.
+                    for c in &mut f.tanks {
+                        *c = (*c).clamp(1, 1_000_000);
+                    }
+                    let n = f.tanks.len();
+                    for list in f.faces.iter_mut().chain([&mut f.inputs, &mut f.outputs]) {
+                        list.retain(|&t| t < n);
+                    }
+                    Arc::new(f)
+                })
+            });
+            if let Some(t) = tanks {
+                out.insert(i, Arc::clone(t));
             }
         }
         out
@@ -1422,7 +2735,13 @@ impl Game<'_> {
     }
     /// A menu opened on this client with its slots under `key`, on block
     /// `target`: a mod block's is laid out by its mod (`native_screen`).
-    pub(super) fn open_native_screen(&mut self, key: Pos, target: Option<Pos>, window: i32) {
+    pub(super) fn open_native_screen(
+        &mut self,
+        key: Pos,
+        target: Option<Pos>,
+        window: i32,
+        menu: &str,
+    ) {
         self.mod_screen = None;
         let Some(t) = target else {
             return;
@@ -1434,6 +2753,16 @@ impl Game<'_> {
             .name
             .to_string();
         if block.starts_with("minecraft:") {
+            return;
+        }
+        // Only when this is the menu the clicked block opens: `target` outlives the
+        // use that set it, so another menu opened later (a command's, another
+        // mod's) would otherwise get the last clicked machine's screen. Asked
+        // here, as the window's world has no mod containers.
+        let mut container = None;
+        self.native_block_entity_container(&block, &mut container);
+        let opens = container.and_then(|c| mod_menu(c.menu.as_deref()?).map(|(m, _)| m));
+        if opens != Some(menu) {
             return;
         }
         let mut screen = None;
@@ -1463,6 +2792,12 @@ impl Game<'_> {
         self.mod_screen
             .as_mut()
             .is_some_and(|s| s.set_data(window, id, value))
+    }
+    /// Whether a mod's screen is open for the current menu: it places its own
+    /// container slots and the player's inventory, so the stock layout of the
+    /// vanilla menu underneath stands back (`slot_position`).
+    pub(super) fn native_screen_shown(&self) -> bool {
+        self.shown_native_screen().is_some()
     }
     /// The open mod screen's height.
     pub(super) fn native_screen_height(&self) -> Option<f32> {
@@ -1612,8 +2947,9 @@ impl Game<'_> {
             self.world.modified.insert((pos.0 >> 4, pos.2 >> 4));
         }
     }
-    /// Menu button `id` on the mod container at `pos` (`clickMenuButton`).
-    pub(super) fn mod_menu_button(&mut self, pos: Pos, id: i32) {
+    /// Menu button `id` on the mod container at `pos` (`clickMenuButton`),
+    /// with the acting player's cursor stack (`carried`, read and written).
+    pub(super) fn mod_menu_button(&mut self, pos: Pos, id: i32, carried: &mut Option<ItemStack>) {
         if self.mod_menu_at(pos).is_none() {
             return;
         }
@@ -1626,6 +2962,7 @@ impl Game<'_> {
         let mut taken = std::mem::take(&mut **m);
         let items = taken.items.clone();
         self.native_menu_button([pos.0, pos.1, pos.2], &mut taken, id);
+        self.native_menu_button_v2([pos.0, pos.1, pos.2], &mut taken, id, carried);
         self.put_back_mod_block_entity(pos, taken, &items);
     }
     /// The cursor from the open mod screen's top left, with its block and
@@ -1668,8 +3005,10 @@ impl Game<'_> {
         true
     }
     /// The open mod screen's tooltip under the cursor (`native_screen_tooltip`).
-    pub(super) fn draw_native_screen_tooltip(&self, batch: &mut HudBatch) {
-        if self.carried.is_some() || self.slot_at(batch, self.cursor.0, self.cursor.1).is_some() {
+    pub(super) fn draw_native_screen_tooltip(&mut self, batch: &mut HudBatch) {
+        // Over no item: an empty slot still gets the mod's hint (which fuel it takes).
+        let slot = self.slot_at(batch, self.cursor.0, self.cursor.1);
+        if self.carried.is_some() || slot.is_some_and(|i| self.slot_view(i).is_some()) {
             return;
         }
         let Some((block, data, at)) = self.native_screen_at() else {
@@ -1812,6 +3151,36 @@ fn mod_menu(name: &str) -> Option<(&'static str, usize)> {
     MOD_MENUS.into_iter().find(|(menu, _)| *menu == name)
 }
 
+/// `state` with its property `key` set to `value`; none when the block has
+/// no such property or value.
+fn with_property(
+    registry: &BlockRegistry,
+    state: BlockStateId,
+    key: &str,
+    value: &str,
+) -> Option<BlockStateId> {
+    let mut s = registry.state(state)?.clone();
+    match s.properties.get(key) {
+        Some(v) if v == value => return Some(state),
+        Some(_) => {}
+        None => return None,
+    }
+    s.properties.insert(key.into(), value.into());
+    registry.resolve(&s).ok()
+}
+
+/// The state a mod's property write changes `state` to; none when the block
+/// has no such property or value, or already has it: `LevelChunk.setBlockState`
+/// returns null for the same state, so `Level.setBlock` returns false.
+fn property_change(
+    registry: &BlockRegistry,
+    state: BlockStateId,
+    key: &str,
+    value: &str,
+) -> Option<BlockStateId> {
+    with_property(registry, state, key, value).filter(|&id| id != state)
+}
+
 /// `config/` beside `options`, made when missing.
 fn config_dir(options: &Path) -> Result<PathBuf, String> {
     let dir = options.with_file_name("config");
@@ -1824,8 +3193,107 @@ fn finite(v: f32, lo: f32, hi: f32) -> f32 {
     if v.is_finite() { v.clamp(lo, hi) } else { lo }
 }
 
+/// An item entity as `native_item_entities` lists it. API 42.
+/// Read by mods only.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(super) struct NativeItemEntity {
+    /// The entity's ID, for `native_set_item_entity`.
+    pub id: u32,
+    pub position: [f64; 3],
+    pub stack: ItemStack,
+    /// Ticks before a player may pick it up (`ItemEntity.pickupDelay`);
+    /// hoppers take it whatever this is.
+    pub pickup_delay: u32,
+}
+
+/// `AABB.intersects`: the boxes overlap, touching faces excluded.
+fn box_meets(b: &horizon_core::geometry::Aabb, min: [f64; 3], max: [f64; 3]) -> bool {
+    let (lo, hi) = (b.min_position(), b.max_position());
+    lo.x < max[0]
+        && hi.x > min[0]
+        && lo.y < max[1]
+        && hi.y > min[1]
+        && lo.z < max[2]
+        && hi.z > min[2]
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// `native_play_sound` takes vanilla's and mods' sound ids, nothing else.
+    #[test]
+    fn sound_ids_are_identifiers() {
+        for id in [
+            "minecraft:block.note_block.harp",
+            "mymod:machine/hum",
+            "my_mod.x-1:a",
+        ] {
+            assert!(super::sound_id(id), "{id}");
+        }
+        for id in [
+            "",
+            "hum",
+            ":hum",
+            "mymod:",
+            "MyMod:hum",
+            "mymod:Hum",
+            "my/mod:hum",
+            "a:b c",
+        ] {
+            assert!(!super::sound_id(id), "{id}");
+        }
+    }
+
+    /// A mod's property write: none for a key or value the block lacks, the
+    /// state itself when it already has the value, else the new state.
+    #[test]
+    fn with_property_finds_the_state() {
+        let facts = br#"{"defaults":{"minecraft:air":0,"test:crop":1},"states":[
+            ["air",true,false,"","minecraft:air"],
+            ["crop0",false,false,"",{"id":"test:crop","properties":{"age":"0"}}],
+            ["crop1",false,false,"",{"id":"test:crop","properties":{"age":"1"}}]
+        ]}"#;
+        let registry = horizon_world::registry::BlockRegistry::from_facts_json(&facts[..]).unwrap();
+        use horizon_world::registry::BlockStateId;
+        let (age0, age1) = (BlockStateId(1), BlockStateId(2));
+        assert_eq!(
+            super::with_property(&registry, age0, "age", "0"),
+            Some(age0)
+        );
+        assert_eq!(
+            super::with_property(&registry, age0, "age", "1"),
+            Some(age1)
+        );
+        assert_eq!(super::with_property(&registry, age0, "age", "9"), None);
+        assert_eq!(super::with_property(&registry, age0, "lit", "true"), None);
+        // What both property setters write: nothing (false) when the
+        // property already has the value, as `Level.setBlock`.
+        assert_eq!(super::property_change(&registry, age0, "age", "0"), None);
+        assert_eq!(
+            super::property_change(&registry, age0, "age", "1"),
+            Some(age1)
+        );
+        assert_eq!(super::property_change(&registry, age0, "age", "9"), None);
+        assert_eq!(super::property_change(&registry, age0, "lit", "true"), None);
+    }
+    /// Both property setters return false for a write that changes nothing:
+    /// each goes through `property_change`, none returns true on its own.
+    #[test]
+    fn property_setters_refuse_no_change() {
+        // A Windows checkout has CRLF line ends: the searches below look for "\n".
+        let source = include_str!("native_hooks.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap_or_default();
+        for head in [
+            "    pub(super) fn native_set_block_property(\n        &mut self,\n        ticks:",
+            "    pub(super) fn native_set_block_property_with(",
+        ] {
+            let body = code.split(head).nth(1).expect(head);
+            let body = &body[..body.find("\n    }\n").expect(head)];
+            assert!(body.contains("property_change("), "{head}");
+            assert!(!body.contains("return true"), "{head}");
+        }
+    }
     /// horizon-mixins refuses targets whose body has a `cfg` or a macro:
     /// the hook points and helpers must stay free of both. The launcher
     /// reads the API line as it is.
@@ -1876,7 +3344,22 @@ mod tests {
 
         let catalog: serde_json::Value =
             serde_json::from_str(include_str!("../../../../native-hooks.json")).unwrap();
-        let hooks = catalog["hooks"].as_array().unwrap();
+        let mut hooks = catalog["hooks"].as_array().unwrap().clone();
+        let fragments = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/native-hook-fragments");
+        for entry in std::fs::read_dir(fragments).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let fragment: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                hooks.extend(fragment["hooks"].as_array().unwrap().iter().cloned().map(
+                    |mut hook| {
+                        hook["version"] = 1.into();
+                        hook
+                    },
+                ));
+            }
+        }
         let source = include_str!("native_hooks.rs");
         let section = source
             .split("/// The hook points. Each does nothing in Horizon.")
@@ -1901,6 +3384,12 @@ mod tests {
                     .next()
             })
             .collect();
+        // The renderer's hook points (`horizon_client_render::gfx::native_render`).
+        let render_hooks: BTreeSet<_> =
+            include_str!("../../../horizon-client-render/src/gfx/native_render.rs")
+                .lines()
+                .filter_map(|line| line.strip_prefix("pub fn native_")?.split('(').next())
+                .collect();
         let declared: BTreeSet<_> = section
             .lines()
             .chain(level_section.lines())
@@ -1910,10 +3399,11 @@ mod tests {
                     .split('(')
                     .next()
             })
+            .chain(render_hooks.iter().copied())
             .collect();
         let mut names = BTreeSet::new();
         let mut contracts = BTreeSet::new();
-        for hook in hooks {
+        for hook in &hooks {
             let name = hook["name"].as_str().unwrap();
             let version = hook["version"].as_u64().unwrap();
             assert!(
@@ -1921,17 +3411,51 @@ mod tests {
                 "invalid or duplicate hook: {name} v{version}"
             );
             names.insert(name);
-            let owner = if level_hooks.contains(name) {
-                "GameLevel"
+            let target = if render_hooks.contains(name) {
+                format!("horizon_client_render::gfx::native_render::native_{name}")
+            } else if level_hooks.contains(name) {
+                format!("horizon_client::game::native_hooks::GameLevel<'_>::native_{name}")
             } else {
-                "Game"
+                format!("horizon_client::game::native_hooks::Game<'_>::native_{name}")
             };
-            assert_eq!(
-                hook["target"].as_str().unwrap(),
-                format!("horizon_client::game::native_hooks::{owner}<'_>::native_{name}")
-            );
+            assert_eq!(hook["target"].as_str().unwrap(), target);
         }
         assert_eq!(names, declared);
+    }
+
+    /// The damage hook gets a mob's source from its damage: the causing mob,
+    /// the direct one when it deals the damage itself.
+    #[test]
+    fn the_damage_hook_names_the_source() {
+        use super::{HurtSource, Hurting, hurt_server_args, mob_source};
+        use horizon_client::mobs::{Damage, DamageKind as K, Who};
+        let source = |kind, attacker| {
+            let s = mob_source(&Damage {
+                kind,
+                attacker,
+                from: None,
+            });
+            (s.damage_type, s.causing, s.direct)
+        };
+        let zombie = Some(Who::Mob(3));
+        assert_eq!(source(K::MobAttack, zombie), ("minecraft:mob_attack", 3, 3));
+        assert_eq!(source(K::Thorns, zombie), ("minecraft:thorns", 3, 3));
+        assert_eq!(source(K::Arrow, zombie), ("minecraft:arrow", 3, 0));
+        let blast = source(K::Explosion, zombie);
+        assert_eq!(blast, ("minecraft:player_explosion", 3, 0));
+        // A player behind a mob's hit isn't known yet, nor is a fall's source.
+        let hit = source(K::PlayerAttack, Some(Who::Player));
+        assert_eq!(hit, ("minecraft:player_attack", 0, 0));
+        assert_eq!(source(K::Fall, None), ("minecraft:fall", 0, 0));
+        let arrow = HurtSource {
+            damage_type: "minecraft:arrow",
+            causing: 4,
+            direct: 0,
+        };
+        let player = (2, "minecraft:player", arrow);
+        assert_eq!(hurt_server_args(Hurting::Player(2, arrow)), player);
+        let dragon = (5, "minecraft:ender_dragon", arrow);
+        assert_eq!(hurt_server_args(Hurting::Dragon(5, arrow)), dragon);
     }
 
     /// A mod container opens a slot grid or a furnace's menu, by its slot

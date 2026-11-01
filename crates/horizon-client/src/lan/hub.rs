@@ -33,13 +33,16 @@ use horizon_world::{
     block_collision_scan::BlockCollisionScan,
     collision_context::CollisionContext,
     nbt::{JavaString, Tag},
+    world_movement::in_range_of_ground,
 };
 use std::sync::{Arc, Mutex, atomic::Ordering};
 
 /// GameEvent types (ClientboundGameEventPacket).
 pub mod chat;
+pub mod chat_filter;
 
 pub mod game_event {
+    pub const NO_RESPAWN_BLOCK_AVAILABLE: u8 = 0;
     pub const START_RAINING: u8 = 1;
     pub const STOP_RAINING: u8 = 2;
     pub const CHANGE_GAME_MODE: u8 = 3;
@@ -173,10 +176,27 @@ pub enum HostEvent {
         sender: u128,
         text: String,
     },
+    /// A player's text the chat filter refused (docs/chat-filter.md): relayed to nobody, for the
+    /// game to log and to carry out `action`.
+    ChatFiltered {
+        sender: u128,
+        name: String,
+        place: chat_filter::Place,
+        text: String,
+        /// The hit's number in the filter's window.
+        count: u32,
+        action: horizon_chat_filter::Action,
+    },
     /// A server log warning (ServerGamePacketListenerImpl's LOGGER.warn).
     Warn(String),
     /// A server log error (LOGGER.error).
     Error(String),
+    /// The anticheat bans this player (`banned-players.json`, then the ban's kick).
+    Ban {
+        uuid: u128,
+        name: String,
+        reason: String,
+    },
 }
 
 pub struct Hub {
@@ -195,6 +215,10 @@ pub struct Hub {
     pub movement_checks: (bool, bool),
     /// The anticheat, when `server.toml` turns it on (dedicated servers).
     pub anticheat: Option<Box<super::anticheat::Anticheat>>,
+    /// The chat filter, when `server.toml` turns it on (dedicated servers).
+    pub chat_filter: Option<Box<horizon_chat_filter::Guard>>,
+    /// The far ring, when `server.toml`'s `max_view_distance` turns it on (dedicated servers).
+    pub far: Option<super::far::Far>,
     /// The `immediate_respawn` game rule, as the players were last told.
     immediate_respawn: bool,
     /// An integrated server's owner (`MinecraftServer.isSingleplayerOwner`),
@@ -208,6 +232,10 @@ pub struct Hub {
     /// The scoreboard's teams, set by the game each tick, for players'
     /// display names.
     pub teams: Vec<crate::scoreboard::Team>,
+    /// Names a server mod shows for players in chat and the Tab list
+    /// (`native_set_nickname`), by UUID. Their real name stays everywhere
+    /// else: the log, commands, the hover of the shown name.
+    pub nicknames: std::collections::HashMap<u128, String>,
     last_clock: i64,
     last_rate: f32,
     ticking: (f32, bool),
@@ -229,6 +257,10 @@ pub struct Hub {
     pub chat_spam_threshold: i32,
     /// `command-spam-threshold-seconds`, as `chat_spam_threshold`.
     pub command_spam_threshold: i32,
+    /// `server.toml`'s `admin_feedback_to_ops` (dedicated servers): whether
+    /// the other operators get a command's `[name: ...]` line (vanilla's
+    /// broadcastToAdmins). False keeps it to the console's log.
+    pub admin_feedback_to_ops: bool,
     chat_type: i32,
     dimension_type: i32,
     clock_ids: Vec<i32>,
@@ -238,6 +270,9 @@ pub struct Hub {
     entities: std::collections::HashMap<String, Entities>,
     /// What one tick of entity tracking sends each guest, kept between ticks.
     entity_out: Vec<Vec<Vec<u8>>>,
+    /// Each placed guest's entities gone this tick, where they were last sent (only while the
+    /// prediction records).
+    entity_gone: Vec<Vec<[f64; 3]>>,
     /// Server mods' commands, a root in the commands report's format, sent
     /// after vanilla's; the key the game last set them for.
     mod_commands: (serde_json::Value, Option<u64>),
@@ -308,11 +343,18 @@ impl Hub {
     /// Player.getDisplayName: the name formatted for the player's team
     /// (PlayerTeam.formatNameForTeam), suggesting `/tell NAME `, showing the
     /// player on hover and inserting the name.
+    /// A nickname (`nicknames`) takes the name's place in the text; the
+    /// hover, the suggested `/tell` and the insertion keep the real name.
     pub fn player_display_name(&self, uuid: u128, name: &str) -> Tag {
-        let Some(team) = self.teams.iter().find(|t| t.players.contains(name)) else {
+        let shown = self.nicknames.get(&uuid).map_or(name, String::as_str);
+        let team = self.teams.iter().find(|t| t.players.contains(name));
+        if team.is_none() && shown == name {
             return display_name(uuid, name);
+        }
+        let mut c = match team {
+            Some(team) => team.formatted_name_comp(&crate::scoreboard::literal(shown)),
+            None => serde_json::json!({ "text": shown }),
         };
-        let mut c = team.formatted_name_comp(&crate::scoreboard::literal(name));
         c["click_event"] =
             serde_json::json!({"action": "suggest_command", "command": format!("/tell {name} ")});
         c["hover_event"] = serde_json::json!({"action": "show_entity", "id": "minecraft:player",
@@ -359,22 +401,73 @@ fn tracked(cx: i32, cz: i32, r: i32, x: i32, z: i32) -> bool {
 fn requeue(
     queue: &mut Vec<(i32, i32)>,
     sent: &crate::fast_hash::FxHashSet<(i32, i32)>,
-    (cx, cz): (i32, i32),
+    center: (i32, i32),
     r: i32,
 ) {
-    queue.retain(|&(x, z)| tracked(cx, cz, r, x, z));
+    requeue_ring(queue, sent, center, 0, r);
+}
+
+/// `requeue` for the chunks tracked at `r` and not at `inner` (0: none): the far ring's.
+fn requeue_ring(
+    queue: &mut Vec<(i32, i32)>,
+    sent: &crate::fast_hash::FxHashSet<(i32, i32)>,
+    (cx, cz): (i32, i32),
+    inner: i32,
+    r: i32,
+) {
+    let tracked = |x, z| tracked(cx, cz, r, x, z) && !tracked(cx, cz, inner, x, z);
+    queue.retain(|&(x, z)| tracked(x, z));
     // A walking player changes chunk every few ticks with hundreds of chunks
     // queued: a set, not a scan of the queue for each of the view's chunks.
     let mut queued: crate::fast_hash::FxHashSet<(i32, i32)> = queue.iter().copied().collect();
     for dz in -r - 2..=r + 2 {
         for dx in -r - 2..=r + 2 {
             let key = (cx + dx, cz + dz);
-            if tracked(cx, cz, r, key.0, key.1) && !sent.contains(&key) && queued.insert(key) {
+            if tracked(key.0, key.1) && !sent.contains(&key) && queued.insert(key) {
                 queue.push(key);
             }
         }
     }
     queue.sort_by_key(|&(x, z)| i64::from(x - cx).pow(2) + i64::from(z - cz).pow(2));
+}
+
+/// A player's next chunks (`Hub::next_batch`), with their places in its queues: the view's, then
+/// the far ring's (none: the save has none to send).
+struct Batch<'w> {
+    near: Vec<(usize, &'w Chunk)>,
+    far: Vec<(usize, Option<Column<'w>>)>,
+}
+
+/// A far chunk to send: the level's own while it holds it, else what the save's readers made.
+enum Column<'w> {
+    Level(&'w Chunk),
+    Saved(Arc<[u8]>),
+}
+
+/// A body in a batch: a column of `Columns`, or one read from the save.
+enum Body {
+    Level(usize),
+    Saved(Arc<[u8]>),
+}
+
+/// The level's columns a tick's batches send, each once, with the number of batches taking it.
+#[derive(Default)]
+struct Columns<'w> {
+    chunks: Vec<&'w Chunk>,
+    uses: Vec<usize>,
+    index: crate::fast_hash::FxHashMap<(i32, i32), usize>,
+}
+
+impl<'w> Columns<'w> {
+    fn add(&mut self, chunk: &'w Chunk) -> usize {
+        let j = *self.index.entry((chunk.x, chunk.z)).or_insert_with(|| {
+            self.chunks.push(chunk);
+            self.uses.push(0);
+            self.chunks.len() - 1
+        });
+        self.uses[j] += 1;
+        j
+    }
 }
 
 /// What a level's players were last told of its clock and weather.
@@ -417,6 +510,8 @@ impl Hub {
             immediate_respawn: false,
             movement_checks: (true, true),
             anticheat: None,
+            chat_filter: None,
+            far: None,
             singleplayer_owner: None,
             flat_world: false,
             riding: Default::default(),
@@ -429,6 +524,7 @@ impl Hub {
             spawn_protection: 0,
             chat_spam_threshold: 0,
             command_spam_threshold: 0,
+            admin_feedback_to_ops: true,
             weather: (false, 0.0, 0.0),
             level_sync: Default::default(),
             chat_type,
@@ -438,9 +534,11 @@ impl Hub {
             entity_types: Default::default(),
             entities: Default::default(),
             entity_out: Vec::new(),
+            entity_gone: Vec::new(),
             mod_commands: (serde_json::Value::Null, None),
             native_menu_events: Vec::new(),
             teams: Vec::new(),
+            nicknames: std::collections::HashMap::new(),
         }
     }
 
@@ -514,10 +612,32 @@ impl Hub {
     /// (ChunkMap.getPlayerViewDistance).
     pub fn set_view_distance(&mut self, distance: i32) {
         self.config.view_distance = distance;
+        let distance = self.chunk_radius();
         self.broadcast(&C::SetChunkCacheRadius(play::Distance { distance }));
         for g in &mut self.guests {
-            g.view_distance = i32::from(g.info.view_distance).clamp(2, distance);
+            g.view_distance = i32::from(g.info.view_distance).clamp(2, self.config.view_distance);
             g.center = None;
+        }
+    }
+    /// The radius the players are told (Login, SetChunkCacheRadius): with the far ring on, its
+    /// `max_view_distance`, so that a client keeps and draws what it is sent past the view.
+    fn chunk_radius(&self) -> i32 {
+        let view = self.config.view_distance;
+        self.far.as_ref().map_or(view, |far| far.max.max(view))
+    }
+    /// How far a player is sent chunks: its view, and with the far ring on, as far as it asked for
+    /// up to `max_view_distance`.
+    fn reach(&self, g: &Guest) -> i32 {
+        self.far.as_ref().map_or(g.view_distance, |far| {
+            i32::from(g.info.view_distance)
+                .min(far.max)
+                .max(g.view_distance)
+        })
+    }
+    /// Where the far ring reads the level in place from: its saves, before each of its ticks.
+    pub fn far_level(&mut self, save: &Arc<crate::save::SaveDir>) {
+        if let Some(far) = self.far.as_mut() {
+            far.set_level(&self.config.dimension, save, &self.encoder);
         }
     }
     /// PlayerList.setSimulationDistance.
@@ -704,7 +824,7 @@ impl Hub {
             game_mode: Some(mode),
             listed: Some(true),
             latency: Some(latency),
-            display_name: Some(None),
+            display_name: Some(self.nicknames.get(&uuid).map(|n| literal(n))),
             list_order: Some(0),
             show_hat: Some(guest.is_none_or(|g| g.info.model_customisation & 0x40 != 0)),
         }
@@ -796,7 +916,7 @@ impl Hub {
             hardcore: self.config.hardcore,
             levels: Self::level_keys(),
             max_players: self.config.max_players as i32,
-            chunk_radius: self.config.view_distance,
+            chunk_radius: self.chunk_radius(),
             simulation_distance: self.config.simulation_distance,
             reduced_debug_info: false,
             show_death_screen: !self.immediate_respawn,
@@ -823,6 +943,18 @@ impl Hub {
         // PlayerList.sendPlayerPermissionLevel, then the recipe book.
         self.send_permission_level(i);
         self.send_initial_recipe_book(i);
+        // PlayerList.placeNewPlayer broadcasts the join line before
+        // players.add: the others read it, the newcomer doesn't.
+        self.broadcast_except(
+            conn,
+            &C::SystemChat(play::SystemChat {
+                content: yellow_names(
+                    "multiplayer.player.joined",
+                    vec![display_name(self.guests[i].uuid, &name)],
+                ),
+                overlay: false,
+            }),
+        );
         self.guests[i].placed = true;
         self.resend_teleport(i, None);
         let g = &self.guests[i];
@@ -866,12 +998,6 @@ impl Hub {
         // ServerPlayer.sendPostEffects and initInventoryMenu.
         self.send_post_effects(i);
         self.send_inventory(i);
-        // PlayerList.placeNewPlayer adds the player to the list, then calls
-        // broadcastSystemMessage: the newcomer reads its own join line too.
-        self.system_message(yellow_names(
-            "multiplayer.player.joined",
-            vec![display_name(uuid, &name)],
-        ));
     }
 
     /// `ServerPlayer.sendPostEffects`: the player's `/posteffect` chains.
@@ -1095,6 +1221,8 @@ impl Hub {
         g.teleport_counter = (g.teleport_counter + 1) & 0x7FFF_FFFF;
         let id = g.teleport_counter;
         g.awaiting_teleport = Some((id, g.position));
+        use play::relative::{DELTA_X, DELTA_Y, DELTA_Z};
+        g.awaiting_keeps_motion = relatives & (DELTA_X | DELTA_Y | DELTA_Z) != 0;
         let turn = relatives & (play::relative::Y_ROT | play::relative::X_ROT) != 0;
         g.send(&C::PlayerPosition(play::PlayerPosition {
             teleport: id,
@@ -1232,6 +1360,7 @@ impl Hub {
     /// players' latencies.
     pub fn tick(&mut self, ctx: &mut TickCtx) -> Vec<HostEvent> {
         let mut events = self.poll(ctx);
+        events.extend(self.drain_packets(ctx));
         events.extend(self.tick_level(ctx));
         self.end_tick();
         events
@@ -1319,10 +1448,12 @@ impl Hub {
         events
     }
 
-    /// The level in place's part of the tick (`ServerLevel.tick`'s chunk
-    /// map and the connections of the players in it): their packets, then
-    /// the chunks, block changes, containers and entities they see.
-    pub fn tick_level(&mut self, ctx: &mut TickCtx) -> Vec<HostEvent> {
+    /// Handle the players in this level's packets (`ServerGamePacketListenerImpl`
+    /// for each), before the level's scheduled block ticks so a place landed in
+    /// the same tick as a falling block's schedule still sees the support
+    /// (#4510). `tick_level` then syncs what those packets (and the block ticks)
+    /// changed.
+    pub fn drain_packets(&mut self, ctx: &mut TickCtx) -> Vec<HostEvent> {
         let mut events = Vec::new();
         for i in 0..self.guests.len() {
             if self.here(&self.guests[i]) {
@@ -1330,6 +1461,15 @@ impl Hub {
                 self.tick_floating(i, &mut events);
             }
         }
+        events
+    }
+
+    /// The level in place's part of the tick (`ServerLevel.tick`'s chunk
+    /// map and the connections of the players in it): the chunks, block
+    /// changes, containers and entities they see. Player packets are drained
+    /// earlier (`drain_packets`) so scheduled ticks see what they placed.
+    pub fn tick_level(&mut self, ctx: &mut TickCtx) -> Vec<HostEvent> {
+        let events = Vec::new();
         if !self.guests.iter().any(|g| self.here(g)) {
             // ServerTickRateManager broadcasts a change to the players there
             // are; one who joins later is sent the state as it is then
@@ -1345,6 +1485,9 @@ impl Hub {
             {
                 let _ = ctx.world.block_log.take();
                 let _ = ctx.world.light_log.take();
+                if let Some(far) = self.far.as_mut() {
+                    far.forget_level();
+                }
             }
             return events;
         }
@@ -1516,9 +1659,13 @@ impl Hub {
     /// (PlayerChunkSender.sendNextChunks). The batches are chosen first, the
     /// columns in them encoded once each, their new sections on the warm-up
     /// threads too (`ChunkEncoder::warm`), then sent: nothing changes the
-    /// level in between, and each player's packets keep their order.
+    /// level in between, and each player's packets keep their order. The far
+    /// ring's chunks the level doesn't hold go as the save's readers made them.
     fn update_chunks(&mut self, ctx: &TickCtx) {
         let world = &*ctx.world;
+        if let Some(far) = self.far.as_mut() {
+            far.poll();
+        }
         let mut batches = Vec::new();
         for i in 0..self.guests.len() {
             if self.here(&self.guests[i]) {
@@ -1533,28 +1680,30 @@ impl Hub {
         }
         // Each column once, however many players it goes to, with the
         // number of batches that take it.
-        let (mut columns, mut uses): (Vec<&Chunk>, Vec<usize>) = Default::default();
-        let mut index = crate::fast_hash::FxHashMap::default();
-        let batches: Vec<(usize, Vec<usize>, Vec<usize>)> = batches
+        let mut columns = Columns::default();
+        let batches: Vec<_> = batches
             .into_iter()
             .map(|(i, batch)| {
-                let (taken, bodies) = batch
+                let (taken, mut bodies): (Vec<_>, Vec<_>) = batch
+                    .near
                     .into_iter()
-                    .map(|(idx, chunk)| {
-                        let j = *index.entry((chunk.x, chunk.z)).or_insert_with(|| {
-                            columns.push(chunk);
-                            uses.push(0);
-                            columns.len() - 1
-                        });
-                        uses[j] += 1;
-                        (idx, j)
-                    })
+                    .map(|(idx, chunk)| (idx, Body::Level(columns.add(chunk))))
                     .unzip();
-                (i, taken, bodies)
+                let mut far = Vec::new();
+                for (idx, column) in batch.far {
+                    far.push((idx, column.is_some()));
+                    match column {
+                        Some(Column::Level(chunk)) => bodies.push(Body::Level(columns.add(chunk))),
+                        Some(Column::Saved(body)) => bodies.push(Body::Saved(body)),
+                        None => {}
+                    }
+                }
+                (i, taken, far, bodies)
             })
             .collect();
-        self.encoder.warm(&columns);
-        let mut bodies: Vec<Vec<u8>> = columns
+        self.encoder.warm(&columns.chunks);
+        let mut encoded: Vec<Vec<u8>> = columns
+            .chunks
             .iter()
             .map(|c| {
                 self.encoder.body_with(c, world, &|x, z| {
@@ -1562,35 +1711,50 @@ impl Hub {
                 })
             })
             .collect();
-        for (i, taken, batch) in batches {
+        let uses = &mut columns.uses;
+        for (i, taken, far, batch) in batches {
             let g = &mut self.guests[i];
             let size = batch.len();
-            g.batch_quota -= size as f32;
-            g.send(&C::ChunkBatchStart(horizon_protocol::packets::Empty));
-            g.sender.send_many(batch.into_iter().map(|j| {
-                uses[j] -= 1;
-                if uses[j] == 0 {
-                    std::mem::take(&mut bodies[j])
-                } else {
-                    bodies[j].clone()
-                }
-            }));
-            g.send(&C::ChunkBatchFinished(play::ChunkBatchFinished {
-                size: size as i32,
-            }));
-            g.unacknowledged += 1;
+            if size > 0 {
+                g.batch_quota -= size as f32;
+                g.send(&C::ChunkBatchStart(horizon_protocol::packets::Empty));
+                g.sender.send_many(batch.into_iter().map(|body| match body {
+                    Body::Level(j) => {
+                        uses[j] -= 1;
+                        if uses[j] == 0 {
+                            std::mem::take(&mut encoded[j])
+                        } else {
+                            encoded[j].clone()
+                        }
+                    }
+                    Body::Saved(body) => body.to_vec(),
+                }));
+                g.send(&C::ChunkBatchFinished(play::ChunkBatchFinished {
+                    size: size as i32,
+                }));
+                g.unacknowledged += 1;
+            }
             for idx in taken.into_iter().rev() {
                 let key = g.chunk_queue.remove(idx);
                 g.sent_chunks.insert(key);
+            }
+            // A far chunk the save doesn't have leaves the queue unsent.
+            for (idx, sent) in far.into_iter().rev() {
+                let key = g.far_queue.remove(idx);
+                if sent {
+                    g.sent_chunks.insert(key);
+                }
             }
         }
     }
 
     /// ChunkMap.move's view change: the new centre, the chunks that left
-    /// the view forgotten and the ones that entered it queued, closest first.
+    /// the view forgotten and the ones that entered it queued, closest first;
+    /// past the view, the far ring's.
     fn update_view(&mut self, i: usize) {
         let (cx, cz) = self.guests[i].chunk();
         let r = self.guests[i].view_distance;
+        let reach = self.reach(&self.guests[i]);
         let g = &mut self.guests[i];
         if g.center == Some((cx, cz)) {
             return;
@@ -1607,61 +1771,96 @@ impl Hub {
             .sent_chunks
             .iter()
             .copied()
-            .filter(|&(x, z)| !tracked(cx, cz, r, x, z))
+            .filter(|&(x, z)| !tracked(cx, cz, reach, x, z))
             .collect();
         for (x, z) in forget {
             g.sent_chunks.remove(&(x, z));
             g.send(&C::ForgetLevelChunk(play::ForgetLevelChunk { pos: [x, z] }));
         }
         requeue(&mut g.chunk_queue, &g.sent_chunks, (cx, cz), r);
+        if reach > r {
+            requeue_ring(&mut g.far_queue, &g.sent_chunks, (cx, cz), r, reach);
+        } else {
+            g.far_queue.clear();
+        }
     }
 
     /// PlayerChunkSender.sendNextChunks' choice: ready chunks, closest first,
     /// as many as the batch quota the client's acknowledgements pace allows,
-    /// with their places in the queue.
+    /// with their places in the queue. What the view leaves of the quota goes
+    /// to the far ring, as far as its brake lets it reach.
     fn next_batch<'w>(
         &mut self,
         i: usize,
         world: &'w World,
         streaming: Option<&crate::streaming::Streaming>,
-    ) -> Option<Vec<(usize, &'w Chunk)>> {
+    ) -> Option<Batch<'w>> {
         let g = &mut self.guests[i];
         if self.ticks <= g.placed_at + 1 || g.unacknowledged >= g.max_unacknowledged {
             return None;
         }
         g.batch_quota = (g.batch_quota + g.chunks_per_tick).min(g.chunks_per_tick.max(1.0));
-        if g.batch_quota < 1.0 || g.chunk_queue.is_empty() {
+        if g.batch_quota < 1.0 || (g.chunk_queue.is_empty() && g.far_queue.is_empty()) {
             return None;
         }
         let budget = g.batch_quota.floor() as usize;
-        let batch: Vec<_> = g
+        // ChunkStatus.LIGHT needs its neighbours at INITIALIZE_LIGHT: a
+        // column whose light layers would leave one out waits for it.
+        let ready = |c: &Chunk| {
+            c.lit
+                && streaming.is_none_or(|streaming| {
+                    (-1..=1).all(|dz| {
+                        (-1..=1).all(|dx| {
+                            let (x, z) = (c.x + dx, c.z + dz);
+                            world.chunks.contains_key(&(x, z))
+                                || streaming.proto_sections(x, z).is_some()
+                        })
+                    })
+                })
+        };
+        let near: Vec<_> = g
             .chunk_queue
             .iter()
             .enumerate()
-            .filter_map(|(idx, key)| Some((idx, &**world.chunks.get(key).filter(|c| c.lit)?)))
-            // ChunkStatus.LIGHT needs its neighbours at INITIALIZE_LIGHT: a
-            // column whose light layers would leave one out waits for it.
-            .filter(|(_, c)| {
-                let Some(streaming) = streaming else {
-                    return true;
-                };
-                (-1..=1).all(|dz| {
-                    (-1..=1).all(|dx| {
-                        let (x, z) = (c.x + dx, c.z + dz);
-                        world.chunks.contains_key(&(x, z))
-                            || streaming.proto_sections(x, z).is_some()
-                    })
-                })
-            })
+            .filter_map(|(idx, key)| Some((idx, &**world.chunks.get(key)?)))
+            .filter(|(_, c)| ready(c))
             .take(budget)
             .collect();
-        (!batch.is_empty()).then_some(batch)
+        let mut far = Vec::new();
+        if let (Some(ring), Some((cx, cz))) = (self.far.as_mut(), g.center) {
+            let mut left = budget - near.len();
+            for (idx, &(x, z)) in g.far_queue.iter().enumerate().take(super::far::LOOKS) {
+                if left == 0 {
+                    break;
+                }
+                if !tracked(cx, cz, ring.limit(), x, z) {
+                    continue;
+                }
+                let column = match world.chunks.get(&(x, z)) {
+                    Some(c) if ready(c) => Some(Column::Level(c)),
+                    Some(_) => continue,
+                    None => match ring.saved(x, z) {
+                        super::far::Saved::Body(body) => Some(Column::Saved(body)),
+                        super::far::Saved::Missing => None,
+                        super::far::Saved::Waiting => continue,
+                    },
+                };
+                left -= usize::from(column.is_some());
+                far.push((idx, column));
+            }
+        }
+        (!near.is_empty() || !far.is_empty()).then_some(Batch { near, far })
     }
 
     /// `ChunkMap.resendBiomesForChunks`: each player in the level is sent,
     /// in one packet, the biomes of those of `columns` it has been sent
     /// (`getPlayers(pos, false)`), in the order given.
-    pub fn resend_biomes(&self, world: &World, columns: &[(i32, i32)]) {
+    pub fn resend_biomes(&mut self, world: &World, columns: &[(i32, i32)]) {
+        if let Some(far) = self.far.as_mut() {
+            for &(x, z) in columns {
+                far.changed(x, z);
+            }
+        }
         let data: Vec<_> = columns
             .iter()
             .filter_map(|key| Some((*key, self.encoder.biome_data(world.chunks.get(key)?))))
@@ -1693,6 +1892,9 @@ impl Hub {
         // One entry per column, so the order is the columns'.
         changes.sort_unstable_by_key(|&(column, _)| column);
         for ((x, z), sections) in changes {
+            if let Some(far) = self.far.as_mut() {
+                far.changed(x, z);
+            }
             let tracked = |g: &Guest, x: i32, z: i32| g.sent_chunks.contains(&(x, z));
             let viewers: Vec<usize> = (0..self.guests.len())
                 .filter(|&i| {
@@ -1725,6 +1927,8 @@ impl Hub {
         let mut changes = std::mem::take(log);
         changes.sort_unstable();
         changes.dedup();
+        // The prediction's replay excuses a client that hadn't seen a change near it.
+        let recording = self.recording();
         // Group by section.
         let mut sections: std::collections::BTreeMap<(i32, i32, i32), Vec<(i32, i32, i32)>> =
             Default::default();
@@ -1735,6 +1939,9 @@ impl Hub {
                 .push(p);
         }
         for ((sx, sy, sz), positions) in sections {
+            if let Some(far) = self.far.as_mut() {
+                far.changed(sx, sz);
+            }
             let viewers: Vec<usize> = (0..self.guests.len())
                 .filter(|&i| {
                     self.here(&self.guests[i]) && self.guests[i].sent_chunks.contains(&(sx, sz))
@@ -1768,11 +1975,27 @@ impl Hub {
             for &i in &viewers {
                 self.guests[i].sender.send(body.clone());
             }
+            if recording {
+                for &i in &viewers {
+                    let g = &mut self.guests[i];
+                    let Some(record) = g.anticheat.record.as_deref_mut() else {
+                        continue;
+                    };
+                    let slack = super::prediction::slack(std::array::from_fn(|i| {
+                        g.position[i] - g.previous_position[i]
+                    }));
+                    for &(x, y, z) in &positions {
+                        if super::prediction::near(g.position, [x, y, z], slack) {
+                            record.changed_near(self.ticks, [x, y, z]);
+                        }
+                    }
+                }
+            }
             // Block entities with data the client shows.
             for &(x, y, z) in &positions {
                 // A decorated pot is no block entity: its tag is the chunk's saved one.
                 let tag = match world.block_entities.get(&(x, y, z)) {
-                    Some(entity) => super::chunks::entity_tag(entity),
+                    Some(entity) => self.encoder.update_tag((x, y, z), entity),
                     None => world
                         .chunks
                         .get(&(x >> 4, z >> 4))
@@ -2041,12 +2264,16 @@ impl Hub {
         let dimension = &self.config.dimension;
         let here = |g: &Guest| g.placed && g.dimension == *dimension;
         outs.resize_with(self.guests.iter().filter(|g| here(g)).count(), Vec::new);
+        // The prediction's replay excuses a client that may still have an entity that left it.
+        let recording = self.recording();
+        let mut gone = std::mem::take(&mut self.entity_gone);
+        gone.resize_with(outs.len(), Vec::new);
         let mut viewers: Vec<Viewer> = self
             .guests
             .iter_mut()
             .filter(|g| here(g))
-            .zip(outs.iter_mut())
-            .map(|(g, out)| Viewer {
+            .zip(outs.iter_mut().zip(gone.iter_mut()))
+            .map(|(g, (out, gone))| Viewer {
                 entity_id: g.entity_id,
                 spectator: g.spectator(),
                 moved: std::mem::take(&mut g.moved),
@@ -2055,6 +2282,7 @@ impl Hub {
                 chunks: &g.sent_chunks,
                 tracker: &mut g.tracker,
                 out,
+                gone: recording.then_some(gone),
             })
             .collect();
         level.range_percent = Some(self.entity_range_percent);
@@ -2066,6 +2294,26 @@ impl Hub {
         for (g, out) in self.guests.iter().filter(|g| here(g)).zip(outs.iter_mut()) {
             g.sender.send_many(out.drain(..));
         }
+        let ticks = self.ticks;
+        for (g, gone) in self
+            .guests
+            .iter_mut()
+            .filter(|g| here(g))
+            .zip(gone.iter_mut())
+        {
+            let slack = super::prediction::slack(std::array::from_fn(|i| {
+                g.position[i] - g.previous_position[i]
+            }));
+            for at in gone.drain(..) {
+                let block = at.map(|v| v.floor() as i32);
+                if let Some(record) = g.anticheat.record.as_deref_mut()
+                    && super::prediction::near(g.position, block, slack)
+                {
+                    record.entity_gone(ticks);
+                }
+            }
+        }
+        self.entity_gone = gone;
         self.entity_out = outs;
         self.entities.insert(self.config.dimension.clone(), level);
     }
@@ -2075,11 +2323,24 @@ impl Hub {
     /// starts the wake-up fade (100).
     pub fn wake(&mut self, i: usize) {
         let g = &mut self.guests[i];
-        if g.bed.take().is_none() && !g.sleeping {
+        let head = g.bed.take();
+        if head.is_none() && !g.sleeping {
             return;
+        }
+        if let Some(head) = head {
+            g.woke_from = Some(head);
         }
         g.sleeping = false;
         g.sleep_timer = 100;
+        if g.sent_bed.take().is_some() {
+            g.send(&C::SetEntityData(play::SetEntityData {
+                id: g.entity_id,
+                values: vec![
+                    (6, serializer::POSE, Value::Id(0)),
+                    (14, serializer::OPTIONAL_BLOCK_POS, Value::OptPos(None)),
+                ],
+            }));
+        }
         let (id, at) = (g.entity_id, g.position);
         // ClientboundAnimatePacket.WAKE_UP.
         self.broadcast_near(
@@ -2363,10 +2624,26 @@ impl Hub {
     /// A move still queued for guest `i`, which a packet the game handles
     /// after this pass must not overtake.
     fn move_queued(&self, i: usize) -> bool {
-        self.guests[i]
-            .inbox
-            .iter()
-            .any(|(p, _)| matches!(p, S::MovePlayerPos(_) | S::MovePlayerPosRot(_)))
+        self.guests[i].inbox.iter().any(|(p, _)| {
+            matches!(
+                p,
+                S::MovePlayerPos(_)
+                    | S::MovePlayerPosRot(_)
+                    | S::MovePlayerRot(_)
+                    | S::MovePlayerStatus(_)
+            )
+        })
+    }
+
+    /// handlePlayerCommand's START_SPRINTING and STOP_SPRINTING: `setSprinting`, whose movement
+    /// speed modifier the attributes then sync to the client (which takes the modifiers as sent:
+    /// one without it would slow a sprinting client to a walk).
+    fn set_sprinting(&mut self, i: usize, sprinting: bool) {
+        let g = &mut self.guests[i];
+        g.sprinting = sprinting;
+        if let Some(m) = g.motion.as_mut() {
+            let _ = m.set_sprint_modifier(sprinting);
+        }
     }
 
     fn process_inbox(&mut self, i: usize, ctx: &mut TickCtx, events: &mut Vec<HostEvent>) {
@@ -2422,6 +2699,7 @@ impl Hub {
                     if !self.guests[i].client_loaded() => {}
                 // handleAcceptTeleportPacket.
                 S::AcceptTeleportation(p) => {
+                    let recording = self.recording();
                     let g = &mut self.guests[i];
                     if let Some((id, at)) = g.awaiting_teleport
                         && id == p.id
@@ -2437,6 +2715,14 @@ impl Hub {
                         }
                         g.position = at;
                         g.awaiting_teleport = None;
+                        // The prediction's replay starts again where the client now is.
+                        if recording {
+                            let kept = g.awaiting_keeps_motion;
+                            g.anticheat
+                                .record
+                                .get_or_insert_default()
+                                .teleported(at, kept);
+                        }
                         let rot = (p.yaw, p.pitch);
                         self.position_change(i, [p.x, p.y, p.z], rot, 0, ctx, events);
                     }
@@ -2480,6 +2766,21 @@ impl Hub {
                     g.max_unacknowledged = 10;
                 }
                 S::Pong(p) => self.anticheat_pong(i, p.id),
+                // handleAttack is the game's too: a move queued behind an attack would move
+                // the player (or land them on the ground, losing a falling attack's critical
+                // hit) before the game checks their reach and state.
+                S::Attack(p) => {
+                    if !self.anticheat_attack(i, p.id, events) {
+                        events.push(HostEvent::Packet(conn, Box::new(S::Attack(p))));
+                        if self.move_queued(i) {
+                            break;
+                        }
+                    }
+                }
+                S::Punch(p) => {
+                    self.anticheat_swing(i);
+                    events.push(HostEvent::Packet(conn, Box::new(S::Punch(p))));
+                }
                 S::ClientTickEnd(_) => {
                     // handleClientTickEnd: no move this tick, no known movement.
                     let g = &mut self.guests[i];
@@ -2537,8 +2838,7 @@ impl Hub {
                     events.push(HostEvent::Packet(conn, Box::new(S::PlayerCommand(p))));
                 }
                 S::PlayerCommand(p) => match p.action {
-                    1 => self.guests[i].sprinting = true,
-                    2 => self.guests[i].sprinting = false,
+                    1 | 2 => self.set_sprinting(i, p.action == 1),
                     // STOP_SLEEPING.
                     0 => self.wake(i),
                     _ => {}
@@ -2567,6 +2867,14 @@ impl Hub {
                 // placer's client plays (BlockItem.place's playSound(player, ...)).
                 S::UseItemOn(p) => {
                     events.push(HostEvent::Packet(conn, Box::new(S::UseItemOn(p))));
+                    if self.move_queued(i) {
+                        break;
+                    }
+                }
+                // handleInteract is the game's too, like handleAttack above: a move queued
+                // behind it waits for the next tick.
+                S::Interact(p) => {
+                    events.push(HostEvent::Packet(conn, Box::new(S::Interact(p))));
                     if self.move_queued(i) {
                         break;
                     }
@@ -2902,7 +3210,13 @@ impl Hub {
     }
 
     /// Set a guest's game mode and tell everyone (ServerPlayer.setGameMode).
-    pub fn set_game_mode(&mut self, conn: u32, mode: i32) {
+    pub fn set_game_mode(
+        &mut self,
+        conn: u32,
+        mode: i32,
+        world: &World,
+        collision: Option<&BlockCollisionRegistry<'_>>,
+    ) {
         let Some(g) = self.guest_mut(conn) else {
             return;
         };
@@ -2913,6 +3227,21 @@ impl Hub {
             g.flying = true;
         } else if !g.creative() {
             g.flying = false;
+        }
+        // ServerPlayerGameMode.changeGameModeForPlayer: a player left flying
+        // by the change lands when the ground is within a block.
+        if !g.spectator()
+            && g.flying
+            && let Some(binding) = collision
+        {
+            let mut scene = SceneCollisions {
+                world,
+                binding,
+                subject: None,
+            };
+            if in_range_of_ground(&mut scene, g.bounds()) {
+                g.flying = false;
+            }
         }
         let uuid = g.uuid;
         g.send(&C::GameEvent(play::GameEvent {
@@ -2929,6 +3258,24 @@ impl Hub {
             entries: vec![play::PlayerInfo {
                 uuid,
                 game_mode: Some(mode),
+                ..Default::default()
+            }],
+        }));
+    }
+
+    /// A player's nickname changed (None: their name again): kept for chat,
+    /// and the Tab list shows it (PlayerInfo UPDATE_DISPLAY_NAME for
+    /// everyone).
+    pub fn set_nickname(&mut self, uuid: u128, nickname: Option<String>) {
+        match nickname {
+            Some(n) => self.nicknames.insert(uuid, n),
+            None => self.nicknames.remove(&uuid),
+        };
+        self.broadcast(&C::PlayerInfoUpdate(play::PlayerInfoUpdate {
+            actions: 0x20,
+            entries: vec![play::PlayerInfo {
+                uuid,
+                display_name: Some(self.nicknames.get(&uuid).map(|n| literal(n))),
                 ..Default::default()
             }],
         }));
@@ -2986,6 +3333,19 @@ impl Hub {
         }
     }
 
+    /// A respawn point whose block is gone or blocked: the respawning player
+    /// is sent NO_RESPAWN_BLOCK_AVAILABLE and says
+    /// `block.minecraft.spawn.not_valid` in its chat.
+    pub fn missing_respawn_block(&self, conn: u32) {
+        self.send_to(
+            conn,
+            &C::GameEvent(play::GameEvent {
+                event: game_event::NO_RESPAWN_BLOCK_AVAILABLE,
+                param: 0.0,
+            }),
+        );
+    }
+
     /// PlayerList.respawn: back to `at` with a fresh start. The vanilla client waits on its
     /// level loading screen from the Respawn packet until the level info's "level chunks load
     /// start" event and the chunk under the player, so the packets follow vanilla's order.
@@ -2995,6 +3355,9 @@ impl Hub {
         let g = &mut self.guests[i];
         // PlayerList.respawn: into the level in place (the respawn level).
         g.dimension = self.config.dimension.clone();
+        // restartClientLoadTimerAfterRespawn: the client loads a whole new level before it
+        // reports it loaded.
+        g.load_timeout = super::guest::CLIENT_LOADED_TIMEOUT;
         // ServerLevel.removePlayerImmediately: the dead player's
         // Entity.setRemoved (KILLED) stops its riding; the new player rides
         // nothing.
@@ -3009,6 +3372,7 @@ impl Hub {
         g.tracker.clear();
         g.sent_chunks.clear();
         g.chunk_queue.clear();
+        g.far_queue.clear();
         let id = g.entity_id;
         self.respawned(id);
         let g = &mut self.guests[i];
@@ -3034,6 +3398,7 @@ impl Hub {
         g.center = None;
         g.sent_chunks.clear();
         g.chunk_queue.clear();
+        g.far_queue.clear();
         g.tracker.clear();
         self.resend_teleport(i, None);
         let spawn = self.default_spawn(ctx.spawn);
@@ -3119,9 +3484,12 @@ impl Hub {
         self.close_container_for(i);
         let g = &mut self.guests[i];
         g.dimension = self.config.dimension.clone();
+        // The load timer is not restarted: vanilla resets the client's loaded state on death and
+        // respawn only, and covers a level change with its separate `isChangingDimension` term.
         g.tracker.clear();
         g.sent_chunks.clear();
         g.chunk_queue.clear();
+        g.far_queue.clear();
         g.center = None;
         g.yaw = yaw;
         if let Some(pitch) = pitch {
@@ -3434,6 +3802,40 @@ mod tests {
                 sent.retain(|&(x, z)| tracked(center.0, center.1, r, x, z));
             }
         }
+    }
+
+    /// The far ring's queue is what the view's leaves of the chunks tracked at the reach, closest
+    /// first, with the sent ones out of both.
+    #[test]
+    fn the_far_ring_queues_what_the_view_leaves() {
+        let mut sent = FxHashSet::default();
+        let (mut near, mut far) = (Vec::new(), Vec::new());
+        for step in 0..12 {
+            let center = (step, -step / 2);
+            requeue(&mut near, &sent, center, 10);
+            requeue_ring(&mut far, &sent, center, 10, 24);
+            let mut all = Vec::new();
+            requeue(&mut all, &sent, center, 24);
+            assert!(far.iter().all(|key| !near.contains(key)));
+            let mut both = [near.clone(), far.clone()].concat();
+            both.sort_unstable();
+            all.sort_unstable();
+            assert_eq!(both, all);
+            let distance = |&(x, z): &(i32, i32)| {
+                i64::from(x - center.0).pow(2) + i64::from(z - center.1).pow(2)
+            };
+            assert!(far.windows(2).all(|w| distance(&w[0]) <= distance(&w[1])));
+            // A few of each sent.
+            for key in near
+                .drain(..near.len().min(40))
+                .chain(far.drain(..far.len().min(90)))
+            {
+                sent.insert(key);
+            }
+        }
+        // Without a ring, nothing.
+        requeue_ring(&mut far, &sent, (0, 0), 10, 10);
+        assert!(far.is_empty());
     }
 
     /// cargo test --release -p horizon-client --lib lan::hub::tests::requeue_cost -- --ignored --nocapture

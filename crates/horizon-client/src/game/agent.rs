@@ -423,6 +423,7 @@ impl Game<'_> {
             Screen::CommandBlock => "command-block",
             Screen::BlockEditor => "block-editor",
             Screen::Win => "win",
+            Screen::DebugOptions => "debug-options",
         }
     }
     pub(super) fn inventory_counts(&self) -> BTreeMap<String, i64> {
@@ -658,7 +659,9 @@ impl Game<'_> {
                 list.push((d, v));
             }
         };
-        for m in self.mobs.iter().filter(|m| m.alive()) {
+        // CAN_BE_PICKED's isPickable (`!isRemoved`): a dead-but-tracked mob
+        // — a fake player the server keeps at health 0 — is still here.
+        for m in self.mobs.iter().filter(|m| !m.removed) {
             let mut v = json!({ "id": m.id, "kind": "mob", "health": m.health, "baby": m.is_baby(), "hurt_time": m.hurt_time });
             // VillagerData as this game knows it: on a client, what the
             // server's synched data says.
