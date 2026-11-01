@@ -70,6 +70,12 @@ Each `native-hooks.json` entry gains three optional fields:
 `neoforge` is absent for Horizon-only hooks. horizon-mixins ignores fields it doesn't know, so this needs no
 tool change; the launcher and the docs can list them.
 
+`vanilla` is the first of these and is already in the catalog (31 October 2026): the class and method a
+hook fires in, as `net/minecraft/server/level/ServerPlayerGameMode#destroyBlock`, taken from the hook's
+doc comment and checked against the 26.3 jar. 19 of 45 hooks have one; the rest are Horizon-only. It is
+what lets `horizon-port-pack census --hooks` join the catalog to the Mixin surface
+([mod-abi-census.md](mod-abi-census.md)). `side`, `cancellable` and `neoforge` are still to come.
+
 ## The hooks we have
 
 Main's catalog (`native-hooks.json`) is the list; this page does not copy it. Each hook would gain `side`,

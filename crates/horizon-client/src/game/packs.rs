@@ -208,6 +208,7 @@ impl Game<'_> {
             self.settings.mods.enabled.clone(),
             self.options.dev_mods.clone(),
         );
+        let java_content = self.options.java_content.clone();
         let (assets, res, context) = (
             self.pack.assets.clone(),
             self.res.clone(),
@@ -216,8 +217,18 @@ impl Game<'_> {
         let (unicode, japanese) = (self.settings.force_unicode, self.settings.japanese_glyphs);
         self.pack_reload = Some(PackReload::spawn(kind, move |progress| {
             stage_pack(
-                &vanilla, &selected, &server, &mods, &dev_mods, &assets, &res, &context, unicode,
-                japanese, progress,
+                &vanilla,
+                &selected,
+                &server,
+                &mods,
+                &dev_mods,
+                &java_content,
+                &assets,
+                &res,
+                &context,
+                unicode,
+                japanese,
+                progress,
             )
             .map_err(|e| e.to_string())
         })?);
@@ -344,6 +355,7 @@ pub(super) fn stage_pack(
     server: &[Pack],
     mods_enabled: &BTreeSet<String>,
     dev_mods: &[PathBuf],
+    java_content: &[horizon_client::mod_content::ContentMod],
     assets: &Arc<Assets>,
     res: &Resources,
     context: &WorkerContext,
@@ -352,7 +364,7 @@ pub(super) fn stage_pack(
     progress: &super::Progress,
 ) -> horizon_client::Result<StagedPack> {
     let root = startup_root(vanilla_root, selected, server)?;
-    let root = super::mods::content_root(&root, mods_enabled, dev_mods);
+    let root = super::mods::content_root(&root, mods_enabled, dev_mods, java_content);
     progress.set(1);
     // The world's models and sprites and the GUI atlas read the same root and nothing of
     // each other: about a second each, side by side.

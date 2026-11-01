@@ -809,6 +809,11 @@ cargo run -p horizon-port-pack -- carry <work> --resources .local/horizon-client
 python3 tools/mod_port_harness.py --work <work>      # or --jars/--deps to export first
 ```
 
+The harness performs a preflight before compiling the probe and lists every missing input together:
+oracle facts, prepared 26.3 resources, the carried-mod directory, or a requested mod's `carry/` folder.
+This keeps an incomplete checkout from failing later inside Cargo or the game process with an unrelated
+subprocess error.
+
 - `tools/neoforge_oracle.py` installs a NeoForge server (21.1.259, ATM10's) under
   `.local/neoforge-oracle/`, builds the exporter mod in `mods/horizon/src/neoforge-oracle/` (our code, dev
   only), starts the server headless with the jars and writes, for every block of the mods'

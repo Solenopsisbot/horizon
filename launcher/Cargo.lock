@@ -2778,6 +2778,7 @@ dependencies = [
 name = "horizon-mods"
 version = "0.1.0"
 dependencies = [
+ "horizon-native-java",
  "horizon-shader-api",
  "log",
  "minisign-verify",
@@ -2790,10 +2791,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-native-java"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "zip",
+]
+
+[[package]]
 name = "horizon-port-pack"
 version = "0.1.0"
 dependencies = [
  "horizon-mods",
+ "horizon-native-java",
  "serde",
  "serde_json",
  "sha1",

@@ -33,12 +33,14 @@
     {
       "name": "block_changed",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::GameLevel<'_>::native_block_changed"
+      "target": "horizon_client::game::native_hooks::GameLevel<'_>::native_block_changed",
+      "vanilla": "net/minecraft/world/level/Level#setBlock"
     },
     {
       "name": "neighbor_changed",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::GameLevel<'_>::native_neighbor_changed"
+      "target": "horizon_client::game::native_hooks::GameLevel<'_>::native_neighbor_changed",
+      "vanilla": "net/minecraft/world/level/Level#neighborChanged"
     },
     {
       "name": "hud",
@@ -93,17 +95,20 @@
     {
       "name": "block_entity",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_block_entity"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_block_entity",
+      "vanilla": "net/minecraft/world/level/block/EntityBlock#newBlockEntity"
     },
     {
       "name": "block_entity_ticks",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_block_entity_ticks"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_block_entity_ticks",
+      "vanilla": "net/minecraft/world/level/block/EntityBlock#getTicker"
     },
     {
       "name": "block_entity_tick",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_block_entity_tick"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_block_entity_tick",
+      "vanilla": "net/minecraft/world/level/Level#tickBlockEntities"
     },
     {
       "name": "block_entity_container",
@@ -133,7 +138,8 @@
     {
       "name": "menu_button",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_menu_button"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_menu_button",
+      "vanilla": "net/minecraft/world/inventory/AbstractContainerMenu#clickMenuButton"
     },
     {
       "name": "register_commands",
@@ -143,7 +149,8 @@
     {
       "name": "perform_command",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_perform_command"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_perform_command",
+      "vanilla": "net/minecraft/commands/Commands#performCommand"
     },
     {
       "name": "menu_clicked",
@@ -163,52 +170,62 @@
     {
       "name": "use_item_on",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_use_item_on"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_use_item_on",
+      "vanilla": "net/minecraft/world/item/ItemStack#useOn"
     },
     {
       "name": "use_item",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_use_item"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_use_item",
+      "vanilla": "net/minecraft/world/item/Item#use"
     },
     {
       "name": "destroy_block",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_destroy_block"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_destroy_block",
+      "vanilla": "net/minecraft/server/level/ServerPlayerGameMode#destroyBlock"
     },
     {
       "name": "place_block",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_place_block"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_place_block",
+      "vanilla": "net/minecraft/world/item/BlockItem#place"
     },
     {
       "name": "right_click_block",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_right_click_block"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_right_click_block",
+      "vanilla": "net/minecraft/server/level/ServerPlayerGameMode#useItemOn"
     },
     {
       "name": "block_spread",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::GameLevel<'_>::native_block_spread"
+      "target": "horizon_client::game::native_hooks::GameLevel<'_>::native_block_spread",
+      "vanilla": "net/minecraft/world/level/material/FlowingFluid#spreadTo"
     },
     {
       "name": "piston_move",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::GameLevel<'_>::native_piston_move"
+      "target": "horizon_client::game::native_hooks::GameLevel<'_>::native_piston_move",
+      "vanilla": "net/minecraft/world/level/block/piston/PistonBaseBlock#moveBlocks"
     },
     {
       "name": "explosion_detonate",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_explosion_detonate"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_explosion_detonate",
+      "vanilla": "net/minecraft/world/level/ServerExplosion#explode"
     },
     {
       "name": "fill_bucket",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_fill_bucket"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_fill_bucket",
+      "vanilla": "net/minecraft/world/item/BucketItem#use"
     },
     {
       "name": "attack_entity",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_attack_entity"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_attack_entity",
+      "vanilla": "net/minecraft/world/entity/player/Player#attack"
     },
     {
       "name": "health_hud",
@@ -218,12 +235,14 @@
     {
       "name": "interact_entity",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_interact_entity"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_interact_entity",
+      "vanilla": "net/minecraft/world/entity/player/Player#interactOn"
     },
     {
       "name": "left_click_block",
       "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_left_click_block"
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_left_click_block",
+      "vanilla": "net/minecraft/server/level/ServerPlayerGameMode#handleBlockBreakAction"
     }
   ]
 }

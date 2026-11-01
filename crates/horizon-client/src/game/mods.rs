@@ -1,7 +1,7 @@
 //! Mods in the game (`docs/mods.md`): content mods' blocks, items, data and
 //! assets (`content_root`), and the Mods page's rows. Code mods are native
 //! (`native_hooks.rs`); WebAssembly code mods don't run any more.
-use super::Game;
+use super::{Game, execution_role::ExecutionRole};
 use horizon_client::{
     mod_list::{self, Installed},
     text::Text,
@@ -24,6 +24,7 @@ pub(super) fn content_root(
     root: &std::path::Path,
     enabled: &std::collections::BTreeSet<String>,
     dev: &[std::path::PathBuf],
+    native: &[horizon_client::mod_content::ContentMod],
 ) -> std::path::PathBuf {
     use horizon_client::mod_content::{self, ContentMod};
     use horizon_mods::{Capability, Content, Package};
@@ -31,7 +32,7 @@ pub(super) fn content_root(
     let mut paths = horizon_mods::find(&here.join(mod_list::DIR));
     paths.retain(|p| !dev.contains(p));
     paths.extend(dev.iter().cloned());
-    let mut mods: Vec<ContentMod> = Vec::new();
+    let mut mods: Vec<ContentMod> = native.to_vec();
     for path in &paths {
         let Ok(package) = Package::read(path) else {
             continue;
@@ -81,6 +82,148 @@ pub(super) fn content_root(
             root.to_owned()
         }
     }
+}
+
+/// Runs explicitly supplied Java entrypoints through the bounded native
+/// interpreter before resource workers start. Java jars are never discovered
+/// implicitly: a launcher or developer must pass `--java-mod PATH`.
+fn native_entrypoint_kinds(jar: &horizon_native_java::NativeJar) -> Vec<String> {
+    let mut kinds: Vec<String> = jar.fabric_entrypoints.keys().cloned().collect();
+    if !jar.neoforge_entrypoints.is_empty() {
+        kinds.push("neoforge".to_owned());
+    }
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
+
+fn seeded_native_host(
+    jar: &horizon_native_java::NativeJar,
+    path: &std::path::Path,
+    role: ExecutionRole,
+) -> horizon_native_java::StdHost {
+    let environment = match role {
+        ExecutionRole::Client => "CLIENT",
+        ExecutionRole::IntegratedServer | ExecutionRole::DedicatedServer => "SERVER",
+    };
+    let id = jar
+        .native_id
+        .as_deref()
+        .or(jar.fabric_id.as_deref())
+        .or(jar.neoforge_id.as_deref())
+        .or_else(|| path.file_stem().and_then(|stem| stem.to_str()));
+    let version = jar
+        .fabric_version
+        .as_deref()
+        .or(jar.neoforge_version.as_deref())
+        .unwrap_or("unknown");
+    let mut host = horizon_native_java::StdHost::new().with_environment_type(environment);
+    if let Some(id) = id {
+        host = host.with_mod(id, version);
+    }
+    for dependency in &jar.required_mods {
+        host = host.with_mod(dependency, "unknown");
+    }
+    host
+}
+
+pub(super) fn run_java_mods(
+    paths: &[PathBuf],
+    role: ExecutionRole,
+) -> Result<Vec<horizon_client::mod_content::ContentMod>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kinds: &[&str] = match role {
+        ExecutionRole::Client => &["client", "main", "neoforge"],
+        ExecutionRole::IntegratedServer | ExecutionRole::DedicatedServer => {
+            &["server", "main", "neoforge"]
+        }
+    };
+    let mut native_content = Vec::new();
+    for path in paths {
+        let jar = horizon_native_java::NativeJar::from_path(path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let (kind, entrypoints) = kinds
+            .iter()
+            .find_map(|kind| {
+                let entries = jar.discover_entrypoints(kind);
+                (!entries.is_empty()).then_some((*kind, entries))
+            })
+            .ok_or_else(|| {
+                let available = native_entrypoint_kinds(&jar);
+                let available = if available.is_empty() {
+                    "none".to_owned()
+                } else {
+                    available.join(", ")
+                };
+                let execution = match role {
+                    ExecutionRole::Client => "client",
+                    ExecutionRole::IntegratedServer | ExecutionRole::DedicatedServer => "server",
+                };
+                format!(
+                    "{}: no native Fabric or NeoForge entrypoint for {execution} execution (available: {available})",
+                    path.display(),
+                )
+            })?;
+        let mut host = seeded_native_host(&jar, path, role);
+        let mut calls = 0;
+        for entry in &entrypoints {
+            let report = jar
+                .execute(&entry.class, entry.method.as_deref(), kind, &mut host)
+                .map_err(|error| {
+                    format!("{} ({kind}, {}): {error}", path.display(), entry.class)
+                })?;
+            calls += report.calls;
+        }
+        log::info!(
+            "Horizon: native Java {} {} entrypoint(s) completed ({} host calls, {} registrations, {} listeners)",
+            path.display(),
+            entrypoints.len(),
+            calls,
+            host.registrations().len(),
+            host.listener_registrations().count(),
+        );
+        if host
+            .registrations()
+            .iter()
+            .any(|entry| entry.declaration.is_none())
+        {
+            log::warn!(
+                "Horizon: native Java {} recorded opaque registrations; typed content declarations are required before they enter live registries",
+                path.display()
+            );
+        }
+        let mut entries = host
+            .registrations()
+            .iter()
+            .filter(|entry| entry.declaration.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in &jar.native_declarations {
+            if !entries.iter().any(|existing| existing.id == entry.id) {
+                entries.push(entry.clone());
+            }
+        }
+        if !entries.is_empty() {
+            let declarations =
+                horizon_mods::native::NativeDeclarations::from_registry_entries(entries.iter())
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+            let id = jar
+                .native_id
+                .clone()
+                .or_else(|| jar.fabric_id.clone())
+                .or_else(|| {
+                    path.file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                })
+                .ok_or_else(|| format!("{}: native metadata has no mod id", path.display()))?;
+            let content = horizon_mods::Content::from_native(id.clone(), declarations)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            native_content.push(horizon_client::mod_content::ContentMod { id, content });
+        }
+    }
+    Ok(native_content)
 }
 
 /// The mods' mob effects join vanilla's (`brewing::effect`), once the root
@@ -232,7 +375,83 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::{collections::BTreeMap, io::Write};
+
+    #[test]
+    fn native_entrypoint_diagnostics_list_declared_loader_kinds() {
+        let mut jar = horizon_native_java::NativeJar::default();
+        jar.fabric_entrypoints = BTreeMap::from([
+            ("client".to_owned(), Vec::new()),
+            ("main".to_owned(), Vec::new()),
+        ]);
+        jar.neoforge_entrypoints.push("demo/NeoMod".to_owned());
+        assert_eq!(
+            native_entrypoint_kinds(&jar),
+            ["client", "main", "neoforge"]
+        );
+    }
+
+    #[test]
+    fn native_startup_seeds_own_and_required_mod_ids() {
+        let mut jar = horizon_native_java::NativeJar::default();
+        jar.fabric_id = Some("demo".into());
+        jar.fabric_version = Some("1.2.3".into());
+        jar.required_mods = vec!["fabric-api".into(), "cloth-config".into()];
+        let mut host = seeded_native_host(
+            &jar,
+            std::path::Path::new("demo.jar"),
+            ExecutionRole::Client,
+        );
+        let loader = horizon_native_java::Value::Ref(Some("fabric-loader".into()));
+        let loaded = horizon_native_java::MethodRef {
+            owner: "net/fabricmc/loader/api/FabricLoader".into(),
+            name: "isModLoaded".into(),
+            descriptor: "(Ljava/lang/String;)Z".into(),
+        };
+        for id in ["demo", "fabric-api", "cloth-config"] {
+            assert_eq!(
+                horizon_native_java::Host::invoke_instance(
+                    &mut host,
+                    &loaded,
+                    &loader,
+                    &[horizon_native_java::Value::Ref(Some(id.into()))],
+                )
+                .unwrap(),
+                horizon_native_java::Value::Int(1)
+            );
+        }
+    }
+
+    #[test]
+    fn native_startup_seeds_neoforge_identity_and_dependencies() {
+        let mut jar = horizon_native_java::NativeJar::default();
+        jar.neoforge_id = Some("ruby".into());
+        jar.neoforge_version = Some("1.2.3".into());
+        jar.required_mods = vec!["geckolib".into()];
+        let mut host = seeded_native_host(
+            &jar,
+            std::path::Path::new("ruby.jar"),
+            ExecutionRole::DedicatedServer,
+        );
+        let loader = horizon_native_java::Value::Ref(Some("fabric-loader".into()));
+        let loaded = horizon_native_java::MethodRef {
+            owner: "net/fabricmc/loader/api/FabricLoader".into(),
+            name: "isModLoaded".into(),
+            descriptor: "(Ljava/lang/String;)Z".into(),
+        };
+        for id in ["ruby", "geckolib"] {
+            assert_eq!(
+                horizon_native_java::Host::invoke_instance(
+                    &mut host,
+                    &loaded,
+                    &loader,
+                    &[horizon_native_java::Value::Ref(Some(id.into()))],
+                )
+                .unwrap(),
+                horizon_native_java::Value::Int(1)
+            );
+        }
+    }
 
     /// A minimal `.hnmod` the registry accepts: its manifest and its mixin's.
     fn hnmod(dir: &std::path::Path, id: &str) {
@@ -285,5 +504,18 @@ mod tests {
         // No folder: no rows.
         assert!(not_built(&dir.join("missing"), "", &[]).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_java_mod_errors_name_the_jar() {
+        let path = std::env::temp_dir().join(format!(
+            "horizon-native-java-invalid-{}-{}.jar",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, b"not a jar").unwrap();
+        let error = run_java_mods(std::slice::from_ref(&path), ExecutionRole::Client).unwrap_err();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        std::fs::remove_file(path).unwrap();
     }
 }

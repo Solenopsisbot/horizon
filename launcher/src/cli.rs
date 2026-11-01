@@ -2268,6 +2268,40 @@ fn mods(action: ModsCmd, as_json: bool) -> Result<(), String> {
             for line in &c.skipped {
                 println!("  doesn't: {line}");
             }
+            if let Some(native) = &c.native {
+                let activity = if native.registrations == 0 && native.listeners == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        ", {} registrations, {} listeners",
+                        native.registrations, native.listeners
+                    )
+                };
+                match (&native.kind, &native.entrypoint, &native.error) {
+                    (Some(kind), Some(entrypoint), None) => println!(
+                        "  native: {entrypoint} ({kind}) completed ({} host calls{activity})",
+                        native.calls,
+                    ),
+                    (Some(kind), Some(entrypoint), Some(error)) => {
+                        println!("  native: {entrypoint} ({kind}) stopped: {error}{activity}")
+                    }
+                    (None, Some(entrypoint), None) => println!(
+                        "  native: {entrypoint} completed ({} host calls{activity})",
+                        native.calls,
+                    ),
+                    (None, Some(entrypoint), Some(error)) => {
+                        println!("  native: {entrypoint} stopped: {error}{activity}")
+                    }
+                    (Some(kind), None, Some(error)) => {
+                        println!("  native: {kind} unavailable: {error}{activity}")
+                    }
+                    (Some(kind), None, None) => {
+                        println!("  native: {kind} has no entrypoint{activity}")
+                    }
+                    (None, None, Some(error)) => println!("  native: unavailable: {error}"),
+                    (None, None, None) => println!("  native: no entrypoint"),
+                }
+            }
         }
         ModsCmd::Install {
             project,

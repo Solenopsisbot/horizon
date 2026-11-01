@@ -1960,6 +1960,21 @@ mod tests {
                 version > 0 && contracts.insert((name, version)),
                 "invalid or duplicate hook: {name} v{version}"
             );
+            // The vanilla method, when the catalog names one: `class#method`,
+            // never a descriptor (the census joins it to Mixin targets).
+            if let Some(vanilla) = hook["vanilla"].as_str() {
+                let (class, method) = vanilla
+                    .split_once('#')
+                    .unwrap_or_else(|| panic!("{name}: vanilla is not class#method: {vanilla}"));
+                assert!(
+                    class.starts_with("net/minecraft/"),
+                    "{name}: vanilla class is not a game class: {class}"
+                );
+                assert!(
+                    !method.is_empty() && !method.contains('('),
+                    "{name}: vanilla method is not a bare name: {method}"
+                );
+            }
             names.insert(name);
             let owner = if level_hooks.contains(name) {
                 "GameLevel"

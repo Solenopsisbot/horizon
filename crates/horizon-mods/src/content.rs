@@ -176,14 +176,14 @@ pub struct MobEffect {
     pub color: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Source {
     Dir(PathBuf),
     Zip(PathBuf),
 }
 
 /// A mod's content: its files and declarations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Content {
     source: Source,
     /// Every content file (`assets/...`, `data/...`), sorted.
@@ -294,6 +294,36 @@ impl Content {
     /// No files: a mod with code only.
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
+            && self.blocks.is_empty()
+            && self.items.is_empty()
+            && self.effects.is_empty()
+    }
+
+    /// Builds the declaration-only content half of a native Java mod.
+    ///
+    /// The resulting content has no source files, but it participates in the
+    /// same resource-root planning as a packaged `.hmod`. Custom registry
+    /// kinds stay outside this vocabulary until Horizon has a typed adapter
+    /// for them.
+    pub fn from_native(
+        id: impl Into<String>,
+        declarations: crate::native::NativeDeclarations,
+    ) -> Result<Self, String> {
+        let id = id.into();
+        if !declarations.custom.is_empty() {
+            return Err(format!(
+                "native mod {id} has {} unsupported custom registrations",
+                declarations.custom.len()
+            ));
+        }
+        Ok(Self {
+            source: Source::Dir(PathBuf::new()),
+            files: Vec::new(),
+            blocks: declarations.blocks,
+            items: declarations.items,
+            effects: declarations.effects,
+            namespaces: vec![id],
+        })
     }
 
     /// One content file's bytes.

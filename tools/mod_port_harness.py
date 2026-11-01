@@ -36,6 +36,40 @@ CHECKS = ['blocks', 'properties', 'sounds', 'shapes', 'drops', 'placement', 'tag
 EXAMPLES = 8
 
 
+def preflight(work, resources, facts, requested_mods=()):
+    """Validate the files the harness needs before building or launching a probe.
+
+    Return the selected mod ids.  Reporting every missing input together keeps a
+    clean checkout from failing later inside Cargo or the game binary with a
+    misleading subprocess error.
+    """
+    work = Path(work)
+    resources = Path(resources)
+    facts = Path(facts)
+    errors = []
+    if not facts.is_file():
+        errors.append(f'oracle facts not found: {facts} (run with --jars or export them first)')
+    if not resources.is_dir():
+        errors.append(f'prepared resources not found: {resources} (pass --resources or prepare 26.3 data)')
+    mods_root = work / 'mods'
+    if not mods_root.is_dir():
+        errors.append(f'mod work folder not found: {mods_root}')
+        selected = []
+    else:
+        selected = list(requested_mods) or sorted(
+            p.name for p in mods_root.iterdir() if (p / 'carry').is_dir()
+        )
+        if not selected:
+            errors.append(f'no carried mods found under {mods_root}')
+        for mod in selected:
+            carry = mods_root / mod / 'carry'
+            if not carry.is_dir():
+                errors.append(f'{mod}: carry directory not found: {carry}')
+    if errors:
+        raise SystemExit('mod-port harness preflight failed:\n- ' + '\n- '.join(errors))
+    return selected
+
+
 def key(k):
     return ','.join(sorted(p for p in k.split(',') if p))
 
@@ -235,8 +269,7 @@ def main():
         if args.deps:
             command += ['--deps', args.deps]
         subprocess.run(command, check=True)
-    if not facts.exists():
-        sys.exit(f'{facts}: no oracle facts (run with --jars, or tools/neoforge_oracle.py export)')
+    mods = preflight(work, args.resources, facts, args.mods)
     subprocess.run(['cargo', 'build', '--release', '-q', '-p', 'horizon-client', '--example', 'mod_port_probe'],
                    cwd=ROOT, check=True)
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'],
@@ -244,7 +277,6 @@ def main():
     probe = Path(metadata['target_directory']) / 'release/examples/mod_port_probe'
     oracle = json.loads(facts.read_text())
     old_items = set(oracle.get('vanilla_items', []))
-    mods = args.mods or sorted(p.name for p in (work / 'mods').iterdir() if (p / 'carry').is_dir())
     rows = []
     for mod in mods:
         # One mod at a time: each against vanilla, as a player adding it would load it (and a pack's

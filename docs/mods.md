@@ -8,7 +8,9 @@ Two kinds of mod run in Horizon:
 | **Native mod** | `.hnmod` | A [horizon-mixins](https://github.com/horizon-rust/horizon-mixins) bundle: Rust that changes the game's own source before it is compiled. | In a game the launcher builds for the player ([native-mods.md](native-mods.md)) |
 
 Fabric and NeoForge jars do **not** run as they are: their code calls and patches Minecraft's Java classes, and
-Horizon has none. What carries over is the data and assets inside a jar ([modpacks.md](modpacks.md)).
+Horizon has none. What carries over is the data and assets inside a jar ([modpacks.md](modpacks.md)). The design
+for closing that gap, by supplying those classes and running the jar against them, is
+[java-mod-compat.md](java-mod-compat.md); none of it is built.
 
 Mods are **off by default**. A fresh install has no `horizon-mods` folder and plays exactly like vanilla 26.3.
 

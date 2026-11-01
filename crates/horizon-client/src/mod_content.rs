@@ -27,6 +27,7 @@ use std::{
 };
 
 /// A content mod to put in the root: its id and content.
+#[derive(Clone, Debug)]
 pub struct ContentMod {
     pub id: String,
     pub content: Content,
@@ -1710,6 +1711,15 @@ fn stamp(base: &Path, mods: &[ContentMod]) -> Result<String> {
         if source.is_dir() {
             for file in &m.content.files {
                 parts.push(meta(&source.join(file))?);
+            }
+            // Native Java declarations have no on-disk content source. Keep
+            // their typed values in the stamp so changing a declaration
+            // invalidates the overlay just like changing a packaged file.
+            if m.content.files.is_empty() && source.as_os_str().is_empty() {
+                parts.push(format!(
+                    "native declarations: blocks={:?}; items={:?}; effects={:?}",
+                    m.content.blocks, m.content.items, m.content.effects
+                ));
             }
         } else {
             parts.push(meta(source)?);

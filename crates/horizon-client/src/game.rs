@@ -398,6 +398,11 @@ struct Options {
     benchmark: Option<String>,
     /// `--dev-mod PATH` (repeatable): content mods always on.
     dev_mods: Vec<PathBuf>,
+    /// `--java-mod PATH` (repeatable): run a bounded Fabric/NeoForge entrypoint
+    /// natively during startup. This is explicit and never scans the mods folder.
+    java_mods: Vec<PathBuf>,
+    /// Typed content declarations exported by explicitly loaded Java jars.
+    java_content: Arc<Vec<horizon_client::mod_content::ContentMod>>,
     /// Single player runs on an integrated server thread (game/integrated.rs),
     /// as vanilla's does: the default. `--in-frame` (or `--no-server-thread`,
     /// or `HORIZON_SERVER_THREAD=0`) runs the world in the frame instead.
@@ -533,6 +538,8 @@ impl Options {
             dedicated: None,
             benchmark: None,
             dev_mods: Vec::new(),
+            java_mods: Vec::new(),
+            java_content: Arc::new(Vec::new()),
             server_thread: std::env::var("HORIZON_SERVER_THREAD").map_or(true, |v| {
                 let on = v != "0";
                 if !on {
@@ -551,7 +558,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..128 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --session-stdin         The same account as JSON on standard input\n  --game-dir DIR          Game folder: saves, options.txt, packs, mods (default: the working directory)\n  --home DIR              Logs and crash reports (default $HORIZON_HOME, else the platform data folder)\n  --fullscreen            Open the window fullscreen\n  --launch-api            Print the Launch API version and options as JSON (docs/api/launch.md)\n  --dev-mod PATH          A content mod (.hmod or folder) to develop: always on\n  --in-frame              DEPRECATED, do not use: unsupported, will be removed soon (also --no-server-thread)\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
+                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..128 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --session-stdin         The same account as JSON on standard input\n  --game-dir DIR          Game folder: saves, options.txt, packs, mods (default: the working directory)\n  --home DIR              Logs and crash reports (default $HORIZON_HOME, else the platform data folder)\n  --fullscreen            Open the window fullscreen\n  --launch-api            Print the Launch API version and options as JSON (docs/api/launch.md)\n  --dev-mod PATH          A content mod (.hmod or folder) to develop: always on\n  --java-mod PATH         Run a bounded Fabric/NeoForge Java entrypoint natively (repeatable)\n  --in-frame              DEPRECATED, do not use: unsupported, will be removed soon (also --no-server-thread)\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
                         horizon_core::VANILLA_VERSION
                     );
                     return Ok(None);
@@ -634,6 +641,7 @@ impl Options {
                             // main has made it the game home already (logging::set_game_home).
                             "--home" => {}
                             "--dev-mod" => o.dev_mods.push(std::path::absolute(&value)?),
+                            "--java-mod" => o.java_mods.push(std::path::absolute(&value)?),
                             "--benchmark" => {
                                 if horizon_client::benchmark::scenes(&value).is_none() {
                                     return Err(format!(
@@ -17565,6 +17573,10 @@ pub fn run() -> Result<()> {
         }
         return Err(error.into());
     }
+    options.java_content = Arc::new(
+        mods::run_java_mods(&options.java_mods, options.execution_role)
+            .map_err(|error| format!("native Java mod startup failed: {error}"))?,
+    );
     // Someone is playing: the anonymous ping behind the launcher's "N playing now", and the
     // official server in their list (servers.dat in the game folder, the working directory). Not
     // for a server, a benchmark, a run that quits by itself, a harness's fixture or a run that
@@ -17602,6 +17614,7 @@ pub fn run() -> Result<()> {
         &options.resources,
         &early_settings.mods.enabled,
         &options.dev_mods,
+        &options.java_content,
     );
     let loaded = load_resources(
         options.resources.clone(),

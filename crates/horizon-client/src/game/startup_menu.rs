@@ -241,6 +241,7 @@ pub(super) fn spawn_loader(
     let settings = settings.clone();
     let vanilla_root = vanilla_root.to_path_buf();
     let dev_mods = options.dev_mods.clone();
+    let java_content = options.java_content.clone();
     let progress = progress.clone();
     let handle = std::thread::Builder::new()
         .name("resource-loader".into())
@@ -251,7 +252,7 @@ pub(super) fn spawn_loader(
                     pack_error = Some(error.to_string());
                     vanilla_root.clone()
                 });
-            let root = mods::content_root(&root, &settings.mods.enabled, &dev_mods);
+            let root = mods::content_root(&root, &settings.mods.enabled, &dev_mods, &java_content);
             let result = load_resources(
                 root,
                 &vanilla_root,

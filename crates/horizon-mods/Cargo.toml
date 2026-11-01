@@ -12,6 +12,7 @@ serde_json = "1"
 toml = "1.1.6"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 log = "0.4"
+horizon-native-java = { path = "../horizon-native-java" }
 # The functions a published WebAssembly mod imports, for its API level (src/api_level.rs): the registry index.
 wasmparser = { version = "0.254", optional = true }
 # The registry index's checks (feature `index`): SHA-256, and minisign signatures (no dependencies of its own).
