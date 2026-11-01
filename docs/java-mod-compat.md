@@ -281,11 +281,13 @@ bounded coordinate-keyed maps also preserve `setBlock`, `setBlockAndUpdate`, `se
 `removeBlock` writes within the façade instance, so a registration callback can observe its own world
 mutation sequence. The maps remain callback-local until the native level handle is wired through the game
 boundary; they do not replace Horizon's authoritative world state.
-`Entity` now retains position, a level handle, a stable UUID marker, and a bounded bounding-box/on-ground
-state; `getX`/`getY`/`getZ`, `position`, `blockPosition`, `level`, `isAlive`, `getUUID`,
-`getBoundingBox`, `setBoundingBox`, and `isOnGround` preserve common entity-inspection and collision
-setup paths. The box and ground flag are façade-local values until the native entity boundary wires live
-physics updates through them; player mutation and synchronization remain native-boundary work.
+`Entity` now retains position, delta movement, a level handle, a stable UUID marker, and a bounded
+bounding-box/on-ground state; `getX`/`getY`/`getZ`, both `setPos` overloads, `position`,
+`getDeltaMovement`, both `setDeltaMovement` overloads, `distanceTo`/`distanceToSqr`, `blockPosition`,
+`level`, `isAlive`, `getUUID`, `getBoundingBox`, `setBoundingBox`, and `isOnGround` preserve common
+entity-inspection, movement, and collision setup paths. The box, motion, and ground flag are façade-local
+values until the native entity boundary wires live physics updates through them; player mutation and
+synchronization remain native-boundary work.
 `BlockEntity` now retains its block position, level, block state, and removed flag. `getBlockPos`,
 `getLevel`, `hasLevel`, `getBlockState`, `isRemoved`, `setRemoved`, `setChanged`, and `getUpdateTag`
 keep common block-entity registration and synchronization code linked. `saveAdditional` and `load` now
@@ -369,6 +371,18 @@ and reports the attempted `entrypoints`, seeded mod ids, call count, recorded re
 content-port result, so a client-only or server-only jar is diagnosed without an extra command.
 When the CLI kind argument is omitted, it makes the same ordered discovery attempt; passing `main`, `client`,
 `server`, or `neoforge` keeps selection strict for reproducible diagnostics.
+
+The compiled smoke regression exercises this path without a Minecraft installation or `.local` data:
+
+```sh
+python3 tools/native_java_smoke.py
+```
+
+The script uses `javac` to compile two ordinary Java classes and a tiny NeoForge `@Mod` annotation,
+packages real Fabric and NeoForge metadata, and checks that the native runner discovers and executes both
+Fabric `main` entrypoints plus the NeoForge constructor. It therefore catches classfile, metadata,
+annotation, and multi-entrypoint regressions that an in-memory Rust fixture cannot; the full mod-port
+harness remains the check that needs prepared vanilla resources.
 
 The game has an explicit `--java-mod <jar>` startup option for this bounded path. It runs the selected
 Fabric or NeoForge entrypoint before resource workers start, records host calls and registration intent,
@@ -659,13 +673,15 @@ state construction and inspection while the registry-backed state definition and
 remain follow-up work.
 `TagKey` now retains its registry key and identifier as a value pair: `create`, `location`, `registry`,
 `isFor`, equality, hashing, and string conversion operate on those fields. This keeps tag-backed block,
-item, and entity registration code from collapsing distinct tags into one neutral object; holder lookup and
-live registry membership remain outside the bounded façade.
+item, and entity registration code from collapsing distinct tags into one neutral object; holder-set
+resolution and live cross-mod membership remain outside the bounded façade.
 `ResourceKey` exposes the corresponding `location`, `registry`, `registryKey`, and `isFor` value operations,
 so code that compares a registry family or resolves an entry's identifier keeps its namespace/path identity
 through the generated façade. Generated `Registry`/`DefaultedRegistry` values now retain bounded
-identifier-to-object entries for `register`, `containsKey`, `get`, `getOptional`, and reverse `getKey`
-queries, so bootstrap code can observe the registrations it just made. The live native registry sink still
+identifier-to-object entries plus each entry's `ResourceKey` for `register`, `containsKey`, `get`,
+`getOptional`, reverse `getKey`, and `getResourceKey` queries, so bootstrap code can observe the
+registrations it just made without losing registry-family identity. `registerForHolder` updates the same
+bounded table and binds the returned holder to that key/value pair. The live native registry sink still
 owns cross-mod membership and final table construction.
 NeoForge capability bootstrap now has the same bounded value layer: `CapabilityManager.get` returns a
 registered `Capability`, `CapabilityToken` preserves the generic lookup shape, `LazyOptional` supports

@@ -544,11 +544,13 @@ pub fn generate_many(
                     "import net.minecraft.resources.*;\n",
                     "public class Registry<T> {\n",
                     "    protected final Map<Identifier,Object> horizonEntries = new LinkedHashMap<>();\n",
-                    "    public <V> V register(ResourceKey<V> key, Identifier id, V value) { horizonEntries.put(id, value); return value; }\n",
+                    "    protected final Map<Identifier,ResourceKey> horizonKeys = new LinkedHashMap<>();\n",
+                    "    public <V> V register(ResourceKey<V> key, Identifier id, V value) { horizonEntries.put(id, value); horizonKeys.put(id, key); return value; }\n",
                     "    public boolean containsKey(Identifier id) { return horizonEntries.containsKey(id); }\n",
                     "    @SuppressWarnings(\"unchecked\") public T get(Identifier id) { return (T) horizonEntries.get(id); }\n",
                     "    public Optional<T> getOptional(Identifier id) { return Optional.ofNullable(get(id)); }\n",
                     "    public Identifier getKey(Object value) { for (Map.Entry<Identifier,Object> e : horizonEntries.entrySet()) if (Objects.equals(e.getValue(), value)) return e.getKey(); return null; }\n",
+                    "    public Optional<ResourceKey> getResourceKey(Object value) { Identifier id = getKey(value); return id == null ? Optional.empty() : Optional.ofNullable(horizonKeys.get(id)); }\n",
                     "}\n",
                 ),
             ),
@@ -1058,7 +1060,7 @@ fn render(
     ) {
         let _ = writeln!(
             out,
-            "    protected final java.util.Map<net.minecraft.resources.Identifier, Object> horizonEntries = new java.util.LinkedHashMap<>();"
+            "    protected final java.util.Map<net.minecraft.resources.Identifier, Object> horizonEntries = new java.util.LinkedHashMap<>();\n    protected final java.util.Map<net.minecraft.resources.Identifier, net.minecraft.resources.ResourceKey> horizonKeys = new java.util.LinkedHashMap<>();"
         );
     }
     let holder_impl = class.name.starts_with("net/minecraft/core/Holder$") && !is_interface;
@@ -1143,7 +1145,7 @@ fn render(
     if class.name == "net/minecraft/world/entity/Entity" {
         let _ = writeln!(
             out,
-            "    protected double horizonX;\n    protected double horizonY;\n    protected double horizonZ;\n    protected net.minecraft.world.level.Level horizonLevel = new net.minecraft.world.level.Level();\n    protected java.util.UUID horizonUuid = new java.util.UUID(0L, 0L);\n    protected net.minecraft.world.phys.AABB horizonBoundingBox = new net.minecraft.world.phys.AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);\n    protected boolean horizonOnGround;"
+            "    protected double horizonX;\n    protected double horizonY;\n    protected double horizonZ;\n    protected double horizonDeltaX;\n    protected double horizonDeltaY;\n    protected double horizonDeltaZ;\n    protected net.minecraft.world.level.Level horizonLevel = new net.minecraft.world.level.Level();\n    protected java.util.UUID horizonUuid = new java.util.UUID(0L, 0L);\n    protected net.minecraft.world.phys.AABB horizonBoundingBox = new net.minecraft.world.phys.AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);\n    protected boolean horizonOnGround;"
         );
     }
     if class.name == "net/minecraft/world/entity/Mob" {
@@ -1996,10 +1998,11 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             if descriptor
                 .starts_with("(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/ResourceKey;")
             {
-                return "p0.horizonEntries.put(p1.location(), p2); return p2;".to_owned();
+                return "p0.horizonEntries.put(p1.location(), p2); p0.horizonKeys.put(p1.location(), p1); return p2;".to_owned();
             }
             if descriptor.starts_with("(Lnet/minecraft/resources/ResourceKey;") {
-                return "horizonEntries.put(p1, p2); return p2;".to_owned();
+                return "horizonEntries.put(p1, p2); horizonKeys.put(p1, p0); return p2;"
+                    .to_owned();
             }
             return "return p2;".to_owned();
         }
@@ -2019,7 +2022,7 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             return "for (java.util.Map.Entry<net.minecraft.resources.Identifier,Object> e : horizonEntries.entrySet()) if (java.util.Objects.equals(e.getValue(), p0)) return e.getKey(); return null;".to_owned();
         }
         if method == "getResourceKey" && ret == "java.util.Optional" {
-            return "net.minecraft.resources.Identifier id = getKey(p0); return id == null ? java.util.Optional.empty() : java.util.Optional.of(new net.minecraft.resources.ResourceKey(new net.minecraft.resources.Identifier(), id));".to_owned();
+            return "net.minecraft.resources.Identifier id = getKey(p0); return id == null ? java.util.Optional.empty() : java.util.Optional.ofNullable(horizonKeys.get(id));".to_owned();
         }
     }
     if class == "net/minecraft/resources/RegistryValidator"
@@ -2066,9 +2069,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         if descriptor.starts_with(
             "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/resources/Identifier;"
         ) {
-            return "net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(p3, p1, p2); return holder;".to_owned();
+            return "p0.horizonEntries.put(p2, p3); p0.horizonKeys.put(p2, p1); net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(p3, p1, p2); return holder;".to_owned();
         }
-        return "net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(p2, p0, p1); return holder;".to_owned();
+        return "horizonEntries.put(p1, p2); horizonKeys.put(p1, p0); net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(p2, p0, p1); return holder;".to_owned();
     }
     if class.starts_with("net/minecraft/core/Holder$") {
         match (method, ret) {
@@ -2530,9 +2533,40 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("getX", "double", "()D") => return "return horizonX;".to_owned(),
             ("getY", "double", "()D") => return "return horizonY;".to_owned(),
             ("getZ", "double", "()D") => return "return horizonZ;".to_owned(),
+            ("setPos", "void", "(DDD)V") => {
+                return "horizonX = p0; horizonY = p1; horizonZ = p2;".to_owned();
+            }
+            ("setPos", "void", "(Lnet/minecraft/world/phys/Vec3;)V") => {
+                return "if (p0 != null) { horizonX = p0.x(); horizonY = p0.y(); horizonZ = p0.z(); }"
+                    .to_owned();
+            }
             ("position", "net.minecraft.world.phys.Vec3", "()Lnet/minecraft/world/phys/Vec3;") => {
                 return "return new net.minecraft.world.phys.Vec3(horizonX, horizonY, horizonZ);"
                     .to_owned();
+            }
+            (
+                "getDeltaMovement",
+                "net.minecraft.world.phys.Vec3",
+                "()Lnet/minecraft/world/phys/Vec3;",
+            ) => {
+                return "return new net.minecraft.world.phys.Vec3(horizonDeltaX, horizonDeltaY, horizonDeltaZ);"
+                    .to_owned();
+            }
+            ("setDeltaMovement", "void", "(DDD)V") => {
+                return "horizonDeltaX = p0; horizonDeltaY = p1; horizonDeltaZ = p2;".to_owned();
+            }
+            ("setDeltaMovement", "void", "(Lnet/minecraft/world/phys/Vec3;)V") => {
+                return "if (p0 != null) { horizonDeltaX = p0.x(); horizonDeltaY = p0.y(); horizonDeltaZ = p0.z(); }"
+                    .to_owned();
+            }
+            ("distanceToSqr", "double", "(Lnet/minecraft/world/entity/Entity;)D") => {
+                return "double dx = horizonX - p0.getX(); double dy = horizonY - p0.getY(); double dz = horizonZ - p0.getZ(); return dx * dx + dy * dy + dz * dz;".to_owned();
+            }
+            ("distanceToSqr", "double", "(DDD)D") => {
+                return "double dx = horizonX - p0; double dy = horizonY - p1; double dz = horizonZ - p2; return dx * dx + dy * dy + dz * dz;".to_owned();
+            }
+            ("distanceTo", "float", "(Lnet/minecraft/world/entity/Entity;)F") => {
+                return "return (float) Math.sqrt(distanceToSqr(p0));".to_owned();
             }
             ("blockPosition", "net.minecraft.core.BlockPos", "()Lnet/minecraft/core/BlockPos;") => {
                 return "return new net.minecraft.core.BlockPos((int) Math.floor(horizonX), (int) Math.floor(horizonY), (int) Math.floor(horizonZ));".to_owned();
@@ -2557,6 +2591,7 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("isOnGround", "boolean", "()Z") | ("onGround", "boolean", "()Z") => {
                 return "return horizonOnGround;".to_owned();
             }
+            ("setOnGround", "void", "(Z)V") => return "horizonOnGround = p0;".to_owned(),
             _ => {}
         }
     }
@@ -3392,7 +3427,7 @@ mod tests {
                 "registerForHolder",
                 "net.minecraft.core.Holder.Reference"
             ),
-            "net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(p2, p0, p1); return holder;"
+            "horizonEntries.put(p1, p2); horizonKeys.put(p1, p0); net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(p2, p0, p1); return holder;"
         );
         assert_eq!(
             runtime_body(
@@ -3452,7 +3487,7 @@ mod tests {
                 "getResourceKey",
                 "java.util.Optional"
             ),
-            "net.minecraft.resources.Identifier id = getKey(p0); return id == null ? java.util.Optional.empty() : java.util.Optional.of(new net.minecraft.resources.ResourceKey(new net.minecraft.resources.Identifier(), id));"
+            "net.minecraft.resources.Identifier id = getKey(p0); return id == null ? java.util.Optional.empty() : java.util.Optional.ofNullable(horizonKeys.get(id));"
         );
         assert_eq!(
             runtime_field_default(
@@ -4298,7 +4333,38 @@ mod tests {
                 "net.minecraft.core.Holder.Reference",
                 "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;",
             ),
-            "net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(p3, p1, p2); return holder;"
+            "p0.horizonEntries.put(p2, p3); p0.horizonKeys.put(p2, p1); net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(p3, p1, p2); return holder;"
+        );
+    }
+
+    #[test]
+    fn registry_resource_key_lookup_keeps_registration_identity() {
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/Registry",
+                "register",
+                "java.lang.Object",
+                "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/ResourceKey;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            "p0.horizonEntries.put(p1.location(), p2); p0.horizonKeys.put(p1.location(), p1); return p2;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/Registry",
+                "register",
+                "java.lang.Object",
+                "(Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            "horizonEntries.put(p1, p2); horizonKeys.put(p1, p0); return p2;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/Registry",
+                "getResourceKey",
+                "java.util.Optional",
+                "(Ljava/lang/Object;)Ljava/util/Optional;",
+            ),
+            "net.minecraft.resources.Identifier id = getKey(p0); return id == null ? java.util.Optional.empty() : java.util.Optional.ofNullable(horizonKeys.get(id));"
         );
     }
 
@@ -4630,6 +4696,24 @@ mod tests {
                     kind: MemberKind::Method,
                 },
                 Declared {
+                    name: "setPos".to_owned(),
+                    descriptor: "(DDD)V".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
+                    name: "getDeltaMovement".to_owned(),
+                    descriptor: "()Lnet/minecraft/world/phys/Vec3;".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
+                    name: "setDeltaMovement".to_owned(),
+                    descriptor: "(DDD)V".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
                     name: "position".to_owned(),
                     descriptor: "()Lnet/minecraft/world/phys/Vec3;".to_owned(),
                     access: 0x0001,
@@ -4679,6 +4763,12 @@ mod tests {
             &class,
             Some(&BTreeSet::from([
                 ("getX".to_owned(), "()D".to_owned()),
+                ("setPos".to_owned(), "(DDD)V".to_owned()),
+                (
+                    "getDeltaMovement".to_owned(),
+                    "()Lnet/minecraft/world/phys/Vec3;".to_owned(),
+                ),
+                ("setDeltaMovement".to_owned(), "(DDD)V".to_owned()),
                 (
                     "position".to_owned(),
                     "()Lnet/minecraft/world/phys/Vec3;".to_owned(),
@@ -4710,6 +4800,7 @@ mod tests {
             &[],
         );
         assert!(source.contains("protected double horizonX;"));
+        assert!(source.contains("protected double horizonDeltaX;"));
         assert!(source.contains("protected net.minecraft.world.level.Level horizonLevel"));
         assert!(source.contains("horizonBoundingBox"));
         assert!(source.contains("horizonOnGround"));
@@ -4721,6 +4812,60 @@ mod tests {
                 "()D"
             ),
             "return horizonX;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "setPos",
+                "void",
+                "(DDD)V",
+            ),
+            "horizonX = p0; horizonY = p1; horizonZ = p2;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "setPos",
+                "void",
+                "(Lnet/minecraft/world/phys/Vec3;)V",
+            ),
+            "if (p0 != null) { horizonX = p0.x(); horizonY = p0.y(); horizonZ = p0.z(); }"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getDeltaMovement",
+                "net.minecraft.world.phys.Vec3",
+                "()Lnet/minecraft/world/phys/Vec3;",
+            ),
+            "return new net.minecraft.world.phys.Vec3(horizonDeltaX, horizonDeltaY, horizonDeltaZ);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "setDeltaMovement",
+                "void",
+                "(DDD)V",
+            ),
+            "horizonDeltaX = p0; horizonDeltaY = p1; horizonDeltaZ = p2;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "distanceToSqr",
+                "double",
+                "(Lnet/minecraft/world/entity/Entity;)D",
+            ),
+            "double dx = horizonX - p0.getX(); double dy = horizonY - p0.getY(); double dz = horizonZ - p0.getZ(); return dx * dx + dy * dy + dz * dz;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "distanceTo",
+                "float",
+                "(Lnet/minecraft/world/entity/Entity;)F",
+            ),
+            "return (float) Math.sqrt(distanceToSqr(p0));"
         );
         assert_eq!(
             runtime_body_with_descriptor(
