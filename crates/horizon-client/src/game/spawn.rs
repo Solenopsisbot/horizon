@@ -30,6 +30,19 @@ const NO_SESSION: &str =
 /// (`NO_SESSION`): Horizon follows Mojang's rules there.
 const OFFLINE_BOTS: bool = true;
 
+/// The tables a game builds for itself (entity and frame models, the creative inventory),
+/// loaded once for every player the process spawns: each gets a clone, whose heavy parts are
+/// shared, instead of parsing the entity models again (20-30 MB of work each).
+static CPU_TEMPLATE: Mutex<Option<super::GameCpuResources>> = Mutex::new(None);
+
+fn cpu_template(root: &Path) -> Result<super::GameCpuResources> {
+    let mut template = CPU_TEMPLATE.lock().unwrap_or_else(|e| e.into_inner());
+    if template.is_none() {
+        *template = Some(super::GameCpuResources::load(root)?);
+    }
+    Ok(template.as_ref().map(Clone::clone).expect("loaded above"))
+}
+
 /// The names of the players spawned in this process and still playing.
 static PLAYING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
@@ -108,6 +121,7 @@ impl Game<'_> {
             options.distance_override = Some(distance.clamp(2, 32));
         }
         let (res, pack, settings) = (self.res.clone(), self.pack.clone(), self.settings.clone());
+        let cpu = cpu_template(&options.resources)?;
         let vanilla_root = self.ui.vanilla_root.clone();
         let thread_name = name.clone();
         let started = std::thread::Builder::new()
@@ -128,7 +142,7 @@ impl Game<'_> {
                         Instant::now(),
                         None,
                         Some(settings),
-                        None,
+                        Some(cpu),
                     )?
                     else {
                         return Ok(());

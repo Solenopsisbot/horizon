@@ -281,6 +281,7 @@ impl Minecart {
         (total * 14.0).floor() as i32 + i32::from(total > 0.0)
     }
 }
+#[derive(Clone)]
 pub(super) struct CartModels {
     pub models: HashMap<CartKind, Part>,
 }

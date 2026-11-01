@@ -22,7 +22,7 @@ pub(super) struct Variant {
     pub author: Option<serde_json::Value>,
 }
 /// Variants by id plus the `#minecraft:placeable` list.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct PaintingVariants {
     pub all: Vec<Variant>,
     pub placeable: Vec<Arc<str>>,

@@ -65,10 +65,14 @@ struct SearchEntry {
     /// Item tags as (namespace, path), lower-cased.
     tags: Vec<(String, String)>,
 }
+/// The heavy lists (the exported tabs and search entries, and the tabs and search results
+/// built from them) are shared: a headless game's spawned players (#4952) clone one
+/// `Creative` instead of each loading its own, and a player whose permissions change
+/// rebuilds into lists of its own (`rebuild`).
 pub struct Creative {
     /// The tabs shown (`CreativeModeTabs.tabs()`), with the stacks the current
     /// permissions put in them.
-    pub tabs: Vec<Tab>,
+    pub tabs: Arc<Vec<Tab>>,
     pub selected: usize,
     /// The page of tabs shown.
     pub page: u32,
@@ -79,18 +83,37 @@ pub struct Creative {
     /// CreativeModeInventoryScreen's search box: an unbordered `EditBox` of 50.
     pub search: EditBox,
     /// The search tab's stacks, in its display order.
-    search_items: Vec<ItemStack>,
-    search_index: Vec<SearchEntry>,
+    search_items: Arc<Vec<ItemStack>>,
+    search_index: Arc<Vec<SearchEntry>>,
     /// Every exported tab, and the search tab's stacks with their entries and
     /// whether only permissions list them: `rebuild` keeps what is shown.
-    exported: Vec<Exported>,
-    exported_search: Vec<(ItemStack, SearchEntry, bool)>,
+    exported: Arc<Vec<Exported>>,
+    exported_search: Arc<Vec<(ItemStack, SearchEntry, bool)>>,
     /// The `hasPermissions` the tabs were last built with
     /// (`CreativeModeTabs.tryRebuildTabContents`).
     permissions: bool,
     /// ItemPickerMenu.items: what the grid shows, filled when the tab or the
     /// search changes (selectTab, refreshSearchResults), not on every frame.
     shown: Mutex<Option<Shown>>,
+}
+impl Clone for Creative {
+    /// Shares the lists; what the grid shows is filled again for the copy.
+    fn clone(&self) -> Self {
+        Self {
+            tabs: self.tabs.clone(),
+            selected: self.selected,
+            page: self.page,
+            scroll: self.scroll,
+            scrolling: self.scrolling,
+            search: self.search.clone(),
+            search_items: self.search_items.clone(),
+            search_index: self.search_index.clone(),
+            exported: self.exported.clone(),
+            exported_search: self.exported_search.clone(),
+            permissions: self.permissions,
+            shown: Mutex::new(None),
+        }
+    }
 }
 /// The grid's stacks for one tab, search text and language.
 struct Shown {
@@ -355,7 +378,7 @@ impl Creative {
     }
     fn new(exported: Vec<Exported>, exported_search: Vec<(ItemStack, SearchEntry, bool)>) -> Self {
         let mut creative = Self {
-            tabs: Vec::new(),
+            tabs: Arc::default(),
             selected: 0,
             page: 0,
             scroll: 0.0,
@@ -367,10 +390,10 @@ impl Creative {
                 search.text_color = u32::MAX;
                 search
             },
-            search_items: Vec::new(),
-            search_index: Vec::new(),
-            exported,
-            exported_search,
+            search_items: Arc::default(),
+            search_index: Arc::default(),
+            exported: Arc::new(exported),
+            exported_search: Arc::new(exported_search),
             permissions: false,
             shown: Mutex::new(None),
         };
@@ -384,26 +407,28 @@ impl Creative {
     fn rebuild(&mut self) {
         let permissions = self.permissions;
         let keep = |operator: bool| permissions || !operator;
-        self.tabs = self
-            .exported
-            .iter()
-            .filter_map(|e| {
-                let items: Vec<ItemStack> = (e.tab.items.iter().zip(&e.operator))
-                    .filter(|(_, o)| keep(**o))
-                    .map(|(s, _)| s.clone())
-                    .collect();
-                (!e.category || !items.is_empty()).then(|| Tab {
-                    items,
-                    ..e.tab.header()
+        self.tabs = Arc::new(
+            self.exported
+                .iter()
+                .filter_map(|e| {
+                    let items: Vec<ItemStack> = (e.tab.items.iter().zip(&e.operator))
+                        .filter(|(_, o)| keep(**o))
+                        .map(|(s, _)| s.clone())
+                        .collect();
+                    (!e.category || !items.is_empty()).then(|| Tab {
+                        items,
+                        ..e.tab.header()
+                    })
                 })
-            })
-            .collect();
-        (self.search_items, self.search_index) = self
+                .collect(),
+        );
+        let (items, index): (Vec<ItemStack>, Vec<SearchEntry>) = self
             .exported_search
             .iter()
             .filter(|(_, _, o)| keep(*o))
             .map(|(s, e, _)| (s.clone(), e.clone()))
             .unzip();
+        (self.search_items, self.search_index) = (Arc::new(items), Arc::new(index));
         self.forget_items();
     }
     /// `CreativeModeInventoryScreen.tryRefreshInvalidatedTabs`, which its
@@ -634,7 +659,8 @@ impl Creative {
     /// saved rows of `HotbarManager` as the tab's items, an empty stack (count
     /// 0) for an empty slot.
     pub fn set_saved_hotbars(&mut self, items: Vec<ItemStack>) {
-        if let Some(tab) = self.tabs.iter_mut().find(|t| t.hotbar) {
+        // The saved hotbars are this player's: its own copy of the tabs, if shared.
+        if let Some(tab) = Arc::make_mut(&mut self.tabs).iter_mut().find(|t| t.hotbar) {
             tab.items = items;
         }
         self.forget_items();

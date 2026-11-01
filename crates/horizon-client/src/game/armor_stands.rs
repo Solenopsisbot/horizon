@@ -32,6 +32,7 @@ fn layer_color(undyed: Option<u32>, stack: Option<&ItemStack>) -> u32 {
 }
 
 /// Armor stand models and the humanoid layers of every equipment asset.
+#[derive(Clone)]
 pub(super) struct ArmorStandAssets {
     pub main: Option<Part>,
     pub small: Option<Part>,

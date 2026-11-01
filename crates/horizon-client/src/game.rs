@@ -17111,6 +17111,7 @@ impl<'a> Game<'a> {
 
 /// CPU-only startup data, owned by one loader generation. No file reads or
 /// model baking are needed when the event loop installs this bundle.
+#[derive(Clone)]
 struct GameCpuResources {
     painting_variants: paintings::PaintingVariants,
     frame_model: frames::FrameModel,
@@ -18339,7 +18340,9 @@ fn start_game<'a>(
     settings: Option<Settings>,
     prepared: Option<GameCpuResources>,
 ) -> Result<Option<Game<'a>>> {
-    let handoff = prepared.is_some();
+    // The loading screen hands its tables over; a spawned player's come from the process's
+    // template (`spawn.rs`) and it has no loading screen.
+    let handoff = prepared.is_some() && !options.spawned;
     let mut settings = match settings {
         Some(settings) => settings,
         None => Settings::load(&Game::options_path()),
