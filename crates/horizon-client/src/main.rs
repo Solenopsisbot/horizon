@@ -25,6 +25,14 @@ fn main() {
     if let Some(dir) = game_args.clone().skip_while(|a| *a != "--home").nth(1) {
         logging::set_game_home(std::path::absolute(dir).unwrap_or_else(|_| dir.into()));
     }
+    // --player-dir too: a player of a shared game folder logs in its own.
+    if let Some(dir) = game_args
+        .clone()
+        .skip_while(|a| *a != "--player-dir")
+        .nth(1)
+    {
+        logging::set_player_dir(std::path::absolute(dir).unwrap_or_else(|_| dir.into()));
+    }
     // The dedicated server logs in its own folder (--game-dir's), as vanilla's does; the game in its home.
     let (home, side, thread) = if args.iter().any(|a| a == "--dedicated") {
         let folder = game_args
@@ -35,7 +43,8 @@ fn main() {
             .unwrap_or_else(|| ".".into());
         (folder, "server", "Server thread")
     } else {
-        (logging::game_home(), "client", "Render thread")
+        let home = logging::player_dir_override().map_or_else(logging::game_home, Into::into);
+        (home, "client", "Render thread")
     };
     if !help {
         logging::init(&home, thread);

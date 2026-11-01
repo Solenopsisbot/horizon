@@ -41,6 +41,11 @@ pub const OPTIONS: &[LaunchOption] = &[
         "Logs (`logs/latest.log`) and crash reports (`crash-reports/`). Default: `HORIZON_HOME`, else `horizon` in the platform data folder.",
     ),
     option(
+        "--player-dir",
+        Some("DIR"),
+        "One player's own files, for several games playing in one game folder at the same time: `options.txt` and the settings beside it, `logs/`, `crash-reports/`, `horizon-player.txt`, `servers.dat`, `hotbar.nbt`, `screenshots/`. Saves, packs, mods and their config stay in the game folder. Created when missing. Default: the game folder, and `--home` for logs.",
+    ),
+    option(
         "--width",
         Some("N"),
         "The window's starting width (default 1280).",
