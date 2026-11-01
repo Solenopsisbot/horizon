@@ -1118,7 +1118,7 @@ fn render(
     if class.name == "net/minecraft/world/level/block/state/BlockState" {
         let _ = writeln!(
             out,
-            "    protected java.util.IdentityHashMap<Object, Object> horizonValues = new java.util.IdentityHashMap<>();"
+            "    protected net.minecraft.world.level.block.Block horizonBlock = new net.minecraft.world.level.block.Block();\n    protected java.util.IdentityHashMap<Object, Object> horizonValues = new java.util.IdentityHashMap<>();"
         );
     }
     if class.name == "net/minecraft/nbt/CompoundTag" {
@@ -2561,6 +2561,18 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     }
     if class == "net/minecraft/world/level/block/state/BlockState" {
         match method {
+            "getBlock" if ret == "net.minecraft.world.level.block.Block" => {
+                return "return horizonBlock;".to_owned();
+            }
+            "is" if ret == "boolean"
+                && descriptor == "(Lnet/minecraft/world/level/block/Block;)Z" =>
+            {
+                return "return horizonBlock == p0;".to_owned();
+            }
+            "isAir" if ret == "boolean" => return "return false;".to_owned(),
+            "canOcclude" if ret == "boolean" => return "return true;".to_owned(),
+            "isSolidRender" if ret == "boolean" => return "return true;".to_owned(),
+            "getLightEmission" if ret == "int" => return "return 0;".to_owned(),
             "setValue" if ret == "net.minecraft.world.level.block.state.BlockState" => {
                 return "horizonValues.put(p0, p1); return this;".to_owned();
             }
@@ -4255,6 +4267,7 @@ mod tests {
             false,
             &[],
         );
+        assert!(source.contains("net.minecraft.world.level.block.Block horizonBlock"));
         assert!(source.contains("IdentityHashMap<Object, Object> horizonValues"));
         assert!(source.contains("horizonValues.put(p0, p1); return this;"));
         assert!(source.contains("return (java.lang.Comparable) horizonValues.get(p0);"));
@@ -4276,6 +4289,24 @@ mod tests {
                 "(Lnet/minecraft/world/level/block/state/properties/Property;Ljava/lang/Comparable;)Lnet/minecraft/world/level/block/state/BlockState;",
             ),
             "horizonValues.put(p0, p1); return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/block/state/BlockState",
+                "getBlock",
+                "net.minecraft.world.level.block.Block",
+                "()Lnet/minecraft/world/level/block/Block;",
+            ),
+            "return horizonBlock;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/block/state/BlockState",
+                "isAir",
+                "boolean",
+                "()Z",
+            ),
+            "return false;"
         );
     }
 

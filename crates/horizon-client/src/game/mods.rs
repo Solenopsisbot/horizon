@@ -95,6 +95,31 @@ fn opaque_registration_keys(entries: &[horizon_native_java::RegistryEntry]) -> V
         .collect()
 }
 
+/// Merge typed declarations from the jar metadata with registrations observed
+/// during entrypoint execution.  A repeated id is safe only when both sources
+/// describe the same registry and typed declaration; otherwise the loader must
+/// stop before content reaches the immutable resource tables.
+fn merge_native_entries(
+    entries: &mut Vec<horizon_native_java::RegistryEntry>,
+    extra: impl IntoIterator<Item = horizon_native_java::RegistryEntry>,
+) -> Result<(), String> {
+    for entry in extra {
+        if let Some(existing) = entries.iter().find(|existing| existing.id == entry.id) {
+            if existing.registry != entry.registry || existing.declaration != entry.declaration {
+                return Err(format!(
+                    "conflicting native registration {} ({} vs {})",
+                    entry.id,
+                    existing.key(),
+                    entry.key()
+                ));
+            }
+            continue;
+        }
+        entries.push(entry);
+    }
+    Ok(())
+}
+
 fn native_entrypoint_kinds(jar: &horizon_native_java::NativeJar) -> Vec<String> {
     let mut kinds: Vec<String> = jar.fabric_entrypoints.keys().cloned().collect();
     if !jar.neoforge_entrypoints.is_empty() {
@@ -206,11 +231,8 @@ pub(super) fn run_java_mods(
             .filter(|entry| entry.declaration.is_some())
             .cloned()
             .collect::<Vec<_>>();
-        for entry in &jar.native_declarations {
-            if !entries.iter().any(|existing| existing.id == entry.id) {
-                entries.push(entry.clone());
-            }
-        }
+        merge_native_entries(&mut entries, jar.native_declarations.clone())
+            .map_err(|error| format!("{}: {error}", path.display()))?;
         if !entries.is_empty() {
             let declarations =
                 horizon_mods::native::NativeDeclarations::from_registry_entries(entries.iter())
@@ -535,6 +557,34 @@ mod tests {
             opaque_registration_keys(&entries),
             ["minecraft:item/ruby:wand"]
         );
+    }
+
+    #[test]
+    fn native_entry_merge_rejects_conflicting_typed_ids() {
+        let block = horizon_native_java::RegistryEntry::typed(
+            "minecraft:block",
+            "ruby:shared",
+            horizon_native_java::RegistryDeclaration::Block {
+                template: "minecraft:stone".into(),
+                properties: std::collections::BTreeMap::new(),
+                item: false,
+            },
+        );
+        let item = horizon_native_java::RegistryEntry::typed(
+            "minecraft:item",
+            "ruby:shared",
+            horizon_native_java::RegistryDeclaration::Item {
+                template: "minecraft:stick".into(),
+                properties: std::collections::BTreeMap::new(),
+            },
+        );
+        let mut entries = vec![block];
+        let error = merge_native_entries(&mut entries, [item]).unwrap_err();
+        assert!(
+            error.contains("conflicting native registration ruby:shared"),
+            "{error}"
+        );
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]

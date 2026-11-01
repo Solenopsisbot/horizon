@@ -64,6 +64,29 @@ pub struct PayloadRegistration {
     pub handler: Value,
 }
 
+/// A capability lookup crossing the native boundary. The native probe records
+/// the request and returns only a value explicitly seeded by a game adapter;
+/// absent values stay empty rather than inventing a live block capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityRequest {
+    pub owner: String,
+    pub capability: String,
+    pub position: Option<String>,
+    pub side: Option<String>,
+}
+
+impl CapabilityRequest {
+    fn key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            self.owner,
+            self.capability,
+            self.position.as_deref().unwrap_or(""),
+            self.side.as_deref().unwrap_or("")
+        )
+    }
+}
+
 impl RegistryEntry {
     pub fn key(&self) -> String {
         format!("{}/{}", self.registry, self.id)
@@ -185,6 +208,8 @@ pub struct StdHost {
     /// The marker is intentionally host-owned: an opaque Java object must not
     /// become a live native capability until a game adapter supplies it.
     lazy_optionals: BTreeMap<String, Option<Value>>,
+    capability_values: BTreeMap<String, Value>,
+    capability_requests: Vec<CapabilityRequest>,
     next_lazy_optional: usize,
     next_fabric_event: usize,
 }
@@ -209,6 +234,8 @@ impl StdHost {
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
+            capability_values: BTreeMap::new(),
+            capability_requests: Vec::new(),
             next_lazy_optional: 0,
             next_fabric_event: 0,
         }
@@ -290,6 +317,30 @@ impl StdHost {
 
     pub fn payload_registrations(&self) -> &[PayloadRegistration] {
         &self.payload_registrations
+    }
+
+    /// Seed one capability result for a game-owned block/entity adapter.
+    /// Requests without a matching seed remain empty.
+    pub fn seed_capability(
+        &mut self,
+        owner: impl Into<String>,
+        capability: impl Into<String>,
+        position: Option<impl Into<String>>,
+        side: Option<impl Into<String>>,
+        value: Value,
+    ) {
+        let request = CapabilityRequest {
+            owner: owner.into(),
+            capability: capability.into(),
+            position: position.map(Into::into),
+            side: side.map(Into::into),
+        };
+        self.capability_values.insert(request.key(), value);
+    }
+
+    /// Capability lookups observed by the native runtime in invocation order.
+    pub fn capability_requests(&self) -> &[CapabilityRequest] {
+        &self.capability_requests
     }
 
     pub fn apply_registrations<S: RegistrySink>(&self, sink: &mut S) -> Result<usize, String> {
@@ -733,6 +784,32 @@ impl Host for StdHost {
             && r.descriptor == "()Z"
         {
             return Ok(Value::Int(1));
+        }
+        if (r.owner == "net/minecraft/world/level/Level"
+            || r.owner == "net/minecraft/world/level/block/entity/BlockEntity")
+            && r.name == "getCapability"
+            && r.descriptor
+                .ends_with("Lnet/neoforged/neoforge/common/util/LazyOptional;")
+            && args.len() >= 2
+        {
+            let capability = capability_text(Self::argument(r, args, 0)?);
+            let (position, side) = if args.len() >= 3 {
+                (
+                    Some(capability_text(Self::argument(r, args, 1)?)),
+                    Some(capability_text(Self::argument(r, args, 2)?)),
+                )
+            } else {
+                (None, Some(capability_text(Self::argument(r, args, 1)?)))
+            };
+            let request = CapabilityRequest {
+                owner: r.owner.clone(),
+                capability,
+                position,
+                side,
+            };
+            let value = self.capability_values.get(&request.key()).cloned();
+            self.capability_requests.push(request);
+            return Ok(self.lazy_optional(value));
         }
         if r.owner == "net/neoforged/neoforge/common/util/LazyOptional" {
             let contents = self.lazy_contents(receiver).flatten();
@@ -2427,6 +2504,15 @@ fn value_marker(value: &Value) -> String {
         Value::Int(value) => format!("i{value}"),
         Value::Ref(Some(value)) => format!("r{}", value.replace('\\', "\\\\").replace(',', "\\,")),
         Value::Ref(None) => "null".to_owned(),
+        Value::Void => "void".to_owned(),
+    }
+}
+
+fn capability_text(value: &Value) -> String {
+    match value {
+        Value::Int(value) => value.to_string(),
+        Value::Ref(Some(value)) => value.replace("\\,", ",").replace("\\\\", "\\"),
+        Value::Ref(None) => "".to_owned(),
         Value::Void => "void".to_owned(),
     }
 }
@@ -7906,6 +7992,57 @@ mandatory = true
                 codec: Value::Ref(Some("stream-codec".into())),
                 handler: Value::Ref(Some("handler".into())),
             }]
+        );
+    }
+
+    #[test]
+    fn standard_host_bridges_seeded_block_capability_requests() {
+        let mut host = StdHost::new();
+        host.seed_capability(
+            "net/minecraft/world/level/Level",
+            "capability/item",
+            Some("block-pos/1,2,3"),
+            Some("direction/north"),
+            Value::Ref(Some("handler/items".into())),
+        );
+        let query = MethodRef {
+            owner: "net/minecraft/world/level/Level".into(),
+            name: "getCapability".into(),
+            descriptor: "(Lnet/neoforged/neoforge/capabilities/Capability;Lnet/minecraft/core/BlockPos;Lnet/minecraft/core/Direction;)Lnet/neoforged/neoforge/common/util/LazyOptional;".into(),
+        };
+        let optional = host
+            .invoke_instance(
+                &query,
+                &Value::Ref(Some("level/main".into())),
+                &[
+                    Value::Ref(Some("capability/item".into())),
+                    Value::Ref(Some("block-pos/1,2,3".into())),
+                    Value::Ref(Some("direction/north".into())),
+                ],
+            )
+            .unwrap();
+        assert_eq!(host.capability_requests().len(), 1);
+        assert_eq!(
+            host.capability_requests()[0],
+            CapabilityRequest {
+                owner: "net/minecraft/world/level/Level".into(),
+                capability: "capability/item".into(),
+                position: Some("block-pos/1,2,3".into()),
+                side: Some("direction/north".into()),
+            }
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/neoforged/neoforge/common/util/LazyOptional".into(),
+                    name: "resolve".into(),
+                    descriptor: "()Ljava/lang/Object;".into(),
+                },
+                &optional,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("handler/items".into()))
         );
     }
 

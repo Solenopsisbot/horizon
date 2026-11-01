@@ -677,10 +677,11 @@ key; generated `DataComponents` constants are distinct identity keys, absent val
 the supplied default), and copies retain the map. This covers
 the common registration and tooltip paths while the Rust mirror grows typed accessors for the modelled
 `StackData` fields in `horizon-items/item_data.rs`.
-BlockState bootstrap paths also retain property assignments in a bounded identity map: `setValue` now
-feeds `getValue`, `hasProperty`, and `getProperties` on the same façade instance. This covers common
-state construction and inspection while the registry-backed state definition and vanilla default values
-remain follow-up work.
+BlockState bootstrap paths retain a bounded block identity and property map: `getBlock`, `is`, `isAir`,
+`canOcclude`, `isSolidRender`, and `getLightEmission` provide stable inspection defaults, while
+`setValue` feeds `getValue`, `hasProperty`, and `getProperties` on the same façade instance. This covers
+common state construction and inspection while the registry-backed state definition and vanilla default
+values remain follow-up work.
 `TagKey` now retains its registry key and identifier as a value pair: `create`, `location`, `registry`,
 `isFor`, equality, hashing, and string conversion operate on those fields. This keeps tag-backed block,
 item, and entity registration code from collapsing distinct tags into one neutral object; holder-set
@@ -697,8 +698,11 @@ NeoForge capability bootstrap now has the same bounded value layer: `CapabilityM
 registered `Capability`, `CapabilityToken` preserves the generic lookup shape, `LazyOptional` supports
 lazy/nullable construction, `Capability.orEmpty` identity filtering, presence, mapping, fallback, listeners, and invalidation, and
 `IItemHandler`/`IItemHandlerModifiable` expose the inventory ABI methods. These shims keep capability
-registration and optional lookups linkable without copying NeoForge implementation code; actual block,
-side, and item transfer remains a native ABI boundary rather than a fabricated Java result.
+registration and optional lookups linkable without copying NeoForge implementation code. The native host
+now records `Level.getCapability` and `BlockEntity.getCapability` requests with capability, position, and
+side markers; a game adapter can seed a handler value for an exact request, while unseeded lookups remain
+empty. Actual block, side, and item transfer still belongs to the live native ABI rather than a fabricated
+Java result.
 The handler façade now keeps a bounded one-slot state per handler: reads return copies, inserts cap the
 stack at 64 and honor simulation, extraction decrements state, and the modifiable variant can replace the
 slot. The native `StdHost` also preserves capability markers and callback-local `LazyOptional` values
