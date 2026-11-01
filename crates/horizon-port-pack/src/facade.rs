@@ -1652,10 +1652,16 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         return "return new net.neoforged.neoforge.capabilities.Capability();".to_owned();
     }
     if class == "net/neoforged/neoforge/capabilities/Capability"
-        && method == "isRegistered"
         && ret == "boolean"
+        && method == "isRegistered"
     {
         return "return true;".to_owned();
+    }
+    if class == "net/neoforged/neoforge/capabilities/Capability"
+        && method == "orEmpty"
+        && ret == "net.neoforged.neoforge.common.util.LazyOptional"
+    {
+        return "return p1 == this && p0 != null ? net.neoforged.neoforge.common.util.LazyOptional.ofNullable(p0) : net.neoforged.neoforge.common.util.LazyOptional.empty();".to_owned();
     }
     if class == "net/neoforged/neoforge/common/util/LazyOptional" {
         match (method, ret) {
@@ -1747,6 +1753,36 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("getX", "int") => return "return horizonX;".to_owned(),
             ("getY", "int") => return "return horizonY;".to_owned(),
             ("getZ", "int") => return "return horizonZ;".to_owned(),
+            ("offset", "net.minecraft.core.BlockPos")
+                if descriptor == "(III)Lnet/minecraft/core/BlockPos;" =>
+            {
+                return "return new net.minecraft.core.BlockPos(horizonX + p0, horizonY + p1, horizonZ + p2);"
+                    .to_owned();
+            }
+            ("relative", "net.minecraft.core.BlockPos")
+                if descriptor
+                    == "(Lnet/minecraft/core/Direction;)Lnet/minecraft/core/BlockPos;" =>
+            {
+                return "return new net.minecraft.core.BlockPos(horizonX + p0.getStepX(), horizonY + p0.getStepY(), horizonZ + p0.getStepZ());"
+                    .to_owned();
+            }
+            ("subtract", "net.minecraft.core.Vec3i")
+                if descriptor == "(Lnet/minecraft/core/Vec3i;)Lnet/minecraft/core/Vec3i;" =>
+            {
+                return "return new net.minecraft.core.Vec3i(horizonX - p0.getX(), horizonY - p0.getY(), horizonZ - p0.getZ());"
+                    .to_owned();
+            }
+            ("distSqr", "double") if descriptor == "(Lnet/minecraft/core/Vec3i;)D" => {
+                return "double dx = horizonX - p0.getX(); double dy = horizonY - p0.getY(); double dz = horizonZ - p0.getZ(); return dx * dx + dy * dy + dz * dz;"
+                    .to_owned();
+            }
+            ("distSqr", "double") if descriptor == "(DDD)D" => {
+                return "double dx = horizonX - p0; double dy = horizonY - p1; double dz = horizonZ - p2; return dx * dx + dy * dy + dz * dz;"
+                    .to_owned();
+            }
+            ("closerThan", "boolean") if descriptor == "(Lnet/minecraft/core/Vec3i;D)Z" => {
+                return "return distSqr(p0) < p1 * p1;".to_owned();
+            }
             ("above", "net.minecraft.core.BlockPos") => {
                 return "return new net.minecraft.core.BlockPos(horizonX, horizonY + 1, horizonZ);"
                     .to_owned();
@@ -3396,6 +3432,14 @@ mod tests {
             ),
             "horizonValid = false; horizonValue = null; horizonSupplier = () -> null;"
         );
+        assert_eq!(
+            runtime_body(
+                "net/neoforged/neoforge/capabilities/Capability",
+                "orEmpty",
+                "net.neoforged.neoforge.common.util.LazyOptional"
+            ),
+            "return p1 == this && p0 != null ? net.neoforged.neoforge.common.util.LazyOptional.ofNullable(p0) : net.neoforged.neoforge.common.util.LazyOptional.empty();"
+        );
     }
 
     #[test]
@@ -4058,6 +4102,46 @@ mod tests {
         assert!(source.contains("protected int horizonX;"));
         assert!(source.contains("this.horizonX = p0;"));
         assert!(source.contains("public int getX() { return horizonX; }"));
+    }
+
+    #[test]
+    fn block_pos_facade_preserves_common_offset_and_distance_queries() {
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/BlockPos",
+                "offset",
+                "net.minecraft.core.BlockPos",
+                "(III)Lnet/minecraft/core/BlockPos;",
+            ),
+            "return new net.minecraft.core.BlockPos(horizonX + p0, horizonY + p1, horizonZ + p2);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/BlockPos",
+                "relative",
+                "net.minecraft.core.BlockPos",
+                "(Lnet/minecraft/core/Direction;)Lnet/minecraft/core/BlockPos;",
+            ),
+            "return new net.minecraft.core.BlockPos(horizonX + p0.getStepX(), horizonY + p0.getStepY(), horizonZ + p0.getStepZ());"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/BlockPos",
+                "distSqr",
+                "double",
+                "(Lnet/minecraft/core/Vec3i;)D",
+            ),
+            "double dx = horizonX - p0.getX(); double dy = horizonY - p0.getY(); double dz = horizonZ - p0.getZ(); return dx * dx + dy * dy + dz * dz;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/BlockPos",
+                "closerThan",
+                "boolean",
+                "(Lnet/minecraft/core/Vec3i;D)Z",
+            ),
+            "return distSqr(p0) < p1 * p1;"
+        );
     }
 
     #[test]

@@ -265,8 +265,8 @@ registry holders, synthetic snapshot-drift methods, fluent block properties, blo
 property factories, SoundEvent creation, criterion-trigger contracts, component factories, creative tab
 builders, `Vec3i.offsetCodec`, `FileToIdConverter` factories, and `FeatureFlagSet.of` bootstrap values.
 The generated `Vec3i`/`BlockPos` stubs now retain constructor coordinates and answer the common `getX`,
-`getY`, `getZ`, `above`, and `below` queries, so value-oriented bootstrap code does not immediately hit a
-neutral default. `Vec3` retains double coordinates with common vector arithmetic, and `AABB` now retains its
+`getY`, `getZ`, `above`, `below`, `offset`, `relative`, `subtract`, and distance queries, so
+value-oriented bootstrap code does not immediately hit a neutral default. `Vec3` retains double coordinates with common vector arithmetic, and `AABB` now retains its
 six bounds with size, containment, center, inflation, and directional expansion queries.
 Component factories now preserve literal and translatable text in `MutableComponent` values; `getString`,
 `append`, and `copy` keep the common display-name bootstrap path alive.
@@ -544,7 +544,7 @@ explicit `--java-mod` path runs this adapter before `Assets::load` and passes th
 `content_root`; opaque Java registrations remain diagnostic until a typed declaration is supplied.
 `NativeDeclarations::from_registry_entries` and `register_entries` provide the all-or-nothing batch seam
 for combining typed entries parsed from `META-INF/horizon-native.json` with typed registrations recorded
-during entrypoint execution. An opaque or invalid entry aborts the batch before any partial declaration
+during entrypoint execution. An opaque or invalid entry aborts the batch and rolls back the staged set, so no partial declaration
 can reach the immutable resource tables. Native content derives its owned namespace fence from every typed
 block, item, and effect identifier, so extra namespaces participate in the same clash checks as packaged
 content before the resource root is built.
@@ -695,7 +695,7 @@ bounded table and binds the returned holder to that key/value pair. The live nat
 owns cross-mod membership and final table construction.
 NeoForge capability bootstrap now has the same bounded value layer: `CapabilityManager.get` returns a
 registered `Capability`, `CapabilityToken` preserves the generic lookup shape, `LazyOptional` supports
-lazy/nullable construction, presence, mapping, fallback, listeners, and invalidation, and
+lazy/nullable construction, `Capability.orEmpty` identity filtering, presence, mapping, fallback, listeners, and invalidation, and
 `IItemHandler`/`IItemHandlerModifiable` expose the inventory ABI methods. These shims keep capability
 registration and optional lookups linkable without copying NeoForge implementation code; actual block,
 side, and item transfer remains a native ABI boundary rather than a fabricated Java result.

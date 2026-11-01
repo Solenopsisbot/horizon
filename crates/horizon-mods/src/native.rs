@@ -22,7 +22,7 @@ pub struct CustomDeclaration {
 }
 
 /// Typed registrations waiting for the pre-resource load phase.
-#[derive(Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct NativeDeclarations {
     pub blocks: Vec<Block>,
     pub items: Vec<Item>,
@@ -52,9 +52,13 @@ impl NativeDeclarations {
     where
         I: IntoIterator<Item = &'a RegistryEntry>,
     {
+        // Stage the batch so a later invalid or opaque entry cannot leave a
+        // partially applied declaration set visible to the resource planner.
+        let mut staged = self.clone();
         for entry in entries {
-            self.register_typed(entry)?;
+            staged.register_typed(entry)?;
         }
+        *self = staged;
         Ok(())
     }
 
@@ -365,5 +369,45 @@ mod tests {
         };
         let error = NativeDeclarations::from_registry_entries([&block, &opaque]).unwrap_err();
         assert!(error.contains("has no typed declaration"), "{error}");
+    }
+
+    #[test]
+    fn register_entries_rolls_back_when_a_later_entry_is_invalid() {
+        let existing = RegistryEntry::typed(
+            "minecraft:item",
+            "ruby:existing",
+            RegistryDeclaration::Item {
+                template: "minecraft:stick".into(),
+                properties: BTreeMap::new(),
+            },
+        );
+        let added = RegistryEntry::typed(
+            "minecraft:item",
+            "ruby:added",
+            RegistryDeclaration::Item {
+                template: "minecraft:stick".into(),
+                properties: BTreeMap::new(),
+            },
+        );
+        let opaque = RegistryEntry {
+            registry: "minecraft:item".into(),
+            id: "ruby:opaque".into(),
+            value: Value::Ref(Some("opaque".into())),
+            declaration: None,
+        };
+        let mut declarations = NativeDeclarations::default();
+        declarations.register_typed(&existing).unwrap();
+        let error = declarations
+            .register_entries([&added, &opaque])
+            .unwrap_err();
+        assert!(error.contains("has no typed declaration"), "{error}");
+        assert_eq!(
+            declarations
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ruby:existing"]
+        );
     }
 }
