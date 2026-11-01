@@ -9,6 +9,7 @@ description = "Port a Java modpack to Horizon: import, inventory, classification
 [dependencies]
 # Content path rules only (no runtime): what the game's content loader accepts.
 horizon-mods = { path = "../horizon-mods", default-features = false }
+horizon-native-java = { path = "../horizon-native-java" }
 serde = { version = "1", features = ["derive"] }
 # Exact float parsing: the upgrade writes back the numbers it read (data pack
 # upgrade), and Java reads them exactly.

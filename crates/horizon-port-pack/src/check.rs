@@ -53,10 +53,131 @@ pub struct Check {
     /// not share one.
     pub namespaces: Vec<String>,
     pub code: classes::Code,
+    /// Result of the optional bounded native Java probe. This is evidence for
+    /// the launcher and never changes the content-port verdict by itself.
+    #[serde(default)]
+    pub native: Option<NativeProbe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeProbe {
+    /// Entrypoint kind used: Fabric `main`, `client`, `server`, or NeoForge.
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub entrypoint: Option<String>,
+    /// Every entrypoint attempted for the selected lifecycle kind. The
+    /// singular `entrypoint` field remains the first one for backwards
+    /// compatibility with existing check reports.
+    #[serde(default)]
+    pub entrypoints: Vec<String>,
+    /// Mod ids visible to the deterministic loader during this probe,
+    /// including the jar itself and its declared required dependencies.
+    #[serde(default)]
+    pub seeded_mods: Vec<String>,
+    pub calls: usize,
+    /// NeoForge registrations recorded by the deterministic host.
+    #[serde(default)]
+    pub registrations: usize,
+    /// NeoForge listener registrations recorded by the deterministic host.
+    #[serde(default)]
+    pub listeners: usize,
+    pub error: Option<String>,
+}
+
+fn seeded_mod_ids(jar_path: &Path) -> Vec<String> {
+    let Ok(info) = jar::read(jar_path) else {
+        return Vec::new();
+    };
+    let mut ids = info.depends;
+    if !info.mod_id.is_empty() {
+        ids.push(info.mod_id);
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn seeded_native_host(jar_path: &Path) -> horizon_native_java::StdHost {
+    let mut host = horizon_native_java::StdHost::new();
+    if let Ok(info) = jar::read(jar_path) {
+        if !info.mod_id.is_empty() {
+            host = host.with_mod(&info.mod_id, &info.version);
+        }
+        for dependency in info.depends {
+            host = host.with_mod(dependency, "unknown");
+        }
+    }
+    host
+}
+
+fn native_probe(jar_path: &Path) -> NativeProbe {
+    let seeded_mods = seeded_mod_ids(jar_path);
+    let jar = match horizon_native_java::NativeJar::from_path(jar_path) {
+        Ok(jar) => jar,
+        Err(error) => {
+            return NativeProbe {
+                kind: None,
+                entrypoint: None,
+                entrypoints: Vec::new(),
+                seeded_mods,
+                calls: 0,
+                registrations: 0,
+                listeners: 0,
+                error: Some(error.to_string()),
+            };
+        }
+    };
+    let selected = ["main", "client", "server", "neoforge"]
+        .into_iter()
+        .find_map(|kind| jar.discover_entrypoint(kind).map(|entry| (kind, entry)));
+    let Some((kind, _entry)) = selected else {
+        return NativeProbe {
+            kind: None,
+            entrypoint: None,
+            entrypoints: Vec::new(),
+            seeded_mods,
+            calls: 0,
+            registrations: 0,
+            listeners: 0,
+            error: Some("no Fabric main/client/server or NeoForge entrypoint".into()),
+        };
+    };
+    let kind = kind.to_owned();
+    let entries = jar.discover_entrypoints(&kind);
+    let entrypoint = entries.first().map(|entry| entry.class.clone());
+    let entrypoints = entries
+        .iter()
+        .map(|entry| entry.class.clone())
+        .collect::<Vec<_>>();
+    // Seed the deterministic loader view from the jar's own metadata.  A
+    // real entrypoint commonly gates registration on its own id or on a
+    // required dependency; probing with an empty map would report both as
+    // absent and make the native result misleading.
+    let mut host = seeded_native_host(jar_path);
+    let mut calls = 0;
+    let mut errors = Vec::new();
+    for entry in &entries {
+        match jar.execute(&entry.class, entry.method.as_deref(), &kind, &mut host) {
+            Ok(report) => calls += report.calls,
+            Err(entry_error) => {
+                errors.push(format!("{}: {entry_error}", entry.class));
+            }
+        }
+    }
+    NativeProbe {
+        kind: Some(kind),
+        entrypoint,
+        entrypoints,
+        seeded_mods,
+        calls,
+        registrations: host.registrations().len(),
+        listeners: host.listener_registrations().count(),
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
+    }
 }
 
 /// The loader a jar is made for, from its metadata file.
-fn loader(names: &[String]) -> &'static str {
+pub(crate) fn loader(names: &[String]) -> &'static str {
     let has = |n: &str| names.iter().any(|x| x == n);
     if has("META-INF/neoforge.mods.toml") {
         "neoforge"
@@ -120,6 +241,7 @@ pub fn check(jar_path: &Path, out: &Path) -> Result<Check, String> {
         depends: info.depends.clone(),
         namespaces: Vec::new(),
         code,
+        native: Some(native_probe(jar_path)),
     };
     fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     let done = |check: Check| -> Result<Check, String> {
@@ -276,6 +398,7 @@ pub fn check(jar_path: &Path, out: &Path) -> Result<Check, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use horizon_native_java::Host;
     use std::io::Write;
 
     fn jar(dir: &Path, files: &[(&str, &[u8])]) -> std::path::PathBuf {
@@ -320,6 +443,11 @@ displayName = "Ruby"
         let c = check(&jar(&dir, &plain), &dir.join("out")).unwrap();
         assert_eq!(c.verdict, Verdict::Works, "{c:?}");
         assert_eq!(c.loader, "neoforge");
+        assert!(
+            c.native
+                .as_ref()
+                .is_some_and(|probe| probe.entrypoint.is_none())
+        );
         assert_eq!(&c.ports[..3], ["1 block", "1 item", "1 recipe"]);
         assert!(dir.join("out/carry/horizon-mod.toml").is_file());
         assert!(dir.join("out/check.json").is_file());
@@ -338,6 +466,93 @@ displayName = "Ruby"
             c.skipped
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn native_probe_selects_client_when_main_is_absent() {
+        let dir = temp("native-client");
+        let metadata = br#"{"schemaVersion":1,"id":"ruby","version":"1.0","entrypoints":{"client":"ruby.Client"}}"#;
+        let class = crate::classes::tests_support::class_file("ruby/Client", "java/lang/Object");
+        let path = jar(
+            &dir,
+            &[("fabric.mod.json", metadata), ("ruby/Client.class", &class)],
+        );
+        let probe = native_probe(&path);
+        assert_eq!(probe.kind.as_deref(), Some("client"));
+        assert_eq!(probe.entrypoint.as_deref(), Some("ruby.Client"));
+        assert_eq!(probe.entrypoints, vec!["ruby.Client"]);
+        assert_eq!(probe.seeded_mods, vec!["ruby"]);
+        assert!(
+            probe.error.is_some(),
+            "the empty fixture has no lifecycle bytecode"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_probe_reports_all_declared_entrypoint_failures() {
+        let dir = temp("native-entrypoint-errors");
+        let metadata = br#"{"schemaVersion":1,"id":"ruby","version":"1.0","entrypoints":{"main":["ruby.One","ruby.Two"]}}"#;
+        let one = crate::classes::tests_support::class_file("ruby/One", "java/lang/Object");
+        let two = crate::classes::tests_support::class_file("ruby/Two", "java/lang/Object");
+        let path = jar(
+            &dir,
+            &[
+                ("fabric.mod.json", metadata),
+                ("ruby/One.class", &one),
+                ("ruby/Two.class", &two),
+            ],
+        );
+        let probe = native_probe(&path);
+        assert_eq!(probe.entrypoints, ["ruby.One", "ruby.Two"]);
+        let error = probe.error.expect("both empty entrypoints should fail");
+        assert!(error.contains("ruby.One"), "{error}");
+        assert!(error.contains("ruby.Two"), "{error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_host_seeds_mod_and_required_dependency_from_metadata() {
+        let dir = temp("native-host");
+        let metadata = br#"{"schemaVersion":1,"id":"ruby","version":"1.0","depends":{"architectury-api":"*","minecraft":"~26.3"}}"#;
+        let path = jar(&dir, &[("fabric.mod.json", metadata)]);
+        let mut host = seeded_native_host(&path);
+        let loaded = horizon_native_java::MethodRef {
+            owner: "net/fabricmc/loader/api/FabricLoader".into(),
+            name: "isModLoaded".into(),
+            descriptor: "(Ljava/lang/String;)Z".into(),
+        };
+        let loader = horizon_native_java::Value::Ref(Some("fabric-loader".into()));
+        assert_eq!(
+            host.invoke_instance(
+                &loaded,
+                &loader,
+                &[horizon_native_java::Value::Ref(Some("ruby".into()))],
+            )
+            .unwrap(),
+            horizon_native_java::Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &loaded,
+                &loader,
+                &[horizon_native_java::Value::Ref(Some(
+                    "architectury-api".into()
+                ))],
+            )
+            .unwrap(),
+            horizon_native_java::Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &loaded,
+                &loader,
+                &[horizon_native_java::Value::Ref(Some("minecraft".into()))],
+            )
+            .unwrap(),
+            horizon_native_java::Value::Int(0)
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

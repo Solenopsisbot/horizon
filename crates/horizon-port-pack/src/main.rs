@@ -23,6 +23,16 @@
 //!   browser installs it: carried over into `<out>/carry/`, its classes
 //!   read, and the verdict (Works, Partly, Doesn't run) in
 //!   `<out>/check.json`.
+//! - `census <jar or folder>... [--out <file>] [--top <n>] [--hooks <file>]`:
+//!   every class, member and Mixin point the jars' code names, ranked
+//!   (`census.json`): what a Java compatibility layer would have to provide
+//!   (`docs/java-mod-compat.md`, phase 0). With `--hooks native-hooks.json`,
+//!   each point is joined against the hook that already names its method.
+//! - `facade <jar> <out> --game <26.3.jar> [--extra <jar-or-dir>] [--jdk <dir>]`:
+//!   a Java façade skeleton for the game classes the jar(s) name, in the real
+//!   26.3 shapes, compiled to `<out>/facade.jar` by `javac`. Methods throw
+//!   `UnsupportedOperationException`: the first one a mod reaches names the
+//!   next thing the game must implement.
 //! - `port <pack> <work> [--from <folder>] [--resources <prepared>]`: every
 //!   step for the portable mods, as the launcher's "Import modpack" runs it.
 //! - `upgrade-datapack <pack> <out> | --world <world>`: a 26.2 data pack
@@ -38,7 +48,7 @@ use std::{
     process::ExitCode,
 };
 
-const USAGE: &str = "usage: horizon-port-pack import <pack> <work> | inventory <work> [--offline] | fetch <work> [--from <folder>] [<mod id>...] | carry <work> [--resources <prepared>] [<mod id>...] | report <work> | check <jar> <out> | port <pack> <work> [--from <folder>] [--resources <prepared>] | upgrade-datapack <pack> (<out> | --world <world>)";
+const USAGE: &str = "usage: horizon-port-pack import <pack> <work> | inventory <work> [--offline] | fetch <work> [--from <folder>] [<mod id>...] | carry <work> [--resources <prepared>] [<mod id>...] | report <work> | check <jar> <out> | census <jar or folder>... [--out <file>] [--top <n>] [--hooks <file>] | facade <jar> <out> --game <26.3.jar> [--extra <jar-or-dir>] [--jdk <dir>] | port <pack> <work> [--from <folder>] [--resources <prepared>] | upgrade-datapack <pack> (<out> | --world <world>)";
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -46,6 +56,15 @@ fn main() -> ExitCode {
         let from = option(&mut args, "--from")?;
         let resources = option(&mut args, "--resources")?;
         let world = option(&mut args, "--world")?;
+        let out = option(&mut args, "--out")?;
+        let top = option(&mut args, "--top")?
+            .and_then(|p| p.to_string_lossy().parse::<usize>().ok())
+            .unwrap_or(20);
+        let hooks = option(&mut args, "--hooks")?;
+        let game = option(&mut args, "--game")?;
+        let jdk = option(&mut args, "--jdk")?;
+        let libs = option(&mut args, "--libs")?;
+        let extra = option(&mut args, "--extra")?;
         let offline = take_flag(&mut args, "--offline");
         let path = |i: usize| args.get(i).map(Path::new).ok_or(USAGE.to_owned());
         let rest = || args.get(2..).unwrap_or_default().to_vec();
@@ -84,6 +103,58 @@ fn main() -> ExitCode {
                 for s in &c.skipped {
                     println!("  skipped: {s}");
                 }
+                Ok(())
+            }
+            Some("facade") => {
+                let game = game.ok_or(
+                    "facade needs --game <26.3.jar>: the real classes to take shapes from",
+                )?;
+                let jdk = jdk
+                    .or_else(|| std::env::var_os("JAVA_HOME").map(PathBuf::from))
+                    .ok_or("facade needs --jdk <dir> or JAVA_HOME")?;
+                let libraries = match &libs {
+                    Some(dir) => horizon_port_pack::facade::library_jars(dir)?,
+                    None => Vec::new(),
+                };
+                let mut targets = vec![path(1)?.to_path_buf()];
+                if let Some(extra) = extra {
+                    if extra.is_dir() {
+                        targets.extend(horizon_port_pack::facade::library_jars(&extra)?);
+                    } else {
+                        targets.push(extra);
+                    }
+                }
+                let report = horizon_port_pack::facade::generate_many(
+                    &targets,
+                    &game,
+                    &libraries,
+                    path(2)?,
+                    &jdk.join("bin").join("javac"),
+                    &jdk.join("bin").join("jar"),
+                )?;
+                println!(
+                    "{} classes, {} methods, {} fields; {} named but missing from the game jar",
+                    report.classes,
+                    report.methods,
+                    report.fields,
+                    report.missing.len(),
+                );
+                for m in &report.missing {
+                    println!("  missing: {m}");
+                }
+                println!("{}", report.jar.display());
+                Ok(())
+            }
+            Some("census") => {
+                let file = out.unwrap_or_else(|| PathBuf::from("census.json"));
+                let index = match &hooks {
+                    Some(path) => Some(horizon_port_pack::census::HookIndex::read(path)?),
+                    None => None,
+                };
+                let census = horizon_port_pack::census::read_with(path(1)?, index.as_ref())?;
+                census.write(&file)?;
+                print!("{}", census.summary(top));
+                println!("{}", file.display());
                 Ok(())
             }
             Some("port") => {

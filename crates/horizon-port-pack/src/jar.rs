@@ -12,7 +12,18 @@ pub struct JarInfo {
     pub license: String,
     /// Required dependencies by mod id (loaders and `minecraft` left out).
     pub depends: Vec<String>,
+    /// Loader entrypoints declared by the jar. Fabric permits one or more
+    /// classes per entrypoint key; keeping the key lets the JVM runner choose
+    /// the right adapter (`main`, `client`, `server`, ...).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entrypoints: Vec<Entrypoint>,
     pub census: Census,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entrypoint {
+    pub kind: String,
+    pub class: String,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,6 +128,7 @@ pub fn mods_toml(text: &str) -> Result<JarInfo, String> {
         license: get(Some(&doc), "license"),
         mod_id,
         depends,
+        entrypoints: Vec::new(),
         census: Census::default(),
     })
 }
@@ -140,12 +152,48 @@ pub fn fabric(text: &str) -> Result<JarInfo, String> {
         .map(|(id, _)| id.clone())
         .filter(|id| !NOT_MODS.contains(&id.as_str()) && !id.starts_with("fabric"))
         .collect();
+    let mut entrypoints = Vec::new();
+    if let Some(groups) = v.get("entrypoints").and_then(|e| e.as_object()) {
+        for (kind, values) in groups {
+            let values = match values {
+                serde_json::Value::String(class) => vec![class.clone()],
+                serde_json::Value::Object(object) => object
+                    .get("value")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+                    .into_iter()
+                    .collect(),
+                serde_json::Value::Array(values) => values
+                    .iter()
+                    .filter_map(|value| match value {
+                        serde_json::Value::String(class) => Some(class.to_owned()),
+                        serde_json::Value::Object(object) => object
+                            .get("value")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for class in values {
+                if !class.is_empty() {
+                    entrypoints.push(Entrypoint {
+                        kind: kind.clone(),
+                        class,
+                    });
+                }
+            }
+        }
+    }
+    entrypoints.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.class.cmp(&b.class)));
     Ok(JarInfo {
         mod_id: s("id"),
         name: s("name"),
         version: s("version"),
         license,
         depends,
+        entrypoints,
         census: Census::default(),
     })
 }
@@ -224,11 +272,29 @@ mandatory = true
     fn reads_fabric_metadata() {
         let info = fabric(
             r#"{"id": "gem", "version": "3", "name": "Gem", "license": ["MIT", "Apache-2.0"],
-                "depends": {"fabricloader": "*", "fabric-api": "*", "minecraft": "1.21.1", "cloth-config": "*"}}"#,
+                "depends": {"fabricloader": "*", "fabric-api": "*", "minecraft": "1.21.1", "cloth-config": "*"},
+                "entrypoints": {"main": "com.example.Gem", "client": ["com.example.GemClient", ""], "server": {"value": "com.example.GemServer", "adapter": "default"}}}"#,
         )
         .unwrap();
         assert_eq!(info.license, "MIT OR Apache-2.0");
         assert_eq!(info.depends, ["cloth-config"]);
+        assert_eq!(
+            info.entrypoints,
+            [
+                Entrypoint {
+                    kind: "client".into(),
+                    class: "com.example.GemClient".into()
+                },
+                Entrypoint {
+                    kind: "main".into(),
+                    class: "com.example.Gem".into()
+                },
+                Entrypoint {
+                    kind: "server".into(),
+                    class: "com.example.GemServer".into()
+                },
+            ]
+        );
     }
 
     #[test]

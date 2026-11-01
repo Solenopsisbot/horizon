@@ -6,9 +6,11 @@
 //! jars they downloaded and what is carried over from them stay there and
 //! are never uploaded or committed.
 pub mod carry;
+pub mod census;
 pub mod check;
 pub mod classes;
 pub mod classify;
+pub mod facade;
 pub mod fetch;
 pub mod import;
 pub mod inventory;

@@ -27,6 +27,8 @@ members = [
     "crates/horizon-mods",
     "crates/cargo-horizon-mod",
     "crates/horizon-port-pack",
+    "crates/horizon-jvm",
+    "crates/horizon-native-java",
     "crates/horizon-shaders",
     "crates/horizon-shader-api",
     "crates/horizon-release-sign",

@@ -11,109 +11,590 @@
 //! and Forge's methods are SRG (`m_60503_`): a class extending such a game
 //! class is counted as code of its own, whatever it overrides.
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    io::Read,
+    path::Path,
+};
 
 /// One class file, as much as this module reads.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Class {
     pub name: String,
+    /// JVM access flags: 0x0200 interface, 0x0400 abstract, 0x0010 final,
+    /// 0x4000 enum, 0x2000 annotation.
+    pub access: u16,
     pub superclass: String,
     pub interfaces: Vec<String>,
+    /// Declared fields, by name.
+    pub fields: Vec<String>,
     /// Declared methods, by name (constructors and lambdas left out).
     pub methods: Vec<String>,
     /// Every class the constant pool names (`net/minecraft/...`).
     pub refs: BTreeSet<String>,
-    /// Annotation and descriptor strings (`Lorg/spongepowered/asm/mixin/Mixin;`).
+    /// Every field and method the constant pool names, with its owner: what
+    /// the class actually attaches to (`docs/java-mod-compat.md`, phase 0).
+    pub members: Vec<Member>,
+    /// The class's own annotations.
+    pub annotations: Vec<Annotation>,
+    /// Every declared field and method, with its access flags: the shapes a
+    /// façade is generated from.
+    pub declared: Vec<Declared>,
+    /// Declared methods' annotations, by method name.
+    pub method_annotations: BTreeMap<String, Vec<Annotation>>,
+    /// Declared fields' annotations, by field name.
+    pub field_annotations: BTreeMap<String, Vec<Annotation>>,
+    /// `@Mixin`'s targets (`net/minecraft/world/level/Level`).
+    pub mixin_targets: Vec<String>,
+    /// `@Inject`, `@Redirect`, `@Overwrite`...: what the mixin does, and where.
+    pub injections: Vec<Injection>,
+    /// The pool names Mixin's annotation: the class is (or uses) a mixin.
     pub mixin: bool,
 }
 
-/// Reads a class file's header, constant pool and declared methods.
+/// A field or method a class names, with the class that owns it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Member {
+    pub owner: String,
+    pub name: String,
+    /// `()V`, `Ljava/lang/String;`
+    pub descriptor: String,
+    pub kind: MemberKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemberKind {
+    Field,
+    Method,
+    InterfaceMethod,
+}
+
+impl Member {
+    /// `owner#name descriptor`, the census's key.
+    pub fn key(&self) -> String {
+        format!("{}#{} {}", self.owner, self.name, self.descriptor)
+    }
+}
+
+/// A field or method a class declares, with its flags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Declared {
+    pub name: String,
+    pub descriptor: String,
+    pub access: u16,
+    pub kind: MemberKind,
+}
+
+impl Declared {
+    pub fn is_static(&self) -> bool {
+        self.access & 0x0008 != 0
+    }
+
+    pub fn is_public(&self) -> bool {
+        self.access & 0x0001 != 0
+    }
+
+    pub fn is_protected(&self) -> bool {
+        self.access & 0x0004 != 0
+    }
+
+    pub fn is_abstract(&self) -> bool {
+        self.access & 0x0400 != 0
+    }
+
+    pub fn is_enum_constant(&self) -> bool {
+        self.kind == MemberKind::Field && self.access & 0x4000 != 0
+    }
+}
+
+/// One annotation, as far as the census needs it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Annotation {
+    /// `Lorg/spongepowered/asm/mixin/Mixin;`
+    pub ty: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub values: BTreeMap<String, Value>,
+}
+
+/// An annotation's element value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Value {
+    Bool(bool),
+    /// Every integral and floating constant, widened.
+    Number(f64),
+    Str(String),
+    /// A class literal (`Lnet/minecraft/world/item/Item;`).
+    Type(String),
+    Enum(String, String),
+    Ann(Annotation),
+    Array(Vec<Value>),
+}
+
+/// One `@Inject`/`@Redirect`/... on a mixin method.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Injection {
+    /// `inject`, `redirect`, `modify-variable`, `overwrite`, `accessor`...
+    pub kind: String,
+    /// The mixin's `method` target, or empty for the whole class.
+    pub method: String,
+    /// The `At` values, `|`-joined: `HEAD`, `INVOKE|target:getBlockState`.
+    pub at: String,
+}
+
+/// The annotation that makes a class a Mixin.
+const MIXIN: &str = "Lorg/spongepowered/asm/mixin/Mixin;";
+
+/// Reads a class file's header, constant pool, members and annotations.
 pub fn parse(bytes: &[u8]) -> Option<Class> {
     let mut r = Reader { bytes, at: 0 };
     if r.u4()? != 0xCAFE_BABE {
         return None;
     }
     r.skip(4)?; // minor, major
-    let count = r.u2()? as usize;
-    let mut utf8: HashMap<usize, String> = HashMap::new();
-    let mut class_of: HashMap<usize, usize> = HashMap::new();
-    let mut i = 1;
-    while i < count {
-        let tag = r.u1()?;
-        match tag {
-            1 => {
-                let len = r.u2()? as usize;
-                let s = r.take(len)?;
-                utf8.insert(i, String::from_utf8_lossy(s).into_owned());
-            }
-            7 => {
-                class_of.insert(i, r.u2()? as usize);
-            }
-            8 | 16 | 19 | 20 => r.skip(2)?,
-            3 | 4 | 9..=12 | 17 | 18 => r.skip(4)?,
-            15 => r.skip(3)?,
-            5 | 6 => {
-                r.skip(8)?;
-                i += 1;
-            }
-            _ => return None,
-        }
-        i += 1;
-    }
-    let class_name = |idx: usize| -> String {
-        class_of
-            .get(&idx)
-            .and_then(|u| utf8.get(u))
-            .cloned()
-            .unwrap_or_default()
-    };
-    r.skip(2)?; // access flags
-    let name = class_name(r.u2()? as usize);
-    let superclass = class_name(r.u2()? as usize);
+    let pool = Pool::read(&mut r)?;
+    let access = r.u2()?;
+    let name = pool.class_name(r.u2()?)?.to_owned();
+    let superclass = pool.class_name(r.u2()?).unwrap_or_default().to_owned();
     let n = r.u2()? as usize;
     let mut interfaces = Vec::with_capacity(n);
     for _ in 0..n {
-        interfaces.push(class_name(r.u2()? as usize));
+        interfaces.push(pool.class_name(r.u2()?).unwrap_or_default().to_owned());
     }
-    // Fields, then methods: flags, name, descriptor, attributes.
+    let mut fields = Vec::new();
+    let mut declared = Vec::new();
+    let mut field_annotations = BTreeMap::new();
+    for _ in 0..r.u2()? {
+        let access = r.u2()?;
+        let field = pool.str(r.u2()?)?.to_owned();
+        let descriptor = pool.str(r.u2()?)?.to_owned();
+        let annotations = annotations(&attributes(&mut r, &pool)?, &pool);
+        if !annotations.is_empty() {
+            field_annotations.insert(field.clone(), annotations);
+        }
+        declared.push(Declared {
+            name: field.clone(),
+            descriptor,
+            access,
+            kind: MemberKind::Field,
+        });
+        fields.push(field);
+    }
     let mut methods = Vec::new();
-    for member in 0..2 {
-        let n = r.u2()?;
-        for _ in 0..n {
-            r.skip(2)?;
-            let name = r.u2()? as usize;
-            r.skip(2)?;
-            let attributes = r.u2()?;
-            for _ in 0..attributes {
-                r.skip(2)?;
-                let len = r.u4()? as usize;
-                r.skip(len)?;
-            }
-            if member == 1
-                && let Some(m) = utf8.get(&name)
-                && !m.starts_with('<')
-                && !m.starts_with("lambda$")
-            {
-                methods.push(m.clone());
+    let mut method_annotations = BTreeMap::new();
+    for _ in 0..r.u2()? {
+        let access = r.u2()?;
+        let method = pool.str(r.u2()?)?.to_owned();
+        let descriptor = pool.str(r.u2()?)?.to_owned();
+        let annotations = annotations(&attributes(&mut r, &pool)?, &pool);
+        if !annotations.is_empty() {
+            method_annotations.insert(method.clone(), annotations);
+        }
+        declared.push(Declared {
+            name: method.clone(),
+            descriptor,
+            access,
+            kind: MemberKind::Method,
+        });
+        // Constructors and lambdas are not members a mod declares.
+        if !method.starts_with('<') && !method.starts_with("lambda$") {
+            methods.push(method);
+        }
+    }
+    let annotations = annotations(&attributes(&mut r, &pool)?, &pool);
+    let mixin = annotations.iter().any(|a| a.ty == MIXIN) || pool.utf8.values().any(|s| s == MIXIN);
+    let mixin_targets = if mixin {
+        mixin_targets(&annotations)
+    } else {
+        Vec::new()
+    };
+    let injections = if mixin {
+        injections(&method_annotations, &field_annotations)
+    } else {
+        Vec::new()
+    };
+    Some(Class {
+        name,
+        access,
+        superclass,
+        interfaces,
+        fields,
+        declared,
+        methods,
+        refs: pool.classes(),
+        members: pool.members(),
+        mixin_targets,
+        injections,
+        annotations,
+        method_annotations,
+        field_annotations,
+        mixin,
+    })
+}
+
+/// Every class file in a jar, its nested jars (`META-INF/jars/`) included,
+/// one level deep.
+pub fn read_jar(path: &Path) -> Result<Vec<Class>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut top = Vec::new();
+    let mut nested = Vec::new();
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_owned();
+        if name.ends_with(".class") {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            top.push(bytes);
+        } else if name.starts_with("META-INF/jars/") && name.ends_with(".jar") && nested.len() < 64
+        {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            if bytes.len() < 32 * 1024 * 1024 {
+                nested.push(bytes);
             }
         }
     }
-    let refs = class_of
-        .values()
-        .filter_map(|u| utf8.get(u))
-        .filter(|s| !s.starts_with('['))
-        .cloned()
-        .collect();
-    let mixin = utf8
-        .values()
-        .any(|s| s == "Lorg/spongepowered/asm/mixin/Mixin;");
-    Some(Class {
-        name,
-        superclass,
-        interfaces,
-        methods,
-        refs,
-        mixin,
+    let mut classes: Vec<Class> = top.iter().filter_map(|b| parse(b)).collect();
+    for bytes in &nested {
+        let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())) else {
+            continue;
+        };
+        for i in 0..archive.len() {
+            let Ok(mut entry) = archive.by_index(i) else {
+                continue;
+            };
+            if !entry.name().ends_with(".class") {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            if entry.read_to_end(&mut bytes).is_ok()
+                && let Some(class) = parse(&bytes)
+            {
+                classes.push(class);
+            }
+        }
+    }
+    Ok(classes)
+}
+
+/// The constant pool, with the entries a class file's members and
+/// annotations need.
+#[derive(Default)]
+struct Pool {
+    utf8: HashMap<usize, String>,
+    class_of: HashMap<usize, usize>,
+    ints: HashMap<usize, i32>,
+    longs: HashMap<usize, i64>,
+    floats: HashMap<usize, f32>,
+    doubles: HashMap<usize, f64>,
+    /// NameAndType: name, descriptor.
+    pairs: HashMap<usize, (usize, usize)>,
+    /// Fieldref, Methodref, InterfaceMethodref: tag, class, NameAndType.
+    refs: Vec<(u8, usize, usize)>,
+}
+
+impl Pool {
+    fn read(r: &mut Reader) -> Option<Pool> {
+        let count = r.u2()? as usize;
+        let mut p = Pool::default();
+        let mut i = 1;
+        while i < count {
+            let tag = r.u1()?;
+            match tag {
+                1 => {
+                    let len = r.u2()? as usize;
+                    let s = r.take(len)?;
+                    p.utf8.insert(i, String::from_utf8_lossy(s).into_owned());
+                }
+                3 => {
+                    p.ints.insert(i, r.u4()? as i32);
+                }
+                4 => {
+                    p.floats.insert(i, f32::from_bits(r.u4()?));
+                }
+                5 => {
+                    let b: [u8; 8] = r.take(8)?.try_into().ok()?;
+                    p.longs.insert(i, i64::from_be_bytes(b));
+                    i += 1;
+                }
+                6 => {
+                    let b: [u8; 8] = r.take(8)?.try_into().ok()?;
+                    p.doubles.insert(i, f64::from_be_bytes(b));
+                    i += 1;
+                }
+                7 => {
+                    p.class_of.insert(i, r.u2()? as usize);
+                }
+                8 | 16 | 19 | 20 => r.skip(2)?,
+                9..=11 => {
+                    let class = r.u2()? as usize;
+                    let pair = r.u2()? as usize;
+                    p.refs.push((tag, class, pair));
+                }
+                12 => {
+                    let name = r.u2()? as usize;
+                    let descriptor = r.u2()? as usize;
+                    p.pairs.insert(i, (name, descriptor));
+                }
+                15 => r.skip(3)?,
+                17 | 18 => r.skip(4)?,
+                _ => return None,
+            }
+            i += 1;
+        }
+        Some(p)
+    }
+
+    fn str(&self, i: u16) -> Option<&str> {
+        self.utf8.get(&(i as usize)).map(String::as_str)
+    }
+
+    fn class_name(&self, i: u16) -> Option<&str> {
+        self.class_of
+            .get(&(i as usize))
+            .and_then(|u| self.str(*u as u16))
+    }
+
+    fn classes(&self) -> BTreeSet<String> {
+        self.class_of
+            .values()
+            .filter_map(|u| self.utf8.get(u))
+            .filter(|s| !s.starts_with('['))
+            .cloned()
+            .collect()
+    }
+
+    fn members(&self) -> Vec<Member> {
+        let mut out = Vec::new();
+        for &(tag, class, pair) in &self.refs {
+            let Some(owner) = self.class_name(class as u16) else {
+                continue;
+            };
+            if owner.starts_with('[') {
+                continue;
+            }
+            let Some(&(name, descriptor)) = self.pairs.get(&pair) else {
+                continue;
+            };
+            let (Some(name), Some(descriptor)) =
+                (self.str(name as u16), self.str(descriptor as u16))
+            else {
+                continue;
+            };
+            out.push(Member {
+                owner: owner.to_owned(),
+                name: name.to_owned(),
+                descriptor: descriptor.to_owned(),
+                kind: match tag {
+                    9 => MemberKind::Field,
+                    10 => MemberKind::Method,
+                    _ => MemberKind::InterfaceMethod,
+                },
+            });
+        }
+        out
+    }
+}
+
+/// A class's, method's or field's attributes: name and bytes.
+fn attributes<'a>(r: &mut Reader<'a>, pool: &Pool) -> Option<Vec<(String, &'a [u8])>> {
+    let n = r.u2()?;
+    let mut out = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let name = pool.str(r.u2()?)?.to_owned();
+        let len = r.u4()? as usize;
+        out.push((name, r.take(len)?));
+    }
+    Some(out)
+}
+
+/// The `RuntimeVisibleAnnotations` (and invisible ones) an attribute list holds.
+fn annotations(attributes: &[(String, &[u8])], pool: &Pool) -> Vec<Annotation> {
+    let mut out = Vec::new();
+    for (name, bytes) in attributes {
+        if name != "RuntimeVisibleAnnotations" && name != "RuntimeInvisibleAnnotations" {
+            continue;
+        }
+        let mut r = Reader { bytes, at: 0 };
+        let Some(n) = r.u2() else { continue };
+        for _ in 0..n {
+            let Some(a) = annotation(&mut r, pool) else {
+                break;
+            };
+            out.push(a);
+        }
+    }
+    out
+}
+
+fn annotation(r: &mut Reader, pool: &Pool) -> Option<Annotation> {
+    let ty = pool.str(r.u2()?)?.to_owned();
+    let n = r.u2()?;
+    let mut values = BTreeMap::new();
+    for _ in 0..n {
+        let name = pool.str(r.u2()?)?.to_owned();
+        values.insert(name, value(r, pool)?);
+    }
+    Some(Annotation { ty, values })
+}
+
+fn value(r: &mut Reader, pool: &Pool) -> Option<Value> {
+    let tag = r.u1()?;
+    Some(match tag {
+        b'B' | b'C' | b'S' | b'I' => {
+            Value::Number(pool.ints.get(&(r.u2()? as usize)).copied()? as f64)
+        }
+        b'Z' => Value::Bool(pool.ints.get(&(r.u2()? as usize)).copied()? != 0),
+        b'J' => Value::Number(pool.longs.get(&(r.u2()? as usize)).copied()? as f64),
+        b'F' => Value::Number(pool.floats.get(&(r.u2()? as usize)).copied()? as f64),
+        b'D' => Value::Number(pool.doubles.get(&(r.u2()? as usize)).copied()?),
+        b's' => Value::Str(pool.str(r.u2()?)?.to_owned()),
+        b'e' => {
+            let ty = pool.str(r.u2()?)?.to_owned();
+            let name = pool.str(r.u2()?)?.to_owned();
+            Value::Enum(ty, name)
+        }
+        b'c' => Value::Type(pool.str(r.u2()?)?.to_owned()),
+        b'@' => Value::Ann(annotation(r, pool)?),
+        b'[' => {
+            let n = r.u2()?;
+            let mut items = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                items.push(value(r, pool)?);
+            }
+            Value::Array(items)
+        }
+        _ => return None,
+    })
+}
+
+/// `@Mixin(Foo.class)` and `@Mixin(targets = "a.B")`.
+fn mixin_targets(annotations: &[Annotation]) -> Vec<String> {
+    let mut out = Vec::new();
+    for a in annotations.iter().filter(|a| a.ty == MIXIN) {
+        for key in ["value", "targets"] {
+            let Some(v) = a.values.get(key) else { continue };
+            for item in items(v) {
+                match item {
+                    Value::Type(t) => {
+                        let name = t.trim_matches(|c| c == 'L' || c == '[' || c == ';');
+                        out.push(name.to_owned());
+                    }
+                    Value::Str(s) => out.push(s.replace('.', "/")),
+                    _ => {}
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn items(value: &Value) -> &[Value] {
+    match value {
+        Value::Array(v) => v,
+        other => std::slice::from_ref(other),
+    }
+}
+
+/// The mixin annotations a method or field carries, as injections.
+fn injections(
+    methods: &BTreeMap<String, Vec<Annotation>>,
+    fields: &BTreeMap<String, Vec<Annotation>>,
+) -> Vec<Injection> {
+    let mut out = Vec::new();
+    for (name, annotations) in methods.iter().chain(fields) {
+        for a in annotations {
+            let Some(kind) = injection_kind(&a.ty) else {
+                continue;
+            };
+            let method = a
+                .values
+                .get("method")
+                .map(|v| {
+                    items(v)
+                        .iter()
+                        .filter_map(text)
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .unwrap_or_default();
+            let at = a
+                .values
+                .get("at")
+                .map(|v| {
+                    items(v)
+                        .iter()
+                        .filter_map(at_value)
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .unwrap_or_default();
+            out.push(Injection {
+                kind: kind.to_owned(),
+                method: if method.is_empty() {
+                    name.clone()
+                } else {
+                    method
+                },
+                at,
+            });
+        }
+    }
+    out
+}
+
+fn text(value: &Value) -> Option<String> {
+    match value {
+        Value::Str(s) => Some(s.clone()),
+        Value::Enum(_, name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn at_value(value: &Value) -> Option<String> {
+    let Value::Ann(a) = value else { return None };
+    let mut out = Vec::new();
+    if let Some(v) = a.values.get("value") {
+        out.extend(items(v).iter().filter_map(text));
+    }
+    if let Some(v) = a.values.get("target") {
+        out.extend(
+            items(v)
+                .iter()
+                .filter_map(|v| text(v).map(|t| format!("target:{t}"))),
+        );
+    }
+    Some(out.join("|"))
+}
+
+/// The simple name of a Mixin annotation, if it is one.
+fn injection_kind(ty: &str) -> Option<&'static str> {
+    let simple = ty
+        .trim_start_matches('L')
+        .trim_end_matches(';')
+        .rsplit('/')
+        .next()?;
+    Some(match simple {
+        "Inject" => "inject",
+        "Redirect" => "redirect",
+        "ModifyVariable" => "modify-variable",
+        "ModifyArg" => "modify-arg",
+        "ModifyArgs" => "modify-args",
+        "ModifyConstant" => "modify-constant",
+        "ModifyExpressionValue" => "modify-expression-value",
+        "ModifyReceiver" => "modify-receiver",
+        "ModifyReturnValue" => "modify-return-value",
+        "WrapOperation" => "wrap-operation",
+        "WrapWithCondition" => "wrap-with-condition",
+        "Overwrite" => "overwrite",
+        "Accessor" => "accessor",
+        "Invoker" => "invoker",
+        "Shadow" => "shadow",
+        _ => return None,
     })
 }
 
@@ -161,6 +642,8 @@ pub enum Feature {
     Renderer,
     /// A worldgen feature, placement or structure type written in Java.
     Worldgen,
+    /// A world or level implementation that reads or mutates simulation state.
+    WorldAccess,
     /// A recipe type (its recipes don't craft) or ingredient type.
     Recipe,
     Effect,
@@ -204,6 +687,10 @@ impl Feature {
             Feature::Worldgen => (
                 "worldgen feature or structure type in code",
                 "worldgen features or structure types in code",
+            ),
+            Feature::WorldAccess => (
+                "world or level implementation",
+                "world or level implementations",
             ),
             Feature::Recipe => (
                 "recipe type of its own (its recipes don't craft)",
@@ -299,6 +786,8 @@ fn kind_of_game_class(name: &str) -> Option<Feature> {
         p if p.starts_with("world/item/enchantment") => Feature::Enchantment,
         p if p.starts_with("world/item") => Feature::ItemBehaviour,
         p if p.starts_with("world/level/levelgen") => Feature::Worldgen,
+        "world/level" => Feature::WorldAccess,
+        p if p.starts_with("world/level/") => Feature::WorldAccess,
         "world/effect" => Feature::Effect,
         p if p.starts_with("client/gui/screens") || p.starts_with("client/gui/components") => {
             Feature::Screen
@@ -613,6 +1102,24 @@ mod tests {
             ["PlayerInteractEvent"]
         );
         assert!(code.behaviour());
+    }
+
+    #[test]
+    fn classifying_level_extensions_marks_world_access() {
+        let files = [class_file(
+            "m/WorldHooks",
+            "net/minecraft/world/level/Level",
+            &["getBlockState", "setBlock"],
+            &[],
+            false,
+        )];
+        let code = census(files.iter().map(Vec::as_slice));
+        assert_eq!(code.features.get(&Feature::WorldAccess), Some(&1));
+        assert!(code.behaviour());
+        assert_eq!(
+            Feature::WorldAccess.describe(2),
+            "2 world or level implementations"
+        );
     }
 
     #[test]
