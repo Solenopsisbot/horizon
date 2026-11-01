@@ -342,6 +342,20 @@ mod tests {
         let content = crate::Content::from_native("ruby", declarations).unwrap();
         assert_eq!(content.blocks[0].id, "ruby:lamp");
         assert_eq!(content.effects[0].id, "ruby:glow");
+        assert_eq!(content.namespaces, ["ruby"]);
+
+        let mut foreign = NativeDeclarations::default();
+        let item = RegistryEntry::typed(
+            "minecraft:item",
+            "shared:wand",
+            RegistryDeclaration::Item {
+                template: "minecraft:stick".into(),
+                properties: BTreeMap::new(),
+            },
+        );
+        foreign.register_typed(&item).unwrap();
+        let content = crate::Content::from_native("ruby", foreign).unwrap();
+        assert_eq!(content.namespaces, ["ruby", "shared"]);
 
         let opaque = RegistryEntry {
             registry: "minecraft:item".into(),

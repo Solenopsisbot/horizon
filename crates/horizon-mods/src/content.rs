@@ -316,13 +316,32 @@ impl Content {
                 declarations.custom.len()
             ));
         }
+        let mut namespaces = Vec::new();
+        let mut add_namespace = |value: &str| {
+            let namespace = value
+                .split_once(':')
+                .map_or(value, |(namespace, _)| namespace);
+            if !namespaces.iter().any(|owned| owned == namespace) {
+                namespaces.push(namespace.to_owned());
+            }
+        };
+        add_namespace(&id);
+        for block in &declarations.blocks {
+            add_namespace(&block.id);
+        }
+        for item in &declarations.items {
+            add_namespace(&item.id);
+        }
+        for effect in &declarations.effects {
+            add_namespace(&effect.id);
+        }
         Ok(Self {
             source: Source::Dir(PathBuf::new()),
             files: Vec::new(),
             blocks: declarations.blocks,
             items: declarations.items,
             effects: declarations.effects,
-            namespaces: vec![id],
+            namespaces,
         })
     }
 

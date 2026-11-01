@@ -1927,7 +1927,10 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     }
     if class == "net/minecraft/network/codec/StreamCodec"
         && ret == "net.minecraft.network.codec.StreamCodec"
-        && matches!(method, "map" | "mapStream" | "dispatch" | "apply")
+        && matches!(
+            method,
+            "map" | "mapStream" | "dispatch" | "apply" | "optional" | "nullable" | "cast" | "tuple"
+        )
     {
         return "return this;".to_owned();
     }
@@ -3337,6 +3340,16 @@ mod tests {
             ),
             "return new net.minecraft.network.codec.StreamCodec() {};"
         );
+        for method in ["optional", "nullable", "cast", "tuple"] {
+            assert_eq!(
+                runtime_body(
+                    "net/minecraft/network/codec/StreamCodec",
+                    method,
+                    "net.minecraft.network.codec.StreamCodec"
+                ),
+                "return this;"
+            );
+        }
         assert_eq!(
             runtime_field_default("", "Lnet/minecraft/network/codec/StreamCodec;", "null"),
             "new net.minecraft.network.codec.StreamCodec() {}"

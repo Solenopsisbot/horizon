@@ -1743,6 +1743,25 @@ impl Host for StdHost {
                     value => Value::Ref(Some(format!("optional/{}", value_marker(&value)))),
                 })
             }
+            (
+                "java/util/Optional",
+                "filter",
+                "(Ljava/util/function/Predicate;)Ljava/util/Optional;",
+            ) => {
+                let Some(_value) = expect_ref(receiver) else {
+                    return Ok(Value::Ref(None));
+                };
+                let predicate = Self::argument(r, args, 0)?;
+                let accepted = matches!(
+                    predicate,
+                    Value::Ref(Some(marker)) if marker.starts_with("@indy:")
+                );
+                Ok(if accepted {
+                    receiver.clone()
+                } else {
+                    Value::Ref(None)
+                })
+            }
             ("java/util/Optional", "ifPresent", "(Ljava/util/function/Consumer;)V") => {
                 if let Some(value) = expect_ref(receiver) {
                     let value = value.strip_prefix("optional/").unwrap_or(value);
@@ -1819,6 +1838,9 @@ impl Host for StdHost {
                 Ok(Self::argument(r, args, 0)?.clone())
             }
             ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V") => Ok(Value::Void),
+            ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
+                expect_ref(receiver).is_some_and(|marker| marker.starts_with("@indy:")) as i32,
+            )),
             ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => Ok(Value::Ref(None)),
             ("net/minecraft/resources/Identifier", name, descriptor) => {
                 let (namespace, path) = identifier_parts(receiver);
@@ -3309,6 +3331,9 @@ impl<H: Host> Runtime<'_, H> {
                 args.first()
             }
             "ifPresent" if r.descriptor == "(Ljava/util/function/Consumer;)V" => args.first(),
+            "filter" if r.descriptor == "(Ljava/util/function/Predicate;)Ljava/util/Optional;" => {
+                args.first()
+            }
             "orElseGet" if r.descriptor == "(Ljava/util/function/Supplier;)Ljava/lang/Object;" => {
                 args.first()
             }
@@ -3329,6 +3354,17 @@ impl<H: Host> Runtime<'_, H> {
         };
         if r.name == "orElseGet" {
             return Ok(Some(Value::Ref(Some(value.to_owned()))));
+        }
+        if r.name == "filter" {
+            let Some(result) =
+                self.invoke_callback(callback, &[Value::Ref(Some(value.to_owned()))])?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(match result {
+                Value::Int(flag) if flag != 0 => receiver.clone(),
+                _ => Value::Ref(None),
+            }));
         }
         let Some(result) = self.invoke_callback(callback, &[Value::Ref(Some(value.to_owned()))])?
         else {
@@ -5737,6 +5773,29 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(&map, &Value::Ref(None), &[Value::Ref(None)])
                 .unwrap(),
+            Value::Ref(None)
+        );
+        let filter = MethodRef {
+            owner: "java/util/Optional".into(),
+            name: "filter".into(),
+            descriptor: "(Ljava/util/function/Predicate;)Ljava/util/Optional;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &filter,
+                &Value::Ref(Some("optional/demo".into())),
+                &[Value::Ref(Some("@indy:predicate".into()))],
+            )
+            .unwrap(),
+            Value::Ref(Some("optional/demo".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &filter,
+                &Value::Ref(Some("optional/demo".into())),
+                &[Value::Ref(None)],
+            )
+            .unwrap(),
             Value::Ref(None)
         );
         let if_present = MethodRef {

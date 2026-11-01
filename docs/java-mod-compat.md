@@ -253,7 +253,7 @@ Caused by: java.lang.UnsupportedOperationException: horizon stub: net/minecraft/
 That is the loop working: the class loads, the entrypoint runs, and the first unimplemented game method
 is named with the mod's own file and line under it. The first runtime slice now treats
 `StreamCodec` factories as bootstrap values, returning an empty codec object so static registration can
-rather than the codec factory itself. Codec composition methods now preserve a non-null receiver, and
+rather than the codec factory itself. Codec composition methods (`map`, `mapStream`, `dispatch`, `apply`, `optional`, `nullable`, `cast`, and `tuple`) preserve a non-null receiver, and
 `CustomPacketPayload.Type` retains its `Identifier` through construction and `id()`, so payload
 registration can compare type identities before crossing the native network boundary. The next failure
 is therefore the next concrete value or registry operation the mod reaches,
@@ -496,8 +496,8 @@ markers produced by `List.of`/`Map.of`, and interface-owner calls (`List`/`Map`)
 receiver where the marker is one of the supported concrete collections. The state is invocation-scoped
 and bounded; distinct Java object identity and concurrent collection semantics remain on the JVM fallback
 path.
-The common `Optional.map`/`ifPresent`/`orElseGet` callback flow executes supported in-jar
-`Function`, `Consumer`, and `Supplier` targets and keeps neutral markers for unresolved callbacks. Its NeoForge mappings keep
+The common `Optional.map`/`filter`/`ifPresent`/`orElseGet` callback flow executes supported in-jar
+`Function`, `Predicate`, `Consumer`, and `Supplier` targets and keeps neutral markers for unresolved callbacks. Its NeoForge mappings keep
 the context, event-bus listener, deferred-register, registry-event, and payload-registration chains alive;
 listener lambdas arrive as captured `@indy:...` markers in the recorded invocation stream. `StdHost` exposes
 those listeners through `dispatch_event` and records deterministic `RegistryEntry` values and holder lookups,
@@ -540,7 +540,9 @@ explicit `--java-mod` path runs this adapter before `Assets::load` and passes th
 `NativeDeclarations::from_registry_entries` and `register_entries` provide the all-or-nothing batch seam
 for combining typed entries parsed from `META-INF/horizon-native.json` with typed registrations recorded
 during entrypoint execution. An opaque or invalid entry aborts the batch before any partial declaration
-can reach the immutable resource tables.
+can reach the immutable resource tables. Native content derives its owned namespace fence from every typed
+block, item, and effect identifier, so extra namespaces participate in the same clash checks as packaged
+content before the resource root is built.
 
 The discovery scanner has a regression fixture for a top-level NeoForge `@Mod` annotation marker;
 the constructor path is therefore testable without requiring a full NeoForge game launch. A synthetic
