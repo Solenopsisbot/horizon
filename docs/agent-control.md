@@ -184,7 +184,7 @@ turn the switch off.
   socket (`ctl-NAME.sock` beside the first). Players share the game's tables (about 370 MB), so each
   costs tens of MB instead of a game's 400: measured on a Ryzen 7 3700X joined to a local server,
   50 players took 1.9 GB and 37% of one core at render distance 3. Each plays as its own account
-  (its session file) or offline under its name, never as the process's; spawned players are blind
+  (its `--session-file`, required), never the process's; spawned players are blind
   (no `vision`). `players` lists them and `quit` on a player's socket removes it
   ([#4952](https://github.com/horizon-rust/horizon/issues/4952)).
 

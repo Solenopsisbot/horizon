@@ -8,8 +8,9 @@
 //! socket, and leaves when that socket is told to `quit`. Players can be added at any time.
 //!
 //! A spawned player is blind: its GUI resources are the fonts only (`UiResources::server`),
-//! so `vision` refuses. Its account is its own (`auth::set_for_thread`): a session file, or
-//! offline under NAME, never the account the process started with.
+//! so `vision` refuses. Its account is its own (`auth::set_for_thread`): the signed-in account
+//! of a session file from the launcher, never the account the process started with. Like the
+//! rest of Horizon it follows Mojang's rules: no player without an account that owns the game.
 
 use super::{Audio, Game, UiResources, start_game};
 use horizon_client::Result;
@@ -19,6 +20,10 @@ use std::{
     sync::Mutex,
     time::Instant,
 };
+
+/// A spawned player plays as a signed-in account that owns the game, as every Horizon player.
+const NO_SESSION: &str =
+    "spawn needs --session-file: the signed-in account it plays as, from the launcher";
 
 /// The names of the players spawned in this process and still playing.
 static PLAYING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
@@ -37,10 +42,10 @@ fn socket_beside(first: &Path, name: &str) -> PathBuf {
 
 impl Game<'_> {
     /// Starts player `name` in this process and returns its control socket. It joins
-    /// `server` (default: the server this game was started on) as the account in
-    /// `session_file`, else offline as `name`, asking for `render_distance` chunks around it
-    /// (default: this game's). It is still connecting when this returns: `wait-ready` on its
-    /// socket says when it has spawned.
+    /// `server` (default: the server this game was started on) as the signed-in account in
+    /// `session_file`, asking for `render_distance` chunks around it (default: this game's).
+    /// It is still connecting when this returns: `wait-ready` on its socket says when it has
+    /// spawned.
     pub(super) fn add_player(
         &self,
         name: &str,
@@ -67,6 +72,9 @@ impl Game<'_> {
         let session = session_file
             .map(horizon_client::auth::AuthSession::load)
             .transpose()?;
+        if session.is_none() {
+            return Err(NO_SESSION.into());
+        }
         let name = session
             .as_ref()
             .map_or(name, |s| s.name.as_str())
