@@ -13,8 +13,9 @@ use horizon_protocol::{
     packets::play::{self, Clientbound as C},
     registry::DimensionType,
 };
+use std::collections::HashMap;
 use std::sync::{
-    Arc,
+    Arc, Mutex, Weak,
     mpsc::{self, TryRecvError},
 };
 
@@ -190,6 +191,61 @@ impl ChunkFormat {
 
 type Decoded = (Box<C>, Result<Chunk, String>);
 
+/// Columns the players of this process hold, by what they were decoded from: the players a
+/// headless game spawned (#4952) that stand in one place get the same columns from the
+/// server, and one copy serves them all. A column is shared until a player changes it (its
+/// copy-on-write `Arc`), and freed with its last player: the map keeps only weak references.
+static SHARED: Mutex<Option<HashMap<u64, Weak<Chunk>>>> = Mutex::new(None);
+
+/// What a column decodes from: its packet's blocks, heightmaps and light, and the format
+/// (dimension and biome registry) it is decoded under. Equal keys decode to equal columns.
+fn column_key(format: &ChunkFormat, p: &play::LevelChunkWithLight) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}", format.column).hash(&mut h);
+    (
+        format.min_y,
+        format.sections,
+        format.has_skylight,
+        format.biome_bits,
+    )
+        .hash(&mut h);
+    format.biome_map.hash(&mut h);
+    (p.x, p.z).hash(&mut h);
+    p.chunk.heightmaps.hash(&mut h);
+    p.chunk.buffer.hash(&mut h);
+    let l = &p.light;
+    (
+        &l.sky_mask,
+        &l.block_mask,
+        &l.empty_sky_mask,
+        &l.empty_block_mask,
+        &l.sky,
+        &l.block,
+    )
+        .hash(&mut h);
+    h.finish()
+}
+
+/// The shared copy of `chunk` if another player of the process holds one, else `chunk`,
+/// now shared.
+fn share_column(key: u64, chunk: Chunk) -> Arc<Chunk> {
+    let mut shared = SHARED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let map = shared.get_or_insert_with(HashMap::new);
+    if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let chunk = Arc::new(chunk);
+    // Columns every player dropped leave dead entries: clear them out now and then.
+    if map.len() >= 4096 && map.len().is_power_of_two() {
+        map.retain(|_, w| w.strong_count() > 0);
+    }
+    map.insert(key, Arc::downgrade(&chunk));
+    chunk
+}
+
 /// One thread that decodes chunk packets in the order they arrived; its
 /// results come back in that order, one per `submit`.
 pub(super) struct ChunkDecoder {
@@ -282,7 +338,14 @@ impl Game<'_> {
             }
         };
         let (x, z) = (p.x, p.z);
-        self.streaming.insert_remote(&mut self.world, chunk);
+        // A headless game's players share the columns they all received; a game with a
+        // window has one player, and nothing to share with.
+        let chunk = if self.options.headless {
+            share_column(column_key(&format, p), chunk)
+        } else {
+            Arc::new(chunk)
+        };
+        self.streaming.insert_remote_shared(&mut self.world, chunk);
         self.world
             .block_entities
             .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));

@@ -879,10 +879,16 @@ impl Streaming {
     /// (`ClientPacketListener.handleLevelChunkWithLight`): nothing is
     /// relit, and it and its neighbours remesh (`enableChunkLight`).
     pub fn insert_remote(&mut self, world: &mut World, chunk: Chunk) {
+        self.insert_remote_shared(world, Arc::new(chunk));
+    }
+    /// [`Self::insert_remote`] for a column other players of this process may hold too
+    /// (a headless game's spawned players, #4952): it is shared until one of them changes it,
+    /// since every change goes through `Arc::make_mut` and so copies it first.
+    pub fn insert_remote_shared(&mut self, world: &mut World, chunk: Arc<Chunk>) {
         let key = (chunk.x, chunk.z);
         self.lighting.remove(&key);
         self.light_snapshots.remove(&key);
-        world.chunks.insert(key, Arc::new(chunk));
+        world.chunks.insert(key, chunk);
         self.lit.insert(key);
         self.generated_total += 1;
         for dz in -1..=1 {
