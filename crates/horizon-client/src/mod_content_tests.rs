@@ -1463,3 +1463,41 @@ fn shapes_reject_unknown_or_missing_template_values() {
     }
     fs::remove_dir_all(scratch).unwrap();
 }
+
+#[test]
+fn native_declaration_changes_invalidate_content_stamp() {
+    use horizon_native_java::{RegistryDeclaration, RegistryEntry};
+    use std::collections::BTreeMap;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!("horizon-native-stamp-{nonce}"));
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("horizon-resources.json"), b"{}").unwrap();
+    let make_mod = |path: &str| {
+        let entry = RegistryEntry::typed(
+            "minecraft:item",
+            format!("ruby:{path}"),
+            RegistryDeclaration::Item {
+                template: "minecraft:stick".into(),
+                properties: BTreeMap::new(),
+            },
+        );
+        ContentMod {
+            id: "ruby".into(),
+            content: Content::from_native(
+                "ruby",
+                horizon_mods::native::NativeDeclarations::from_registry_entries([&entry]).unwrap(),
+            )
+            .unwrap(),
+        }
+    };
+    let first = make_mod("wand");
+    let second = make_mod("staff");
+    let first_stamp = stamp(&base, std::slice::from_ref(&first)).unwrap();
+    let second_stamp = stamp(&base, std::slice::from_ref(&second)).unwrap();
+    assert_ne!(first_stamp, second_stamp);
+    fs::remove_dir_all(base).unwrap();
+}
