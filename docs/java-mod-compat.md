@@ -278,8 +278,8 @@ preserve nested `Tag` references, `getCompound` returns the nested value or an e
 `getList` plus the generated `ListTag` retain bounded add/get/size/string/compound operations. These
 collections remain callback-local until the Rust NBT bridge is wired through the native boundary.
 `Level` and `ServerLevel` now retain a game-time and dimension marker and answer the common
-`getGameTime`/`getDayTime`, `dimension`, block-state/entity, loaded-chunk, sky-visibility, side, and
-build-height queries. Their
+`getGameTime`/`getDayTime`, weather and thunder levels, `isRaining`/`isThundering`, `dimension`,
+block-state/entity, loaded-chunk, sky-visibility, side, and build-height queries. Their
 bounded coordinate-keyed maps also preserve `setBlock`, `setBlockAndUpdate`, `setBlockEntity`, and
 `removeBlock` writes within the façade instance, so a registration callback can observe its own world
 mutation sequence. The maps remain callback-local until the native level handle is wired through the game
@@ -307,9 +307,10 @@ retains its effect, duration, amplifier, ambient/visibility/icon flags, infinite
 bounded duration ticking; live AI and effect scheduling remain native-boundary work.
 `Player` and `ServerPlayer` façade stubs now retain bounded creative/spectator flags, scoreboard identity,
 and experience level/progress. `isCreative`, `isSpectator`, `getScoreboardName`, `getName`,
-`getDisplayName`, and the experience queries preserve common permission, HUD, and display-name paths;
-inventory and abilities accessors return façade values, while authority, profile identity, and inventory
-synchronization remain native-boundary work.
+`getDisplayName`, and the experience queries preserve common permission, HUD, and display-name paths.
+`getInventory` now returns a 36-slot callback-local inventory with selected-item, set/remove, and clear
+operations; `getAbilities` exposes bounded flying/walking speed accessors. Authority, profile identity,
+and live inventory synchronization remain native-boundary work.
 The Hollow Dawn core entrypoint now
 initialises successfully with the combined façade and processed Fabric API jars, keeping each runtime
 slice concrete and replayable.
@@ -384,8 +385,10 @@ python3 tools/native_java_smoke.py
 
 The script uses `javac` to compile two ordinary Java classes and a tiny NeoForge `@Mod` annotation,
 packages real Fabric and NeoForge metadata, and checks that the native runner discovers and executes both
-Fabric `main` entrypoints plus the NeoForge constructor. It therefore catches classfile, metadata,
-annotation, and multi-entrypoint regressions that an in-memory Rust fixture cannot; the full mod-port
+Fabric `main` entrypoints plus the NeoForge constructor. The first Fabric entrypoint also runs an
+`Optional.filter` predicate through the bounded host, so the smoke test proves a real callback boundary in
+addition to classfile and metadata discovery. It therefore catches classfile, metadata, annotation,
+and multi-entrypoint regressions that an in-memory Rust fixture cannot; the full mod-port
 harness remains the check that needs prepared vanilla resources.
 
 The game has an explicit `--java-mod <jar>` startup option for this bounded path. It runs the selected

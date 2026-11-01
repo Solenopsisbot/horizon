@@ -1,4 +1,4 @@
-"""End-to-end regression for a compiled Fabric native probe jar."""
+"""End-to-end regression for compiled Fabric and NeoForge native probe jars."""
 
 import shutil
 import subprocess
@@ -22,6 +22,7 @@ class NativeJavaSmokeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn('"entrypoints": ["demo.First", "demo.Second"]', result.stdout)
         self.assertIn('"entrypoints": ["demo.Neo"]', result.stdout)
+        self.assertIn('"host_calls": 7', result.stdout)
 
 
 if __name__ == "__main__":

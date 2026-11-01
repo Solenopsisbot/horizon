@@ -2,9 +2,10 @@
 """Compile and execute tiny Fabric and NeoForge native probe jars.
 
 This is intentionally independent of ``.local`` and a Minecraft installation.  It
-checks the complete native probe path with a real classfile: javac emits the
+checks the complete native probe path with real classfiles: javac emits the
 bytecode, jar packages it with Fabric metadata, and horizon-native-java discovers
-and executes both lifecycle entries, plus a constructor-discovered NeoForge jar.
+and executes both lifecycle entries, including an Optional.filter predicate callback,
+plus a constructor-discovered NeoForge jar.
 """
 
 from __future__ import annotations
@@ -24,11 +25,17 @@ SOURCES = {
     "demo/First.java": """
 package demo;
 
+import java.util.Optional;
+
 public final class First {
     public void onInitialize() {
         int value = plus(19, 23);
         while (value < 42) {
             value++;
+        }
+        Optional<String> marker = Optional.ofNullable("native");
+        if (!marker.filter(text -> text.length() == 6).isPresent()) {
+            throw new IllegalStateException("Optional.filter host path failed");
         }
     }
 
@@ -225,6 +232,13 @@ def main() -> int:
             return 1
         if not isinstance(report.get("host_calls"), int):
             print(f"native probe omitted host call count: {report!r}", file=sys.stderr)
+            return 1
+        if report["host_calls"] < 5:
+            print(
+                "native probe did not exercise the Optional.filter host path: "
+                f"expected at least 5 host calls, got {report['host_calls']}",
+                file=sys.stderr,
+            )
             return 1
         neo_probe = run(
             [

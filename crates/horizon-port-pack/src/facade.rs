@@ -1139,7 +1139,7 @@ fn render(
     ) {
         let _ = writeln!(
             out,
-            "    protected long horizonGameTime;\n    protected net.minecraft.resources.ResourceKey horizonDimension = new net.minecraft.resources.ResourceKey();\n    protected java.util.Map<String, net.minecraft.world.level.block.state.BlockState> horizonBlocks = new java.util.LinkedHashMap<>();\n    protected java.util.Map<String, net.minecraft.world.level.block.entity.BlockEntity> horizonBlockEntities = new java.util.LinkedHashMap<>();\n    protected String horizonBlockKey(net.minecraft.core.BlockPos pos) {{ return pos.getX() + \",\" + pos.getY() + \",\" + pos.getZ(); }}"
+            "    protected long horizonGameTime;\n    protected float horizonRainLevel;\n    protected float horizonThunderLevel;\n    protected net.minecraft.resources.ResourceKey horizonDimension = new net.minecraft.resources.ResourceKey();\n    protected java.util.Map<String, net.minecraft.world.level.block.state.BlockState> horizonBlocks = new java.util.LinkedHashMap<>();\n    protected java.util.Map<String, net.minecraft.world.level.block.entity.BlockEntity> horizonBlockEntities = new java.util.LinkedHashMap<>();\n    protected String horizonBlockKey(net.minecraft.core.BlockPos pos) {{ return pos.getX() + \",\" + pos.getY() + \",\" + pos.getZ(); }}"
         );
     }
     if class.name == "net/minecraft/world/level/block/entity/BlockEntity" {
@@ -1180,6 +1180,12 @@ fn render(
             out,
             "    protected boolean horizonCreative;\n    protected boolean horizonSpectator;\n    protected String horizonScoreboardName = \"Player\";\n    protected int horizonExperienceLevel;\n    protected float horizonExperienceProgress;"
         );
+    }
+    if class.name == "net/minecraft/world/entity/player/Inventory" {
+        out.push_str("    protected net.minecraft.world.item.ItemStack[] horizonItems = new net.minecraft.world.item.ItemStack[36];\n    protected int horizonSelected;\n");
+    }
+    if class.name == "net/minecraft/world/entity/player/Abilities" {
+        out.push_str("    protected float horizonFlyingSpeed = 0.05f;\n    protected float horizonWalkingSpeed = 0.1f;\n");
     }
     if class.name == "net/minecraft/client/KeyMapping" {
         let _ = writeln!(out, "    private String horizonName = \"\";");
@@ -2560,6 +2566,21 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("getSkyDarken", "int", "()I") => {
                 return "return 0;".to_owned();
             }
+            ("isRaining", "boolean", "()Z") => {
+                return "return horizonRainLevel > 0.0f;".to_owned();
+            }
+            ("isThundering", "boolean", "()Z") => {
+                return "return horizonThunderLevel > 0.0f;".to_owned();
+            }
+            ("isRainingAt", "boolean", "(Lnet/minecraft/core/BlockPos;)Z") => {
+                return "return horizonRainLevel > 0.0f && canSeeSky(p0);".to_owned();
+            }
+            ("getRainLevel", "float", "(F)F") => {
+                return "return horizonRainLevel;".to_owned();
+            }
+            ("getThunderLevel", "float", "(F)F") => {
+                return "return horizonThunderLevel;".to_owned();
+            }
             (
                 "dimension",
                 "net.minecraft.resources.ResourceKey",
@@ -2824,6 +2845,59 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
                 return "if (horizonDuration > 0) horizonDuration--; return horizonDuration;"
                     .to_owned();
             }
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/entity/player/Inventory" {
+        match (method, ret, descriptor) {
+            ("getContainerSize", "int", "()I") => return "return horizonItems.length;".to_owned(),
+            ("isEmpty", "boolean", "()Z") => {
+                return "for (net.minecraft.world.item.ItemStack stack : horizonItems) if (stack != null && !stack.isEmpty()) return false; return true;".to_owned();
+            }
+            (
+                "getItem",
+                "net.minecraft.world.item.ItemStack",
+                "(I)Lnet/minecraft/world/item/ItemStack;",
+            ) => {
+                return "return p0 >= 0 && p0 < horizonItems.length && horizonItems[p0] != null ? horizonItems[p0] : new net.minecraft.world.item.ItemStack();".to_owned();
+            }
+            ("setItem", "void", "(ILnet/minecraft/world/item/ItemStack;)V") => {
+                return "if (p0 >= 0 && p0 < horizonItems.length) horizonItems[p0] = p1 == null ? new net.minecraft.world.item.ItemStack() : p1;".to_owned();
+            }
+            (
+                "getSelected",
+                "net.minecraft.world.item.ItemStack",
+                "()Lnet/minecraft/world/item/ItemStack;",
+            ) => {
+                return "return getItem(horizonSelected);".to_owned();
+            }
+            (
+                "removeItem",
+                "net.minecraft.world.item.ItemStack",
+                "(II)Lnet/minecraft/world/item/ItemStack;",
+            ) => {
+                return "if (p0 < 0 || p0 >= horizonItems.length) return new net.minecraft.world.item.ItemStack(); net.minecraft.world.item.ItemStack old = horizonItems[p0]; horizonItems[p0] = new net.minecraft.world.item.ItemStack(); return old == null ? new net.minecraft.world.item.ItemStack() : old;".to_owned();
+            }
+            (
+                "removeItemNoUpdate",
+                "net.minecraft.world.item.ItemStack",
+                "(I)Lnet/minecraft/world/item/ItemStack;",
+            ) => {
+                return "return removeItem(p0, Integer.MAX_VALUE);".to_owned();
+            }
+            ("clearContent", "void", "()V") => {
+                return "for (int i = 0; i < horizonItems.length; i++) horizonItems[i] = new net.minecraft.world.item.ItemStack();".to_owned();
+            }
+            ("setChanged", "void", "()V") => return "".to_owned(),
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/entity/player/Abilities" {
+        match (method, ret, descriptor) {
+            ("getFlyingSpeed", "float", "()F") => return "return horizonFlyingSpeed;".to_owned(),
+            ("setFlyingSpeed", "void", "(F)V") => return "horizonFlyingSpeed = p0;".to_owned(),
+            ("getWalkingSpeed", "float", "()F") => return "return horizonWalkingSpeed;".to_owned(),
+            ("setWalkingSpeed", "void", "(F)V") => return "horizonWalkingSpeed = p0;".to_owned(),
             _ => {}
         }
     }
@@ -4697,6 +4771,8 @@ mod tests {
             &[],
         );
         assert!(source.contains("protected long horizonGameTime;"));
+        assert!(source.contains("protected float horizonRainLevel;"));
+        assert!(source.contains("protected float horizonThunderLevel;"));
         assert!(source.contains("horizonDimension"));
         assert_eq!(
             runtime_body_with_descriptor(
@@ -4733,6 +4809,33 @@ mod tests {
                 "(Lnet/minecraft/core/BlockPos;)Z",
             ),
             "return true;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/Level",
+                "isRaining",
+                "boolean",
+                "()Z",
+            ),
+            "return horizonRainLevel > 0.0f;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/Level",
+                "isRainingAt",
+                "boolean",
+                "(Lnet/minecraft/core/BlockPos;)Z",
+            ),
+            "return horizonRainLevel > 0.0f && canSeeSky(p0);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/Level",
+                "getThunderLevel",
+                "float",
+                "(F)F",
+            ),
+            "return horizonThunderLevel;"
         );
         assert_eq!(
             runtime_body_with_descriptor(
@@ -5640,6 +5743,71 @@ mod tests {
             ),
             "return horizonExperienceProgress;"
         );
+    }
+
+    #[test]
+    fn player_inventory_and_abilities_are_bounded() {
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/player/Inventory",
+                "getContainerSize",
+                "int",
+                "()I",
+            ),
+            "return horizonItems.length;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/player/Inventory",
+                "getSelected",
+                "net.minecraft.world.item.ItemStack",
+                "()Lnet/minecraft/world/item/ItemStack;",
+            ),
+            "return getItem(horizonSelected);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/player/Inventory",
+                "clearContent",
+                "void",
+                "()V",
+            ),
+            "for (int i = 0; i < horizonItems.length; i++) horizonItems[i] = new net.minecraft.world.item.ItemStack();"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/player/Abilities",
+                "getFlyingSpeed",
+                "float",
+                "()F",
+            ),
+            "return horizonFlyingSpeed;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/player/Abilities",
+                "setWalkingSpeed",
+                "void",
+                "(F)V",
+            ),
+            "horizonWalkingSpeed = p0;"
+        );
+        let inventory = Class {
+            name: "net/minecraft/world/entity/player/Inventory".to_owned(),
+            ..Class::default()
+        };
+        let mut report = Report::default();
+        let source = render(
+            &inventory,
+            Some(&BTreeSet::new()),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut report,
+            false,
+            &[],
+        );
+        assert!(source.contains("horizonItems = new net.minecraft.world.item.ItemStack[36]"));
     }
 
     #[test]

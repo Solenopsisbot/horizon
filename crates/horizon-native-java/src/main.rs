@@ -1,4 +1,4 @@
-use horizon_native_java::{NativeJar, NullHost};
+use horizon_native_java::{NativeJar, StdHost};
 use std::{path::PathBuf, process::ExitCode};
 
 fn main() -> ExitCode {
@@ -57,7 +57,7 @@ fn main() -> ExitCode {
         }
         return ExitCode::FAILURE;
     };
-    let mut host = NullHost;
+    let mut host = StdHost::new();
     let mut calls = 0;
     let mut error = None;
     for entry in &entrypoints {
