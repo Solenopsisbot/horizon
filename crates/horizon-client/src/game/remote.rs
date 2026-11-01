@@ -896,7 +896,7 @@ impl Game<'_> {
                 Vec::new(),
                 7,
             )),
-            decoder: ChunkDecoder::new(),
+            decoder: ChunkDecoder::new(self.options.headless),
             view_distance: self.settings.render_distance,
             simulation_distance: self.settings.simulation_distance,
             sequence: 0,

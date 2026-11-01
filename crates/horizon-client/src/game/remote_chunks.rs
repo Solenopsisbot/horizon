@@ -189,7 +189,7 @@ impl ChunkFormat {
     }
 }
 
-type Decoded = (Box<C>, Result<Chunk, String>);
+type Decoded = (Box<C>, Result<Arc<Chunk>, String>);
 
 /// Columns the players of this process hold, by what they were decoded from: the players a
 /// headless game spawned (#4952) that stand in one place get the same columns from the
@@ -227,15 +227,32 @@ fn column_key(format: &ChunkFormat, p: &play::LevelChunkWithLight) -> u64 {
     h.finish()
 }
 
-/// The shared copy of `chunk` if another player of the process holds one, else `chunk`,
-/// now shared.
-fn share_column(key: u64, chunk: Chunk) -> Arc<Chunk> {
-    let mut shared = SHARED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+/// The column `p` decodes to under `format`: the copy another player of the process already
+/// holds, without decoding it again, else decoded now and shared from then on. The map isn't
+/// locked while a column decodes; if two players decode one at once, the second takes the
+/// first one's copy.
+fn decode_shared(
+    format: &ChunkFormat,
+    p: &play::LevelChunkWithLight,
+) -> Result<Arc<Chunk>, String> {
+    let key = column_key(format, p);
+    let lock = || {
+        SHARED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some(existing) = lock()
+        .as_ref()
+        .and_then(|m| m.get(&key))
+        .and_then(Weak::upgrade)
+    {
+        return Ok(existing);
+    }
+    let chunk = format.column(p)?;
+    let mut shared = lock();
     let map = shared.get_or_insert_with(HashMap::new);
     if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
-        return existing;
+        return Ok(existing);
     }
     let chunk = Arc::new(chunk);
     // Columns every player dropped leave dead entries: clear them out now and then.
@@ -243,7 +260,7 @@ fn share_column(key: u64, chunk: Chunk) -> Arc<Chunk> {
         map.retain(|_, w| w.strong_count() > 0);
     }
     map.insert(key, Arc::downgrade(&chunk));
-    chunk
+    Ok(chunk)
 }
 
 /// One thread that decodes chunk packets in the order they arrived; its
@@ -254,7 +271,9 @@ pub(super) struct ChunkDecoder {
 }
 
 impl ChunkDecoder {
-    pub(super) fn new() -> Self {
+    /// `share`: a headless game's decoder, whose players share their columns
+    /// (`decode_shared`): a column another player already holds isn't decoded again.
+    pub(super) fn new(share: bool) -> Self {
         let (jobs, todo) = mpsc::channel::<(Arc<ChunkFormat>, Box<C>)>();
         let (finished, done) = mpsc::channel();
         // The thread ends with the connection, when `jobs` is dropped.
@@ -266,7 +285,8 @@ impl ChunkDecoder {
                 horizon_threads::favour_current();
                 for (format, packet) in todo {
                     let column = match &*packet {
-                        C::LevelChunkWithLight(p) => format.column(p),
+                        C::LevelChunkWithLight(p) if share => decode_shared(&format, p),
+                        C::LevelChunkWithLight(p) => format.column(p).map(Arc::new),
                         _ => Err("not a chunk packet".into()),
                     };
                     if finished.send((packet, column)).is_err() {
@@ -311,7 +331,7 @@ impl Game<'_> {
     pub(super) fn remote_chunk(
         &mut self,
         p: &play::LevelChunkWithLight,
-        decoded: Option<(&Arc<ChunkFormat>, Result<Chunk, String>)>,
+        decoded: Option<(&Arc<ChunkFormat>, Result<Arc<Chunk>, String>)>,
     ) {
         // ClientChunkCache.replaceWithPacketData: a column outside the
         // storage around the view centre is ignored.
@@ -326,9 +346,12 @@ impl Game<'_> {
         let Some(format) = self.remote.as_ref().map(|r| r.chunk_format.clone()) else {
             return;
         };
+        // A headless game's players share the columns they all received; a game with a
+        // window has one player, and nothing to share with.
         let column = match decoded {
             Some((used, column)) if Arc::ptr_eq(used, &format) => column,
-            _ => format.column(p),
+            _ if self.options.headless => decode_shared(&format, p),
+            _ => format.column(p).map(Arc::new),
         };
         let chunk = match column {
             Ok(chunk) => chunk,
@@ -338,13 +361,6 @@ impl Game<'_> {
             }
         };
         let (x, z) = (p.x, p.z);
-        // A headless game's players share the columns they all received; a game with a
-        // window has one player, and nothing to share with.
-        let chunk = if self.options.headless {
-            share_column(column_key(&format, p), chunk)
-        } else {
-            Arc::new(chunk)
-        };
         self.streaming.insert_remote_shared(&mut self.world, chunk);
         self.world
             .block_entities
@@ -459,7 +475,7 @@ mod tests {
     fn the_decoder_returns_columns_in_order() {
         let overworld = DimensionType::vanilla("minecraft:overworld");
         let format = Arc::new(ChunkFormat::new(&overworld, vec![0, 7, 9], 2));
-        let decoder = ChunkDecoder::new();
+        let decoder = ChunkDecoder::new(false);
         for x in 0..20 {
             assert!(decoder.submit(format.clone(), packet(x, 1 + x)).is_none());
         }
