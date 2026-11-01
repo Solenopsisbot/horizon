@@ -2526,6 +2526,12 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         {
             return "net.minecraft.network.chat.MutableComponent value = new net.minecraft.network.chat.MutableComponent(); value.horizonText = horizonText; value.horizonKey = horizonKey; return value;".to_owned();
         }
+        if method == "plainCopy" && ret == "net.minecraft.network.chat.MutableComponent" {
+            return "net.minecraft.network.chat.MutableComponent value = new net.minecraft.network.chat.MutableComponent(); value.horizonText = horizonText; return value;".to_owned();
+        }
+        if method == "withStyle" && ret == "net.minecraft.network.chat.MutableComponent" {
+            return "return this;".to_owned();
+        }
     }
     if class == "net/minecraft/world/entity/EntityType$Builder" {
         if method == "of" && ret == "net.minecraft.world.entity.EntityType.Builder" {
@@ -3887,6 +3893,22 @@ mod tests {
                 "java.lang.String"
             ),
             "return horizonText;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/network/chat/MutableComponent",
+                "plainCopy",
+                "net.minecraft.network.chat.MutableComponent"
+            ),
+            "net.minecraft.network.chat.MutableComponent value = new net.minecraft.network.chat.MutableComponent(); value.horizonText = horizonText; return value;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/network/chat/MutableComponent",
+                "withStyle",
+                "net.minecraft.network.chat.MutableComponent"
+            ),
+            "return this;"
         );
         assert_eq!(
             runtime_body(

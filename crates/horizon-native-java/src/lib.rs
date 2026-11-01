@@ -1129,6 +1129,26 @@ impl Host for StdHost {
                     | "java/util/AbstractMap"
                     | "java/util/HashMap"
                     | "java/util/LinkedHashMap",
+                    "merge",
+                    "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+                ) => {
+                    let key = Self::argument(r, args, 0)?.clone();
+                    let incoming = Self::argument(r, args, 1)?.clone();
+                    let values = self
+                        .mutable_collections
+                        .entry(marker.to_owned())
+                        .or_default();
+                    if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key) {
+                        return Ok(values[index * 2 + 1].clone());
+                    }
+                    values.extend([key, incoming.clone()]);
+                    return Ok(incoming);
+                }
+                (
+                    "java/util/Map"
+                    | "java/util/AbstractMap"
+                    | "java/util/HashMap"
+                    | "java/util/LinkedHashMap",
                     "putIfAbsent",
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                 ) => {
@@ -6262,6 +6282,31 @@ mandatory = true
             host.invoke_instance(&map_get, &map, &[Value::Ref(Some("computed-key".into()))])
                 .unwrap(),
             Value::Ref(Some("computed/rcomputed-key".into()))
+        );
+        let merge = MethodRef {
+            owner: "java/util/Map".into(),
+            name: "merge".into(),
+            descriptor:
+                "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;"
+                    .into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &merge,
+                &map,
+                &[
+                    Value::Ref(Some("merged-key".into())),
+                    Value::Ref(Some("merged-value".into())),
+                    Value::Ref(Some("@indy:merge".into())),
+                ],
+            )
+            .unwrap(),
+            Value::Ref(Some("merged-value".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(&map_get, &map, &[Value::Ref(Some("merged-key".into()))],)
+                .unwrap(),
+            Value::Ref(Some("merged-value".into()))
         );
         let put_if_absent = MethodRef {
             owner: "java/util/Map".into(),
