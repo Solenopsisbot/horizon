@@ -1169,7 +1169,7 @@ async fn open_device(
 /// `open_device`, taking an adapter of the CPU type (software rendering) only
 /// when `allow_cpu`.
 async fn open_device_with(
-    window: &Arc<Window>,
+    window: Option<&Arc<Window>>,
     offscreen: bool,
     api: GraphicsApi,
     layers: u32,
