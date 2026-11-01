@@ -202,6 +202,13 @@ pub(super) fn run_java_mods(
         let mut host = seeded_native_host(&jar, path, role);
         let mut calls = 0;
         for entry in &entrypoints {
+            if let Some(adapter) = entry.adapter.as_deref() {
+                return Err(format!(
+                    "{} ({kind}, {}): Fabric entrypoint adapter {adapter} is not supported by the native path",
+                    path.display(),
+                    entry.class
+                ));
+            }
             let report = jar
                 .execute(&entry.class, entry.method.as_deref(), kind, &mut host)
                 .map_err(|error| {
