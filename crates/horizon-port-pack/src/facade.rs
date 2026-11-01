@@ -1477,6 +1477,21 @@ fn render(
             methods += 1;
         }
     }
+    if class.name == "net/minecraft/world/entity/Entity" {
+        let required = [
+            ("getEyeHeight", "()F", "float"),
+            ("getBbHeight", "()F", "float"),
+            ("getBbWidth", "()F", "float"),
+        ];
+        for (name, descriptor, ret) in required {
+            if !seen.insert((name.to_owned(), String::new())) {
+                continue;
+            }
+            let body = runtime_body_with_descriptor(&class.name, name, ret, descriptor);
+            let _ = writeln!(out, "    public {ret} {name}() {{ {body} }}");
+            methods += 1;
+        }
+    }
     if class.name == "net/minecraft/network/chat/MutableComponent" {
         if seen.insert(("getString".to_owned(), "".to_owned())) {
             let _ = writeln!(
@@ -2335,6 +2350,14 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             {
                 return "return horizonComponents.containsKey(p0);".to_owned();
             }
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/entity/Entity" {
+        match (method, ret, descriptor) {
+            ("getEyeHeight", "float", "()F") => return "return 1.62f;".to_owned(),
+            ("getBbHeight", "float", "()F") => return "return 1.8f;".to_owned(),
+            ("getBbWidth", "float", "()F") => return "return 0.6f;".to_owned(),
             _ => {}
         }
     }
@@ -5387,6 +5410,9 @@ mod tests {
         assert!(source.contains("horizonOnGround"));
         assert!(source.contains("horizonXRot"));
         assert!(source.contains("horizonRemoved"));
+        assert!(source.contains("public float getEyeHeight()"));
+        assert!(source.contains("public float getBbHeight()"));
+        assert!(source.contains("public float getBbWidth()"));
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/world/entity/Entity",
@@ -5485,6 +5511,33 @@ mod tests {
                 "()D",
             ),
             "return horizonY + 1.62;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getEyeHeight",
+                "float",
+                "()F",
+            ),
+            "return 1.62f;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getBbHeight",
+                "float",
+                "()F",
+            ),
+            "return 1.8f;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getBbWidth",
+                "float",
+                "()F",
+            ),
+            "return 0.6f;"
         );
         assert_eq!(
             runtime_body_with_descriptor(
