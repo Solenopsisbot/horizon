@@ -30,6 +30,7 @@ fn main() -> ExitCode {
         vec![horizon_native_java::Entrypoint {
             class,
             method: None,
+            adapter: None,
         }]
     } else {
         let selected_kind = match requested_kind.as_deref() {
@@ -61,6 +62,13 @@ fn main() -> ExitCode {
     let mut calls = 0;
     let mut error = None;
     for entry in &entrypoints {
+        if let Some(adapter) = entry.adapter.as_deref() {
+            error = Some(format!(
+                "{}: Fabric entrypoint adapter {adapter} is not supported by the native path",
+                entry.class
+            ));
+            break;
+        }
         match jar.execute(&entry.class, entry.method.as_deref(), &kind, &mut host) {
             Ok(report) => calls += report.calls,
             Err(entry_error) => {

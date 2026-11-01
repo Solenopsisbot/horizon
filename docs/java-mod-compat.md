@@ -401,6 +401,8 @@ scanned from `mods/` implicitly. Registrations remain diagnostic until a typed d
 the content rows described below.
 `NativeJar` reads the first `[[mods]]` record in `META-INF/neoforge.mods.toml` as the NeoForge id and version,
 and carries required `[[dependencies.<id>]]` records into the same startup seed used for Fabric metadata.
+Fabric entrypoint objects retain their optional `adapter` name; the native launcher reports that adapter
+explicitly and stops rather than invoking the target with the wrong lifecycle contract.
 Loader-provided ids (`minecraft`, `neoforge`, `forge`, `java`, and `fabricloader`) and optional dependencies
 are excluded, so `ModList` and `FabricLoader` presence checks see only the mod's real required libraries.
 If a jar has no entrypoint usable for the current client or server role, the startup error names the role
@@ -673,8 +675,8 @@ copy is a handful of small objects rather than an NBT tree walk. This one coinci
 would otherwise have been the worst hotspot in the design.
 The generated façade now preserves the common item/count value path (`getCount`, `setCount`, `isEmpty`,
 `getItem`, `copy`, `copyWithCount`, `grow`, and `shrink`) plus bounded stack inspection (`getMaxStackSize`,
-`hasFoil`, damage defaults, and `getHoverName`) so bootstrap code can inspect stacks before the full
-component bridge is attached. It also has a bounded erased component map: `get`,
+`hasFoil`, bounded damage/enchantment/use-duration inspection, and `getHoverName`) so bootstrap code
+can inspect stacks before the full component bridge is attached. It also has a bounded erased component map: `get`,
 `getOrDefault`, `set`, `remove`, `has`, and `hasNonDefault` use the `DataComponentType` object as the
 key; generated `DataComponents` constants are distinct identity keys, absent values read as `null` (or
 the supplied default), and copies retain the map. This covers

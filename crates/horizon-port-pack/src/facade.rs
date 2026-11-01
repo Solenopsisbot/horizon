@@ -1106,7 +1106,7 @@ fn render(
     if class.name == "net/minecraft/world/item/ItemStack" {
         let _ = writeln!(
             out,
-            "    protected net.minecraft.world.item.Item horizonItem = new net.minecraft.world.item.Item();\n    protected int horizonCount;\n    protected java.util.Map<net.minecraft.core.component.DataComponentType, Object> horizonComponents = new java.util.HashMap<>();"
+            "    protected net.minecraft.world.item.Item horizonItem = new net.minecraft.world.item.Item();\n    protected int horizonCount;\n    protected int horizonDamage;\n    protected java.util.Map<net.minecraft.core.component.DataComponentType, Object> horizonComponents = new java.util.HashMap<>();"
         );
     }
     if class.name == "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type" {
@@ -2270,9 +2270,12 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             }
             ("getMaxStackSize", "int") => return "return 64;".to_owned(),
             ("hasFoil", "boolean") => return "return false;".to_owned(),
-            ("isDamaged", "boolean") => return "return false;".to_owned(),
-            ("getDamageValue", "int") => return "return 0;".to_owned(),
+            ("isDamaged", "boolean") => return "return horizonDamage > 0;".to_owned(),
+            ("getDamageValue", "int") => return "return horizonDamage;".to_owned(),
+            ("setDamageValue", "void") => return "horizonDamage = Math.max(0, p0);".to_owned(),
             ("getMaxDamage", "int") => return "return 0;".to_owned(),
+            ("isEnchanted", "boolean") => return "return false;".to_owned(),
+            ("getUseDuration", "int") => return "return 0;".to_owned(),
             ("getHoverName", "net.minecraft.network.chat.Component") => {
                 return "return net.minecraft.network.chat.Component.literal(horizonItem.toString());".to_owned();
             }
@@ -3619,6 +3622,30 @@ mod tests {
         );
         assert_eq!(
             runtime_body("net/minecraft/world/item/ItemStack", "hasFoil", "boolean"),
+            "return false;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/item/ItemStack",
+                "getDamageValue",
+                "int"
+            ),
+            "return horizonDamage;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/item/ItemStack",
+                "setDamageValue",
+                "void"
+            ),
+            "horizonDamage = Math.max(0, p0);"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/item/ItemStack",
+                "isEnchanted",
+                "boolean"
+            ),
             "return false;"
         );
         assert_eq!(

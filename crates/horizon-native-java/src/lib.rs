@@ -2911,6 +2911,9 @@ pub struct NativeJar {
 pub struct Entrypoint {
     pub class: String,
     pub method: Option<String>,
+    /// Fabric entrypoint adapters change the invocation contract. They are
+    /// retained for diagnostics until a native adapter implementation exists.
+    pub adapter: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3037,6 +3040,7 @@ impl NativeJar {
                 .map(|class| Entrypoint {
                     class: class.replace('/', "."),
                     method: None,
+                    adapter: None,
                 })
                 .collect();
         }
@@ -4620,6 +4624,10 @@ fn parse_metadata(
                 entries.push(Entrypoint {
                     class: class.to_owned(),
                     method: method.map(str::to_owned),
+                    adapter: value
+                        .get("adapter")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
                 });
             }
             entrypoints.insert(kind.clone(), entries);
@@ -5033,7 +5041,8 @@ mod tests {
                     "client".into(),
                     vec![Entrypoint {
                             class: "demo.Client".into(),
-                        method: Some("boot".into())
+                        method: Some("boot".into()),
+                        adapter: None,
                     }]
                 )]),
                 Vec::<String>::new(),
@@ -5048,6 +5057,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(required, ["cloth-config", "fabric-api"]);
+    }
+
+    #[test]
+    fn metadata_retains_fabric_entrypoint_adapter_for_loader_diagnostics() {
+        let (_, _, entrypoints, _) = parse_metadata(
+            r#"{"id":"demo","entrypoints":{"main":[{"value":"demo.Main","adapter":"net.fabricmc.api.ModInitializer"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            entrypoints["main"][0],
+            Entrypoint {
+                class: "demo.Main".into(),
+                method: None,
+                adapter: Some("net.fabricmc.api.ModInitializer".into()),
+            }
+        );
     }
 
     #[test]
@@ -5463,10 +5488,12 @@ mandatory = true
                     Entrypoint {
                         class: "demo.First".into(),
                         method: None,
+                        adapter: None,
                     },
                     Entrypoint {
                         class: "demo.Second".into(),
                         method: Some("boot".into()),
+                        adapter: None,
                     },
                 ],
             )]),
@@ -5479,10 +5506,12 @@ mandatory = true
                 Entrypoint {
                     class: "demo.First".into(),
                     method: None,
+                    adapter: None,
                 },
                 Entrypoint {
                     class: "demo.Second".into(),
                     method: Some("boot".into()),
+                    adapter: None,
                 },
             ]
         );
