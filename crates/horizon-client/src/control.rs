@@ -341,27 +341,41 @@ impl Drop for Server {
     }
 }
 
+/// One connection: its lines go to the game as they arrive, and their replies go back in the
+/// same order from a writer thread. The reader doesn't wait for a reply before reading the
+/// next line, so commands a client sends together (a script steering a bot each tick: look,
+/// keys, state) reach the game in one frame and are answered in it, rather than one frame
+/// each.
 fn serve(stream: Stream, sender: &mpsc::Sender<Request>) {
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
+    // The replies still to write, in the order their commands came.
+    let (pending, replies) = mpsc::channel::<mpsc::Receiver<String>>();
+    let writing = thread::spawn(move || {
+        for response in replies {
+            // The game dropping the reply sender means it exited mid-command.
+            let text = response
+                .recv()
+                .unwrap_or_else(|_| r#"{"error":"game exited"}"#.to_owned());
+            if writeln!(writer, "{text}").is_err() {
+                return;
+            }
+        }
+    });
     for line in BufReader::new(stream).lines() {
-        let Ok(line) = line else { return };
+        let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
         let (reply, response) = mpsc::channel();
-        if sender.send(Request { line, reply }).is_err() {
-            return;
-        }
-        // The game dropping the reply sender means it exited mid-command.
-        let text = response
-            .recv()
-            .unwrap_or_else(|_| r#"{"error":"game exited"}"#.to_owned());
-        if writeln!(writer, "{text}").is_err() {
-            return;
+        if sender.send(Request { line, reply }).is_err() || pending.send(response).is_err() {
+            break;
         }
     }
+    // The client closed its side: write what is still owed, then end.
+    drop(pending);
+    let _ = writing.join();
 }
 
 #[cfg(test)]
@@ -390,6 +404,37 @@ mod tests {
         assert_eq!(reply.trim(), r#"{"ok":true}"#);
         drop(server);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn commands_sent_together_reach_the_game_together() {
+        let path =
+            std::env::temp_dir().join(format!("horizon-ctl-pipe-{}.json", std::process::id()));
+        let server = Server::start(&path).unwrap();
+        let mut client = connect(&path).unwrap();
+        write!(client, "look 10 0\nkey w down\nstate\n").unwrap();
+        // All three are waiting before the game answers the first: one frame for the lot.
+        let mut requests = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while requests.len() < 3 && std::time::Instant::now() < deadline {
+            match server.try_recv() {
+                Some(r) => requests.push(r),
+                None => thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        let lines: Vec<&str> = requests.iter().map(|r| r.line.as_str()).collect();
+        assert_eq!(lines, ["look 10 0", "key w down", "state"]);
+        // Answered out of order, the replies still come back in the commands' order.
+        for (i, r) in requests.iter().enumerate().rev() {
+            r.reply.send(format!("{{\"n\":{i}}}")).unwrap();
+        }
+        let mut reader = BufReader::new(client);
+        for i in 0..3 {
+            let mut reply = String::new();
+            reader.read_line(&mut reply).unwrap();
+            assert_eq!(reply.trim(), format!("{{\"n\":{i}}}"));
+        }
+        drop(server);
     }
 
     #[test]
