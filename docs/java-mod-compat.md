@@ -278,18 +278,20 @@ preserve nested `Tag` references, `getCompound` returns the nested value or an e
 `getList` plus the generated `ListTag` retain bounded add/get/size/string/compound operations. These
 collections remain callback-local until the Rust NBT bridge is wired through the native boundary.
 `Level` and `ServerLevel` now retain a game-time and dimension marker and answer the common
-`getGameTime`, `dimension`, `getBlockState`, `getBlockEntity`, side, and build-height queries. Their
+`getGameTime`/`getDayTime`, `dimension`, block-state/entity, loaded-chunk, sky-visibility, side, and
+build-height queries. Their
 bounded coordinate-keyed maps also preserve `setBlock`, `setBlockAndUpdate`, `setBlockEntity`, and
 `removeBlock` writes within the façade instance, so a registration callback can observe its own world
 mutation sequence. The maps remain callback-local until the native level handle is wired through the game
 boundary; they do not replace Horizon's authoritative world state.
-`Entity` now retains position, delta movement, a level handle, a stable UUID marker, and a bounded
-bounding-box/on-ground state; `getX`/`getY`/`getZ`, both `setPos` overloads, `position`,
-`getDeltaMovement`, both `setDeltaMovement` overloads, `distanceTo`/`distanceToSqr`, `blockPosition`,
-`level`, `isAlive`, `getUUID`, `getBoundingBox`, `setBoundingBox`, and `isOnGround` preserve common
-entity-inspection, movement, and collision setup paths. The box, motion, and ground flag are façade-local
-values until the native entity boundary wires live physics updates through them; player mutation and
-synchronization remain native-boundary work.
+`Entity` now retains position, delta movement, rotation, removal state, a level handle, a stable UUID
+marker, and a bounded bounding-box/on-ground state; `getX`/`getY`/`getZ`, both `setPos` overloads,
+`position`, `getDeltaMovement`, both `setDeltaMovement` overloads, `getXRot`/`setXRot`,
+`getYRot`/`setYRot`, `distanceTo`/`distanceToSqr`, `blockPosition`, `level`, `isAlive`, `isRemoved`,
+`discard`, `getUUID`, `getBoundingBox`, `setBoundingBox`, and `isOnGround` preserve common entity
+inspection, movement, and collision setup paths. The box, motion, rotation, and removal state are
+façade-local until the native entity boundary wires live physics updates through them; player mutation
+and synchronization remain native-boundary work.
 `BlockEntity` now retains its block position, level, block state, and removed flag. `getBlockPos`,
 `getLevel`, `hasLevel`, `getBlockState`, `isRemoved`, `setRemoved`, `setChanged`, and `getUpdateTag`
 keep common block-entity registration and synchronization code linked. `saveAdditional` and `load` now

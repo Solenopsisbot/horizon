@@ -1151,7 +1151,7 @@ fn render(
     if class.name == "net/minecraft/world/entity/Entity" {
         let _ = writeln!(
             out,
-            "    protected double horizonX;\n    protected double horizonY;\n    protected double horizonZ;\n    protected double horizonDeltaX;\n    protected double horizonDeltaY;\n    protected double horizonDeltaZ;\n    protected net.minecraft.world.level.Level horizonLevel = new net.minecraft.world.level.Level();\n    protected java.util.UUID horizonUuid = new java.util.UUID(0L, 0L);\n    protected net.minecraft.world.phys.AABB horizonBoundingBox = new net.minecraft.world.phys.AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);\n    protected boolean horizonOnGround;"
+            "    protected double horizonX;\n    protected double horizonY;\n    protected double horizonZ;\n    protected double horizonDeltaX;\n    protected double horizonDeltaY;\n    protected double horizonDeltaZ;\n    protected float horizonXRot;\n    protected float horizonYRot;\n    protected net.minecraft.world.level.Level horizonLevel = new net.minecraft.world.level.Level();\n    protected java.util.UUID horizonUuid = new java.util.UUID(0L, 0L);\n    protected net.minecraft.world.phys.AABB horizonBoundingBox = new net.minecraft.world.phys.AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);\n    protected boolean horizonOnGround;\n    protected boolean horizonRemoved;"
         );
     }
     if class.name == "net/minecraft/world/entity/Mob" {
@@ -2547,8 +2547,18 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         "net/minecraft/world/level/Level" | "net/minecraft/server/level/ServerLevel"
     ) {
         match (method, ret, descriptor) {
-            ("getGameTime", "long", "()J") => {
+            ("getGameTime", "long", "()J") | ("getDayTime", "long", "()J") => {
                 return "return horizonGameTime;".to_owned();
+            }
+            ("isLoaded", "boolean", "(Lnet/minecraft/core/BlockPos;)Z")
+            | ("hasChunkAt", "boolean", "(Lnet/minecraft/core/BlockPos;)Z") => {
+                return "return horizonBlocks.containsKey(horizonBlockKey(p0)) || horizonBlockEntities.containsKey(horizonBlockKey(p0));".to_owned();
+            }
+            ("canSeeSky", "boolean", "(Lnet/minecraft/core/BlockPos;)Z") => {
+                return "return true;".to_owned();
+            }
+            ("getSkyDarken", "int", "()I") => {
+                return "return 0;".to_owned();
             }
             (
                 "dimension",
@@ -2661,6 +2671,15 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
                 return "return horizonOnGround;".to_owned();
             }
             ("setOnGround", "void", "(Z)V") => return "horizonOnGround = p0;".to_owned(),
+            ("getXRot", "float", "()F") => return "return horizonXRot;".to_owned(),
+            ("setXRot", "void", "(F)V") => return "horizonXRot = p0;".to_owned(),
+            ("getYRot", "float", "()F") => return "return horizonYRot;".to_owned(),
+            ("setYRot", "void", "(F)V") => return "horizonYRot = p0;".to_owned(),
+            ("isRemoved", "boolean", "()Z") => return "return horizonRemoved;".to_owned(),
+            ("discard", "void", "()V") => return "horizonRemoved = true;".to_owned(),
+            ("remove", "void", "(Lnet/minecraft/world/entity/Entity$RemovalReason;)V") => {
+                return "horizonRemoved = true;".to_owned();
+            }
             _ => {}
         }
     }
@@ -4691,6 +4710,33 @@ mod tests {
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/world/level/Level",
+                "getDayTime",
+                "long",
+                "()J"
+            ),
+            "return horizonGameTime;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/Level",
+                "isLoaded",
+                "boolean",
+                "(Lnet/minecraft/core/BlockPos;)Z",
+            ),
+            "return horizonBlocks.containsKey(horizonBlockKey(p0)) || horizonBlockEntities.containsKey(horizonBlockKey(p0));"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/Level",
+                "canSeeSky",
+                "boolean",
+                "(Lnet/minecraft/core/BlockPos;)Z",
+            ),
+            "return true;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/Level",
                 "getBlockState",
                 "net.minecraft.world.level.block.state.BlockState",
                 "(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/block/state/BlockState;",
@@ -5018,6 +5064,8 @@ mod tests {
         assert!(source.contains("protected net.minecraft.world.level.Level horizonLevel"));
         assert!(source.contains("horizonBoundingBox"));
         assert!(source.contains("horizonOnGround"));
+        assert!(source.contains("horizonXRot"));
+        assert!(source.contains("horizonRemoved"));
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/world/entity/Entity",
@@ -5134,6 +5182,42 @@ mod tests {
                 "()Z",
             ),
             "return horizonOnGround;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "setXRot",
+                "void",
+                "(F)V",
+            ),
+            "horizonXRot = p0;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getYRot",
+                "float",
+                "()F",
+            ),
+            "return horizonYRot;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "isRemoved",
+                "boolean",
+                "()Z",
+            ),
+            "return horizonRemoved;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "discard",
+                "void",
+                "()V",
+            ),
+            "horizonRemoved = true;"
         );
     }
 

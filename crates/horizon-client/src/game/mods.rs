@@ -87,6 +87,14 @@ pub(super) fn content_root(
 /// Runs explicitly supplied Java entrypoints through the bounded native
 /// interpreter before resource workers start. Java jars are never discovered
 /// implicitly: a launcher or developer must pass `--java-mod PATH`.
+fn opaque_registration_keys(entries: &[horizon_native_java::RegistryEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| entry.declaration.is_none())
+        .map(horizon_native_java::RegistryEntry::key)
+        .collect()
+}
+
 fn native_entrypoint_kinds(jar: &horizon_native_java::NativeJar) -> Vec<String> {
     let mut kinds: Vec<String> = jar.fabric_entrypoints.keys().cloned().collect();
     if !jar.neoforge_entrypoints.is_empty() {
@@ -184,14 +192,12 @@ pub(super) fn run_java_mods(
             host.registrations().len(),
             host.listener_registrations().count(),
         );
-        if host
-            .registrations()
-            .iter()
-            .any(|entry| entry.declaration.is_none())
-        {
+        let opaque_keys = opaque_registration_keys(host.registrations());
+        if !opaque_keys.is_empty() {
             log::warn!(
-                "Horizon: native Java {} recorded opaque registrations; typed content declarations are required before they enter live registries",
-                path.display()
+                "Horizon: native Java {} recorded opaque registrations [{}]; typed content declarations are required before they enter live registries",
+                path.display(),
+                opaque_keys.join(", ")
             );
         }
         let mut entries = host
@@ -504,6 +510,31 @@ mod tests {
         // No folder: no rows.
         assert!(not_built(&dir.join("missing"), "", &[]).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn opaque_registration_diagnostics_name_registry_keys() {
+        let entries = vec![
+            horizon_native_java::RegistryEntry {
+                registry: "minecraft:item".into(),
+                id: "ruby:wand".into(),
+                value: horizon_native_java::Value::Ref(Some("opaque/wand".into())),
+                declaration: None,
+            },
+            horizon_native_java::RegistryEntry::typed(
+                "minecraft:block",
+                "ruby:lamp",
+                horizon_native_java::RegistryDeclaration::Block {
+                    template: "minecraft:stone".into(),
+                    properties: std::collections::BTreeMap::new(),
+                    item: false,
+                },
+            ),
+        ];
+        assert_eq!(
+            opaque_registration_keys(&entries),
+            ["minecraft:item/ruby:wand"]
+        );
     }
 
     #[test]
