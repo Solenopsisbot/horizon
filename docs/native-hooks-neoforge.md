@@ -108,8 +108,10 @@ Hoppers, comparators and other mods should not read a fixed `slots` field. NeoFo
 `Capabilities.Item.BLOCK` ("automation-accessible inventory of a block") with `ResourceHandler<ItemResource>`,
 and `Capabilities.Energy.BLOCK` with `EnergyHandler`
 ([Capabilities](https://docs.neoforged.net/docs/inventories/capabilities/)). A Horizon
-`block_capability(pos, kind, side, out)` hook could fill an out parameter with a handler object, so new kinds
-(fluids, energy) are new kinds, not new fields on a struct, and older mods keep compiling. Menus and screens
+`block_capability(pos, kind, side, out)` hook can fill an out parameter with a handler object. The native
+Java host now records equivalent `Level.getCapability` and `BlockEntity.getCapability` requests and accepts
+an exact seeded result from a game adapter; an absent seed returns an empty `LazyOptional`. New kinds
+(fluids, energy) remain new kinds, not new fields on a struct, and older mods keep compiling. Menus and screens
 are not modelled here: main already has `menu_clicked`, `menu_closed`, `screen*` and `block_entity_container`,
 and any change to them gets its own proposal with its own citations.
 
