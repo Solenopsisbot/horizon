@@ -2736,6 +2736,15 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("blockPosition", "net.minecraft.core.BlockPos", "()Lnet/minecraft/core/BlockPos;") => {
                 return "return new net.minecraft.core.BlockPos((int) Math.floor(horizonX), (int) Math.floor(horizonY), (int) Math.floor(horizonZ));".to_owned();
             }
+            (
+                "getEyePosition",
+                "net.minecraft.world.phys.Vec3",
+                "(F)Lnet/minecraft/world/phys/Vec3;",
+            ) => {
+                return "return new net.minecraft.world.phys.Vec3(horizonX, horizonY + 1.62, horizonZ);"
+                    .to_owned();
+            }
+            ("getEyeY", "double", "()D") => return "return horizonY + 1.62;".to_owned(),
             ("level", "net.minecraft.world.level.Level", "()Lnet/minecraft/world/level/Level;") => {
                 return "return horizonLevel;".to_owned();
             }
@@ -5281,6 +5290,18 @@ mod tests {
                     kind: MemberKind::Method,
                 },
                 Declared {
+                    name: "getEyePosition".to_owned(),
+                    descriptor: "(F)Lnet/minecraft/world/phys/Vec3;".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
+                    name: "getEyeY".to_owned(),
+                    descriptor: "()D".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
                     name: "level".to_owned(),
                     descriptor: "()Lnet/minecraft/world/level/Level;".to_owned(),
                     access: 0x0001,
@@ -5332,6 +5353,11 @@ mod tests {
                     "blockPosition".to_owned(),
                     "()Lnet/minecraft/core/BlockPos;".to_owned(),
                 ),
+                (
+                    "getEyePosition".to_owned(),
+                    "(F)Lnet/minecraft/world/phys/Vec3;".to_owned(),
+                ),
+                ("getEyeY".to_owned(), "()D".to_owned()),
                 (
                     "level".to_owned(),
                     "()Lnet/minecraft/world/level/Level;".to_owned(),
@@ -5441,6 +5467,24 @@ mod tests {
                 "()Lnet/minecraft/core/BlockPos;",
             ),
             "return new net.minecraft.core.BlockPos((int) Math.floor(horizonX), (int) Math.floor(horizonY), (int) Math.floor(horizonZ));"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getEyePosition",
+                "net.minecraft.world.phys.Vec3",
+                "(F)Lnet/minecraft/world/phys/Vec3;",
+            ),
+            "return new net.minecraft.world.phys.Vec3(horizonX, horizonY + 1.62, horizonZ);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getEyeY",
+                "double",
+                "()D",
+            ),
+            "return horizonY + 1.62;"
         );
         assert_eq!(
             runtime_body_with_descriptor(

@@ -288,7 +288,7 @@ boundary; they do not replace Horizon's authoritative world state.
 marker, and a bounded bounding-box/on-ground state; `getX`/`getY`/`getZ`, both `setPos` overloads,
 `position`, `getDeltaMovement`, both `setDeltaMovement` overloads, `getXRot`/`setXRot`,
 `getYRot`/`setYRot`, `distanceTo`/`distanceToSqr`, `blockPosition`, `level`, `isAlive`, `isRemoved`,
-`discard`, `getUUID`, `getBoundingBox`, `setBoundingBox`, and `isOnGround` preserve common entity
+`getEyePosition`/`getEyeY`, `discard`, `getUUID`, `getBoundingBox`, `setBoundingBox`, and `isOnGround` preserve common entity
 inspection, movement, and collision setup paths. The box, motion, rotation, and removal state are
 façade-local until the native entity boundary wires live physics updates through them; player mutation
 and synchronization remain native-boundary work.
