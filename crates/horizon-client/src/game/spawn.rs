@@ -25,6 +25,11 @@ use std::{
 const NO_SESSION: &str =
     "spawn needs --session-file: the signed-in account it plays as, from the launcher";
 
+/// FORK ONLY (Solenopsisbot/horizon main, never upstream): without a session file a spawned
+/// player plays offline as NAME, for bots on our own offline servers. Upstream refuses it
+/// (`NO_SESSION`): Horizon follows Mojang's rules there.
+const OFFLINE_BOTS: bool = true;
+
 /// The names of the players spawned in this process and still playing.
 static PLAYING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
@@ -72,7 +77,7 @@ impl Game<'_> {
         let session = session_file
             .map(horizon_client::auth::AuthSession::load)
             .transpose()?;
-        if session.is_none() {
+        if session.is_none() && !OFFLINE_BOTS {
             return Err(NO_SESSION.into());
         }
         let name = session
