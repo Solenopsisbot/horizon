@@ -420,6 +420,7 @@ impl GameLevel<'_> {
         }
         let entity = self.world.block_entities.remove(&key);
         self.world.block_names.remove(&key);
+        self.world.forget_block_entity_source(key);
         let name = self.facts.get(old).name.clone();
         let kind = match &entity {
             // BaseContainerBlockEntity.preRemoveSideEffects: Containers.dropContents.
@@ -475,7 +476,7 @@ impl GameLevel<'_> {
                     // events and a neighbour update), the record pops, and
                     // onSongChanged updates the neighbours again.
                     if let Some(BlockEntity::Jukebox(j)) = &entity
-                        && let Some(record) = j.record.clone()
+                        && let Some(record) = j.record().cloned()
                     {
                         if j.playing {
                             self.jukebox_stopped(pos, old);

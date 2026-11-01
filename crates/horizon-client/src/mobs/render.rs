@@ -970,8 +970,26 @@ pub fn base_transform(m: &Mob, alpha: f32, camera: glam::DVec3) -> glam::Mat4 {
         m.previous.x + (m.position.x - m.previous.x) * a,
         m.previous.y + (m.position.y - m.previous.y) * a,
         m.previous.z + (m.position.z - m.previous.z) * a,
-    ) - camera;
+    ) - camera
+        + enderman_render_offset(m, alpha);
     base_transform_at(m, alpha, glam::Mat4::from_translation(p.as_vec3()))
+}
+/// `EndermanRenderer.getRenderOffset`: a creepy (angry) enderman is moved by
+/// a gaussian 0.02 blocks sideways in x and z every frame. Vanilla draws from
+/// the renderer's own random; this one is seeded by the mob and the frame's
+/// age, so the body, its carried block and its eyes agree within a frame.
+fn enderman_render_offset(m: &Mob, alpha: f32) -> glam::DVec3 {
+    use horizon_core::random::{LegacyRandom, RandomSource};
+    if m.species() != Species::Enderman || !m.extra.flag {
+        return glam::DVec3::ZERO;
+    }
+    let frame = (m.age as f32 + alpha).to_bits();
+    let mut random = LegacyRandom::new((i64::from(m.id) << 32) ^ i64::from(frame));
+    // `0.02 * state.scale`, the enderman's scale being 1.
+    let d = 0.02;
+    let x = random.next_gaussian() * d;
+    let z = random.next_gaussian() * d;
+    glam::DVec3::new(x, 0.0, z)
 }
 /// `base_transform` from a pose of the entity's origin (`EntityRenderDispatcher.submit`
 /// under a pose stack, as `SpawnerRenderer` draws the mob inside a spawner).
@@ -1042,7 +1060,7 @@ pub fn base_transform_at(m: &Mob, alpha: f32, origin: glam::Mat4) -> glam::Mat4 
         }
         let yaw = m.previous_head_yaw + wrap(m.head_yaw - m.previous_head_yaw) * alpha;
         let (look_x, look_z) = (-(yaw.to_radians()).msin(), (yaw.to_radians()).mcos());
-        let v = m.velocity;
+        let v = m.extra.previous_velocity.lerp(m.velocity, f64::from(alpha));
         let view_scale = (pitch.to_radians()).mcos();
         let (look_x, look_z) = (look_x * view_scale, look_z * view_scale);
         let view_length = f64::from(look_x * look_x + look_z * look_z);
@@ -1915,6 +1933,17 @@ fn hand_base(
             0.078_125,
         ));
     }
+    if m.species() == Species::CopperGolem {
+        // `CopperGolemModel.translateToHand`: a still golem holds the item
+        // across the arm, a working one scaled down in front of it.
+        if m.extra.variant3 == super::copper_golem::IDLE {
+            t *= glam::Mat4::from_rotation_y((if left { 90.0f32 } else { -90.0 }).to_radians())
+                * glam::Mat4::from_translation(glam::Vec3::new(0.0, 0.0, 0.125));
+        } else {
+            t *= glam::Mat4::from_scale(glam::Vec3::splat(0.55))
+                * glam::Mat4::from_translation(glam::Vec3::new(-0.125, 0.3125, -0.1875));
+        }
+    }
     let (ox, oy, oz) = if m.is_baby() {
         (0.0, 1.0, -4.5)
     } else {
@@ -2050,6 +2079,20 @@ pub fn held_item_transform(
     if m.species() == Species::Fox {
         return (!left).then(|| fox_item_transform(m, alpha, camera, data));
     }
+    // DolphinCarryingItemLayer: the main hand's item at the snout, lifted and
+    // pulled in as the dolphin pitches (up or down) toward 60 degrees.
+    if m.species() == Species::Dolphin {
+        return (!left).then(|| {
+            let pitch = anim::state(m, alpha).x_rot;
+            let percent = pitch.abs() / 60.0;
+            let offset = if pitch < 0.0 {
+                glam::Vec3::new(0.0, 1.0 - percent * 0.5, -1.0 + percent * 0.5)
+            } else {
+                glam::Vec3::new(0.0, 1.0 + percent * 0.8, -1.0 + percent * 0.2)
+            };
+            base_transform(m, alpha, camera) * glam::Mat4::from_translation(offset)
+        });
+    }
     if !super::illager::shows_item(m) {
         return None;
     }
@@ -2123,9 +2166,131 @@ pub fn held_item_transform(
     Some(t)
 }
 
+/// `ArmedEntityRenderState.extractArmedEntityRenderState`: each arm's item
+/// model reads the stack held by that arm. Only the main hand currently
+/// retains a full stack; the off hand must not inherit its item or components.
+pub fn held_item_stack(extra: &super::Extra, off_hand: bool) -> Option<crate::items::ItemStack> {
+    let item = if off_hand {
+        extra.off_hand.as_ref()?
+    } else {
+        if let Some(stack) = extra.main_hand_stack() {
+            return Some(stack.clone());
+        }
+        extra.main_hand.as_ref()?
+    };
+    Some(crate::items::ItemStack::new(item, 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offhand_does_not_inherit_mainhand_components() {
+        use crate::items::ItemStack;
+        let mut extra = super::super::Extra::default();
+        let mut main = ItemStack::new("minecraft:crossbow", 1);
+        main.data_mut().custom_name = Some(horizon_world::nbt::Tag::String("Main hand".into()));
+        extra.set_main_hand_stack(Some(main));
+        extra.off_hand = Some("minecraft:crossbow".into());
+        assert_eq!(
+            held_item_stack(&extra, false)
+                .unwrap()
+                .custom_name()
+                .as_deref(),
+            Some("Main hand")
+        );
+        assert!(
+            held_item_stack(&extra, true)
+                .unwrap()
+                .custom_name()
+                .is_none()
+        );
+        extra.off_hand = None;
+        assert!(held_item_stack(&extra, true).is_none());
+    }
+
+    /// The elytra's flight yaw (`AvatarRenderer.extractFlightData`) lerps
+    /// the velocity of the previous tick towards this tick's, so the model
+    /// does not step once per tick while the view turns (#4104).
+    #[test]
+    fn the_elytra_flight_yaw_lerps_the_velocity_between_ticks() {
+        use crate::mobs::{Anim, Brain, Flags, MobType, Part};
+        use horizon_core::geometry::Vec3;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let model = Arc::new(Part::parse("root", &json!({"children": {"head": {}}})));
+        let kind = Arc::new(MobType {
+            id: "minecraft:player".into(),
+            species: Species::Zombie,
+            width: 0.6,
+            height: 1.8,
+            eye_height: 1.62,
+            category: "misc".into(),
+            max_health: 20.0,
+            speed: 0.1,
+            flying_speed: 0.02,
+            attack_damage: 1.0,
+            attack_knockback: 0.0,
+            follow_range: 0.0,
+            step_height: 0.6,
+            armor: 0.0,
+            armor_toughness: 0.0,
+            knockback_resistance: 0.0,
+            jump_strength: 0.42,
+            attributes: Arc::default(),
+            gravity: 0.08,
+            safe_fall_distance: 3.0,
+            fall_damage_multiplier: 1.0,
+            water_efficiency: 0.0,
+            water_slowdown: 0.8,
+            air_speed: 0.02,
+            baby_scale: 0.5,
+            head_rot_speed: 10.0,
+            max_head_x_rot: 40.0,
+            max_head_y_rot: 75.0,
+            ambient_interval: 80,
+            flags: Flags::default(),
+            model,
+            layers: std::collections::HashMap::new(),
+            texture: String::new(),
+            brain: Brain::Passive,
+            anim: Anim::Camel,
+            sounds: [""; 3],
+            step_sound: None,
+            food: Arc::default(),
+            tempt: Arc::default(),
+        });
+        let gliding = |previous: Vec3, current: Vec3| {
+            let mut m = Mob::new(1, kind.clone(), Vec3::ZERO, 0.0);
+            m.extra.fall_flying = true;
+            m.extra.fall_fly_ticks = 20;
+            m.extra.previous_velocity = previous;
+            m.velocity = current;
+            m
+        };
+        let from = Vec3::new(0.4, 0.0, 0.4);
+        let to = Vec3::new(0.0, 0.0, 0.5);
+        let at = |m: &Mob, alpha: f32| base_transform_at(m, alpha, glam::Mat4::IDENTITY);
+        let differs = |a: glam::Mat4, b: glam::Mat4| {
+            a.to_cols_array()
+                .iter()
+                .zip(b.to_cols_array())
+                .any(|(x, y)| (x - y).abs() > 1.0e-4)
+        };
+        let m = gliding(from, to);
+        // The ends are the two ticks' velocities.
+        assert!(!differs(at(&m, 0.0), at(&gliding(from, from), 0.0)));
+        assert!(!differs(at(&m, 1.0), at(&gliding(to, to), 1.0)));
+        // Between them the yaw is that of the lerped velocity, which is
+        // neither end: the current tick's alone made it snap.
+        let mid = Vec3::new(0.2, 0.0, 0.45);
+        let half = at(&m, 0.5);
+        assert!(!differs(half, at(&gliding(mid, mid), 0.5)));
+        assert!(differs(half, at(&gliding(to, to), 0.5)));
+        assert!(differs(half, at(&gliding(from, from), 0.5)));
+    }
 
     /// Six faces whose corners span `min` to `max`.
     fn cube(min: [f32; 3], max: [f32; 3]) -> Vec<super::super::Polygon> {
@@ -2231,6 +2396,7 @@ mod tests {
             entity_tags: Default::default(),
             villager_hats: Default::default(),
             pois: Default::default(),
+            species_placements: Default::default(),
         };
         let atlas = |name: &str| {
             Some(if name.contains("_inner") {
@@ -2319,6 +2485,7 @@ mod tests {
             entity_tags: Default::default(),
             villager_hats: Default::default(),
             pois: Default::default(),
+            species_placements: Default::default(),
         };
         let atlas = |name: &str| {
             Some(if name.contains("copper_golem_eyes") {
@@ -2371,6 +2538,7 @@ mod tests {
             entity_tags: Default::default(),
             villager_hats: Default::default(),
             pois: Default::default(),
+            species_placements: Default::default(),
         };
         for left in [false, true] {
             let t = held_item_transform(&mob, 0.5, glam::DVec3::ZERO, &data, left).unwrap();
@@ -2479,6 +2647,7 @@ mod tests {
             entity_tags: Default::default(),
             villager_hats: Default::default(),
             pois: Default::default(),
+            species_placements: Default::default(),
         };
         let atlas = |_: &str| Some([0.0, 0.0, 0.25, 0.25]);
         let part = &kind.model;

@@ -83,6 +83,13 @@ mod hardware {
 }
 
 impl Pads {
+    /// Include releases delayed until the next simulation tick.
+    pub(super) fn holds_action(&self, settings: &gamepad::PadSettings, action: &str) -> bool {
+        settings.binding(action).is_some_and(|button| {
+            self.edges.is_held(button) || self.late_releases.contains(&button)
+        })
+    }
+
     /// A new player entity took over (spawn, respawn, a server joined, a
     /// dimension change): its health is not compared with the old one's.
     pub(super) fn player_replaced(&mut self) {
@@ -102,6 +109,8 @@ impl Game<'_> {
                     self.pad_edge(event_loop, button, down);
                 }
             }
+            // The keyboard's menu focus follows its widget all the same.
+            self.pad_menu_frame(event_loop);
             return;
         }
         let hardware = self.pad.read();

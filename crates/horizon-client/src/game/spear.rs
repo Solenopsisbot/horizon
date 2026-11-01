@@ -222,6 +222,9 @@ impl Game<'_> {
         };
         let old_health = self.mobs[index].health;
         let hurt = deals_damage && self.hurt_by_player(index, total, Damage::spear(from));
+        if hurt && old_health > 0.0 && !self.mobs[index].alive() {
+            self.native_kill_event(index);
+        }
         // causeExtraKnockback: a push of 0.4, then the weapon's Knockback.
         if deals_knockback {
             let (xd, zd) = self.extra_knockback_direction();
@@ -304,9 +307,7 @@ impl Game<'_> {
         let look = view_vector(self.yaw, self.pitch);
         let look = Vec3::new(look[0], look[1], look[2]);
         // The attack damage attribute.
-        let damage = 1.0
-            + self.attack_item_info().map_or(0.0, |i| i.attack_damage)
-            + self.effect_attack_bonus();
+        let damage = self.attack_damage();
         let movement = self.known_player_movement();
         let mut hit = false;
         for i in self.stab_targets(eye, look, movement) {

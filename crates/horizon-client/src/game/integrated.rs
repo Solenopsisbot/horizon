@@ -11,10 +11,10 @@
 //! is DEPRECATED: never use it, it gets no fixes and will be removed soon.
 //! LAN guests and dedicated servers use the same code either way.
 use super::{
-    Game, Options, PackResources, Resources, UiResources, WorldIcon,
+    Dim, Game, Options, PackResources, Resources, UiResources, WorldIcon,
     execution_role::ExecutionRole,
-    lan::{LanSettings, Owner},
-    world_loading::WorldRequest,
+    lan::{LanSettings, Owner, SyncPreload, preload_sync_data},
+    world_loading::{WorldLoader, WorldRequest},
 };
 use horizon_client::level_loading::{STATUS_RADIUS, Stage};
 use horizon_client::{
@@ -60,9 +60,18 @@ struct Flags {
     entity_distance: AtomicU32,
     /// `MinecraftServer.isCurrentlySaving`: the server is autosaving.
     saving: AtomicBool,
+    /// The generators of the levels the server has run, by dimension: what
+    /// F3's chunk generation entry asks `ServerChunkCache.getGenerator`.
+    terrain: Mutex<
+        std::collections::HashMap<&'static str, Arc<horizon_client::vanillagen::VanillaTerrain>>,
+    >,
     /// What the server's `LevelLoadListener` reports, for the window's
     /// `LevelLoadingScreen` (`LevelLoadTracker.serverProgress/statusView`).
     load: Arc<horizon_client::level_loading::ServerLoadView>,
+    /// Where the window's debug entries want the server's lines for (its
+    /// dimension and feet), and the lines of the last tick there.
+    debug_at: Mutex<Option<(Dim, [i32; 3])>>,
+    debug: Mutex<super::debug_lines::ServerDebug>,
 }
 
 /// Work the window hands its server thread (`MinecraftServer.execute`).
@@ -77,12 +86,33 @@ pub(super) struct Integrated {
     pub world_name: String,
 }
 impl Integrated {
+    /// The generator of the server's level in `dimension`, once it has run.
+    pub fn terrain(
+        &self,
+        dimension: &str,
+    ) -> Option<Arc<horizon_client::vanillagen::VanillaTerrain>> {
+        self.flags.terrain.lock().ok()?.get(dimension).cloned()
+    }
     /// The server's load progress and chunk status map.
     pub fn load_view(&self) -> &Arc<horizon_client::level_loading::ServerLoadView> {
         &self.flags.load
     }
     pub fn smoothed_tick_ms(&self) -> f32 {
         f32::from_bits(self.flags.smoothed_tick_ms.load(Ordering::Relaxed))
+    }
+    /// Asks for the debug entries' server lines at `at`, or stops asking.
+    pub(super) fn request_debug(&self, at: Option<(Dim, [i32; 3])>) {
+        if let Ok(mut want) = self.flags.debug_at.lock() {
+            *want = at;
+        }
+    }
+    /// The debug entries' server lines of the last tick.
+    pub(super) fn debug(&self) -> super::debug_lines::ServerDebug {
+        self.flags
+            .debug
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or_default()
     }
     /// `MinecraftServer.isCurrentlySaving`.
     pub fn is_saving(&self) -> bool {
@@ -296,6 +326,19 @@ impl Game<'_> {
         options.server = None;
         options.world = None;
         self.join_world_rest()?;
+        // The window plays against the world's own biome table (its chunks
+        // carry the packs' ids past the built-in list, `set_registries`
+        // names them through it), as the server thread's copy does.
+        let world = std::env::current_dir()?.join("saves").join(folder);
+        let enabled_features = horizon_client::save::Level::read(&world)
+            .map(|l| l.enabled_features)
+            .unwrap_or_default();
+        self.world_biomes = Some(super::world_loading::packed_biomes(
+            &world,
+            &self.options.resources,
+            self.res.biomes(),
+            &enabled_features,
+        ));
         let (res, pack, settings) = (self.res.clone(), self.pack.clone(), self.settings.clone());
         let flags = Arc::new(Flags::default());
         flags
@@ -490,9 +533,11 @@ impl Game<'_> {
         flags: Arc<Flags>,
         tasks: Receiver<Task>,
         ready: &Sender<Ready>,
+        opening: Opening,
     ) -> Result<()> {
-        let result = self.run_integrated_inner(launch, flags, tasks, ready);
+        let result = self.run_integrated_inner(launch, flags, tasks, ready, opening);
         if let Err(error) = &result {
+            self.native_players_leaving();
             self.native_lifecycle_close_failed(&error.to_string());
         }
         result
@@ -504,10 +549,11 @@ impl Game<'_> {
         flags: Arc<Flags>,
         tasks: Receiver<Task>,
         ready: &Sender<Ready>,
+        opening: Opening,
     ) -> Result<()> {
         // The open segment runs as one unit (`integrated_open`) so its
         // failures fire `WorldOpenFailed` with the engine's own error text.
-        if let Err(e) = self.integrated_open(&launch, &flags, tasks, ready) {
+        if let Err(e) = self.integrated_open(&launch, &flags, tasks, ready, opening) {
             self.native_lifecycle_world_failed(&e.to_string());
             return Err(e);
         }
@@ -556,12 +602,34 @@ impl Game<'_> {
                     self.debug_charts.smoothed_tick_ms.to_bits(),
                     Ordering::Relaxed,
                 );
+                if let (Some(terrain), Ok(mut terrains)) =
+                    (self.end.locator(), flags.terrain.lock())
+                {
+                    terrains.insert(self.dim.id(), terrain);
+                }
             }
             self.apply_publish();
             self.publish_load_view();
             self.wait_for_next_server_tick(&mut next, paused);
         }
         self.stop_integrated()
+    }
+
+    /// After the level of `dim` ticked: the window's debug entries' server
+    /// lines, when they want them from this level.
+    pub(super) fn publish_server_debug(&self, dim: Dim) {
+        let Some(serving) = &self.serving else {
+            return;
+        };
+        let want = serving.flags.debug_at.lock().ok().and_then(|w| *w);
+        if let Some((at, feet)) = want
+            && at == dim
+        {
+            let lines = self.server_debug_lines(feet);
+            if let Ok(mut debug) = serving.flags.debug.lock() {
+                *debug = lines;
+            }
+        }
     }
 
     /// The integrated server's world open: `run_integrated`'s segment
@@ -573,15 +641,18 @@ impl Game<'_> {
         flags: &Arc<Flags>,
         tasks: Receiver<Task>,
         ready: &Sender<Ready>,
+        opening: Opening,
     ) -> Result<()> {
+        // MinecraftServer.loadLevel's start: nothing is loaded yet.
+        self.native_server_about_to_start(false);
         self.native_lifecycle_open_started();
-        self.load_world(WorldRequest::new(
-            &launch.folder,
-            launch.name.as_deref(),
-            launch.seed,
-            launch.creative,
-            launch.create.as_ref(),
-        )?)?;
+        // `load_world`, with the world `serve` started preparing.
+        self.join_world_rest()?;
+        self.perf.world_opening();
+        self.finish_open_world(opening.world?.finish()?)?;
+        if let Some(sync) = opening.sync {
+            sync.adopt(&self.pack_files());
+        }
         let saved = Box::new(self.level.clone());
         // IntegratedServer runs the server mods; the window the client mods.
         self.mods.dev = self.options.dev_mods.clone();
@@ -669,16 +740,18 @@ impl Game<'_> {
     fn stop_integrated(&mut self) -> Result<()> {
         // The close request: lifecycle observation stops.
         self.native_lifecycle.begin_close();
+        // MinecraftServer.stopServer's start: everyone is still here.
+        self.native_server_stopping(false);
+        self.native_players_leaving();
         // IntegratedServer.stopServer: teardownPublishedState.
         if let Some(s) = self.serving.take() {
             s.flags.published.store(0, Ordering::Relaxed);
         }
         if let Some(mut host) = self.lan.take() {
+            self.flush_native_net(&mut host);
             // PlayerList.removeAll: the owner and every guest leave the game.
             host.award_leave_game_to_all();
-            for g in &host.hub.guests {
-                self.save_guest(&host, g);
-            }
+            self.save_leaving_guests(&mut host);
             let conns: Vec<u32> = host.hub.guests.iter().map(|g| g.conn).collect();
             for conn in conns {
                 host.hub.kick(
@@ -953,7 +1026,8 @@ impl Game<'_> {
                 .find(|g| g.uuid == owner)
                 .map(|g| g.conn)
         {
-            host.hub.set_game_mode(conn, mode);
+            host.hub
+                .set_game_mode(conn, mode, &self.world, Some(self.collision));
         }
     }
     /// `IntegratedServer.setWorldAllowCommands`: the owner is an operator
@@ -985,8 +1059,46 @@ fn serve(
     tasks: Receiver<Task>,
     ready: &Sender<Ready>,
 ) -> Result<()> {
-    let mut server = server_game(res, pack, options, settings)?;
-    server.run_integrated(launch, flags, tasks, ready)
+    // The world prepares, and the registries the server sends are read, on
+    // helper threads while this one builds the server's own Game: none of
+    // them reads what another makes (`integrated_open` takes them up).
+    let world = WorldRequest::new(
+        &launch.folder,
+        launch.name.as_deref(),
+        launch.seed,
+        launch.creative,
+        launch.create.as_ref(),
+    )
+    .and_then(|request| {
+        WorldLoader::start(
+            request,
+            res.clone(),
+            pack.clone(),
+            options.clone(),
+            settings.clone(),
+        )
+    });
+    let opening = Opening {
+        world,
+        sync: preload_sync_data(&options.resources),
+    };
+    let mut server = match server_game(res, pack, options, settings) {
+        Ok(server) => server,
+        Err(e) => {
+            // The world's session lock is let go before the failure is told.
+            if let Ok(world) = opening.world {
+                drop(world.finish());
+            }
+            return Err(e);
+        }
+    };
+    server.run_integrated(launch, flags, tasks, ready, opening)
+}
+
+/// What `serve` starts beside the server's own Game.
+struct Opening {
+    world: Result<WorldLoader>,
+    sync: Option<SyncPreload>,
 }
 
 /// Component oracles supply their own synthetic levels and entity phases.

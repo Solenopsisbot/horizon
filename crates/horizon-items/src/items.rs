@@ -266,7 +266,7 @@ pub struct Items {
     /// Item tags in vanilla's order (`TagLoader`: file order, nested tags in
     /// place, first occurrence kept), the order `TagSlotDisplay` resolves.
     pub item_tag_order: HashMap<String, Vec<String>>,
-    loot: HashMap<String, Value>,
+    loot: Arc<HashMap<String, Value>>,
     /// The `jukebox_song` registry.
     pub songs: HashMap<String, Song>,
     /// The `instrument` registry (goat horns).
@@ -448,8 +448,10 @@ pub(crate) fn load_tag_lists(
     }
     // The packs' entries join the game's own, in pack order; a `replace`
     // file drops what the lower sources put in (`TagLoader.load` walks the
-    // resource stack the same way).
-    for (id, files) in overlay.kind(&format!("tags/{kind}")) {
+    // resource stack the same way). `tag_kind` reads the packs' keys
+    // (`tags/<ns>:<registry>/<path>`) and yields the `ns:path` ids the raw
+    // map is keyed by.
+    for (id, files) in overlay.tag_kind(kind) {
         let slot = raw.entry(id.to_owned()).or_default();
         for bytes in files {
             let Ok(v) = serde_json::from_slice::<Value>(bytes) else {
@@ -845,51 +847,11 @@ impl Items {
             );
             order.push(id);
         }
-        let mut loot = HashMap::new();
         // Every loot table, keyed by its id (blocks/stone, entities/sheep/white,
-        // gameplay/chicken_lay, shearing/sheep/red...).
-        fn walk_loot(
-            dir: &Path,
-            base: &Path,
-            namespace: &str,
-            loot: &mut HashMap<String, Value>,
-        ) -> Result<()> {
-            for entry in fs::read_dir(dir)?.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    walk_loot(&p, base, namespace, loot)?;
-                } else if p.extension().is_some_and(|e| e == "json") {
-                    let id = p
-                        .strip_prefix(base)?
-                        .with_extension("")
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    loot.insert(
-                        format!("{namespace}:{id}"),
-                        serde_json::from_slice(&fs::read(&p)?)?,
-                    );
-                }
-            }
-            Ok(())
-        }
-        let loot_root = root.join("data/minecraft/loot_table");
-        walk_loot(&loot_root, &loot_root, "minecraft", &mut loot)?;
-        // Content mods' tables (docs/modpacks.md): `<ns>:blocks/...`.
-        for namespace in crate::content_namespaces::namespaces(root) {
-            let dir = root.join(format!("data/{namespace}/loot_table"));
-            if dir.is_dir() {
-                walk_loot(&dir, &dir, &namespace, &mut loot)?;
-            }
-        }
-        // The packs' tables over the game's own: the top pack's file for
-        // each id (`SimpleJsonResourceReloadListener` sees one resource per
-        // id, the resource stack's top).
-        for (id, files) in overlay.kind("loot_table") {
-            let Ok(v) = serde_json::from_slice::<Value>(PackOverlay::top(files)) else {
-                continue;
-            };
-            loot.insert(id.to_owned(), v);
-        }
+        // gameplay/chicken_lay, shearing/sheep/red...), of every namespace
+        // (content mods' tables, docs/modpacks.md), with the packs' over the
+        // game's own: one map with the loot data of the same root and packs.
+        let loot = horizon_world::loot::shared_tables(root, overlay)?;
         let registry_order = registry_order(root, &order);
         Ok(Self {
             items,
@@ -901,7 +863,7 @@ impl Items {
             loot,
             songs: load_songs(root),
             instruments: load_instruments(root),
-            enchantments: Arc::new(crate::enchant::Enchantments::load(root)),
+            enchantments: Arc::new(crate::enchant::Enchantments::load_with(root, overlay)),
         })
     }
     pub fn get(&self, id: &str) -> Option<&ItemInfo> {
@@ -928,10 +890,10 @@ impl Items {
             block_tags: load_tags(root, "block", overlay)?,
             item_tags: load_tags(root, "item", overlay)?,
             item_tag_order: load_tag_lists(root, "item", overlay)?,
-            loot: HashMap::new(),
+            loot: Default::default(),
             songs: HashMap::new(),
             instruments: HashMap::new(),
-            enchantments: Arc::new(crate::enchant::Enchantments::load(root)),
+            enchantments: Arc::new(crate::enchant::Enchantments::load_with(root, overlay)),
         })
     }
     /// An item table with only tags, for unit tests of item rules.
@@ -947,7 +909,7 @@ impl Items {
                 .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
                 .collect(),
             item_tags,
-            loot: HashMap::new(),
+            loot: Default::default(),
             songs: HashMap::new(),
             instruments: HashMap::new(),
             enchantments: Arc::new(crate::enchant::Enchantments::default()),
@@ -957,9 +919,13 @@ impl Items {
     pub fn block_in_tag(&self, tag: &str, block: &str) -> bool {
         self.block_tags.get(tag).is_some_and(|s| s.contains(block))
     }
+    /// Whether an item belongs to a loaded item tag.
+    pub fn item_in_tag(&self, tag: &str, item: &str) -> bool {
+        self.item_tags.get(tag).is_some_and(|s| s.contains(item))
+    }
     fn block_matches(&self, spec: &str, block: &str) -> bool {
         match spec.strip_prefix('#') {
-            Some(tag) => self.block_tags.get(tag).is_some_and(|s| s.contains(block)),
+            Some(tag) => self.block_in_tag(tag, block),
             None => spec == block,
         }
     }
@@ -1939,6 +1905,24 @@ mod tests {
     use super::*;
     use horizon_core::random::LegacyRandom;
     use serde_json::json;
+
+    #[test]
+    fn loaded_block_and_item_tags_answer_membership() {
+        let mut items = super::Items::for_tests(std::collections::HashMap::from([(
+            "test:items".into(),
+            ["test:apple".into()].into_iter().collect(),
+        )]));
+        items.block_tags.insert(
+            "test:blocks".into(),
+            ["test:stone".into()].into_iter().collect(),
+        );
+        assert!(items.block_in_tag("test:blocks", "test:stone"));
+        assert!(!items.block_in_tag("test:blocks", "test:dirt"));
+        assert!(!items.block_in_tag("test:missing", "test:stone"));
+        assert!(items.item_in_tag("test:items", "test:apple"));
+        assert!(!items.item_in_tag("test:items", "test:stone"));
+        assert!(!items.item_in_tag("test:missing", "test:apple"));
+    }
 
     fn ctx<'a>(
         items: &'a Items,
