@@ -214,6 +214,7 @@ pub(super) fn boat_wood(item: &str) -> Option<&str> {
         .or_else(|| name.strip_suffix("_raft"))
         .filter(|w| !w.ends_with("_chest"))
 }
+#[derive(Clone)]
 pub(super) struct BoatModels {
     pub models: HashMap<String, Part>,
     pub chest_models: HashMap<String, Part>,
