@@ -288,7 +288,7 @@ boundary; they do not replace Horizon's authoritative world state.
 marker, and a bounded bounding-box/on-ground state; `getX`/`getY`/`getZ`, both `setPos` overloads,
 `position`, `getDeltaMovement`, both `setDeltaMovement` overloads, `getXRot`/`setXRot`,
 `getYRot`/`setYRot`, `distanceTo`/`distanceToSqr`, `blockPosition`, `level`, `isAlive`, `isRemoved`,
-`getEyePosition`/`getEyeY`, `discard`, `getUUID`, `getBoundingBox`, `setBoundingBox`, and `isOnGround` preserve common entity
+`getEyePosition`/`getEyeY`, `getEyeHeight`, `getBbHeight`/`getBbWidth`, `discard`, `getUUID`, `getBoundingBox`, `setBoundingBox`, and `isOnGround` preserve common entity
 inspection, movement, and collision setup paths. The box, motion, rotation, and removal state are
 façade-local until the native entity boundary wires live physics updates through them; player mutation
 and synchronization remain native-boundary work.
@@ -386,8 +386,8 @@ python3 tools/native_java_smoke.py
 The script uses `javac` to compile two ordinary Java classes and a tiny NeoForge `@Mod` annotation,
 packages real Fabric and NeoForge metadata, and checks that the native runner discovers and executes both
 Fabric `main` entrypoints plus the NeoForge constructor. The first Fabric entrypoint also runs an
-`Optional.filter` predicate through the bounded host, so the smoke test proves a real callback boundary in
-addition to classfile and metadata discovery. It therefore catches classfile, metadata, annotation,
+`Optional.filter` predicate and a mutable `Map.forEach` `BiConsumer` through the bounded host, so the smoke
+test proves real callback boundaries in addition to classfile and metadata discovery. It therefore catches classfile, metadata, annotation,
 and multi-entrypoint regressions that an in-memory Rust fixture cannot; the full mod-port
 harness remains the check that needs prepared vanilla resources.
 

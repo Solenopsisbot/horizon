@@ -1,5 +1,6 @@
 """End-to-end regression for compiled Fabric and NeoForge native probe jars."""
 
+import json
 import shutil
 import subprocess
 import sys
@@ -22,7 +23,8 @@ class NativeJavaSmokeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn('"entrypoints": ["demo.First", "demo.Second"]', result.stdout)
         self.assertIn('"entrypoints": ["demo.Neo"]', result.stdout)
-        self.assertIn('"host_calls": 7', result.stdout)
+        report = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertGreaterEqual(report["fabric"]["host_calls"], 10)
 
 
 if __name__ == "__main__":

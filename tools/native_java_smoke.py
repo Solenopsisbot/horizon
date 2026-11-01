@@ -25,6 +25,7 @@ SOURCES = {
     "demo/First.java": """
 package demo;
 
+import java.util.HashMap;
 import java.util.Optional;
 
 public final class First {
@@ -37,6 +38,14 @@ public final class First {
         if (!marker.filter(text -> text.length() == 6).isPresent()) {
             throw new IllegalStateException("Optional.filter host path failed");
         }
+        HashMap<String, Integer> values = new HashMap<>();
+        values.put("left", 19);
+        values.put("right", 23);
+        values.forEach((key, item) -> {
+            if (item < 19 || item > 23) {
+                throw new IllegalStateException("Map.forEach host path failed for " + key);
+            }
+        });
     }
 
     private static int plus(int left, int right) {
@@ -233,10 +242,10 @@ def main() -> int:
         if not isinstance(report.get("host_calls"), int):
             print(f"native probe omitted host call count: {report!r}", file=sys.stderr)
             return 1
-        if report["host_calls"] < 5:
+        if report["host_calls"] < 10:
             print(
-                "native probe did not exercise the Optional.filter host path: "
-                f"expected at least 5 host calls, got {report['host_calls']}",
+                "native probe did not exercise the Optional.filter and Map.forEach host paths: "
+                f"expected at least 10 host calls, got {report['host_calls']}",
                 file=sys.stderr,
             )
             return 1

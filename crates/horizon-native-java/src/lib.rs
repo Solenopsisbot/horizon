@@ -1129,6 +1129,35 @@ impl Host for StdHost {
                     | "java/util/AbstractMap"
                     | "java/util/HashMap"
                     | "java/util/LinkedHashMap",
+                    "forEach",
+                    "(Ljava/util/function/BiConsumer;)V",
+                ) => {
+                    let callback = Self::argument(r, args, 0)?.clone();
+                    let entries = self
+                        .mutable_collections
+                        .entry(marker.to_owned())
+                        .or_default()
+                        .chunks_exact(2)
+                        .map(|pair| [pair[0].clone(), pair[1].clone()])
+                        .collect::<Vec<_>>();
+                    for [key, value] in entries {
+                        self.invoke_instance(
+                            &MethodRef {
+                                owner: "java/util/function/BiConsumer".into(),
+                                name: "accept".into(),
+                                descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)V".into(),
+                            },
+                            &callback,
+                            &[key, value],
+                        )?;
+                    }
+                    return Ok(Value::Void);
+                }
+                (
+                    "java/util/Map"
+                    | "java/util/AbstractMap"
+                    | "java/util/HashMap"
+                    | "java/util/LinkedHashMap",
                     "merge",
                     "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
                 ) => {
@@ -1965,6 +1994,11 @@ impl Host for StdHost {
                 Ok(Self::argument(r, args, 0)?.clone())
             }
             ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V") => Ok(Value::Void),
+            (
+                "java/util/function/BiConsumer",
+                "accept",
+                "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            ) => Ok(Value::Void),
             ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
                 expect_ref(receiver).is_some_and(|marker| marker.starts_with("@indy:")) as i32,
             )),
@@ -4360,6 +4394,8 @@ impl<H: Host> Runtime<'_, H> {
                                 "java/util/function/Function"
                                     | "java/util/function/UnaryOperator"
                                     | "java/util/function/Consumer"
+                                    | "java/util/function/BiConsumer"
+                                    | "java/util/function/BiFunction"
                                     | "java/util/function/Supplier"
                             ) {
                                 if let Some(receiver) = receiver.as_ref() {
@@ -6371,6 +6407,55 @@ mandatory = true
             .unwrap(),
             Value::Int(1)
         );
+    }
+
+    #[test]
+    fn standard_host_invokes_map_for_each_callbacks() {
+        let mut host = StdHost::new();
+        let map = Value::Ref(Some("java/util/HashMap".into()));
+        host.invoke_instance(
+            &MethodRef {
+                owner: "java/util/HashMap".into(),
+                name: "<init>".into(),
+                descriptor: "()V".into(),
+            },
+            &map,
+            &[],
+        )
+        .unwrap();
+        let put = MethodRef {
+            owner: "java/util/HashMap".into(),
+            name: "put".into(),
+            descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;".into(),
+        };
+        for (key, value) in [("first", "one"), ("second", "two")] {
+            host.invoke_instance(
+                &put,
+                &map,
+                &[Value::Ref(Some(key.into())), Value::Ref(Some(value.into()))],
+            )
+            .unwrap();
+        }
+        let for_each = MethodRef {
+            owner: "java/util/Map".into(),
+            name: "forEach".into(),
+            descriptor: "(Ljava/util/function/BiConsumer;)V".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &for_each,
+                &map,
+                &[Value::Ref(Some("@indy:map-consumer".into()))],
+            )
+            .unwrap(),
+            Value::Void
+        );
+        let callbacks = host
+            .calls()
+            .iter()
+            .filter(|call| call.owner == "java/util/function/BiConsumer" && call.name == "accept")
+            .count();
+        assert_eq!(callbacks, 2);
     }
 
     #[test]
