@@ -1178,7 +1178,7 @@ fn render(
     ) {
         let _ = writeln!(
             out,
-            "    protected boolean horizonCreative;\n    protected boolean horizonSpectator;\n    protected String horizonScoreboardName = \"Player\";\n    protected int horizonExperienceLevel;\n    protected float horizonExperienceProgress;"
+            "    protected boolean horizonCreative;\n    protected boolean horizonSpectator;\n    protected String horizonScoreboardName = \"Player\";\n    protected int horizonExperienceLevel;\n    protected float horizonExperienceProgress;\n    protected net.minecraft.world.entity.player.Inventory horizonInventory = new net.minecraft.world.entity.player.Inventory();\n    protected net.minecraft.world.entity.player.Abilities horizonAbilities = new net.minecraft.world.entity.player.Abilities();"
         );
     }
     if class.name == "net/minecraft/world/entity/player/Inventory" {
@@ -2998,14 +2998,14 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
                 "net.minecraft.world.entity.player.Inventory",
                 "()Lnet/minecraft/world/entity/player/Inventory;",
             ) => {
-                return "return new net.minecraft.world.entity.player.Inventory();".to_owned();
+                return "return horizonInventory;".to_owned();
             }
             (
                 "getAbilities",
                 "net.minecraft.world.entity.player.Abilities",
                 "()Lnet/minecraft/world/entity/player/Abilities;",
             ) => {
-                return "return new net.minecraft.world.entity.player.Abilities();".to_owned();
+                return "return horizonAbilities;".to_owned();
             }
             _ => {}
         }
@@ -5886,6 +5886,14 @@ mod tests {
         );
         assert!(source.contains("protected boolean horizonCreative;"));
         assert!(source.contains("horizonScoreboardName = \"Player\";"));
+        assert!(
+            source
+                .contains("horizonInventory = new net.minecraft.world.entity.player.Inventory();")
+        );
+        assert!(
+            source
+                .contains("horizonAbilities = new net.minecraft.world.entity.player.Abilities();")
+        );
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/world/entity/player/Player",
@@ -5912,6 +5920,24 @@ mod tests {
                 "()F",
             ),
             "return horizonExperienceProgress;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/player/Player",
+                "getInventory",
+                "net.minecraft.world.entity.player.Inventory",
+                "()Lnet/minecraft/world/entity/player/Inventory;",
+            ),
+            "return horizonInventory;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/player/Player",
+                "getAbilities",
+                "net.minecraft.world.entity.player.Abilities",
+                "()Lnet/minecraft/world/entity/player/Abilities;",
+            ),
+            "return horizonAbilities;"
         );
     }
 

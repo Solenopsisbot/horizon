@@ -1798,6 +1798,27 @@ impl Host for StdHost {
             ("net/fabricmc/api/EnvType", "toString", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(enum_name(receiver).to_owned())))
             }
+            ("java/util/Optional", "toString", "()Ljava/lang/String;") => {
+                Ok(Value::Ref(Some(match expect_ref(receiver) {
+                    Some(value) => format!(
+                        "Optional[{}]",
+                        value.strip_prefix("optional/").unwrap_or(value)
+                    ),
+                    None => "Optional.empty".to_owned(),
+                })))
+            }
+            ("java/util/Optional", "hashCode", "()I") => {
+                Ok(Value::Int(expect_ref(receiver).map_or(0, |value| {
+                    stable_hash(value.strip_prefix("optional/").unwrap_or(value))
+                })))
+            }
+            ("java/util/Optional", "equals", "(Ljava/lang/Object;)Z") => {
+                let left = expect_ref(receiver)
+                    .map(|value| value.strip_prefix("optional/").unwrap_or(value));
+                let right = expect_ref(Self::argument(r, args, 0)?)
+                    .map(|value| value.strip_prefix("optional/").unwrap_or(value));
+                Ok(Value::Int((left == right) as i32))
+            }
             ("java/util/Optional", "isPresent", "()Z") => {
                 Ok(Value::Int(expect_ref(receiver).is_some() as i32))
             }
@@ -4595,7 +4616,12 @@ fn parse_metadata(
         .into_iter()
         .flatten()
         .map(|(id, _)| id.clone())
-        .filter(|id| !matches!(id.as_str(), "minecraft" | "fabricloader" | "java"))
+        .filter(|id| {
+            !matches!(
+                id.as_str(),
+                "minecraft" | "fabricloader" | "java" | "neoforge" | "forge"
+            )
+        })
         .collect::<Vec<_>>();
     required_mods.sort();
     required_mods.dedup();
@@ -5053,7 +5079,7 @@ mod tests {
     #[test]
     fn metadata_collects_required_mod_ids_for_native_loader_seeding() {
         let (_, _, _, required) = parse_metadata(
-            r#"{"id":"demo","version":"1","depends":{"minecraft":"1.21","fabricloader":"*","fabric-api":"*","cloth-config":"*"}}"#,
+            r#"{"id":"demo","version":"1","depends":{"minecraft":"1.21","fabricloader":"*","neoforge":"*","forge":"*","fabric-api":"*","cloth-config":"*"}}"#,
         )
         .unwrap();
         assert_eq!(required, ["cloth-config", "fabric-api"]);
@@ -5881,6 +5907,34 @@ mandatory = true
             host.invoke(&of_nullable, &[Value::Ref(None)]).unwrap(),
             Value::Ref(None)
         );
+        let optional_to_string = MethodRef {
+            owner: "java/util/Optional".into(),
+            name: "toString".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &optional_to_string,
+                &Value::Ref(Some("optional/demo".into())),
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("Optional[demo]".into()))
+        );
+        let optional_equals = MethodRef {
+            owner: "java/util/Optional".into(),
+            name: "equals".into(),
+            descriptor: "(Ljava/lang/Object;)Z".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &optional_equals,
+                &Value::Ref(Some("optional/demo".into())),
+                &[Value::Ref(Some("optional/demo".into()))],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
         let map = MethodRef {
             owner: "java/util/Optional".into(),
             name: "map".into(),
@@ -5898,6 +5952,21 @@ mandatory = true
             host.invoke_instance(&map, &Value::Ref(None), &[Value::Ref(None)])
                 .unwrap(),
             Value::Ref(None)
+        );
+        let to_string = MethodRef {
+            owner: "java/util/Optional".into(),
+            name: "toString".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&to_string, &Value::Ref(Some("optional/demo".into())), &[])
+                .unwrap(),
+            Value::Ref(Some("Optional[demo]".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(&to_string, &Value::Ref(None), &[])
+                .unwrap(),
+            Value::Ref(Some("Optional.empty".into()))
         );
         let filter = MethodRef {
             owner: "java/util/Optional".into(),

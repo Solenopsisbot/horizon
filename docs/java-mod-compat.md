@@ -485,6 +485,8 @@ game/config/mods paths, plus a deterministic `getAllMods` list backed by the see
 `with_mod`. NeoForge's `ModList.get().isLoaded` and `getModContainerById` use the same seeded map and
 return deterministic container markers, covering the common loader-side dependency checks. Common
 `Optional.empty`/`of`/`ofNullable` constructors and
+`isPresent`, `isEmpty`, `map`, `filter`, `equals`, `hashCode`, and `toString` preserve bounded optional
+value semantics for loader bootstrap code, while unresolved callbacks remain explicit markers. Common
 `java.nio.file.Paths.get` and `Path.resolve`, `toString`, `normalize`, and
 `toAbsolutePath` calls use deterministic path markers. Common `List.of`, `Set.of`, `Map.of`, empty/singleton
 `Collections` factories, and bounded `size`, `isEmpty`, `contains`, `containsAll`, `get`, `Map.get`, `Map.getOrDefault`, and
