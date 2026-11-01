@@ -2068,6 +2068,25 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             _ => {}
         }
     }
+    if class == "net/minecraft/core/HolderSet" {
+        match (method, ret) {
+            ("size", "int") => return "return 0;".to_owned(),
+            ("isEmpty", "boolean") => return "return true;".to_owned(),
+            ("contains", "boolean") => return "return false;".to_owned(),
+            ("stream", "java.util.stream.Stream") => {
+                return "return java.util.stream.Stream.empty();".to_owned();
+            }
+            ("get", _) => return "return null;".to_owned(),
+            ("unwrap", "java.util.Optional") => {
+                return "return java.util.Optional.empty();".to_owned();
+            }
+            ("canSerializeIn", "boolean") => return "return false;".to_owned(),
+            ("empty" | "direct" | "list" | "named", "net.minecraft.core.HolderSet") => {
+                return "return new net.minecraft.core.HolderSet() {};".to_owned();
+            }
+            _ => {}
+        }
+    }
     if class == "net/minecraft/core/Registry"
         && method == "registerForHolder"
         && ret == "net.minecraft.core.Holder.Reference"
@@ -4472,6 +4491,50 @@ mod tests {
                 "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;",
             ),
             "p0.horizonEntries.put(p2, p3); p0.horizonKeys.put(p2, p1); net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(p3, p1, p2); return holder;"
+        );
+    }
+
+    #[test]
+    fn holder_set_facade_keeps_bounded_membership_shape() {
+        assert_eq!(
+            runtime_body_with_descriptor("net/minecraft/core/HolderSet", "size", "int", "()I",),
+            "return 0;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/HolderSet",
+                "isEmpty",
+                "boolean",
+                "()Z",
+            ),
+            "return true;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/HolderSet",
+                "contains",
+                "boolean",
+                "(Lnet/minecraft/core/Holder;)Z",
+            ),
+            "return false;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/HolderSet",
+                "stream",
+                "java.util.stream.Stream",
+                "()Ljava/util/stream/Stream;",
+            ),
+            "return java.util.stream.Stream.empty();"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/HolderSet",
+                "direct",
+                "net.minecraft.core.HolderSet",
+                "(Lnet/minecraft/core/Holder;)Lnet/minecraft/core/HolderSet;",
+            ),
+            "return new net.minecraft.core.HolderSet() {};"
         );
     }
 

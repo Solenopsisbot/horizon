@@ -419,8 +419,9 @@ writes registrations into that view. The networking
 registration boundary includes `RegisterPayloadHandlersEvent` and fluent `PayloadRegistrar` methods. The façade
 also emits the common `IEventBus.addListener` overloads with `EventPriority`, event classes, and cancellation
 flags, so listener-heavy NeoForge constructors keep linking. This keeps the usual constructor registration
-sequence linked; the native host now exposes bounded listener dispatch and a `RegistrySink` export, while
-live registry wiring remains follow-up work.
+sequence linked; the native host now records the direct `RegisterEvent.register` supplier overload as a
+`RegistryEntry`, alongside bounded listener dispatch and the `RegistrySink` export. Supplier values remain
+opaque callback markers until a Horizon-owned adapter executes them; live registry wiring remains follow-up work.
 `PayloadRegistrar` now retains the registrar returned by one `RegisterPayloadHandlersEvent` and counts its
 play-to-server, play-to-client, and bidirectional registrations, so payload bootstrap can inspect a stable
 registration object before the native channel boundary is attached.
@@ -622,7 +623,7 @@ with it, what Horizon has, and the bridge's answer.
 | Java side | What mods do with it | Horizon today | Bridge |
 |---|---|---|---|
 | `Registry`, `DeferredRegister`, `RegisterEvent` | register blocks, items, entities, menus | `mod_content` (`data/<ns>/horizon/*.json`), native registries | the native host records registration intent now; typed declarations must be exported before the immutable tables load so bridged and carried content share one namespace |
-| `Holder`, `Holder.Reference`, `HolderSet` | retain a registered value, compare its key, inspect optional bindings | native registry handles and typed declarations | generated holder references retain a bounded value/key/id triple; `registerForHolder` binds it, while unresolved holder sets remain an explicit neutral boundary |
+| `Holder`, `Holder.Reference`, `HolderSet` | retain a registered value, compare its key, inspect optional bindings | native registry handles and typed declarations | generated holder references retain a bounded value/key/id triple; `registerForHolder` binds it, while `HolderSet` exposes empty-safe size, membership, stream, and factory defaults until live cross-mod membership is wired |
 | `Block`, `BlockState`, `BlockBehaviour.Properties` | behaviour, states, shapes | `horizon-items/blocks.rs`, `horizon-world/level/` | façade superclass; calls route to Horizon's trait dispatch; unknown behaviours are reported per class |
 | `ItemStack`, `DataComponents` | item data, NBT-free components | `items.rs`, `item_data.rs` | mirrored value; the component map is 1:1 with Horizon's, which is the luckiest alignment in this design |
 | `BlockEntity`, `BlockEntityType`, `saveAdditional` | machines, NBT | `native_block_entity` family (API 15–18) | Java object owns the NBT mirror; Rust calls `tick`, `load`, `save` at the same points |
@@ -676,7 +677,7 @@ remain follow-up work.
 `TagKey` now retains its registry key and identifier as a value pair: `create`, `location`, `registry`,
 `isFor`, equality, hashing, and string conversion operate on those fields. This keeps tag-backed block,
 item, and entity registration code from collapsing distinct tags into one neutral object; holder-set
-resolution and live cross-mod membership remain outside the bounded façade.
+queries now have empty-safe bounded defaults, while live cross-mod membership remains outside the façade.
 `ResourceKey` exposes the corresponding `location`, `registry`, `registryKey`, and `isFor` value operations,
 so code that compares a registry family or resolves an entry's identifier keeps its namespace/path identity
 through the generated façade. Generated `Registry`/`DefaultedRegistry` values now retain bounded

@@ -2088,6 +2088,24 @@ impl Host for StdHost {
             ) => Ok(Value::Void),
             (
                 "net/neoforged/neoforge/registries/RegisterEvent",
+                "register",
+                "(Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/resources/Identifier;Ljava/util/function/Supplier;)V",
+            ) if args.len() >= 3 => {
+                let registry = expect_ref(Self::argument(r, args, 0)?)
+                    .map(|value| value.strip_prefix("resource-key/").unwrap_or(value))
+                    .unwrap_or("minecraft:unknown")
+                    .to_owned();
+                let (namespace, path) = identifier_parts(Self::argument(r, args, 1)?);
+                self.registrations.push(RegistryEntry {
+                    registry,
+                    id: format!("{namespace}:{path}"),
+                    value: Self::argument(r, args, 2)?.clone(),
+                    declaration: None,
+                });
+                Ok(Value::Void)
+            }
+            (
+                "net/neoforged/neoforge/registries/RegisterEvent",
                 "getRegistryKey",
                 "()Lnet/minecraft/resources/ResourceKey;",
             ) => Ok(Value::Ref(Some(
@@ -7056,6 +7074,34 @@ mandatory = true
         let mut typed_sink = TypedSink::default();
         assert_eq!(host.apply_typed_registrations(&mut typed_sink).unwrap(), 1);
         assert_eq!(typed_sink.0, vec!["deferred-register/registry/demo/entry"]);
+    }
+
+    #[test]
+    fn standard_host_records_neoforge_register_event_supplier() {
+        let mut host = StdHost::new();
+        let event = Value::Ref(Some("register-event".into()));
+        let register = MethodRef {
+            owner: "net/neoforged/neoforge/registries/RegisterEvent".into(),
+            name: "register".into(),
+            descriptor: "(Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/resources/Identifier;Ljava/util/function/Supplier;)V".into(),
+        };
+        host.invoke_instance(
+            &register,
+            &event,
+            &[
+                Value::Ref(Some("resource-key/minecraft:item".into())),
+                Value::Ref(Some("identifier/ruby:wand".into())),
+                Value::Ref(Some("@indy:ruby-wand-supplier".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(host.registrations().len(), 1);
+        let entry = &host.registrations()[0];
+        assert_eq!(entry.key(), "minecraft:item/ruby:wand");
+        assert_eq!(
+            entry.value,
+            Value::Ref(Some("@indy:ruby-wand-supplier".into()))
+        );
     }
 
     #[test]
