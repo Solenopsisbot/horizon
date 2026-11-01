@@ -373,14 +373,23 @@ impl StdHost {
                 && invocation.method.name == "addListener")
                 || (invocation.method.owner == "net/fabricmc/fabric/api/event/Event"
                     && invocation.method.name == "register"))
-                && invocation.args.last().is_some_and(|value| {
+                && invocation.args.iter().any(|value| {
                     matches!(value, Value::Ref(Some(marker)) if marker.starts_with("@indy:"))
                 })
         })
     }
 
+    fn listener_receives_cancelled(listener: &HostInvocation) -> bool {
+        listener
+            .args
+            .iter()
+            .any(|value| matches!(value, Value::Int(1)))
+    }
+
     pub fn dispatch_event(&self, event: Value) -> Vec<EventDispatch> {
+        let cancelled = event_is_cancelled(&event);
         self.listener_registrations()
+            .filter(|listener| !cancelled || Self::listener_receives_cancelled(listener))
             .cloned()
             .map(|listener| EventDispatch {
                 listener,
@@ -8175,6 +8184,38 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(&invoker, &event, &[]).unwrap(),
             Value::Ref(Some("fabric-event/0/invoker".into()))
+        );
+    }
+
+    #[test]
+    fn dispatch_event_honors_neoforge_receive_cancelled_flag() {
+        let mut host = StdHost::new();
+        let bus = Value::Ref(Some("event-bus".into()));
+        let add_listener = MethodRef {
+            owner: "net/neoforged/bus/api/IEventBus".into(),
+            name: "addListener".into(),
+            descriptor: "(Ljava/util/function/Consumer;)Lnet/neoforged/bus/api/IEventBus;".into(),
+        };
+        host.invoke_instance(
+            &add_listener,
+            &bus,
+            &[Value::Ref(Some("@indy:default-listener".into()))],
+        )
+        .unwrap();
+        host.invoke_instance(
+            &add_listener,
+            &bus,
+            &[
+                Value::Ref(Some("@indy:cancelled-listener".into())),
+                Value::Int(1),
+            ],
+        )
+        .unwrap();
+        let dispatches = host.dispatch_event(Value::Ref(Some("event/cancelled/demo".into())));
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(
+            dispatches[0].listener.args[0],
+            Value::Ref(Some("@indy:cancelled-listener".into()))
         );
     }
 

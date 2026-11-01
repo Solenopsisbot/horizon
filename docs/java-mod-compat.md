@@ -427,6 +427,8 @@ flags, so listener-heavy NeoForge constructors keep linking. This keeps the usua
 sequence linked; the native host now records the direct `RegisterEvent.register` supplier overload as a
 `RegistryEntry`, alongside bounded listener dispatch and the `RegistrySink` export. Supplier values remain
 opaque callback markers until a Horizon-owned adapter executes them; live registry wiring remains follow-up work.
+The host now recognizes NeoForge listeners that opt into cancelled events and excludes default listeners from
+cancelled dispatches, while Fabric and non-cancelled events retain registration order.
 `PayloadRegistrar` now retains the registrar returned by one `RegisterPayloadHandlersEvent` and counts its
 play-to-server, play-to-client, and bidirectional registrations, so payload bootstrap can inspect a stable
 registration object before the native channel boundary is attached.
@@ -670,8 +672,9 @@ independently. A Java `ItemStack` is therefore a component map on both sides of 
 copy is a handful of small objects rather than an NBT tree walk. This one coincidence removes what
 would otherwise have been the worst hotspot in the design.
 The generated façade now preserves the common item/count value path (`getCount`, `setCount`, `isEmpty`,
-`getItem`, `copy`, `copyWithCount`, `grow`, and `shrink`) so bootstrap code can inspect stacks before
-the full component bridge is attached. It also has a bounded erased component map: `get`,
+`getItem`, `copy`, `copyWithCount`, `grow`, and `shrink`) plus bounded stack inspection (`getMaxStackSize`,
+`hasFoil`, damage defaults, and `getHoverName`) so bootstrap code can inspect stacks before the full
+component bridge is attached. It also has a bounded erased component map: `get`,
 `getOrDefault`, `set`, `remove`, `has`, and `hasNonDefault` use the `DataComponentType` object as the
 key; generated `DataComponents` constants are distinct identity keys, absent values read as `null` (or
 the supplied default), and copies retain the map. This covers

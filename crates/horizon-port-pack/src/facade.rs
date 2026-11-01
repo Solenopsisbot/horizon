@@ -2268,6 +2268,14 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("isEmpty", "boolean") => {
                 return "return horizonCount <= 0;".to_owned();
             }
+            ("getMaxStackSize", "int") => return "return 64;".to_owned(),
+            ("hasFoil", "boolean") => return "return false;".to_owned(),
+            ("isDamaged", "boolean") => return "return false;".to_owned(),
+            ("getDamageValue", "int") => return "return 0;".to_owned(),
+            ("getMaxDamage", "int") => return "return 0;".to_owned(),
+            ("getHoverName", "net.minecraft.network.chat.Component") => {
+                return "return net.minecraft.network.chat.Component.literal(horizonItem.toString());".to_owned();
+            }
             ("getItem", "net.minecraft.world.item.Item") => {
                 return "return horizonItem;".to_owned();
             }
@@ -3600,6 +3608,26 @@ mod tests {
         assert_eq!(
             runtime_body("net/minecraft/world/item/ItemStack", "isEmpty", "boolean"),
             "return horizonCount <= 0;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/item/ItemStack",
+                "getMaxStackSize",
+                "int"
+            ),
+            "return 64;"
+        );
+        assert_eq!(
+            runtime_body("net/minecraft/world/item/ItemStack", "hasFoil", "boolean"),
+            "return false;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/item/ItemStack",
+                "getHoverName",
+                "net.minecraft.network.chat.Component",
+            ),
+            "return net.minecraft.network.chat.Component.literal(horizonItem.toString());"
         );
         assert!(
             runtime_body(
