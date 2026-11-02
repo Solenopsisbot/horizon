@@ -47,7 +47,7 @@ fn fabric_fixture_runs_entrypoint_and_carries_resource_and_registry_declaration(
     zip.write_all(br#"{"enabled":true}"#).unwrap();
     zip.start_file("META-INF/horizon-native.json", options)
         .unwrap();
-    zip.write_all(br#"{"id":"fixture-registry","registrations":[{"registry":"minecraft:item","id":"fixture:crystal","kind":"item","template":"minecraft:stick"}]}"#).unwrap();
+    zip.write_all(br#"{"id":"fixture-registry","registrations":[{"registry":"minecraft:item","id":"fixture:crystal","kind":"item","template":"minecraft:stick"},{"registry":"minecraft:block","id":"fixture:lamp","kind":"block","template":"minecraft:stone","item":false,"properties":{"light":12}},{"registry":"minecraft:mob_effect","id":"fixture:glow","kind":"mob_effect","category":"beneficial","color":16711935}]}"#).unwrap();
     zip.finish().unwrap();
 
     let jar = NativeJar::from_path(&jar_path).unwrap();
@@ -55,10 +55,21 @@ fn fabric_fixture_runs_entrypoint_and_carries_resource_and_registry_declaration(
     assert_eq!(jar.required_mods, Vec::<String>::new());
     let entry = jar.discover_entrypoint("main").unwrap();
     assert_eq!(entry.class, "fixture.RegistryEntrypoint");
-    assert_eq!(jar.native_declarations.len(), 1);
+    assert_eq!(jar.native_declarations.len(), 3);
     assert_eq!(
         jar.native_declarations[0].key(),
         "minecraft:item/fixture:crystal"
+    );
+    assert_eq!(
+        jar.native_declarations
+            .iter()
+            .map(RegistryEntry::key)
+            .collect::<Vec<_>>(),
+        vec![
+            "minecraft:item/fixture:crystal",
+            "minecraft:block/fixture:lamp",
+            "minecraft:mob_effect/fixture:glow",
+        ]
     );
 
     let mut host =
@@ -75,9 +86,34 @@ fn fabric_fixture_runs_entrypoint_and_carries_resource_and_registry_declaration(
     for declaration in &jar.native_declarations {
         sink.register_typed(declaration).unwrap();
     }
-    assert_eq!(sink.0.len(), 1);
+    assert_eq!(sink.0.len(), 3);
     assert_eq!(sink.0[0].key(), "minecraft:item/fixture:crystal");
     assert!(matches!(sink.0[0].value, Value::Ref(Some(_))));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fabric_fixture_rejects_unknown_typed_declaration_kind() {
+    let root = std::env::temp_dir().join(format!(
+        "horizon-native-java-invalid-fixture-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let jar_path = root.join("fixture-invalid.jar");
+    let file = fs::File::create(&jar_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file("META-INF/horizon-native.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(br#"{"id":"fixture-invalid","registrations":[{"registry":"minecraft:item","id":"fixture:bad","kind":"not-a-supported-kind"}]}"#).unwrap();
+    zip.finish().unwrap();
+
+    let error = NativeJar::from_path(&jar_path).unwrap_err().to_string();
+    assert!(
+        error.contains("unknown native registration kind not-a-supported-kind"),
+        "{error}"
+    );
 
     fs::remove_dir_all(root).unwrap();
 }

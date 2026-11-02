@@ -58,7 +58,7 @@ fn main() -> ExitCode {
         }
         return ExitCode::FAILURE;
     };
-    let mut host = StdHost::new();
+    let mut host = jar.seed_host(StdHost::new());
     let mut calls = 0;
     let mut error = None;
     for entry in &entrypoints {

@@ -1160,6 +1160,23 @@ impl Host for StdHost {
                 };
                 Ok(Value::Ref(self.properties.get(key).cloned()))
             }
+            (
+                "java/lang/System",
+                "getProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            ) => {
+                let key = match Self::argument(r, args, 0)? {
+                    Value::Ref(Some(key)) => key,
+                    _ => return Ok(Value::Ref(None)),
+                };
+                let default = match Self::argument(r, args, 1)? {
+                    Value::Ref(value) => value.clone(),
+                    _ => None,
+                };
+                Ok(Value::Ref(
+                    self.properties.get(key).cloned().or(default),
+                ))
+            }
             ("java/lang/System", "getProperties", "()Ljava/util/Properties;") => {
                 let values = self
                     .properties
@@ -4843,6 +4860,27 @@ impl NativeJar {
         Vec::new()
     }
 
+    /// Seed a host with the mod identity and required mod ids declared by
+    /// this jar.  The command-line probe uses this before invoking an
+    /// entrypoint so loader queries such as `isModLoaded` and
+    /// `getModContainer` observe the jar being executed.  The host remains
+    /// explicit and deterministic: dependency versions are represented by a
+    /// stable `unknown` marker until the launcher supplies resolved versions.
+    pub fn seed_host(&self, mut host: StdHost) -> StdHost {
+        if let Some(id) = self.fabric_id.as_deref().or(self.neoforge_id.as_deref()) {
+            let version = self
+                .fabric_version
+                .as_deref()
+                .or(self.neoforge_version.as_deref())
+                .unwrap_or("unknown");
+            host = host.with_mod(id, version);
+        }
+        for dependency in &self.required_mods {
+            host = host.with_mod(dependency, "unknown");
+        }
+        host
+    }
+
     pub fn execute<H: Host>(
         &self,
         class: &str,
@@ -7697,6 +7735,41 @@ mandatory = true
     }
 
     #[test]
+    fn seed_host_exposes_jar_identity_and_required_loader_mods() {
+        let jar = NativeJar {
+            fabric_id: Some("demo".into()),
+            fabric_version: Some("1.2.3".into()),
+            required_mods: vec!["library".into()],
+            ..NativeJar::default()
+        };
+        let mut host = jar.seed_host(StdHost::new());
+        let loader = Value::Ref(Some("fabric-loader".into()));
+        let loaded = MethodRef {
+            owner: "net/fabricmc/loader/api/FabricLoader".into(),
+            name: "isModLoaded".into(),
+            descriptor: "(Ljava/lang/String;)Z".into(),
+        };
+        for id in ["demo", "library"] {
+            assert_eq!(
+                host.invoke_instance(&loaded, &loader, &[Value::Ref(Some(id.into()))])
+                    .unwrap(),
+                Value::Int(1),
+                "{id} should be visible to the seeded loader"
+            );
+        }
+        let container = MethodRef {
+            owner: "net/fabricmc/loader/api/FabricLoader".into(),
+            name: "getModContainer".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/util/Optional;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&container, &loader, &[Value::Ref(Some("demo".into()))])
+                .unwrap(),
+            Value::Ref(Some("mod-container/demo/1.2.3".into()))
+        );
+    }
+
+    #[test]
     fn neoforge_constructor_arguments_use_neutral_values() {
         let class = ClassFile {
             name: "demo/NeoMod".into(),
@@ -7754,6 +7827,33 @@ mandatory = true
             host.invoke(&property, &[Value::Ref(Some("demo.mode".into()))])
                 .unwrap(),
             Value::Ref(Some("native".into()))
+        );
+        let property_with_default = MethodRef {
+            owner: "java/lang/System".into(),
+            name: "getProperty".into(),
+            descriptor: "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke(
+                &property_with_default,
+                &[
+                    Value::Ref(Some("demo.mode".into())),
+                    Value::Ref(Some("fallback".into())),
+                ],
+            )
+            .unwrap(),
+            Value::Ref(Some("native".into()))
+        );
+        assert_eq!(
+            host.invoke(
+                &property_with_default,
+                &[
+                    Value::Ref(Some("missing.mode".into())),
+                    Value::Ref(Some("fallback".into())),
+                ],
+            )
+            .unwrap(),
+            Value::Ref(Some("fallback".into()))
         );
         let parse = MethodRef {
             owner: "java/lang/Integer".into(),
@@ -7838,6 +7938,8 @@ mandatory = true
             host.calls(),
             &[
                 property,
+                property_with_default.clone(),
+                property_with_default,
                 parse,
                 parse_radix,
                 value_of_radix,
