@@ -104,16 +104,42 @@ fn merge_native_entries(
     extra: impl IntoIterator<Item = horizon_native_java::RegistryEntry>,
 ) -> Result<(), String> {
     for entry in extra {
-        if let Some(existing) = entries.iter().find(|existing| existing.id == entry.id) {
-            if existing.registry != entry.registry || existing.declaration != entry.declaration {
-                return Err(format!(
-                    "conflicting native registration {} ({} vs {})",
-                    entry.id,
-                    existing.key(),
-                    entry.key()
-                ));
+        if let Some(index) = entries
+            .iter()
+            .position(|existing| existing.registry == entry.registry && existing.id == entry.id)
+        {
+            let existing = &entries[index];
+            match (&existing.declaration, &entry.declaration) {
+                // A metadata declaration is the explicit adapter for an
+                // opaque callback registration. Prefer it while preserving
+                // the all-or-nothing merge boundary.
+                (None, Some(_)) => entries[index] = entry,
+                // Keep an already-typed callback registration when metadata
+                // contributes only the same opaque key.
+                (Some(_), None) | (None, None) => {}
+                (Some(existing), Some(incoming)) if existing == incoming => {}
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "conflicting native registration {} ({} vs {})",
+                        entry.id,
+                        existing.key(),
+                        entry.key()
+                    ));
+                }
             }
             continue;
+        }
+        if entries.iter().any(|existing| existing.id == entry.id) {
+            return Err(format!(
+                "conflicting native registration {} ({} vs {})",
+                entry.id,
+                entries
+                    .iter()
+                    .find(|existing| existing.id == entry.id)
+                    .expect("checked above")
+                    .key(),
+                entry.key()
+            ));
         }
         entries.push(entry);
     }
@@ -570,6 +596,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn java_mod_role_selection_rejects_client_entrypoint_on_server() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-game-java-role-fixture-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("src/demo/ClientOnlyMod.java");
+        let classes = root.join("classes");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&classes).unwrap();
+        std::fs::write(
+            &source,
+            "package demo; public final class ClientOnlyMod { public void onInitializeClient() {} }\n",
+        )
+        .unwrap();
+        let status = Command::new("javac")
+            .arg("--release")
+            .arg("17")
+            .arg("-d")
+            .arg(&classes)
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success(), "javac failed");
+
+        let jar_path = root.join("client-only.jar");
+        let file = std::fs::File::create(&jar_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(
+            br#"{"id":"client-only","version":"1.0","entrypoints":{"client":"demo.ClientOnlyMod"}}"#,
+        )
+        .unwrap();
+        zip.start_file("demo/ClientOnlyMod.class", options).unwrap();
+        zip.write_all(&std::fs::read(classes.join("demo/ClientOnlyMod.class")).unwrap())
+            .unwrap();
+        zip.finish().unwrap();
+
+        let client_content =
+            run_java_mods(std::slice::from_ref(&jar_path), ExecutionRole::Client).unwrap();
+        assert!(client_content.is_empty());
+        let error = run_java_mods(
+            std::slice::from_ref(&jar_path),
+            ExecutionRole::DedicatedServer,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("no native Fabric or NeoForge entrypoint for server execution")
+                && error.contains("client"),
+            "{error}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A minimal `.hnmod` the registry accepts: its manifest and its mixin's.
     fn hnmod(dir: &std::path::Path, id: &str) {
         let horizon = "a".repeat(40);
@@ -674,6 +758,33 @@ mod tests {
             "{error}"
         );
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn native_entry_merge_promotes_opaque_registration_to_typed() {
+        let opaque = horizon_native_java::RegistryEntry {
+            registry: "minecraft:block".into(),
+            id: "ruby:lamp".into(),
+            value: horizon_native_java::Value::Ref(Some("opaque/lamp".into())),
+            declaration: None,
+        };
+        let typed = horizon_native_java::RegistryEntry::typed(
+            "minecraft:block",
+            "ruby:lamp",
+            horizon_native_java::RegistryDeclaration::Block {
+                template: "minecraft:stone".into(),
+                properties: std::collections::BTreeMap::new(),
+                item: true,
+            },
+        );
+        let mut entries = vec![opaque];
+        merge_native_entries(&mut entries, [typed]).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].declaration.is_some());
+        assert_eq!(
+            entries[0].value,
+            horizon_native_java::Value::Ref(Some("typed/minecraft:block/ruby:lamp".into()))
+        );
     }
 
     #[test]
