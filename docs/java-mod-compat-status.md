@@ -16,9 +16,10 @@ Last checked: 3 November 2026, commit `3b6170de3`.
 - [x] Record Fabric events, NeoForge events, and legacy Forge event-bus listeners with ordering, cancellation markers, and unregister support.
 - [x] Record custom payload registrations for the supported Fabric/NeoForge directions and the bounded legacy Forge `SimpleChannel.registerMessage` alias.
 - [x] Provide bounded NeoForge and legacy Forge capability/`LazyOptional` markers, NBT values, identifiers, resource keys, arrays, reflection metadata, collections (including `removeIf`), maps (including `computeIfPresent`), streams (including runtime-owned `toArray` results and `Collectors.toList/toSet`), and optionals.
-- [x] Provide common Java wrapper/string/collection operations used by loader bootstrap code, including integer/long/float/double/byte/short/character conversion, `Number` accessors, checked math, seeded `System.currentTimeMillis`/`identityHashCode`, explicitly seeded `System.getenv` queries, deterministic `Thread.currentThread`/`getName`/`isDaemon`/`getContextClassLoader` markers, bounded callback combinators, `Arrays.asList`, `Objects.hashCode`/`requireNonNullElse`, and a restricted `String.format` subset.
+- [x] Provide common Java wrapper/string/collection operations used by loader bootstrap code, including integer/long/float/double/byte/short/character conversion, `Number` accessors, checked math, seeded `System.currentTimeMillis`/`identityHashCode`, seeded `System.getProperty(key, default)` and `System.getenv` queries, deterministic `Thread.currentThread`/`getName`/`isDaemon`/`getContextClassLoader` markers, bounded callback combinators, `Arrays.asList`, `Objects.hashCode`/`requireNonNullElse`, and a restricted `String.format` subset.
 - [x] Provide bounded `ClassLoader.getResource`/`getResourceAsStream` markers from explicitly seeded `StdHost::with_resource` entries; resource queries never read host files or the process classpath.
-- [x] Maintain a deterministic Fabric jar fixture covering entrypoint execution, seeded resources, and typed registry declarations.
+- [x] Maintain a deterministic Fabric jar fixture covering entrypoint execution, seeded resources, multiple typed registry declarations, and unknown-kind diagnostics.
+- [x] Maintain a runtime-built legacy Forge fixture covering `mods.toml`, `@Mod` discovery, `DeferredRegister`, and the bounded `SimpleChannel.registerMessage` alias; this remains probe coverage rather than live Forge runtime support.
 - [x] Preserve bounded Throwable/Exception/Error messages and cause markers, including `getMessage`, `getCause`, `initCause`, and `toString` diagnostics.
 - [x] Mirror the common `Locale.US` integer grouping path used by the native statistics screen without emulating arbitrary locale patterns.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs and array-returning signatures.
@@ -28,7 +29,7 @@ Last checked: 3 November 2026, commit `3b6170de3`.
 
 - [ ] Full Mixin weaving. The census reads config targets, injection annotations, `@At`, plugins, refmaps, and access metadata; it does not execute plugins, apply access changes, or rewrite bytecode.
 - [ ] Unmatched Mixin injection points. They are listed under `hook_points` with an empty `native_hooks` array and counted in `points_report_only`.
-- [ ] Java registration markers. Native registration sinks still need typed Horizon adapters before a Java object can create live game content.
+- [ ] Java registration markers. Explicit `META-INF/horizon-native.json` declarations now cross the typed sink; opaque registrations observed during Java execution still need a Horizon adapter before they can create live game content.
 - [ ] JVM fallback coverage. Unsupported native calls are explicit, but the JVM path still needs broader loader façades and real-mod fixtures.
 - [ ] Java classpath discovery. The census reports `ServiceLoader` and arbitrary `ClassLoader` class loading as dynamic diagnostics. The native runtime now rejects `ServiceLoader.load`/`loadInstalled` with an explicit unsupported boundary; provider and unseeded resource emulation remains report-only until an adapter supplies explicitly seeded values.
 

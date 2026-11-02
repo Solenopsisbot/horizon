@@ -880,6 +880,7 @@ fn neoforge_entrypoints(parsed: &[classes::Class]) -> Vec<crate::jar::Entrypoint
             Some(crate::jar::Entrypoint {
                 kind: "neoforge".to_owned(),
                 class: class.name.clone(),
+                adapter: None,
             })
         })
         .collect::<Vec<_>>();
@@ -1031,6 +1032,16 @@ mod tests {
         let file = std::fs::File::create(&path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default();
+        // Keep the fixture close to a real Fabric mod: the census must join
+        // loader metadata with report-only Mixin config discovery in one
+        // deterministic read.  The adapter is retained as a diagnostic;
+        // this test does not execute or weave the class.
+        zip.start_file("fabric.mod.json", options).unwrap();
+        std::io::Write::write_all(
+            &mut zip,
+            br#"{"id":"fixture-mixin","version":"1.0.0","entrypoints":{"main":{"value":"example.FixtureMixin","adapter":"net.fabricmc.api.ModInitializer"}}}"#,
+        )
+        .unwrap();
         zip.start_file("fixture.mixins.json", options).unwrap();
         std::io::Write::write_all(
             &mut zip,
@@ -1058,6 +1069,14 @@ mod tests {
         .unwrap();
         let hooks = HookIndex::read(&hooks_path).unwrap();
         let census = read_with(&path, Some(&hooks)).unwrap();
+        assert_eq!(census.jars[0].entrypoints.len(), 1);
+        assert_eq!(census.jars[0].entrypoints[0].kind, "main");
+        assert_eq!(census.jars[0].entrypoints[0].class, "example.FixtureMixin");
+        assert_eq!(
+            census.jars[0].entrypoints[0].adapter.as_deref(),
+            Some("net.fabricmc.api.ModInitializer")
+        );
+        assert_eq!(census.jars[0].mixin_config_names, ["fixture.mixins.json"]);
         assert_eq!(
             census.jars[0].mixin_config_targets,
             ["net.minecraft.ClientTarget", "net.minecraft.Target"]
@@ -1205,6 +1224,7 @@ mod tests {
             [crate::jar::Entrypoint {
                 kind: "neoforge".to_owned(),
                 class: "example/RubyMod".to_owned(),
+                adapter: None,
             }]
         );
     }

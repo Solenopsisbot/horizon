@@ -27,6 +27,10 @@ pub struct JarInfo {
 pub struct Entrypoint {
     pub kind: String,
     pub class: String,
+    /// Optional Fabric adapter retained so the launcher can explain why a
+    /// bounded native invocation cannot execute this entrypoint yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,31 +169,48 @@ pub fn fabric(text: &str) -> Result<JarInfo, String> {
     if let Some(groups) = v.get("entrypoints").and_then(|e| e.as_object()) {
         for (kind, values) in groups {
             let values = match values {
-                serde_json::Value::String(class) => vec![class.clone()],
+                serde_json::Value::String(class) => vec![(class.clone(), None)],
                 serde_json::Value::Object(object) => object
                     .get("value")
                     .and_then(|value| value.as_str())
-                    .map(str::to_owned)
+                    .map(|class| {
+                        (
+                            class.to_owned(),
+                            object
+                                .get("adapter")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned),
+                        )
+                    })
                     .into_iter()
                     .collect(),
                 serde_json::Value::Array(values) => values
                     .iter()
                     .filter_map(|value| match value {
-                        serde_json::Value::String(class) => Some(class.to_owned()),
+                        serde_json::Value::String(class) => Some((class.to_owned(), None)),
                         serde_json::Value::Object(object) => object
                             .get("value")
                             .and_then(|value| value.as_str())
-                            .map(str::to_owned),
+                            .map(|class| {
+                                (
+                                    class.to_owned(),
+                                    object
+                                        .get("adapter")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_owned),
+                                )
+                            }),
                         _ => None,
                     })
                     .collect(),
                 _ => Vec::new(),
             };
-            for class in values {
+            for (class, adapter) in values {
                 if !class.is_empty() {
                     entrypoints.push(Entrypoint {
                         kind: kind.clone(),
                         class,
+                        adapter,
                     });
                 }
             }
@@ -320,15 +341,18 @@ mandatory = true
             [
                 Entrypoint {
                     kind: "client".into(),
-                    class: "com.example.GemClient".into()
+                    class: "com.example.GemClient".into(),
+                    adapter: None
                 },
                 Entrypoint {
                     kind: "main".into(),
-                    class: "com.example.Gem".into()
+                    class: "com.example.Gem".into(),
+                    adapter: None
                 },
                 Entrypoint {
                     kind: "server".into(),
-                    class: "com.example.GemServer".into()
+                    class: "com.example.GemServer".into(),
+                    adapter: Some("default".into())
                 },
             ]
         );

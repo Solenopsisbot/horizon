@@ -219,11 +219,20 @@ until a deliberately bounded native contract with explicitly seeded providers is
 
 The native path has a deterministic smoke fixture in
 `crates/horizon-native-java/tests/fixture_registry.rs`. The test builds a small Fabric jar at runtime
-with a real `fabric.mod.json` entrypoint, a classpath resource, and a typed item declaration in
-`META-INF/horizon-native.json`; it then discovers and executes the entrypoint, seeds the resource through
-the bounded host, and hands the declaration to a typed registry sink. This keeps the loader, resource,
+with a real `fabric.mod.json` entrypoint, a classpath resource, and typed item, block, and mob-effect
+declarations in `META-INF/horizon-native.json`; it then discovers and executes the entrypoint, seeds the
+resource through the bounded host, and hands every declaration to a typed registry sink. The fixture also
+checks that an unknown declaration kind is rejected at the jar boundary. This keeps the loader, resource,
 and registry boundaries deterministic without depending on a player's installed jars or committing a
 binary artifact.
+
+The Forge-family probe has a matching source-built fixture in
+`crates/horizon-native-java/tests/fixture_legacy_forge.rs`. It compiles a tiny legacy Forge `@Mod`
+class and its ABI declarations with `javac`, packages `META-INF/mods.toml`, and checks discovery and
+constructor execution through the native host. The fixture then exercises the bounded
+`DeferredRegister` and `SimpleChannel.registerMessage` aliases. It proves the metadata and probe
+boundaries without claiming that legacy Forge is a supported 26.3 runtime loader or that those
+registrations reach Horizon's live registries.
 
 The attach path is real: a mod's entrypoint runs on an embedded JVM against a generated façade.
 
@@ -502,9 +511,10 @@ metadata accessors expose that marker without loading classes. The bounded runti
 handles `java.lang.reflect.Array` `newInstance`, `getLength`, `get`, and `set` against arrays it owns during the
 current invocation. The crate
 also exposes a deterministic `StdHost` adapter for a small set of side-effect-free
-queries (`System.getProperty`, deterministic `System.currentTimeMillis`/`identityHashCode`, primitive parsing, line separators, string receivers, and math helpers); every
-external call is recorded with its receiver and arguments for later dispatch. The CLI keeps the neutral `NullHost` default so probe results remain independent of
-machine properties, while a game-facing host can opt into Horizon-owned mappings without coupling the
+queries (`System.getProperty` including its explicit default overload, deterministic `System.currentTimeMillis`/`identityHashCode`, primitive parsing, line separators, string receivers, and math helpers); every
+external call is recorded with its receiver and arguments for later dispatch. The standalone CLI seeds a
+`StdHost` from the jar's declared identity and required mod ids, while callers that need a neutral probe
+can use `NullHost`; a game-facing host can opt into Horizon-owned mappings without coupling the
 interpreter crate to `horizon-client`. Unknown calls keep the neutral return contract.
 The standard-library surface also includes deterministic `Integer.compare`/`toHexString`, integer
 `Math.floorDiv`/`floorMod`/`addExact`, and
