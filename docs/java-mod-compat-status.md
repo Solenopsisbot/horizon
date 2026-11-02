@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `7303f105f`.
+Last checked: 3 November 2026, commit `899e636fc`.
 
 ## Supported now
 
@@ -17,7 +17,7 @@ Last checked: 3 November 2026, commit `7303f105f`.
 - [x] Record custom payload registrations for the supported Fabric/NeoForge directions, retain custom payload type identity, and support the bounded legacy Forge `SimpleChannel.registerMessage` alias.
 - [x] Provide bounded NeoForge and legacy Forge capability/`LazyOptional` markers, NBT values, identifiers, resource keys (including `ResourceKey.location`), capability `orEmpty` values, arrays, reflection metadata, collections (including `removeIf`), maps (including `computeIfPresent` and `merge`), primitive optionals (`OptionalInt`, `OptionalLong`, `OptionalDouble`), streams (including runtime-owned `toArray` results and `Collectors.toList/toSet`), and optionals.
 - [x] Provide common Java wrapper/string/collection operations used by loader bootstrap code, including integer/long/float/double/byte/short/character conversion, `Number` accessors, checked math, seeded `System.currentTimeMillis`/`identityHashCode`, seeded `System.getProperty(key, default)` and `System.getenv` queries, deterministic `Thread.currentThread`/`getName`/`isDaemon`/`getContextClassLoader` markers, bounded callback combinators, `Arrays.asList`, `Objects.hashCode`/`requireNonNullElse`, and a restricted `String.format` subset.
-- [x] Provide bounded `ClassLoader.getResource`/`getResourceAsStream`/`getResources` markers from explicitly seeded `StdHost::with_resource` entries, explicitly seeded `ClassLoader.loadClass` markers, current-jar `Class.forName`, and explicitly seeded `ServiceLoader` providers and iterators, and capability `orEmpty` values; these queries never scan host files or the process classpath.
+- [x] Provide bounded `ClassLoader.getResource`/`getResourceAsStream`/`getResources` markers from explicitly seeded `StdHost::with_resource` entries, explicitly seeded `ClassLoader.loadClass` markers, current-jar `Class.forName`, bounded field reflection, and explicitly seeded `ServiceLoader` providers and iterators, and capability `orEmpty` values; these queries never scan host files or the process classpath.
 - [x] Maintain deterministic Fabric jar fixtures covering entrypoint execution, seeded resources, typed registry declarations, unknown-kind diagnostics, an invokedynamic event listener dispatch, and the Horizon typed content adapter/content-planning path.
 - [x] Maintain runtime-built legacy Forge fixtures covering `mods.toml`, `@Mod` discovery, `DeferredRegister`, `SimpleChannel.registerMessage`, event-bus listener dispatch, Forge `register(Object)`/`unregister(Object)` handlers, and the game-facing `--java-mod` content path; role selection and typed-registration merge behavior are also covered.
 - [x] Preserve bounded Throwable/Exception/Error messages and cause markers, including `getMessage`, `getCause`, `initCause`, and `toString` diagnostics.
@@ -46,7 +46,7 @@ Last checked: 3 November 2026, commit `7303f105f`.
 
 ## Validation snapshot
 
-- `horizon-native-java`: 98 unit tests passing, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection, TagKey values, bounded primitive optionals, custom payload type identity, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries.
+- `horizon-native-java`: 99 unit tests passing, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection and bounded field metadata, TagKey values, bounded primitive optionals, custom payload type identity, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries.
 - `horizon-mods`: 27 unit tests passing, plus the runtime-built typed declaration adapter fixture.
 - `horizon-port-pack`: 162 unit tests passing, including Mixin `@At`/slice boundary metadata and values, config edge values, Mixin Extras injector normalization, loader ABI classification, Mojang codec/datafixer ABI coverage, native declaration-kind reporting, deduplicated Mixin hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, and descriptor normalization coverage.
 - `horizon-jvm`: 9 unit tests passing, including explicit fallback labels, static-initialization fallback diagnostics, and NeoForge constructor-only entry selection.

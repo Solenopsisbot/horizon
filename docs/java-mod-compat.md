@@ -582,6 +582,9 @@ same marker lookup to a game-owned adapter. `StdHost::with_class` supplies the m
 `ClassLoader.loadClass` marker for a known binary or internal class name; missing classes remain explicit
 errors. `Class.forName` resolves only names already loaded from the current jar, preserving a useful
 reflection path without opening the process classpath.
+The native reflection surface also retains declared fields and exposes bounded
+`getFields`/`getDeclaredFields`, `getField`/`getDeclaredField`, and
+`Field.getName`/`getType`/`getModifiers` markers.
 The same seeded resource table backs `ClassLoader.getResources` and `getSystemResources` through a
 bounded `Enumeration`; missing names are empty, and the host never scans additional classpath locations.
 The native host also exposes `StdHost::with_service_provider` for deterministic `ServiceLoader`
