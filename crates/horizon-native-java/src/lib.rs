@@ -1604,6 +1604,40 @@ impl Host for StdHost {
                 return Ok(value);
             }
         }
+        if r.owner == "java/lang/reflect/Field"
+            && matches!(
+                r.name.as_str(),
+                "getName" | "getType" | "getModifiers" | "toString"
+            )
+        {
+            let marker = receiver_marker.as_deref().ok_or_else(|| {
+                NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
+            })?;
+            let method = marker.strip_prefix("reflect-field/").ok_or_else(|| {
+                NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
+            })?;
+            let (_, member) = method.split_once('#').ok_or_else(|| {
+                NativeError::Metadata("reflective field marker has no name separator".into())
+            })?;
+            let (name, descriptor_and_access) = member.split_once(':').unwrap_or((member, ""));
+            let (descriptor, access) = descriptor_and_access
+                .rsplit_once(':')
+                .map_or((descriptor_and_access, 0), |(descriptor, access)| {
+                    (descriptor, access.parse::<u16>().unwrap_or(0))
+                });
+            return match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some(name.to_owned()))),
+                ("getType", "()Ljava/lang/Class;") => {
+                    Ok(Value::Ref(Some(format!("class-descriptor/{descriptor}"))))
+                }
+                ("getModifiers", "()I") => Ok(Value::Int(i32::from(access))),
+                ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(marker.to_owned()))),
+                _ => Err(NativeError::MissingMethod(format!(
+                    "java/lang/reflect/Field#{}{}",
+                    r.name, r.descriptor
+                ))),
+            };
+        }
         if r.owner == "java/lang/reflect/Method"
             && matches!(
                 r.name.as_str(),
@@ -4981,12 +5015,26 @@ impl Method {
 }
 
 #[derive(Debug, Clone)]
+pub struct Field {
+    pub name: String,
+    pub descriptor: String,
+    pub access: u16,
+}
+
+impl Field {
+    pub fn is_static(&self) -> bool {
+        self.access & 8 != 0
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ClassFile {
     pub name: String,
     pub super_name: String,
     pool: Vec<Cp>,
     bootstrap_methods: Vec<BootstrapMethod>,
     pub methods: Vec<Method>,
+    pub fields: Vec<Field>,
 }
 
 #[derive(Debug, Clone)]
@@ -5010,7 +5058,7 @@ impl ClassFile {
         let super_name = class_name(&pool, super_index)?;
         let interface_count = r.u2()? as usize;
         r.skip(interface_count * 2)?;
-        skip_members(&mut r, &pool)?;
+        let fields = read_fields(&mut r, &pool)?;
         let methods = read_methods(&mut r, &pool)?;
         let bootstrap_methods = read_bootstrap_methods(&mut r, &pool)?;
         Ok(Self {
@@ -5019,6 +5067,7 @@ impl ClassFile {
             pool,
             bootstrap_methods,
             methods,
+            fields,
         })
     }
 
@@ -5964,6 +6013,44 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        if r.owner == "java/lang/Class"
+            && matches!(r.name.as_str(), "getFields" | "getDeclaredFields")
+            && r.descriptor == "()[Ljava/lang/reflect/Field;"
+        {
+            let class = expect_string(receiver.unwrap_or(&Value::Ref(None))).to_owned();
+            let fields = self
+                .classes
+                .get(&class)
+                .map(|file| {
+                    file.fields
+                        .iter()
+                        .map(|field| {
+                            Value::Ref(Some(format!(
+                                "reflect-field/{class}#{}:{}",
+                                field.name, field.descriptor
+                            )))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let marker = self.new_array("java/lang/reflect/Field", "getDeclaredFields");
+            self.arrays.insert(marker.clone(), fields);
+            return Ok(Some(Value::Ref(Some(marker))));
+        }
+        if r.owner == "java/lang/Class"
+            && matches!(r.name.as_str(), "getField" | "getDeclaredField")
+            && r.descriptor == "(Ljava/lang/String;)Ljava/lang/reflect/Field;"
+        {
+            let class = expect_string(receiver.unwrap_or(&Value::Ref(None))).to_owned();
+            let name = expect_string(StdHost::argument(r, args, 0)?);
+            let marker = self
+                .classes
+                .get(&class)
+                .and_then(|file| file.fields.iter().find(|field| field.name == name))
+                .map(|field| format!("reflect-field/{class}#{}:{}", field.name, field.descriptor))
+                .unwrap_or_else(|| format!("reflect-field/{class}#{name}"));
+            return Ok(Some(Value::Ref(Some(marker))));
+        }
         if r.owner == "java/lang/Class"
             && matches!(r.name.as_str(), "getMethods" | "getDeclaredMethods")
             && r.descriptor == "()[Ljava/lang/reflect/Method;"
@@ -7456,13 +7543,21 @@ fn read_pool(r: &mut Reader<'_>) -> Result<Vec<Cp>, NativeError> {
     }
     Ok(pool)
 }
-fn skip_members(r: &mut Reader<'_>, pool: &[Cp]) -> Result<(), NativeError> {
+fn read_fields(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Field>, NativeError> {
     let n = r.u2()? as usize;
+    let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        r.skip(6)?;
+        let access = r.u2()?;
+        let name = utf8(pool, r.u2()?)?;
+        let descriptor = utf8(pool, r.u2()?)?;
         skip_attributes(r, pool)?;
+        out.push(Field {
+            name,
+            descriptor,
+            access,
+        });
     }
-    Ok(())
+    Ok(out)
 }
 fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeError> {
     let n = r.u2()? as usize;
@@ -7825,6 +7920,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![Method {
                 name: "onInitialize".into(),
                 descriptor: "()V".into(),
@@ -7850,6 +7946,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![
                 Method {
                     name: "sum".into(),
@@ -7944,6 +8041,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![
                 method("pop2", vec![0x04, 0x05, 0x06, 0x58, 0xac]),
                 method("dup_x1", vec![0x04, 0x05, 0x5a, 0x57, 0x60, 0xac]),
@@ -7997,6 +8095,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![
                 method("and", vec![0x10, 0x0f, 0x10, 0x03, 0x7e, 0xac]),
                 method("or", vec![0x04, 0x07, 0x80, 0xac]),
@@ -8034,6 +8133,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![Method {
                 name: "identity".into(),
                 descriptor: "(I)I".into(),
@@ -8064,6 +8164,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![Method {
                 name: "choose".into(),
                 descriptor: "()I".into(),
@@ -8094,6 +8195,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![Method {
                 name: "run".into(),
                 descriptor: "()V".into(),
@@ -8116,6 +8218,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty, Cp::Utf8("Lnet/neoforged/fml/common/Mod;".into())],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![],
         };
         let jar = NativeJar::from_classes([class]);
@@ -8137,6 +8240,7 @@ mandatory = true
                 Cp::Utf8("Lnet/minecraftforge/fml/common/Mod;".into()),
             ],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![],
         };
         let jar = NativeJar::from_classes([class]);
@@ -8239,6 +8343,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty, Cp::Utf8("Lnet/neoforged/fml/common/Mod;".into())],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![Method {
                 name: "<init>".into(),
                 descriptor: "(Lnet/neoforged/bus/api/IEventBus;Lnet/neoforged/fml/ModContainer;)V"
@@ -11935,6 +12040,7 @@ mandatory = true
                 method_ref: 5,
                 arguments: Vec::new(),
             }],
+            fields: Vec::new(),
             methods: vec![Method {
                 name: "make".into(),
                 descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;".into(),
@@ -12005,6 +12111,7 @@ mandatory = true
                 method_ref: 5,
                 arguments: vec![0, 12, 0],
             }],
+            fields: Vec::new(),
             methods: Vec::new(),
         };
         assert_eq!(
@@ -12035,6 +12142,7 @@ mandatory = true
                 Cp::Utf8("I".into()),
             ],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![Method {
                 name: "roundTrip".into(),
                 descriptor: "(Ljava/lang/Object;)I".into(),
@@ -12117,6 +12225,7 @@ mandatory = true
                 Cp::Utf8("I".into()),
             ],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![
                 Method {
                     name: "<clinit>".into(),
@@ -12156,6 +12265,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![
                 method(
                     "read",
@@ -12632,6 +12742,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![
                 Method {
                     name: "answer".into(),
@@ -12829,6 +12940,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![Method {
                 name: "callback".into(),
                 descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;".into(),
@@ -12862,6 +12974,7 @@ mandatory = true
                 Cp::Utf8("(Ljava/util/function/Function;)Ljava/util/Optional;".into()),
             ],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![
                 Method {
                     name: "call".into(),
@@ -12933,6 +13046,7 @@ mandatory = true
             super_name: "java/lang/Object".into(),
             pool: vec![Cp::Empty],
             bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
             methods: vec![Method {
                 name: "callback".into(),
                 descriptor: "(Ljava/lang/Object;)V".into(),
