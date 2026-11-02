@@ -38,13 +38,19 @@ weave bytecode. Injection points whose target method has a native hook are **hoo
 The remaining call-site points are **report-only** and are counted in `points_report_only`, so an
 unsupported transform is visible without implying that the tool implements weaving.
 `mixin_config_targets_report_only` counts the target declarations collected from config JSON.
+Each jar also reports the bounded `mixin_config_fields` map: for each config that declares one
+of the common edge fields (`plugin`, `refmap`, `required`, `minVersion`, or
+`compatibilityLevel`), it records the field names that are present. Values are not interpreted,
+plugin callbacks are not run, and this metadata never enables weaving.
 
 The census also discovers loader access metadata without applying it. A Fabric jar's
 `accessWidener` path in `fabric.mod.json` is read and its access, extendable, mutable (including
 transitive forms) targets are listed. NeoForge/Forge `accesstransformer.cfg` resources are listed by
 target after their access modifier. Each jar contributes at most 256 targets of each kind;
 the merged JSON and text summary include counts by target. This is an attachment-surface
-report only: bytecode access changes remain outside the census.
+report only: bytecode access changes remain outside the census. The CLI summary also prints a
+single `access metadata` line with the total target declarations and an explicit report-only
+marker, so a run's output makes clear that no access changes were applied.
 
 ## Fabric API 26.3
 

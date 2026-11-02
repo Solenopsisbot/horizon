@@ -8,7 +8,8 @@ events).
 
 **Scope: 26.3 only.** A jar is in scope when its `fabric.mod.json` or `neoforge.mods.toml` says 26.3.
 Forge and NeoForge split at 1.20.2, so the 26.3 Forge-family loader is NeoForge; a jar declaring the old
-`mods.toml` is out of scope, and its data is still the carry pipeline's job ([modpacks.md](modpacks.md)).
+`mods.toml` remains out of runtime scope, while its metadata is still parsed for bounded native
+entrypoint diagnostics and its data is handled by the carry pipeline ([modpacks.md](modpacks.md)).
 Anything built for an older Minecraft version is a port, not a bridge.
 
 That narrowing is worth its weight. Since 26.1 the game ships unobfuscated
@@ -403,8 +404,10 @@ the host are merged with the jar's explicit `META-INF/horizon-native.json` decla
 planning. Java jars are never
 scanned from `mods/` implicitly. Registrations remain diagnostic until a typed declaration adapter supplies
 the content rows described below.
-`NativeJar` reads the first `[[mods]]` record in `META-INF/neoforge.mods.toml` as the NeoForge id and version,
-and carries required `[[dependencies.<id>]]` records into the same startup seed used for Fabric metadata.
+`NativeJar` reads the first `[[mods]]` record in either `META-INF/neoforge.mods.toml` or legacy
+`META-INF/mods.toml` as the loader id and version, and carries required `[[dependencies.<id>]]` records into
+the same startup seed used for Fabric metadata. Forge and NeoForge `@Mod` annotations are both discoverable
+as `neoforge` probe entrypoints.
 Fabric entrypoint objects retain their optional `adapter` name; the native launcher reports that adapter
 explicitly and stops rather than invoking the target with the wrong lifecycle contract; the selected
 entrypoint set is validated before any entrypoint executes, so a mixed declaration cannot leave partial

@@ -3722,9 +3722,9 @@ pub struct NativeJar {
     classes: BTreeMap<String, ClassFile>,
     pub fabric_id: Option<String>,
     pub fabric_version: Option<String>,
-    /// The first mod's id/version from NeoForge's `neoforge.mods.toml`.
-    /// NeoForge does not put these in a JSON entrypoint declaration, so the
-    /// native launcher keeps them beside the Fabric metadata fields.
+    /// The first mod's id/version from Forge or NeoForge `mods.toml`.
+    /// These loaders do not put these in a JSON entrypoint declaration, so
+    /// the native launcher keeps them beside the Fabric metadata fields.
     pub neoforge_id: Option<String>,
     pub neoforge_version: Option<String>,
     /// Required mod ids from Fabric or NeoForge metadata, excluding loader-provided ids.
@@ -3758,9 +3758,10 @@ impl NativeJar {
         let neoforge_entrypoints = classes
             .iter()
             .filter(|class| {
-                class.pool.iter().any(|constant| {
-                    matches!(constant, Cp::Utf8(value) if value == "Lnet/neoforged/fml/common/Mod;")
-                })
+                class
+                    .pool
+                    .iter()
+                    .any(|constant| matches!(constant, Cp::Utf8(value) if is_mod_annotation(value)))
             })
             .map(|class| class.name.clone())
             .collect();
@@ -3778,6 +3779,7 @@ impl NativeJar {
         let mut neoforge_entrypoints = Vec::new();
         let mut metadata = None;
         let mut neoforge_metadata = None;
+        let mut forge_metadata = None;
         let mut native_metadata = None;
         for i in 0..zip.len() {
             let mut e = zip
@@ -3794,6 +3796,11 @@ impl NativeJar {
                 std::io::Read::read_to_string(&mut e, &mut text)
                     .map_err(|e| NativeError::Metadata(e.to_string()))?;
                 neoforge_metadata = Some(text);
+            } else if name == "META-INF/mods.toml" {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut e, &mut text)
+                    .map_err(|e| NativeError::Metadata(e.to_string()))?;
+                forge_metadata = Some(text);
             } else if name == "META-INF/horizon-native.json" {
                 let mut text = String::new();
                 std::io::Read::read_to_string(&mut e, &mut text)
@@ -3808,9 +3815,11 @@ impl NativeJar {
                 std::io::Read::read_to_end(&mut e, &mut bytes)
                     .map_err(|e| NativeError::Zip(e.to_string()))?;
                 let class = ClassFile::parse(&bytes)?;
-                if class.pool.iter().any(|constant| {
-                    matches!(constant, Cp::Utf8(value) if value == "Lnet/neoforged/fml/common/Mod;")
-                }) {
+                if class
+                    .pool
+                    .iter()
+                    .any(|constant| matches!(constant, Cp::Utf8(value) if is_mod_annotation(value)))
+                {
                     neoforge_entrypoints.push(class.name.clone());
                 }
                 classes.push(class);
@@ -3820,7 +3829,8 @@ impl NativeJar {
             .map(|m| parse_metadata(&m))
             .transpose()?
             .unwrap_or((None, None, BTreeMap::new(), Vec::new()));
-        let (neoforge_id, neoforge_version, neoforge_required_mods) = neoforge_metadata
+        let loader_metadata = neoforge_metadata.or(forge_metadata);
+        let (neoforge_id, neoforge_version, neoforge_required_mods) = loader_metadata
             .map(|text| parse_neoforge_metadata(&text))
             .transpose()?
             .unwrap_or((None, None, Vec::new()));
@@ -5659,6 +5669,16 @@ fn parse_metadata(
     Ok((id, version, entrypoints, required_mods))
 }
 
+/// Forge 1.x and NeoForge use the same `@Mod` bootstrap convention, but the
+/// annotation moved packages when NeoForge forked. Keep both markers so a
+/// legacy Forge 26.3 jar is discoverable by the bounded native probe.
+fn is_mod_annotation(value: &str) -> bool {
+    matches!(
+        value,
+        "Lnet/neoforged/fml/common/Mod;" | "Lnet/minecraftforge/fml/common/Mod;"
+    )
+}
+
 /// Read the small, stable part of NeoForge's loader metadata needed by the
 /// native launcher.  This intentionally accepts only the first `[[mods]]`
 /// record and required dependency records; the full loader validates version
@@ -6170,6 +6190,37 @@ mandatory = true
     }
 
     #[test]
+    fn jar_reads_legacy_forge_mods_toml_for_native_loader_seeding() {
+        let path = std::env::temp_dir().join(format!(
+            "horizon-native-forge-metadata-{}.jar",
+            std::process::id()
+        ));
+        let file = File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "META-INF/mods.toml",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(
+            br#"[[mods]]
+modId = "legacy"
+version = "1.0"
+[[dependencies.legacy]]
+modId = "library"
+mandatory = true
+"#,
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        let jar = NativeJar::from_path(&path).unwrap();
+        assert_eq!(jar.neoforge_id.as_deref(), Some("legacy"));
+        assert_eq!(jar.neoforge_version.as_deref(), Some("1.0"));
+        assert_eq!(jar.required_mods, ["library"]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn jar_reads_typed_native_metadata() {
         let path = std::env::temp_dir().join(format!(
             "horizon-native-metadata-{}.jar",
@@ -6500,6 +6551,38 @@ mandatory = true
         );
         assert!(jar.discover_entrypoint("main").is_none());
         assert!(jar.discover_entrypoint("client").is_none());
+    }
+
+    #[test]
+    fn legacy_forge_metadata_and_mod_marker_are_discoverable() {
+        let class = ClassFile {
+            name: "demo/ForgeMod".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![
+                Cp::Empty,
+                Cp::Utf8("Lnet/minecraftforge/fml/common/Mod;".into()),
+            ],
+            bootstrap_methods: Vec::new(),
+            methods: vec![],
+        };
+        let jar = NativeJar::from_classes([class]);
+        assert_eq!(
+            jar.discover_entrypoint("neoforge").unwrap().class,
+            "demo.ForgeMod"
+        );
+
+        let text = r#"
+[[mods]]
+modId = "legacy"
+version = "1.0"
+[[dependencies.legacy]]
+modId = "library"
+mandatory = true
+"#;
+        let (id, version, required) = parse_neoforge_metadata(text).unwrap();
+        assert_eq!(id.as_deref(), Some("legacy"));
+        assert_eq!(version.as_deref(), Some("1.0"));
+        assert_eq!(required, ["library"]);
     }
 
     #[test]

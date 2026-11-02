@@ -186,6 +186,11 @@ pub struct JarCensus {
     /// Bounded target classes read from this jar's Mixin config JSON (report only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mixin_config_targets: Vec<String>,
+    /// Common Mixin config edge fields, keyed by config path (report only).
+    /// Values are limited to the known metadata names; configs are never
+    /// executed and these fields do not affect weaving.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mixin_config_fields: BTreeMap<String, Vec<String>>,
     /// Jars nested under `META-INF/jars/` that were read too.
     pub nested: usize,
     pub references: usize,
@@ -397,6 +402,7 @@ impl Census {
             classes: parsed.len(),
             mixin_config_names: jar::mixin_config_names(&names),
             mixin_config_targets: mixin_config_targets(&mut zip, &names),
+            mixin_config_fields: mixin_config_fields(&mut zip, &names),
             nested,
             error,
             ..JarCensus::default()
@@ -557,6 +563,13 @@ impl Census {
         if broken > 0 {
             out.push_str(&format!("{broken} jars with unreadable metadata\n"));
         }
+        let widener_targets: usize = self.access_widener_targets.values().sum();
+        let transformer_targets: usize = self.access_transformer_targets.values().sum();
+        if widener_targets > 0 || transformer_targets > 0 {
+            out.push_str(&format!(
+                "access metadata: {widener_targets} access widener targets, {transformer_targets} access transformer targets (report-only; no bytecode changes)\n"
+            ));
+        }
         if self.totals.points_needing_hooks > 0 {
             let share =
                 100.0 * self.totals.points_covered as f64 / self.totals.points_needing_hooks as f64;
@@ -642,6 +655,14 @@ fn is_access_transformer(name: &str) -> bool {
 
 const MAX_MIXIN_CONFIG_BYTES: u64 = 1 << 20;
 const MAX_MIXIN_CONFIG_TARGETS: usize = 256;
+const MAX_MIXIN_CONFIG_FIELDS: usize = 256;
+const MIXIN_CONFIG_EDGE_FIELDS: [&str; 5] = [
+    "plugin",
+    "refmap",
+    "required",
+    "minVersion",
+    "compatibilityLevel",
+];
 
 /// Reads only bounded JSON config entries and reports safe class names under
 /// `target` keys. No Mixin semantics are applied and malformed/oversized
@@ -670,6 +691,43 @@ fn mixin_config_targets(zip: &mut zip::ZipArchive<fs::File>, names: &[String]) -
     out.sort();
     out.dedup();
     out.truncate(MAX_MIXIN_CONFIG_TARGETS);
+    out
+}
+
+/// Reads a bounded set of common Mixin config edge fields. This intentionally
+/// reports presence only: plugin callbacks and compatibility requirements are
+/// not interpreted by the census.
+fn mixin_config_fields(
+    zip: &mut zip::ZipArchive<fs::File>,
+    names: &[String],
+) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for name in jar::mixin_config_names(names)
+        .into_iter()
+        .take(MAX_MIXIN_CONFIG_FIELDS)
+    {
+        let Ok(mut entry) = zip.by_name(&name) else {
+            continue;
+        };
+        if entry.size() > MAX_MIXIN_CONFIG_BYTES {
+            continue;
+        }
+        let mut text = String::new();
+        if entry.read_to_string(&mut text).is_err() {
+            continue;
+        }
+        let Ok(serde_json::Value::Object(object)) = serde_json::from_str(&text) else {
+            continue;
+        };
+        let fields: Vec<String> = MIXIN_CONFIG_EDGE_FIELDS
+            .iter()
+            .filter(|field| object.contains_key(**field))
+            .map(|field| (*field).to_owned())
+            .collect();
+        if !fields.is_empty() {
+            out.insert(name, fields);
+        }
+    }
     out
 }
 
@@ -909,7 +967,7 @@ mod tests {
         let mut zip = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default();
         zip.start_file("ruby.mixins.json", options).unwrap();
-        std::io::Write::write_all(&mut zip, br#"{"mixins":[{"target":"net.minecraft.Foo"},{"target":"bad target"}],"client":[{"target":"a/b/C"}]}"#).unwrap();
+        std::io::Write::write_all(&mut zip, br#"{"plugin":"example.Plugin","refmap":"ruby.refmap.json","required":true,"minVersion":"0.8","compatibilityLevel":"JAVA_25","mixins":[{"target":"net.minecraft.Foo"},{"target":"bad target"}],"client":[{"target":"a/b/C"}]}"#).unwrap();
         zip.finish().unwrap();
         let census = read(&path).unwrap();
         assert_eq!(
@@ -919,6 +977,16 @@ mod tests {
         assert_eq!(
             census.mixin_config_targets.get("net.minecraft.Foo"),
             Some(&1)
+        );
+        assert_eq!(
+            census.jars[0].mixin_config_fields["ruby.mixins.json"],
+            [
+                "plugin",
+                "refmap",
+                "required",
+                "minVersion",
+                "compatibilityLevel"
+            ]
         );
     }
 
@@ -1001,6 +1069,19 @@ mod tests {
         let rows = ranked(&map, 2);
         assert_eq!(rows[0].0, "c");
         assert_eq!(rows[1].0, "a");
+    }
+
+    #[test]
+    fn summary_calls_out_access_metadata_as_report_only() {
+        let census = Census {
+            access_widener_targets: BTreeMap::from([(String::from("net/minecraft/Foo"), 2)]),
+            access_transformer_targets: BTreeMap::from([(String::from("net.minecraft.Bar"), 1)]),
+            ..Census::default()
+        };
+        let summary = census.summary(20);
+        assert!(summary.contains(
+            "access metadata: 2 access widener targets, 1 access transformer targets (report-only; no bytecode changes)"
+        ));
     }
 
     #[test]
