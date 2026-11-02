@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `4bac6991d`.
+Last checked: 3 November 2026, commit `fdb1efd2f`.
 
 ## Supported now
 
@@ -30,7 +30,7 @@ Last checked: 3 November 2026, commit `4bac6991d`.
 - [ ] Full Mixin weaving. The census reads config targets, injection annotations, `@At`, plugins, refmaps, and access metadata; it does not execute plugins, apply access changes, or rewrite bytecode.
 - [ ] Unmatched Mixin injection points. They are listed under `hook_points` with an empty `native_hooks` array and counted in `points_report_only`.
 - [ ] Java registration markers. Explicit `META-INF/horizon-native.json` declarations now cross the typed sink; opaque registrations observed during Java execution still need a Horizon adapter before they can create live game content.
-- [ ] JVM fallback coverage. Unsupported native calls are explicit, but the JVM path still needs broader loader façades and real-mod fixtures.
+- [ ] JVM fallback coverage. Unsupported native calls, dynamic classpath failures, and missing façade members now have explicit diagnostics; the JVM path still needs broader loader façades and real-mod fixtures.
 - [ ] Java classpath discovery. The census reports `ServiceLoader` and arbitrary `ClassLoader` class loading as dynamic diagnostics. The native runtime now rejects `ServiceLoader.load`/`loadInstalled` with an explicit unsupported boundary; provider and unseeded resource emulation remains report-only until an adapter supplies explicitly seeded values.
 
 ## Remaining work
@@ -46,8 +46,8 @@ Last checked: 3 November 2026, commit `4bac6991d`.
 
 ## Validation snapshot
 
-- `horizon-native-java`: 91 unit tests passing, including bounded `Number` accessors, callback combinators, restricted string formatting, deterministic Thread/class-loader markers, Throwable metadata, and explicit `ServiceLoader` classpath boundaries.
-- `horizon-port-pack`: 154 unit tests passing, including Mixin metadata and descriptor normalization coverage.
+- `horizon-native-java`: 92 unit tests passing, plus runtime-built Fabric, legacy Forge, and NeoForge fixture tests, including bounded `Number` accessors, callback combinators, restricted string formatting, deterministic Thread/class-loader markers, Throwable metadata, and explicit `ServiceLoader` classpath boundaries.
+- `horizon-port-pack`: 155 unit tests passing, including Mixin metadata, multi-method hook matching, and descriptor normalization coverage.
 - `horizon-jvm`: 8 unit tests passing, including explicit fallback labels.
 - Workspace check, targeted clippy, formatting, and `tools/native_java_smoke.py` passing.
 
