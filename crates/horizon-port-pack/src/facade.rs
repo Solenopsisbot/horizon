@@ -3315,8 +3315,10 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             "getNamespace" => "return horizonNamespace;".to_owned(),
             "getPath" => "return horizonPath;".to_owned(),
             "withPath" => "return new Identifier(horizonNamespace, (String) p0.apply(horizonPath));".to_owned(),
+            "withPrefix" => "return new Identifier(horizonNamespace, p0 + horizonPath);".to_owned(),
             "withSuffix" => "return new Identifier(horizonNamespace, horizonPath + p0);".to_owned(),
             "toString" => "return horizonNamespace + \":\" + horizonPath;".to_owned(),
+            "toLanguageKey" if descriptor == "(Ljava/lang/String;)Ljava/lang/String;" => "return p0 + \".\" + horizonNamespace + \".\" + horizonPath.replace('/', '.');".to_owned(),
             "toLanguageKey" => "return horizonNamespace + \".\" + horizonPath.replace('/', '.');".to_owned(),
             "toShortString" => "return horizonNamespace.equals(\"minecraft\") ? horizonPath : horizonNamespace + \"/\" + horizonPath;".to_owned(),
             "hashCode" => {
@@ -3919,6 +3921,24 @@ mod tests {
                 "net.minecraft.resources.Identifier"
             )
             .contains("indexOf(':')")
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/resources/Identifier",
+                "withPrefix",
+                "net.minecraft.resources.Identifier",
+                "(Ljava/lang/String;)Lnet/minecraft/resources/Identifier;",
+            ),
+            "return new Identifier(horizonNamespace, p0 + horizonPath);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/resources/Identifier",
+                "toLanguageKey",
+                "java.lang.String",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+            ),
+            "return p0 + \".\" + horizonNamespace + \".\" + horizonPath.replace('/', '.');"
         );
         assert!(
             runtime_body("net/minecraft/network/VarInt", "getByteSize", "int")
