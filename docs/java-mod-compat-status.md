@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `50bf2c326`.
+Last checked: 3 November 2026, commit `7b621ee94`.
 
 ## Supported now
 
@@ -22,7 +22,7 @@ Last checked: 3 November 2026, commit `50bf2c326`.
 - [x] Maintain a runtime-built legacy Forge fixture covering `mods.toml`, `@Mod` discovery, `DeferredRegister`, and the bounded `SimpleChannel.registerMessage` alias; this remains probe coverage rather than live Forge runtime support.
 - [x] Preserve bounded Throwable/Exception/Error messages and cause markers, including `getMessage`, `getCause`, `initCause`, and `toString` diagnostics.
 - [x] Mirror the common `Locale.US` integer grouping path used by the native statistics screen without emulating arbitrary locale patterns.
-- [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs, array-returning signatures, and common `Identifier` prefix/language-key/ordering helpers.
+- [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs, array-returning signatures, and common `Identifier` prefix/language-key/ordering helpers, and Holder serialization queries.
 - [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, Mixin `@At` and slice metadata/value preservation, access-widener/access-transformer discovery, Mojang support-API façade classification, and explicit report-only diagnostics.
 
 ## Partial or report-only
@@ -49,6 +49,6 @@ Last checked: 3 November 2026, commit `50bf2c326`.
 - `horizon-native-java`: 95 unit tests passing, plus runtime-built Fabric, legacy Forge, and NeoForge fixture tests, including bounded primitive optionals, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread/class-loader markers, Throwable metadata, and explicit ServiceLoader provider boundaries.
 - `horizon-port-pack`: 157 unit tests passing, including Mixin `@At`/slice metadata and values, multi-method hook matching, Identifier façade bodies, and descriptor normalization coverage.
 - `horizon-jvm`: 8 unit tests passing, including explicit fallback labels.
-- Workspace check, targeted clippy, formatting, and `tools/native_java_smoke.py` passing.
+- Workspace check, targeted clippy, formatting, and `tools/native_java_smoke.py` passing with compiled OptionalLong/OptionalDouble paths.
 
 Every compatibility commit should update this checklist when a surface moves between these sections and should include the focused test or probe that justifies the change.

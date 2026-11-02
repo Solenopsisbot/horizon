@@ -415,8 +415,9 @@ python3 tools/native_java_smoke.py
 The script uses `javac` to compile two ordinary Java classes and a tiny NeoForge `@Mod` annotation,
 packages real Fabric and NeoForge metadata, and checks that the native runner discovers and executes both
 Fabric `main` entrypoints plus the NeoForge constructor. The first Fabric entrypoint also runs an
-`Optional.filter` predicate and a mutable `Map.forEach` `BiConsumer` through the bounded host, so the smoke
-test proves real callback boundaries in addition to classfile and metadata discovery. It therefore catches classfile, metadata, annotation,
+`Optional.filter` predicate, `OptionalLong`/`OptionalDouble` value paths, and a mutable `Map.forEach`
+`BiConsumer` through the bounded host, so the smoke test proves primitive-value and callback boundaries
+in addition to classfile and metadata discovery. It therefore catches classfile, metadata, annotation,
 and multi-entrypoint regressions that an in-memory Rust fixture cannot; the full mod-port
 harness remains the check that needs prepared vanilla resources.
 
@@ -451,7 +452,8 @@ startup rather than silently entering the native registries.
 The façade now also has the first NeoForge registration boundary: `FMLJavaModLoadingContext.get()` and
 `getModEventBus()` yield neutral context and bus values, `IEventBus` fluent registration returns its receiver,
 and `DeferredRegister.create`/`register` yield façade register and holder objects. `DeferredHolder` now
-also exposes the common `value`, `getOptional`, `getKey`, and `getId` accessors (including the modern
+also exposes the common `value`, `getOptional`, `getKey`, `getId`, and bounded holder serialization
+queries (including the modern
 `ResourceLocation` return type) with typed neutral return
 values, and `DeferredRegister.getEntries` returns a bounded holder collection, so constructors can inspect
 a registration without linking against NeoForge's implementation.
