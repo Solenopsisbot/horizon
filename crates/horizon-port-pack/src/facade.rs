@@ -2496,6 +2496,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("isDamageable", "boolean") => return "return false;".to_owned(),
             ("isEnchanted", "boolean") => return "return false;".to_owned(),
             ("getUseDuration", "int") => return "return 0;".to_owned(),
+            ("getUseAnimation", "net.minecraft.world.item.UseAnim") => {
+                return "return net.minecraft.world.item.UseAnim.NONE;".to_owned();
+            }
             ("getHoverName", "net.minecraft.network.chat.Component") => {
                 return "return net.minecraft.network.chat.Component.literal(horizonItem.toString());".to_owned();
             }
@@ -4080,6 +4083,14 @@ mod tests {
                 "boolean"
             ),
             "return false;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/item/ItemStack",
+                "getUseAnimation",
+                "net.minecraft.world.item.UseAnim"
+            ),
+            "return net.minecraft.world.item.UseAnim.NONE;"
         );
         assert_eq!(
             runtime_body(
