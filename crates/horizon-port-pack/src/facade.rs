@@ -2345,6 +2345,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("is", "boolean") if descriptor.contains("Holder") => {
                 return "return this == p0;".to_owned();
             }
+            ("canSerializeIn", "boolean") => {
+                return "return horizonValue != null;".to_owned();
+            }
             ("kind", _) => return "return null;".to_owned(),
             ("tags", _) if ret == "java.util.stream.Stream" => {
                 return "return java.util.stream.Stream.empty();".to_owned();
@@ -2361,6 +2364,7 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("isBound", "boolean") | ("is", "boolean") => {
                 return "return false;".to_owned();
             }
+            ("canSerializeIn", "boolean") => return "return false;".to_owned(),
             ("kind", _) => return "return null;".to_owned(),
             ("tags", _) if ret == "java.util.stream.Stream" => {
                 return "return java.util.stream.Stream.empty();".to_owned();
@@ -5298,6 +5302,15 @@ mod tests {
         );
         assert_eq!(
             runtime_body_with_descriptor(
+                "net/minecraft/core/Holder$Reference",
+                "canSerializeIn",
+                "boolean",
+                "(Lnet/minecraft/core/HolderOwner;)Z",
+            ),
+            "return horizonValue != null;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
                 "net/minecraft/core/Registry",
                 "get",
                 "java.lang.Object",
@@ -5313,6 +5326,15 @@ mod tests {
                 "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;",
             ),
             "p0.horizonEntries.put(p2, p3); p0.horizonKeys.put(p2, p1); net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(p3, p1, p2); return holder;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/Holder",
+                "canSerializeIn",
+                "boolean",
+                "(Lnet/minecraft/core/HolderOwner;)Z",
+            ),
+            "return false;"
         );
     }
 
