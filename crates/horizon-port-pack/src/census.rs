@@ -1467,6 +1467,18 @@ mod tests {
             member_disposition(&member("com/mojang/serialization/Codec")),
             AbiDisposition::Facade
         );
+        for owner in [
+            "com/mojang/serialization/MapCodec",
+            "com/mojang/serialization/DataResult",
+            "com/mojang/serialization/DynamicOps",
+            "com/mojang/datafixers/util/Pair",
+        ] {
+            assert_eq!(
+                member_disposition(&member(owner)),
+                AbiDisposition::Facade,
+                "Mojang codec/datafixer surface {owner} must stay façade-backed"
+            );
+        }
         assert_eq!(
             member_disposition(&member("net/neoforged/bus/api/IEventBus")),
             AbiDisposition::Loader
