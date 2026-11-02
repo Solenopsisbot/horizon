@@ -1529,6 +1529,47 @@ impl Host for StdHost {
                     | "java/util/AbstractMap"
                     | "java/util/HashMap"
                     | "java/util/LinkedHashMap",
+                    "replaceAll",
+                    "(Ljava/util/function/BiFunction;)V",
+                ) => {
+                    let callback = Self::argument(r, args, 0)?.clone();
+                    let entries = self
+                        .mutable_collections
+                        .entry(marker.to_owned())
+                        .or_default()
+                        .chunks_exact(2)
+                        .map(|pair| [pair[0].clone(), pair[1].clone()])
+                        .collect::<Vec<_>>();
+                    let mut replacements = Vec::with_capacity(entries.len());
+                    for [key, value] in entries {
+                        replacements.push(
+                            self.invoke_instance(
+                                &MethodRef {
+                                    owner: "java/util/function/BiFunction".into(),
+                                    name: "apply".into(),
+                                    descriptor:
+                                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+                                            .into(),
+                                },
+                                &callback,
+                                &[key, value],
+                            )?,
+                        );
+                    }
+                    let values = self
+                        .mutable_collections
+                        .entry(marker.to_owned())
+                        .or_default();
+                    for (index, value) in replacements.into_iter().enumerate() {
+                        values[index * 2 + 1] = value;
+                    }
+                    return Ok(Value::Void);
+                }
+                (
+                    "java/util/Map"
+                    | "java/util/AbstractMap"
+                    | "java/util/HashMap"
+                    | "java/util/LinkedHashMap",
                     "put",
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                 ) => {
@@ -2453,6 +2494,11 @@ impl Host for StdHost {
             | ("java/util/function/Function", "apply", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
                 Ok(Self::argument(r, args, 0)?.clone())
             }
+            (
+                "java/util/function/BiFunction",
+                "apply",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ) => Ok(Self::argument(r, args, 1)?.clone()),
             ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V") => Ok(Value::Void),
             (
                 "java/util/function/BiConsumer",
@@ -2646,6 +2692,9 @@ impl Host for StdHost {
             ("net/fabricmc/loader/api/metadata/ModMetadata", "getName", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(metadata_part(expect_ref(receiver), 1))))
             }
+            ("net/fabricmc/loader/api/metadata/ModMetadata", "getType", "()Ljava/lang/String;") => {
+                Ok(Value::Ref(Some("release".into())))
+            }
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getDescription",
@@ -2686,6 +2735,17 @@ impl Host for StdHost {
                 if descriptor.ends_with("Lnet/neoforged/bus/api/IEventBus;") =>
             {
                 Ok(receiver.clone())
+            }
+            ("net/neoforged/bus/api/IEventBus", "unregister", "(Ljava/lang/Object;)V") => {
+                let target = Self::argument(r, args, 0)?.clone();
+                self.invocations.retain(|invocation| {
+                    let listener = (invocation.method.owner == "net/neoforged/bus/api/IEventBus"
+                        && invocation.method.name == "addListener")
+                        || (invocation.method.owner == "net/fabricmc/fabric/api/event/Event"
+                            && invocation.method.name == "register");
+                    !listener || !invocation.args.iter().any(|value| value == &target)
+                });
+                Ok(Value::Void)
             }
             ("net/neoforged/bus/api/IEventBus", "post", "(Lnet/neoforged/bus/api/Event;)Z") => {
                 let event = Self::argument(r, args, 0)?.clone();
@@ -7643,6 +7703,30 @@ mandatory = true
             .unwrap(),
             Value::Ref(Some("value".into()))
         );
+        let replace_all = MethodRef {
+            owner: "java/util/Map".into(),
+            name: "replaceAll".into(),
+            descriptor: "(Ljava/util/function/BiFunction;)V".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &replace_all,
+                &map,
+                &[Value::Ref(Some("@indy:map-replace".into()))],
+            )
+            .unwrap(),
+            Value::Void
+        );
+        assert_eq!(
+            host.invoke_instance(&map_get, &map, &[Value::Ref(Some("key".into()))])
+                .unwrap(),
+            Value::Ref(Some("updated".into()))
+        );
+        assert!(
+            host.calls().iter().any(|call| {
+                call.owner == "java/util/function/BiFunction" && call.name == "apply"
+            })
+        );
         let remove_if = MethodRef {
             owner: "java/util/Map".into(),
             name: "remove".into(),
@@ -8342,6 +8426,20 @@ mandatory = true
             host.invoke_instance(&name, &Value::Ref(Some("metadata/demo/1.2.3".into())), &[])
                 .unwrap(),
             Value::Ref(Some("demo".into()))
+        );
+        let metadata_type = MethodRef {
+            owner: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
+            name: "getType".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &metadata_type,
+                &Value::Ref(Some("metadata/demo/1.2.3".into())),
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("release".into()))
         );
         let provides = MethodRef {
             owner: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
@@ -10298,6 +10396,34 @@ mandatory = true
         assert_eq!(
             dispatches[0].listener.args.last(),
             Some(&Value::Ref(Some("@indy:typed-listener".into())))
+        );
+    }
+
+    #[test]
+    fn standard_host_unregistration_removes_neoforge_listener() {
+        let mut host = StdHost::new();
+        let bus = Value::Ref(Some("event-bus".into()));
+        let add_listener = MethodRef {
+            owner: "net/neoforged/bus/api/IEventBus".into(),
+            name: "addListener".into(),
+            descriptor: "(Ljava/util/function/Consumer;)Lnet/neoforged/bus/api/IEventBus;".into(),
+        };
+        let listener = Value::Ref(Some("@indy:remove-me".into()));
+        host.invoke_instance(&add_listener, &bus, std::slice::from_ref(&listener))
+            .unwrap();
+        let unregister = MethodRef {
+            owner: "net/neoforged/bus/api/IEventBus".into(),
+            name: "unregister".into(),
+            descriptor: "(Ljava/lang/Object;)V".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&unregister, &bus, std::slice::from_ref(&listener))
+                .unwrap(),
+            Value::Void
+        );
+        assert!(
+            host.dispatch_event(Value::Ref(Some("event/demo".into())))
+                .is_empty()
         );
     }
 

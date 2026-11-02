@@ -495,7 +495,7 @@ counts are bounded to keep native probes finite.
 can use the same key/value queries as `getProperty` without crossing the host boundary.
 `StdHost` also exposes deterministic Fabric loader values for mod-presence checks, metadata ids, names,
 versions, empty `getProvides` and `getDependencies` collections (including
-`Version.getRaw`/`getFriendlyString`), environment type (`CLIENT` by default, or
+`ModMetadata.getType` as the deterministic `release` marker, and `Version.getRaw`/`getFriendlyString`), environment type (`CLIENT` by default, or
 `SERVER` via `with_environment_type`, including `EnvType.isClient`, `name`, and `ordinal`), and the
 game/config/mods paths, and a configurable `isDevelopmentEnvironment` marker (off by default), plus a deterministic `getAllMods` list backed by the seeded containers; callers seed the loaded-mod map with
 `with_mod`. NeoForge's `ModList.get().isLoaded`, `getMods`, and `getModContainerById` use the same seeded map and
@@ -549,7 +549,8 @@ work-item surface. This keeps Fabric callback registration observable without pr
 an arbitrary event combiner in the bounded host. NeoForge `IEventBus.post` also records posted event
 values and returns a deterministic cancellation result for the explicit `event/cancelled/...`,
 `cancelled/...`, and `@cancelled:...` markers; full event hierarchy and mutable cancellation state
-remain a native hook boundary. Event callbacks can query inherited `isCanceled()` against those markers;
+remain a native hook boundary. `IEventBus.unregister(Object)` removes matching bounded listener markers,
+and event callbacks can query inherited `isCanceled()` against those markers;
 changing cancellation still belongs to the native hook boundary. `PayloadRegistrar` calls now retain a bounded direction/type/codec/handler
 record through `StdHost::payload_registrations`, leaving byte encoding and channel ownership to Horizon's
 network boundary.
