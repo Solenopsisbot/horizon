@@ -8548,6 +8548,36 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_keeps_neoforge_typed_listener_overload_fluent() {
+        let mut host = StdHost::new();
+        let bus = Value::Ref(Some("event-bus".into()));
+        let add_listener = MethodRef {
+            owner: "net/neoforged/bus/api/IEventBus".into(),
+            name: "addListener".into(),
+            descriptor: "(Lnet/neoforged/bus/api/EventPriority;ZLjava/lang/Class;Ljava/util/function/Consumer;)Lnet/neoforged/bus/api/IEventBus;".into(),
+        };
+        let result = host
+            .invoke_instance(
+                &add_listener,
+                &bus,
+                &[
+                    Value::Ref(Some("NORMAL".into())),
+                    Value::Int(1),
+                    Value::Ref(Some("demo/Event".into())),
+                    Value::Ref(Some("@indy:typed-listener".into())),
+                ],
+            )
+            .unwrap();
+        assert_eq!(result, bus);
+        let dispatches = host.dispatch_event(Value::Ref(Some("event/cancelled/demo".into())));
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(
+            dispatches[0].listener.args.last(),
+            Some(&Value::Ref(Some("@indy:typed-listener".into())))
+        );
+    }
+
+    #[test]
     fn standard_host_records_neoforge_posts_and_reports_bounded_cancellation() {
         let mut host = StdHost::new();
         let post = MethodRef {
