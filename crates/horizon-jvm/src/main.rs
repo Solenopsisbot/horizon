@@ -538,7 +538,10 @@ fn fallback_label(class: &str, detail: Option<&str>) -> Option<String> {
             "JVM fallback selected for dynamic classpath lookup{}",
             detail.map_or_else(String::new, |value| format!(": {value}"))
         )),
-        "java.lang.NoSuchMethodError" | "java.lang.NoSuchFieldError" => Some(format!(
+        "java.lang.NoSuchMethodError"
+        | "java.lang.NoSuchFieldError"
+        | "java.lang.NoSuchMethodException"
+        | "java.lang.NoSuchFieldException" => Some(format!(
             "JVM fallback selected for missing façade member{}",
             detail.map_or_else(String::new, |value| format!(": {value}"))
         )),
@@ -808,6 +811,20 @@ mod tests {
         );
         assert_eq!(
             fallback_label("java.lang.NoSuchFieldError", None),
+            Some("JVM fallback selected for missing façade member".to_owned())
+        );
+        assert_eq!(
+            fallback_label(
+                "java.lang.NoSuchMethodException",
+                Some("net.minecraft.world.level.Level#getBlockState")
+            ),
+            Some(
+                "JVM fallback selected for missing façade member: net.minecraft.world.level.Level#getBlockState"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            fallback_label("java.lang.NoSuchFieldException", None),
             Some("JVM fallback selected for missing façade member".to_owned())
         );
     }
