@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `e2d2afaaf`.
+Last checked: 3 November 2026, commit `7303f105f`.
 
 ## Supported now
 
@@ -23,7 +23,7 @@ Last checked: 3 November 2026, commit `e2d2afaaf`.
 - [x] Preserve bounded Throwable/Exception/Error messages and cause markers, including `getMessage`, `getCause`, `initCause`, and `toString` diagnostics.
 - [x] Mirror the common `Locale.US` integer grouping path used by the native statistics screen without emulating arbitrary locale patterns.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs, array-returning signatures, common `Identifier` prefix/language-key/ordering helpers, Holder serialization queries, and TagKey values.
-- [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, Mixin `@At`, slice boundary/value preservation, and Mixin Extras injector normalization, loader ABI classification, access-widener/access-transformer discovery, Mojang support-API façade classification, and explicit report-only diagnostics.
+- [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, Mixin `@At`, slice boundary/value preservation, config edge values, and Mixin Extras injector normalization, loader ABI classification, access-widener/access-transformer discovery, Mojang support-API façade classification, and explicit report-only diagnostics.
 
 ## Partial or report-only
 
@@ -48,7 +48,7 @@ Last checked: 3 November 2026, commit `e2d2afaaf`.
 
 - `horizon-native-java`: 98 unit tests passing, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection, TagKey values, bounded primitive optionals, custom payload type identity, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries.
 - `horizon-mods`: 27 unit tests passing, plus the runtime-built typed declaration adapter fixture.
-- `horizon-port-pack`: 162 unit tests passing, including Mixin `@At`/slice boundary metadata and values, Mixin Extras injector normalization, loader ABI classification, Mojang codec/datafixer ABI coverage, native declaration-kind reporting, deduplicated Mixin hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, and descriptor normalization coverage.
+- `horizon-port-pack`: 162 unit tests passing, including Mixin `@At`/slice boundary metadata and values, config edge values, Mixin Extras injector normalization, loader ABI classification, Mojang codec/datafixer ABI coverage, native declaration-kind reporting, deduplicated Mixin hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, and descriptor normalization coverage.
 - `horizon-jvm`: 9 unit tests passing, including explicit fallback labels, static-initialization fallback diagnostics, and NeoForge constructor-only entry selection.
 - Workspace check, full client clippy, compatibility-crate clippy, formatting, and `tools/native_java_smoke.py` passing with compiled OptionalLong/OptionalDouble paths.
 

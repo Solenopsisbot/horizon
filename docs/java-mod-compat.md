@@ -208,7 +208,7 @@ scoped by a number.
 The census is also a product: it is the "what runs" table the launcher shows for a jar before install,
 and the generated reference under `docs/api/`.
 Mixin configuration files are also inspected in report-only mode: bounded JSON reads collect safe class names from `target` fields and record edge-field presence (including `required` and `priority`) in the per-jar and aggregate census. Injection annotations report presence and deterministic scalar values for `require`, `expect`, `cancellable`, `order`, and `priority`, plus bounded `slice` presence, so native hook planning can preserve ordering, contracts, and selector context. Native hook names for one target method are sorted and deduplicated before they enter `native_hooks`;
-Mixin Extras `WrapMethod` and legacy `ModifyConst` names normalize into stable report buckets, and nested slice `from`/`to` boundaries are preserved. Values are not interpreted, configs are not executed, and no bytecode is woven; malformed or oversized files are skipped.
+Mixin Extras `WrapMethod` and legacy `ModifyConst` names normalize into stable report buckets, nested slice `from`/`to` boundaries are preserved, and scalar config edge values remain report-only metadata. Values are not interpreted, configs are not executed, and no bytecode is woven; malformed or oversized files are skipped.
 JDK classpath discovery is reported with the same bounded rule. References to `ServiceLoader` and calls
 to `ServiceLoader.load`/`loadInstalled` or `ClassLoader.getResource*`/`loadClass` mark a jar as dynamic,
 with the exact owner and method in its diagnostic list. The census does not emulate providers or resource
@@ -472,7 +472,7 @@ Static initialization failures are labeled explicitly for JVM fallback diagnosti
 The game-facing startup tests cover the corresponding native `--java-mod` content path, client/server role rejection, and typed metadata merge behavior.
 
 The façade now also has the first NeoForge registration boundary: `FMLJavaModLoadingContext.get()` and
-`getModEventBus()` yield neutral context and bus values, `IEventBus` fluent registration returns its receiver, including bounded `register(Object)`/`unregister(Object)` listener markers,
+`getModEventBus()` yield neutral context and bus values, `FMLJavaModLoadingContext.getContainer()` returns a bounded mod-container façade, and `IEventBus` fluent registration returns its receiver, including bounded `register(Object)`/`unregister(Object)` listener markers,
 and `DeferredRegister.create`/`register` yield façade register and holder objects. `DeferredHolder` now
 also exposes the common `value`, `getOptional`, `getKey`, `getId`, and bounded holder serialization
 queries (including the modern
