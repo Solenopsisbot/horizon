@@ -449,6 +449,10 @@ limited to the event-bus surface; unrelated Forge APIs remain unsupported.
 `PayloadRegistrar` now retains the registrar returned by one `RegisterPayloadHandlersEvent` and counts its
 play and configuration registrations in each direction, so payload bootstrap can inspect a stable
 registration object before the native channel boundary is attached.
+Legacy Forge's `NetworkRegistry.newSimpleChannel` and `SimpleChannel.registerMessage` use the same bounded
+payload marker: the message class, encoder, and handler are retained as a bidirectional registration. The
+legacy message id and decoder remain opaque, and channel ownership plus byte encoding and sends are still
+unsupported at this boundary.
 When a target references NeoForge, the generator emits these public ABI shims directly, so the path does not
 depend on shipping NeoForge's jar. A synthetic `@Mod` that creates a `DeferredRegister`, attaches it to the
 event bus, and registers an object now completes through both `horizon-jvm` and the native probe.
@@ -749,7 +753,10 @@ owns cross-mod membership and final table construction.
 NeoForge capability bootstrap now has the same bounded value layer: `CapabilityManager.get` returns a
 registered `Capability`, `CapabilityToken` preserves the generic lookup shape, `LazyOptional` supports
 lazy/nullable construction, `Capability.orEmpty` identity filtering, presence, mapping, fallback, listeners, and invalidation, and
-`IItemHandler`/`IItemHandlerModifiable` expose the inventory ABI methods. These shims keep capability
+`IItemHandler`/`IItemHandlerModifiable` expose the inventory ABI methods. Legacy Forge's
+`net.minecraftforge.common.util.LazyOptional` is an explicit package alias with the same bounded
+construction, mapping, fallback, listener, and invalidation behavior; other Forge-only APIs remain
+unsupported until separately mapped. These shims keep capability
 registration and optional lookups linkable without copying NeoForge implementation code. The native host
 now records `Level.getCapability` and `BlockEntity.getCapability` requests with capability, position, and
 side markers; a game adapter can seed a handler value for an exact request, while unseeded lookups remain

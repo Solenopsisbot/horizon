@@ -14,7 +14,7 @@ Last checked: 2 November 2026, commit `0e8da6ce7`.
 - [x] Expose bounded NeoForge and legacy Forge loader values: mod lists, containers, event-bus access, and mod ids.
 - [x] Register and inspect bounded NeoForge and Forge deferred registrations, holders, registry objects, keys, ids, and entry collections.
 - [x] Record Fabric events, NeoForge events, and legacy Forge event-bus listeners with ordering, cancellation markers, and unregister support.
-- [x] Record custom payload registrations for the supported Fabric/NeoForge directions.
+- [x] Record custom payload registrations for the supported Fabric/NeoForge directions and the bounded legacy Forge `SimpleChannel.registerMessage` alias.
 - [x] Provide bounded capability and `LazyOptional` markers, NBT values, identifiers, resource keys, arrays, reflection metadata, collections, maps, streams, and optionals.
 - [x] Provide common Java wrapper/string operations used by loader bootstrap code, including integer/long/float/double/byte conversion and checked math.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs and array-returning signatures.

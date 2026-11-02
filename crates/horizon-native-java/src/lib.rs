@@ -491,8 +491,8 @@ impl Host for StdHost {
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
-            ("net/neoforged/neoforge/capabilities/CapabilityManager", "get", descriptor)
-                if descriptor.ends_with("Lnet/neoforged/neoforge/capabilities/Capability;") =>
+            (owner, "get", descriptor)
+                if is_capability_manager_owner(owner) && descriptor.ends_with("Capability;") =>
             {
                 Ok(Value::Ref(Some(format!(
                     "capability/{}",
@@ -501,21 +501,21 @@ impl Host for StdHost {
                         .unwrap_or_else(|| "token/null".into())
                 ))))
             }
-            ("net/neoforged/neoforge/common/util/LazyOptional", "empty", descriptor)
-                if descriptor.ends_with("Lnet/neoforged/neoforge/common/util/LazyOptional;") =>
+            (owner, "empty", descriptor)
+                if is_lazy_optional_owner(owner) && descriptor.ends_with("LazyOptional;") =>
             {
                 Ok(self.lazy_optional(None))
             }
-            ("net/neoforged/neoforge/common/util/LazyOptional", "ofNullable", descriptor)
-                if descriptor.ends_with("Lnet/neoforged/neoforge/common/util/LazyOptional;") =>
+            (owner, "ofNullable", descriptor)
+                if is_lazy_optional_owner(owner) && descriptor.ends_with("LazyOptional;") =>
             {
                 Ok(self.lazy_optional(match Self::argument(r, args, 0)? {
                     Value::Ref(None) => None,
                     value => Some(value.clone()),
                 }))
             }
-            ("net/neoforged/neoforge/common/util/LazyOptional", "of", descriptor)
-                if descriptor.ends_with("Lnet/neoforged/neoforge/common/util/LazyOptional;") =>
+            (owner, "of", descriptor)
+                if is_lazy_optional_owner(owner) && descriptor.ends_with("LazyOptional;") =>
             {
                 // A Supplier callback belongs to the loaded jar and is
                 // executed by NativeJar when a callback dispatch is
@@ -1030,17 +1030,13 @@ impl Host for StdHost {
                 ))),
             };
         }
-        if r.owner == "net/neoforged/neoforge/capabilities/Capability"
-            && r.name == "isRegistered"
-            && r.descriptor == "()Z"
-        {
+        if is_capability_owner(&r.owner) && r.name == "isRegistered" && r.descriptor == "()Z" {
             return Ok(Value::Int(1));
         }
         if (r.owner == "net/minecraft/world/level/Level"
             || r.owner == "net/minecraft/world/level/block/entity/BlockEntity")
             && r.name == "getCapability"
-            && r.descriptor
-                .ends_with("Lnet/neoforged/neoforge/common/util/LazyOptional;")
+            && r.descriptor.ends_with("LazyOptional;")
             && args.len() >= 2
         {
             let capability = capability_text(Self::argument(r, args, 0)?);
@@ -1062,7 +1058,7 @@ impl Host for StdHost {
             self.capability_requests.push(request);
             return Ok(self.lazy_optional(value));
         }
-        if r.owner == "net/neoforged/neoforge/common/util/LazyOptional" {
+        if is_lazy_optional_owner(&r.owner) {
             let contents = self.lazy_contents(receiver).flatten();
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("isPresent", "()Z") => return Ok(Value::Int(contents.is_some() as i32)),
@@ -1088,10 +1084,7 @@ impl Host for StdHost {
                         &[],
                     );
                 }
-                (
-                    "map",
-                    "(Ljava/util/function/Function;)Lnet/neoforged/neoforge/common/util/LazyOptional;",
-                ) => {
+                ("map", descriptor) if descriptor.ends_with("LazyOptional;") => {
                     let Some(value) = contents else {
                         return Ok(self.lazy_optional(None));
                     };
@@ -1110,7 +1103,7 @@ impl Host for StdHost {
                         value => Some(value),
                     }));
                 }
-                ("cast", "()Lnet/neoforged/neoforge/common/util/LazyOptional;") => {
+                ("cast", descriptor) if descriptor.ends_with("LazyOptional;") => {
                     return Ok(receiver.clone());
                 }
                 ("ifPresent", "(Ljava/util/function/Consumer;)V") => {
@@ -1128,10 +1121,7 @@ impl Host for StdHost {
                     }
                     return Ok(Value::Void);
                 }
-                (
-                    "addListener",
-                    "(Ljava/util/function/Consumer;)Lnet/neoforged/neoforge/common/util/LazyOptional;",
-                ) => {
+                ("addListener", descriptor) if descriptor.ends_with("LazyOptional;") => {
                     return Ok(receiver.clone());
                 }
                 ("invalidate", "()V") => {
@@ -3074,6 +3064,23 @@ impl Host for StdHost {
                 }
                 Ok(receiver.clone())
             }
+            // Forge's legacy SimpleChannel carries an id plus separate
+            // encoder/decoder callbacks. Record the message class, encoder,
+            // and handler through the same bounded bidirectional payload
+            // marker; byte encoding, channel ownership, and sends remain a
+            // game-owned boundary.
+            ("net/minecraftforge/network/simple/SimpleChannel", "registerMessage", descriptor)
+                if descriptor.ends_with("Lnet/minecraftforge/network/simple/SimpleChannel;")
+                    && args.len() >= 5 =>
+            {
+                self.payload_registrations.push(PayloadRegistration {
+                    direction: "playBidirectional".into(),
+                    payload_type: args[1].clone(),
+                    codec: args[2].clone(),
+                    handler: args[4].clone(),
+                });
+                Ok(receiver.clone())
+            }
             _ => Ok(Value::default_for(&r.descriptor)),
         }
     }
@@ -3381,6 +3388,33 @@ fn capability_text(value: &Value) -> String {
         Value::Ref(None) => "".to_owned(),
         Value::Void => "void".to_owned(),
     }
+}
+
+// Forge and NeoForge kept the same bounded capability contracts while moving
+// the classes between packages. Treat the owner names as aliases, preserving
+// the marker semantics without fabricating a live capability implementation.
+fn is_capability_manager_owner(owner: &str) -> bool {
+    matches!(
+        owner,
+        "net/neoforged/neoforge/capabilities/CapabilityManager"
+            | "net/minecraftforge/common/capabilities/CapabilityManager"
+    )
+}
+
+fn is_capability_owner(owner: &str) -> bool {
+    matches!(
+        owner,
+        "net/neoforged/neoforge/capabilities/Capability"
+            | "net/minecraftforge/common/capabilities/Capability"
+    )
+}
+
+fn is_lazy_optional_owner(owner: &str) -> bool {
+    matches!(
+        owner,
+        "net/neoforged/neoforge/common/util/LazyOptional"
+            | "net/minecraftforge/common/util/LazyOptional"
+    )
 }
 
 fn optional_wrap(value: Value) -> Value {
@@ -10548,6 +10582,41 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_aliases_legacy_forge_simple_channel_registration() {
+        let mut host = StdHost::new();
+        let channel = Value::Ref(Some("forge-channel".into()));
+        let method = MethodRef {
+            owner: "net/minecraftforge/network/simple/SimpleChannel".into(),
+            name: "registerMessage".into(),
+            descriptor: "(ILjava/lang/Class;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Lnet/minecraftforge/network/simple/SimpleChannel;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &method,
+                &channel,
+                &[
+                    Value::Int(7),
+                    Value::Ref(Some("message-class".into())),
+                    Value::Ref(Some("encoder".into())),
+                    Value::Ref(Some("decoder".into())),
+                    Value::Ref(Some("handler".into())),
+                ],
+            )
+            .unwrap(),
+            channel
+        );
+        assert_eq!(
+            host.payload_registrations(),
+            &[PayloadRegistration {
+                direction: "playBidirectional".into(),
+                payload_type: Value::Ref(Some("message-class".into())),
+                codec: Value::Ref(Some("encoder".into())),
+                handler: Value::Ref(Some("handler".into())),
+            }]
+        );
+    }
+
+    #[test]
     fn standard_host_bridges_seeded_block_capability_requests() {
         let mut host = StdHost::new();
         host.seed_capability(
@@ -10716,6 +10785,46 @@ mandatory = true
             host.invoke_instance(&or_else, &optional, &[Value::Ref(Some("fallback".into()))],)
                 .unwrap(),
             Value::Ref(Some("fallback".into()))
+        );
+    }
+
+    #[test]
+    fn standard_host_maps_legacy_forge_lazy_optional_alias() {
+        let mut host = StdHost::new();
+        let owner = "net/minecraftforge/common/util/LazyOptional";
+        let optional = host
+            .invoke(
+                &MethodRef {
+                    owner: owner.into(),
+                    name: "ofNullable".into(),
+                    descriptor: "(Ljava/lang/Object;)Lnet/minecraftforge/common/util/LazyOptional;"
+                        .into(),
+                },
+                &[Value::Ref(Some("forge-value".into()))],
+            )
+            .unwrap();
+        let resolve = MethodRef {
+            owner: owner.into(),
+            name: "resolve".into(),
+            descriptor: "()Ljava/lang/Object;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&resolve, &optional, &[]).unwrap(),
+            Value::Ref(Some("forge-value".into()))
+        );
+        host.invoke_instance(
+            &MethodRef {
+                owner: owner.into(),
+                name: "invalidate".into(),
+                descriptor: "()V".into(),
+            },
+            &optional,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            host.invoke_instance(&resolve, &optional, &[]).unwrap(),
+            Value::Ref(None)
         );
     }
 

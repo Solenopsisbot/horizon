@@ -465,6 +465,50 @@ pub fn generate_many(
                     "}\n",
                 ),
             ),
+            // Legacy Forge capability package aliases. Keep these bounded to
+            // the same marker and optional semantics as the NeoForge shims.
+            (
+                "net/minecraftforge/common/capabilities/CapabilityToken.java",
+                "package net.minecraftforge.common.capabilities; public class CapabilityToken<T> {}\n",
+            ),
+            (
+                "net/minecraftforge/common/capabilities/Capability.java",
+                "package net.minecraftforge.common.capabilities; import net.minecraftforge.common.util.LazyOptional; public class Capability<T> { public boolean isRegistered() { return true; } public <R> LazyOptional<R> orEmpty(R value, Object requested) { return requested == this && value != null ? LazyOptional.ofNullable(value) : LazyOptional.empty(); } }\n",
+            ),
+            (
+                "net/minecraftforge/common/capabilities/CapabilityManager.java",
+                "package net.minecraftforge.common.capabilities; public final class CapabilityManager { private CapabilityManager() {} public static <T> Capability<T> get(CapabilityToken<T> token) { return new Capability<>(); } }\n",
+            ),
+            (
+                "net/minecraftforge/common/util/LazyOptional.java",
+                concat!(
+                    "package net.minecraftforge.common.util;\n",
+                    "import java.util.Optional;\n",
+                    "import java.util.function.Consumer;\n",
+                    "import java.util.function.Function;\n",
+                    "import java.util.function.Supplier;\n",
+                    "public class LazyOptional<T> {\n",
+                    "    private Supplier<? extends T> horizonSupplier;\n",
+                    "    private T horizonValue;\n",
+                    "    private boolean horizonValid = true;\n",
+                    "    private LazyOptional(Supplier<? extends T> supplier) { this.horizonSupplier = supplier; }\n",
+                    "    public static <T> LazyOptional<T> empty() { return new LazyOptional<>(() -> null); }\n",
+                    "    public static <T> LazyOptional<T> of(Supplier<? extends T> supplier) { return new LazyOptional<>(supplier); }\n",
+                    "    public static <T> LazyOptional<T> ofNullable(T value) { return new LazyOptional<>(() -> value); }\n",
+                    "    private T horizonGet() { if (horizonValue == null && horizonSupplier != null) horizonValue = horizonSupplier.get(); return horizonValue; }\n",
+                    "    public boolean isPresent() { return horizonValid && horizonGet() != null; }\n",
+                    "    public T resolve() { return isPresent() ? horizonGet() : null; }\n",
+                    "    public T orElse(T fallback) { T value = resolve(); return value == null ? fallback : value; }\n",
+                    "    public T orElseGet(Supplier<? extends T> fallback) { T value = resolve(); return value == null ? fallback.get() : value; }\n",
+                    "    public void ifPresent(Consumer<? super T> consumer) { T value = resolve(); if (value != null) consumer.accept(value); }\n",
+                    "    public <R> LazyOptional<R> map(Function<? super T, ? extends R> mapper) { T value = resolve(); return value == null ? empty() : of(() -> mapper.apply(value)); }\n",
+                    "    @SuppressWarnings(\"unchecked\") public <R> LazyOptional<R> cast() { return (LazyOptional<R>) this; }\n",
+                    "    public void invalidate() { horizonValid = false; horizonValue = null; horizonSupplier = () -> null; }\n",
+                    "    public LazyOptional<T> addListener(Consumer<LazyOptional<T>> listener) { if (!horizonValid) listener.accept(this); return this; }\n",
+                    "    public Optional<T> resolveOptional() { return Optional.ofNullable(resolve()); }\n",
+                    "}\n",
+                ),
+            ),
             (
                 "net/neoforged/neoforge/items/IItemHandler.java",
                 concat!(
@@ -488,9 +532,6 @@ pub fn generate_many(
                     "    default ItemStack getStackInSlot(int slot) { HorizonSlot value = horizonSlot(this, slot); return value == null || value.count <= 0 ? new ItemStack() : horizonCopy(value.stack, value.count); }\n",
                     "    default ItemStack insertItem(int slot, ItemStack stack, boolean simulate) { HorizonSlot value = horizonSlot(this, slot); int incoming = horizonCount(stack); if (value == null || incoming <= 0) return incoming <= 0 ? new ItemStack() : stack; Item existing = horizonItem(value.stack); Item incomingItem = horizonItem(stack); if (value.count > 0 && existing != incomingItem) return horizonCopy(stack, incoming); int amount = Math.min(incoming, Math.max(0, 64 - value.count)); if (!simulate && amount > 0) { if (value.count == 0) value.stack = stack; value.count += amount; } return amount == incoming ? new ItemStack() : horizonCopy(stack, incoming - amount); }\n",
                     "    default ItemStack extractItem(int slot, int amount, boolean simulate) { HorizonSlot value = horizonSlot(this, slot); if (value == null || amount <= 0 || value.count <= 0) return new ItemStack(); int moved = Math.min(amount, value.count); ItemStack result = horizonCopy(value.stack, moved); if (!simulate) { value.count -= moved; if (value.count == 0) value.stack = null; } return result; }\n",
-                    "    default int getSlotLimit(int slot) { return slot == 0 ? 64 : 0; }\n",
-                    "    default boolean isItemValid(int slot, ItemStack stack) { return slot == 0 && stack != null; }\n",
-                    "}\n",
                 ),
             ),
             (
@@ -644,6 +685,26 @@ pub fn generate_many(
                     "public class RegisterPayloadHandlersEvent extends Event {\n",
                     "    private final PayloadRegistrar horizonRegistrar = new PayloadRegistrar();\n",
                     "    public PayloadRegistrar registrar(String version) { return horizonRegistrar; }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "net/minecraftforge/network/simple/SimpleChannel.java",
+                concat!(
+                    "package net.minecraftforge.network.simple;\n",
+                    "public class SimpleChannel {\n",
+                    "    public SimpleChannel registerMessage(int id, Class type, Object encoder, Object decoder, Object handler) { return this; }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "net/minecraftforge/network/NetworkRegistry.java",
+                concat!(
+                    "package net.minecraftforge.network;\n",
+                    "import net.minecraftforge.network.simple.SimpleChannel;\n",
+                    "public final class NetworkRegistry {\n",
+                    "    private NetworkRegistry() {}\n",
+                    "    public static SimpleChannel newSimpleChannel(Object name, Object protocol, Object clientAccepted, Object serverAccepted) { return new SimpleChannel(); }\n",
                     "}\n",
                 ),
             ),
@@ -1683,30 +1744,79 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     {
         return "return p0;".to_owned();
     }
-    if class == "net/neoforged/neoforge/capabilities/CapabilityManager"
-        && method == "get"
-        && ret == "net.neoforged.neoforge.capabilities.Capability"
+    if matches!(
+        class,
+        "net/neoforged/neoforge/capabilities/CapabilityManager"
+            | "net/minecraftforge/common/capabilities/CapabilityManager"
+    ) && method == "get"
+        && (ret == "net.neoforged.neoforge.capabilities.Capability"
+            || ret == "net.minecraftforge.common.capabilities.Capability")
     {
-        return "return new net.neoforged.neoforge.capabilities.Capability();".to_owned();
+        return format!(
+            "return new {}.Capability();",
+            class.replace("/CapabilityManager", "").replace('/', ".")
+        );
     }
-    if class == "net/neoforged/neoforge/capabilities/Capability"
-        && ret == "boolean"
+    if matches!(
+        class,
+        "net/neoforged/neoforge/capabilities/Capability"
+            | "net/minecraftforge/common/capabilities/Capability"
+    ) && ret == "boolean"
         && method == "isRegistered"
     {
         return "return true;".to_owned();
     }
-    if class == "net/neoforged/neoforge/capabilities/Capability"
-        && method == "orEmpty"
-        && ret == "net.neoforged.neoforge.common.util.LazyOptional"
+    if matches!(
+        class,
+        "net/neoforged/neoforge/capabilities/Capability"
+            | "net/minecraftforge/common/capabilities/Capability"
+    ) && method == "orEmpty"
+        && (ret == "net.neoforged.neoforge.common.util.LazyOptional"
+            || ret == "net.minecraftforge.common.util.LazyOptional")
     {
-        return "return p1 == this && p0 != null ? net.neoforged.neoforge.common.util.LazyOptional.ofNullable(p0) : net.neoforged.neoforge.common.util.LazyOptional.empty();".to_owned();
+        let optional = if class.starts_with("net/minecraftforge/") {
+            "net.minecraftforge.common.util.LazyOptional"
+        } else {
+            "net.neoforged.neoforge.common.util.LazyOptional"
+        };
+        return format!(
+            "return p1 == this && p0 != null ? {optional}.ofNullable(p0) : {optional}.empty();"
+        );
     }
-    if class == "net/neoforged/neoforge/common/util/LazyOptional" {
+    if matches!(
+        class,
+        "net/neoforged/neoforge/common/util/LazyOptional"
+            | "net/minecraftforge/common/util/LazyOptional"
+    ) {
         match (method, ret) {
             ("empty", "net.neoforged.neoforge.common.util.LazyOptional")
             | ("of", "net.neoforged.neoforge.common.util.LazyOptional")
             | ("ofNullable", "net.neoforged.neoforge.common.util.LazyOptional") => {
                 return "return new net.neoforged.neoforge.common.util.LazyOptional();".to_owned();
+            }
+            ("empty", "net.minecraftforge.common.util.LazyOptional")
+            | ("of", "net.minecraftforge.common.util.LazyOptional")
+            | ("ofNullable", "net.minecraftforge.common.util.LazyOptional") => {
+                return "return new net.minecraftforge.common.util.LazyOptional();".to_owned();
+            }
+            ("isPresent", "boolean") => {
+                return "return horizonValid && horizonGet() != null;".to_owned();
+            }
+            ("resolve", _) => return "return horizonGet();".to_owned(),
+            ("orElse", _) => return "return horizonGet() == null ? p0 : horizonGet();".to_owned(),
+            ("invalidate", "void") => {
+                return "horizonValid = false; horizonValue = null; horizonSupplier = () -> null;"
+                    .to_owned();
+            }
+            _ => {}
+        }
+    }
+    if class == "net/minecraftforge/common/util/LazyOptional" {
+        match (method, ret) {
+            ("empty", "net.minecraftforge.common.util.LazyOptional")
+            | ("of", "net.minecraftforge.common.util.LazyOptional")
+            | ("ofNullable", "net.minecraftforge.common.util.LazyOptional") => {
+                return "return new net.minecraftforge.common.util.LazyOptional();".to_owned();
             }
             ("isPresent", "boolean") => {
                 return "return horizonValid && horizonGet() != null;".to_owned();
@@ -1768,6 +1878,22 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     }
     if class == "net/neoforged/neoforge/network/registration/PayloadRegistrar"
         && ret == "net.neoforged.neoforge.network.registration.PayloadRegistrar"
+    {
+        return "return this;".to_owned();
+    }
+    // Legacy Forge's SimpleChannel registration has no StreamCodec and carries
+    // separate encoder/decoder callbacks. Reuse the NeoForge registrar marker
+    // only for the bounded registration observation; byte encoding, channel
+    // ownership and sendToServer/send remain unsupported.
+    if class == "net/minecraftforge/network/NetworkRegistry"
+        && method == "newSimpleChannel"
+        && ret == "net.minecraftforge.network.simple.SimpleChannel"
+    {
+        return "return new net.minecraftforge.network.simple.SimpleChannel();".to_owned();
+    }
+    if class == "net/minecraftforge/network/simple/SimpleChannel"
+        && method == "registerMessage"
+        && ret == "net.minecraftforge.network.simple.SimpleChannel"
     {
         return "return this;".to_owned();
     }
@@ -3594,6 +3720,22 @@ mod tests {
         );
         assert_eq!(
             runtime_body(
+                "net/minecraftforge/common/util/LazyOptional",
+                "isPresent",
+                "boolean"
+            ),
+            "return horizonValid && horizonGet() != null;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraftforge/common/util/LazyOptional",
+                "invalidate",
+                "void"
+            ),
+            "horizonValid = false; horizonValue = null; horizonSupplier = () -> null;"
+        );
+        assert_eq!(
+            runtime_body(
                 "net/neoforged/neoforge/capabilities/Capability",
                 "isRegistered",
                 "boolean"
@@ -3623,6 +3765,22 @@ mod tests {
                 "net.neoforged.neoforge.common.util.LazyOptional"
             ),
             "return p1 == this && p0 != null ? net.neoforged.neoforge.common.util.LazyOptional.ofNullable(p0) : net.neoforged.neoforge.common.util.LazyOptional.empty();"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraftforge/common/capabilities/CapabilityManager",
+                "get",
+                "net.minecraftforge.common.capabilities.Capability"
+            ),
+            "return new net.minecraftforge.common.capabilities.Capability();"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraftforge/common/capabilities/Capability",
+                "orEmpty",
+                "net.minecraftforge.common.util.LazyOptional"
+            ),
+            "return p1 == this && p0 != null ? net.minecraftforge.common.util.LazyOptional.ofNullable(p0) : net.minecraftforge.common.util.LazyOptional.empty();"
         );
     }
 
