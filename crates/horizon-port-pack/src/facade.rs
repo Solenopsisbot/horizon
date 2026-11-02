@@ -2487,6 +2487,11 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("isEmpty", "boolean") => {
                 return "return horizonCount <= 0;".to_owned();
             }
+            ("getTags", "java.util.stream.Stream")
+                if descriptor == "()Ljava/util/stream/Stream;" =>
+            {
+                return "return java.util.stream.Stream.empty();".to_owned();
+            }
             ("getMaxStackSize", "int") => return "return 64;".to_owned(),
             ("hasFoil", "boolean") => return "return false;".to_owned(),
             ("isDamaged", "boolean") => return "return horizonDamage > 0;".to_owned(),
@@ -4012,6 +4017,15 @@ mod tests {
         assert_eq!(
             runtime_body("net/minecraft/world/item/ItemStack", "isEmpty", "boolean"),
             "return horizonCount <= 0;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/item/ItemStack",
+                "getTags",
+                "java.util.stream.Stream",
+                "()Ljava/util/stream/Stream;",
+            ),
+            "return java.util.stream.Stream.empty();"
         );
         assert_eq!(
             runtime_body(
