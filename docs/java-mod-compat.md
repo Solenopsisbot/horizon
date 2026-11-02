@@ -1,7 +1,7 @@
 # Java mods on Horizon: the compatibility runtime (design)
 
-Status: Phase 1 probe, 1 November 2026. Phase 0 is measured ([mod-abi-census.md](mod-abi-census.md));
-the façade generator and embedded JVM runner are now built and exercised against Fabric API and Hollow
+Status: Phase 1 probe, 2 November 2026. Phase 0 is measured ([mod-abi-census.md](mod-abi-census.md));
+the maintained progress checklist is [java-mod-compat-status.md](java-mod-compat-status.md). The façade generator and embedded JVM runner are now built and exercised against Fabric API and Hollow
 Dawn. Read it with [mods.md](mods.md) (what runs today), [modpacks.md](modpacks.md) (the
 port pipeline) and [native-hooks-neoforge.md](native-hooks-neoforge.md) (hooks named after NeoForge
 events).
