@@ -2244,6 +2244,19 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         if method == "get" && descriptor.contains("Lnet/minecraft/resources/Identifier;") {
             return format!("return ({ret}) horizonEntries.get(p0);");
         }
+        if method == "getOrThrow"
+            && (descriptor.contains("Lnet/minecraft/resources/ResourceKey;")
+                || descriptor.contains("Lnet/minecraft/resources/Identifier;"))
+        {
+            let key = if descriptor.contains("Lnet/minecraft/resources/ResourceKey;") {
+                "p0.location()"
+            } else {
+                "p0"
+            };
+            return format!(
+                "Object value = horizonEntries.get({key}); if (value == null) throw new IllegalStateException(\"missing registry value: \" + {key}); return ({ret}) value;"
+            );
+        }
         if method == "getHolder"
             && ret == "java.util.Optional"
             && descriptor.contains("Lnet/minecraft/resources/ResourceKey;")
@@ -5332,6 +5345,15 @@ mod tests {
                 "(Lnet/minecraft/resources/ResourceKey;)Ljava/util/Optional;",
             ),
             "Object value = horizonEntries.get(p0.location()); if (value == null) return java.util.Optional.empty(); net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(value, p0, p0.location()); return java.util.Optional.of(holder);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/Registry",
+                "getOrThrow",
+                "java.lang.Object",
+                "(Lnet/minecraft/resources/ResourceKey;)Ljava/lang/Object;",
+            ),
+            "Object value = horizonEntries.get(p0.location()); if (value == null) throw new IllegalStateException(\"missing registry value: \" + p0.location()); return (java.lang.Object) value;"
         );
         assert_eq!(
             runtime_body_with_descriptor(
