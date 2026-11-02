@@ -224,6 +224,9 @@ pub struct StdHost {
     posted_events: Vec<Value>,
     registrations: Vec<RegistryEntry>,
     payload_registrations: Vec<PayloadRegistration>,
+    /// Identifiers retained by `CustomPacketPayload.Type` values created by
+    /// the bounded networking façade.
+    packet_types: BTreeMap<String, String>,
     holders: BTreeMap<String, Value>,
     mutable_collections: BTreeMap<String, Vec<Value>>,
     iterators: BTreeMap<String, (Vec<Value>, usize)>,
@@ -266,6 +269,7 @@ impl StdHost {
             posted_events: Vec::new(),
             registrations: Vec::new(),
             payload_registrations: Vec::new(),
+            packet_types: BTreeMap::new(),
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             iterators: BTreeMap::new(),
@@ -2363,6 +2367,49 @@ impl Host for StdHost {
                 "invoker" => {
                     let marker = receiver_marker.unwrap_or_else(|| "fabric-event/unknown".into());
                     return Ok(Value::Ref(Some(format!("{marker}/invoker"))));
+                }
+                _ => {}
+            }
+        }
+        if r.owner == "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type" {
+            let marker = expect_ref(receiver).ok_or_else(|| {
+                NativeError::Metadata("malformed packet payload type marker".into())
+            })?;
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                (
+                    "<init>",
+                    "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/network/codec/StreamCodec;)V",
+                ) => {
+                    let (namespace, path) = identifier_parts(Self::argument(r, args, 0)?);
+                    self.packet_types
+                        .insert(marker.to_owned(), format!("{namespace}:{path}"));
+                    return Ok(Value::Void);
+                }
+                ("id", "()Lnet/minecraft/resources/Identifier;") => {
+                    let id = self
+                        .packet_types
+                        .get(marker)
+                        .map_or("minecraft:unknown", String::as_str);
+                    return Ok(identifier_parse(id));
+                }
+                ("toString", "()Ljava/lang/String;") => {
+                    let id = self
+                        .packet_types
+                        .get(marker)
+                        .map_or("minecraft:unknown", String::as_str);
+                    return Ok(Value::Ref(Some(id.to_owned())));
+                }
+                ("hashCode", "()I") => {
+                    let id = self
+                        .packet_types
+                        .get(marker)
+                        .map_or("minecraft:unknown", String::as_str);
+                    return Ok(Value::Int(stable_hash(id)));
+                }
+                ("equals", "(Ljava/lang/Object;)Z") => {
+                    let other = expect_ref(Self::argument(r, args, 0)?)
+                        .and_then(|other| self.packet_types.get(other));
+                    return Ok(Value::Int((self.packet_types.get(marker) == other) as i32));
                 }
                 _ => {}
             }
@@ -12854,6 +12901,46 @@ mandatory = true
         assert_eq!(
             host.payload_registrations().last().unwrap().direction,
             "configurationToClient"
+        );
+    }
+
+    #[test]
+    fn standard_host_retains_custom_packet_payload_type_identity() {
+        let mut host = StdHost::new();
+        let type_marker = Value::Ref(Some("packet-type#1".into()));
+        let constructor = MethodRef {
+            owner: "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type".into(),
+            name: "<init>".into(),
+            descriptor:
+                "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/network/codec/StreamCodec;)V"
+                    .into(),
+        };
+        host.invoke_instance(
+            &constructor,
+            &type_marker,
+            &[
+                Value::Ref(Some("identifier/demo:ping".into())),
+                Value::Ref(Some("stream-codec".into())),
+            ],
+        )
+        .unwrap();
+        let id = MethodRef {
+            owner: "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type".into(),
+            name: "id".into(),
+            descriptor: "()Lnet/minecraft/resources/Identifier;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&id, &type_marker, &[]).unwrap(),
+            Value::Ref(Some("identifier/demo:ping".into()))
+        );
+        let to_string = MethodRef {
+            owner: id.owner.clone(),
+            name: "toString".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&to_string, &type_marker, &[]).unwrap(),
+            Value::Ref(Some("demo:ping".into()))
         );
     }
 
