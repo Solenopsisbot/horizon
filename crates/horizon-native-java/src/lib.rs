@@ -1689,6 +1689,48 @@ impl Host for StdHost {
                     | "java/util/AbstractMap"
                     | "java/util/HashMap"
                     | "java/util/LinkedHashMap",
+                    "computeIfPresent",
+                    "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+                ) => {
+                    let key = Self::argument(r, args, 0)?.clone();
+                    let function = Self::argument(r, args, 1)?.clone();
+                    let current = self.mutable_collections.get(marker).and_then(|values| {
+                        values
+                            .chunks_exact(2)
+                            .find(|pair| pair[0] == key)
+                            .map(|pair| pair[1].clone())
+                    });
+                    let Some(current) = current else {
+                        return Ok(Value::Ref(None));
+                    };
+                    let computed = self.invoke_instance(
+                        &MethodRef {
+                            owner: "java/util/function/BiFunction".into(),
+                            name: "apply".into(),
+                            descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+                                .into(),
+                        },
+                        &function,
+                        &[key.clone(), current],
+                    )?;
+                    let values = self
+                        .mutable_collections
+                        .entry(marker.to_owned())
+                        .or_default();
+                    if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key) {
+                        if matches!(computed, Value::Ref(None)) {
+                            values.drain(index * 2..index * 2 + 2);
+                            return Ok(Value::Ref(None));
+                        }
+                        values[index * 2 + 1] = computed.clone();
+                    }
+                    return Ok(computed);
+                }
+                (
+                    "java/util/Map"
+                    | "java/util/AbstractMap"
+                    | "java/util/HashMap"
+                    | "java/util/LinkedHashMap",
                     "forEach",
                     "(Ljava/util/function/BiConsumer;)V",
                 ) => {
@@ -8928,6 +8970,24 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(&map_get, &map, &[Value::Ref(Some("computed-key".into()))])
                 .unwrap(),
+            Value::Ref(Some("computed/rcomputed-key".into()))
+        );
+        let compute_present = MethodRef {
+            owner: "java/util/Map".into(),
+            name: "computeIfPresent".into(),
+            descriptor: "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;"
+                .into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &compute_present,
+                &map,
+                &[
+                    Value::Ref(Some("computed-key".into())),
+                    Value::Ref(Some("@indy:compute-present".into())),
+                ],
+            )
+            .unwrap(),
             Value::Ref(Some("computed/rcomputed-key".into()))
         );
         let merge = MethodRef {
