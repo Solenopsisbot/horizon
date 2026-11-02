@@ -321,6 +321,17 @@ impl StdHost {
         self.resource(name)
     }
 
+    fn resource_enumeration(&mut self, name: &str) -> Value {
+        let marker = format!("resource-enumeration/{}", self.next_iterator);
+        self.next_iterator = self.next_iterator.saturating_add(1);
+        let values = self
+            .resource(name)
+            .map(|value| vec![Value::Ref(Some(value.to_owned()))])
+            .unwrap_or_default();
+        self.iterators.insert(marker.clone(), (values, 0));
+        Value::Ref(Some(marker))
+    }
+
     /// Seed one deterministic class marker for the bounded
     /// `ClassLoader.loadClass` contract. Java binary names and internal names
     /// are normalized to the same slash-separated key.
@@ -1348,6 +1359,14 @@ impl Host for StdHost {
                 let name = expect_string(Self::argument(r, args, 0)?);
                 Ok(Value::Ref(self.resource(name).map(str::to_owned)))
             }
+            (
+                "java/lang/ClassLoader",
+                "getResources" | "getSystemResources",
+                "(Ljava/lang/String;)Ljava/util/Enumeration;",
+            ) => {
+                let name = expect_string(Self::argument(r, args, 0)?);
+                Ok(self.resource_enumeration(name))
+            }
             ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;") => {
                 Ok(Value::Ref(Some("thread/main".into())))
             }
@@ -1482,6 +1501,12 @@ impl Host for StdHost {
                 let name = expect_string(Self::argument(r, args, 0)?);
                 return Ok(Value::Ref(self.resource(name).map(str::to_owned)));
             }
+            if r.name == "getResources"
+                && r.descriptor == "(Ljava/lang/String;)Ljava/util/Enumeration;"
+            {
+                let name = expect_string(Self::argument(r, args, 0)?);
+                return Ok(self.resource_enumeration(name));
+            }
         }
         if r.owner == "java/text/NumberFormat"
             && r.name == "format"
@@ -1611,6 +1636,19 @@ impl Host for StdHost {
         }
         if is_capability_owner(&r.owner) && r.name == "isRegistered" && r.descriptor == "()Z" {
             return Ok(Value::Int(1));
+        }
+        if is_capability_owner(&r.owner)
+            && r.name == "orEmpty"
+            && r.descriptor.ends_with("LazyOptional;")
+        {
+            let value = Self::argument(r, args, 0)?.clone();
+            let requested = Self::argument(r, args, 1)?;
+            let matches_capability = expect_ref(receiver)
+                .zip(expect_ref(requested))
+                .is_some_and(|(capability, requested)| capability == requested);
+            return Ok(self.lazy_optional(
+                (matches_capability && !matches!(value, Value::Ref(None))).then_some(value),
+            ));
         }
         if (r.owner == "net/minecraft/world/level/Level"
             || r.owner == "net/minecraft/world/level/block/entity/BlockEntity")
@@ -2441,6 +2479,29 @@ impl Host for StdHost {
             }
             if r.name == "reload" && r.descriptor == "()V" {
                 return Ok(Value::Void);
+            }
+        }
+        if r.owner == "java/util/Enumeration"
+            && matches!(r.descriptor.as_str(), "()Z" | "()Ljava/lang/Object;")
+        {
+            let marker = receiver_marker.as_deref().ok_or_else(|| {
+                NativeError::Metadata("malformed java/util/Enumeration marker".into())
+            })?;
+            let (values, index) = self.iterators.get_mut(marker).ok_or_else(|| {
+                NativeError::Metadata("unknown java/util/Enumeration marker".into())
+            })?;
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("hasMoreElements", "()Z") => {
+                    return Ok(Value::Int((*index < values.len()) as i32));
+                }
+                ("nextElement", "()Ljava/lang/Object;") => {
+                    let value = values.get(*index).cloned().ok_or_else(|| {
+                        NativeError::Metadata("java/util/Enumeration exhausted".into())
+                    })?;
+                    *index += 1;
+                    return Ok(value);
+                }
+                _ => {}
             }
         }
         // NeoForge event subclasses inherit this query from the common event
@@ -8435,6 +8496,56 @@ mandatory = true
                 .unwrap(),
             Value::Ref(None)
         );
+
+        let resources = MethodRef {
+            owner: "java/lang/ClassLoader".into(),
+            name: "getResources".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/util/Enumeration;".into(),
+        };
+        let enumeration = host
+            .invoke_instance(
+                &resources,
+                &loader,
+                &[Value::Ref(Some("assets/demo.txt".into()))],
+            )
+            .unwrap();
+        let has_more = MethodRef {
+            owner: "java/util/Enumeration".into(),
+            name: "hasMoreElements".into(),
+            descriptor: "()Z".into(),
+        };
+        let next = MethodRef {
+            owner: "java/util/Enumeration".into(),
+            name: "nextElement".into(),
+            descriptor: "()Ljava/lang/Object;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&has_more, &enumeration, &[]).unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(&next, &enumeration, &[]).unwrap(),
+            Value::Ref(Some("resource/demo".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(&has_more, &enumeration, &[]).unwrap(),
+            Value::Int(0)
+        );
+
+        let missing = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/lang/ClassLoader".into(),
+                    name: "getSystemResources".into(),
+                    descriptor: "(Ljava/lang/String;)Ljava/util/Enumeration;".into(),
+                },
+                &[Value::Ref(Some("missing.txt".into()))],
+            )
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(&has_more, &missing, &[]).unwrap(),
+            Value::Int(0)
+        );
     }
 
     #[test]
@@ -13058,6 +13169,34 @@ mandatory = true
             )
             .unwrap(),
             Value::Int(1)
+        );
+
+        let or_empty = MethodRef {
+            owner: "net/neoforged/neoforge/capabilities/Capability".into(),
+            name: "orEmpty".into(),
+            descriptor:
+                "(Ljava/lang/Object;Ljava/lang/Object;)Lnet/neoforged/neoforge/common/util/LazyOptional;"
+                    .into(),
+        };
+        let optional = host
+            .invoke_instance(
+                &or_empty,
+                &capability,
+                &[Value::Ref(Some("handler/items".into())), capability.clone()],
+            )
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/neoforged/neoforge/common/util/LazyOptional".into(),
+                    name: "resolve".into(),
+                    descriptor: "()Ljava/lang/Object;".into(),
+                },
+                &optional,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("handler/items".into()))
         );
 
         let optional = host
