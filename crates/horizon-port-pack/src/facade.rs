@@ -1281,8 +1281,9 @@ fn render(
         }
         let name = &field.name;
         let ty = java_type(&field.descriptor);
-        let default = runtime_field_default(
+        let default = runtime_field_default_named(
             &class.name,
+            name,
             &field.descriptor,
             default_value(&field.descriptor),
         );
@@ -1872,6 +1873,68 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             }
             ("getId", "net.minecraft.resources.Identifier") => {
                 return "return horizonId;".to_owned();
+            }
+            _ => {}
+        }
+    }
+    // InteractionResult is a sealed value interface used by virtually every
+    // item and block interaction callback. Its 26.3 shape is four nested
+    // records (Success, Fail, Pass, TryEmptyHandInteraction), so preserve the
+    // bounded result predicate and Success value accessors instead of treating
+    // it as the old enum-shaped API.
+    if class == "net/minecraft/world/InteractionResult" {
+        match (method, ret, descriptor) {
+            ("consumesAction", "boolean", _) => {
+                return "return this instanceof InteractionResult.Success;".to_owned();
+            }
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/InteractionResult$Success" {
+        match (method, ret, descriptor) {
+            ("consumesAction", "boolean", _) => return "return true;".to_owned(),
+            ("shouldSwing", "boolean", _) => {
+                return "return swingSource() != InteractionResult.SwingSource.NONE;".to_owned();
+            }
+            ("wasItemInteraction", "boolean", _) => {
+                return "return itemContext().wasItemInteraction();".to_owned();
+            }
+            (
+                "heldItemTransformedTo",
+                "net.minecraft.world.item.ItemStack",
+                "()Lnet/minecraft/world/item/ItemStack;",
+            ) => {
+                return "return itemContext().heldItemTransformedTo();".to_owned();
+            }
+            (
+                "heldItemTransformedTo",
+                "net.minecraft.world.InteractionResult.Success",
+                "(Lnet/minecraft/world/item/ItemStack;)Lnet/minecraft/world/InteractionResult$Success;",
+            ) => {
+                return "return new Success(swingSource(), new InteractionResult.ItemContext(true, p0));".to_owned();
+            }
+            (
+                "withoutItem",
+                "net.minecraft.world.InteractionResult.Success",
+                "()Lnet/minecraft/world/InteractionResult$Success;",
+            ) => {
+                return "return new Success(swingSource(), InteractionResult.ItemContext.NONE);"
+                    .to_owned();
+            }
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/InteractionResult$ItemContext" {
+        match (method, ret, descriptor) {
+            ("wasItemInteraction", "boolean", _) => {
+                return "return wasItemInteraction;".to_owned();
+            }
+            (
+                "heldItemTransformedTo",
+                "net.minecraft.world.item.ItemStack",
+                "()Lnet/minecraft/world/item/ItemStack;",
+            ) => {
+                return "return heldItemTransformedTo;".to_owned();
             }
             _ => {}
         }
@@ -3383,6 +3446,37 @@ fn voxel_shape_placeholder() -> String {
 }
 
 fn runtime_field_default(class: &str, descriptor: &str, fallback: &str) -> String {
+    runtime_field_default_named(class, "", descriptor, fallback)
+}
+
+fn runtime_field_default_named(
+    class: &str,
+    field: &str,
+    descriptor: &str,
+    fallback: &str,
+) -> String {
+    if class == "net/minecraft/world/InteractionResult" {
+        return match field {
+            "SUCCESS" => "new net.minecraft.world.InteractionResult.Success(net.minecraft.world.InteractionResult.SwingSource.PREDICTED, net.minecraft.world.InteractionResult.ItemContext.DEFAULT)".to_owned(),
+            "SUCCESS_SERVER" => "new net.minecraft.world.InteractionResult.Success(net.minecraft.world.InteractionResult.SwingSource.SERVER_ONLY, net.minecraft.world.InteractionResult.ItemContext.DEFAULT)".to_owned(),
+            "CONSUME" => "new net.minecraft.world.InteractionResult.Success(net.minecraft.world.InteractionResult.SwingSource.NONE, net.minecraft.world.InteractionResult.ItemContext.DEFAULT)".to_owned(),
+            "FAIL" => "new net.minecraft.world.InteractionResult.Fail()".to_owned(),
+            "PASS" => "new net.minecraft.world.InteractionResult.Pass()".to_owned(),
+            "TRY_WITH_EMPTY_HAND" => "new net.minecraft.world.InteractionResult.TryEmptyHandInteraction()".to_owned(),
+            _ => fallback.to_owned(),
+        };
+    }
+    if class == "net/minecraft/world/InteractionResult$ItemContext" {
+        return match field {
+            "DEFAULT" => {
+                "new net.minecraft.world.InteractionResult.ItemContext(true, null)".to_owned()
+            }
+            "NONE" => {
+                "new net.minecraft.world.InteractionResult.ItemContext(false, null)".to_owned()
+            }
+            _ => fallback.to_owned(),
+        };
+    }
     if class == "net/minecraft/world/entity/SpawnPlacementTypes"
         && descriptor == "Lnet/minecraft/world/entity/SpawnPlacementType;"
     {
@@ -4008,6 +4102,49 @@ mod tests {
                 "boolean"
             ),
             "return (p0 & 0x80) != 0;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/InteractionResult",
+                "consumesAction",
+                "boolean"
+            ),
+            "return this instanceof InteractionResult.Success;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/InteractionResult$Success",
+                "shouldSwing",
+                "boolean"
+            ),
+            "return swingSource() != InteractionResult.SwingSource.NONE;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/InteractionResult$Success",
+                "heldItemTransformedTo",
+                "net.minecraft.world.item.ItemStack",
+                "()Lnet/minecraft/world/item/ItemStack;",
+            ),
+            "return itemContext().heldItemTransformedTo();"
+        );
+        assert_eq!(
+            runtime_field_default_named(
+                "net/minecraft/world/InteractionResult",
+                "SUCCESS_SERVER",
+                "Lnet/minecraft/world/InteractionResult$Success;",
+                "null",
+            ),
+            "new net.minecraft.world.InteractionResult.Success(net.minecraft.world.InteractionResult.SwingSource.SERVER_ONLY, net.minecraft.world.InteractionResult.ItemContext.DEFAULT)"
+        );
+        assert_eq!(
+            runtime_field_default_named(
+                "net/minecraft/world/InteractionResult$ItemContext",
+                "NONE",
+                "Lnet/minecraft/world/InteractionResult$ItemContext;",
+                "null",
+            ),
+            "new net.minecraft.world.InteractionResult.ItemContext(false, null)"
         );
         assert_eq!(
             runtime_body(
@@ -6950,6 +7087,87 @@ mod tests {
             access: 0x0001,
             kind: MemberKind::Method,
         }));
+    }
+
+    #[test]
+    fn interaction_result_facade_preserves_26_3_nested_value_shape() {
+        let class = Class {
+            name: "net/minecraft/world/InteractionResult".to_owned(),
+            access: 0x0201,
+            declared: vec![
+                Declared {
+                    name: "SUCCESS".to_owned(),
+                    descriptor: "Lnet/minecraft/world/InteractionResult$Success;".to_owned(),
+                    access: 0x0019,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "SUCCESS_SERVER".to_owned(),
+                    descriptor: "Lnet/minecraft/world/InteractionResult$Success;".to_owned(),
+                    access: 0x0019,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "CONSUME".to_owned(),
+                    descriptor: "Lnet/minecraft/world/InteractionResult$Success;".to_owned(),
+                    access: 0x0019,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "FAIL".to_owned(),
+                    descriptor: "Lnet/minecraft/world/InteractionResult$Fail;".to_owned(),
+                    access: 0x0019,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "PASS".to_owned(),
+                    descriptor: "Lnet/minecraft/world/InteractionResult$Pass;".to_owned(),
+                    access: 0x0019,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "TRY_WITH_EMPTY_HAND".to_owned(),
+                    descriptor: "Lnet/minecraft/world/InteractionResult$TryEmptyHandInteraction;"
+                        .to_owned(),
+                    access: 0x0019,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "consumesAction".to_owned(),
+                    descriptor: "()Z".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+            ],
+            ..Class::default()
+        };
+        let mut report = Report::default();
+        let source = render(
+            &class,
+            Some(&BTreeSet::from([(
+                "consumesAction".to_owned(),
+                "()Z".to_owned(),
+            )])),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut report,
+            false,
+            &[],
+        );
+        assert!(source.contains("public interface InteractionResult"));
+        assert!(source.contains("public static final net.minecraft.world.InteractionResult.Success SUCCESS = new net.minecraft.world.InteractionResult.Success"));
+        assert!(source.contains("InteractionResult.SwingSource.PREDICTED"));
+        assert!(source.contains("consumesAction()"));
+        assert!(source.contains("this instanceof InteractionResult.Success"));
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/InteractionResult$ItemContext",
+                "wasItemInteraction",
+                "boolean"
+            ),
+            "return wasItemInteraction;"
+        );
     }
 
     #[test]

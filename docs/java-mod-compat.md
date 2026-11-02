@@ -848,10 +848,11 @@ for bootstrap checks.
 `ItemStack.getUseAnimation()` now returns the deterministic `UseAnim.NONE` façade value, and `getTags()`
 returns a bounded empty stream alongside the existing count, copy, damage, component, and tag queries, keeping
 common item bootstrap branches linkable.
-`InteractionResult` keeps the common item and block callback contract linkable as well: `isSuccess`,
-`isAccepted`, `consumesAction`, `shouldSwing`, and `shouldAwardStats` preserve the enum's bounded state,
-while `sidedSuccess`, `success`, `consume`, `pass`, and `fail` return the matching façade values. The
-interaction result does not perform live server-side effects; those remain in the native hook boundary.
+`InteractionResult` keeps the common item and block callback contract linkable as well. Its sealed 26.3
+shape is represented by the nested `Success`, `Fail`, `Pass`, and `TryEmptyHandInteraction` records;
+`consumesAction`, `shouldSwing`, `wasItemInteraction`, and `heldItemTransformedTo` preserve their bounded
+state and item context, while the six public result constants are initialized to matching façade values.
+The interaction result does not perform live server-side effects; those remain in the native hook boundary.
 The `ItemStack.is(TagKey)` and `BlockState.is(TagKey)` overloads are also linked with an explicit empty
 membership result until registry-backed tag tables are attached.
 `TagKey` now retains its registry key and identifier as a value pair: `create`, `location`, `registry`,
