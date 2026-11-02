@@ -574,12 +574,14 @@ marker, whose `getName()` is `main`, `isDaemon()` is false, and `getContextClass
 native worker threads or a host class loader.
 That bootstrap class-loader marker supports bounded `getResource(String)` and
 `getResourceAsStream(String)` queries against resources explicitly seeded with
-`StdHost::with_resource`. Missing names return null, and the native host never
-opens files or consults the process classpath; `StdHost::resource` exposes the
+`StdHost::with_resource`. Missing names return null, and `getResources`/`getSystemResources` return empty
+explicit enumerations; the native host never opens files or consults the process classpath; `StdHost::resource` exposes the
 same marker lookup to a game-owned adapter. `StdHost::with_class` supplies the matching bounded
 `ClassLoader.loadClass` marker for a known binary or internal class name; missing classes remain explicit
 errors. `Class.forName` resolves only names already loaded from the current jar, preserving a useful
 reflection path without opening the process classpath.
+The same seeded resource table backs `ClassLoader.getResources` and `getSystemResources` through a
+bounded `Enumeration`; missing names are empty, and the host never scans additional classpath locations.
 The native host also exposes `StdHost::with_service_provider` for deterministic `ServiceLoader`
 fixtures. `ServiceLoader.load`/`loadInstalled` return a seeded service marker, `iterator()` yields the
 seeded provider class markers, and `reload()` is a bounded no-op; missing services remain explicit errors.
