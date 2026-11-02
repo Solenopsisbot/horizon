@@ -221,7 +221,7 @@ It does not repeal the other costs — object model, exceptions, GC, monitors, a
 
 The census now keeps the full descriptor on every member key and adds a
 `member_disposition` aggregate. References route to `facade` (`net/minecraft`),
-`loader` (`net/fabricmc`, `net/neoforged`, `net/minecraftforge`, or `org/quiltmc`), `jdk` (standard-library owners), or
+`loader` (`net/fabricmc`, `net/neoforged`, `net/minecraftforge`, Mixin, Mixin Extras, or `org/quiltmc`), `jdk` (standard-library owners), or
 `external`. This is a routing aid for the generated ABI: overloaded methods
 remain distinct in `members`, while the aggregate tells the next implementation
 queue whether to extend the façade, native loader host, JDK runtime, or a

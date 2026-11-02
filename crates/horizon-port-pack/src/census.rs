@@ -141,6 +141,11 @@ pub fn member_disposition(member: &classes::Member) -> AbiDisposition {
         // loader/transform layer and are part of the generated façade
         // contract, rather than an external carried dependency.
         || owner.starts_with("org/spongepowered/asm/mixin/")
+        // Mixin Extras is the companion injector library used by many Fabric
+        // and NeoForge mods. Its annotations and callback contracts belong to
+        // the same transform layer, so route them with Mixin rather than as a
+        // carried external dependency.
+        || owner.starts_with("com/llamalad7/mixinextras/")
         || owner.starts_with("org/quiltmc/")
     {
         AbiDisposition::Loader
@@ -1602,6 +1607,12 @@ mod tests {
         );
         assert_eq!(
             member_disposition(&member("org/spongepowered/asm/mixin/injection/Inject")),
+            AbiDisposition::Loader
+        );
+        assert_eq!(
+            member_disposition(&member(
+                "com/llamalad7/mixinextras/injector/wrapoperation/WrapOperation"
+            )),
             AbiDisposition::Loader
         );
         assert_eq!(
