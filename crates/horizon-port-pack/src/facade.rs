@@ -1978,6 +1978,30 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ) => {
                 return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof net.minecraft.resources.Identifier ? (net.minecraft.resources.Identifier) horizonValues.get(horizonReadIndex - 1) : new net.minecraft.resources.Identifier();".to_owned();
             }
+            (
+                "writeEnum",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(Ljava/lang/Enum;)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonValues.add(p0); return this;".to_owned();
+            }
+            ("readEnum", "java.lang.Enum", "(Ljava/lang/Class;)Ljava/lang/Enum;") => {
+                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof java.lang.Enum ? (java.lang.Enum) horizonValues.get(horizonReadIndex - 1) : null;".to_owned();
+            }
+            (
+                "writeNullable",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(Ljava/lang/Object;Ljava/util/function/BiConsumer;)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonValues.add(p0); return this;".to_owned();
+            }
+            (
+                "readNullable",
+                "java.lang.Object",
+                "(Ljava/util/function/Function;)Ljava/lang/Object;",
+            ) => {
+                return "return horizonReadIndex < horizonValues.size() ? horizonValues.get(horizonReadIndex++) : null;".to_owned();
+            }
             _ => {}
         }
     }
@@ -4151,6 +4175,33 @@ mod tests {
                 "()Lnet/minecraft/resources/Identifier;",
             ),
             "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof net.minecraft.resources.Identifier ? (net.minecraft.resources.Identifier) horizonValues.get(horizonReadIndex - 1) : new net.minecraft.resources.Identifier();"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "writeEnum",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(Ljava/lang/Enum;)Lnet/minecraft/network/FriendlyByteBuf;",
+            ),
+            "horizonValues.add(p0); return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "readEnum",
+                "java.lang.Enum",
+                "(Ljava/lang/Class;)Ljava/lang/Enum;",
+            ),
+            "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof java.lang.Enum ? (java.lang.Enum) horizonValues.get(horizonReadIndex - 1) : null;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "readNullable",
+                "java.lang.Object",
+                "(Ljava/util/function/Function;)Ljava/lang/Object;",
+            ),
+            "return horizonReadIndex < horizonValues.size() ? horizonValues.get(horizonReadIndex++) : null;"
         );
     }
 
