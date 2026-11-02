@@ -534,7 +534,7 @@ impl StdHost {
     pub fn listener_registrations(&self) -> impl Iterator<Item = &HostInvocation> {
         self.invocations.iter().filter(|invocation| {
             ((is_event_bus_owner(&invocation.method.owner)
-                && invocation.method.name == "addListener")
+                && matches!(invocation.method.name.as_str(), "addListener" | "register"))
                 || (invocation.method.owner == "net/fabricmc/fabric/api/event/Event"
                     && invocation.method.name == "register"))
                 && invocation.args.iter().any(|value| {
@@ -3808,7 +3808,7 @@ impl Host for StdHost {
                 let target = Self::argument(r, args, 0)?.clone();
                 self.invocations.retain(|invocation| {
                     let listener = (is_event_bus_owner(&invocation.method.owner)
-                        && invocation.method.name == "addListener")
+                        && matches!(invocation.method.name.as_str(), "addListener" | "register"))
                         || (invocation.method.owner == "net/fabricmc/fabric/api/event/Event"
                             && invocation.method.name == "register");
                     !listener || !invocation.args.iter().any(|value| value == &target)
@@ -13402,6 +13402,29 @@ mandatory = true
             )
             .unwrap(),
             Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn standard_host_tracks_forge_register_object_listeners() {
+        let mut host = StdHost::new();
+        let bus = Value::Ref(Some("forge-event-bus".into()));
+        let register = MethodRef {
+            owner: "net/minecraftforge/eventbus/api/IEventBus".into(),
+            name: "register".into(),
+            descriptor: "(Ljava/lang/Object;)Lnet/minecraftforge/eventbus/api/IEventBus;".into(),
+        };
+        host.invoke_instance(
+            &register,
+            &bus,
+            &[Value::Ref(Some("@indy:forge-static-handler".into()))],
+        )
+        .unwrap();
+        let dispatches = host.dispatch_event(Value::Ref(Some("forge-event".into())));
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(
+            dispatches[0].listener.method.owner,
+            "net/minecraftforge/eventbus/api/IEventBus"
         );
     }
 
