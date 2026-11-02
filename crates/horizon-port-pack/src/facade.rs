@@ -3318,6 +3318,7 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             "withPrefix" => "return new Identifier(horizonNamespace, p0 + horizonPath);".to_owned(),
             "withSuffix" => "return new Identifier(horizonNamespace, horizonPath + p0);".to_owned(),
             "toString" => "return horizonNamespace + \":\" + horizonPath;".to_owned(),
+            "compareTo" if ret == "int" => "return toString().compareTo(p0.toString());".to_owned(),
             "toLanguageKey" if descriptor == "(Ljava/lang/String;)Ljava/lang/String;" => "return p0 + \".\" + horizonNamespace + \".\" + horizonPath.replace('/', '.');".to_owned(),
             "toLanguageKey" => "return horizonNamespace + \".\" + horizonPath.replace('/', '.');".to_owned(),
             "toShortString" => "return horizonNamespace.equals(\"minecraft\") ? horizonPath : horizonNamespace + \"/\" + horizonPath;".to_owned(),
@@ -3939,6 +3940,15 @@ mod tests {
                 "(Ljava/lang/String;)Ljava/lang/String;",
             ),
             "return p0 + \".\" + horizonNamespace + \".\" + horizonPath.replace('/', '.');"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/resources/Identifier",
+                "compareTo",
+                "int",
+                "(Ljava/lang/Object;)I",
+            ),
+            "return toString().compareTo(p0.toString());"
         );
         assert!(
             runtime_body("net/minecraft/network/VarInt", "getByteSize", "int")
