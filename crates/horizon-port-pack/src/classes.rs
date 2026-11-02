@@ -646,10 +646,15 @@ fn injection_kind(ty: &str) -> Option<&'static str> {
         "ModifyArg" => "modify-arg",
         "ModifyArgs" => "modify-args",
         "ModifyConstant" => "modify-constant",
+        // Mixin Extras uses the singular `ModifyConst` spelling in older
+        // releases; normalize it to the same report bucket as Mixin's
+        // `ModifyConstant` injector.
+        "ModifyConst" => "modify-constant",
         "ModifyExpressionValue" => "modify-expression-value",
         "ModifyReceiver" => "modify-receiver",
         "ModifyReturnValue" => "modify-return-value",
         "WrapOperation" => "wrap-operation",
+        "WrapMethod" => "wrap-method",
         "WrapWithCondition" => "wrap-with-condition",
         "Overwrite" => "overwrite",
         "Accessor" => "accessor",
@@ -1182,6 +1187,18 @@ mod tests {
         assert!(!c.mixin);
         assert!(parse(&bytes[..bytes.len() - 3]).is_none());
         assert!(parse(b"not a class").is_none());
+    }
+
+    #[test]
+    fn normalizes_mixin_extras_injector_names() {
+        assert_eq!(
+            injection_kind("Lcom/llamalad7/mixinextras/injector/WrapMethod;"),
+            Some("wrap-method")
+        );
+        assert_eq!(
+            injection_kind("Lcom/llamalad7/mixinextras/injector/ModifyConst;"),
+            Some("modify-constant")
+        );
     }
 
     #[test]
