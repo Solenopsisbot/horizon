@@ -2156,8 +2156,13 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
                 return "return java.util.Optional.empty();".to_owned();
             }
             ("canSerializeIn", "boolean") => return "return false;".to_owned(),
-            ("empty" | "direct" | "list" | "named", "net.minecraft.core.HolderSet") => {
+            ("empty" | "list" | "named", "net.minecraft.core.HolderSet") => {
                 return "return new net.minecraft.core.HolderSet() {};".to_owned();
+            }
+            ("direct", "net.minecraft.core.HolderSet")
+                if descriptor == "(Lnet/minecraft/core/Holder;)Lnet/minecraft/core/HolderSet;" =>
+            {
+                return "return new net.minecraft.core.HolderSet() { public int size() { return 1; } public boolean isEmpty() { return false; } public boolean contains(net.minecraft.core.Holder value) { return value == p0; } public java.util.stream.Stream stream() { return java.util.stream.Stream.of(p0); } public net.minecraft.core.Holder get(int index) { return index == 0 ? p0 : null; } };".to_owned();
             }
             _ => {}
         }
@@ -2408,6 +2413,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             {
                 return "horizonValues.put(p0, p1);".to_owned();
             }
+            "putByteArray" if descriptor == "(Ljava/lang/String;[B)V" => {
+                return "horizonValues.put(p0, p1 == null ? new byte[0] : p1.clone());".to_owned();
+            }
             "put"
                 if descriptor
                     == "(Ljava/lang/String;Lnet/minecraft/nbt/Tag;)Lnet/minecraft/nbt/Tag;" =>
@@ -2437,6 +2445,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             }
             "getDouble" if descriptor == "(Ljava/lang/String;)D" => {
                 return "return horizonValues.get(p0) instanceof Number ? ((Number) horizonValues.get(p0)).doubleValue() : 0.0d;".to_owned();
+            }
+            "getByteArray" if descriptor == "(Ljava/lang/String;)[B" => {
+                return "Object value = horizonValues.get(p0); return value instanceof byte[] ? ((byte[]) value).clone() : new byte[0];".to_owned();
             }
             "get" if descriptor == "(Ljava/lang/String;)Lnet/minecraft/nbt/Tag;" => {
                 return "Object value = horizonValues.get(p0); return value instanceof net.minecraft.nbt.Tag ? (net.minecraft.nbt.Tag) value : null;".to_owned();
@@ -4819,6 +4830,24 @@ mod tests {
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/nbt/CompoundTag",
+                "putByteArray",
+                "void",
+                "(Ljava/lang/String;[B)V",
+            ),
+            "horizonValues.put(p0, p1 == null ? new byte[0] : p1.clone());"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/nbt/CompoundTag",
+                "getByteArray",
+                "byte[]",
+                "(Ljava/lang/String;)[B",
+            ),
+            "Object value = horizonValues.get(p0); return value instanceof byte[] ? ((byte[]) value).clone() : new byte[0];"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/nbt/CompoundTag",
                 "getList",
                 "net.minecraft.nbt.ListTag",
                 "(Ljava/lang/String;I)Lnet/minecraft/nbt/ListTag;",
@@ -4972,7 +5001,7 @@ mod tests {
                 "net.minecraft.core.HolderSet",
                 "(Lnet/minecraft/core/Holder;)Lnet/minecraft/core/HolderSet;",
             ),
-            "return new net.minecraft.core.HolderSet() {};"
+            "return new net.minecraft.core.HolderSet() { public int size() { return 1; } public boolean isEmpty() { return false; } public boolean contains(net.minecraft.core.Holder value) { return value == p0; } public java.util.stream.Stream stream() { return java.util.stream.Stream.of(p0); } public net.minecraft.core.Holder get(int index) { return index == 0 ? p0 : null; } };"
         );
     }
 

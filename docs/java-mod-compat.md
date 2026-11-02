@@ -271,7 +271,7 @@ six bounds with size, containment, center, inflation, and directional expansion 
 Component factories now preserve literal and translatable text in `MutableComponent` values; `getString`,
 `append`, and `copy` keep the common display-name bootstrap path alive.
 `CompoundTag` now has a bounded value path for scalar `putString`, `putInt`, `putBoolean`, `putLong`,
-`putByte`, `putShort`, `putFloat`, and `putDouble`, with matching reads, `contains`, `isEmpty`, `size`,
+`putByte`, `putShort`, `putFloat`, `putDouble`, and bounded byte-array round trips, with matching reads, `contains`, `isEmpty`, `size`,
 `remove`, `copy`, and `getAllKeys`, backed by a Java-owned map. Numeric reads accept any boxed
 `Number`, so common NBT bootstrap code can read a value written with a narrower type. `put`/`get`
 preserve nested `Tag` references, `getCompound` returns the nested value or an empty façade tag, and
@@ -698,7 +698,8 @@ membership result until registry-backed tag tables are attached.
 `TagKey` now retains its registry key and identifier as a value pair: `create`, `location`, `registry`,
 `isFor`, equality, hashing, and string conversion operate on those fields. This keeps tag-backed block,
 item, and entity registration code from collapsing distinct tags into one neutral object; holder-set
-queries now have empty-safe bounded defaults, while live cross-mod membership remains outside the façade.
+queries now have empty-safe bounded defaults, while `HolderSet.direct` preserves a singleton holder's
+size, identity membership, stream, and indexed access. Live cross-mod membership remains outside the façade.
 `ResourceKey` exposes the corresponding `location`, `registry`, `registryKey`, and `isFor` value operations,
 so code that compares a registry family or resolves an entry's identifier keeps its namespace/path identity
 through the generated façade. Generated `Registry`/`DefaultedRegistry` values now retain bounded
