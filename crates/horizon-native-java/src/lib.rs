@@ -2438,7 +2438,8 @@ impl Host for StdHost {
                 Ok(path_value(name))
             }
             ("java/lang/Class", "getName", "()Ljava/lang/String;")
-            | ("java/lang/Class", "getTypeName", "()Ljava/lang/String;") => {
+            | ("java/lang/Class", "getTypeName", "()Ljava/lang/String;")
+            | ("java/lang/Class", "getCanonicalName", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(class_binary_name(receiver))))
             }
             ("java/lang/Class", "getSimpleName", "()Ljava/lang/String;") => {
@@ -10640,6 +10641,15 @@ mandatory = true
         };
         assert_eq!(
             host.invoke_instance(&get_name, &class, &[]).unwrap(),
+            Value::Ref(Some("demo.Bootstrap".into()))
+        );
+        let canonical_name = MethodRef {
+            owner: "java/lang/Class".into(),
+            name: "getCanonicalName".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&canonical_name, &class, &[]).unwrap(),
             Value::Ref(Some("demo.Bootstrap".into()))
         );
         let simple_name = MethodRef {
