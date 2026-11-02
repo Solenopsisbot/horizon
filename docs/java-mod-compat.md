@@ -503,7 +503,8 @@ value semantics for loader bootstrap code, while unresolved callbacks remain exp
 `toAbsolutePath` calls use deterministic path markers. Common `List.of`, `Set.of`, `Map.of`, empty/singleton
 `Collections` factories, and bounded `size`, `isEmpty`, `contains`, `containsAll`, `get`, `Map.get`, `Map.getOrDefault`, and
 key/value queries use escaped value markers; `Map.keySet`, `Map.values`, and `Collection.iterator` project those markers into bounded
-set/list views, so bootstrap code can inspect immutable configuration collections without starting a JVM. Boxed
+set/list views, while `Collection.forEach` invokes bounded `Consumer` callbacks, so bootstrap code can inspect
+immutable configuration collections without starting a JVM. Boxed
 `Integer` and `Boolean` values preserve deterministic markers through `valueOf`, unboxing,
 equality, hashing, and string conversion. Bounded `Double` and `Float` parsing, boxing, unboxing,
 `isNaN`/`isInfinite`, and Java-style string conversion use deterministic floating-point markers;
@@ -528,7 +529,7 @@ listener lambdas arrive as captured `@indy:...` markers in the recorded invocati
 those listeners through `dispatch_event` and records deterministic `RegistryEntry` values and holder lookups,
 which is the first dispatchable host contract. `NativeJar::execute_dispatch` now resolves supported callback
 targets, restores captured receivers, appends the event, and invokes the callback through the bounded native
-interpreter. The host also carries the common `Identifier`/`ResourceKey` value operations (parse, namespace,
+interpreter. The host also carries the common `Identifier`/`ResourceLocation`/`ResourceKey` value operations (parse, namespace,
 path, short/language keys, suffixes, equality, key identifiers, and the common identity path-function
 callback) as deterministic markers. The native host also carries the text-bearing
 `Component`/`MutableComponent` subset (`literal`, translatable factories, `getString`, `append`, and
@@ -543,7 +544,8 @@ work-item surface. This keeps Fabric callback registration observable without pr
 an arbitrary event combiner in the bounded host. NeoForge `IEventBus.post` also records posted event
 values and returns a deterministic cancellation result for the explicit `event/cancelled/...`,
 `cancelled/...`, and `@cancelled:...` markers; full event hierarchy and mutable cancellation state
-remain a native hook boundary. `PayloadRegistrar` calls now retain a bounded direction/type/codec/handler
+remain a native hook boundary. Event callbacks can query inherited `isCanceled()` against those markers;
+changing cancellation still belongs to the native hook boundary. `PayloadRegistrar` calls now retain a bounded direction/type/codec/handler
 record through `StdHost::payload_registrations`, leaving byte encoding and channel ownership to Horizon's
 network boundary.
 The generated NeoForge `DeferredHolder` façade now retains its id, registry key, and lazy supplier: `get`,

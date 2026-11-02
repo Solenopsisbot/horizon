@@ -864,8 +864,12 @@ impl Host for StdHost {
             ("java/nio/file/Paths", "get", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
                 Ok(path_value(expect_string(Self::argument(r, args, 0)?)))
             }
-            ("net/minecraft/resources/Identifier", name, descriptor)
-                if descriptor.ends_with("Lnet/minecraft/resources/Identifier;") =>
+            (
+                "net/minecraft/resources/Identifier" | "net/minecraft/resources/ResourceLocation",
+                name,
+                descriptor,
+            ) if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
+                || descriptor.ends_with("Lnet/minecraft/resources/ResourceLocation;") =>
             {
                 let value = match name {
                     "fromNamespaceAndPath" | "tryBuild" => {
@@ -1088,6 +1092,28 @@ impl Host for StdHost {
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
+            if r.name == "forEach"
+                && r.descriptor == "(Ljava/util/function/Consumer;)V"
+                && !is_map_owner(&r.owner)
+            {
+                let callback = Self::argument(r, args, 0)?.clone();
+                let values = host_collection_values(self, receiver)?
+                    .into_iter()
+                    .map(|value| parse_collection_value(&value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for value in values {
+                    self.invoke_instance(
+                        &MethodRef {
+                            owner: "java/util/function/Consumer".into(),
+                            name: "accept".into(),
+                            descriptor: "(Ljava/lang/Object;)V".into(),
+                        },
+                        &callback,
+                        &[value],
+                    )?;
+                }
+                return Ok(Value::Void);
+            }
             match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
                 (_, "<init>", _) => {
                     self.ensure_mutable_collection(receiver);
@@ -1581,6 +1607,14 @@ impl Host for StdHost {
                 }
                 _ => {}
             }
+        }
+        // NeoForge event subclasses inherit this query from the common event
+        // base, but javac may emit the concrete subclass as the owner. Keep
+        // the marker-based cancellation state visible regardless of that
+        // symbolic owner choice; mutating cancellation remains a game-host
+        // responsibility.
+        if r.name == "isCanceled" && r.descriptor == "()Z" {
+            return Ok(Value::Int(event_is_cancelled(receiver) as i32));
         }
         if r.name == "iterator"
             && r.descriptor == "()Ljava/util/Iterator;"
@@ -2355,7 +2389,11 @@ impl Host for StdHost {
                 expect_ref(receiver).is_some_and(|marker| marker.starts_with("@indy:")) as i32,
             )),
             ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => Ok(Value::Ref(None)),
-            ("net/minecraft/resources/Identifier", name, descriptor) => {
+            (
+                "net/minecraft/resources/Identifier" | "net/minecraft/resources/ResourceLocation",
+                name,
+                descriptor,
+            ) => {
                 let (namespace, path) = identifier_parts(receiver);
                 match (name, descriptor) {
                     ("getNamespace", "()Ljava/lang/String;") => {
@@ -2376,16 +2414,21 @@ impl Host for StdHost {
                         "{namespace}.{}",
                         path.replace('/', ".")
                     )))),
-                    ("withSuffix", "(Ljava/lang/String;)Lnet/minecraft/resources/Identifier;") => {
+                    ("withSuffix", descriptor)
+                        if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
+                            || descriptor
+                                .ends_with("Lnet/minecraft/resources/ResourceLocation;") =>
+                    {
                         Ok(identifier_value(
                             namespace,
                             &format!("{path}{}", expect_string(Self::argument(r, args, 0)?)),
                         ))
                     }
-                    (
-                        "withPath",
-                        "(Ljava/util/function/UnaryOperator;)Lnet/minecraft/resources/Identifier;",
-                    ) => {
+                    ("withPath", descriptor)
+                        if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
+                            || descriptor
+                                .ends_with("Lnet/minecraft/resources/ResourceLocation;") =>
+                    {
                         let apply = MethodRef {
                             owner: "java/util/function/UnaryOperator".into(),
                             name: "apply".into(),
@@ -2414,12 +2457,16 @@ impl Host for StdHost {
             ("net/minecraft/resources/ResourceKey", name, descriptor) => {
                 let marker = expect_string(receiver);
                 match (name, descriptor) {
-                    ("identifier", "()Lnet/minecraft/resources/Identifier;") => {
-                        Ok(identifier_value("minecraft", marker))
-                    }
-                    ("registry", "()Lnet/minecraft/resources/Identifier;") => {
-                        Ok(identifier_value("minecraft", marker))
-                    }
+                    (
+                        "identifier",
+                        "()Lnet/minecraft/resources/Identifier;"
+                        | "()Lnet/minecraft/resources/ResourceLocation;",
+                    ) => Ok(identifier_value("minecraft", marker)),
+                    (
+                        "registry",
+                        "()Lnet/minecraft/resources/Identifier;"
+                        | "()Lnet/minecraft/resources/ResourceLocation;",
+                    ) => Ok(identifier_value("minecraft", marker)),
                     ("hashCode", "()I") => Ok(Value::Int(stable_hash(marker))),
                     _ => Ok(Value::default_for(&r.descriptor)),
                 }
@@ -7012,6 +7059,27 @@ mandatory = true
                 .unwrap(),
             Value::Int(1)
         );
+        let collection_for_each = MethodRef {
+            owner: "java/util/Collection".into(),
+            name: "forEach".into(),
+            descriptor: "(Ljava/util/function/Consumer;)V".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &collection_for_each,
+                &list,
+                &[Value::Ref(Some("@indy:list-consumer".into()))],
+            )
+            .unwrap(),
+            Value::Void
+        );
+        assert_eq!(
+            host.calls()
+                .iter()
+                .filter(|call| call.owner == "java/util/function/Consumer" && call.name == "accept")
+                .count(),
+            2
+        );
         let map_of = MethodRef {
             owner: "java/util/Map".into(),
             name: "of".into(),
@@ -8229,6 +8297,25 @@ mandatory = true
             .invoke(&parse, &[Value::Ref(Some("ruby:lamp".into()))])
             .unwrap();
         assert_eq!(id, Value::Ref(Some("identifier/ruby:lamp".into())));
+        let modern_parse = MethodRef {
+            owner: "net/minecraft/resources/ResourceLocation".into(),
+            name: "parse".into(),
+            descriptor: "(Ljava/lang/String;)Lnet/minecraft/resources/ResourceLocation;".into(),
+        };
+        let modern_id = host
+            .invoke(&modern_parse, &[Value::Ref(Some("ruby:lamp".into()))])
+            .unwrap();
+        assert_eq!(modern_id, id);
+        let modern_string = MethodRef {
+            owner: "net/minecraft/resources/ResourceLocation".into(),
+            name: "toString".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&modern_string, &modern_id, &[])
+                .unwrap(),
+            Value::Ref(Some("ruby:lamp".into()))
+        );
         let path = MethodRef {
             owner: "net/minecraft/resources/Identifier".into(),
             name: "getPath".into(),
@@ -8281,6 +8368,15 @@ mandatory = true
             host.invoke_instance(&key_id, &key, &[]).unwrap(),
             Value::Ref(Some(_))
         ));
+        let key_id_modern = MethodRef {
+            owner: "net/minecraft/resources/ResourceKey".into(),
+            name: "identifier".into(),
+            descriptor: "()Lnet/minecraft/resources/ResourceLocation;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&key_id_modern, &key, &[]).unwrap(),
+            host.invoke_instance(&key_id, &key, &[]).unwrap()
+        );
     }
 
     #[test]
@@ -9786,6 +9882,24 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(&invoker, &event, &[]).unwrap(),
             Value::Ref(Some("fabric-event/0/invoker".into()))
+        );
+        let is_canceled = MethodRef {
+            owner: "demo/Event".into(),
+            name: "isCanceled".into(),
+            descriptor: "()Z".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&is_canceled, &event, &[]).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &is_canceled,
+                &Value::Ref(Some("event/cancelled/demo".into())),
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1)
         );
     }
 
