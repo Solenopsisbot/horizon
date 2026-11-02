@@ -7461,7 +7461,7 @@ fn parse_neoforge_metadata(
         match (section, key) {
             (Section::Mods, "modId") if id.is_none() => id = Some(value.to_owned()),
             (Section::Mods, "version") if version.is_none() => version = Some(value.to_owned()),
-            (Section::Mods, "clientSideOnly") if id.is_some() => {
+            (Section::Mods, "clientSideOnly") => {
                 client_side_only = value.eq_ignore_ascii_case("true");
             }
             (Section::Dependency, "modId") => dependency = Some(value.to_owned()),
@@ -7924,9 +7924,9 @@ mod tests {
 modLoader = "javafml"
 
 [[mods]]
+clientSideOnly = true
 modId = "ruby"
 version = "1.2.3"
-clientSideOnly = true
 
 [[dependencies.ruby]]
 modId = "neoforge"

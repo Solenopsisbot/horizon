@@ -683,8 +683,11 @@ mod tests {
         let jar_path = root.join("client-only-neoforge.jar");
         let file = std::fs::File::create(&jar_path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        zip.start_file("META-INF/neoforge.mods.toml", zip::write::SimpleFileOptions::default())
-            .unwrap();
+        zip.start_file(
+            "META-INF/neoforge.mods.toml",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
         zip.write_all(
             br#"[[mods]]
 modId = "client_only"

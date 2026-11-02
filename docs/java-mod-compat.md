@@ -617,7 +617,7 @@ primitive-optional paths with `isPresent`, `isEmpty`, extraction, `orElse`, `equ
 `toAbsolutePath` calls use deterministic path markers. Common `List.of`, `Set.of`, `Map.of`, empty/singleton
 `Collections` factories, and bounded `size`, `isEmpty`, `contains`, `containsAll`, `get`, `Map.get`, `Map.getOrDefault`, and
 key/value queries use escaped value markers; `Map.keySet`, `Map.values`, `Map.entrySet`/`Map.Entry`, and `Collection.iterator` project those markers into bounded
-set/list views, while `Collection.forEach` invokes bounded `Consumer` callbacks, so bootstrap code can inspect
+set/list views; `Iterator.forEachRemaining` drains a bounded iterator through the callback bridge, while `Collection.forEach` invokes bounded `Consumer` callbacks, so bootstrap code can inspect
 immutable configuration collections without starting a JVM. Boxed
 `Arrays.asList(Object[])` is also available for bootstrap varargs; it preserves the opaque array marker as one bounded list value
 instead of exposing runtime-owned array storage.
