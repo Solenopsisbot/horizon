@@ -542,7 +542,7 @@ fn injections(
                         .join("|")
                 })
                 .unwrap_or_default();
-            let metadata_values = [
+            let metadata_values: BTreeMap<String, String> = [
                 "require",
                 "expect",
                 "cancellable",
@@ -558,6 +558,29 @@ fn injections(
                     .map(|value| (field.to_owned(), value))
             })
             .collect();
+            let group = annotations
+                .iter()
+                .find(|annotation| annotation_simple(annotation.ty.as_str()) == "Group")
+                .and_then(group_metadata);
+            let mut metadata_values = metadata_values;
+            if let Some(group) = group {
+                metadata_values.insert("group".to_owned(), group);
+            }
+            let mut metadata = [
+                "require",
+                "expect",
+                "cancellable",
+                "order",
+                "priority",
+                "slice",
+            ]
+            .into_iter()
+            .filter(|field| a.values.contains_key(*field))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+            if metadata_values.contains_key("group") {
+                metadata.push("group".to_owned());
+            }
             out.push(Injection {
                 kind: kind.to_owned(),
                 method: if method.is_empty() {
@@ -566,18 +589,7 @@ fn injections(
                     method
                 },
                 at,
-                metadata: [
-                    "require",
-                    "expect",
-                    "cancellable",
-                    "order",
-                    "priority",
-                    "slice",
-                ]
-                .into_iter()
-                .filter(|field| a.values.contains_key(*field))
-                .map(str::to_owned)
-                .collect(),
+                metadata,
                 metadata_values,
             });
         }
@@ -659,6 +671,24 @@ fn metadata_text(value: &Value) -> Option<String> {
         return Some("present".to_owned());
     }
     scalar_text(value)
+}
+
+fn annotation_simple(ty: &str) -> &str {
+    ty.trim_start_matches('L')
+        .trim_end_matches(';')
+        .rsplit('/')
+        .next()
+        .unwrap_or(ty)
+}
+
+fn group_metadata(annotation: &Annotation) -> Option<String> {
+    let mut values = Vec::new();
+    for key in ["name", "min", "max", "log"] {
+        if let Some(value) = annotation.values.get(key).and_then(scalar_text) {
+            values.push(format!("{key}:{value}"));
+        }
+    }
+    Some(values.join("|"))
 }
 
 /// The simple name of a Mixin annotation, if it is one.
@@ -1334,6 +1364,31 @@ mod tests {
         assert_eq!(
             parsed[0].metadata_values.get("slice").map(String::as_str),
             Some("from:head|to:tail")
+        );
+    }
+
+    #[test]
+    fn injection_metadata_preserves_group_constraints() {
+        let group = Annotation {
+            ty: "Lorg/spongepowered/asm/mixin/injection/Group;".to_owned(),
+            values: BTreeMap::from([
+                ("name".to_owned(), Value::Str("interaction".to_owned())),
+                ("min".to_owned(), Value::Number(1.0)),
+                ("max".to_owned(), Value::Number(2.0)),
+                ("log".to_owned(), Value::Bool(true)),
+            ]),
+        };
+        let inject = Annotation {
+            ty: "Lorg/spongepowered/asm/mixin/injection/Inject;".to_owned(),
+            values: BTreeMap::from([("method".to_owned(), Value::Str("tick()V".to_owned()))]),
+        };
+        let methods = BTreeMap::from([("run".to_owned(), vec![group, inject])]);
+        let parsed = injections(&methods, &BTreeMap::new());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].metadata, ["group"]);
+        assert_eq!(
+            parsed[0].metadata_values.get("group").map(String::as_str),
+            Some("name:interaction|min:1|max:2|log:true")
         );
     }
 

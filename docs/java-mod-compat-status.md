@@ -23,7 +23,7 @@ Last checked: 3 November 2026, commit `bf83a4da0`.
 - [x] Preserve bounded Throwable/Exception/Error messages and cause markers, including `getMessage`, `getCause`, `initCause`, and `toString` diagnostics.
 - [x] Mirror the common `Locale.US` integer grouping path used by the native statistics screen without emulating arbitrary locale patterns.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs, array-returning signatures, common `Identifier` prefix/language-key/ordering helpers, Holder serialization queries, TagKey values, `HitResult`/`BlockHitResult` state and copy factories, `InteractionHand` name/opposite semantics, and the sealed 26.3 `InteractionResult` value records and constants.
-- [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, Mixin `@At` values and bounded `args` selectors, slice boundary/value preservation, top-level and nested `injectors` config edge values, and Mixin Extras injector normalization, loader ABI classification, access-widener/access-transformer discovery, Mojang support-API façade classification, and explicit report-only diagnostics.
+- [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, Mixin `@At` values and bounded `args` selectors, report-only `@Group` constraints, slice boundary/value preservation, top-level and nested `injectors` config edge values, and Mixin Extras injector normalization, loader ABI classification, access-widener/access-transformer discovery, Mojang support-API façade classification, and explicit report-only diagnostics.
 
 ## Partial or report-only
 
