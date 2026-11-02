@@ -533,7 +533,9 @@ are also deterministic, covering namespace/path normalization used by loader met
 counts are bounded to keep native probes finite.
 Throwable and common Exception/Error subclasses retain constructor message and cause markers, with bounded
 `getMessage`, `getCause`, `initCause`, and `toString` accessors for loader diagnostics; stack traces and arbitrary
-throw/catch control flow remain outside this surface.
+throw/catch control flow remain outside this surface. The embedded JVM runner labels
+`UnsupportedOperationException`, dynamic classpath failures, and missing façade members such as
+`NoSuchMethodError`/`NoSuchFieldError` as explicit fallback diagnostics instead of opaque entrypoint errors.
 `System.getProperties()` exposes the seeded properties as a bounded `Properties` map, so bootstrap code
 can use the same key/value queries as `getProperty` without crossing the host boundary.
 `System.getenv(String)` and the no-argument `System.getenv()` map are likewise backed only by values explicitly

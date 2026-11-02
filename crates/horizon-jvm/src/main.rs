@@ -538,6 +538,10 @@ fn fallback_label(class: &str, detail: Option<&str>) -> Option<String> {
             "JVM fallback selected for dynamic classpath lookup{}",
             detail.map_or_else(String::new, |value| format!(": {value}"))
         )),
+        "java.lang.NoSuchMethodError" | "java.lang.NoSuchFieldError" => Some(format!(
+            "JVM fallback selected for missing façade member{}",
+            detail.map_or_else(String::new, |value| format!(": {value}"))
+        )),
         _ => None,
     }
 }
@@ -791,6 +795,20 @@ mod tests {
         assert_eq!(
             fallback_label("java.lang.IllegalStateException", None),
             None
+        );
+        assert_eq!(
+            fallback_label(
+                "java.lang.NoSuchMethodError",
+                Some("dev.horizon.Native#missing")
+            ),
+            Some(
+                "JVM fallback selected for missing façade member: dev.horizon.Native#missing"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            fallback_label("java.lang.NoSuchFieldError", None),
+            Some("JVM fallback selected for missing façade member".to_owned())
         );
     }
 
