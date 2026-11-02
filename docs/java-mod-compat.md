@@ -217,13 +217,13 @@ until a deliberately bounded native contract with explicitly seeded providers is
 
 ## Phase 1, first slice (measured 1 November 2026)
 
-The native path has a checked-in smoke fixture at
-`crates/horizon-native-java/tests/fixtures/fixture-registry.jar`. It is a small Fabric jar with a real
-`fabric.mod.json` entrypoint, a classpath resource, and a typed item declaration in
-`META-INF/horizon-native.json`. `fixture_registry.rs` loads the jar, discovers and executes its
-entrypoint, seeds the resource through the bounded host, and hands the declaration to a typed registry
-sink. This keeps the loader, resource, and registry boundaries deterministic without depending on a
-player's installed jars.
+The native path has a deterministic smoke fixture in
+`crates/horizon-native-java/tests/fixture_registry.rs`. The test builds a small Fabric jar at runtime
+with a real `fabric.mod.json` entrypoint, a classpath resource, and a typed item declaration in
+`META-INF/horizon-native.json`; it then discovers and executes the entrypoint, seeds the resource through
+the bounded host, and hands the declaration to a typed registry sink. This keeps the loader, resource,
+and registry boundaries deterministic without depending on a player's installed jars or committing a
+binary artifact.
 
 The attach path is real: a mod's entrypoint runs on an embedded JVM against a generated façade.
 
