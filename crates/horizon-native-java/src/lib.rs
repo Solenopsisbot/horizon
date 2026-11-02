@@ -5550,6 +5550,11 @@ impl<H: Host> Runtime<'_, H> {
             }
             ("count", "()J") => Value::Int(values.len() as i32),
             ("toList", "()Ljava/util/List;") => collection_value("list", &values),
+            ("toArray", "()[Ljava/lang/Object;") => {
+                let marker = self.new_array(class, method);
+                self.arrays.insert(marker.clone(), values);
+                Value::Ref(Some(marker))
+            }
             ("isEmpty", "()Z") => Value::Int(values.is_empty() as i32),
             ("forEach", "(Ljava/util/function/Consumer;)V") => {
                 let callback = StdHost::argument(r, args, 0)?;
@@ -11214,6 +11219,35 @@ mandatory = true
                 "list",
                 &[Value::Ref(Some("alpha".into())), Value::Int(2)],
             ))
+        );
+        let array = runtime
+            .invoke_stream(
+                &MethodRef {
+                    owner: "java/util/stream/Stream".into(),
+                    name: "toArray".into(),
+                    descriptor: "()[Ljava/lang/Object;".into(),
+                },
+                Some(&distinct),
+                &[],
+                "demo/Stream",
+                "probe",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            runtime
+                .invoke_reflect_array(
+                    &MethodRef {
+                        owner: "java/lang/reflect/Array".into(),
+                        name: "getLength".into(),
+                        descriptor: "(Ljava/lang/Object;)I".into(),
+                    },
+                    std::slice::from_ref(&array),
+                    "demo/Stream",
+                    "probe",
+                )
+                .unwrap(),
+            Some(Value::Int(2))
         );
     }
 
