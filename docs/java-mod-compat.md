@@ -467,7 +467,7 @@ startup rather than silently entering the native registries.
 
 The embedded JVM runner treats a discovered `neoforge` entrypoint as constructor-only, invoking the
 mod constructor and optional Mixin `onLoad` hook without fabricating a Fabric `onInitialize` call.
-The game-facing startup test covers the corresponding native `--java-mod` content path.
+The game-facing startup tests cover the corresponding native `--java-mod` content path, client/server role rejection, and typed metadata merge behavior.
 
 The façade now also has the first NeoForge registration boundary: `FMLJavaModLoadingContext.get()` and
 `getModEventBus()` yield neutral context and bus values, `IEventBus` fluent registration returns its receiver,

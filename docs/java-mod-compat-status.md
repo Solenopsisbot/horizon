@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `37266bf0a`.
+Last checked: 3 November 2026, commit `972b33841`.
 
 ## Supported now
 
@@ -19,7 +19,7 @@ Last checked: 3 November 2026, commit `37266bf0a`.
 - [x] Provide common Java wrapper/string/collection operations used by loader bootstrap code, including integer/long/float/double/byte/short/character conversion, `Number` accessors, checked math, seeded `System.currentTimeMillis`/`identityHashCode`, seeded `System.getProperty(key, default)` and `System.getenv` queries, deterministic `Thread.currentThread`/`getName`/`isDaemon`/`getContextClassLoader` markers, bounded callback combinators, `Arrays.asList`, `Objects.hashCode`/`requireNonNullElse`, and a restricted `String.format` subset.
 - [x] Provide bounded `ClassLoader.getResource`/`getResourceAsStream` markers from explicitly seeded `StdHost::with_resource` entries, explicitly seeded `ClassLoader.loadClass` markers, current-jar `Class.forName`, and explicitly seeded `ServiceLoader` providers and iterators; these queries never scan host files or the process classpath.
 - [x] Maintain deterministic Fabric jar fixtures covering entrypoint execution, seeded resources, typed registry declarations, unknown-kind diagnostics, an invokedynamic event listener dispatch, and the Horizon typed content adapter/content-planning path.
-- [x] Maintain runtime-built legacy Forge fixtures covering `mods.toml`, `@Mod` discovery, `DeferredRegister`, `SimpleChannel.registerMessage`, event-bus listener dispatch, and the game-facing `--java-mod` content path; this remains probe coverage rather than live Forge runtime support.
+- [x] Maintain runtime-built legacy Forge fixtures covering `mods.toml`, `@Mod` discovery, `DeferredRegister`, `SimpleChannel.registerMessage`, event-bus listener dispatch, and the game-facing `--java-mod` content path; role selection and typed-registration merge behavior are also covered.
 - [x] Preserve bounded Throwable/Exception/Error messages and cause markers, including `getMessage`, `getCause`, `initCause`, and `toString` diagnostics.
 - [x] Mirror the common `Locale.US` integer grouping path used by the native statistics screen without emulating arbitrary locale patterns.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs, array-returning signatures, common `Identifier` prefix/language-key/ordering helpers, Holder serialization queries, and TagKey values.
@@ -37,7 +37,7 @@ Last checked: 3 November 2026, commit `37266bf0a`.
 
 - [ ] Build an ABI corpus from representative Fabric, Forge, and NeoForge jars and rank missing calls by execution frequency.
 - [ ] Define the Mixin translation pipeline: resolve config targets, apply priority/order and cancellation, map supported injectors to Horizon hooks, and keep a JVM fallback for unsupported transforms.
-- [ ] Add broader real-mod integration fixtures for registries, networking, capabilities, entities, menus, resource loading, and client/server separation; Fabric and legacy Forge event registration/dispatch now have source-built fixtures.
+- [ ] Add broader real-mod integration fixtures for registries, networking, capabilities, entities, menus, resource loading, and client/server separation; current fixtures cover client/server role rejection and typed content merging.
 - [ ] Connect translated callbacks to the generated typed native API and Horizon's server-thread and dedicated-server boundaries.
 - [ ] Complete live content registration and registry synchronization for code-declared blocks, items, entities, recipes, data maps, attachments, and custom ingredients.
 - [ ] Expand client compatibility for HUDs, key mappings, tooltips, models, renderers, particles, screens, and shader-facing code.
@@ -50,6 +50,6 @@ Last checked: 3 November 2026, commit `37266bf0a`.
 - `horizon-mods`: 27 unit tests passing, plus the runtime-built typed declaration adapter fixture.
 - `horizon-port-pack`: 159 unit tests passing, including Mixin `@At`/slice metadata and values, loader ABI classification, Mojang codec/datafixer ABI coverage, native declaration-kind reporting, multi-method hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, and descriptor normalization coverage.
 - `horizon-jvm`: 9 unit tests passing, including explicit fallback labels and NeoForge constructor-only entry selection.
-- Workspace check, compatibility-crate clippy, formatting, and `tools/native_java_smoke.py` passing with compiled OptionalLong/OptionalDouble paths; the full client clippy job still has a pre-existing render lint.
+- Workspace check, full client clippy, compatibility-crate clippy, formatting, and `tools/native_java_smoke.py` passing with compiled OptionalLong/OptionalDouble paths.
 
 Every compatibility commit should update this checklist when a surface moves between these sections and should include the focused test or probe that justifies the change.
