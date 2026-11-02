@@ -577,7 +577,25 @@ fn at_value(value: &Value) -> Option<String> {
                 .filter_map(|v| text(v).map(|t| format!("target:{t}"))),
         );
     }
+    for key in ["ordinal", "shift", "by"] {
+        if let Some(v) = a.values.get(key) {
+            out.extend(
+                items(v)
+                    .iter()
+                    .filter_map(scalar_text)
+                    .map(|t| format!("{key}:{t}")),
+            );
+        }
+    }
     Some(out.join("|"))
+}
+
+fn scalar_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(number) if number.fract() == 0.0 => Some(format!("{number:.0}")),
+        Value::Number(number) => Some(number.to_string()),
+        other => text(other),
+    }
 }
 
 /// The simple name of a Mixin annotation, if it is one.
@@ -1130,6 +1148,35 @@ mod tests {
         assert!(!c.mixin);
         assert!(parse(&bytes[..bytes.len() - 3]).is_none());
         assert!(parse(b"not a class").is_none());
+    }
+
+    #[test]
+    fn at_metadata_preserves_ordinal_shift_and_by() {
+        let at = Annotation {
+            ty: "Lorg/spongepowered/asm/mixin/injection/At;".to_owned(),
+            values: BTreeMap::from([
+                ("value".to_owned(), Value::Str("INVOKE".to_owned())),
+                (
+                    "target".to_owned(),
+                    Value::Str("Lnet/minecraft/Target;method()V".to_owned()),
+                ),
+                ("ordinal".to_owned(), Value::Number(2.0)),
+                (
+                    "shift".to_owned(),
+                    Value::Enum(
+                        "Lorg/spongepowered/asm/mixin/injection/At$Shift;".to_owned(),
+                        "BY".to_owned(),
+                    ),
+                ),
+                ("by".to_owned(), Value::Number(1.0)),
+            ]),
+        };
+        assert_eq!(
+            at_value(&Value::Ann(at)),
+            Some(
+                "INVOKE|target:Lnet/minecraft/Target;method()V|ordinal:2|shift:BY|by:1".to_owned()
+            )
+        );
     }
 
     #[test]
