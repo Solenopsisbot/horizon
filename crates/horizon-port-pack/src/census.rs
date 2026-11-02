@@ -305,6 +305,10 @@ impl HookIndex {
                 .or_insert_with(Vec::new)
                 .push(hook.name);
         }
+        for names in by_method.values_mut() {
+            names.sort();
+            names.dedup();
+        }
         Ok(HookIndex { by_method })
     }
 
@@ -1314,6 +1318,24 @@ mod tests {
         census.join(&hooks);
         assert_eq!(census.points[0].hooks, ["destroy_block"]);
         assert_eq!(census.totals.points_covered, 1);
+    }
+
+    #[test]
+    fn hook_catalog_deduplicates_names_for_one_method() {
+        let dir = std::env::temp_dir().join("horizon-census-hook-dedup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hooks.json");
+        std::fs::write(
+            &file,
+            r#"{"hooks":[{"name":"zeta","vanilla":"net/minecraft/Target#tick"},{"name":"alpha","vanilla":"net/minecraft/Target#tick"},{"name":"zeta","vanilla":"net/minecraft/Target#tick"}]}"#,
+        )
+        .unwrap();
+        let hooks = HookIndex::read(&file).unwrap();
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(
+            hooks.hooks_for("net/minecraft/Target", "tick").unwrap(),
+            &["alpha", "zeta"]
+        );
     }
 
     #[test]
