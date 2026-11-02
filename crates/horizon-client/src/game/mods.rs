@@ -215,6 +215,17 @@ pub(super) fn run_java_mods(
     for path in paths {
         let jar = horizon_native_java::NativeJar::from_path(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
+        if jar.client_side_only
+            && matches!(
+                role,
+                ExecutionRole::IntegratedServer | ExecutionRole::DedicatedServer
+            )
+        {
+            return Err(format!(
+                "{}: clientSideOnly mod cannot run for server execution",
+                path.display()
+            ));
+        }
         let (kind, entrypoints) = kinds
             .iter()
             .find_map(|kind| {
@@ -657,6 +668,42 @@ mod tests {
             "{error}"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn client_only_neoforge_mods_are_rejected_before_server_entrypoint_loading() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-game-java-client-only-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let jar_path = root.join("client-only-neoforge.jar");
+        let file = std::fs::File::create(&jar_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("META-INF/neoforge.mods.toml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(
+            br#"[[mods]]
+modId = "client_only"
+version = "1.0"
+clientSideOnly = true
+"#,
+        )
+        .unwrap();
+        zip.finish().unwrap();
+
+        let error = run_java_mods(
+            std::slice::from_ref(&jar_path),
+            ExecutionRole::DedicatedServer,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("clientSideOnly mod cannot run for server execution"),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

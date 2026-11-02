@@ -5306,6 +5306,10 @@ pub struct NativeJar {
     pub neoforge_version: Option<String>,
     /// Required mod ids from Fabric or NeoForge metadata, excluding loader-provided ids.
     pub required_mods: Vec<String>,
+    /// Forge/NeoForge metadata can mark a mod as client-only. The game-side
+    /// loader uses this to keep the constructor off integrated/dedicated
+    /// server roles rather than executing a client class and failing later.
+    pub client_side_only: bool,
     pub fabric_entrypoints: BTreeMap<String, Vec<Entrypoint>>,
     pub neoforge_entrypoints: Vec<String>,
     /// Explicit Horizon-owned declarations from `META-INF/horizon-native.json`.
@@ -5413,10 +5417,11 @@ impl NativeJar {
             .transpose()?
             .unwrap_or((None, None, BTreeMap::new(), Vec::new()));
         let loader_metadata = neoforge_metadata.or(forge_metadata);
-        let (neoforge_id, neoforge_version, neoforge_required_mods) = loader_metadata
-            .map(|text| parse_neoforge_metadata(&text))
-            .transpose()?
-            .unwrap_or((None, None, Vec::new()));
+        let (neoforge_id, neoforge_version, neoforge_required_mods, client_side_only) =
+            loader_metadata
+                .map(|text| parse_neoforge_metadata(&text))
+                .transpose()?
+                .unwrap_or((None, None, Vec::new(), false));
         let (native_id, native_declarations) = native_metadata
             .map(|text| parse_native_metadata(&text))
             .transpose()?
@@ -5427,6 +5432,7 @@ impl NativeJar {
         jar.fabric_version = fabric_version;
         jar.neoforge_id = neoforge_id;
         jar.neoforge_version = neoforge_version;
+        jar.client_side_only = client_side_only;
         if !neoforge_required_mods.is_empty() {
             let mut required = required_mods;
             required.extend(neoforge_required_mods);
@@ -7395,7 +7401,7 @@ fn is_mod_annotation(value: &str) -> bool {
 /// ranges and display metadata elsewhere.
 fn parse_neoforge_metadata(
     text: &str,
-) -> Result<(Option<String>, Option<String>, Vec<String>), NativeError> {
+) -> Result<(Option<String>, Option<String>, Vec<String>, bool), NativeError> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Section {
         None,
@@ -7408,6 +7414,7 @@ fn parse_neoforge_metadata(
     let mut dependency = None;
     let mut dependency_required = false;
     let mut required = Vec::new();
+    let mut client_side_only = false;
     let mut flush = |dependency: &mut Option<String>, required_flag: &mut bool| {
         if *required_flag {
             if let Some(id) = dependency.take() {
@@ -7454,6 +7461,9 @@ fn parse_neoforge_metadata(
         match (section, key) {
             (Section::Mods, "modId") if id.is_none() => id = Some(value.to_owned()),
             (Section::Mods, "version") if version.is_none() => version = Some(value.to_owned()),
+            (Section::Mods, "clientSideOnly") if id.is_some() => {
+                client_side_only = value.eq_ignore_ascii_case("true");
+            }
             (Section::Dependency, "modId") => dependency = Some(value.to_owned()),
             (Section::Dependency, "type") => {
                 dependency_required |= value.eq_ignore_ascii_case("required")
@@ -7469,7 +7479,7 @@ fn parse_neoforge_metadata(
     }
     required.sort();
     required.dedup();
-    Ok((id, version, required))
+    Ok((id, version, required, client_side_only))
 }
 
 fn parse_native_metadata(text: &str) -> Result<(Option<String>, Vec<RegistryEntry>), NativeError> {
@@ -7909,13 +7919,14 @@ mod tests {
 
     #[test]
     fn neoforge_metadata_collects_identity_and_required_mod_ids() {
-        let (id, version, required) = parse_neoforge_metadata(
+        let (id, version, required, client_side_only) = parse_neoforge_metadata(
             r#"
 modLoader = "javafml"
 
 [[mods]]
 modId = "ruby"
 version = "1.2.3"
+clientSideOnly = true
 
 [[dependencies.ruby]]
 modId = "neoforge"
@@ -7942,6 +7953,7 @@ mandatory = true
         assert_eq!(id.as_deref(), Some("ruby"));
         assert_eq!(version.as_deref(), Some("1.2.3"));
         assert_eq!(required, ["curios", "fabric-api", "geckolib"]);
+        assert!(client_side_only);
     }
 
     #[test]
@@ -8424,10 +8436,11 @@ version = "1.0"
 modId = "library"
 mandatory = true
 "#;
-        let (id, version, required) = parse_neoforge_metadata(text).unwrap();
+        let (id, version, required, client_side_only) = parse_neoforge_metadata(text).unwrap();
         assert_eq!(id.as_deref(), Some("legacy"));
         assert_eq!(version.as_deref(), Some("1.0"));
         assert_eq!(required, ["library"]);
+        assert!(!client_side_only);
     }
 
     #[test]
