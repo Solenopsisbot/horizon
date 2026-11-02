@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `067f25876`.
+Last checked: 3 November 2026, commit `dc2ec2055`.
 
 ## Supported now
 
@@ -43,8 +43,8 @@ Last checked: 3 November 2026, commit `067f25876`.
 
 ## Validation snapshot
 
-- `horizon-native-java`: 88 unit tests passing, including bounded `Number` accessors, callback combinators, restricted string formatting, and deterministic Thread bootstrap markers.
-- `horizon-port-pack`: 150 unit tests passing.
+- `horizon-native-java`: 89 unit tests passing, including bounded `Number` accessors, callback combinators, restricted string formatting, deterministic Thread bootstrap markers, and Throwable metadata.
+- `horizon-port-pack`: 152 unit tests passing.
 - `horizon-jvm`: 7 unit tests passing.
 - Workspace check, targeted clippy, formatting, and `tools/native_java_smoke.py` passing.
 
