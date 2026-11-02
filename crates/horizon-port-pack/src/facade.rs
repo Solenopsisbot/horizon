@@ -1240,6 +1240,18 @@ fn render(
             "    protected double horizonX;\n    protected double horizonY;\n    protected double horizonZ;\n    protected double horizonDeltaX;\n    protected double horizonDeltaY;\n    protected double horizonDeltaZ;\n    protected float horizonXRot;\n    protected float horizonYRot;\n    protected net.minecraft.world.level.Level horizonLevel = new net.minecraft.world.level.Level();\n    protected java.util.UUID horizonUuid = new java.util.UUID(0L, 0L);\n    protected net.minecraft.world.phys.AABB horizonBoundingBox = new net.minecraft.world.phys.AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);\n    protected boolean horizonOnGround;\n    protected boolean horizonRemoved;"
         );
     }
+    if class.name == "net/minecraft/world/entity/EntityType$Builder" {
+        let _ = writeln!(
+            out,
+            "    protected float horizonWidth = 0.6f;\n    protected float horizonHeight = 1.8f;\n    protected int horizonTrackingRange = 5;\n    protected int horizonUpdateInterval = 3;\n    protected boolean horizonFireImmune;"
+        );
+    }
+    if class.name == "net/minecraft/world/entity/EntityType" {
+        let _ = writeln!(
+            out,
+            "    protected float horizonWidth = 0.6f;\n    protected float horizonHeight = 1.8f;\n    protected int horizonTrackingRange = 5;\n    protected int horizonUpdateInterval = 3;\n    protected boolean horizonFireImmune;\n    public EntityType() {{}}\n    public EntityType(float width, float height, int trackingRange, int updateInterval, boolean fireImmune) {{ this.horizonWidth = width; this.horizonHeight = height; this.horizonTrackingRange = trackingRange; this.horizonUpdateInterval = updateInterval; this.horizonFireImmune = fireImmune; }}"
+        );
+    }
     if class.name == "net/minecraft/world/entity/Mob" {
         let _ = writeln!(
             out,
@@ -3027,6 +3039,19 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         }
     }
     if class == "net/minecraft/world/entity/EntityType$Builder" {
+        if method == "sized" && ret == "net.minecraft.world.entity.EntityType.Builder" {
+            return "horizonWidth = p0; horizonHeight = p1; return this;".to_owned();
+        }
+        if method == "clientTrackingRange" && ret == "net.minecraft.world.entity.EntityType.Builder"
+        {
+            return "horizonTrackingRange = p0; return this;".to_owned();
+        }
+        if method == "updateInterval" && ret == "net.minecraft.world.entity.EntityType.Builder" {
+            return "horizonUpdateInterval = p0; return this;".to_owned();
+        }
+        if method == "fireImmune" && ret == "net.minecraft.world.entity.EntityType.Builder" {
+            return "horizonFireImmune = true; return this;".to_owned();
+        }
         if method == "of" && ret == "net.minecraft.world.entity.EntityType.Builder" {
             return "return new EntityType.Builder();".to_owned();
         }
@@ -3034,7 +3059,17 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             return "return this;".to_owned();
         }
         if method == "build" && ret == "net.minecraft.world.entity.EntityType" {
-            return "return new net.minecraft.world.entity.EntityType();".to_owned();
+            return "return new net.minecraft.world.entity.EntityType(horizonWidth, horizonHeight, horizonTrackingRange, horizonUpdateInterval, horizonFireImmune);".to_owned();
+        }
+    }
+    if class == "net/minecraft/world/entity/EntityType" {
+        match (method, ret) {
+            ("getWidth", "float") => return "return horizonWidth;".to_owned(),
+            ("getHeight", "float") => return "return horizonHeight;".to_owned(),
+            ("getTrackingRange", "int") => return "return horizonTrackingRange;".to_owned(),
+            ("getUpdateInterval", "int") => return "return horizonUpdateInterval;".to_owned(),
+            ("fireImmune", "boolean") => return "return horizonFireImmune;".to_owned(),
+            _ => {}
         }
     }
     if class == "net/minecraft/world/entity/EntityType"
@@ -4908,6 +4943,38 @@ mod tests {
                 "net.minecraft.world.entity.EntityType.Builder"
             ),
             "return new EntityType.Builder();"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/EntityType$Builder",
+                "sized",
+                "net.minecraft.world.entity.EntityType.Builder"
+            ),
+            "horizonWidth = p0; horizonHeight = p1; return this;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/EntityType$Builder",
+                "fireImmune",
+                "net.minecraft.world.entity.EntityType.Builder"
+            ),
+            "horizonFireImmune = true; return this;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/EntityType$Builder",
+                "build",
+                "net.minecraft.world.entity.EntityType"
+            ),
+            "return new net.minecraft.world.entity.EntityType(horizonWidth, horizonHeight, horizonTrackingRange, horizonUpdateInterval, horizonFireImmune);"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/EntityType",
+                "getTrackingRange",
+                "int"
+            ),
+            "return horizonTrackingRange;"
         );
         assert_eq!(
             runtime_body(
