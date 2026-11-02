@@ -440,6 +440,30 @@ impl StdHost {
         &self.registrations
     }
 
+    /// Attach a Horizon-owned declaration to a registration recorded while a
+    /// Java entrypoint executed. The lookup is explicit and all-or-nothing:
+    /// opaque entries remain diagnostic until a loader adapter supplies a
+    /// declaration, and an already-enriched entry cannot be replaced silently.
+    pub fn attach_registration_declaration(
+        &mut self,
+        registry: &str,
+        id: &str,
+        declaration: RegistryDeclaration,
+    ) -> Result<(), String> {
+        let entry = self
+            .registrations
+            .iter_mut()
+            .find(|entry| entry.registry == registry && entry.id == id)
+            .ok_or_else(|| format!("native registration {registry}/{id} was not recorded"))?;
+        if entry.declaration.is_some() {
+            return Err(format!(
+                "native registration {registry}/{id} already has a declaration"
+            ));
+        }
+        entry.declaration = Some(declaration);
+        Ok(())
+    }
+
     pub fn payload_registrations(&self) -> &[PayloadRegistration] {
         &self.payload_registrations
     }
@@ -11608,10 +11632,16 @@ mandatory = true
         );
         assert_eq!(typed.key(), "minecraft:block/demo:entry");
         assert!(typed.value == Value::Ref(Some("typed/minecraft:block/demo:entry".into())));
-        let enriched = host.registrations()[0]
-            .clone()
-            .with_declaration(typed.declaration.clone().expect("typed declaration"));
-        host.registrations.push(enriched);
+        let (registry, id) = {
+            let entry = &host.registrations()[0];
+            (entry.registry.clone(), entry.id.clone())
+        };
+        host.attach_registration_declaration(
+            &registry,
+            &id,
+            typed.declaration.clone().expect("typed declaration"),
+        )
+        .unwrap();
         #[derive(Default)]
         struct TypedSink(Vec<String>);
         impl TypedRegistrySink for TypedSink {
