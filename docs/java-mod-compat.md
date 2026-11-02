@@ -433,9 +433,10 @@ sequence linked; the native host now records the direct `RegisterEvent.register`
 `RegistryEntry`, alongside bounded listener dispatch and the `RegistrySink` export. Supplier values remain
 opaque callback markers until a Horizon-owned adapter executes them; live registry wiring remains follow-up work.
 The host now recognizes NeoForge listeners that opt into cancelled events and excludes default listeners from
-cancelled dispatches, while Fabric and non-cancelled events retain registration order.
+cancelled dispatches, while Fabric listeners remain eligible for the array-backed event callback even when the
+event marker is cancelled; both loader families retain registration order.
 `PayloadRegistrar` now retains the registrar returned by one `RegisterPayloadHandlersEvent` and counts its
-play-to-server, play-to-client, and bidirectional registrations, so payload bootstrap can inspect a stable
+play and configuration registrations in each direction, so payload bootstrap can inspect a stable
 registration object before the native channel boundary is attached.
 When a target references NeoForge, the generator emits these public ABI shims directly, so the path does not
 depend on shipping NeoForge's jar. A synthetic `@Mod` that creates a `DeferredRegister`, attaches it to the

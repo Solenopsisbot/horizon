@@ -380,6 +380,9 @@ impl StdHost {
     }
 
     fn listener_receives_cancelled(listener: &HostInvocation) -> bool {
+        if listener.method.owner == "net/fabricmc/fabric/api/event/Event" {
+            return true;
+        }
         listener
             .args
             .iter()
@@ -875,23 +878,60 @@ impl Host for StdHost {
                     return Ok(contents.unwrap_or(Self::argument(r, args, 0)?.clone()));
                 }
                 ("orElseGet", "(Ljava/util/function/Supplier;)Ljava/lang/Object;") => {
-                    // The supplier callback is retained as an explicit host
-                    // marker; native callback dispatch can resolve it later.
-                    return Ok(contents.unwrap_or(Value::Ref(None)));
+                    if let Some(value) = contents {
+                        return Ok(value);
+                    }
+                    let supplier = Self::argument(r, args, 0)?;
+                    return self.invoke_instance(
+                        &MethodRef {
+                            owner: "java/util/function/Supplier".into(),
+                            name: "get".into(),
+                            descriptor: "()Ljava/lang/Object;".into(),
+                        },
+                        supplier,
+                        &[],
+                    );
                 }
                 (
                     "map",
                     "(Ljava/util/function/Function;)Lnet/neoforged/neoforge/common/util/LazyOptional;",
                 ) => {
-                    return Ok(match contents {
-                        Some(value) => self.lazy_optional(Some(value)),
-                        None => self.lazy_optional(None),
-                    });
+                    let Some(value) = contents else {
+                        return Ok(self.lazy_optional(None));
+                    };
+                    let function = Self::argument(r, args, 0)?;
+                    let mapped = self.invoke_instance(
+                        &MethodRef {
+                            owner: "java/util/function/Function".into(),
+                            name: "apply".into(),
+                            descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;".into(),
+                        },
+                        function,
+                        &[value],
+                    )?;
+                    return Ok(self.lazy_optional(match mapped {
+                        Value::Ref(None) => None,
+                        value => Some(value),
+                    }));
                 }
                 ("cast", "()Lnet/neoforged/neoforge/common/util/LazyOptional;") => {
                     return Ok(receiver.clone());
                 }
-                ("ifPresent", "(Ljava/util/function/Consumer;)V") => return Ok(Value::Void),
+                ("ifPresent", "(Ljava/util/function/Consumer;)V") => {
+                    if let Some(value) = contents {
+                        let consumer = Self::argument(r, args, 0)?;
+                        self.invoke_instance(
+                            &MethodRef {
+                                owner: "java/util/function/Consumer".into(),
+                                name: "accept".into(),
+                                descriptor: "(Ljava/lang/Object;)V".into(),
+                            },
+                            consumer,
+                            &[value],
+                        )?;
+                    }
+                    return Ok(Value::Void);
+                }
                 (
                     "addListener",
                     "(Ljava/util/function/Consumer;)Lnet/neoforged/neoforge/common/util/LazyOptional;",
@@ -2402,7 +2442,12 @@ impl Host for StdHost {
             {
                 if matches!(
                     r.name.as_str(),
-                    "playToServer" | "playToClient" | "playBidirectional"
+                    "playToServer"
+                        | "playToClient"
+                        | "playBidirectional"
+                        | "configurationToServer"
+                        | "configurationToClient"
+                        | "configurationBidirectional"
                 ) && args.len() >= 3
                 {
                     self.payload_registrations.push(PayloadRegistration {
@@ -8603,6 +8648,26 @@ mandatory = true
                 handler: Value::Ref(Some("handler".into())),
             }]
         );
+
+        let configuration = MethodRef {
+            owner: "net/neoforged/neoforge/network/registration/PayloadRegistrar".into(),
+            name: "configurationToClient".into(),
+            descriptor: "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;".into(),
+        };
+        host.invoke_instance(
+            &configuration,
+            &registrar,
+            &[
+                Value::Ref(Some("config-type".into())),
+                Value::Ref(Some("config-codec".into())),
+                Value::Ref(Some("config-handler".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            host.payload_registrations().last().unwrap().direction,
+            "configurationToClient"
+        );
     }
 
     #[test]
@@ -8717,6 +8782,45 @@ mandatory = true
                 .unwrap(),
             Value::Ref(Some("handler/items".into()))
         );
+        let mapped = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "net/neoforged/neoforge/common/util/LazyOptional".into(),
+                    name: "map".into(),
+                    descriptor: "(Ljava/util/function/Function;)Lnet/neoforged/neoforge/common/util/LazyOptional;".into(),
+                },
+                &optional,
+                &[Value::Ref(Some("@indy:identity-map".into()))],
+            )
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/neoforged/neoforge/common/util/LazyOptional".into(),
+                    name: "resolve".into(),
+                    descriptor: "()Ljava/lang/Object;".into(),
+                },
+                &mapped,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("handler/items".into()))
+        );
+        host.invoke_instance(
+            &MethodRef {
+                owner: "net/neoforged/neoforge/common/util/LazyOptional".into(),
+                name: "ifPresent".into(),
+                descriptor: "(Ljava/util/function/Consumer;)V".into(),
+            },
+            &mapped,
+            &[Value::Ref(Some("@indy:capability-consumer".into()))],
+        )
+        .unwrap();
+        assert!(host.invocations().iter().any(|invocation| {
+            invocation.method.owner == "java/util/function/Consumer"
+                && invocation.method.name == "accept"
+                && invocation.args == [Value::Ref(Some("handler/items".into()))]
+        }));
         host.invoke_instance(
             &MethodRef {
                 owner: "net/neoforged/neoforge/common/util/LazyOptional".into(),
@@ -8777,6 +8881,13 @@ mandatory = true
             "net/fabricmc/fabric/api/event/Event"
         );
         assert_eq!(dispatches[0].event, Value::Ref(Some("demo-event".into())));
+        let cancelled_dispatches =
+            host.dispatch_event(Value::Ref(Some("event/cancelled/demo".into())));
+        assert_eq!(cancelled_dispatches.len(), 1);
+        assert_eq!(
+            cancelled_dispatches[0].listener.method.owner,
+            "net/fabricmc/fabric/api/event/Event"
+        );
         let invoker = MethodRef {
             owner: "net/fabricmc/fabric/api/event/Event".into(),
             name: "invoker".into(),
