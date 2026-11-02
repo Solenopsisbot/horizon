@@ -1482,6 +1482,9 @@ fn render(
             ("getEyeHeight", "()F", "float"),
             ("getBbHeight", "()F", "float"),
             ("getBbWidth", "()F", "float"),
+            ("getBlockX", "()I", "int"),
+            ("getBlockY", "()I", "int"),
+            ("getBlockZ", "()I", "int"),
         ];
         for (name, descriptor, ret) in required {
             if !seen.insert((name.to_owned(), String::new())) {
@@ -1981,6 +1984,17 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         && ret == "net.minecraft.resources.Identifier"
     {
         return "return horizonId;".to_owned();
+    }
+    if class == "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type" {
+        match (method, ret, descriptor) {
+            ("toString", "java.lang.String", "()Ljava/lang/String;") => {
+                return "return horizonId.toString();".to_owned();
+            }
+            ("equals", "boolean", "(Ljava/lang/Object;)Z") => {
+                return "return horizonId.equals(p0);".to_owned();
+            }
+            _ => {}
+        }
     }
     if class == "net/minecraft/network/codec/StreamCodec"
         && ret == "net.minecraft.network.codec.StreamCodec"
@@ -2784,6 +2798,15 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
                     .to_owned();
             }
             ("getEyeY", "double", "()D") => return "return horizonY + 1.62;".to_owned(),
+            ("getBlockX", "int", "()I") => {
+                return "return (int) Math.floor(horizonX);".to_owned();
+            }
+            ("getBlockY", "int", "()I") => {
+                return "return (int) Math.floor(horizonY);".to_owned();
+            }
+            ("getBlockZ", "int", "()I") => {
+                return "return (int) Math.floor(horizonZ);".to_owned();
+            }
             ("level", "net.minecraft.world.level.Level", "()Lnet/minecraft/world/level/Level;") => {
                 return "return horizonLevel;".to_owned();
             }
@@ -4034,6 +4057,24 @@ mod tests {
                 "net.minecraft.resources.Identifier"
             ),
             "return horizonId;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type",
+                "toString",
+                "java.lang.String",
+                "()Ljava/lang/String;",
+            ),
+            "return horizonId.toString();"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type",
+                "equals",
+                "boolean",
+                "(Ljava/lang/Object;)Z",
+            ),
+            "return horizonId.equals(p0);"
         );
         assert_eq!(
             runtime_body(
@@ -5465,6 +5506,9 @@ mod tests {
         assert!(source.contains("public float getEyeHeight()"));
         assert!(source.contains("public float getBbHeight()"));
         assert!(source.contains("public float getBbWidth()"));
+        assert!(source.contains("public int getBlockX()"));
+        assert!(source.contains("public int getBlockY()"));
+        assert!(source.contains("public int getBlockZ()"));
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/world/entity/Entity",
@@ -5590,6 +5634,33 @@ mod tests {
                 "()F",
             ),
             "return 0.6f;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getBlockX",
+                "int",
+                "()I",
+            ),
+            "return (int) Math.floor(horizonX);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getBlockY",
+                "int",
+                "()I",
+            ),
+            "return (int) Math.floor(horizonY);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getBlockZ",
+                "int",
+                "()I",
+            ),
+            "return (int) Math.floor(horizonZ);"
         );
         assert_eq!(
             runtime_body_with_descriptor(

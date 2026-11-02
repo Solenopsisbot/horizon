@@ -254,8 +254,8 @@ That is the loop working: the class loads, the entrypoint runs, and the first un
 is named with the mod's own file and line under it. The first runtime slice now treats
 `StreamCodec` factories as bootstrap values, returning an empty codec object so static registration can
 rather than the codec factory itself. Codec composition methods (`map`, `mapStream`, `dispatch`, `apply`, `optional`, `nullable`, `cast`, and `tuple`) preserve a non-null receiver, and
-`CustomPacketPayload.Type` retains its `Identifier` through construction and `id()`, so payload
-registration can compare type identities before crossing the native network boundary. The next failure
+`CustomPacketPayload.Type` retains its `Identifier` through construction, `id()`, `toString()`, and
+equality, so payload registration can compare and log type identities before crossing the native network boundary. The next failure
 is therefore the next concrete value or registry operation the mod reaches,
 rather than the codec factory itself.
 
@@ -288,7 +288,7 @@ wired through the game boundary; they do not replace Horizon's authoritative wor
 `Entity` now retains position, delta movement, rotation, removal state, a level handle, a stable UUID
 marker, and a bounded bounding-box/on-ground state; `getX`/`getY`/`getZ`, both `setPos` overloads,
 `position`, `getDeltaMovement`, both `setDeltaMovement` overloads, `getXRot`/`setXRot`,
-`getYRot`/`setYRot`, `distanceTo`/`distanceToSqr`, `blockPosition`, `level`, `isAlive`, `isRemoved`,
+`getYRot`/`setYRot`, `distanceTo`/`distanceToSqr`, `blockPosition`, `getBlockX`/`getBlockY`/`getBlockZ`, `level`, `isAlive`, `isRemoved`,
 `getEyePosition`/`getEyeY`, `getEyeHeight`, `getBbHeight`/`getBbWidth`, `discard`, `getUUID`, `getBoundingBox`, `setBoundingBox`, and `isOnGround` preserve common entity
 inspection, movement, and collision setup paths. The box, motion, rotation, and removal state are
 façade-local until the native entity boundary wires live physics updates through them; player mutation
@@ -500,7 +500,7 @@ equality, hashing, and string conversion. `java.util.UUID.fromString`, determini
 `toString`, `equals`, and `hashCode` preserve canonical UUID identity markers without process randomness;
 malformed UUID strings remain explicit metadata errors. `Enum.valueOf`, `name`, `ordinal`, `equals`,
 and `hashCode` preserve deterministic enum markers for loader and configuration branches. Collection `stream()` supports bounded `map`, `filter`, `distinct`,
-`limit`, `skip`, `count`, `toList`, `isEmpty`, and `forEach` chains using the same in-jar callback bridge.
+`limit`, `skip`, `count`, `toList`, `isEmpty`, `anyMatch`, and `forEach` chains using the same in-jar callback bridge.
 Native `ArrayList`, `HashMap`, `LinkedHashMap`, `HashSet`, and `LinkedHashSet` markers also retain bounded
 constructor, add/put, get, size, clear, indexed insertion/replacement, set duplicate suppression and removal,
 list removal and index queries, `List.addAll`, `Collection.containsAll`, `removeAll`, and `retainAll`,

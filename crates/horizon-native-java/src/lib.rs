@@ -3876,6 +3876,30 @@ impl<H: Host> Runtime<'_, H> {
                 let skip = expect_int(r, StdHost::argument(r, args, 0)?)?.max(0) as usize;
                 self.new_stream(class, method, values.into_iter().skip(skip).collect())
             }
+            ("anyMatch", "(Ljava/util/function/Predicate;)Z") => {
+                let callback = StdHost::argument(r, args, 0)?;
+                let mut matched = false;
+                for value in values {
+                    let result =
+                        match self.invoke_callback(callback, std::slice::from_ref(&value))? {
+                            Some(result) => result,
+                            None => self.host.invoke_instance(
+                                &MethodRef {
+                                    owner: "java/util/function/Predicate".into(),
+                                    name: "test".into(),
+                                    descriptor: "(Ljava/lang/Object;)Z".into(),
+                                },
+                                callback,
+                                std::slice::from_ref(&value),
+                            )?,
+                        };
+                    if matches!(result, Value::Int(flag) if flag != 0) {
+                        matched = true;
+                        break;
+                    }
+                }
+                Value::Int(matched as i32)
+            }
             ("count", "()J") => Value::Int(values.len() as i32),
             ("toList", "()Ljava/util/List;") => collection_value("list", &values),
             ("isEmpty", "()Z") => Value::Int(values.is_empty() as i32),
@@ -7904,6 +7928,22 @@ mandatory = true
                 )
                 .unwrap(),
             Some(Value::Int(3))
+        );
+        assert_eq!(
+            runtime
+                .invoke_stream(
+                    &MethodRef {
+                        owner: "java/util/stream/Stream".into(),
+                        name: "anyMatch".into(),
+                        descriptor: "(Ljava/util/function/Predicate;)Z".into(),
+                    },
+                    Some(&stream),
+                    &[Value::Ref(Some("@indy:stream-predicate".into()))],
+                    "demo/Stream",
+                    "probe",
+                )
+                .unwrap(),
+            Some(Value::Int(1))
         );
         let distinct = runtime
             .invoke_stream(
