@@ -1972,12 +1972,34 @@ impl Host for StdHost {
                 ) => {
                     let key = Self::argument(r, args, 0)?.clone();
                     let incoming = Self::argument(r, args, 1)?.clone();
+                    let function = Self::argument(r, args, 2)?.clone();
                     let values = self
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
                     if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key) {
-                        return Ok(values[index * 2 + 1].clone());
+                        let current = values[index * 2 + 1].clone();
+                        let merged = self.invoke_instance(
+                            &MethodRef {
+                                owner: "java/util/function/BiFunction".into(),
+                                name: "apply".into(),
+                                descriptor:
+                                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+                                        .into(),
+                            },
+                            &function,
+                            &[current, incoming],
+                        )?;
+                        let values = self
+                            .mutable_collections
+                            .entry(marker.to_owned())
+                            .or_default();
+                        if matches!(merged, Value::Ref(None)) {
+                            values.drain(index * 2..index * 2 + 2);
+                            return Ok(Value::Ref(None));
+                        }
+                        values[index * 2 + 1] = merged.clone();
+                        return Ok(merged);
                     }
                     values.extend([key, incoming.clone()]);
                     return Ok(incoming);
@@ -9392,6 +9414,24 @@ mandatory = true
             host.invoke_instance(&map_get, &map, &[Value::Ref(Some("merged-key".into()))],)
                 .unwrap(),
             Value::Ref(Some("merged-value".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &merge,
+                &map,
+                &[
+                    Value::Ref(Some("merged-key".into())),
+                    Value::Ref(Some("updated-value".into())),
+                    Value::Ref(Some("@indy:merge-existing".into())),
+                ],
+            )
+            .unwrap(),
+            Value::Ref(Some("updated-value".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(&map_get, &map, &[Value::Ref(Some("merged-key".into()))],)
+                .unwrap(),
+            Value::Ref(Some("updated-value".into()))
         );
         let put_if_absent = MethodRef {
             owner: "java/util/Map".into(),
