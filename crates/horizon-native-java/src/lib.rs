@@ -2571,6 +2571,29 @@ impl Host for StdHost {
             let marker = receiver_marker.as_deref().ok_or_else(|| {
                 NativeError::Metadata("malformed java/util/Iterator marker".into())
             })?;
+            if r.name == "forEachRemaining" && r.descriptor == "(Ljava/util/function/Consumer;)V" {
+                let callback = Self::argument(r, args, 0)?.clone();
+                let remaining = {
+                    let (values, index) = self.iterators.get_mut(marker).ok_or_else(|| {
+                        NativeError::Metadata("unknown java/util/Iterator marker".into())
+                    })?;
+                    let remaining = values.get(*index..).unwrap_or_default().to_vec();
+                    *index = values.len();
+                    remaining
+                };
+                for value in remaining {
+                    self.invoke_instance(
+                        &MethodRef {
+                            owner: "java/util/function/Consumer".into(),
+                            name: "accept".into(),
+                            descriptor: "(Ljava/lang/Object;)V".into(),
+                        },
+                        &callback,
+                        &[value],
+                    )?;
+                }
+                return Ok(Value::Void);
+            }
             let (values, index) = self
                 .iterators
                 .get_mut(marker)
@@ -10164,6 +10187,43 @@ mandatory = true
             Value::Int(0)
         );
         assert!(host.invoke_instance(&next, &iterator, &[]).is_err());
+        let remaining_iterator = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "java/util/Collection".into(),
+                    name: "iterator".into(),
+                    descriptor: "()Ljava/util/Iterator;".into(),
+                },
+                &list,
+                &[],
+            )
+            .unwrap();
+        let for_each_remaining = MethodRef {
+            owner: "java/util/Iterator".into(),
+            name: "forEachRemaining".into(),
+            descriptor: "(Ljava/util/function/Consumer;)V".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &for_each_remaining,
+                &remaining_iterator,
+                &[Value::Ref(Some("@indy:remaining-consumer".into()))],
+            )
+            .unwrap(),
+            Value::Void
+        );
+        assert_eq!(
+            host.invoke_instance(&has_next, &remaining_iterator, &[])
+                .unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            host.calls()
+                .iter()
+                .filter(|call| call.owner == "java/util/function/Consumer" && call.name == "accept")
+                .count(),
+            4
+        );
         let entries_iterator = host
             .invoke_instance(
                 &MethodRef {
