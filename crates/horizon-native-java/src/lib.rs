@@ -1708,6 +1708,27 @@ impl Host for StdHost {
                     expect_string(receiver)
                 ))))
             }
+            ("java/lang/String", "indexOf", "(Ljava/lang/String;)I") => {
+                Ok(Value::Int(utf16_index_of(
+                    expect_string(receiver),
+                    expect_string(Self::argument(r, args, 0)?),
+                    0,
+                )))
+            }
+            ("java/lang/String", "indexOf", "(Ljava/lang/String;I)I") => {
+                let start = expect_int(r, Self::argument(r, args, 1)?)?;
+                Ok(Value::Int(utf16_index_of(
+                    expect_string(receiver),
+                    expect_string(Self::argument(r, args, 0)?),
+                    start,
+                )))
+            }
+            ("java/lang/String", "lastIndexOf", "(Ljava/lang/String;)I") => {
+                Ok(Value::Int(utf16_last_index_of(
+                    expect_string(receiver),
+                    expect_string(Self::argument(r, args, 0)?),
+                )))
+            }
             (
                 "java/lang/String",
                 "replace",
@@ -2568,6 +2589,34 @@ fn stable_hash(value: &str) -> i32 {
     value.encode_utf16().fold(0_i32, |hash, unit| {
         hash.wrapping_mul(31).wrapping_add(i32::from(unit))
     })
+}
+
+fn utf16_index_of(haystack: &str, needle: &str, from: i32) -> i32 {
+    let haystack = haystack.encode_utf16().collect::<Vec<_>>();
+    let needle = needle.encode_utf16().collect::<Vec<_>>();
+    let start = from.max(0) as usize;
+    if needle.is_empty() {
+        return start.min(haystack.len()) as i32;
+    }
+    haystack
+        .get(start..)
+        .and_then(|tail| {
+            tail.windows(needle.len())
+                .position(|window| window == needle)
+        })
+        .map_or(-1, |index| (start + index) as i32)
+}
+
+fn utf16_last_index_of(haystack: &str, needle: &str) -> i32 {
+    let haystack = haystack.encode_utf16().collect::<Vec<_>>();
+    let needle = needle.encode_utf16().collect::<Vec<_>>();
+    if needle.is_empty() {
+        return haystack.len() as i32;
+    }
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+        .map_or(-1, |index| index as i32)
 }
 
 fn event_is_cancelled(value: &Value) -> bool {
@@ -5916,6 +5965,30 @@ mandatory = true
             host.invoke_instance(&char_at, &receiver, &[Value::Int(1)])
                 .unwrap(),
             Value::Int('é' as i32)
+        );
+        let index_of = MethodRef {
+            owner: "java/lang/String".into(),
+            name: "indexOf".into(),
+            descriptor: "(Ljava/lang/String;)I".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&index_of, &receiver, &[Value::Ref(Some("World".into()))])
+                .unwrap(),
+            Value::Int(5)
+        );
+        let last_index_of = MethodRef {
+            owner: "java/lang/String".into(),
+            name: "lastIndexOf".into(),
+            descriptor: "(Ljava/lang/String;)I".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &last_index_of,
+                &Value::Ref(Some("héllo hé".into())),
+                &[Value::Ref(Some("hé".into()))],
+            )
+            .unwrap(),
+            Value::Int(6)
         );
         let hash = MethodRef {
             owner: "java/lang/String".into(),

@@ -1486,6 +1486,12 @@ fn render(
             ("getBlockX", "()I", "int"),
             ("getBlockY", "()I", "int"),
             ("getBlockZ", "()I", "int"),
+            ("isPassenger", "()Z", "boolean"),
+            (
+                "getVehicle",
+                "()Lnet/minecraft/world/entity/Entity;",
+                "net.minecraft.world.entity.Entity",
+            ),
         ];
         for (name, descriptor, ret) in required {
             if !seen.insert((name.to_owned(), String::new())) {
@@ -2310,6 +2316,13 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     {
         return "return this;".to_owned();
     }
+    if class == "net/minecraft/world/item/Item"
+        && method == "getDefaultInstance"
+        && ret == "net.minecraft.world.item.ItemStack"
+        && descriptor == "()Lnet/minecraft/world/item/ItemStack;"
+    {
+        return "return new net.minecraft.world.item.ItemStack(this, 1);".to_owned();
+    }
     if class == "net/minecraft/world/item/ItemStack" {
         match (method, ret) {
             ("getCount", "int") => return "return horizonCount;".to_owned(),
@@ -2850,6 +2863,12 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("getBlockZ", "int", "()I") => {
                 return "return (int) Math.floor(horizonZ);".to_owned();
             }
+            ("isPassenger", "boolean", "()Z") => return "return false;".to_owned(),
+            (
+                "getVehicle",
+                "net.minecraft.world.entity.Entity",
+                "()Lnet/minecraft/world/entity/Entity;",
+            ) => return "return null;".to_owned(),
             ("level", "net.minecraft.world.level.Level", "()Lnet/minecraft/world/level/Level;") => {
                 return "return horizonLevel;".to_owned();
             }
@@ -3723,6 +3742,15 @@ mod tests {
                 "net.minecraft.world.flag.FeatureFlagSet"
             ),
             "return new FeatureFlagSet();"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/item/Item",
+                "getDefaultInstance",
+                "net.minecraft.world.item.ItemStack",
+                "()Lnet/minecraft/world/item/ItemStack;",
+            ),
+            "return new net.minecraft.world.item.ItemStack(this, 1);"
         );
         assert_eq!(
             runtime_body("net/minecraft/world/item/ItemStack", "getCount", "int"),
@@ -5627,6 +5655,8 @@ mod tests {
         assert!(source.contains("public int getBlockX()"));
         assert!(source.contains("public int getBlockY()"));
         assert!(source.contains("public int getBlockZ()"));
+        assert!(source.contains("public boolean isPassenger()"));
+        assert!(source.contains("public net.minecraft.world.entity.Entity getVehicle()"));
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/world/entity/Entity",
@@ -5779,6 +5809,24 @@ mod tests {
                 "()I",
             ),
             "return (int) Math.floor(horizonZ);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "isPassenger",
+                "boolean",
+                "()Z",
+            ),
+            "return false;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getVehicle",
+                "net.minecraft.world.entity.Entity",
+                "()Lnet/minecraft/world/entity/Entity;",
+            ),
+            "return null;"
         );
         assert_eq!(
             runtime_body_with_descriptor(

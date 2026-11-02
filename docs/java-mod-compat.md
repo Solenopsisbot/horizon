@@ -288,7 +288,7 @@ wired through the game boundary; they do not replace Horizon's authoritative wor
 `Entity` now retains position, delta movement, rotation, removal state, a level handle, a stable UUID
 marker, and a bounded bounding-box/on-ground state; `getX`/`getY`/`getZ`, both `setPos` overloads,
 `position`, `getDeltaMovement`, both `setDeltaMovement` overloads, `getXRot`/`setXRot`,
-`getYRot`/`setYRot`, `distanceTo`/`distanceToSqr`, `blockPosition`, `getBlockX`/`getBlockY`/`getBlockZ`, `level`, `isAlive`, `isRemoved`,
+`getYRot`/`setYRot`, `distanceTo`/`distanceToSqr`, `blockPosition`, `getBlockX`/`getBlockY`/`getBlockZ`, `isPassenger`/`getVehicle`, `level`, `isAlive`, `isRemoved`,
 `getEyePosition`/`getEyeY`, `getEyeHeight`, `getBbHeight`/`getBbWidth`, `discard`, `getUUID`, `getBoundingBox`, `setBoundingBox`, and `isOnGround` preserve common entity
 inspection, movement, and collision setup paths. The box, motion, rotation, and removal state are
 façade-local until the native entity boundary wires live physics updates through them; player mutation
@@ -477,7 +477,7 @@ interpreter crate to `horizon-client`. Unknown calls keep the neutral return con
 The standard-library surface also includes deterministic `StringBuilder`/`StringBuffer` append and
 `toString` values, primitive `String.valueOf` overloads, plus `Objects.equals`, `requireNonNull`, and
 `toString`, which covers common loader bootstrap formatting and null checks without a JVM.
-String `replace` (character and `CharSequence` forms), `trim`, `strip`, and `isBlank` are also
+String `replace` (character and `CharSequence` forms), `indexOf`, `lastIndexOf`, `trim`, `strip`, and `isBlank` are also
 deterministic, covering namespace/path normalization used by loader metadata and registration code.
 `System.getProperties()` exposes the seeded properties as a bounded `Properties` map, so bootstrap code
 can use the same key/value queries as `getProperty` without crossing the host boundary.
@@ -682,7 +682,8 @@ would otherwise have been the worst hotspot in the design.
 The generated façade now preserves the common item/count value path (`getCount`, `setCount`, `isEmpty`,
 `getItem`, `copy`, `copyWithCount`, `grow`, and `shrink`) plus bounded stack inspection (`getMaxStackSize`,
 `hasFoil`, `isDamageable`, bounded damage/enchantment/use-duration inspection, and `getHoverName`) so bootstrap code
-can inspect stacks before the full component bridge is attached. It also has a bounded erased component map: `get`,
+can inspect stacks before the full component bridge is attached. `Item.getDefaultInstance` now creates a one-item
+stack retaining the item identity. It also has a bounded erased component map: `get`,
 `getOrDefault`, `set`, `remove`, `has`, and `hasNonDefault` use the `DataComponentType` object as the
 key; generated `DataComponents` constants are distinct identity keys, absent values read as `null` (or
 the supplied default), and copies retain the map. This covers
