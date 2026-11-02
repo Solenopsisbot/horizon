@@ -423,7 +423,8 @@ startup rather than silently entering the native registries.
 The façade now also has the first NeoForge registration boundary: `FMLJavaModLoadingContext.get()` and
 `getModEventBus()` yield neutral context and bus values, `IEventBus` fluent registration returns its receiver,
 and `DeferredRegister.create`/`register` yield façade register and holder objects. `DeferredHolder` now
-also exposes the common `value`, `getOptional`, `getKey`, and `getId` accessors with typed neutral return
+also exposes the common `value`, `getOptional`, `getKey`, and `getId` accessors (including the modern
+`ResourceLocation` return type) with typed neutral return
 values, so constructors can inspect a registration without linking against NeoForge's implementation.
 `RegisterEvent` now
 also has its public registration overloads, a retained registry key and registry view, and a helper callback that
@@ -482,11 +483,13 @@ interpreter crate to `horizon-client`. Unknown calls keep the neutral return con
 The standard-library surface also includes deterministic `Integer.compare`/`toHexString`, integer
 `Math.floorDiv`/`floorMod`/`addExact`, and
 bounded `Long.compare`/`toHexString`,
+`Long.parseLong`/`valueOf`/`toString`,
 `StringBuilder`/`StringBuffer` append and
 `toString` values, primitive `String.valueOf` overloads, plus `Objects.equals`, `requireNonNull`, and
 `toString`, which covers common loader bootstrap formatting and null checks without a JVM.
-String `replace` (character and `CharSequence` forms), `indexOf`, `lastIndexOf`, `trim`, `strip`, and `isBlank` are also
-deterministic, covering namespace/path normalization used by loader metadata and registration code.
+String `replace` (character and `CharSequence` forms), `repeat`, `indexOf`, `lastIndexOf`, `trim`, `strip`, and `isBlank`
+are also deterministic, covering namespace/path normalization used by loader metadata and registration code. Repetition
+counts are bounded to keep native probes finite.
 `System.getProperties()` exposes the seeded properties as a bounded `Properties` map, so bootstrap code
 can use the same key/value queries as `getProperty` without crossing the host boundary.
 `StdHost` also exposes deterministic Fabric loader values for mod-presence checks, metadata ids, names,
@@ -549,7 +552,8 @@ changing cancellation still belongs to the native hook boundary. `PayloadRegistr
 record through `StdHost::payload_registrations`, leaving byte encoding and channel ownership to Horizon's
 network boundary.
 The generated NeoForge `DeferredHolder` façade now retains its id, registry key, and lazy supplier: `get`,
-`value`, `isPresent`, `getOptional`, `getId`, and `getKey` agree on one holder state. The matching
+`value`, `isPresent`, `getOptional`, `getId`, and `getKey` agree on one holder state. `Holder` and
+`Holder.Reference` queries for `value`, `isBound`, and `unwrapKey` use the same bounded marker. The matching
 `DeferredRegister` shim binds the namespace and supplier when `register` is called, so common registry
 bootstrap code can inspect holders before the native registry sink commits typed declarations.
 Unsupported callback bodies still return the interpreter's explicit bounded diagnostics. The sink is

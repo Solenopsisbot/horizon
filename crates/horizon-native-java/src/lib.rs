@@ -631,8 +631,8 @@ impl Host for StdHost {
                 Ok(Value::Int(result as i32))
             }
             ("java/lang/Long", "compare", "(JJ)I") => {
-                let left = expect_int(r, Self::argument(r, args, 0)?)?;
-                let right = expect_int(r, Self::argument(r, args, 1)?)?;
+                let left = expect_long(r, Self::argument(r, args, 0)?)?;
+                let right = expect_long(r, Self::argument(r, args, 1)?)?;
                 Ok(Value::Int(match left.cmp(&right) {
                     std::cmp::Ordering::Less => -1,
                     std::cmp::Ordering::Equal => 0,
@@ -640,7 +640,31 @@ impl Host for StdHost {
                 }))
             }
             ("java/lang/Long", "toHexString", "(J)Ljava/lang/String;") => Ok(Value::Ref(Some(
-                format!("{:x}", expect_int(r, Self::argument(r, args, 0)?)? as u32),
+                format!("{:x}", expect_long(r, Self::argument(r, args, 0)?)? as u64),
+            ))),
+            ("java/lang/Long", "parseLong", "(Ljava/lang/String;)J") => {
+                Ok(long_value(parse_java_long(Self::argument(r, args, 0)?)?))
+            }
+            ("java/lang/Long", "parseLong", "(Ljava/lang/String;I)J") => {
+                let text = expect_string(Self::argument(r, args, 0)?);
+                let radix = expect_int(r, Self::argument(r, args, 1)?)?;
+                let radix = u32::try_from(radix).map_err(|_| {
+                    NativeError::Metadata(
+                        "java/lang/Long.parseLong received an invalid radix".into(),
+                    )
+                })?;
+                let value = i64::from_str_radix(text, radix).map_err(|_| {
+                    NativeError::Metadata(
+                        "invalid long argument for java/lang/Long.parseLong".into(),
+                    )
+                })?;
+                Ok(long_value(value))
+            }
+            ("java/lang/Long", "valueOf", "(Ljava/lang/String;)Ljava/lang/Long;") => {
+                Ok(long_value(parse_java_long(Self::argument(r, args, 0)?)?))
+            }
+            ("java/lang/Long", "toString", "(J)Ljava/lang/String;") => Ok(Value::Ref(Some(
+                expect_long(r, Self::argument(r, args, 0)?)?.to_string(),
             ))),
             ("java/lang/Boolean", "parseBoolean", "(Ljava/lang/String;)Z") => {
                 let value = match Self::argument(r, args, 0)? {
@@ -1866,6 +1890,16 @@ impl Host for StdHost {
                         .is_some_and(|other| Some(other) == boxed_integer(receiver)))
                     as i32,
             )),
+            ("java/lang/Long", "longValue", "()J") => {
+                Ok(long_value(boxed_long(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Long marker".into())
+                })?))
+            }
+            ("java/lang/Long", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
+                boxed_long(receiver)
+                    .ok_or_else(|| NativeError::Metadata("malformed java/lang/Long marker".into()))?
+                    .to_string(),
+            ))),
             ("java/lang/Double", "doubleValue", "()D")
             | ("java/lang/Float", "doubleValue", "()D") => {
                 Ok(double_value(boxed_float(receiver).ok_or_else(|| {
@@ -1996,6 +2030,19 @@ impl Host for StdHost {
                     "{}{suffix}",
                     expect_string(receiver)
                 ))))
+            }
+            ("java/lang/String", "repeat", "(I)Ljava/lang/String;") => {
+                let count = expect_int(r, Self::argument(r, args, 0)?)?;
+                let count = usize::try_from(count)
+                    .ok()
+                    .filter(|count| *count <= 1 << 20)
+                    .ok_or_else(|| {
+                        NativeError::Metadata(format!(
+                            "{}#{} repeat count is invalid",
+                            r.owner, r.name
+                        ))
+                    })?;
+                Ok(Value::Ref(Some(expect_string(receiver).repeat(count))))
             }
             ("java/lang/String", "indexOf", "(Ljava/lang/String;)I") => {
                 Ok(Value::Int(utf16_index_of(
@@ -2675,13 +2722,36 @@ impl Host for StdHost {
             (
                 "net/neoforged/neoforge/registries/DeferredHolder",
                 "getId",
-                "()Lnet/minecraft/resources/Identifier;",
+                "()Lnet/minecraft/resources/Identifier;"
+                | "()Lnet/minecraft/resources/ResourceLocation;",
             ) => Ok(Value::Ref(Some(format!(
                 "identifier/{}",
                 expect_ref(receiver).map_or("holder/", String::as_str)
             )))),
             ("net/neoforged/neoforge/registries/DeferredHolder", "isPresent", "()Z") => {
                 Ok(Value::Int(1))
+            }
+            ("net/minecraft/core/Holder", "value", "()Ljava/lang/Object;")
+            | ("net/minecraft/core/Holder$Reference", "value", "()Ljava/lang/Object;") => {
+                let key = expect_ref(receiver)
+                    .and_then(|value| value.strip_prefix("holder/"))
+                    .unwrap_or("deferred-register/registry/default/entry");
+                Ok(self
+                    .holders
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| Value::Ref(Some(format!("registered/{key}")))))
+            }
+            ("net/minecraft/core/Holder", "isBound", "()Z")
+            | ("net/minecraft/core/Holder$Reference", "isBound", "()Z") => Ok(Value::Int(
+                expect_ref(receiver).is_some_and(|value| value.starts_with("holder/")) as i32,
+            )),
+            ("net/minecraft/core/Holder", "unwrapKey", "()Ljava/util/Optional;")
+            | ("net/minecraft/core/Holder$Reference", "unwrapKey", "()Ljava/util/Optional;") => {
+                let key = expect_ref(receiver)
+                    .and_then(|value| value.strip_prefix("holder/"))
+                    .unwrap_or("deferred-register/registry/default/entry");
+                Ok(Value::Ref(Some(format!("optional/resource-key/{key}"))))
             }
             (
                 "net/neoforged/neoforge/registries/DeferredRegister",
@@ -3091,6 +3161,32 @@ fn boxed_integer(value: &Value) -> Option<i32> {
             .and_then(|value| value.parse::<i32>().ok()),
         _ => None,
     }
+}
+
+fn parse_java_long(value: &Value) -> Result<i64, NativeError> {
+    expect_string(value).trim().parse::<i64>().map_err(|_| {
+        NativeError::Metadata("invalid long argument for java/lang/Long.parseLong".into())
+    })
+}
+
+fn long_value(value: i64) -> Value {
+    Value::Ref(Some(format!("long:{value}")))
+}
+
+fn boxed_long(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int(value) => Some(i64::from(*value)),
+        Value::Ref(Some(value)) => value
+            .strip_prefix("long:")
+            .and_then(|value| value.parse::<i64>().ok()),
+        _ => None,
+    }
+}
+
+fn expect_long(r: &MethodRef, value: &Value) -> Result<i64, NativeError> {
+    boxed_long(value).ok_or_else(|| {
+        NativeError::Metadata(format!("{}#{} expects a long value", r.owner, r.name))
+    })
 }
 
 fn boxed_boolean(value: &Value) -> Option<bool> {
@@ -6399,6 +6495,11 @@ mandatory = true
             Value::Ref(Some("ff".into()))
         );
         assert_eq!(
+            host.invoke(&long_hex, &[Value::Ref(Some("long:-1".into()))])
+                .unwrap(),
+            Value::Ref(Some("ffffffffffffffff".into()))
+        );
+        assert_eq!(
             host.calls(),
             &[
                 property,
@@ -6408,6 +6509,7 @@ mandatory = true
                 compare,
                 hex,
                 long_compare,
+                long_hex.clone(),
                 long_hex,
             ]
         );
@@ -6445,6 +6547,48 @@ mandatory = true
             host.invoke(&floor_mod, &[Value::Int(i32::MIN), Value::Int(-1)])
                 .unwrap(),
             Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn standard_host_maps_bounded_long_parsing() {
+        let mut host = StdHost::new();
+        let parse = MethodRef {
+            owner: "java/lang/Long".into(),
+            name: "parseLong".into(),
+            descriptor: "(Ljava/lang/String;)J".into(),
+        };
+        let value = host
+            .invoke(&parse, &[Value::Ref(Some("9223372036854775807".into()))])
+            .unwrap();
+        assert_eq!(value, Value::Ref(Some("long:9223372036854775807".into())));
+        assert_eq!(
+            host.invoke(
+                &MethodRef {
+                    owner: "java/lang/Long".into(),
+                    name: "toString".into(),
+                    descriptor: "(J)Ljava/lang/String;".into(),
+                },
+                std::slice::from_ref(&value),
+            )
+            .unwrap(),
+            Value::Ref(Some("9223372036854775807".into()))
+        );
+        assert_eq!(
+            host.invoke(
+                &MethodRef {
+                    owner: "java/lang/Long".into(),
+                    name: "parseLong".into(),
+                    descriptor: "(Ljava/lang/String;I)J".into(),
+                },
+                &[Value::Ref(Some("ff".into())), Value::Int(16)],
+            )
+            .unwrap(),
+            Value::Ref(Some("long:255".into()))
+        );
+        assert!(
+            host.invoke(&parse, &[Value::Ref(Some("oops".into()))])
+                .is_err()
         );
     }
 
@@ -6693,6 +6837,20 @@ mandatory = true
             host.invoke_instance(&starts, &receiver, &[Value::Ref(Some("Hé".into()))])
                 .unwrap(),
             Value::Int(1)
+        );
+        let repeat = MethodRef {
+            owner: "java/lang/String".into(),
+            name: "repeat".into(),
+            descriptor: "(I)Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&repeat, &Value::Ref(Some("ab".into())), &[Value::Int(3)])
+                .unwrap(),
+            Value::Ref(Some("ababab".into()))
+        );
+        assert!(
+            host.invoke_instance(&repeat, &receiver, &[Value::Int(-1)])
+                .is_err()
         );
         let substring = MethodRef {
             owner: "java/lang/String".into(),
@@ -8480,6 +8638,70 @@ mandatory = true
                 "{name} returned {value:?}"
             );
         }
+        let holder_value = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraft/core/Holder".into(),
+                    name: "value".into(),
+                    descriptor: "()Ljava/lang/Object;".into(),
+                },
+                &Value::Ref(Some("holder/deferred-register/registry/demo/entry".into())),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            holder_value,
+            Value::Ref(Some(
+                "registered/deferred-register/registry/demo/entry".into()
+            ))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraft/core/Holder".into(),
+                    name: "isBound".into(),
+                    descriptor: "()Z".into(),
+                },
+                &Value::Ref(Some("holder/deferred-register/registry/demo/entry".into())),
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        let holder_key = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraft/core/Holder$Reference".into(),
+                    name: "unwrapKey".into(),
+                    descriptor: "()Ljava/util/Optional;".into(),
+                },
+                &Value::Ref(Some("holder/deferred-register/registry/demo/entry".into())),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            holder_key,
+            Value::Ref(Some(
+                "optional/resource-key/deferred-register/registry/demo/entry".into()
+            ))
+        );
+        let modern_id = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "net/neoforged/neoforge/registries/DeferredHolder".into(),
+                    name: "getId".into(),
+                    descriptor: "()Lnet/minecraft/resources/ResourceLocation;".into(),
+                },
+                &Value::Ref(Some("holder/deferred-register/registry/demo/entry".into())),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            modern_id,
+            Value::Ref(Some(
+                "identifier/holder/deferred-register/registry/demo/entry".into()
+            ))
+        );
         let optional = host
             .invoke_instance(
                 &MethodRef {
@@ -8507,7 +8729,7 @@ mandatory = true
             ))
         );
         assert_eq!(host.registrations().len(), 1);
-        assert_eq!(host.invocations().len(), 12);
+        assert_eq!(host.invocations().len(), 16);
         assert_eq!(
             host.invocations()[2].args[0],
             Value::Ref(Some("@indy:listener".into()))
