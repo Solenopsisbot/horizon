@@ -519,6 +519,22 @@ impl Host for StdHost {
                 self.next_fabric_event = self.next_fabric_event.saturating_add(1);
                 Ok(Value::Ref(Some(marker)))
             }
+            ("java/lang/Integer", "parseInt", "(Ljava/lang/String;I)I") => {
+                let text = expect_string(Self::argument(r, args, 0)?);
+                let radix = expect_int(r, Self::argument(r, args, 1)?)?;
+                let radix = u32::try_from(radix).map_err(|_| {
+                    NativeError::Metadata(
+                        "java/lang/Integer.parseInt received an invalid radix".into(),
+                    )
+                })?;
+                let value = i32::from_str_radix(text, radix).map_err(|_| {
+                    NativeError::Metadata(format!(
+                        "invalid integer argument for {}#{}",
+                        r.owner, r.name
+                    ))
+                })?;
+                Ok(Value::Int(value))
+            }
             ("java/lang/Integer", "parseInt", "(Ljava/lang/String;)I") => {
                 let value = match Self::argument(r, args, 0)? {
                     Value::Ref(Some(value)) => value.parse::<i32>().map_err(|_| {
@@ -548,6 +564,21 @@ impl Host for StdHost {
                             "invalid integer argument for java/lang/Integer.valueOf".into(),
                         )
                     })?;
+                Ok(Value::Ref(Some(format!("integer:{value}"))))
+            }
+            ("java/lang/Integer", "valueOf", "(Ljava/lang/String;I)Ljava/lang/Integer;") => {
+                let text = expect_string(Self::argument(r, args, 0)?);
+                let radix = expect_int(r, Self::argument(r, args, 1)?)?;
+                let radix = u32::try_from(radix).map_err(|_| {
+                    NativeError::Metadata(
+                        "java/lang/Integer.valueOf received an invalid radix".into(),
+                    )
+                })?;
+                let value = i32::from_str_radix(text, radix).map_err(|_| {
+                    NativeError::Metadata(
+                        "invalid integer argument for java/lang/Integer.valueOf".into(),
+                    )
+                })?;
                 Ok(Value::Ref(Some(format!("integer:{value}"))))
             }
             ("java/lang/Boolean", "parseBoolean", "(Ljava/lang/String;)Z") => {
@@ -5677,7 +5708,36 @@ mandatory = true
                 .unwrap(),
             Value::Int(7)
         );
-        assert_eq!(host.calls(), &[property, parse]);
+        let parse_radix = MethodRef {
+            owner: "java/lang/Integer".into(),
+            name: "parseInt".into(),
+            descriptor: "(Ljava/lang/String;I)I".into(),
+        };
+        assert_eq!(
+            host.invoke(
+                &parse_radix,
+                &[Value::Ref(Some("ff".into())), Value::Int(16)],
+            )
+            .unwrap(),
+            Value::Int(255)
+        );
+        let value_of_radix = MethodRef {
+            owner: "java/lang/Integer".into(),
+            name: "valueOf".into(),
+            descriptor: "(Ljava/lang/String;I)Ljava/lang/Integer;".into(),
+        };
+        assert_eq!(
+            host.invoke(
+                &value_of_radix,
+                &[Value::Ref(Some("101".into())), Value::Int(2)],
+            )
+            .unwrap(),
+            Value::Ref(Some("integer:5".into()))
+        );
+        assert_eq!(
+            host.calls(),
+            &[property, parse, parse_radix, value_of_radix]
+        );
     }
 
     #[test]

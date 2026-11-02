@@ -1496,6 +1496,19 @@ fn render(
             methods += 1;
         }
     }
+    if class.name == "net/minecraft/world/level/block/state/BlockState" {
+        for (name, descriptor, ret) in [
+            ("hasBlockEntity", "()Z", "boolean"),
+            ("isRandomlyTicking", "()Z", "boolean"),
+        ] {
+            if !seen.insert((name.to_owned(), String::new())) {
+                continue;
+            }
+            let body = runtime_body_with_descriptor(&class.name, name, ret, descriptor);
+            let _ = writeln!(out, "    public {ret} {name}() {{ {body} }}");
+            methods += 1;
+        }
+    }
     if class.name == "net/minecraft/network/chat/MutableComponent" {
         if seen.insert(("getString".to_owned(), "".to_owned())) {
             let _ = writeln!(
@@ -2645,6 +2658,12 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             "is" if ret == "boolean" && descriptor == "(Lnet/minecraft/tags/TagKey;)Z" => {
                 return "return false;".to_owned();
             }
+            "hasBlockEntity" if ret == "boolean" && descriptor == "()Z" => {
+                return "return false;".to_owned();
+            }
+            "isRandomlyTicking" if ret == "boolean" && descriptor == "()Z" => {
+                return "return false;".to_owned();
+            }
             "isAir" if ret == "boolean" => return "return false;".to_owned(),
             "canOcclude" if ret == "boolean" => return "return true;".to_owned(),
             "isSolidRender" if ret == "boolean" => return "return true;".to_owned(),
@@ -2758,6 +2777,14 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
                 "(Lnet/minecraft/core/BlockPos;)I",
             ) => {
                 return "return canSeeSky(p0) ? 15 : 0;".to_owned();
+            }
+            (
+                "isOutsideBuildHeight",
+                "boolean",
+                "(Lnet/minecraft/core/BlockPos;)Z",
+            ) => {
+                return "return p0.getY() < getMinBuildHeight() || p0.getY() >= getMaxBuildHeight();"
+                    .to_owned();
             }
             _ => {}
         }
@@ -4471,6 +4498,8 @@ mod tests {
         assert!(source.contains("horizonValues.put(p0, p1); return this;"));
         assert!(source.contains("return (java.lang.Comparable) horizonValues.get(p0);"));
         assert!(source.contains("return horizonValues.containsKey(p0);"));
+        assert!(source.contains("public boolean hasBlockEntity()"));
+        assert!(source.contains("public boolean isRandomlyTicking()"));
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/world/level/block/state/BlockState",
@@ -4511,6 +4540,24 @@ mod tests {
             runtime_body_with_descriptor(
                 "net/minecraft/world/level/block/state/BlockState",
                 "isAir",
+                "boolean",
+                "()Z",
+            ),
+            "return false;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/block/state/BlockState",
+                "hasBlockEntity",
+                "boolean",
+                "()Z",
+            ),
+            "return false;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/block/state/BlockState",
+                "isRandomlyTicking",
                 "boolean",
                 "()Z",
             ),
@@ -5260,6 +5307,15 @@ mod tests {
                 "(Lnet/minecraft/core/BlockPos;)I",
             ),
             "return canSeeSky(p0) ? 15 : 0;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/Level",
+                "isOutsideBuildHeight",
+                "boolean",
+                "(Lnet/minecraft/core/BlockPos;)Z",
+            ),
+            "return p0.getY() < getMinBuildHeight() || p0.getY() >= getMaxBuildHeight();"
         );
     }
 

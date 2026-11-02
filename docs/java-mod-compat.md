@@ -282,8 +282,8 @@ collections remain callback-local until the Rust NBT bridge is wired through the
 block-state/entity, loaded-chunk, sky-visibility, side, and build-height queries. Their
 bounded coordinate-keyed maps also preserve `setBlock`, `setBlockAndUpdate`, `setBlockEntity`, and
 `removeBlock` writes within the façade instance, so a registration callback can observe its own world
-mutation sequence. `getSeaLevel` and `getMaxLocalRawBrightness` provide the common overworld constants
-for terrain and light bootstrap code. The maps remain callback-local until the native level handle is
+mutation sequence. `getSeaLevel`, `getMaxLocalRawBrightness`, and `isOutsideBuildHeight` provide common
+overworld terrain bounds for terrain and light bootstrap code. The maps remain callback-local until the native level handle is
 wired through the game boundary; they do not replace Horizon's authoritative world state.
 `Entity` now retains position, delta movement, rotation, removal state, a level handle, a stable UUID
 marker, and a bounded bounding-box/on-ground state; `getX`/`getY`/`getZ`, both `setPos` overloads,
@@ -692,7 +692,8 @@ BlockState bootstrap paths retain a bounded block identity and property map: `ge
 `canOcclude`, `isSolidRender`, and `getLightEmission` provide stable inspection defaults, while
 `setValue` feeds `getValue`, `hasProperty`, and `getProperties` on the same façade instance. This covers
 common state construction and inspection while the registry-backed state definition and vanilla default
-values remain follow-up work.
+values remain follow-up work. `hasBlockEntity` and `isRandomlyTicking` expose explicit empty-safe defaults
+for bootstrap checks.
 The `ItemStack.is(TagKey)` and `BlockState.is(TagKey)` overloads are also linked with an explicit empty
 membership result until registry-backed tag tables are attached.
 `TagKey` now retains its registry key and identifier as a value pair: `create`, `location`, `registry`,
