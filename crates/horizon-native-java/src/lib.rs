@@ -382,7 +382,7 @@ impl StdHost {
 
     pub fn listener_registrations(&self) -> impl Iterator<Item = &HostInvocation> {
         self.invocations.iter().filter(|invocation| {
-            ((invocation.method.owner == "net/neoforged/bus/api/IEventBus"
+            ((is_event_bus_owner(&invocation.method.owner)
                 && invocation.method.name == "addListener")
                 || (invocation.method.owner == "net/fabricmc/fabric/api/event/Event"
                     && invocation.method.name == "register"))
@@ -471,7 +471,17 @@ impl Host for StdHost {
             ) => Ok(Value::Ref(Some(
                 "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext".into(),
             ))),
+            (
+                "net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext",
+                "get",
+                "()Lnet/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext;",
+            ) => Ok(Value::Ref(Some(
+                "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext".into(),
+            ))),
             ("net/neoforged/fml/ModList", "get", "()Lnet/neoforged/fml/ModList;") => {
+                Ok(Value::Ref(Some("neoforge-mod-list".into())))
+            }
+            ("net/minecraftforge/fml/ModList", "get", "()Lnet/minecraftforge/fml/ModList;") => {
                 Ok(Value::Ref(Some("neoforge-mod-list".into())))
             }
             _ => Ok(Value::default_for(&r.descriptor)),
@@ -513,9 +523,12 @@ impl Host for StdHost {
                 // than treating the callback marker as a game value.
                 Ok(self.lazy_optional(None))
             }
-            ("net/neoforged/neoforge/registries/DeferredRegister", "create", descriptor)
-                if descriptor.ends_with("Lnet/neoforged/neoforge/registries/DeferredRegister;") =>
-            {
+            (
+                owner @ ("net/neoforged/neoforge/registries/DeferredRegister"
+                | "net/minecraftforge/registries/DeferredRegister"),
+                "create",
+                descriptor,
+            ) if descriptor.ends_with(&format!("L{owner};")) => {
                 let registry = args
                     .first()
                     .and_then(expect_ref)
@@ -2621,7 +2634,11 @@ impl Host for StdHost {
                 };
                 Ok(Value::Int(self.mods.contains_key(id) as i32))
             }
-            ("net/neoforged/fml/ModList", "isLoaded", "(Ljava/lang/String;)Z") => {
+            (
+                "net/neoforged/fml/ModList" | "net/minecraftforge/fml/ModList",
+                "isLoaded",
+                "(Ljava/lang/String;)Z",
+            ) => {
                 let id = match Self::argument(r, args, 0)? {
                     Value::Ref(Some(id)) => id,
                     _ => return Ok(Value::Int(0)),
@@ -2629,7 +2646,7 @@ impl Host for StdHost {
                 Ok(Value::Int(self.mods.contains_key(id) as i32))
             }
             (
-                "net/neoforged/fml/ModList",
+                "net/neoforged/fml/ModList" | "net/minecraftforge/fml/ModList",
                 "getModContainerById",
                 "(Ljava/lang/String;)Ljava/util/Optional;",
             ) => {
@@ -2641,7 +2658,11 @@ impl Host for StdHost {
                     format!("neoforge-mod-container/{id}/{version}")
                 })))
             }
-            ("net/neoforged/fml/ModList", "getMods", "()Ljava/util/List;") => {
+            (
+                "net/neoforged/fml/ModList" | "net/minecraftforge/fml/ModList",
+                "getMods",
+                "()Ljava/util/List;",
+            ) => {
                 let values = self
                     .mods
                     .iter()
@@ -2712,9 +2733,11 @@ impl Host for StdHost {
                     &[path_value(&format!("/horizon/mods/{id}"))],
                 ))
             }
-            ("net/neoforged/fml/ModContainer", "getModId", "()Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(metadata_part(expect_ref(receiver), 1))))
-            }
+            (
+                "net/neoforged/fml/ModContainer" | "net/minecraftforge/fml/ModContainer",
+                "getModId",
+                "()Ljava/lang/String;",
+            ) => Ok(Value::Ref(Some(metadata_part(expect_ref(receiver), 1)))),
             ("net/fabricmc/loader/api/metadata/ModMetadata", "getId", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(metadata_part(expect_ref(receiver), 1))))
             }
@@ -2760,20 +2783,27 @@ impl Host for StdHost {
                 "getModEventBus",
                 "()Lnet/neoforged/bus/api/IEventBus;",
             ) => Ok(Value::Ref(Some("net/neoforged/bus/api/IEventBus".into()))),
-            ("net/neoforged/bus/api/IEventBus", "addListener", descriptor)
-                if descriptor.ends_with("Lnet/neoforged/bus/api/IEventBus;") =>
+            (
+                "net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext",
+                "getModEventBus",
+                "()Lnet/minecraftforge/eventbus/api/IEventBus;",
+            ) => Ok(Value::Ref(Some(
+                "net/minecraftforge/eventbus/api/IEventBus".into(),
+            ))),
+            (owner, "addListener", descriptor)
+                if is_event_bus_owner(owner) && descriptor.ends_with("IEventBus;") =>
             {
                 Ok(receiver.clone())
             }
-            ("net/neoforged/bus/api/IEventBus", "register", descriptor)
-                if descriptor.ends_with("Lnet/neoforged/bus/api/IEventBus;") =>
+            (owner, "register", descriptor)
+                if is_event_bus_owner(owner) && descriptor.ends_with("IEventBus;") =>
             {
                 Ok(receiver.clone())
             }
-            ("net/neoforged/bus/api/IEventBus", "unregister", "(Ljava/lang/Object;)V") => {
+            (owner, "unregister", "(Ljava/lang/Object;)V") if is_event_bus_owner(owner) => {
                 let target = Self::argument(r, args, 0)?.clone();
                 self.invocations.retain(|invocation| {
-                    let listener = (invocation.method.owner == "net/neoforged/bus/api/IEventBus"
+                    let listener = (is_event_bus_owner(&invocation.method.owner)
                         && invocation.method.name == "addListener")
                         || (invocation.method.owner == "net/fabricmc/fabric/api/event/Event"
                             && invocation.method.name == "register");
@@ -2781,12 +2811,22 @@ impl Host for StdHost {
                 });
                 Ok(Value::Void)
             }
-            ("net/neoforged/bus/api/IEventBus", "post", "(Lnet/neoforged/bus/api/Event;)Z") => {
+            (owner, "post", descriptor)
+                if is_event_bus_owner(owner)
+                    && descriptor.ends_with(")Z")
+                    && (descriptor.contains("Lnet/neoforged/bus/api/Event;")
+                        || descriptor.contains("Lnet/minecraftforge/eventbus/api/Event;")) =>
+            {
                 let event = Self::argument(r, args, 0)?.clone();
                 Ok(Value::Int(self.post_event(event) as i32))
             }
-            ("net/neoforged/neoforge/registries/DeferredRegister", "register", descriptor)
-                if descriptor.ends_with("Lnet/neoforged/neoforge/registries/DeferredHolder;") =>
+            (
+                "net/neoforged/neoforge/registries/DeferredRegister"
+                | "net/minecraftforge/registries/DeferredRegister",
+                "register",
+                descriptor,
+            ) if descriptor.ends_with("Lnet/neoforged/neoforge/registries/DeferredHolder;")
+                || descriptor.ends_with("Lnet/minecraftforge/registries/RegistryObject;") =>
             {
                 let id = args
                     .first()
@@ -2811,7 +2851,8 @@ impl Host for StdHost {
                 Ok(Value::Ref(Some(format!("holder/{key}"))))
             }
             (
-                "net/neoforged/neoforge/registries/DeferredRegister",
+                "net/neoforged/neoforge/registries/DeferredRegister"
+                | "net/minecraftforge/registries/DeferredRegister",
                 "getEntries",
                 "()Ljava/util/Collection;",
             ) => {
@@ -2870,6 +2911,75 @@ impl Host for StdHost {
             )))),
             ("net/neoforged/neoforge/registries/DeferredHolder", "isPresent", "()Z") => {
                 Ok(Value::Int(1))
+            }
+            ("net/minecraftforge/registries/RegistryObject", "get", "()Ljava/lang/Object;")
+            | (
+                "net/minecraftforge/registries/RegistryObject",
+                "orElse",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+            | (
+                "net/minecraftforge/registries/RegistryObject",
+                "orElseGet",
+                "(Ljava/util/function/Supplier;)Ljava/lang/Object;",
+            ) => {
+                let key = expect_ref(receiver)
+                    .and_then(|value| value.strip_prefix("holder/"))
+                    .unwrap_or("deferred-register/registry/default/entry");
+                Ok(self
+                    .holders
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| Value::Ref(Some(format!("registered/{key}")))))
+            }
+            ("net/minecraftforge/registries/RegistryObject", "isPresent", "()Z") => {
+                Ok(Value::Int(1))
+            }
+            (
+                "net/minecraftforge/registries/RegistryObject",
+                "getId",
+                "()Lnet/minecraft/resources/ResourceLocation;",
+            )
+            | (
+                "net/minecraftforge/registries/RegistryObject",
+                "getRegistryName",
+                "()Lnet/minecraft/resources/ResourceLocation;",
+            ) => Ok(Value::Ref(Some(format!(
+                "identifier/{}",
+                expect_ref(receiver).map_or("holder/", String::as_str)
+            )))),
+            (
+                "net/minecraftforge/registries/RegistryObject",
+                "getKey",
+                "()Lnet/minecraft/resources/ResourceKey;",
+            ) => Ok(Value::Ref(Some(format!(
+                "resource-key/{}",
+                expect_ref(receiver).map_or("holder/", String::as_str)
+            )))),
+            (
+                "net/minecraftforge/registries/RegistryObject",
+                "getOptional",
+                "()Ljava/util/Optional;",
+            ) => Ok(Value::Ref(Some(format!(
+                "optional/registered/{}",
+                expect_ref(receiver)
+                    .and_then(|value| value.strip_prefix("holder/"))
+                    .unwrap_or("deferred-register/registry/default/entry")
+            )))),
+            (
+                "net/minecraftforge/registries/IForgeRegistryEntry",
+                "getRegistryName",
+                "()Lnet/minecraft/resources/ResourceLocation;",
+            ) => Ok(Value::Ref(Some(format!(
+                "identifier/{}",
+                expect_ref(receiver).map_or("registered/", String::as_str)
+            )))),
+            (
+                "net/minecraftforge/registries/IForgeRegistryEntry",
+                "setRegistryName",
+                descriptor,
+            ) if descriptor.ends_with("Lnet/minecraftforge/registries/IForgeRegistryEntry;") => {
+                Ok(receiver.clone())
             }
             ("net/minecraft/core/Holder", "value", "()Ljava/lang/Object;")
             | ("net/minecraft/core/Holder$Reference", "value", "()Ljava/lang/Object;") => {
@@ -3197,6 +3307,16 @@ fn event_is_cancelled(value: &Value) -> bool {
             || marker.starts_with("event/cancelled/")
             || marker.starts_with("@cancelled:")
     })
+}
+
+/// Forge 1.20-era event-bus names are ABI-compatible with the bounded
+/// NeoForge surface we expose. Keep the alias explicit so newer Forge-only
+/// APIs do not accidentally become supported by prefix matching.
+fn is_event_bus_owner(owner: &str) -> bool {
+    matches!(
+        owner,
+        "net/neoforged/bus/api/IEventBus" | "net/minecraftforge/eventbus/api/IEventBus"
+    )
 }
 
 fn uuid_value(text: &str) -> Result<Value, NativeError> {
@@ -8846,6 +8966,67 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_maps_legacy_forge_loader_aliases() {
+        let mut host = StdHost::new().with_mod("legacy", "2.0");
+        let list = host
+            .get_static(&MethodRef {
+                owner: "net/minecraftforge/fml/ModList".into(),
+                name: "get".into(),
+                descriptor: "()Lnet/minecraftforge/fml/ModList;".into(),
+            })
+            .unwrap();
+        assert_eq!(list, Value::Ref(Some("neoforge-mod-list".into())));
+        let container = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraftforge/fml/ModList".into(),
+                    name: "getModContainerById".into(),
+                    descriptor: "(Ljava/lang/String;)Ljava/util/Optional;".into(),
+                },
+                &list,
+                &[Value::Ref(Some("legacy".into()))],
+            )
+            .unwrap();
+        assert_eq!(
+            container,
+            Value::Ref(Some("neoforge-mod-container/legacy/2.0".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraftforge/fml/ModContainer".into(),
+                    name: "getModId".into(),
+                    descriptor: "()Ljava/lang/String;".into(),
+                },
+                &container,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("legacy".into()))
+        );
+        let context = host
+            .get_static(&MethodRef {
+                owner: "net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext".into(),
+                name: "get".into(),
+                descriptor: "()Lnet/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext;".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext".into(),
+                    name: "getModEventBus".into(),
+                    descriptor: "()Lnet/minecraftforge/eventbus/api/IEventBus;".into(),
+                },
+                &context,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("net/minecraftforge/eventbus/api/IEventBus".into()))
+        );
+    }
+
+    #[test]
     fn standard_host_maps_identifier_and_resource_key_values() {
         let mut host = StdHost::new();
         let parse = MethodRef {
@@ -9211,6 +9392,68 @@ mandatory = true
         let mut typed_sink = TypedSink::default();
         assert_eq!(host.apply_typed_registrations(&mut typed_sink).unwrap(), 1);
         assert_eq!(typed_sink.0, vec!["deferred-register/registry/demo/entry"]);
+    }
+
+    #[test]
+    fn standard_host_aliases_legacy_forge_registry_objects() {
+        let mut host = StdHost::new();
+        let register = host
+            .invoke(
+                &MethodRef {
+                    owner: "net/minecraftforge/registries/DeferredRegister".into(),
+                    name: "create".into(),
+                    descriptor: "(Ljava/lang/Object;Ljava/lang/String;)Lnet/minecraftforge/registries/DeferredRegister;".into(),
+                },
+                &[Value::Ref(Some("registry".into())), Value::Ref(Some("legacy".into()))],
+            )
+            .unwrap();
+        let object = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraftforge/registries/DeferredRegister".into(),
+                    name: "register".into(),
+                    descriptor: "(Ljava/lang/String;Ljava/util/function/Supplier;)Lnet/minecraftforge/registries/RegistryObject;".into(),
+                },
+                &register,
+                &[Value::Ref(Some("entry".into())), Value::Ref(Some("@indy:supplier".into()))],
+            )
+            .unwrap();
+        assert_eq!(
+            object,
+            Value::Ref(Some(
+                "holder/deferred-register/registry/legacy/entry".into()
+            ))
+        );
+        let value = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraftforge/registries/RegistryObject".into(),
+                    name: "get".into(),
+                    descriptor: "()Ljava/lang/Object;".into(),
+                },
+                &object,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            value,
+            Value::Ref(Some(
+                "registered/deferred-register/registry/legacy/entry".into()
+            ))
+        );
+        let name = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraftforge/registries/IForgeRegistryEntry".into(),
+                    name: "getRegistryName".into(),
+                    descriptor: "()Lnet/minecraft/resources/ResourceLocation;".into(),
+                },
+                &value,
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(name, Value::Ref(Some(marker)) if marker.starts_with("identifier/")));
+        assert_eq!(host.registrations().len(), 1);
     }
 
     #[test]
@@ -10671,6 +10914,85 @@ mandatory = true
                 Value::Ref(Some("event/demo".into())),
                 Value::Ref(Some("event/cancelled/demo".into())),
             ]
+        );
+    }
+
+    #[test]
+    fn standard_host_aliases_legacy_forge_event_bus() {
+        let mut host = StdHost::new();
+        let context = host
+            .get_static(&MethodRef {
+                owner: "net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext".into(),
+                name: "get".into(),
+                descriptor: "()Lnet/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext;".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext".into(),
+                    name: "getModEventBus".into(),
+                    descriptor: "()Lnet/minecraftforge/eventbus/api/IEventBus;".into(),
+                },
+                &context,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("net/minecraftforge/eventbus/api/IEventBus".into()))
+        );
+        let bus = Value::Ref(Some("net/minecraftforge/eventbus/api/IEventBus".into()));
+        let add = MethodRef {
+            owner: "net/minecraftforge/eventbus/api/IEventBus".into(),
+            name: "addListener".into(),
+            descriptor:
+                "(Ljava/util/function/Consumer;)Lnet/minecraftforge/eventbus/api/IEventBus;".into(),
+        };
+        let listener = Value::Ref(Some("@indy:forge-listener".into()));
+        assert_eq!(
+            host.invoke_instance(&add, &bus, std::slice::from_ref(&listener))
+                .unwrap(),
+            bus
+        );
+        assert_eq!(
+            host.dispatch_event(Value::Ref(Some("forge-event".into())))
+                .len(),
+            1
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraftforge/eventbus/api/IEventBus".into(),
+                    name: "unregister".into(),
+                    descriptor: "(Ljava/lang/Object;)V".into(),
+                },
+                &bus,
+                std::slice::from_ref(&listener),
+            )
+            .unwrap(),
+            Value::Void
+        );
+        assert!(
+            host.dispatch_event(Value::Ref(Some("forge-event-after-remove".into())))
+                .is_empty()
+        );
+
+        let post = MethodRef {
+            owner: "net/minecraftforge/eventbus/api/IEventBus".into(),
+            name: "post".into(),
+            descriptor: "(Lnet/minecraftforge/eventbus/api/Event;)Z".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &post,
+                &bus,
+                &[Value::Ref(Some("event/cancelled/forge".into()))]
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.posted_events(),
+            &[Value::Ref(Some("event/cancelled/forge".into()))]
         );
     }
 

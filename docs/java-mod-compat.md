@@ -443,6 +443,9 @@ opaque callback markers until a Horizon-owned adapter executes them; live regist
 The host now recognizes NeoForge listeners that opt into cancelled events and excludes default listeners from
 cancelled dispatches, while Fabric listeners remain eligible for the array-backed event callback even when the
 event marker is cancelled; both loader families retain registration order.
+Legacy Forge event-bus owners (`net.minecraftforge.eventbus.api.IEventBus` and its `Event` descriptor) use the
+same bounded listener, cancellation, fluent-registration, and `post` behavior. This alias is deliberately
+limited to the event-bus surface; unrelated Forge APIs remain unsupported.
 `PayloadRegistrar` now retains the registrar returned by one `RegisterPayloadHandlersEvent` and counts its
 play and configuration registrations in each direction, so payload bootstrap can inspect a stable
 registration object before the native channel boundary is attached.
@@ -506,7 +509,10 @@ game/config/mods paths, Fabric `ModContainer.getRootPaths` (a bounded mod-root m
 `isDevelopmentEnvironment` marker (off by default), plus a deterministic `getAllMods` list backed by the seeded containers; callers seed the loaded-mod map with
 `with_mod`. NeoForge's `ModList.get().isLoaded`, `getMods`, and `getModContainerById` use the same seeded map and
 return deterministic container markers, and `ModContainer.getModId` exposes the seeded id for
-NeoForge entrypoints. Common
+NeoForge entrypoints. The corresponding legacy Forge owners (`net.minecraftforge.fml.ModList`,
+`ModContainer`, and `FMLJavaModLoadingContext`) are accepted as aliases and use the same deterministic
+seeded state and event-bus behavior, so loader bootstrap checks stay consistent across the fork.
+Common
 `Optional.empty`/`of`/`ofNullable` constructors and
 `isPresent`, `isEmpty`, `map`, `filter`, `or`, `equals`, `hashCode`, and `toString` preserve bounded optional
 value semantics for loader bootstrap code, while unresolved callbacks remain explicit markers. Common
@@ -566,6 +572,10 @@ The generated NeoForge `DeferredHolder` façade now retains its id, registry key
 `DeferredRegister` shim binds the namespace and supplier when `register` is called, and `getEntries` projects
 the registered holders into a bounded collection, so common registry bootstrap code can inspect holders before
 the native registry sink commits typed declarations.
+Legacy Forge registry names use the same bounded markers: `net.minecraftforge.registries.DeferredRegister`
+delegates to the register path, `RegistryObject` exposes `get`, `isPresent`, `getOptional`, `getId`, and
+`getKey`, and `IForgeRegistryEntry.getRegistryName`/`setRegistryName` retain the value marker. This alias
+surface is limited to value and identity queries; it does not load Forge's mutable registry implementation.
 Unsupported callback bodies still return the interpreter's explicit bounded diagnostics. The sink is
 deliberately an export boundary today: Horizon's prepared block and item registries are immutable once
 `content_root` has loaded, and an opaque Java object marker cannot safely become a native block or item.
