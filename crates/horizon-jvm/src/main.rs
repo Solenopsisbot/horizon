@@ -556,7 +556,9 @@ fn fallback_label(class: &str, detail: Option<&str>) -> Option<String> {
         "java.lang.NoSuchMethodError"
         | "java.lang.NoSuchFieldError"
         | "java.lang.NoSuchMethodException"
-        | "java.lang.NoSuchFieldException" => Some(format!(
+        | "java.lang.NoSuchFieldException"
+        | "java.lang.AbstractMethodError"
+        | "java.lang.IncompatibleClassChangeError" => Some(format!(
             "JVM fallback selected for missing façade member{}",
             detail.map_or_else(String::new, |value| format!(": {value}"))
         )),
@@ -851,6 +853,20 @@ mod tests {
         );
         assert_eq!(
             fallback_label("java.lang.NoSuchFieldException", None),
+            Some("JVM fallback selected for missing façade member".to_owned())
+        );
+        assert_eq!(
+            fallback_label(
+                "java.lang.AbstractMethodError",
+                Some("net.fabricmc.loader.api.ModContainer#getMetadata")
+            ),
+            Some(
+                "JVM fallback selected for missing façade member: net.fabricmc.loader.api.ModContainer#getMetadata"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            fallback_label("java.lang.IncompatibleClassChangeError", None),
             Some("JVM fallback selected for missing façade member".to_owned())
         );
         assert_eq!(

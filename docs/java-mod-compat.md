@@ -562,7 +562,8 @@ Throwable and common Exception/Error subclasses retain constructor message and c
 `getMessage`, `getCause`, `initCause`, and `toString` accessors for loader diagnostics; stack traces and arbitrary
 throw/catch control flow remain outside this surface. The embedded JVM runner labels
 `UnsupportedOperationException`, dynamic classpath failures, and missing façade members such as
-`NoSuchMethodError`/`NoSuchFieldError` as explicit fallback diagnostics instead of opaque entrypoint errors.
+`NoSuchMethodError`/`NoSuchFieldError`/`AbstractMethodError`/`IncompatibleClassChangeError` as explicit
+fallback diagnostics instead of opaque entrypoint errors.
 `System.getProperties()` exposes the seeded properties as a bounded `Properties` map, so bootstrap code
 can use the same key/value queries as `getProperty` without crossing the host boundary.
 `System.getenv(String)` and the no-argument `System.getenv()` map are likewise backed only by values explicitly
@@ -847,6 +848,10 @@ for bootstrap checks.
 `ItemStack.getUseAnimation()` now returns the deterministic `UseAnim.NONE` façade value, and `getTags()`
 returns a bounded empty stream alongside the existing count, copy, damage, component, and tag queries, keeping
 common item bootstrap branches linkable.
+`InteractionResult` keeps the common item and block callback contract linkable as well: `isSuccess`,
+`isAccepted`, `consumesAction`, `shouldSwing`, and `shouldAwardStats` preserve the enum's bounded state,
+while `sidedSuccess`, `success`, `consume`, `pass`, and `fail` return the matching façade values. The
+interaction result does not perform live server-side effects; those remain in the native hook boundary.
 The `ItemStack.is(TagKey)` and `BlockState.is(TagKey)` overloads are also linked with an explicit empty
 membership result until registry-backed tag tables are attached.
 `TagKey` now retains its registry key and identifier as a value pair: `create`, `location`, `registry`,
