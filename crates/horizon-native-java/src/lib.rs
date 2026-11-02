@@ -581,6 +581,18 @@ impl Host for StdHost {
                 })?;
                 Ok(Value::Ref(Some(format!("integer:{value}"))))
             }
+            ("java/lang/Integer", "compare", "(II)I") => {
+                let left = expect_int(r, Self::argument(r, args, 0)?)?;
+                let right = expect_int(r, Self::argument(r, args, 1)?)?;
+                Ok(Value::Int(match left.cmp(&right) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }))
+            }
+            ("java/lang/Integer", "toHexString", "(I)Ljava/lang/String;") => Ok(Value::Ref(Some(
+                format!("{:x}", expect_int(r, Self::argument(r, args, 0)?)? as u32),
+            ))),
             ("java/lang/Boolean", "parseBoolean", "(Ljava/lang/String;)Z") => {
                 let value = match Self::argument(r, args, 0)? {
                     Value::Ref(Some(value)) => value.eq_ignore_ascii_case("true"),
@@ -5783,9 +5795,28 @@ mandatory = true
             .unwrap(),
             Value::Ref(Some("integer:5".into()))
         );
+        let compare = MethodRef {
+            owner: "java/lang/Integer".into(),
+            name: "compare".into(),
+            descriptor: "(II)I".into(),
+        };
+        assert_eq!(
+            host.invoke(&compare, &[Value::Int(-2), Value::Int(7)])
+                .unwrap(),
+            Value::Int(-1)
+        );
+        let hex = MethodRef {
+            owner: "java/lang/Integer".into(),
+            name: "toHexString".into(),
+            descriptor: "(I)Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke(&hex, &[Value::Int(255)]).unwrap(),
+            Value::Ref(Some("ff".into()))
+        );
         assert_eq!(
             host.calls(),
-            &[property, parse, parse_radix, value_of_radix]
+            &[property, parse, parse_radix, value_of_radix, compare, hex]
         );
     }
 

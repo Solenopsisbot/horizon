@@ -2109,6 +2109,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         if method == "containsKey" && ret == "boolean" {
             return "return horizonEntries.containsKey(p0);".to_owned();
         }
+        if method == "get" && descriptor.contains("Lnet/minecraft/resources/ResourceKey;") {
+            return format!("return ({ret}) horizonEntries.get(p0.location());");
+        }
         if method == "get" && descriptor.contains("Lnet/minecraft/resources/Identifier;") {
             return format!("return ({ret}) horizonEntries.get(p0);");
         }
@@ -2355,7 +2358,7 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
                     "horizonCount"
                 };
                 return format!(
-                    "net.minecraft.world.item.ItemStack value = new net.minecraft.world.item.ItemStack(horizonItem, {count}); value.horizonComponents.putAll(horizonComponents); return value;"
+                    "net.minecraft.world.item.ItemStack value = new net.minecraft.world.item.ItemStack(horizonItem, {count}); value.horizonDamage = horizonDamage; value.horizonComponents.putAll(horizonComponents); return value;"
                 );
             }
             ("grow", "void") => {
@@ -3829,6 +3832,14 @@ mod tests {
             )
             .contains("horizonCount")
         );
+        assert!(
+            runtime_body(
+                "net/minecraft/world/item/ItemStack",
+                "copy",
+                "net.minecraft.world.item.ItemStack"
+            )
+            .contains("horizonDamage = horizonDamage")
+        );
         assert_eq!(
             runtime_body(
                 "net/minecraft/util/StringRepresentable",
@@ -5024,6 +5035,15 @@ mod tests {
                 "()Lnet/minecraft/resources/ResourceKey;",
             ),
             "return horizonKey;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/Registry",
+                "get",
+                "java.lang.Object",
+                "(Lnet/minecraft/resources/ResourceKey;)Ljava/lang/Object;",
+            ),
+            "return (java.lang.Object) horizonEntries.get(p0.location());"
         );
         assert_eq!(
             runtime_body_with_descriptor(

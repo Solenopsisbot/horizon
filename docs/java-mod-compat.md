@@ -474,7 +474,8 @@ queries (`System.getProperty`, primitive parsing, line separators, string receiv
 external call is recorded with its receiver and arguments for later dispatch. The CLI keeps the neutral `NullHost` default so probe results remain independent of
 machine properties, while a game-facing host can opt into Horizon-owned mappings without coupling the
 interpreter crate to `horizon-client`. Unknown calls keep the neutral return contract.
-The standard-library surface also includes deterministic `StringBuilder`/`StringBuffer` append and
+The standard-library surface also includes deterministic `Integer.compare`/`toHexString`,
+`StringBuilder`/`StringBuffer` append and
 `toString` values, primitive `String.valueOf` overloads, plus `Objects.equals`, `requireNonNull`, and
 `toString`, which covers common loader bootstrap formatting and null checks without a JVM.
 String `replace` (character and `CharSequence` forms), `indexOf`, `lastIndexOf`, `trim`, `strip`, and `isBlank` are also
@@ -683,7 +684,7 @@ The generated façade now preserves the common item/count value path (`getCount`
 `getItem`, `copy`, `copyWithCount`, `grow`, and `shrink`) plus bounded stack inspection (`getMaxStackSize`,
 `hasFoil`, `isDamageable`, bounded damage/enchantment/use-duration inspection, and `getHoverName`) so bootstrap code
 can inspect stacks before the full component bridge is attached. `Item.getDefaultInstance` now creates a one-item
-stack retaining the item identity. It also has a bounded erased component map: `get`,
+stack retaining the item identity, and stack copies preserve damage alongside their component map. It also has a bounded erased component map: `get`,
 `getOrDefault`, `set`, `remove`, `has`, and `hasNonDefault` use the `DataComponentType` object as the
 key; generated `DataComponents` constants are distinct identity keys, absent values read as `null` (or
 the supplied default), and copies retain the map. This covers
@@ -705,7 +706,7 @@ size, identity membership, stream, and indexed access. Live cross-mod membership
 `ResourceKey` exposes the corresponding `location`, `registry`, `registryKey`, and `isFor` value operations,
 so code that compares a registry family or resolves an entry's identifier keeps its namespace/path identity
 through the generated façade. Generated `Registry`/`DefaultedRegistry` values now retain bounded
-identifier-to-object entries plus each entry's `ResourceKey` for `register`, `containsKey`, `get`,
+identifier-to-object entries plus each entry's `ResourceKey` for `register`, `containsKey`, `get` (by identifier or key),
 `getOptional`, reverse `getKey`, and `getResourceKey` queries, so bootstrap code can observe the
 registrations it just made without losing registry-family identity. `registerForHolder` updates the same
 bounded table and binds the returned holder to that key/value pair. The live native registry sink still
