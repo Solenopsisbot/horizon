@@ -2587,6 +2587,22 @@ impl Host for StdHost {
                 _ => {}
             }
         }
+        if r.owner == "java/util/Map$Entry" {
+            let (key, value) = map_entry_parts(receiver)?;
+            return match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getKey", "()Ljava/lang/Object;") => Ok(key),
+                ("getValue", "()Ljava/lang/Object;") => Ok(value),
+                ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
+                    "{}={}",
+                    value_marker(&key),
+                    value_marker(&value)
+                )))),
+                _ => Err(NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    r.owner, r.name, r.descriptor
+                ))),
+            };
+        }
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("java/nio/file/Path", "toString", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(path_text(receiver).to_owned())))
@@ -2737,6 +2753,25 @@ impl Host for StdHost {
                         .chunks_exact(2)
                         .any(|pair| pair[1] == needle) as i32,
                 ))
+            }
+            (
+                "java/util/Map"
+                | "java/util/HashMap"
+                | "java/util/LinkedHashMap"
+                | "java/util/Properties",
+                "entrySet",
+                "()Ljava/util/Set;",
+            ) => {
+                let values = host_collection_values(self, receiver)?;
+                let entries = values
+                    .chunks_exact(2)
+                    .map(|pair| {
+                        let key = parse_collection_value(&pair[0])?;
+                        let value = parse_collection_value(&pair[1])?;
+                        Ok(map_entry_value(&key, &value))
+                    })
+                    .collect::<Result<Vec<_>, NativeError>>()?;
+                Ok(collection_value("set", &entries))
             }
             (
                 "java/util/Map"
@@ -4891,6 +4926,30 @@ fn collection_value(kind: &str, values: &[Value]) -> Value {
     } else {
         format!("{kind}/{values}")
     }))
+}
+
+fn map_entry_value(key: &Value, value: &Value) -> Value {
+    Value::Ref(Some(format!(
+        "map-entry/{},{}",
+        value_marker(key),
+        value_marker(value)
+    )))
+}
+
+fn map_entry_parts(value: &Value) -> Result<(Value, Value), NativeError> {
+    let marker = expect_ref(value)
+        .and_then(|marker| marker.strip_prefix("map-entry/"))
+        .ok_or_else(|| NativeError::Metadata("expected a native map entry marker".into()))?;
+    let parts = split_capture_markers(marker)?;
+    if parts.len() != 2 {
+        return Err(NativeError::Metadata(
+            "map entry marker must contain key and value".into(),
+        ));
+    }
+    Ok((
+        parse_value_marker(&parts[0])?,
+        parse_value_marker(&parts[1])?,
+    ))
 }
 
 fn is_collection_owner(owner: &str) -> bool {
@@ -10058,6 +10117,16 @@ mandatory = true
                 .unwrap(),
             Value::Int(1)
         );
+        let entry_set = MethodRef {
+            owner: "java/util/Map".into(),
+            name: "entrySet".into(),
+            descriptor: "()Ljava/util/Set;".into(),
+        };
+        let entries = host.invoke_instance(&entry_set, &map, &[]).unwrap();
+        assert_eq!(
+            host.invoke_instance(&size, &entries, &[]).unwrap(),
+            Value::Int(1)
+        );
         let iterator = MethodRef {
             owner: "java/util/Collection".into(),
             name: "iterator".into(),
@@ -10095,6 +10164,36 @@ mandatory = true
             Value::Int(0)
         );
         assert!(host.invoke_instance(&next, &iterator, &[]).is_err());
+        let entries_iterator = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "java/util/Collection".into(),
+                    name: "iterator".into(),
+                    descriptor: "()Ljava/util/Iterator;".into(),
+                },
+                &entries,
+                &[],
+            )
+            .unwrap();
+        let entry = host.invoke_instance(&next, &entries_iterator, &[]).unwrap();
+        let entry_key = MethodRef {
+            owner: "java/util/Map$Entry".into(),
+            name: "getKey".into(),
+            descriptor: "()Ljava/lang/Object;".into(),
+        };
+        let entry_value = MethodRef {
+            owner: "java/util/Map$Entry".into(),
+            name: "getValue".into(),
+            descriptor: "()Ljava/lang/Object;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&entry_key, &entry, &[]).unwrap(),
+            Value::Ref(Some("key".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(&entry_value, &entry, &[]).unwrap(),
+            Value::Ref(Some("value".into()))
+        );
         let remove_if = MethodRef {
             owner: "java/util/Collection".into(),
             name: "removeIf".into(),
