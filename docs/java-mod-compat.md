@@ -254,8 +254,8 @@ That is the loop working: the class loads, the entrypoint runs, and the first un
 is named with the mod's own file and line under it. The first runtime slice now treats
 `StreamCodec` factories as bootstrap values, returning an empty codec object so static registration can
 rather than the codec factory itself. Codec composition methods (`map`, `mapStream`, `dispatch`, `apply`, `optional`, `nullable`, `cast`, and `tuple`) preserve a non-null receiver, and
-`CustomPacketPayload.Type` retains its `Identifier` through construction, `id()`, `toString()`, and
-equality, so payload registration can compare and log type identities before crossing the native network boundary. The next failure
+`CustomPacketPayload.Type` retains its `Identifier` through construction, `id()`, `toString()`, equality,
+and hashing, so payload registration can compare and log type identities before crossing the native network boundary. The next failure
 is therefore the next concrete value or registry operation the mod reaches,
 rather than the codec factory itself.
 
@@ -275,7 +275,7 @@ Component factories now preserve literal and translatable text in `MutableCompon
 `remove`, `copy`, and `getAllKeys`, backed by a Java-owned map. Numeric reads accept any boxed
 `Number`, so common NBT bootstrap code can read a value written with a narrower type. `put`/`get`
 preserve nested `Tag` references, `getCompound` returns the nested value or an empty façade tag, and
-`getList` plus the generated `ListTag` retain bounded add/get/size/string/compound operations. These
+`getList` plus the generated `ListTag` retain bounded add/get/remove/size/string/compound operations. These
 collections remain callback-local until the Rust NBT bridge is wired through the native boundary.
 `Level` and `ServerLevel` now retain a game-time and dimension marker and answer the common
 `getGameTime`/`getDayTime`, weather and thunder levels, `isRaining`/`isThundering`, `dimension`,
@@ -487,7 +487,7 @@ versions, empty `getProvides` and `getDependencies` collections (including
 `Version.getRaw`/`getFriendlyString`), environment type (`CLIENT` by default, or
 `SERVER` via `with_environment_type`, including `EnvType.isClient`, `name`, and `ordinal`), and the
 game/config/mods paths, plus a deterministic `getAllMods` list backed by the seeded containers; callers seed the loaded-mod map with
-`with_mod`. NeoForge's `ModList.get().isLoaded` and `getModContainerById` use the same seeded map and
+`with_mod`. NeoForge's `ModList.get().isLoaded`, `getMods`, and `getModContainerById` use the same seeded map and
 return deterministic container markers, covering the common loader-side dependency checks. Common
 `Optional.empty`/`of`/`ofNullable` constructors and
 `isPresent`, `isEmpty`, `map`, `filter`, `equals`, `hashCode`, and `toString` preserve bounded optional

@@ -2013,6 +2013,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("equals", "boolean", "(Ljava/lang/Object;)Z") => {
                 return "return horizonId.equals(p0);".to_owned();
             }
+            ("hashCode", "int", "()I") => {
+                return "return horizonId.hashCode();".to_owned();
+            }
             _ => {}
         }
     }
@@ -2535,6 +2538,7 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             "add" if descriptor == "(Lnet/minecraft/nbt/Tag;)Z" => return "return horizonValues.add(p0);".to_owned(),
             "add" if descriptor == "(ILnet/minecraft/nbt/Tag;)V" => return "horizonValues.add(p0, p1);".to_owned(),
             "get" if descriptor == "(I)Lnet/minecraft/nbt/Tag;" => return "return horizonValues.get(p0);".to_owned(),
+            "remove" if descriptor == "(I)Lnet/minecraft/nbt/Tag;" => return "return horizonValues.remove(p0);".to_owned(),
             "size" if descriptor == "()I" => return "return horizonValues.size();".to_owned(),
             "isEmpty" if descriptor == "()Z" => return "return horizonValues.isEmpty();".to_owned(),
             "getCompound" if descriptor == "(I)Lnet/minecraft/nbt/CompoundTag;" => return "Object value = horizonValues.get(p0); return value instanceof net.minecraft.nbt.CompoundTag ? (net.minecraft.nbt.CompoundTag) value : new net.minecraft.nbt.CompoundTag();".to_owned(),
@@ -4195,6 +4199,15 @@ mod tests {
             "return horizonId.equals(p0);"
         );
         assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type",
+                "hashCode",
+                "int",
+                "()I",
+            ),
+            "return horizonId.hashCode();"
+        );
+        assert_eq!(
             runtime_body(
                 "net/minecraft/network/codec/StreamCodec",
                 "map",
@@ -4985,6 +4998,15 @@ mod tests {
                 "(I)Lnet/minecraft/nbt/CompoundTag;",
             ),
             "Object value = horizonValues.get(p0); return value instanceof net.minecraft.nbt.CompoundTag ? (net.minecraft.nbt.CompoundTag) value : new net.minecraft.nbt.CompoundTag();"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/nbt/ListTag",
+                "remove",
+                "net.minecraft.nbt.Tag",
+                "(I)Lnet/minecraft/nbt/Tag;",
+            ),
+            "return horizonValues.remove(p0);"
         );
         let class = Class {
             name: "net/minecraft/nbt/ListTag".to_owned(),

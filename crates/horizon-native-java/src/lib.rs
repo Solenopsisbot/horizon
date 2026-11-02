@@ -2163,6 +2163,16 @@ impl Host for StdHost {
                     format!("neoforge-mod-container/{id}/{version}")
                 })))
             }
+            ("net/neoforged/fml/ModList", "getMods", "()Ljava/util/List;") => {
+                let values = self
+                    .mods
+                    .iter()
+                    .map(|(id, version)| {
+                        Value::Ref(Some(format!("neoforge-mod-container/{id}/{version}")))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(collection_value("list", &values))
+            }
             (
                 "net/fabricmc/loader/api/FabricLoader",
                 "getModContainer",
@@ -7499,6 +7509,25 @@ mandatory = true
             host.invoke_instance(&container, &list, &[Value::Ref(Some("demo".into()))])
                 .unwrap(),
             Value::Ref(Some("neoforge-mod-container/demo/1.2.3".into()))
+        );
+        let mods = MethodRef {
+            owner: "net/neoforged/fml/ModList".into(),
+            name: "getMods".into(),
+            descriptor: "()Ljava/util/List;".into(),
+        };
+        let mods_value = host.invoke_instance(&mods, &list, &[]).unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/List".into(),
+                    name: "size".into(),
+                    descriptor: "()I".into(),
+                },
+                &mods_value,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1)
         );
     }
 
