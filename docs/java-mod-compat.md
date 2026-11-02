@@ -600,7 +600,7 @@ opens resource bytes or arbitrary filesystem paths. The same seeded resource tab
 bounded `Enumeration`; missing names are empty, and the host never scans additional classpath locations.
 Bundled non-class files also retain bounded bytes (4 MiB per file and 32 MiB per jar) for
 `getResourceAsStream`/`getSystemResourceAsStream`. The native `InputStream` marker supports deterministic
-`read()`, `available()`, `skip(long)`, and `close()` cursors; marker-only resources remain empty streams.
+`read()`, `available()`, `skip(long)`, `skipNBytes(long)`, `mark/reset`, and `close()` cursors; marker-only resources remain empty streams.
 The native host also exposes `StdHost::with_service_provider` for deterministic `ServiceLoader`
 fixtures. `ServiceLoader.load`/`loadInstalled` return a seeded service marker, `iterator()` yields the
 seeded provider class markers, and `reload()` is a bounded no-op; missing services remain explicit errors.
@@ -857,6 +857,7 @@ common state construction and inspection while the registry-backed state definit
 values remain follow-up work. `hasBlockEntity` and `isRandomlyTicking` expose explicit empty-safe defaults
 for bootstrap checks.
 `BlockState.getFluidState()` now returns a bounded `FluidState` value with deterministic empty, source, amount, and height queries, keeping common fluid checks linkable without inventing live fluid registries.
+`EntityType.Builder` preserves bounded size, client tracking range, update interval, and fire-immunity values through `build`; the generated `EntityType` exposes those values for bootstrap inspection without installing a live entity registry entry.
 `ItemStack.getUseAnimation()` now returns the deterministic `UseAnim.NONE` façade value, and `getTags()`
 returns a bounded empty stream alongside the existing count, copy, damage, component, and tag queries, keeping
 common item bootstrap branches linkable.
