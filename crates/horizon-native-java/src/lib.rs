@@ -596,6 +596,18 @@ impl Host for StdHost {
             ("java/lang/Integer", "toHexString", "(I)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 format!("{:x}", expect_int(r, Self::argument(r, args, 0)?)? as u32),
             ))),
+            ("java/lang/Long", "compare", "(JJ)I") => {
+                let left = expect_int(r, Self::argument(r, args, 0)?)?;
+                let right = expect_int(r, Self::argument(r, args, 1)?)?;
+                Ok(Value::Int(match left.cmp(&right) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }))
+            }
+            ("java/lang/Long", "toHexString", "(J)Ljava/lang/String;") => Ok(Value::Ref(Some(
+                format!("{:x}", expect_int(r, Self::argument(r, args, 0)?)? as u32),
+            ))),
             ("java/lang/Boolean", "parseBoolean", "(Ljava/lang/String;)Z") => {
                 let value = match Self::argument(r, args, 0)? {
                     Value::Ref(Some(value)) => value.eq_ignore_ascii_case("true"),
@@ -3790,6 +3802,15 @@ impl<H: Host> Runtime<'_, H> {
                     })?;
                 Value::Int(expect_int(r, &value)?)
             }
+            ("getLong", "(Ljava/lang/Object;I)J") => {
+                let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
+                self.array(StdHost::argument(r, args, 0)?)?
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        NativeError::Metadata(format!("array index {index} out of bounds"))
+                    })?
+            }
             ("set", "(Ljava/lang/Object;ILjava/lang/Object;)V") => {
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
                 let marker = expect_array_marker(StdHost::argument(r, args, 0)?)?;
@@ -3823,6 +3844,22 @@ impl<H: Host> Runtime<'_, H> {
                 Value::Void
             }
             ("setBoolean", "(Ljava/lang/Object;IZ)V") => {
+                let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
+                let marker = expect_array_marker(StdHost::argument(r, args, 0)?)?;
+                let slot = self
+                    .arrays
+                    .get_mut(marker)
+                    .ok_or_else(|| {
+                        NativeError::Metadata("array is not owned by this invocation".into())
+                    })?
+                    .get_mut(index)
+                    .ok_or_else(|| {
+                        NativeError::Metadata(format!("array index {index} out of bounds"))
+                    })?;
+                *slot = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
+                Value::Void
+            }
+            ("setLong", "(Ljava/lang/Object;IJ)V") => {
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
                 let marker = expect_array_marker(StdHost::argument(r, args, 0)?)?;
                 let slot = self
@@ -4147,6 +4184,9 @@ impl<H: Host> Runtime<'_, H> {
                     }
                 }
                 Value::Int(matched as i32)
+            }
+            ("findFirst" | "findAny", "()Ljava/util/Optional;") => {
+                optional_wrap(values.into_iter().next().unwrap_or(Value::Ref(None)))
             }
             ("count", "()J") => Value::Int(values.len() as i32),
             ("toList", "()Ljava/util/List;") => collection_value("list", &values),
@@ -5965,9 +6005,37 @@ mandatory = true
             host.invoke(&hex, &[Value::Int(255)]).unwrap(),
             Value::Ref(Some("ff".into()))
         );
+        let long_compare = MethodRef {
+            owner: "java/lang/Long".into(),
+            name: "compare".into(),
+            descriptor: "(JJ)I".into(),
+        };
+        assert_eq!(
+            host.invoke(&long_compare, &[Value::Int(4), Value::Int(9)])
+                .unwrap(),
+            Value::Int(-1)
+        );
+        let long_hex = MethodRef {
+            owner: "java/lang/Long".into(),
+            name: "toHexString".into(),
+            descriptor: "(J)Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke(&long_hex, &[Value::Int(255)]).unwrap(),
+            Value::Ref(Some("ff".into()))
+        );
         assert_eq!(
             host.calls(),
-            &[property, parse, parse_radix, value_of_radix, compare, hex]
+            &[
+                property,
+                parse,
+                parse_radix,
+                value_of_radix,
+                compare,
+                hex,
+                long_compare,
+                long_hex,
+            ]
         );
     }
 
@@ -8295,6 +8363,44 @@ mandatory = true
                 .unwrap(),
             Some(Value::Int(1))
         );
+        let long_array = runtime
+            .invoke_reflect_array(
+                &new_instance,
+                &[Value::Ref(Some("long".into())), Value::Int(1)],
+                "demo/Reflective",
+                "probe",
+            )
+            .unwrap()
+            .unwrap();
+        let set_long = MethodRef {
+            owner: "java/lang/reflect/Array".into(),
+            name: "setLong".into(),
+            descriptor: "(Ljava/lang/Object;IJ)V".into(),
+        };
+        runtime
+            .invoke_reflect_array(
+                &set_long,
+                &[long_array.clone(), Value::Int(0), Value::Int(42)],
+                "demo/Reflective",
+                "probe",
+            )
+            .unwrap();
+        let get_long = MethodRef {
+            owner: "java/lang/reflect/Array".into(),
+            name: "getLong".into(),
+            descriptor: "(Ljava/lang/Object;I)J".into(),
+        };
+        assert_eq!(
+            runtime
+                .invoke_reflect_array(
+                    &get_long,
+                    &[long_array, Value::Int(0)],
+                    "demo/Reflective",
+                    "probe",
+                )
+                .unwrap(),
+            Some(Value::Int(42))
+        );
     }
 
     #[test]
@@ -8407,6 +8513,22 @@ mandatory = true
                 )
                 .unwrap(),
             Some(Value::Int(1))
+        );
+        assert_eq!(
+            runtime
+                .invoke_stream(
+                    &MethodRef {
+                        owner: "java/util/stream/Stream".into(),
+                        name: "findFirst".into(),
+                        descriptor: "()Ljava/util/Optional;".into(),
+                    },
+                    Some(&stream),
+                    &[],
+                    "demo/Stream",
+                    "probe",
+                )
+                .unwrap(),
+            Some(Value::Ref(Some("optional/alpha".into())))
         );
         let distinct = runtime
             .invoke_stream(
