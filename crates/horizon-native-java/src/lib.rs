@@ -302,6 +302,11 @@ impl StdHost {
             .map(String::as_str)
     }
 
+    /// Alias named for callers that want to make the query boundary explicit.
+    pub fn query_resource(&self, name: &str) -> Option<&str> {
+        self.resource(name)
+    }
+
     /// Set the deterministic value returned by `System.currentTimeMillis`.
     ///
     /// Native probes must not read the machine clock; callers that need a
