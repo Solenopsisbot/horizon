@@ -2441,6 +2441,29 @@ impl Host for StdHost {
                     )
                 }
             }
+            ("java/util/Optional", "or", "(Ljava/util/function/Supplier;)Ljava/util/Optional;") => {
+                if expect_ref(receiver).is_some() {
+                    Ok(receiver.clone())
+                } else {
+                    let supplier = Self::argument(r, args, 0)?;
+                    let supplied = self.invoke_instance(
+                        &MethodRef {
+                            owner: "java/util/function/Supplier".into(),
+                            name: "get".into(),
+                            descriptor: "()Ljava/lang/Object;".into(),
+                        },
+                        supplier,
+                        &[],
+                    )?;
+                    Ok(match supplied {
+                        Value::Ref(Some(value)) if value.starts_with("optional/") => {
+                            Value::Ref(Some(value))
+                        }
+                        Value::Ref(None) => Value::Ref(None),
+                        value => optional_wrap(value),
+                    })
+                }
+            }
             ("java/util/Optional", "orElseThrow", "()Ljava/lang/Object;") => {
                 if expect_ref(receiver).is_some() {
                     self.invoke_instance(
@@ -2678,6 +2701,17 @@ impl Host for StdHost {
                     .unwrap_or_else(|| "mod-container/unknown/unknown".into())
                     .replacen("mod-container/", "metadata/", 1),
             ))),
+            (
+                "net/fabricmc/loader/api/ModContainer",
+                "getRootPaths",
+                "()Ljava/util/Collection;",
+            ) => {
+                let id = metadata_part(expect_ref(receiver), 1);
+                Ok(collection_value(
+                    "list",
+                    &[path_value(&format!("/horizon/mods/{id}"))],
+                ))
+            }
             ("net/neoforged/fml/ModContainer", "getModId", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(metadata_part(expect_ref(receiver), 1))))
             }
@@ -2775,6 +2809,22 @@ impl Host for StdHost {
                 });
                 self.holders.insert(key.clone(), value.clone());
                 Ok(Value::Ref(Some(format!("holder/{key}"))))
+            }
+            (
+                "net/neoforged/neoforge/registries/DeferredRegister",
+                "getEntries",
+                "()Ljava/util/Collection;",
+            ) => {
+                let registry = expect_ref(receiver).map_or("", String::as_str);
+                let entries = self
+                    .registrations
+                    .iter()
+                    .filter(|entry| entry.registry == registry)
+                    .map(|entry| {
+                        Value::Ref(Some(format!("holder/{}/{}", entry.registry, entry.id)))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(collection_value("list", &entries))
             }
             ("net/neoforged/neoforge/registries/DeferredHolder", "get", "()Ljava/lang/Object;")
             | (
@@ -7265,6 +7315,29 @@ mandatory = true
             .unwrap(),
             Value::Ref(None)
         );
+        let or = MethodRef {
+            owner: "java/util/Optional".into(),
+            name: "or".into(),
+            descriptor: "(Ljava/util/function/Supplier;)Ljava/util/Optional;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &or,
+                &Value::Ref(Some("optional/demo".into())),
+                &[Value::Ref(Some("@indy:unused-supplier".into()))],
+            )
+            .unwrap(),
+            Value::Ref(Some("optional/demo".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &or,
+                &Value::Ref(None),
+                &[Value::Ref(Some("@indy:empty-supplier".into()))],
+            )
+            .unwrap(),
+            Value::Ref(None)
+        );
         let if_present = MethodRef {
             owner: "java/util/Optional".into(),
             name: "ifPresent".into(),
@@ -8417,6 +8490,40 @@ mandatory = true
                 .unwrap(),
             Value::Ref(Some("metadata/demo/1.2.3".into()))
         );
+        let root_paths = MethodRef {
+            owner: "net/fabricmc/loader/api/ModContainer".into(),
+            name: "getRootPaths".into(),
+            descriptor: "()Ljava/util/Collection;".into(),
+        };
+        let roots = host
+            .invoke_instance(&root_paths, &container_value, &[])
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/Collection".into(),
+                    name: "size".into(),
+                    descriptor: "()I".into(),
+                },
+                &roots,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/Collection".into(),
+                    name: "contains".into(),
+                    descriptor: "(Ljava/lang/Object;)Z".into(),
+                },
+                &roots,
+                &[Value::Ref(Some("path:/horizon/mods/demo".into()))],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
         let name = MethodRef {
             owner: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
             name: "getName".into(),
@@ -8809,6 +8916,30 @@ mandatory = true
             .unwrap(),
             Value::Ref(Some("holder/deferred-register/registry/demo/entry".into()))
         );
+        let entries = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "net/neoforged/neoforge/registries/DeferredRegister".into(),
+                    name: "getEntries".into(),
+                    descriptor: "()Ljava/util/Collection;".into(),
+                },
+                &register,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/Collection".into(),
+                    name: "size".into(),
+                    descriptor: "()I".into(),
+                },
+                &entries,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
         let holder_get = MethodRef {
             owner: "net/neoforged/neoforge/registries/DeferredHolder".into(),
             name: "get".into(),
@@ -8941,7 +9072,7 @@ mandatory = true
             ))
         );
         assert_eq!(host.registrations().len(), 1);
-        assert_eq!(host.invocations().len(), 16);
+        assert_eq!(host.invocations().len(), 18);
         assert_eq!(
             host.invocations()[2].args[0],
             Value::Ref(Some("@indy:listener".into()))

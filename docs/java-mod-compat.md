@@ -425,7 +425,8 @@ The façade now also has the first NeoForge registration boundary: `FMLJavaModLo
 and `DeferredRegister.create`/`register` yield façade register and holder objects. `DeferredHolder` now
 also exposes the common `value`, `getOptional`, `getKey`, and `getId` accessors (including the modern
 `ResourceLocation` return type) with typed neutral return
-values, so constructors can inspect a registration without linking against NeoForge's implementation.
+values, and `DeferredRegister.getEntries` returns a bounded holder collection, so constructors can inspect
+a registration without linking against NeoForge's implementation.
 `RegisterEvent` now
 also has its public registration overloads, a retained registry key and registry view, and a helper callback that
 writes registrations into that view. The networking
@@ -497,12 +498,13 @@ can use the same key/value queries as `getProperty` without crossing the host bo
 versions, empty `getProvides` and `getDependencies` collections (including
 `ModMetadata.getType` as the deterministic `release` marker, and `Version.getRaw`/`getFriendlyString`), environment type (`CLIENT` by default, or
 `SERVER` via `with_environment_type`, including `EnvType.isClient`, `name`, and `ordinal`), and the
-game/config/mods paths, and a configurable `isDevelopmentEnvironment` marker (off by default), plus a deterministic `getAllMods` list backed by the seeded containers; callers seed the loaded-mod map with
+game/config/mods paths, Fabric `ModContainer.getRootPaths` (a bounded mod-root marker), and a configurable
+`isDevelopmentEnvironment` marker (off by default), plus a deterministic `getAllMods` list backed by the seeded containers; callers seed the loaded-mod map with
 `with_mod`. NeoForge's `ModList.get().isLoaded`, `getMods`, and `getModContainerById` use the same seeded map and
 return deterministic container markers, and `ModContainer.getModId` exposes the seeded id for
 NeoForge entrypoints. Common
 `Optional.empty`/`of`/`ofNullable` constructors and
-`isPresent`, `isEmpty`, `map`, `filter`, `equals`, `hashCode`, and `toString` preserve bounded optional
+`isPresent`, `isEmpty`, `map`, `filter`, `or`, `equals`, `hashCode`, and `toString` preserve bounded optional
 value semantics for loader bootstrap code, while unresolved callbacks remain explicit markers. Common
 `java.nio.file.Paths.get` and `Path.resolve`, `toString`, `normalize`, and
 `toAbsolutePath` calls use deterministic path markers. Common `List.of`, `Set.of`, `Map.of`, empty/singleton
@@ -557,8 +559,9 @@ network boundary.
 The generated NeoForge `DeferredHolder` façade now retains its id, registry key, and lazy supplier: `get`,
 `value`, `isPresent`, `getOptional`, `getId`, and `getKey` agree on one holder state. `Holder` and
 `Holder.Reference` queries for `value`, `isBound`, and `unwrapKey` use the same bounded marker. The matching
-`DeferredRegister` shim binds the namespace and supplier when `register` is called, so common registry
-bootstrap code can inspect holders before the native registry sink commits typed declarations.
+`DeferredRegister` shim binds the namespace and supplier when `register` is called, and `getEntries` projects
+the registered holders into a bounded collection, so common registry bootstrap code can inspect holders before
+the native registry sink commits typed declarations.
 Unsupported callback bodies still return the interpreter's explicit bounded diagnostics. The sink is
 deliberately an export boundary today: Horizon's prepared block and item registries are immutable once
 `content_root` has loaded, and an opaque Java object marker cannot safely become a native block or item.
