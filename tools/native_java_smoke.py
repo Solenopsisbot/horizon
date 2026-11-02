@@ -27,6 +27,8 @@ package demo;
 
 import java.util.HashMap;
 import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.OptionalLong;
 
 public final class First {
     public void onInitialize() {
@@ -37,6 +39,14 @@ public final class First {
         Optional<String> marker = Optional.ofNullable("native");
         if (!marker.filter(text -> text.length() == 6).isPresent()) {
             throw new IllegalStateException("Optional.filter host path failed");
+        }
+        OptionalLong longMarker = OptionalLong.of(42L);
+        if (!longMarker.isPresent() || !longMarker.toString().equals("OptionalLong[42]")) {
+            throw new IllegalStateException("OptionalLong host path failed");
+        }
+        OptionalDouble doubleMarker = OptionalDouble.of(3.5D);
+        if (!doubleMarker.isPresent() || !doubleMarker.toString().equals("OptionalDouble[3.5]")) {
+            throw new IllegalStateException("OptionalDouble host path failed");
         }
         HashMap<String, Integer> values = new HashMap<>();
         values.put("left", 19);
@@ -268,7 +278,7 @@ def main() -> int:
             return 1
         if report["host_calls"] < 10:
             print(
-                "native probe did not exercise the Optional.filter and Map.forEach host paths: "
+                "native probe did not exercise the Optional/primitive-optional and Map.forEach host paths: "
                 f"expected at least 10 host calls, got {report['host_calls']}",
                 file=sys.stderr,
             )
