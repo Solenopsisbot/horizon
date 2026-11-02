@@ -509,6 +509,8 @@ are also deterministic, covering namespace/path normalization used by loader met
 counts are bounded to keep native probes finite.
 `System.getProperties()` exposes the seeded properties as a bounded `Properties` map, so bootstrap code
 can use the same key/value queries as `getProperty` without crossing the host boundary.
+`System.getenv(String)` and the no-argument `System.getenv()` map are likewise backed only by values explicitly
+seeded with `StdHost::with_environment_variable`; unknown keys return null and the process environment is never read.
 `System.currentTimeMillis()` returns a seeded deterministic value (zero by default, configurable with
 `StdHost::with_current_time_millis`); it never reads the machine clock, and follows the interpreter's bounded
 wide-primitive representation.

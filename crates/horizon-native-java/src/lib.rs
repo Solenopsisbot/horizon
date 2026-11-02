@@ -195,6 +195,9 @@ impl Host for NullHost {}
 #[derive(Debug, Clone)]
 pub struct StdHost {
     properties: BTreeMap<String, String>,
+    /// Explicitly seeded environment values exposed through `System.getenv`.
+    /// The host process environment is never consulted.
+    environment: BTreeMap<String, String>,
     /// Deterministic epoch value returned by `System.currentTimeMillis`.
     ///
     /// The native interpreter represents wide primitives with its bounded
@@ -233,6 +236,7 @@ impl StdHost {
     pub fn new() -> Self {
         Self {
             properties: BTreeMap::from([("line.separator".into(), "\n".into())]),
+            environment: BTreeMap::new(),
             current_time_millis: 0,
             mods: BTreeMap::new(),
             environment_type: "CLIENT".into(),
@@ -256,6 +260,17 @@ impl StdHost {
 
     pub fn with_property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.properties.insert(key.into(), value.into());
+        self
+    }
+
+    /// Seed a deterministic environment value returned by `System.getenv`.
+    /// Unseeded keys remain absent; this method never reads the process environment.
+    pub fn with_environment_variable(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.environment.insert(key.into(), value.into());
         self
     }
 
@@ -469,6 +484,9 @@ impl Host for StdHost {
             ("java/lang/Boolean", "FALSE", "Ljava/lang/Boolean;") => {
                 Ok(Value::Ref(Some("false".into())))
             }
+            ("java/util/Locale", "US", "Ljava/util/Locale;") => {
+                Ok(Value::Ref(Some("locale/US".into())))
+            }
             (
                 "net/fabricmc/loader/api/FabricLoader",
                 "getInstance",
@@ -507,6 +525,22 @@ impl Host for StdHost {
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            ("java/text/NumberFormat", "getIntegerInstance", "()Ljava/text/NumberFormat;") => {
+                Ok(Value::Ref(Some("number-format/integer/US".into())))
+            }
+            (
+                "java/text/NumberFormat",
+                "getIntegerInstance",
+                "(Ljava/util/Locale;)Ljava/text/NumberFormat;",
+            ) => {
+                let locale = Self::argument(r, args, 0)?;
+                if !matches!(locale, Value::Ref(Some(marker)) if marker == "locale/US") {
+                    return Err(NativeError::Metadata(
+                        "java/text/NumberFormat.getIntegerInstance supports only Locale.US".into(),
+                    ));
+                }
+                Ok(Value::Ref(Some("number-format/integer/US".into())))
+            }
             (owner, "get", descriptor)
                 if is_capability_manager_owner(owner) && descriptor.ends_with("Capability;") =>
             {
@@ -1060,6 +1094,26 @@ impl Host for StdHost {
                     .collect::<Vec<_>>();
                 Ok(collection_value("map", &values))
             }
+            ("java/lang/System", "getenv", "(Ljava/lang/String;)Ljava/lang/String;") => {
+                let key = match Self::argument(r, args, 0)? {
+                    Value::Ref(Some(key)) => key,
+                    _ => return Ok(Value::Ref(None)),
+                };
+                Ok(Value::Ref(self.environment.get(key).cloned()))
+            }
+            ("java/lang/System", "getenv", "()Ljava/util/Map;") => {
+                let values = self
+                    .environment
+                    .iter()
+                    .flat_map(|(key, value)| {
+                        [
+                            Value::Ref(Some(key.clone())),
+                            Value::Ref(Some(value.clone())),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                Ok(collection_value("map", &values))
+            }
             ("java/lang/System", "currentTimeMillis", "()J") => {
                 Ok(Value::Int(self.current_time_millis))
             }
@@ -1082,6 +1136,40 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if r.owner == "java/text/NumberFormat"
+            && r.name == "format"
+            && matches!(
+                r.descriptor.as_str(),
+                "(I)Ljava/lang/String;" | "(J)Ljava/lang/String;"
+            )
+        {
+            let marker = expect_ref(receiver)
+                .ok_or_else(|| NativeError::Metadata("malformed NumberFormat marker".into()))?;
+            if marker != "number-format/integer/US" {
+                return Err(NativeError::Metadata(
+                    "unsupported NumberFormat marker".into(),
+                ));
+            }
+            let value = expect_int(r, Self::argument(r, args, 0)?)?;
+            return Ok(Value::Ref(Some(format_integer_us(value))));
+        }
+        if r.owner == "java/util/Locale" {
+            let marker = expect_ref(receiver)
+                .ok_or_else(|| NativeError::Metadata("malformed Locale marker".into()))?;
+            if marker != "locale/US" {
+                return Err(NativeError::Metadata("unsupported Locale marker".into()));
+            }
+            return match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getLanguage", "()Ljava/lang/String;") => Ok(Value::Ref(Some("en".into()))),
+                ("getCountry", "()Ljava/lang/String;") => Ok(Value::Ref(Some("US".into()))),
+                ("toLanguageTag", "()Ljava/lang/String;") => Ok(Value::Ref(Some("en-US".into()))),
+                ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some("en_US".into()))),
+                _ => Err(NativeError::Metadata(format!(
+                    "unsupported Locale.US query {}#{}{}",
+                    r.owner, r.name, r.descriptor
+                ))),
+            };
+        }
         let receiver_marker = expect_ref(receiver).cloned();
         if let Some(marker) = receiver_marker.as_deref() {
             let callback_result = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
@@ -3657,6 +3745,118 @@ fn value_text(value: &Value) -> String {
     }
 }
 
+/// Implement the small deterministic `String.format` subset used by loader diagnostics.
+///
+/// Supported conversions are `%s`, `%d`, `%f`, `%b`, `%c`, `%%`, and `%n` with
+/// implicit, sequential arguments. Flags, widths, precisions, argument indexes,
+/// and locale-sensitive conversions return an explicit metadata error.
+fn format_java_string_call<H: Host>(
+    runtime: &Runtime<'_, H>,
+    r: &MethodRef,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let (format, values) = match r.descriptor.as_str() {
+        "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;" => (
+            expect_string(
+                args.first()
+                    .ok_or_else(|| NativeError::Metadata("String.format missing format".into()))?,
+            ),
+            args.get(1),
+        ),
+        "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;" => (
+            expect_string(
+                args.get(1)
+                    .ok_or_else(|| NativeError::Metadata("String.format missing format".into()))?,
+            ),
+            args.get(2),
+        ),
+        _ => {
+            return Err(NativeError::Metadata(format!(
+                "unsupported String.format descriptor {}",
+                r.descriptor
+            )));
+        }
+    };
+    let values =
+        values.ok_or_else(|| NativeError::Metadata("String.format missing arguments".into()))?;
+    let values = runtime
+        .array(values)
+        .map_err(|_| NativeError::Metadata("String.format arguments must be an Object[]".into()))?;
+    let mut output = String::with_capacity(format.len());
+    let mut next = 0usize;
+    let bytes = format.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            let ch = format[i..].chars().next().expect("valid format offset");
+            output.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        i += 1;
+        let conversion = *bytes
+            .get(i)
+            .ok_or_else(|| NativeError::Metadata("unterminated String.format conversion".into()))?
+            as char;
+        i += 1;
+        match conversion {
+            '%' => output.push('%'),
+            'n' => output.push('\n'),
+            's' => output.push_str(&value_text(values.get(next).ok_or_else(|| {
+                NativeError::Metadata("String.format missing %s argument".into())
+            })?)),
+            'd' => {
+                let value = values.get(next).ok_or_else(|| {
+                    NativeError::Metadata("String.format missing %d argument".into())
+                })?;
+                let value = boxed_integer(value).ok_or_else(|| {
+                    NativeError::Metadata("String.format %d requires an integer".into())
+                })?;
+                output.push_str(&value.to_string());
+            }
+            'f' => {
+                let value = values.get(next).ok_or_else(|| {
+                    NativeError::Metadata("String.format missing %f argument".into())
+                })?;
+                let value = boxed_float(value).ok_or_else(|| {
+                    NativeError::Metadata("String.format %f requires a floating-point value".into())
+                })?;
+                output.push_str(&format_java_float(value));
+            }
+            'b' => {
+                let value = values.get(next).ok_or_else(|| {
+                    NativeError::Metadata("String.format missing %b argument".into())
+                })?;
+                output.push_str(if matches!(value, Value::Ref(None)) {
+                    "false"
+                } else {
+                    "true"
+                });
+            }
+            'c' => {
+                let value = values.get(next).ok_or_else(|| {
+                    NativeError::Metadata("String.format missing %c argument".into())
+                })?;
+                let value = boxed_integer(value)
+                    .and_then(|v| char::from_u32(v as u32))
+                    .ok_or_else(|| {
+                        NativeError::Metadata("String.format %c requires a character".into())
+                    })?;
+                output.push(value);
+            }
+            other => {
+                return Err(NativeError::Metadata(format!(
+                    "unsupported String.format conversion %{other}"
+                )));
+            }
+        }
+        if !matches!(conversion, '%' | 'n') {
+            next += 1;
+        }
+    }
+    Ok(Value::Ref(Some(output)))
+}
+
 fn boxed_integer(value: &Value) -> Option<i32> {
     match value {
         Value::Int(value) => Some(*value),
@@ -3849,6 +4049,23 @@ fn expect_float(r: &MethodRef, value: &Value) -> Result<f64, NativeError> {
             r.owner, r.name
         ))
     })
+}
+
+fn format_integer_us(value: i32) -> String {
+    let negative = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index != 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    if negative {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
 }
 
 fn format_java_float(value: f64) -> String {
@@ -5792,57 +6009,66 @@ impl<H: Host> Runtime<'_, H> {
                         Some(pop(&mut stack, class, method)?)
                     };
                     self.calls += 1;
-                    let value =
-                        if let Some(value) = self.invoke_reflect_array(&r, &args, class, method)? {
+                    let value = if r.owner == "java/lang/String"
+                        && r.name == "format"
+                        && (r.descriptor
+                            == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
+                            || r.descriptor
+                                == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
+                    {
+                        format_java_string_call(self, &r, &args)?
+                    } else if let Some(value) =
+                        self.invoke_reflect_array(&r, &args, class, method)?
+                    {
+                        value
+                    } else if let Some(value) =
+                        self.invoke_stream(&r, receiver.as_ref(), &args, class, method)?
+                    {
+                        value
+                    } else if let Some(value) =
+                        self.invoke_reflect_method(&r, receiver.as_ref(), &args)?
+                    {
+                        value
+                    } else if r.owner == "java/lang/Class"
+                        && r.name == "forName"
+                        && r.descriptor.ends_with(")Ljava/lang/Class;")
+                    {
+                        self.class_for_name(&args)?
+                    } else if self.classes.contains_key(&r.owner) {
+                        self.invoke(&r.owner, &r.name, &r.descriptor, receiver, &args)?
+                    } else {
+                        let optional = receiver
+                            .as_ref()
+                            .map(|receiver| self.invoke_optional(&r, receiver, &args))
+                            .transpose()?
+                            .flatten();
+                        if let Some(value) = optional {
                             value
-                        } else if let Some(value) =
-                            self.invoke_stream(&r, receiver.as_ref(), &args, class, method)?
-                        {
-                            value
-                        } else if let Some(value) =
-                            self.invoke_reflect_method(&r, receiver.as_ref(), &args)?
-                        {
-                            value
-                        } else if r.owner == "java/lang/Class"
-                            && r.name == "forName"
-                            && r.descriptor.ends_with(")Ljava/lang/Class;")
-                        {
-                            self.class_for_name(&args)?
-                        } else if self.classes.contains_key(&r.owner) {
-                            self.invoke(&r.owner, &r.name, &r.descriptor, receiver, &args)?
-                        } else {
-                            let optional = receiver
-                                .as_ref()
-                                .map(|receiver| self.invoke_optional(&r, receiver, &args))
-                                .transpose()?
-                                .flatten();
-                            if let Some(value) = optional {
-                                value
-                            } else if matches!(
-                                r.owner.as_str(),
-                                "java/util/function/Function"
-                                    | "java/util/function/UnaryOperator"
-                                    | "java/util/function/Consumer"
-                                    | "java/util/function/Predicate"
-                                    | "java/util/function/BiConsumer"
-                                    | "java/util/function/BiFunction"
-                                    | "java/util/function/Supplier"
-                            ) {
-                                if let Some(receiver) = receiver.as_ref() {
-                                    if let Some(value) = self.invoke_callback(receiver, &args)? {
-                                        value
-                                    } else {
-                                        self.host.invoke_instance(&r, receiver, &args)?
-                                    }
+                        } else if matches!(
+                            r.owner.as_str(),
+                            "java/util/function/Function"
+                                | "java/util/function/UnaryOperator"
+                                | "java/util/function/Consumer"
+                                | "java/util/function/Predicate"
+                                | "java/util/function/BiConsumer"
+                                | "java/util/function/BiFunction"
+                                | "java/util/function/Supplier"
+                        ) {
+                            if let Some(receiver) = receiver.as_ref() {
+                                if let Some(value) = self.invoke_callback(receiver, &args)? {
+                                    value
                                 } else {
-                                    self.host.invoke(&r, &args)?
+                                    self.host.invoke_instance(&r, receiver, &args)?
                                 }
-                            } else if let Some(receiver) = receiver.as_ref() {
-                                self.host.invoke_instance(&r, receiver, &args)?
                             } else {
                                 self.host.invoke(&r, &args)?
                             }
-                        };
+                        } else if let Some(receiver) = receiver.as_ref() {
+                            self.host.invoke_instance(&r, receiver, &args)?
+                        } else {
+                            self.host.invoke(&r, &args)?
+                        }
+                    };
                     if value != Value::Void {
                         stack.push(value);
                     }
@@ -6548,6 +6774,77 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use std::io::Write;
+    #[test]
+    fn string_format_supports_loader_diagnostic_subset() {
+        let mut host = NullHost;
+        let runtime = Runtime {
+            classes: &BTreeMap::new(),
+            host: &mut host,
+            calls: 0,
+            fields: BTreeMap::new(),
+            static_fields: BTreeMap::new(),
+            initialized_classes: std::collections::BTreeSet::new(),
+            arrays: BTreeMap::from([(
+                "array/test/args/0".into(),
+                vec![Value::Int(7), Value::Ref(Some("ok".into()))],
+            )]),
+            next_array: 0,
+            next_object: 0,
+            streams: BTreeMap::new(),
+            next_stream: 0,
+        };
+        let method = MethodRef {
+            owner: "java/lang/String".into(),
+            name: "format".into(),
+            descriptor: "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;".into(),
+        };
+        let value = format_java_string_call(
+            &runtime,
+            &method,
+            &[
+                Value::Ref(Some("%d/%s%%".into())),
+                Value::Ref(Some("array/test/args/0".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(value, Value::Ref(Some("7/ok%".into())));
+    }
+
+    #[test]
+    fn string_format_rejects_widths_explicitly() {
+        let mut host = NullHost;
+        let runtime = Runtime {
+            classes: &BTreeMap::new(),
+            host: &mut host,
+            calls: 0,
+            fields: BTreeMap::new(),
+            static_fields: BTreeMap::new(),
+            initialized_classes: std::collections::BTreeSet::new(),
+            arrays: BTreeMap::from([("array/test/args/0".into(), vec![Value::Int(7)])]),
+            next_array: 0,
+            next_object: 0,
+            streams: BTreeMap::new(),
+            next_stream: 0,
+        };
+        let method = MethodRef {
+            owner: "java/lang/String".into(),
+            name: "format".into(),
+            descriptor: "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;".into(),
+        };
+        let error = format_java_string_call(
+            &runtime,
+            &method,
+            &[
+                Value::Ref(Some("%03d".into())),
+                Value::Ref(Some("array/test/args/0".into())),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, NativeError::Metadata(message) if message.contains("unsupported String.format conversion %0"))
+        );
+    }
+
     #[test]
     fn descriptor_count_handles_arrays() {
         assert_eq!(arg_count("(I[Ljava/lang/String;)V"), 2);
@@ -9101,6 +9398,44 @@ mandatory = true
         assert_eq!(
             default_host.invoke(&current_time_millis, &[]).unwrap(),
             Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn standard_host_uses_only_seeded_environment_values() {
+        let mut host = StdHost::new().with_environment_variable("DEMO_MODE", "native");
+        let getenv = MethodRef {
+            owner: "java/lang/System".into(),
+            name: "getenv".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke(&getenv, &[Value::Ref(Some("DEMO_MODE".into()))])
+                .unwrap(),
+            Value::Ref(Some("native".into()))
+        );
+        // Arbitrary process variables are deliberately invisible to StdHost.
+        assert_eq!(
+            host.invoke(&getenv, &[Value::Ref(Some("PATH".into()))])
+                .unwrap(),
+            Value::Ref(None)
+        );
+
+        let getenv_all = MethodRef {
+            owner: "java/lang/System".into(),
+            name: "getenv".into(),
+            descriptor: "()Ljava/util/Map;".into(),
+        };
+        let values = host.invoke(&getenv_all, &[]).unwrap();
+        let get = MethodRef {
+            owner: "java/util/Map".into(),
+            name: "get".into(),
+            descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&get, &values, &[Value::Ref(Some("DEMO_MODE".into()))])
+                .unwrap(),
+            Value::Ref(Some("native".into()))
         );
     }
 
@@ -11733,6 +12068,25 @@ mandatory = true
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn standard_host_maps_locale_us_integer_number_format() {
+        let mut host = StdHost::new();
+        let locale = host
+            .get_static(&MethodRef { owner: "java/util/Locale".into(), name: "US".into(), descriptor: "Ljava/util/Locale;".into() })
+            .unwrap();
+        assert_eq!(locale, Value::Ref(Some("locale/US".into())));
+        assert_eq!(host.invoke_instance(&MethodRef { owner: "java/util/Locale".into(), name: "toLanguageTag".into(), descriptor: "()Ljava/lang/String;".into() }, &locale, &[]).unwrap(), Value::Ref(Some("en-US".into())));
+        let format = host.invoke(&MethodRef { owner: "java/text/NumberFormat".into(), name: "getIntegerInstance".into(), descriptor: "(Ljava/util/Locale;)Ljava/text/NumberFormat;".into() }, &[locale]).unwrap();
+        assert_eq!(host.invoke_instance(&MethodRef { owner: "java/text/NumberFormat".into(), name: "format".into(), descriptor: "(I)Ljava/lang/String;".into() }, &format, &[Value::Int(-2_147_483_648)]).unwrap(), Value::Ref(Some("-2,147,483,648".into())));
+    }
+
+    #[test]
+    fn standard_host_rejects_non_us_number_format_locale() {
+        let mut host = StdHost::new();
+        let error = host.invoke(&MethodRef { owner: "java/text/NumberFormat".into(), name: "getIntegerInstance".into(), descriptor: "(Ljava/util/Locale;)Ljava/text/NumberFormat;".into() }, &[Value::Ref(Some("locale/FRANCE".into()))]).unwrap_err();
+        assert!(error.to_string().contains("only Locale.US"));
     }
 
     #[test]

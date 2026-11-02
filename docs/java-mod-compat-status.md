@@ -16,7 +16,7 @@ Last checked: 2 November 2026, commit `5371dda57`.
 - [x] Record Fabric events, NeoForge events, and legacy Forge event-bus listeners with ordering, cancellation markers, and unregister support.
 - [x] Record custom payload registrations for the supported Fabric/NeoForge directions and the bounded legacy Forge `SimpleChannel.registerMessage` alias.
 - [x] Provide bounded NeoForge and legacy Forge capability/`LazyOptional` markers, NBT values, identifiers, resource keys, arrays, reflection metadata, collections, maps, streams, and optionals.
-- [x] Provide common Java wrapper/string operations used by loader bootstrap code, including integer/long/float/double/byte/short/character conversion, `Number` accessors, checked math, seeded `System.currentTimeMillis`, and bounded callback combinators.
+- [x] Provide common Java wrapper/string operations used by loader bootstrap code, including integer/long/float/double/byte/short/character conversion, `Number` accessors, checked math, seeded `System.currentTimeMillis`, explicitly seeded `System.getenv` queries, and bounded callback combinators.
 - [x] Mirror the common `Locale.US` integer grouping path used by the native statistics screen without emulating arbitrary locale patterns.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs and array-returning signatures.
 - [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, access-widener/access-transformer discovery, and explicit report-only diagnostics.

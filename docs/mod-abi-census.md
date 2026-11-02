@@ -260,3 +260,13 @@ dependency shim.
 - ~~Join the hooks~~ done: `census --hooks native-hooks.json`, after `vanilla` was added to the catalog.
 - Decide per class, from the 264, between a Java-owned method and a named hook; that list is phase 4.
 - Run the same census over every 26.3 jar as the ecosystem reaches the version.
+
+### Native bootstrap formatting subset (wave 32)
+
+The bounded native loader now handles `java.lang.String.format` for the forms used by
+bootstrap diagnostics: sequential `%s`, `%d`, `%f`, `%b`, `%c`, `%%`, and `%n`, with
+both `(String,Object[])` and `(Locale,String,Object[])` descriptors. Arguments come only
+from runtime-owned object arrays. Widths, flags, precisions, indexes, and unknown
+conversions return explicit `NativeError::Metadata` errors; no locale-sensitive formatting
+or arbitrary `Object.toString` execution is attempted. `String.valueOf(Object)` remains
+marker based (`null` → `"null"`) so opaque loader values stay deterministic.
