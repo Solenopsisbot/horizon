@@ -198,6 +198,10 @@ pub struct StdHost {
     /// Explicitly seeded environment values exposed through `System.getenv`.
     /// The host process environment is never consulted.
     environment: BTreeMap<String, String>,
+    /// Explicitly seeded classpath resources exposed through the bounded
+    /// `ClassLoader` query surface. The host never opens files or consults a
+    /// process classpath.
+    resources: BTreeMap<String, String>,
     /// Deterministic epoch value returned by `System.currentTimeMillis`.
     ///
     /// The native interpreter represents wide primitives with its bounded
@@ -242,6 +246,7 @@ impl StdHost {
         Self {
             properties: BTreeMap::from([("line.separator".into(), "\n".into())]),
             environment: BTreeMap::new(),
+            resources: BTreeMap::new(),
             current_time_millis: 0,
             mods: BTreeMap::new(),
             environment_type: "CLIENT".into(),
@@ -279,6 +284,22 @@ impl StdHost {
     ) -> Self {
         self.environment.insert(key.into(), value.into());
         self
+    }
+
+    /// Seed a deterministic classpath resource marker. `ClassLoader` resource
+    /// queries return this marker when `name` is requested; absent names stay
+    /// null. This is metadata only and never reads a host file.
+    pub fn with_resource(mut self, name: impl Into<String>, marker: impl Into<String>) -> Self {
+        self.resources.insert(name.into(), marker.into());
+        self
+    }
+
+    /// Query an explicitly seeded resource marker without crossing into the
+    /// host filesystem or process classpath.
+    pub fn resource(&self, name: &str) -> Option<&str> {
+        self.resources
+            .get(name.strip_prefix('/').unwrap_or(name))
+            .map(String::as_str)
     }
 
     /// Set the deterministic value returned by `System.currentTimeMillis`.
@@ -532,6 +553,15 @@ impl Host for StdHost {
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            // ServiceLoader is deliberately a hard boundary in the native
+            // probe.  Scanning the host JVM class path would make execution
+            // depend on whichever jars happen to be installed on the machine;
+            // a future adapter must provide an explicit, seeded provider set.
+            ("java/util/ServiceLoader", "load" | "loadInstalled", _) => Err(
+                NativeError::Metadata(
+                    "java/util/ServiceLoader provider discovery is unsupported in the native runtime; explicit seeded providers are required (host classpath scanning is disabled)".into(),
+                ),
+            ),
             ("java/text/NumberFormat", "getIntegerInstance", "()Ljava/text/NumberFormat;") => {
                 Ok(Value::Ref(Some("number-format/integer/US".into())))
             }
@@ -1171,6 +1201,15 @@ impl Host for StdHost {
             ("java/lang/System", "lineSeparator", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some("\n".into())))
             }
+            ("java/lang/ClassLoader", "getSystemResource", "(Ljava/lang/String;)Ljava/net/URL;")
+            | (
+                "java/lang/ClassLoader",
+                "getSystemResourceAsStream",
+                "(Ljava/lang/String;)Ljava/io/InputStream;",
+            ) => {
+                let name = expect_string(Self::argument(r, args, 0)?);
+                Ok(Value::Ref(self.resource(name).map(str::to_owned)))
+            }
             ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;") => {
                 Ok(Value::Ref(Some("thread/main".into())))
             }
@@ -1262,6 +1301,32 @@ impl Host for StdHost {
                     r.name, r.descriptor
                 ))),
             };
+        }
+        if r.owner == "java/lang/ClassLoader" {
+            let marker = expect_ref(receiver).ok_or_else(|| {
+                NativeError::Metadata("malformed java/lang/ClassLoader marker".into())
+            })?;
+            if marker != "classloader/bootstrap" {
+                return Err(NativeError::Metadata(
+                    "unsupported java/lang/ClassLoader marker".into(),
+                ));
+            }
+            if matches!(r.name.as_str(), "getResource" | "getResourceAsStream")
+                && r.descriptor == "(Ljava/lang/String;)Ljava/lang/Object;"
+            {
+                let name = expect_string(Self::argument(r, args, 0)?);
+                return Ok(Value::Ref(self.resource(name).map(str::to_owned)));
+            }
+            if r.name == "getResource" && r.descriptor == "(Ljava/lang/String;)Ljava/net/URL;" {
+                let name = expect_string(Self::argument(r, args, 0)?);
+                return Ok(Value::Ref(self.resource(name).map(str::to_owned)));
+            }
+            if r.name == "getResourceAsStream"
+                && r.descriptor == "(Ljava/lang/String;)Ljava/io/InputStream;"
+            {
+                let name = expect_string(Self::argument(r, args, 0)?);
+                return Ok(Value::Ref(self.resource(name).map(str::to_owned)));
+            }
         }
         if r.owner == "java/text/NumberFormat"
             && r.name == "format"
@@ -7648,6 +7713,31 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_rejects_service_loader_classpath_scanning() {
+        let mut host = StdHost::new();
+        for (name, descriptor) in [
+            ("load", "(Ljava/lang/Class;)Ljava/util/ServiceLoader;"),
+            (
+                "loadInstalled",
+                "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
+            ),
+        ] {
+            let method = MethodRef {
+                owner: "java/util/ServiceLoader".into(),
+                name: name.into(),
+                descriptor: descriptor.into(),
+            };
+            let error = host.invoke(&method, &[Value::Ref(Some("demo/Provider".into()))]);
+            assert!(matches!(
+                error,
+                Err(NativeError::Metadata(message))
+                    if message.contains("ServiceLoader")
+                        && message.contains("host classpath scanning is disabled")
+            ));
+        }
+    }
+
+    #[test]
     fn standard_host_maps_common_queries_and_records_calls() {
         let mut host = StdHost::new().with_property("demo.mode", "native");
         let property = MethodRef {
@@ -7752,6 +7842,36 @@ mandatory = true
                 long_hex.clone(),
                 long_hex,
             ]
+        );
+    }
+
+    #[test]
+    fn standard_host_classloader_resources_are_explicit_and_host_local() {
+        let mut host = StdHost::new().with_resource("assets/demo.txt", "resource/demo");
+        assert_eq!(host.resource("assets/demo.txt"), Some("resource/demo"));
+        assert_eq!(host.resource("/assets/demo.txt"), Some("resource/demo"));
+        assert_eq!(host.resource("missing.txt"), None);
+
+        let loader = Value::Ref(Some("classloader/bootstrap".into()));
+        let url = MethodRef {
+            owner: "java/lang/ClassLoader".into(),
+            name: "getResource".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/net/URL;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&url, &loader, &[Value::Ref(Some("assets/demo.txt".into()))])
+                .unwrap(),
+            Value::Ref(Some("resource/demo".into()))
+        );
+        let stream = MethodRef {
+            name: "getResourceAsStream".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/io/InputStream;".into(),
+            ..url.clone()
+        };
+        assert_eq!(
+            host.invoke_instance(&stream, &loader, &[Value::Ref(Some("missing.txt".into()))])
+                .unwrap(),
+            Value::Ref(None)
         );
     }
 

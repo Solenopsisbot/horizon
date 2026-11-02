@@ -211,8 +211,9 @@ Mixin configuration files are also inspected in report-only mode: bounded JSON r
 JDK classpath discovery is reported with the same bounded rule. References to `ServiceLoader` and calls
 to `ServiceLoader.load`/`loadInstalled` or `ClassLoader.getResource*`/`loadClass` mark a jar as dynamic,
 with the exact owner and method in its diagnostic list. The census does not emulate providers or resource
-lookup; the embedded JVM remains responsible for those calls until a deliberately bounded native contract
-is specified.
+lookup. Native execution rejects `ServiceLoader.load` and `loadInstalled` with a structured unsupported
+diagnostic rather than scanning the host class path; the embedded JVM remains responsible for those calls
+until a deliberately bounded native contract with explicitly seeded providers is specified.
 
 ## Phase 1, first slice (measured 1 November 2026)
 
@@ -526,6 +527,11 @@ Thread bootstrap queries are likewise deterministic: `Thread.currentThread()` re
 marker, whose `getName()` is `main`, `isDaemon()` is false, and `getContextClassLoader()` returns the
 `classloader/bootstrap` marker. These markers keep common loader initialization paths alive without exposing
 native worker threads or a host class loader.
+That bootstrap class-loader marker supports bounded `getResource(String)` and
+`getResourceAsStream(String)` queries against resources explicitly seeded with
+`StdHost::with_resource`. Missing names return null, and the native host never
+opens files or consults the process classpath; `StdHost::resource` exposes the
+same marker lookup to a game-owned adapter.
 For native client paths that mirror bootstrap-visible `NumberFormat.getIntegerInstance(Locale.US)`,
 `horizon_client::java_text::format_integer_us` provides deterministic ASCII digit grouping (including negative
 values) without emulating arbitrary locale or formatter patterns.

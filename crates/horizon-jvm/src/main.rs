@@ -488,9 +488,58 @@ fn describe(
     entry: &str,
     error: jni::errors::Error,
 ) -> Result<(), String> {
+    let fallback = (error.to_string() == "Java exception was thrown")
+        .then(|| exception_fallback(env))
+        .flatten();
     let _ = env.exception_describe();
     let _ = env.exception_clear();
+    if let Some(message) = fallback {
+        return Err(format!("{stage} {entry}: {message}"));
+    }
     Err(format!("{stage} {entry}: {error}"))
+}
+
+/// Turn the exceptions that mean "the native façade cannot handle this" into
+/// an explicit JVM fallback diagnostic. Dynamic classpath/resource lookups
+/// stay on HotSpot, so a mod can tell this is a deliberate fallback rather
+/// than an opaque entrypoint failure.
+fn exception_fallback(env: &mut JNIEnv) -> Option<String> {
+    let throwable = env.exception_occurred().ok()?;
+    let class = env.get_object_class(&throwable).ok()?;
+    let name = env
+        .call_method(&class, "getName", "()Ljava/lang/String;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+    let name = env
+        .get_string((&name).into())
+        .ok()?
+        .to_string_lossy()
+        .into_owned();
+    let message = env
+        .call_method(&throwable, "getMessage", "()Ljava/lang/String;", &[])
+        .ok()
+        .and_then(|value| value.l().ok())
+        .and_then(|value| {
+            let text = env.get_string((&value).into()).ok()?;
+            Some(text.to_string_lossy().into_owned())
+        });
+    let detail = message.filter(|value| !value.is_empty());
+    fallback_label(&name, detail.as_deref())
+}
+
+fn fallback_label(class: &str, detail: Option<&str>) -> Option<String> {
+    match class {
+        "java.lang.UnsupportedOperationException" => Some(format!(
+            "JVM fallback selected for unsupported native call{}",
+            detail.map_or_else(String::new, |value| format!(": {value}"))
+        )),
+        "java.lang.ClassNotFoundException" | "java.lang.NoClassDefFoundError" => Some(format!(
+            "JVM fallback selected for dynamic classpath lookup{}",
+            detail.map_or_else(String::new, |value| format!(": {value}"))
+        )),
+        _ => None,
+    }
 }
 
 fn take(args: &mut Vec<String>, name: &str) -> Option<String> {
@@ -670,8 +719,8 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_entries, fabric_entries, fabric_metadata, is_minecraft_class, nested_jar_name,
-        split_entrypoint,
+        discover_entries, fabric_entries, fabric_metadata, fallback_label, is_minecraft_class,
+        nested_jar_name, split_entrypoint,
     };
     use std::{fs::File, io::Write};
     use zip::write::SimpleFileOptions;
@@ -719,6 +768,30 @@ mod tests {
             ("example.Client", Some("initializeClient"))
         );
         assert_eq!(split_entrypoint("example.Main"), ("example.Main", None));
+    }
+
+    #[test]
+    fn labels_native_and_dynamic_classpath_fallbacks() {
+        assert_eq!(
+            fallback_label(
+                "java.lang.UnsupportedOperationException",
+                Some("net.minecraft.world.Level#getBlockState")
+            ),
+            Some("JVM fallback selected for unsupported native call: net.minecraft.world.Level#getBlockState".to_owned())
+        );
+        assert_eq!(
+            fallback_label(
+                "java.lang.ClassNotFoundException",
+                Some("optional.Provider")
+            ),
+            Some(
+                "JVM fallback selected for dynamic classpath lookup: optional.Provider".to_owned()
+            )
+        );
+        assert_eq!(
+            fallback_label("java.lang.IllegalStateException", None),
+            None
+        );
     }
 
     #[test]
