@@ -293,7 +293,8 @@ is named with the mod's own file and line under it. The first runtime slice now 
 `StreamCodec` factories as bootstrap values, returning an empty codec object so static registration can
 rather than the codec factory itself. Codec composition methods (`map`, `mapStream`, `dispatch`, `apply`, `optional`, `nullable`, `cast`, and `tuple`) preserve a non-null receiver, and
 `CustomPacketPayload.Type` retains its `Identifier` through construction, `id()`, `toString()`, equality,
-and hashing, so payload registration can compare and log type identities before crossing the native network boundary. The next failure
+and hashing in the native host, so payload registration can compare and log type identities before crossing
+the native network boundary. The next failure
 is therefore the next concrete value or registry operation the mod reaches,
 rather than the codec factory itself.
 
@@ -433,6 +434,9 @@ in addition to classfile and metadata discovery. It therefore catches classfile,
 and multi-entrypoint regressions that an in-memory Rust fixture cannot; the full mod-port
 harness remains the check that needs prepared vanilla resources.
 
+The game-facing `run_java_mods` path has a source-built regression test that compiles a Fabric jar,
+executes it through the actual startup loader, and asserts that typed block content reaches `ContentMod`.
+
 The game has an explicit `--java-mod <jar>` startup option for this bounded path. It runs the selected
 Fabric or NeoForge entrypoint before resource workers start, records host calls and registration intent,
 seeds the deterministic loader with the jar's own id/version and required loader dependencies, and fails
@@ -460,6 +464,9 @@ An explicitly supported jar may include `META-INF/horizon-native.json` to supply
 The loader validates block, item, and mob-effect declarations, turns them into declaration-only `Content`,
 and layers them through the same `content_root` planner as `.hmod` content. Unknown custom kinds fail the
 startup rather than silently entering the native registries.
+
+The embedded JVM runner treats a discovered `neoforge` entrypoint as constructor-only, invoking the
+mod constructor and optional Mixin `onLoad` hook without fabricating a Fabric `onInitialize` call.
 
 The façade now also has the first NeoForge registration boundary: `FMLJavaModLoadingContext.get()` and
 `getModEventBus()` yield neutral context and bus values, `IEventBus` fluent registration returns its receiver,
