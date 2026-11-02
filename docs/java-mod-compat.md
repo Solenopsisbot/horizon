@@ -207,7 +207,7 @@ scoped by a number.
 
 The census is also a product: it is the "what runs" table the launcher shows for a jar before install,
 and the generated reference under `docs/api/`.
-Mixin configuration files are also inspected in report-only mode: bounded JSON reads collect safe class names from `target` fields and record edge-field presence (including `required` and `priority`) in the per-jar and aggregate census. Injection annotations report presence and deterministic scalar values for `require`, `expect`, `cancellable`, `order`, and `priority`, plus bounded `slice` presence, so native hook planning can preserve ordering, contracts, and selector context. Values are not interpreted, configs are not executed, and no bytecode is woven; malformed or oversized files are skipped.
+Mixin configuration files are also inspected in report-only mode: bounded JSON reads collect safe class names from `target` fields and record edge-field presence (including `required` and `priority`) in the per-jar and aggregate census. Injection annotations report presence and deterministic scalar values for `require`, `expect`, `cancellable`, `order`, and `priority`, plus bounded `slice` presence, so native hook planning can preserve ordering, contracts, and selector context. Native hook names for one target method are sorted and deduplicated before they enter `native_hooks`. Values are not interpreted, configs are not executed, and no bytecode is woven; malformed or oversized files are skipped.
 JDK classpath discovery is reported with the same bounded rule. References to `ServiceLoader` and calls
 to `ServiceLoader.load`/`loadInstalled` or `ClassLoader.getResource*`/`loadClass` mark a jar as dynamic,
 with the exact owner and method in its diagnostic list. The census does not emulate providers or resource
@@ -835,8 +835,9 @@ BlockState bootstrap paths retain a bounded block identity and property map: `ge
 common state construction and inspection while the registry-backed state definition and vanilla default
 values remain follow-up work. `hasBlockEntity` and `isRandomlyTicking` expose explicit empty-safe defaults
 for bootstrap checks.
-`ItemStack.getUseAnimation()` now returns the deterministic `UseAnim.NONE` façade value alongside the existing
-count, copy, damage, component, and tag queries, keeping common item bootstrap branches linkable.
+`ItemStack.getUseAnimation()` now returns the deterministic `UseAnim.NONE` façade value, and `getTags()`
+returns a bounded empty stream alongside the existing count, copy, damage, component, and tag queries, keeping
+common item bootstrap branches linkable.
 The `ItemStack.is(TagKey)` and `BlockState.is(TagKey)` overloads are also linked with an explicit empty
 membership result until registry-backed tag tables are attached.
 `TagKey` now retains its registry key and identifier as a value pair: `create`, `location`, `registry`,
