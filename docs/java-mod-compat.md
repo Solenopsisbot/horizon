@@ -497,6 +497,10 @@ The standard-library surface also includes deterministic `Integer.compare`/`toHe
 bounded `Long.compare`/`toHexString`,
 `Long.parseLong`/`valueOf`/`toString`,
 bounded `Byte.parseByte`/`valueOf`/`byteValue`,
+bounded `Short.parseShort`/`valueOf`/`shortValue`/`toString`,
+bounded `Number` primitive accessors across the supported boxed numeric markers,
+common `Character.isLetter`/`isDigit`/`toLowerCase` queries and
+`valueOf`/`charValue` boxing operations,
 `StringBuilder`/`StringBuffer` append and
 `toString` values, primitive `String.valueOf` overloads, plus `Objects.equals`, `requireNonNull`, and
 `toString`, which covers common loader bootstrap formatting and null checks without a JVM.

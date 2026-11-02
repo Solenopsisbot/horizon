@@ -40,7 +40,7 @@ Last checked: 2 November 2026, commit `266ba0a02`.
 
 ## Validation snapshot
 
-- `horizon-native-java`: 76 unit tests passing.
+- `horizon-native-java`: 79 unit tests passing, including bounded `Number` accessors across boxed integer and floating markers.
 - `horizon-port-pack`: 150 unit tests passing.
 - `horizon-jvm`: 7 unit tests passing.
 - Workspace check, targeted clippy, formatting, and `tools/native_java_smoke.py` passing.

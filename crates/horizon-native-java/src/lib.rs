@@ -594,6 +594,42 @@ impl Host for StdHost {
                 })?;
                 Ok(Value::Ref(Some(format!("byte:{value}"))))
             }
+            ("java/lang/Short", "parseShort", "(Ljava/lang/String;)S") => Ok(Value::Int(
+                i32::from(parse_java_short(Self::argument(r, args, 0)?)?),
+            )),
+            ("java/lang/Short", "parseShort", "(Ljava/lang/String;I)S") => {
+                let text = expect_string(Self::argument(r, args, 0)?);
+                let radix = short_radix(r, Self::argument(r, args, 1)?)?;
+                let value = i16::from_str_radix(text, radix).map_err(|_| {
+                    NativeError::Metadata(
+                        "invalid short argument for java/lang/Short.parseShort".into(),
+                    )
+                })?;
+                Ok(Value::Int(i32::from(value)))
+            }
+            ("java/lang/Short", "valueOf", "(S)Ljava/lang/Short;") => {
+                let value = expect_int(r, Self::argument(r, args, 0)?)?;
+                let value = i16::try_from(value).map_err(|_| {
+                    NativeError::Metadata(
+                        "invalid short argument for java/lang/Short.valueOf".into(),
+                    )
+                })?;
+                Ok(Value::Ref(Some(format!("short:{value}"))))
+            }
+            ("java/lang/Short", "valueOf", "(Ljava/lang/String;)Ljava/lang/Short;") => {
+                let value = parse_java_short(Self::argument(r, args, 0)?)?;
+                Ok(Value::Ref(Some(format!("short:{value}"))))
+            }
+            ("java/lang/Short", "valueOf", "(Ljava/lang/String;I)Ljava/lang/Short;") => {
+                let text = expect_string(Self::argument(r, args, 0)?);
+                let radix = short_radix(r, Self::argument(r, args, 1)?)?;
+                let value = i16::from_str_radix(text, radix).map_err(|_| {
+                    NativeError::Metadata(
+                        "invalid short argument for java/lang/Short.valueOf".into(),
+                    )
+                })?;
+                Ok(Value::Ref(Some(format!("short:{value}"))))
+            }
             ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
                 Ok(Value::Ref(Some(format!("integer:{value}"))))
@@ -635,6 +671,25 @@ impl Host for StdHost {
             ("java/lang/Integer", "toHexString", "(I)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 format!("{:x}", expect_int(r, Self::argument(r, args, 0)?)? as u32),
             ))),
+            ("java/lang/Character", "isLetter", "(C)Z")
+            | ("java/lang/Character", "isLetter", "(I)Z") => Ok(Value::Int(
+                java_code_point(Self::argument(r, args, 0)?).is_some_and(char::is_alphabetic)
+                    as i32,
+            )),
+            ("java/lang/Character", "isDigit", "(C)Z")
+            | ("java/lang/Character", "isDigit", "(I)Z") => Ok(Value::Int(
+                java_code_point(Self::argument(r, args, 0)?).is_some_and(char::is_numeric) as i32,
+            )),
+            ("java/lang/Character", "toLowerCase", "(C)C")
+            | ("java/lang/Character", "toLowerCase", "(I)I") => {
+                let value = java_code_point(Self::argument(r, args, 0)?)
+                    .and_then(|c| c.to_lowercase().next());
+                Ok(Value::Int(value.map_or(0xfffd, u32::from) as i32))
+            }
+            ("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;") => {
+                let value = expect_int(r, Self::argument(r, args, 0)?)?;
+                Ok(Value::Ref(Some(format!("character:{value}"))))
+            }
             ("java/lang/Double", "parseDouble", "(Ljava/lang/String;)D") => {
                 Ok(double_value(parse_java_float(Self::argument(r, args, 0)?)?))
             }
@@ -901,6 +956,15 @@ impl Host for StdHost {
             ("java/lang/String", "valueOf", "(I)Ljava/lang/String;")
             | ("java/lang/Integer", "toString", "(I)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 expect_int(r, Self::argument(r, args, 0)?)?.to_string(),
+            ))),
+            ("java/lang/Short", "toString", "(S)Ljava/lang/String;") => Ok(Value::Ref(Some(
+                i16::try_from(expect_int(r, Self::argument(r, args, 0)?)?)
+                    .map_err(|_| {
+                        NativeError::Metadata(
+                            "invalid short argument for java/lang/Short.toString".into(),
+                        )
+                    })?
+                    .to_string(),
             ))),
             ("java/lang/String", "valueOf", "(Z)Ljava/lang/String;")
             | ("java/lang/Boolean", "toString", "(Z)Ljava/lang/String;") => Ok(Value::Ref(Some(
@@ -1926,7 +1990,40 @@ impl Host for StdHost {
             (owner, "toString", "()Ljava/lang/String;") if is_collection_owner(owner) => {
                 Ok(Value::Ref(Some(collection_text(receiver)?)))
             }
-            ("java/lang/Integer", "intValue", "()I") | ("java/lang/Number", "intValue", "()I") => {
+            // Number's primitive accessors are inherited by every boxed numeric
+            // type. Keep the conversion rules in one bounded path so a value
+            // written as (for example) a Long can be read through Number.
+            ("java/lang/Number", "intValue", "()I") => {
+                Ok(Value::Int(number_int_value(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Number marker".into())
+                })?))
+            }
+            ("java/lang/Number", "longValue", "()J") => {
+                Ok(long_value(number_long_value(receiver).ok_or_else(
+                    || NativeError::Metadata("malformed java/lang/Number marker".into()),
+                )?))
+            }
+            ("java/lang/Number", "shortValue", "()S") => {
+                Ok(Value::Int(number_short_value(receiver).ok_or_else(
+                    || NativeError::Metadata("malformed java/lang/Number marker".into()),
+                )?))
+            }
+            ("java/lang/Number", "byteValue", "()B") => {
+                Ok(Value::Int(number_byte_value(receiver).ok_or_else(
+                    || NativeError::Metadata("malformed java/lang/Number marker".into()),
+                )?))
+            }
+            ("java/lang/Number", "floatValue", "()F") => {
+                Ok(float_value(boxed_number(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Number marker".into())
+                })?))
+            }
+            ("java/lang/Number", "doubleValue", "()D") => {
+                Ok(double_value(boxed_number(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Number marker".into())
+                })?))
+            }
+            ("java/lang/Integer", "intValue", "()I") => {
                 Ok(Value::Int(boxed_integer(receiver).ok_or_else(|| {
                     NativeError::Metadata("malformed java/lang/Integer marker".into())
                 })?))
@@ -1956,11 +2053,35 @@ impl Host for StdHost {
                         .is_some_and(|other| Some(other) == boxed_integer(receiver)))
                     as i32,
             )),
+            ("java/lang/Character", "charValue", "()C") => {
+                Ok(Value::Int(boxed_character(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Character marker".into())
+                })?))
+            }
+            ("java/lang/Character", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
+                char::from_u32(boxed_character(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Character marker".into())
+                })? as u32)
+                .unwrap_or('\u{fffd}')
+                .to_string(),
+            ))),
             ("java/lang/Byte", "byteValue", "()B") => {
                 Ok(Value::Int(boxed_byte(receiver).ok_or_else(|| {
                     NativeError::Metadata("malformed java/lang/Byte marker".into())
                 })? as i32))
             }
+            ("java/lang/Short", "shortValue", "()S") => {
+                Ok(Value::Int(i32::from(boxed_short(receiver).ok_or_else(
+                    || NativeError::Metadata("malformed java/lang/Short marker".into()),
+                )?)))
+            }
+            ("java/lang/Short", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
+                boxed_short(receiver)
+                    .ok_or_else(|| {
+                        NativeError::Metadata("malformed java/lang/Short marker".into())
+                    })?
+                    .to_string(),
+            ))),
             ("java/lang/Long", "longValue", "()J") => {
                 Ok(long_value(boxed_long(receiver).ok_or_else(|| {
                     NativeError::Metadata("malformed java/lang/Long marker".into())
@@ -3457,8 +3578,92 @@ fn boxed_integer(value: &Value) -> Option<i32> {
     }
 }
 
+fn java_code_point(value: &Value) -> Option<char> {
+    let code_point = boxed_integer(value)?;
+    (0..=0x10ffff)
+        .contains(&code_point)
+        .then(|| char::from_u32(code_point as u32))
+        .flatten()
+}
+
+fn boxed_character(value: &Value) -> Option<i32> {
+    match value {
+        // Java `char` is an unsigned UTF-16 code unit, so isolated surrogates
+        // are valid boxed values even though they are not Rust scalar values.
+        Value::Int(value) => (0..=0xffff).contains(value).then_some(*value),
+        Value::Ref(Some(value)) => value
+            .strip_prefix("character:")
+            .and_then(|value| value.parse::<i32>().ok())
+            .and_then(|value| (0..=0xffff).contains(&value).then_some(value)),
+        _ => None,
+    }
+}
+
+/// Read any of the host's boxed numeric markers as a Java `double`-like value.
+/// The native probe does not model primitive wide values separately, so all
+/// conversions pass through this helper before applying Java's narrowing cast.
+fn boxed_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int(value) => Some(f64::from(*value)),
+        Value::Ref(Some(value)) => value
+            .strip_prefix("integer:")
+            .or_else(|| value.strip_prefix("byte:"))
+            .or_else(|| value.strip_prefix("short:"))
+            .or_else(|| value.strip_prefix("long:"))
+            .or_else(|| value.strip_prefix("double:"))
+            .or_else(|| value.strip_prefix("float:"))
+            .and_then(|value| value.parse::<f64>().ok()),
+        _ => None,
+    }
+}
+
+fn number_int_value(value: &Value) -> Option<i32> {
+    match value {
+        Value::Ref(Some(value)) if value.starts_with("long:") => value
+            .strip_prefix("long:")?
+            .parse::<i64>()
+            .ok()
+            .map(|v| v as i32),
+        _ => boxed_number(value).map(|v| v as i32),
+    }
+}
+
+fn number_long_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Ref(Some(value)) if value.starts_with("long:") => {
+            value.strip_prefix("long:")?.parse::<i64>().ok()
+        }
+        _ => boxed_number(value).map(|v| v as i64),
+    }
+}
+
+fn number_short_value(value: &Value) -> Option<i32> {
+    number_long_value(value).map(|v| (v as i16) as i32)
+}
+
+fn number_byte_value(value: &Value) -> Option<i32> {
+    number_long_value(value).map(|v| (v as i8) as i32)
+}
+
 fn parse_java_byte(value: &Value) -> Result<i8, std::num::ParseIntError> {
     expect_string(value).trim().parse::<i8>()
+}
+
+fn parse_java_short(value: &Value) -> Result<i16, NativeError> {
+    expect_string(value).parse::<i16>().map_err(|_| {
+        NativeError::Metadata("invalid short argument for java/lang/Short.parseShort".into())
+    })
+}
+
+fn short_radix(r: &MethodRef, value: &Value) -> Result<u32, NativeError> {
+    let radix = expect_int(r, value)?;
+    if !(2..=36).contains(&radix) {
+        return Err(NativeError::Metadata(format!(
+            "{} received an invalid radix",
+            r.name
+        )));
+    }
+    Ok(radix as u32)
 }
 
 fn boxed_byte(value: &Value) -> Option<i8> {
@@ -3467,6 +3672,16 @@ fn boxed_byte(value: &Value) -> Option<i8> {
         Value::Ref(Some(value)) => value
             .strip_prefix("byte:")
             .and_then(|value| value.parse::<i8>().ok()),
+        _ => None,
+    }
+}
+
+fn boxed_short(value: &Value) -> Option<i16> {
+    match value {
+        Value::Int(value) => i16::try_from(*value).ok(),
+        Value::Ref(Some(value)) => value
+            .strip_prefix("short:")
+            .and_then(|value| value.parse::<i16>().ok()),
         _ => None,
     }
 }
@@ -6984,6 +7199,71 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_maps_character_queries_and_boxing() {
+        let mut host = StdHost::new();
+        let letter = MethodRef {
+            owner: "java/lang/Character".into(),
+            name: "isLetter".into(),
+            descriptor: "(C)Z".into(),
+        };
+        assert_eq!(
+            host.invoke(&letter, &[Value::Int('Æ' as i32)]).unwrap(),
+            Value::Int(1)
+        );
+        let digit = MethodRef {
+            name: "isDigit".into(),
+            descriptor: "(I)Z".into(),
+            ..letter.clone()
+        };
+        assert_eq!(
+            host.invoke(&digit, &[Value::Int('७' as i32)]).unwrap(),
+            Value::Int(1)
+        );
+        let lower = MethodRef {
+            name: "toLowerCase".into(),
+            descriptor: "(C)C".into(),
+            ..letter.clone()
+        };
+        assert_eq!(
+            host.invoke(&lower, &[Value::Int('Q' as i32)]).unwrap(),
+            Value::Int('q' as i32)
+        );
+        let value_of = MethodRef {
+            name: "valueOf".into(),
+            descriptor: "(C)Ljava/lang/Character;".into(),
+            ..letter.clone()
+        };
+        let boxed = host.invoke(&value_of, &[Value::Int('Z' as i32)]).unwrap();
+        assert_eq!(boxed, Value::Ref(Some("character:90".into())));
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    name: "charValue".into(),
+                    descriptor: "()C".into(),
+                    ..letter.clone()
+                },
+                &boxed,
+                &[]
+            )
+            .unwrap(),
+            Value::Int('Z' as i32)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    name: "toString".into(),
+                    descriptor: "()Ljava/lang/String;".into(),
+                    ..letter
+                },
+                &boxed,
+                &[]
+            )
+            .unwrap(),
+            Value::Ref(Some("Z".into()))
+        );
+    }
+
+    #[test]
     fn standard_host_maps_byte_wrapper_values() {
         let mut host = StdHost::new();
         let parse = MethodRef {
@@ -7020,6 +7300,88 @@ mandatory = true
         );
         assert!(
             host.invoke(&parse, &[Value::Ref(Some("128".into()))])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn standard_host_maps_bounded_short_wrapper_values() {
+        let mut host = StdHost::new();
+        let parse = MethodRef {
+            owner: "java/lang/Short".into(),
+            name: "parseShort".into(),
+            descriptor: "(Ljava/lang/String;)S".into(),
+        };
+        assert_eq!(
+            host.invoke(&parse, &[Value::Ref(Some("-32768".into()))])
+                .unwrap(),
+            Value::Int(-32768)
+        );
+        assert_eq!(
+            host.invoke(
+                &MethodRef {
+                    owner: "java/lang/Short".into(),
+                    name: "parseShort".into(),
+                    descriptor: "(Ljava/lang/String;I)S".into(),
+                },
+                &[Value::Ref(Some("7fff".into())), Value::Int(16)],
+            )
+            .unwrap(),
+            Value::Int(32767)
+        );
+        let value_of = MethodRef {
+            owner: "java/lang/Short".into(),
+            name: "valueOf".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/lang/Short;".into(),
+        };
+        let boxed = host
+            .invoke(&value_of, &[Value::Ref(Some("32767".into()))])
+            .unwrap();
+        assert_eq!(boxed, Value::Ref(Some("short:32767".into())));
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/lang/Short".into(),
+                    name: "shortValue".into(),
+                    descriptor: "()S".into(),
+                },
+                &boxed,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(32767)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/lang/Short".into(),
+                    name: "toString".into(),
+                    descriptor: "()Ljava/lang/String;".into(),
+                },
+                &boxed,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("32767".into()))
+        );
+        assert_eq!(
+            host.invoke(
+                &MethodRef {
+                    owner: "java/lang/Short".into(),
+                    name: "toString".into(),
+                    descriptor: "(S)Ljava/lang/String;".into(),
+                },
+                &[Value::Int(-12)],
+            )
+            .unwrap(),
+            Value::Ref(Some("-12".into()))
+        );
+        assert!(
+            host.invoke(&parse, &[Value::Ref(Some("32768".into()))])
+                .is_err()
+        );
+        assert!(
+            host.invoke(&parse, &[Value::Ref(Some(" 1 ".into()))])
                 .is_err()
         );
     }
@@ -7110,6 +7472,48 @@ mandatory = true
         assert!(
             host.invoke(&parse_double, &[Value::Ref(Some("oops".into()))])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn standard_host_maps_number_accessors_across_boxed_types() {
+        let mut host = StdHost::new();
+        let number = |name: &str, descriptor: &str| MethodRef {
+            owner: "java/lang/Number".into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let long = Value::Ref(Some("long:4294967297".into()));
+        assert_eq!(
+            host.invoke_instance(&number("intValue", "()I"), &long, &[])
+                .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(&number("longValue", "()J"), &long, &[])
+                .unwrap(),
+            long_value(4_294_967_297)
+        );
+        assert_eq!(
+            host.invoke_instance(&number("byteValue", "()B"), &long, &[])
+                .unwrap(),
+            Value::Int(1)
+        );
+        let floating = Value::Ref(Some("double:3.75".into()));
+        assert_eq!(
+            host.invoke_instance(&number("intValue", "()I"), &floating, &[])
+                .unwrap(),
+            Value::Int(3)
+        );
+        assert_eq!(
+            host.invoke_instance(&number("floatValue", "()F"), &floating, &[])
+                .unwrap(),
+            float_value(3.75)
+        );
+        assert_eq!(
+            host.invoke_instance(&number("doubleValue", "()D"), &long, &[])
+                .unwrap(),
+            double_value(4_294_967_297.0)
         );
     }
 
