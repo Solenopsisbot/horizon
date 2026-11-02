@@ -710,6 +710,7 @@ const MIXIN_CONFIG_EDGE_FIELDS: [&str; 6] = [
     "compatibilityLevel",
     "priority",
 ];
+const MIXIN_CONFIG_INJECTOR_FIELDS: [&str; 3] = ["defaultRequire", "maxShiftBy", "injectionPoints"];
 
 /// Reads only bounded JSON config entries and reports safe class names under
 /// `target` keys. No Mixin semantics are applied and malformed/oversized
@@ -766,11 +767,22 @@ fn mixin_config_fields(
         let Ok(serde_json::Value::Object(object)) = serde_json::from_str(&text) else {
             continue;
         };
-        let fields: Vec<String> = MIXIN_CONFIG_EDGE_FIELDS
+        let mut fields: Vec<String> = MIXIN_CONFIG_EDGE_FIELDS
             .iter()
             .filter(|field| object.contains_key(**field))
             .map(|field| (*field).to_owned())
             .collect();
+        if let Some(injectors) = object
+            .get("injectors")
+            .and_then(serde_json::Value::as_object)
+        {
+            fields.extend(
+                MIXIN_CONFIG_INJECTOR_FIELDS
+                    .iter()
+                    .filter(|field| injectors.contains_key(**field))
+                    .map(|field| format!("injectors.{field}")),
+            );
+        }
         if !fields.is_empty() {
             out.insert(name, fields);
         }
@@ -802,7 +814,7 @@ fn mixin_config_values(
         let Ok(serde_json::Value::Object(object)) = serde_json::from_str(&text) else {
             continue;
         };
-        let values = MIXIN_CONFIG_EDGE_FIELDS
+        let mut values = MIXIN_CONFIG_EDGE_FIELDS
             .iter()
             .filter_map(|field| {
                 object
@@ -811,6 +823,16 @@ fn mixin_config_values(
                     .map(|value| ((*field).to_owned(), value))
             })
             .collect::<BTreeMap<_, _>>();
+        if let Some(injectors) = object
+            .get("injectors")
+            .and_then(serde_json::Value::as_object)
+        {
+            for field in MIXIN_CONFIG_INJECTOR_FIELDS {
+                if let Some(value) = injectors.get(field).and_then(config_scalar_text) {
+                    values.insert(format!("injectors.{field}"), value);
+                }
+            }
+        }
         if !values.is_empty() {
             out.insert(name, values);
         }
@@ -1083,7 +1105,7 @@ mod tests {
         let mut zip = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default();
         zip.start_file("ruby.mixins.json", options).unwrap();
-        std::io::Write::write_all(&mut zip, br#"{"plugin":"example.Plugin","refmap":"ruby.refmap.json","required":true,"minVersion":"0.8","compatibilityLevel":"JAVA_25","priority":1200,"mixins":[{"target":"net.minecraft.Foo"},{"target":"bad target"}],"client":[{"target":"a/b/C"}]}"#).unwrap();
+        std::io::Write::write_all(&mut zip, br#"{"plugin":"example.Plugin","refmap":"ruby.refmap.json","required":true,"minVersion":"0.8","compatibilityLevel":"JAVA_25","priority":1200,"injectors":{"defaultRequire":2,"maxShiftBy":3,"injectionPoints":["example.Point"]},"mixins":[{"target":"net.minecraft.Foo"},{"target":"bad target"}],"client":[{"target":"a/b/C"}]}"#).unwrap();
         zip.finish().unwrap();
         let census = read(&path).unwrap();
         assert_eq!(
@@ -1102,13 +1124,18 @@ mod tests {
                 "required",
                 "minVersion",
                 "compatibilityLevel",
-                "priority"
+                "priority",
+                "injectors.defaultRequire",
+                "injectors.maxShiftBy",
+                "injectors.injectionPoints"
             ]
         );
         assert_eq!(
             census.jars[0].mixin_config_values["ruby.mixins.json"],
             BTreeMap::from([
                 ("compatibilityLevel".to_owned(), "JAVA_25".to_owned()),
+                ("injectors.defaultRequire".to_owned(), "2".to_owned()),
+                ("injectors.maxShiftBy".to_owned(), "3".to_owned()),
                 ("minVersion".to_owned(), "0.8".to_owned()),
                 ("plugin".to_owned(), "example.Plugin".to_owned()),
                 ("priority".to_owned(), "1200".to_owned()),

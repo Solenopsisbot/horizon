@@ -207,7 +207,7 @@ scoped by a number.
 
 The census is also a product: it is the "what runs" table the launcher shows for a jar before install,
 and the generated reference under `docs/api/`.
-Mixin configuration files are also inspected in report-only mode: bounded JSON reads collect safe class names from `target` fields and record edge-field presence (including `required` and `priority`) in the per-jar and aggregate census. Injection annotations report presence and deterministic scalar values for `require`, `expect`, `cancellable`, `order`, and `priority`, plus bounded `slice` presence, so native hook planning can preserve ordering, contracts, and selector context. Native hook names for one target method are sorted and deduplicated before they enter `native_hooks`;
+Mixin configuration files are also inspected in report-only mode: bounded JSON reads collect safe class names from `target` fields and record edge-field presence (including `required` and `priority`) plus nested `injectors.defaultRequire`, `injectors.maxShiftBy`, and `injectors.injectionPoints` in the per-jar and aggregate census. Injection annotations report presence and deterministic scalar values for `require`, `expect`, `cancellable`, `order`, and `priority`, plus bounded `slice` presence, so native hook planning can preserve ordering, contracts, and selector context. Native hook names for one target method are sorted and deduplicated before they enter `native_hooks`;
 Mixin Extras `WrapMethod` and legacy `ModifyConst` names normalize into stable report buckets, nested slice `from`/`to` boundaries are preserved, and scalar config edge values remain report-only metadata. Values are not interpreted, configs are not executed, and no bytecode is woven; malformed or oversized files are skipped.
 JDK classpath discovery is reported with the same bounded rule. References to `ServiceLoader` and calls
 to `ServiceLoader.load`/`loadInstalled` or `ClassLoader.getResource*`/`loadClass` mark a jar as dynamic,
@@ -576,7 +576,8 @@ marker, whose `getName()` is `main`, `isDaemon()` is false, and `getContextClass
 native worker threads or a host class loader.
 That bootstrap class-loader marker supports bounded `getResource(String)` and
 `getResourceAsStream(String)` queries against resources explicitly seeded with
-`StdHost::with_resource`. Missing names return null, and `getResources`/`getSystemResources` return empty
+`StdHost::with_resource`; `NativeJar::seed_host` now seeds every non-class file
+bundled in the loaded jar with a deterministic `jar-resource/{path}` marker. Missing names return null, and `getResources`/`getSystemResources` return empty
 explicit enumerations; the native host never opens files or consults the process classpath; `StdHost::resource` exposes the
 same marker lookup to a game-owned adapter. `StdHost::with_class` supplies the matching bounded
 `ClassLoader.loadClass` marker for a known binary or internal class name; missing classes remain explicit
@@ -585,7 +586,8 @@ reflection path without opening the process classpath.
 The native reflection surface also retains declared fields and exposes bounded
 `getFields`/`getDeclaredFields`, `getField`/`getDeclaredField`, and
 `Field.getName`/`getType`/`getModifiers` markers.
-The same seeded resource table backs `ClassLoader.getResources` and `getSystemResources` through a
+`NativeJar::resource_names` exposes the sorted bundled paths for game-owned adapters; the native host never
+opens resource bytes or arbitrary filesystem paths. The same seeded resource table backs `ClassLoader.getResources` and `getSystemResources` through a
 bounded `Enumeration`; missing names are empty, and the host never scans additional classpath locations.
 The native host also exposes `StdHost::with_service_provider` for deterministic `ServiceLoader`
 fixtures. `ServiceLoader.load`/`loadInstalled` return a seeded service marker, `iterator()` yields the
