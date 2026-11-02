@@ -396,6 +396,7 @@ pub fn generate_many(
                     "    default <T extends Event> IEventBus addListener(EventPriority priority, Class<T> type, Consumer<T> listener) { return this; }\n",
                     "    default <T extends Event> IEventBus addListener(EventPriority priority, boolean receiveCancelled, Class<T> type, Consumer<T> listener) { return this; }\n",
                     "    default IEventBus register(Object object) { return this; }\n",
+                    "    default IEventBus unregister(Object object) { return this; }\n",
                     "    default boolean post(Event event) { return false; }\n",
                     "}\n",
                 ),
@@ -3756,6 +3757,7 @@ mod tests {
         assert!(source.contains("horizonRegistrationCount++; return this;"));
         assert!(source.contains("private final PayloadRegistrar horizonRegistrar"));
         assert!(source.contains("return horizonRegistrar;"));
+        assert!(source.contains("default IEventBus unregister(Object object) { return this; }"));
     }
 
     #[test]
