@@ -204,6 +204,7 @@ pub struct StdHost {
     payload_registrations: Vec<PayloadRegistration>,
     holders: BTreeMap<String, Value>,
     mutable_collections: BTreeMap<String, Vec<Value>>,
+    iterators: BTreeMap<String, (Vec<Value>, usize)>,
     /// Callback-local values returned by NeoForge's `LazyOptional` façade.
     /// The marker is intentionally host-owned: an opaque Java object must not
     /// become a live native capability until a game adapter supplies it.
@@ -212,6 +213,7 @@ pub struct StdHost {
     capability_requests: Vec<CapabilityRequest>,
     next_lazy_optional: usize,
     next_fabric_event: usize,
+    next_iterator: usize,
 }
 
 impl Default for StdHost {
@@ -233,11 +235,13 @@ impl StdHost {
             payload_registrations: Vec::new(),
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
+            iterators: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
             capability_requests: Vec::new(),
             next_lazy_optional: 0,
             next_fabric_event: 0,
+            next_iterator: 0,
         }
     }
 
@@ -596,6 +600,36 @@ impl Host for StdHost {
             ("java/lang/Integer", "toHexString", "(I)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 format!("{:x}", expect_int(r, Self::argument(r, args, 0)?)? as u32),
             ))),
+            ("java/lang/Double", "parseDouble", "(Ljava/lang/String;)D") => {
+                Ok(double_value(parse_java_float(Self::argument(r, args, 0)?)?))
+            }
+            ("java/lang/Double", "valueOf", "(Ljava/lang/String;)Ljava/lang/Double;") => {
+                Ok(double_value(parse_java_float(Self::argument(r, args, 0)?)?))
+            }
+            ("java/lang/Double", "isNaN", "(D)Z") | ("java/lang/Double", "isInfinite", "(D)Z") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)?;
+                let result = if r.name == "isNaN" {
+                    value.is_nan()
+                } else {
+                    value.is_infinite()
+                };
+                Ok(Value::Int(result as i32))
+            }
+            ("java/lang/Float", "parseFloat", "(Ljava/lang/String;)F") => {
+                Ok(float_value(parse_java_float(Self::argument(r, args, 0)?)?))
+            }
+            ("java/lang/Float", "valueOf", "(Ljava/lang/String;)Ljava/lang/Float;") => {
+                Ok(float_value(parse_java_float(Self::argument(r, args, 0)?)?))
+            }
+            ("java/lang/Float", "isNaN", "(F)Z") | ("java/lang/Float", "isInfinite", "(F)Z") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)?;
+                let result = if r.name == "isNaN" {
+                    value.is_nan()
+                } else {
+                    value.is_infinite()
+                };
+                Ok(Value::Int(result as i32))
+            }
             ("java/lang/Long", "compare", "(JJ)I") => {
                 let left = expect_int(r, Self::argument(r, args, 0)?)?;
                 let right = expect_int(r, Self::argument(r, args, 1)?)?;
@@ -742,11 +776,14 @@ impl Host for StdHost {
                         method: r.name.clone(),
                     });
                 }
-                Ok(Value::Int(if left == i32::MIN && right == -1 {
-                    i32::MIN
+                let quotient = i64::from(left) / i64::from(right);
+                let remainder = i64::from(left) % i64::from(right);
+                let quotient = if remainder != 0 && (left < 0) != (right < 0) {
+                    quotient - 1
                 } else {
-                    left.div_euclid(right)
-                }))
+                    quotient
+                };
+                Ok(Value::Int(quotient as i32))
             }
             ("java/lang/Math", "floorMod", "(II)I") => {
                 let left = expect_int(r, Self::argument(r, args, 0)?)?;
@@ -757,7 +794,29 @@ impl Host for StdHost {
                         method: r.name.clone(),
                     });
                 }
-                Ok(Value::Int(left.rem_euclid(right)))
+                // Java computes `a - floorDiv(a, b) * b` in i32 arithmetic, so
+                // a negative divisor produces a negative remainder and the
+                // MIN_VALUE/-1 overflow wraps to zero.
+                let quotient = i64::from(left) / i64::from(right);
+                let remainder = i64::from(left) % i64::from(right);
+                let quotient = if remainder != 0 && (left < 0) != (right < 0) {
+                    quotient - 1
+                } else {
+                    quotient
+                };
+                Ok(Value::Int(
+                    (i64::from(left) - quotient * i64::from(right)) as i32,
+                ))
+            }
+            ("java/lang/Math", "addExact", "(II)I") => {
+                let left = expect_int(r, Self::argument(r, args, 0)?)?;
+                let right = expect_int(r, Self::argument(r, args, 1)?)?;
+                left.checked_add(right)
+                    .map(Value::Int)
+                    .ok_or_else(|| NativeError::Arithmetic {
+                        class: r.owner.clone(),
+                        method: r.name.clone(),
+                    })
             }
             ("java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(value_text(Self::argument(r, args, 0)?))))
@@ -795,6 +854,12 @@ impl Host for StdHost {
                 char::from_u32(expect_int(r, Self::argument(r, args, 0)?)? as u32)
                     .unwrap_or('\u{fffd}')
                     .to_string(),
+            ))),
+            ("java/lang/Double", "toString", "(D)Ljava/lang/String;")
+            | ("java/lang/Float", "toString", "(F)Ljava/lang/String;")
+            | ("java/lang/String", "valueOf", "(D)Ljava/lang/String;")
+            | ("java/lang/String", "valueOf", "(F)Ljava/lang/String;") => Ok(Value::Ref(Some(
+                format_java_float(expect_float(r, Self::argument(r, args, 0)?)?),
             ))),
             ("java/nio/file/Paths", "get", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
                 Ok(path_value(expect_string(Self::argument(r, args, 0)?)))
@@ -1517,6 +1582,43 @@ impl Host for StdHost {
                 _ => {}
             }
         }
+        if r.name == "iterator"
+            && r.descriptor == "()Ljava/util/Iterator;"
+            && is_collection_owner(&r.owner)
+            && !is_map_owner(&r.owner)
+        {
+            let values = host_collection_values(self, receiver)?
+                .into_iter()
+                .map(|value| parse_collection_value(&value))
+                .collect::<Result<Vec<_>, _>>()?;
+            let marker = format!("iterator/{}", self.next_iterator);
+            self.next_iterator = self.next_iterator.saturating_add(1);
+            self.iterators.insert(marker.clone(), (values, 0));
+            return Ok(Value::Ref(Some(marker)));
+        }
+        if matches!(
+            r.owner.as_str(),
+            "java/util/Iterator" | "java/util/ListIterator"
+        ) {
+            let marker = receiver_marker.as_deref().ok_or_else(|| {
+                NativeError::Metadata("malformed java/util/Iterator marker".into())
+            })?;
+            let (values, index) = self
+                .iterators
+                .get_mut(marker)
+                .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("hasNext", "()Z") => return Ok(Value::Int((*index < values.len()) as i32)),
+                ("next", "()Ljava/lang/Object;") => {
+                    let value = values.get(*index).cloned().ok_or_else(|| {
+                        NativeError::Metadata("java/util/Iterator exhausted".into())
+                    })?;
+                    *index += 1;
+                    return Ok(value);
+                }
+                _ => {}
+            }
+        }
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("java/nio/file/Path", "toString", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(path_text(receiver).to_owned())))
@@ -1729,6 +1831,39 @@ impl Host for StdHost {
                     && boxed_integer(Self::argument(r, args, 0)?)
                         .is_some_and(|other| Some(other) == boxed_integer(receiver)))
                     as i32,
+            )),
+            ("java/lang/Double", "doubleValue", "()D")
+            | ("java/lang/Float", "doubleValue", "()D") => {
+                Ok(double_value(boxed_float(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Double marker".into())
+                })?))
+            }
+            ("java/lang/Double", "floatValue", "()F")
+            | ("java/lang/Float", "floatValue", "()F") => {
+                Ok(float_value(boxed_float(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Float marker".into())
+                })?))
+            }
+            ("java/lang/Double", "toString", "()Ljava/lang/String;")
+            | ("java/lang/Float", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
+                format_java_float(boxed_float(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed floating-point marker".into())
+                })?),
+            ))),
+            ("java/lang/Double", "isNaN", "()Z") | ("java/lang/Float", "isNaN", "()Z") => {
+                Ok(Value::Int(
+                    boxed_float(receiver)
+                        .ok_or_else(|| {
+                            NativeError::Metadata("malformed floating-point marker".into())
+                        })?
+                        .is_nan() as i32,
+                ))
+            }
+            ("java/lang/Double", "isInfinite", "()Z")
+            | ("java/lang/Float", "isInfinite", "()Z") => Ok(Value::Int(
+                boxed_float(receiver)
+                    .ok_or_else(|| NativeError::Metadata("malformed floating-point marker".into()))?
+                    .is_infinite() as i32,
             )),
             ("java/lang/Boolean", "booleanValue", "()Z") => {
                 Ok(Value::Int(boxed_boolean(receiver).ok_or_else(|| {
@@ -2921,6 +3056,58 @@ fn boxed_boolean(value: &Value) -> Option<bool> {
     }
 }
 
+fn parse_java_float(value: &Value) -> Result<f64, NativeError> {
+    let text = expect_string(value).trim();
+    let normalized = match text {
+        "Infinity" | "+Infinity" => "inf",
+        "-Infinity" => "-inf",
+        other => other,
+    };
+    normalized
+        .parse::<f64>()
+        .map_err(|_| NativeError::Metadata(format!("invalid floating-point argument: {text}")))
+}
+
+fn double_value(value: f64) -> Value {
+    Value::Ref(Some(format!("double:{value}")))
+}
+
+fn float_value(value: f64) -> Value {
+    Value::Ref(Some(format!("float:{}", value as f32)))
+}
+
+fn boxed_float(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int(value) => Some(f64::from(*value)),
+        Value::Ref(Some(value)) => value
+            .strip_prefix("double:")
+            .or_else(|| value.strip_prefix("float:"))
+            .and_then(|value| value.parse::<f64>().ok()),
+        _ => None,
+    }
+}
+
+fn expect_float(r: &MethodRef, value: &Value) -> Result<f64, NativeError> {
+    boxed_float(value).ok_or_else(|| {
+        NativeError::Metadata(format!(
+            "{}#{} expects a floating-point value",
+            r.owner, r.name
+        ))
+    })
+}
+
+fn format_java_float(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".into()
+    } else if value == f64::INFINITY {
+        "Infinity".into()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".into()
+    } else {
+        value.to_string()
+    }
+}
+
 fn collection_value(kind: &str, values: &[Value]) -> Value {
     let values = values
         .iter()
@@ -3993,6 +4180,31 @@ impl<H: Host> Runtime<'_, H> {
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
         if r.owner == "java/lang/Class"
+            && matches!(r.name.as_str(), "getMethods" | "getDeclaredMethods")
+            && r.descriptor == "()[Ljava/lang/reflect/Method;"
+        {
+            let class = expect_string(receiver.unwrap_or(&Value::Ref(None))).to_owned();
+            let methods = self
+                .classes
+                .get(&class)
+                .map(|file| {
+                    file.methods
+                        .iter()
+                        .filter(|method| method.name != "<init>")
+                        .map(|method| {
+                            Value::Ref(Some(format!(
+                                "reflect-method/{class}#{}{}",
+                                method.name, method.descriptor
+                            )))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let marker = self.new_array("java/lang/reflect/Method", "getMethods");
+            self.arrays.insert(marker.clone(), methods);
+            return Ok(Some(Value::Ref(Some(marker))));
+        }
+        if r.owner == "java/lang/Class"
             && matches!(r.name.as_str(), "getMethod" | "getDeclaredMethod")
             && r.descriptor.ends_with(")Ljava/lang/reflect/Method;")
         {
@@ -4125,6 +4337,20 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if r.owner == "java/util/Optional"
+            && r.name == "stream"
+            && r.descriptor == "()Ljava/util/stream/Stream;"
+        {
+            let Some(receiver) = receiver else {
+                return Ok(None);
+            };
+            let values = expect_ref(receiver)
+                .map(|value| value.strip_prefix("optional/").unwrap_or(value))
+                .map(|value| Value::Ref(Some(value.to_owned())))
+                .into_iter()
+                .collect();
+            return Ok(Some(self.new_stream(class, method, values)));
+        }
         if r.name == "stream"
             && r.descriptor == "()Ljava/util/stream/Stream;"
             && receiver.is_some_and(|_| {
@@ -6163,6 +6389,105 @@ mandatory = true
                 .unwrap(),
             Value::Int(2)
         );
+        assert_eq!(
+            host.invoke(&floor_mod, &[Value::Int(7), Value::Int(-3)])
+                .unwrap(),
+            Value::Int(-2)
+        );
+        assert_eq!(
+            host.invoke(&floor_mod, &[Value::Int(i32::MIN), Value::Int(-1)])
+                .unwrap(),
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn standard_host_maps_checked_integer_math() {
+        let mut host = StdHost::new();
+        let add_exact = MethodRef {
+            owner: "java/lang/Math".into(),
+            name: "addExact".into(),
+            descriptor: "(II)I".into(),
+        };
+        assert_eq!(
+            host.invoke(&add_exact, &[Value::Int(40), Value::Int(2)])
+                .unwrap(),
+            Value::Int(42)
+        );
+        assert!(matches!(
+            host.invoke(&add_exact, &[Value::Int(i32::MAX), Value::Int(1)]),
+            Err(NativeError::Arithmetic { .. })
+        ));
+        assert!(matches!(
+            host.invoke(&add_exact, &[Value::Int(i32::MIN), Value::Int(-1)]),
+            Err(NativeError::Arithmetic { .. })
+        ));
+    }
+
+    #[test]
+    fn standard_host_maps_bounded_floating_point_wrappers() {
+        let mut host = StdHost::new();
+        let parse_double = MethodRef {
+            owner: "java/lang/Double".into(),
+            name: "parseDouble".into(),
+            descriptor: "(Ljava/lang/String;)D".into(),
+        };
+        let double = host
+            .invoke(&parse_double, &[Value::Ref(Some("Infinity".into()))])
+            .unwrap();
+        assert_eq!(double, Value::Ref(Some("double:inf".into())));
+        assert_eq!(
+            host.invoke(
+                &MethodRef {
+                    owner: "java/lang/Double".into(),
+                    name: "isInfinite".into(),
+                    descriptor: "(D)Z".into(),
+                },
+                std::slice::from_ref(&double),
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke(
+                &MethodRef {
+                    owner: "java/lang/Double".into(),
+                    name: "toString".into(),
+                    descriptor: "(D)Ljava/lang/String;".into(),
+                },
+                std::slice::from_ref(&double),
+            )
+            .unwrap(),
+            Value::Ref(Some("Infinity".into()))
+        );
+        let float = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/lang/Float".into(),
+                    name: "parseFloat".into(),
+                    descriptor: "(Ljava/lang/String;)F".into(),
+                },
+                &[Value::Ref(Some("1.25".into()))],
+            )
+            .unwrap();
+        assert_eq!(float, Value::Ref(Some("float:1.25".into())));
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/lang/Float".into(),
+                    name: "toString".into(),
+                    descriptor: "()Ljava/lang/String;".into(),
+                },
+                &float,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("1.25".into()))
+        );
+        assert!(
+            host.invoke(&parse_double, &[Value::Ref(Some("oops".into()))])
+                .is_err()
+        );
     }
 
     #[test]
@@ -6786,6 +7111,43 @@ mandatory = true
                 .unwrap(),
             Value::Int(1)
         );
+        let iterator = MethodRef {
+            owner: "java/util/Collection".into(),
+            name: "iterator".into(),
+            descriptor: "()Ljava/util/Iterator;".into(),
+        };
+        let iterator = host.invoke_instance(&iterator, &list, &[]).unwrap();
+        let has_next = MethodRef {
+            owner: "java/util/Iterator".into(),
+            name: "hasNext".into(),
+            descriptor: "()Z".into(),
+        };
+        let next = MethodRef {
+            owner: "java/util/Iterator".into(),
+            name: "next".into(),
+            descriptor: "()Ljava/lang/Object;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&has_next, &iterator, &[]).unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(&next, &iterator, &[]).unwrap(),
+            Value::Ref(Some("alpha".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(&has_next, &iterator, &[]).unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(&next, &iterator, &[]).unwrap(),
+            Value::Int(7)
+        );
+        assert_eq!(
+            host.invoke_instance(&has_next, &iterator, &[]).unwrap(),
+            Value::Int(0)
+        );
+        assert!(host.invoke_instance(&next, &iterator, &[]).is_err());
     }
 
     #[test]
@@ -8586,6 +8948,26 @@ mandatory = true
                 ],
             )
             .unwrap();
+        let optional = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/util/Optional".into(),
+                    name: "of".into(),
+                    descriptor: "(Ljava/lang/Object;)Ljava/util/Optional;".into(),
+                },
+                &[Value::Ref(Some("alpha".into()))],
+            )
+            .unwrap();
+        let empty = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/util/Optional".into(),
+                    name: "empty".into(),
+                    descriptor: "()Ljava/util/Optional;".into(),
+                },
+                &[],
+            )
+            .unwrap();
         let mut runtime = Runtime {
             classes: &classes,
             host: &mut host,
@@ -8644,6 +9026,66 @@ mandatory = true
                 )
                 .unwrap(),
             Some(Value::Int(1))
+        );
+        let optional_stream = runtime
+            .invoke_stream(
+                &MethodRef {
+                    owner: "java/util/Optional".into(),
+                    name: "stream".into(),
+                    descriptor: "()Ljava/util/stream/Stream;".into(),
+                },
+                Some(&optional),
+                &[],
+                "demo/Stream",
+                "probe",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            runtime
+                .invoke_stream(
+                    &MethodRef {
+                        owner: "java/util/stream/Stream".into(),
+                        name: "count".into(),
+                        descriptor: "()J".into(),
+                    },
+                    Some(&optional_stream),
+                    &[],
+                    "demo/Stream",
+                    "probe",
+                )
+                .unwrap(),
+            Some(Value::Int(1))
+        );
+        let empty_stream = runtime
+            .invoke_stream(
+                &MethodRef {
+                    owner: "java/util/Optional".into(),
+                    name: "stream".into(),
+                    descriptor: "()Ljava/util/stream/Stream;".into(),
+                },
+                Some(&empty),
+                &[],
+                "demo/Stream",
+                "probe",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            runtime
+                .invoke_stream(
+                    &MethodRef {
+                        owner: "java/util/stream/Stream".into(),
+                        name: "count".into(),
+                        descriptor: "()J".into(),
+                    },
+                    Some(&empty_stream),
+                    &[],
+                    "demo/Stream",
+                    "probe",
+                )
+                .unwrap(),
+            Some(Value::Int(0))
         );
         assert_eq!(
             runtime
@@ -8795,6 +9237,66 @@ mandatory = true
             method,
             Value::Ref(Some("reflect-method/demo/Reflective#answer()I".into()))
         );
+        let methods_lookup = MethodRef {
+            owner: "java/lang/Class".into(),
+            name: "getDeclaredMethods".into(),
+            descriptor: "()[Ljava/lang/reflect/Method;".into(),
+        };
+        let methods = runtime
+            .invoke_reflect_method(
+                &methods_lookup,
+                Some(&Value::Ref(Some("demo/Reflective".into()))),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let method_count = runtime
+            .invoke_reflect_array(
+                &MethodRef {
+                    owner: "java/lang/reflect/Array".into(),
+                    name: "getLength".into(),
+                    descriptor: "(Ljava/lang/Object;)I".into(),
+                },
+                std::slice::from_ref(&methods),
+                "demo/Reflective",
+                "probe",
+            )
+            .unwrap();
+        assert_eq!(method_count, Some(Value::Int(2)));
+        let mut std_host = StdHost::new();
+        let method_name = MethodRef {
+            owner: "java/lang/reflect/Method".into(),
+            name: "getName".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            std_host
+                .invoke_instance(&method_name, &method, &[])
+                .unwrap(),
+            Value::Ref(Some("answer".into()))
+        );
+        let parameter_count = MethodRef {
+            owner: "java/lang/reflect/Method".into(),
+            name: "getParameterCount".into(),
+            descriptor: "()I".into(),
+        };
+        assert_eq!(
+            std_host
+                .invoke_instance(&parameter_count, &method, &[])
+                .unwrap(),
+            Value::Int(0)
+        );
+        let method_string = MethodRef {
+            owner: "java/lang/reflect/Method".into(),
+            name: "toString".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            std_host
+                .invoke_instance(&method_string, &method, &[])
+                .unwrap(),
+            Value::Ref(Some("reflect-method/demo/Reflective#answer()I".into()))
+        );
         let invoke = MethodRef {
             owner: "java/lang/reflect/Method".into(),
             name: "invoke".into(),
@@ -8834,6 +9336,12 @@ mandatory = true
         assert_eq!(
             overloaded,
             Value::Ref(Some("reflect-method/demo/Reflective#answer(I)I".into()))
+        );
+        assert_eq!(
+            std_host
+                .invoke_instance(&parameter_count, &overloaded, &[])
+                .unwrap(),
+            Value::Int(1)
         );
         assert_eq!(
             runtime

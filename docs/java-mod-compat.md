@@ -467,9 +467,11 @@ This is a real native execution boundary, not a claim of full JVM compatibility:
 Kotlin runtime behavior, and loader APIs remain on the embedded-JVM path until their native host contracts are
 implemented. Class literals support bounded metadata queries (`getName`, `getSimpleName`, `getTypeName`,
 primitive/array checks, and nominal `isAssignableFrom`) without loading classes from disk; `Class.forName` resolves
-only already-loaded jar classes, while reflective member enumeration remains unavailable. `getMethod`/`getDeclaredMethod` can produce a bounded marker,
+only already-loaded jar classes, while reflective member enumeration is limited to methods declared by those loaded classes. `getMethods` and
+`getDeclaredMethods` return bounded arrays of method markers; `getMethod`/`getDeclaredMethod` can produce a bounded marker,
 including an exact descriptor when the parameter `Class[]` is available, and `Method.invoke` dispatches only to a
-matching overload already loaded from the jar. The bounded runtime also
+matching overload already loaded from the jar. Bounded `Method.getName`, `getParameterCount`, and `toString`
+metadata accessors expose that marker without loading classes. The bounded runtime also
 handles `java.lang.reflect.Array` `newInstance`, `getLength`, `get`, and `set` against arrays it owns during the
 current invocation. The crate
 also exposes a deterministic `StdHost` adapter for a small set of side-effect-free
@@ -478,7 +480,7 @@ external call is recorded with its receiver and arguments for later dispatch. Th
 machine properties, while a game-facing host can opt into Horizon-owned mappings without coupling the
 interpreter crate to `horizon-client`. Unknown calls keep the neutral return contract.
 The standard-library surface also includes deterministic `Integer.compare`/`toHexString`, integer
-`Math.floorDiv`/`floorMod`, and
+`Math.floorDiv`/`floorMod`/`addExact`, and
 bounded `Long.compare`/`toHexString`,
 `StringBuilder`/`StringBuffer` append and
 `toString` values, primitive `String.valueOf` overloads, plus `Objects.equals`, `requireNonNull`, and
@@ -500,14 +502,16 @@ value semantics for loader bootstrap code, while unresolved callbacks remain exp
 `java.nio.file.Paths.get` and `Path.resolve`, `toString`, `normalize`, and
 `toAbsolutePath` calls use deterministic path markers. Common `List.of`, `Set.of`, `Map.of`, empty/singleton
 `Collections` factories, and bounded `size`, `isEmpty`, `contains`, `containsAll`, `get`, `Map.get`, `Map.getOrDefault`, and
-key/value queries use escaped value markers; `Map.keySet` and `Map.values` project those markers into bounded
+key/value queries use escaped value markers; `Map.keySet`, `Map.values`, and `Collection.iterator` project those markers into bounded
 set/list views, so bootstrap code can inspect immutable configuration collections without starting a JVM. Boxed
 `Integer` and `Boolean` values preserve deterministic markers through `valueOf`, unboxing,
-equality, hashing, and string conversion. `java.util.UUID.fromString`, deterministic `randomUUID`,
+equality, hashing, and string conversion. Bounded `Double` and `Float` parsing, boxing, unboxing,
+`isNaN`/`isInfinite`, and Java-style string conversion use deterministic floating-point markers;
+malformed values remain explicit metadata errors. `java.util.UUID.fromString`, deterministic `randomUUID`,
 `toString`, `equals`, and `hashCode` preserve canonical UUID identity markers without process randomness;
 malformed UUID strings remain explicit metadata errors. `Enum.valueOf`, `name`, `ordinal`, `equals`,
 and `hashCode` preserve deterministic enum markers for loader and configuration branches. Collection `stream()` supports bounded `map`, `filter`, `distinct`,
-`limit`, `skip`, `count`, `toList`, `isEmpty`, `findFirst`, `findAny`, `anyMatch`, `allMatch`, `noneMatch`, and `forEach` chains using the same in-jar callback bridge.
+`limit`, `skip`, `count`, `toList`, `isEmpty`, `findFirst`, `findAny`, `anyMatch`, `allMatch`, `noneMatch`, and `forEach` chains using the same in-jar callback bridge. `Optional.stream()` also produces a bounded zero-or-one-element stream, so optional registry lookups can enter those chains without a JVM.
 Native `ArrayList`, `HashMap`, `LinkedHashMap`, `HashSet`, and `LinkedHashSet` markers also retain bounded
 constructor, add/put, get, size, clear, indexed insertion/replacement, set duplicate suppression and removal,
 list removal and index queries, `List.addAll`, `Collection.containsAll`, `removeAll`, and `retainAll`,
