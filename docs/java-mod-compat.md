@@ -211,9 +211,10 @@ Mixin configuration files are also inspected in report-only mode: bounded JSON r
 JDK classpath discovery is reported with the same bounded rule. References to `ServiceLoader` and calls
 to `ServiceLoader.load`/`loadInstalled` or `ClassLoader.getResource*`/`loadClass` mark a jar as dynamic,
 with the exact owner and method in its diagnostic list. The census does not emulate providers or resource
-lookup. Native execution rejects `ServiceLoader.load` and `loadInstalled` with a structured unsupported
-diagnostic rather than scanning the host class path; the embedded JVM remains responsible for those calls
-until a deliberately bounded native contract with explicitly seeded providers is specified.
+lookup. Native execution accepts `ServiceLoader.load` and `loadInstalled` only for providers explicitly
+seeded through the host contract, exposes a bounded iterator over those providers, and reports an
+unsupported diagnostic for unseeded services; it never scans the host class path. The embedded JVM remains
+responsible for arbitrary provider discovery.
 
 ## Phase 1, first slice (measured 1 November 2026)
 
@@ -552,6 +553,9 @@ That bootstrap class-loader marker supports bounded `getResource(String)` and
 `StdHost::with_resource`. Missing names return null, and the native host never
 opens files or consults the process classpath; `StdHost::resource` exposes the
 same marker lookup to a game-owned adapter.
+The native host also exposes `StdHost::with_service_provider` for deterministic `ServiceLoader`
+fixtures. `ServiceLoader.load`/`loadInstalled` return a seeded service marker, `iterator()` yields the
+seeded provider class markers, and `reload()` is a bounded no-op; missing services remain explicit errors.
 For native client paths that mirror bootstrap-visible `NumberFormat.getIntegerInstance(Locale.US)`,
 `horizon_client::java_text::format_integer_us` provides deterministic ASCII digit grouping (including negative
 values) without emulating arbitrary locale or formatter patterns.
