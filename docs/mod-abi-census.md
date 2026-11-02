@@ -29,6 +29,9 @@ For native hook translation, `census.json` also includes `hook_points`: a map ke
 `args` selectors, report-only `@Group` constraints, and count,
 and any matching native hook names in the explicit `native_hooks` array. An empty array is the
 unsupported-mixin diagnostic: the point needs a façade-owned Java method or a new native hook.
+The aggregate `mixin_method_descriptors` map retains the exact JVM descriptors for each
+descriptor-free `target#method` key, so overloaded targets remain distinguishable to a future
+translator without changing hook matching.
 Accessor, invoker, and shadow rows are omitted because
 they require member shape rather than a call-site hook. This keeps consumers from having to
 filter and regroup the ranked `points` array.

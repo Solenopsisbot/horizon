@@ -105,6 +105,11 @@ pub struct Census {
     /// form and count so native hook translation need not scan `points`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hook_points: BTreeMap<String, Vec<HookPoint>>,
+    /// Exact JVM descriptors retained for Mixin target methods. Hook lookup
+    /// remains descriptor-free, while this map preserves overload identity
+    /// for a future translator.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mixin_method_descriptors: BTreeMap<String, Vec<String>>,
     /// Access-widener targets, counted across jars (discovery only).
     #[serde(default)]
     pub access_widener_targets: BTreeMap<String, usize>,
@@ -345,6 +350,10 @@ pub fn read_with(path: &Path, hooks: Option<&HookIndex>) -> Result<Census, Strin
     for jar in jars(path)? {
         census.add(&jar, &mut points)?;
     }
+    for descriptors in census.mixin_method_descriptors.values_mut() {
+        descriptors.sort();
+        descriptors.dedup();
+    }
     census.points = points
         .into_iter()
         .map(|((target, method, kind, at), count)| PointCount {
@@ -501,6 +510,17 @@ impl Census {
                 // a `|`-joined string; expand it here so each target method
                 // can match its own native hook instead of becoming one
                 // permanently report-only `foo|bar` point.
+                for target in &class.mixin_targets {
+                    for method in injection.method.split('|') {
+                        let Some(descriptor) = method_descriptor(method) else {
+                            continue;
+                        };
+                        self.mixin_method_descriptors
+                            .entry(format!("{}#{}", target, strip_descriptor(method)))
+                            .or_default()
+                            .push(descriptor.to_owned());
+                    }
+                }
                 for method in injection_methods(&injection.method) {
                     for target in &class.mixin_targets {
                         *points
@@ -990,6 +1010,10 @@ fn strip_descriptor(method: &str) -> &str {
     method.split(['(', ' ']).next().unwrap_or(method).trim()
 }
 
+fn method_descriptor(method: &str) -> Option<&str> {
+    method.find('(').map(|at| &method[at..])
+}
+
 /// Mixin's `method` element can be a scalar or an array. The class reader
 /// preserves arrays as `|`-joined text so this boundary can expand them into
 /// independently matchable native hook keys.
@@ -1210,6 +1234,10 @@ mod tests {
         assert_eq!(census.mixin_targets.get("net/minecraft/Target"), Some(&1));
         assert_eq!(census.injections.get("inject"), Some(&1));
         assert_eq!(
+            census.mixin_method_descriptors["net/minecraft/Target#destroyBlock"],
+            ["()V"]
+        );
+        assert_eq!(
             census.hook_points["net/minecraft/Target#destroyBlock"][0].hooks,
             ["destroy_block"]
         );
@@ -1379,6 +1407,8 @@ mod tests {
         assert_eq!(strip_descriptor("tick()V"), "tick");
         assert_eq!(strip_descriptor("tick"), "tick");
         assert_eq!(strip_descriptor("a b"), "a");
+        assert_eq!(method_descriptor("tick()V"), Some("()V"));
+        assert_eq!(method_descriptor("tick"), None);
     }
 
     #[test]
