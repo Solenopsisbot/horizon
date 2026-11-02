@@ -465,8 +465,8 @@ An explicitly supported jar may include `META-INF/horizon-native.json` to supply
 `{"id":"mod_id","registrations":[{"registry":"minecraft:block","id":"mod_id:block","kind":"block","template":"minecraft:stone","properties":{},"item":true},{"registry":"minecraft:recipe","id":"mod_id:block","kind":"recipe","recipe":{"type":"minecraft:crafting_shaped","pattern":["#"]}}]}`.
 The loader validates block, item, mob-effect, and recipe declarations, turns them into declaration-only
 `Content`, writes recipe declarations as `data/<namespace>/recipe/<path>.json`, and layers them through
-the same `content_root` planner as `.hmod` content. Unknown custom kinds fail the startup rather than
-silently entering the native registries.
+the same `content_root` planner as `.hmod` content. Unsupported custom kinds fail before content planning
+with the registry, id, and kind named, rather than silently entering the native registries.
 
 The embedded JVM runner treats a discovered `neoforge` entrypoint as constructor-only, invoking the
 mod constructor and optional Mixin `onLoad` hook without fabricating a Fabric `onInitialize` call.
@@ -507,7 +507,7 @@ legacy message id and decoder remain opaque, and channel ownership plus byte enc
 unsupported at this boundary.
 The generated `FriendlyByteBuf` façade keeps a bounded FIFO of payload values for common bootstrap calls:
 `writeUtf`/`readUtf`, `writeVarInt`/`readVarInt`, `writeInt`/`readInt`, `writeBoolean`/`readBoolean`,
-and `writeResourceLocation`/`readResourceLocation` round trips. It preserves registration-time value
+and `writeResourceLocation`/`readResourceLocation`, `writeEnum`/`readEnum`, and bounded `writeNullable`/`readNullable` round trips. It preserves registration-time value
 semantics without claiming ownership of the live Netty channel or packet bytes.
 When a target references NeoForge, the generator emits these public ABI shims directly, so the path does not
 depend on shipping NeoForge's jar. A synthetic `@Mod` that creates a `DeferredRegister`, attaches it to the

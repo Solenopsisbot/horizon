@@ -316,9 +316,19 @@ impl Content {
     ) -> Result<Self, String> {
         let id = id.into();
         if !declarations.custom.is_empty() {
+            let mut details = declarations
+                .custom
+                .iter()
+                .take(8)
+                .map(|custom| format!("{}/{} ({})", custom.registry, custom.id, custom.kind))
+                .collect::<Vec<_>>();
+            if declarations.custom.len() > details.len() {
+                details.push("...".to_owned());
+            }
             return Err(format!(
-                "native mod {id} has {} unsupported custom registrations",
-                declarations.custom.len()
+                "native mod {id} has {} unsupported custom registrations: {}",
+                declarations.custom.len(),
+                details.join(", ")
             ));
         }
         let mut namespaces = Vec::new();
@@ -695,6 +705,19 @@ capabilities = ["registries"]
         assert_eq!(content.items[0].rarity, Some(Rarity::Uncommon));
         assert!(content.items[0].components.is_empty());
         assert_eq!(content.items[0].crafting_remainder, None);
+    }
+
+    #[test]
+    fn native_custom_registration_diagnostic_names_entity_kind() {
+        let mut declarations = crate::native::NativeDeclarations::default();
+        declarations.custom.push(crate::native::CustomDeclaration {
+            registry: "minecraft:entity_type".into(),
+            id: "ruby:bird".into(),
+            kind: "entity".into(),
+            properties: BTreeMap::new(),
+        });
+        let error = Content::from_native("ruby", declarations).unwrap_err();
+        assert!(error.contains("minecraft:entity_type/ruby:bird (entity)"), "{error}");
     }
 
     #[test]
