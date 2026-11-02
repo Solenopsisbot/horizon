@@ -418,7 +418,7 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeMap, io::Write};
+    use std::{collections::BTreeMap, io::Write, process::Command};
 
     #[test]
     fn native_entrypoint_diagnostics_list_declared_loader_kinds() {
@@ -514,6 +514,60 @@ mod tests {
                 horizon_native_java::Value::Int(1)
             );
         }
+    }
+
+    #[test]
+    fn java_mod_path_returns_typed_content_mods() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-game-java-content-fixture-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("src/demo/TypedGameMod.java");
+        let classes = root.join("classes");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&classes).unwrap();
+        std::fs::write(
+            &source,
+            "package demo; public final class TypedGameMod { public void onInitialize() {} }\n",
+        )
+        .unwrap();
+        let status = Command::new("javac")
+            .arg("--release")
+            .arg("17")
+            .arg("-d")
+            .arg(&classes)
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success(), "javac failed");
+
+        let jar_path = root.join("typed-game.jar");
+        let file = std::fs::File::create(&jar_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(
+            br#"{"id":"typed-game","version":"1.0","entrypoints":{"main":"demo.TypedGameMod"}}"#,
+        )
+        .unwrap();
+        zip.start_file("demo/TypedGameMod.class", options).unwrap();
+        zip.write_all(&std::fs::read(classes.join("demo/TypedGameMod.class")).unwrap())
+            .unwrap();
+        zip.start_file("META-INF/horizon-native.json", options)
+            .unwrap();
+        zip.write_all(
+            br#"{"id":"typed-game","registrations":[{"registry":"minecraft:block","id":"typed:game_lamp","kind":"block","template":"minecraft:stone","item":true,"properties":{}}]}"#,
+        )
+        .unwrap();
+        zip.finish().unwrap();
+
+        let content =
+            run_java_mods(std::slice::from_ref(&jar_path), ExecutionRole::Client).unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].id, "typed-game");
+        assert_eq!(content[0].content.blocks[0].id, "typed:game_lamp");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A minimal `.hnmod` the registry accepts: its manifest and its mixin's.
