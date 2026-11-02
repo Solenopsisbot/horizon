@@ -853,6 +853,8 @@ shape is represented by the nested `Success`, `Fail`, `Pass`, and `TryEmptyHandI
 `consumesAction`, `shouldSwing`, `wasItemInteraction`, and `heldItemTransformedTo` preserve their bounded
 state and item context, while the six public result constants are initialized to matching façade values.
 The interaction result does not perform live server-side effects; those remain in the native hook boundary.
+`InteractionHand.getName()` and `getOpposite()` preserve the two-hand value semantics used by item and
+block callbacks, so hand-dependent branches do not fall back to neutral enum stubs.
 The `ItemStack.is(TagKey)` and `BlockState.is(TagKey)` overloads are also linked with an explicit empty
 membership result until registry-backed tag tables are attached.
 `TagKey` now retains its registry key and identifier as a value pair: `create`, `location`, `registry`,

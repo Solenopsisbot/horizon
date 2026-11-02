@@ -2192,6 +2192,17 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             _ => {}
         }
     }
+    if class == "net/minecraft/world/InteractionHand" {
+        match (method, ret) {
+            ("getName", "java.lang.String") => {
+                return "return this == MAIN_HAND ? \"main_hand\" : \"off_hand\";".to_owned();
+            }
+            ("getOpposite", "net.minecraft.world.InteractionHand") => {
+                return "return this == MAIN_HAND ? OFF_HAND : MAIN_HAND;".to_owned();
+            }
+            _ => {}
+        }
+    }
     if class == "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type"
         && method == "id"
         && ret == "net.minecraft.resources.Identifier"
@@ -4548,6 +4559,22 @@ mod tests {
         assert_eq!(
             runtime_body("net/minecraft/core/Direction$Axis", "isVertical", "boolean"),
             "return this == Y;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/InteractionHand",
+                "getName",
+                "java.lang.String"
+            ),
+            "return this == MAIN_HAND ? \"main_hand\" : \"off_hand\";"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/InteractionHand",
+                "getOpposite",
+                "net.minecraft.world.InteractionHand"
+            ),
+            "return this == MAIN_HAND ? OFF_HAND : MAIN_HAND;"
         );
         assert_eq!(
             runtime_body(
