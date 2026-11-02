@@ -937,6 +937,13 @@ impl Host for StdHost {
                     value => optional_wrap(value.clone()),
                 })
             }
+            ("java/util/OptionalInt", "empty", "()Ljava/util/OptionalInt;") => Ok(Value::Ref(None)),
+            ("java/util/OptionalInt", "of", "(I)Ljava/util/OptionalInt;") => {
+                Ok(Value::Ref(Some(format!(
+                    "optional-int/{}",
+                    expect_int(r, Self::argument(r, args, 0)?)?
+                ))))
+            }
             // Keep Arrays.asList bounded when the interpreter passes an
             // opaque array marker. The marker is retained as the list's
             // single value; expanding runtime-owned array storage here would
@@ -2992,6 +2999,37 @@ impl Host for StdHost {
             ("java/util/Optional", "isEmpty", "()Z") => {
                 Ok(Value::Int(expect_ref(receiver).is_none() as i32))
             }
+            ("java/util/OptionalInt", "isPresent", "()Z") => {
+                Ok(Value::Int(optional_int_value(receiver).is_some() as i32))
+            }
+            ("java/util/OptionalInt", "isEmpty", "()Z") => {
+                Ok(Value::Int(optional_int_value(receiver).is_none() as i32))
+            }
+            ("java/util/OptionalInt", "getAsInt", "()I") => optional_int_value(receiver)
+                .map_or_else(
+                    || {
+                        Err(NativeError::Metadata(
+                            "OptionalInt.getAsInt on empty optional".into(),
+                        ))
+                    },
+                    |value| Ok(Value::Int(value)),
+                ),
+            ("java/util/OptionalInt", "orElse", "(I)I") => Ok(Value::Int(
+                optional_int_value(receiver).unwrap_or(expect_int(r, Self::argument(r, args, 0)?)?),
+            )),
+            ("java/util/OptionalInt", "toString", "()Ljava/lang/String;") => {
+                Ok(Value::Ref(Some(match optional_int_value(receiver) {
+                    Some(value) => format!("OptionalInt[{}]", value),
+                    None => "OptionalInt.empty".into(),
+                })))
+            }
+            ("java/util/OptionalInt", "hashCode", "()I") => {
+                Ok(Value::Int(optional_int_value(receiver).unwrap_or(0)))
+            }
+            ("java/util/OptionalInt", "equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
+                (optional_int_value(receiver) == optional_int_value(Self::argument(r, args, 0)?))
+                    as i32,
+            )),
             (
                 "java/util/Optional",
                 "map",
@@ -4123,6 +4161,12 @@ fn optional_wrap(value: Value) -> Value {
         Value::Ref(None) | Value::Void => Value::Ref(None),
         value => Value::Ref(Some(format!("optional/{}", value_marker(&value)))),
     }
+}
+
+fn optional_int_value(value: &Value) -> Option<i32> {
+    expect_ref(value)
+        .and_then(|marker| marker.strip_prefix("optional-int/"))
+        .and_then(|value| value.parse().ok())
 }
 
 fn collection_empty(kind: &str) -> Value {
@@ -9108,6 +9152,65 @@ mandatory = true
                 .iter()
                 .any(|call| { call.owner == "java/util/function/Supplier" && call.name == "get" })
         );
+    }
+
+    #[test]
+    fn standard_host_maps_optional_int_values() {
+        let mut host = StdHost::new();
+        let empty = MethodRef {
+            owner: "java/util/OptionalInt".into(),
+            name: "empty".into(),
+            descriptor: "()Ljava/util/OptionalInt;".into(),
+        };
+        let of = MethodRef {
+            owner: "java/util/OptionalInt".into(),
+            name: "of".into(),
+            descriptor: "(I)Ljava/util/OptionalInt;".into(),
+        };
+        let empty_value = host.invoke(&empty, &[]).unwrap();
+        let value = host.invoke(&of, &[Value::Int(42)]).unwrap();
+        assert_eq!(empty_value, Value::Ref(None));
+        assert_eq!(value, Value::Ref(Some("optional-int/42".into())));
+
+        let present = MethodRef {
+            owner: "java/util/OptionalInt".into(),
+            name: "isPresent".into(),
+            descriptor: "()Z".into(),
+        };
+        let get = MethodRef {
+            owner: "java/util/OptionalInt".into(),
+            name: "getAsInt".into(),
+            descriptor: "()I".into(),
+        };
+        let or_else = MethodRef {
+            owner: "java/util/OptionalInt".into(),
+            name: "orElse".into(),
+            descriptor: "(I)I".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&present, &value, &[]).unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(&get, &value, &[]).unwrap(),
+            Value::Int(42)
+        );
+        assert_eq!(
+            host.invoke_instance(&or_else, &empty_value, &[Value::Int(7)])
+                .unwrap(),
+            Value::Int(7)
+        );
+
+        let to_string = MethodRef {
+            owner: "java/util/OptionalInt".into(),
+            name: "toString".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&to_string, &value, &[]).unwrap(),
+            Value::Ref(Some("OptionalInt[42]".into()))
+        );
+        assert!(host.invoke_instance(&get, &empty_value, &[]).is_err());
     }
 
     #[test]
