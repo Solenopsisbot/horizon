@@ -3697,6 +3697,22 @@ mod tests {
             ),
             "return this;"
         );
+        assert_eq!(
+            runtime_body(
+                "net/minecraftforge/network/NetworkRegistry",
+                "newSimpleChannel",
+                "net.minecraftforge.network.simple.SimpleChannel"
+            ),
+            "return new net.minecraftforge.network.simple.SimpleChannel();"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraftforge/network/simple/SimpleChannel",
+                "registerMessage",
+                "net.minecraftforge.network.simple.SimpleChannel"
+            ),
+            "return this;"
+        );
     }
 
     #[test]
