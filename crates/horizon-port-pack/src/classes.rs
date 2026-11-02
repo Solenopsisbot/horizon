@@ -545,11 +545,18 @@ fn injections(
                     method
                 },
                 at,
-                metadata: ["require", "expect", "cancellable", "order", "priority"]
-                    .into_iter()
-                    .filter(|field| a.values.contains_key(*field))
-                    .map(str::to_owned)
-                    .collect(),
+                metadata: [
+                    "require",
+                    "expect",
+                    "cancellable",
+                    "order",
+                    "priority",
+                    "slice",
+                ]
+                .into_iter()
+                .filter(|field| a.values.contains_key(*field))
+                .map(str::to_owned)
+                .collect(),
             });
         }
     }
@@ -1177,6 +1184,27 @@ mod tests {
                 "INVOKE|target:Lnet/minecraft/Target;method()V|ordinal:2|shift:BY|by:1".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn injection_metadata_reports_slice_presence() {
+        let inject = Annotation {
+            ty: "Lorg/spongepowered/asm/mixin/injection/Inject;".to_owned(),
+            values: BTreeMap::from([
+                ("method".to_owned(), Value::Str("tick()V".to_owned())),
+                (
+                    "slice".to_owned(),
+                    Value::Ann(Annotation {
+                        ty: "Lorg/spongepowered/asm/mixin/injection/Slice;".to_owned(),
+                        values: BTreeMap::new(),
+                    }),
+                ),
+            ]),
+        };
+        let methods = BTreeMap::from([("run".to_owned(), vec![inject])]);
+        let parsed = injections(&methods, &BTreeMap::new());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].metadata, ["slice"]);
     }
 
     #[test]
