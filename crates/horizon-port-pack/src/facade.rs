@@ -2244,6 +2244,12 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         if method == "get" && descriptor.contains("Lnet/minecraft/resources/Identifier;") {
             return format!("return ({ret}) horizonEntries.get(p0);");
         }
+        if method == "getHolder"
+            && ret == "java.util.Optional"
+            && descriptor.contains("Lnet/minecraft/resources/ResourceKey;")
+        {
+            return "Object value = horizonEntries.get(p0.location()); if (value == null) return java.util.Optional.empty(); net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(value, p0, p0.location()); return java.util.Optional.of(holder);".to_owned();
+        }
         if method == "getOptional"
             && ret == "java.util.Optional"
             && descriptor.contains("Lnet/minecraft/resources/Identifier;")
@@ -5317,6 +5323,15 @@ mod tests {
                 "(Lnet/minecraft/resources/ResourceKey;)Ljava/lang/Object;",
             ),
             "return (java.lang.Object) horizonEntries.get(p0.location());"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/Registry",
+                "getHolder",
+                "java.util.Optional",
+                "(Lnet/minecraft/resources/ResourceKey;)Ljava/util/Optional;",
+            ),
+            "Object value = horizonEntries.get(p0.location()); if (value == null) return java.util.Optional.empty(); net.minecraft.core.Holder.Reference holder = new net.minecraft.core.Holder.Reference(); holder.horizonBind(value, p0, p0.location()); return java.util.Optional.of(holder);"
         );
         assert_eq!(
             runtime_body_with_descriptor(
