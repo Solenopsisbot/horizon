@@ -202,6 +202,10 @@ pub struct StdHost {
     /// `ClassLoader` query surface. The host never opens files or consults a
     /// process classpath.
     resources: BTreeMap<String, String>,
+    /// Explicitly seeded Java service providers. Native execution never scans
+    /// the host classpath; callers must supply the service and provider class
+    /// names they want visible to `ServiceLoader`.
+    service_providers: BTreeMap<String, Vec<String>>,
     /// Deterministic epoch value returned by `System.currentTimeMillis`.
     ///
     /// The native interpreter represents wide primitives with its bounded
@@ -247,6 +251,7 @@ impl StdHost {
             properties: BTreeMap::from([("line.separator".into(), "\n".into())]),
             environment: BTreeMap::new(),
             resources: BTreeMap::new(),
+            service_providers: BTreeMap::new(),
             current_time_millis: 0,
             mods: BTreeMap::new(),
             environment_type: "CLIENT".into(),
@@ -305,6 +310,27 @@ impl StdHost {
     /// Alias named for callers that want to make the query boundary explicit.
     pub fn query_resource(&self, name: &str) -> Option<&str> {
         self.resource(name)
+    }
+
+    /// Seed one deterministic provider for a Java service. Provider discovery
+    /// remains explicit and invocation-local; no JDK or host classpath lookup
+    /// is performed.
+    pub fn with_service_provider(
+        mut self,
+        service: impl Into<String>,
+        provider: impl Into<String>,
+    ) -> Self {
+        let providers = self.service_providers.entry(service.into()).or_default();
+        let provider = provider.into();
+        if !providers.contains(&provider) {
+            providers.push(provider);
+        }
+        self
+    }
+
+    /// Return the explicitly seeded providers for a service, if any.
+    pub fn service_providers(&self, service: &str) -> Option<&[String]> {
+        self.service_providers.get(service).map(Vec::as_slice)
     }
 
     /// Set the deterministic value returned by `System.currentTimeMillis`.
@@ -558,15 +584,20 @@ impl Host for StdHost {
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
-            // ServiceLoader is deliberately a hard boundary in the native
-            // probe.  Scanning the host JVM class path would make execution
-            // depend on whichever jars happen to be installed on the machine;
-            // a future adapter must provide an explicit, seeded provider set.
-            ("java/util/ServiceLoader", "load" | "loadInstalled", _) => Err(
-                NativeError::Metadata(
-                    "java/util/ServiceLoader provider discovery is unsupported in the native runtime; explicit seeded providers are required (host classpath scanning is disabled)".into(),
-                ),
-            ),
+            // ServiceLoader is deterministic only when its provider set is
+            // explicitly seeded. Never inspect the host JVM class path.
+            ("java/util/ServiceLoader", "load" | "loadInstalled", descriptor)
+                if descriptor.starts_with("(Ljava/lang/Class;") =>
+            {
+                let service = expect_string(Self::argument(r, args, 0)?).replace('.', "/");
+                if self.service_providers.contains_key(&service) {
+                    Ok(Value::Ref(Some(format!("service-loader/{service}"))))
+                } else {
+                    Err(NativeError::Metadata(format!(
+                        "java/util/ServiceLoader has no explicitly seeded providers for {service}; host classpath scanning is disabled"
+                    )))
+                }
+            }
             ("java/text/NumberFormat", "getIntegerInstance", "()Ljava/text/NumberFormat;") => {
                 Ok(Value::Ref(Some("number-format/integer/US".into())))
             }
@@ -1173,9 +1204,7 @@ impl Host for StdHost {
                     Value::Ref(value) => value.clone(),
                     _ => None,
                 };
-                Ok(Value::Ref(
-                    self.properties.get(key).cloned().or(default),
-                ))
+                Ok(Value::Ref(self.properties.get(key).cloned().or(default)))
             }
             ("java/lang/System", "getProperties", "()Ljava/util/Properties;") => {
                 let values = self
@@ -1223,7 +1252,11 @@ impl Host for StdHost {
             ("java/lang/System", "lineSeparator", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some("\n".into())))
             }
-            ("java/lang/ClassLoader", "getSystemResource", "(Ljava/lang/String;)Ljava/net/URL;")
+            (
+                "java/lang/ClassLoader",
+                "getSystemResource",
+                "(Ljava/lang/String;)Ljava/net/URL;",
+            )
             | (
                 "java/lang/ClassLoader",
                 "getSystemResourceAsStream",
@@ -2238,6 +2271,35 @@ impl Host for StdHost {
                 _ => {}
             }
         }
+        if r.owner == "java/util/ServiceLoader" {
+            let marker = receiver_marker.as_deref().ok_or_else(|| {
+                NativeError::Metadata("malformed java/util/ServiceLoader marker".into())
+            })?;
+            let service = marker.strip_prefix("service-loader/").ok_or_else(|| {
+                NativeError::Metadata("unsupported java/util/ServiceLoader marker".into())
+            })?;
+            if r.name == "iterator" && r.descriptor == "()Ljava/util/Iterator;" {
+                let values = self
+                    .service_providers
+                    .get(service)
+                    .ok_or_else(|| {
+                        NativeError::Metadata(format!(
+                            "unknown seeded ServiceLoader service {service}"
+                        ))
+                    })?
+                    .iter()
+                    .cloned()
+                    .map(|provider| Value::Ref(Some(provider)))
+                    .collect::<Vec<_>>();
+                let iterator = format!("iterator/{}", self.next_iterator);
+                self.next_iterator = self.next_iterator.saturating_add(1);
+                self.iterators.insert(iterator.clone(), (values, 0));
+                return Ok(Value::Ref(Some(iterator)));
+            }
+            if r.name == "reload" && r.descriptor == "()V" {
+                return Ok(Value::Void);
+            }
+        }
         // NeoForge event subclasses inherit this query from the common event
         // base, but javac may emit the concrete subclass as the owner. Keep
         // the marker-based cancellation state visible regardless of that
@@ -3166,6 +3228,24 @@ impl Host for StdHost {
                         "{namespace}.{}",
                         path.replace('/', ".")
                     )))),
+                    ("toLanguageKey", "(Ljava/lang/String;)Ljava/lang/String;") => {
+                        Ok(Value::Ref(Some(format!(
+                            "{}.{}.{}",
+                            expect_string(Self::argument(r, args, 0)?),
+                            namespace,
+                            path.replace('/', ".")
+                        ))))
+                    }
+                    ("withPrefix", descriptor)
+                        if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
+                            || descriptor
+                                .ends_with("Lnet/minecraft/resources/ResourceLocation;") =>
+                    {
+                        Ok(identifier_value(
+                            namespace,
+                            &format!("{}{}", expect_string(Self::argument(r, args, 0)?), path),
+                        ))
+                    }
                     ("withSuffix", descriptor)
                         if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
                             || descriptor
@@ -7838,6 +7918,59 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_loads_only_explicit_service_providers() {
+        let mut host = StdHost::new()
+            .with_service_provider("demo/Provider", "demo.FirstProvider")
+            .with_service_provider("demo/Provider", "demo.SecondProvider");
+        assert_eq!(
+            host.service_providers("demo/Provider"),
+            Some(
+                [
+                    "demo.FirstProvider".to_owned(),
+                    "demo.SecondProvider".to_owned()
+                ]
+                .as_slice()
+            )
+        );
+        let load = MethodRef {
+            owner: "java/util/ServiceLoader".into(),
+            name: "load".into(),
+            descriptor: "(Ljava/lang/Class;)Ljava/util/ServiceLoader;".into(),
+        };
+        let loader = host
+            .invoke(&load, &[Value::Ref(Some("demo.Provider".into()))])
+            .unwrap();
+        assert_eq!(
+            loader,
+            Value::Ref(Some("service-loader/demo/Provider".into()))
+        );
+        let iterator = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "java/util/ServiceLoader".into(),
+                    name: "iterator".into(),
+                    descriptor: "()Ljava/util/Iterator;".into(),
+                },
+                &loader,
+                &[],
+            )
+            .unwrap();
+        let next = MethodRef {
+            owner: "java/util/Iterator".into(),
+            name: "next".into(),
+            descriptor: "()Ljava/lang/Object;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&next, &iterator, &[]).unwrap(),
+            Value::Ref(Some("demo.FirstProvider".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(&next, &iterator, &[]).unwrap(),
+            Value::Ref(Some("demo.SecondProvider".into()))
+        );
+    }
+
+    #[test]
     fn standard_host_maps_common_queries_and_records_calls() {
         let mut host = StdHost::new().with_property("demo.mode", "native");
         let property = MethodRef {
@@ -10687,6 +10820,26 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(&short, &id, &[]).unwrap(),
             Value::Ref(Some("ruby/lamp".into()))
+        );
+        let prefixed = MethodRef {
+            owner: "net/minecraft/resources/Identifier".into(),
+            name: "withPrefix".into(),
+            descriptor: "(Ljava/lang/String;)Lnet/minecraft/resources/Identifier;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&prefixed, &id, &[Value::Ref(Some("block/".into()))],)
+                .unwrap(),
+            Value::Ref(Some("identifier/ruby:block/lamp".into()))
+        );
+        let language_key = MethodRef {
+            owner: "net/minecraft/resources/Identifier".into(),
+            name: "toLanguageKey".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&language_key, &id, &[Value::Ref(Some("item".into()))],)
+                .unwrap(),
+            Value::Ref(Some("item.ruby.lamp".into()))
         );
         let with_path = MethodRef {
             owner: "net/minecraft/resources/Identifier".into(),
