@@ -2,7 +2,7 @@
 //! (`neoforge.mods.toml`, `mods.toml`, `fabric.mod.json`) and a census of
 //! its data, assets and classes.
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Read, path::Path};
+use std::{collections::BTreeSet, fs, io::Read, path::Path};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct JarInfo {
@@ -52,6 +52,10 @@ pub struct Census {
     /// configuration files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mixin_config_names: Vec<String>,
+    /// Typed Horizon registration kinds declared in `META-INF/horizon-native.json`.
+    /// Values are metadata only; the native adapter validates declarations later.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_declaration_kinds: Vec<String>,
 }
 
 const NOT_MODS: [&str; 5] = ["minecraft", "neoforge", "forge", "fabricloader", "java"];
@@ -81,6 +85,9 @@ pub fn read(path: &Path) -> Result<JarInfo, String> {
     }
     let names: Vec<String> = zip.file_names().map(str::to_owned).collect();
     info.census = census(&names);
+    if let Some(metadata) = text(&mut zip, "META-INF/horizon-native.json") {
+        info.census.native_declaration_kinds = native_declaration_kinds(&metadata);
+    }
     if info.mod_id.is_empty() {
         info.mod_id = path
             .file_stem()
@@ -268,6 +275,26 @@ pub fn census(names: &[String]) -> Census {
     c
 }
 
+/// Extract the stable set of typed Horizon registration kinds from the
+/// explicit native metadata file. Unknown or malformed metadata remains
+/// report-empty; validation belongs to `horizon_native_java`/`horizon-mods`.
+pub fn native_declaration_kinds(text: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let mut kinds = BTreeSet::new();
+    if let Some(entries) = value.get("registrations").and_then(|v| v.as_array()) {
+        for kind in entries
+            .iter()
+            .filter_map(|entry| entry.get("kind"))
+            .filter_map(|kind| kind.as_str())
+        {
+            kinds.insert(kind.to_owned());
+        }
+    }
+    kinds.into_iter().collect()
+}
+
 /// Returns the mixin configuration paths in stable jar order. This only
 /// inspects entry names; config JSON is deliberately left opaque because the
 /// loader-specific schema is not needed by the census.
@@ -385,6 +412,17 @@ mandatory = true
         );
         assert_eq!((c.classes, c.mixin_configs), (1, 1));
         assert_eq!(c.mixin_config_names, ["ruby.mixins.json"]);
+    }
+
+    #[test]
+    fn reports_typed_native_declaration_kinds_stably() {
+        assert_eq!(
+            native_declaration_kinds(
+                r#"{"registrations":[{"kind":"item"},{"kind":"block"},{"kind":"item"},{"kind":3}]}"#
+            ),
+            ["block", "item"]
+        );
+        assert!(native_declaration_kinds("not json").is_empty());
     }
 
     #[test]
