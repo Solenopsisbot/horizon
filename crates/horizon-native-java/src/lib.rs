@@ -944,6 +944,24 @@ impl Host for StdHost {
                     expect_int(r, Self::argument(r, args, 0)?)?
                 ))))
             }
+            ("java/util/OptionalLong", "empty", "()Ljava/util/OptionalLong;") => {
+                Ok(Value::Ref(None))
+            }
+            ("java/util/OptionalLong", "of", "(J)Ljava/util/OptionalLong;") => {
+                Ok(Value::Ref(Some(format!(
+                    "optional-long/{}",
+                    expect_long(r, Self::argument(r, args, 0)?)?
+                ))))
+            }
+            ("java/util/OptionalDouble", "empty", "()Ljava/util/OptionalDouble;") => {
+                Ok(Value::Ref(None))
+            }
+            ("java/util/OptionalDouble", "of", "(D)Ljava/util/OptionalDouble;") => {
+                Ok(Value::Ref(Some(format!(
+                    "optional-double/{}",
+                    expect_float(r, Self::argument(r, args, 0)?)?
+                ))))
+            }
             // Keep Arrays.asList bounded when the interpreter passes an
             // opaque array marker. The marker is retained as the list's
             // single value; expanding runtime-owned array storage here would
@@ -3030,6 +3048,66 @@ impl Host for StdHost {
                 (optional_int_value(receiver) == optional_int_value(Self::argument(r, args, 0)?))
                     as i32,
             )),
+            ("java/util/OptionalLong", "isPresent", "()Z") => {
+                Ok(Value::Int(optional_long_value(receiver).is_some() as i32))
+            }
+            ("java/util/OptionalLong", "isEmpty", "()Z") => {
+                Ok(Value::Int(optional_long_value(receiver).is_none() as i32))
+            }
+            ("java/util/OptionalLong", "getAsLong", "()J") => optional_long_value(receiver)
+                .map(long_value)
+                .ok_or_else(|| {
+                    NativeError::Metadata("OptionalLong.getAsLong on empty optional".into())
+                }),
+            ("java/util/OptionalLong", "orElse", "(J)J") => Ok(long_value(
+                optional_long_value(receiver)
+                    .unwrap_or(expect_long(r, Self::argument(r, args, 0)?)?),
+            )),
+            ("java/util/OptionalLong", "toString", "()Ljava/lang/String;") => {
+                Ok(Value::Ref(Some(match optional_long_value(receiver) {
+                    Some(value) => format!("OptionalLong[{}]", value),
+                    None => "OptionalLong.empty".into(),
+                })))
+            }
+            ("java/util/OptionalLong", "hashCode", "()I") => Ok(Value::Int(
+                optional_long_value(receiver)
+                    .map(|value| stable_hash(&format!("optional-long/{value}")))
+                    .unwrap_or(0),
+            )),
+            ("java/util/OptionalLong", "equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
+                (optional_long_value(receiver) == optional_long_value(Self::argument(r, args, 0)?))
+                    as i32,
+            )),
+            ("java/util/OptionalDouble", "isPresent", "()Z") => {
+                Ok(Value::Int(optional_double_value(receiver).is_some() as i32))
+            }
+            ("java/util/OptionalDouble", "isEmpty", "()Z") => {
+                Ok(Value::Int(optional_double_value(receiver).is_none() as i32))
+            }
+            ("java/util/OptionalDouble", "getAsDouble", "()D") => optional_double_value(receiver)
+                .map(double_value)
+                .ok_or_else(|| {
+                    NativeError::Metadata("OptionalDouble.getAsDouble on empty optional".into())
+                }),
+            ("java/util/OptionalDouble", "orElse", "(D)D") => Ok(double_value(
+                optional_double_value(receiver)
+                    .unwrap_or(expect_float(r, Self::argument(r, args, 0)?)?),
+            )),
+            ("java/util/OptionalDouble", "toString", "()Ljava/lang/String;") => {
+                Ok(Value::Ref(Some(match optional_double_value(receiver) {
+                    Some(value) => format!("OptionalDouble[{}]", value),
+                    None => "OptionalDouble.empty".into(),
+                })))
+            }
+            ("java/util/OptionalDouble", "hashCode", "()I") => Ok(Value::Int(
+                optional_double_value(receiver)
+                    .map(|value| stable_hash(&format!("optional-double/{value}")))
+                    .unwrap_or(0),
+            )),
+            ("java/util/OptionalDouble", "equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
+                (optional_double_bits(receiver)
+                    == optional_double_bits(Self::argument(r, args, 0)?)) as i32,
+            )),
             (
                 "java/util/Optional",
                 "map",
@@ -3334,6 +3412,11 @@ impl Host for StdHost {
                     ) => Ok(identifier_value("minecraft", marker)),
                     (
                         "registry",
+                        "()Lnet/minecraft/resources/Identifier;"
+                        | "()Lnet/minecraft/resources/ResourceLocation;",
+                    ) => Ok(identifier_value("minecraft", marker)),
+                    (
+                        "location",
                         "()Lnet/minecraft/resources/Identifier;"
                         | "()Lnet/minecraft/resources/ResourceLocation;",
                     ) => Ok(identifier_value("minecraft", marker)),
@@ -4167,6 +4250,22 @@ fn optional_int_value(value: &Value) -> Option<i32> {
     expect_ref(value)
         .and_then(|marker| marker.strip_prefix("optional-int/"))
         .and_then(|value| value.parse().ok())
+}
+
+fn optional_long_value(value: &Value) -> Option<i64> {
+    expect_ref(value)
+        .and_then(|marker| marker.strip_prefix("optional-long/"))
+        .and_then(|value| value.parse().ok())
+}
+
+fn optional_double_value(value: &Value) -> Option<f64> {
+    expect_ref(value)
+        .and_then(|marker| marker.strip_prefix("optional-double/"))
+        .and_then(|value| value.parse().ok())
+}
+
+fn optional_double_bits(value: &Value) -> Option<u64> {
+    optional_double_value(value).map(f64::to_bits)
 }
 
 fn collection_empty(kind: &str) -> Value {
@@ -9214,6 +9313,109 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_maps_optional_long_and_double_values() {
+        let mut host = StdHost::new();
+        let long_empty = MethodRef {
+            owner: "java/util/OptionalLong".into(),
+            name: "empty".into(),
+            descriptor: "()Ljava/util/OptionalLong;".into(),
+        };
+        let long_of = MethodRef {
+            owner: "java/util/OptionalLong".into(),
+            name: "of".into(),
+            descriptor: "(J)Ljava/util/OptionalLong;".into(),
+        };
+        let empty_long = host.invoke(&long_empty, &[]).unwrap();
+        let long = host
+            .invoke(
+                &long_of,
+                &[Value::Ref(Some("long:9007199254740991".into()))],
+            )
+            .unwrap();
+        assert_eq!(empty_long, Value::Ref(None));
+        assert_eq!(
+            long,
+            Value::Ref(Some("optional-long/9007199254740991".into()))
+        );
+        let long_get = MethodRef {
+            owner: "java/util/OptionalLong".into(),
+            name: "getAsLong".into(),
+            descriptor: "()J".into(),
+        };
+        let long_or_else = MethodRef {
+            owner: "java/util/OptionalLong".into(),
+            name: "orElse".into(),
+            descriptor: "(J)J".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&long_get, &long, &[]).unwrap(),
+            Value::Ref(Some("long:9007199254740991".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &long_or_else,
+                &empty_long,
+                &[Value::Ref(Some("long:7".into()))]
+            )
+            .unwrap(),
+            Value::Ref(Some("long:7".into()))
+        );
+
+        let double_empty = MethodRef {
+            owner: "java/util/OptionalDouble".into(),
+            name: "empty".into(),
+            descriptor: "()Ljava/util/OptionalDouble;".into(),
+        };
+        let double_of = MethodRef {
+            owner: "java/util/OptionalDouble".into(),
+            name: "of".into(),
+            descriptor: "(D)Ljava/util/OptionalDouble;".into(),
+        };
+        let empty_double = host.invoke(&double_empty, &[]).unwrap();
+        let double = host
+            .invoke(&double_of, &[Value::Ref(Some("double:3.5".into()))])
+            .unwrap();
+        assert_eq!(empty_double, Value::Ref(None));
+        assert_eq!(double, Value::Ref(Some("optional-double/3.5".into())));
+        let double_get = MethodRef {
+            owner: "java/util/OptionalDouble".into(),
+            name: "getAsDouble".into(),
+            descriptor: "()D".into(),
+        };
+        let double_or_else = MethodRef {
+            owner: "java/util/OptionalDouble".into(),
+            name: "orElse".into(),
+            descriptor: "(D)D".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&double_get, &double, &[]).unwrap(),
+            Value::Ref(Some("double:3.5".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &double_or_else,
+                &empty_double,
+                &[Value::Ref(Some("double:2.25".into()))]
+            )
+            .unwrap(),
+            Value::Ref(Some("double:2.25".into()))
+        );
+        let to_string = MethodRef {
+            owner: "java/util/OptionalDouble".into(),
+            name: "toString".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&to_string, &double, &[]).unwrap(),
+            Value::Ref(Some("OptionalDouble[3.5]".into()))
+        );
+        assert!(
+            host.invoke_instance(&double_get, &empty_double, &[])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn standard_host_maps_common_collections() {
         let mut host = StdHost::new();
         let list_of = MethodRef {
@@ -10985,6 +11187,15 @@ mandatory = true
         };
         assert_eq!(
             host.invoke_instance(&key_id_modern, &key, &[]).unwrap(),
+            host.invoke_instance(&key_id, &key, &[]).unwrap()
+        );
+        let key_location = MethodRef {
+            owner: "net/minecraft/resources/ResourceKey".into(),
+            name: "location".into(),
+            descriptor: "()Lnet/minecraft/resources/Identifier;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&key_location, &key, &[]).unwrap(),
             host.invoke_instance(&key_id, &key, &[]).unwrap()
         );
     }
