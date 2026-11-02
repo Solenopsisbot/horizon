@@ -282,8 +282,9 @@ collections remain callback-local until the Rust NBT bridge is wired through the
 block-state/entity, loaded-chunk, sky-visibility, side, and build-height queries. Their
 bounded coordinate-keyed maps also preserve `setBlock`, `setBlockAndUpdate`, `setBlockEntity`, and
 `removeBlock` writes within the façade instance, so a registration callback can observe its own world
-mutation sequence. The maps remain callback-local until the native level handle is wired through the game
-boundary; they do not replace Horizon's authoritative world state.
+mutation sequence. `getSeaLevel` and `getMaxLocalRawBrightness` provide the common overworld constants
+for terrain and light bootstrap code. The maps remain callback-local until the native level handle is
+wired through the game boundary; they do not replace Horizon's authoritative world state.
 `Entity` now retains position, delta movement, rotation, removal state, a level handle, a stable UUID
 marker, and a bounded bounding-box/on-ground state; `getX`/`getY`/`getZ`, both `setPos` overloads,
 `position`, `getDeltaMovement`, both `setDeltaMovement` overloads, `getXRot`/`setXRot`,
@@ -402,7 +403,9 @@ the content rows described below.
 `NativeJar` reads the first `[[mods]]` record in `META-INF/neoforge.mods.toml` as the NeoForge id and version,
 and carries required `[[dependencies.<id>]]` records into the same startup seed used for Fabric metadata.
 Fabric entrypoint objects retain their optional `adapter` name; the native launcher reports that adapter
-explicitly and stops rather than invoking the target with the wrong lifecycle contract.
+explicitly and stops rather than invoking the target with the wrong lifecycle contract; the selected
+entrypoint set is validated before any entrypoint executes, so a mixed declaration cannot leave partial
+registrations behind.
 Loader-provided ids (`minecraft`, `neoforge`, `forge`, `java`, and `fabricloader`) and optional dependencies
 are excluded, so `ModList` and `FabricLoader` presence checks see only the mod's real required libraries.
 If a jar has no entrypoint usable for the current client or server role, the startup error names the role
@@ -689,6 +692,8 @@ BlockState bootstrap paths retain a bounded block identity and property map: `ge
 `setValue` feeds `getValue`, `hasProperty`, and `getProperties` on the same façade instance. This covers
 common state construction and inspection while the registry-backed state definition and vanilla default
 values remain follow-up work.
+The `ItemStack.is(TagKey)` and `BlockState.is(TagKey)` overloads are also linked with an explicit empty
+membership result until registry-backed tag tables are attached.
 `TagKey` now retains its registry key and identifier as a value pair: `create`, `location`, `registry`,
 `isFor`, equality, hashing, and string conversion operate on those fields. This keeps tag-backed block,
 item, and entity registration code from collapsing distinct tags into one neutral object; holder-set

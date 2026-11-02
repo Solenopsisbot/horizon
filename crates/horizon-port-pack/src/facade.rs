@@ -2317,6 +2317,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("is", "boolean") if descriptor == "(Lnet/minecraft/world/item/Item;)Z" => {
                 return "return horizonItem == p0;".to_owned();
             }
+            ("is", "boolean") if descriptor == "(Lnet/minecraft/tags/TagKey;)Z" => {
+                return "return false;".to_owned();
+            }
             // Data components are keyed by their identity-bearing type.  The
             // façade keeps the common typed operations after erasure; Java's
             // call site inserts the cast required by the generic API.
@@ -2609,6 +2612,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             {
                 return "return horizonBlock == p0;".to_owned();
             }
+            "is" if ret == "boolean" && descriptor == "(Lnet/minecraft/tags/TagKey;)Z" => {
+                return "return false;".to_owned();
+            }
             "isAir" if ret == "boolean" => return "return false;".to_owned(),
             "canOcclude" if ret == "boolean" => return "return true;".to_owned(),
             "isSolidRender" if ret == "boolean" => return "return true;".to_owned(),
@@ -2712,6 +2718,16 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             }
             ("getMaxBuildHeight", "int", "()I") => {
                 return "return 320;".to_owned();
+            }
+            ("getSeaLevel", "int", "()I") => {
+                return "return 63;".to_owned();
+            }
+            (
+                "getMaxLocalRawBrightness",
+                "int",
+                "(Lnet/minecraft/core/BlockPos;)I",
+            ) => {
+                return "return canSeeSky(p0) ? 15 : 0;".to_owned();
             }
             _ => {}
         }
@@ -3679,6 +3695,15 @@ mod tests {
             "horizonDamage = Math.max(0, p0);"
         );
         assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/item/ItemStack",
+                "is",
+                "boolean",
+                "(Lnet/minecraft/tags/TagKey;)Z",
+            ),
+            "return false;"
+        );
+        assert_eq!(
             runtime_body(
                 "net/minecraft/world/item/ItemStack",
                 "isEnchanted",
@@ -4411,6 +4436,15 @@ mod tests {
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/world/level/block/state/BlockState",
+                "is",
+                "boolean",
+                "(Lnet/minecraft/tags/TagKey;)Z",
+            ),
+            "return false;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/block/state/BlockState",
                 "isAir",
                 "boolean",
                 "()Z",
@@ -5105,6 +5139,24 @@ mod tests {
                 "()Z",
             ),
             "return false;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/Level",
+                "getSeaLevel",
+                "int",
+                "()I",
+            ),
+            "return 63;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/Level",
+                "getMaxLocalRawBrightness",
+                "int",
+                "(Lnet/minecraft/core/BlockPos;)I",
+            ),
+            "return canSeeSky(p0) ? 15 : 0;"
         );
     }
 

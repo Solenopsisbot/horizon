@@ -130,6 +130,15 @@ fn native_entrypoint_kinds(jar: &horizon_native_java::NativeJar) -> Vec<String> 
     kinds
 }
 
+fn unsupported_fabric_adapter(entries: &[horizon_native_java::Entrypoint]) -> Option<(&str, &str)> {
+    entries.iter().find_map(|entry| {
+        entry
+            .adapter
+            .as_deref()
+            .map(|adapter| (entry.class.as_str(), adapter))
+    })
+}
+
 fn seeded_native_host(
     jar: &horizon_native_java::NativeJar,
     path: &std::path::Path,
@@ -199,16 +208,15 @@ pub(super) fn run_java_mods(
                     path.display(),
                 )
             })?;
+        if let Some((class, adapter)) = unsupported_fabric_adapter(&entrypoints) {
+            return Err(format!(
+                "{} ({kind}, {class}): Fabric entrypoint adapter {adapter} is not supported by the native path",
+                path.display()
+            ));
+        }
         let mut host = seeded_native_host(&jar, path, role);
         let mut calls = 0;
         for entry in &entrypoints {
-            if let Some(adapter) = entry.adapter.as_deref() {
-                return Err(format!(
-                    "{} ({kind}, {}): Fabric entrypoint adapter {adapter} is not supported by the native path",
-                    path.display(),
-                    entry.class
-                ));
-            }
             let report = jar
                 .execute(&entry.class, entry.method.as_deref(), kind, &mut host)
                 .map_err(|error| {
@@ -423,6 +431,26 @@ mod tests {
         assert_eq!(
             native_entrypoint_kinds(&jar),
             ["client", "main", "neoforge"]
+        );
+    }
+
+    #[test]
+    fn unsupported_fabric_adapters_are_rejected_before_execution() {
+        let entries = vec![
+            horizon_native_java::Entrypoint {
+                class: "demo.First".into(),
+                method: None,
+                adapter: None,
+            },
+            horizon_native_java::Entrypoint {
+                class: "demo.Second".into(),
+                method: None,
+                adapter: Some("net.fabricmc.api.ModInitializer".into()),
+            },
+        ];
+        assert_eq!(
+            unsupported_fabric_adapter(&entries),
+            Some(("demo.Second", "net.fabricmc.api.ModInitializer"))
         );
     }
 
