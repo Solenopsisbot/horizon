@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 2 November 2026, commit `0e8da6ce7`.
+Last checked: 2 November 2026, commit `266ba0a02`.
 
 ## Supported now
 
@@ -15,7 +15,7 @@ Last checked: 2 November 2026, commit `0e8da6ce7`.
 - [x] Register and inspect bounded NeoForge and Forge deferred registrations, holders, registry objects, keys, ids, and entry collections.
 - [x] Record Fabric events, NeoForge events, and legacy Forge event-bus listeners with ordering, cancellation markers, and unregister support.
 - [x] Record custom payload registrations for the supported Fabric/NeoForge directions and the bounded legacy Forge `SimpleChannel.registerMessage` alias.
-- [x] Provide bounded capability and `LazyOptional` markers, NBT values, identifiers, resource keys, arrays, reflection metadata, collections, maps, streams, and optionals.
+- [x] Provide bounded NeoForge and legacy Forge capability/`LazyOptional` markers, NBT values, identifiers, resource keys, arrays, reflection metadata, collections, maps, streams, and optionals.
 - [x] Provide common Java wrapper/string operations used by loader bootstrap code, including integer/long/float/double/byte conversion and checked math.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs and array-returning signatures.
 - [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, access-widener/access-transformer discovery, and explicit report-only diagnostics.
@@ -40,7 +40,7 @@ Last checked: 2 November 2026, commit `0e8da6ce7`.
 
 ## Validation snapshot
 
-- `horizon-native-java`: 74 unit tests passing.
+- `horizon-native-java`: 76 unit tests passing.
 - `horizon-port-pack`: 150 unit tests passing.
 - `horizon-jvm`: 7 unit tests passing.
 - Workspace check, targeted clippy, formatting, and `tools/native_java_smoke.py` passing.
