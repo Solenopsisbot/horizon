@@ -141,6 +141,10 @@ pub struct Injection {
     pub method: String,
     /// The `At` values, `|`-joined: `HEAD`, `INVOKE|target:getBlockState`.
     pub at: String,
+    /// Presence-only edge metadata used when planning native hook contracts.
+    /// Values are intentionally not interpreted by the census.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata: Vec<String>,
 }
 
 /// The annotation that makes a class a Mixin.
@@ -541,6 +545,11 @@ fn injections(
                     method
                 },
                 at,
+                metadata: ["require", "expect", "cancellable", "order", "priority"]
+                    .into_iter()
+                    .filter(|field| a.values.contains_key(*field))
+                    .map(str::to_owned)
+                    .collect(),
             });
         }
     }

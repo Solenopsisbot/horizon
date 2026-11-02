@@ -101,6 +101,10 @@ ranked by the ecosystem itself.
 hook's own doc comment and verified against the 26.3 jar with `javap` (19 of 45 hooks; the rest are
 Horizon-only, like `zoom` or `minimap`). Joined against Fabric API 26.3:
 
+The join uses the JVM method name before its descriptor, so a catalog entry such as
+`Class#method(Ljava/lang/String;)V` matches a Mixin target recorded as `method`. Overloads remain
+distinct in the census member table; hook coverage is intentionally reported at the method contract.
+
 **7 of 689 injection points (1.0%) land on a method a hook already names**, at six methods:
 `ServerPlayerGameMode#destroyBlock` (`destroy_block`), `#handleBlockBreakAction` (`left_click_block`),
 `#useItemOn` (`right_click_block`), `Player#attack` (`attack_entity`), `ItemStack#useOn` (`use_item_on`)

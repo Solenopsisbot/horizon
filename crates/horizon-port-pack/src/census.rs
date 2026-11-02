@@ -92,6 +92,10 @@ pub struct Census {
     pub mixin_config_targets: BTreeMap<String, usize>,
     /// `inject`, `redirect`, `overwrite`...: how many.
     pub injections: BTreeMap<String, usize>,
+    /// Presence counts for Mixin injection ordering/contract metadata. Values
+    /// are reported only; the census never applies these semantics.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mixin_annotation_fields: BTreeMap<String, usize>,
     /// `HEAD`, `INVOKE|target:getBlockState`...: how many.
     pub at: BTreeMap<String, usize>,
     /// One row per (target, method, form, anchor), with the hooks at it.
@@ -286,7 +290,11 @@ impl HookIndex {
                 continue;
             };
             by_method
-                .entry((class.to_owned(), method.to_owned()))
+                // Mixin metadata commonly includes a JVM descriptor while
+                // the census point key is descriptor-free. Keep the catalog
+                // and census on the same method contract so overloads do not
+                // become false report-only points.
+                .entry((class.to_owned(), strip_descriptor(method).to_owned()))
                 .or_insert_with(Vec::new)
                 .push(hook.name);
         }
@@ -459,6 +467,12 @@ impl Census {
             }
             for injection in &class.injections {
                 *self.injections.entry(injection.kind.clone()).or_default() += 1;
+                for field in &injection.metadata {
+                    *self
+                        .mixin_annotation_fields
+                        .entry(field.clone())
+                        .or_default() += 1;
+                }
                 if !injection.at.is_empty() {
                     *self.at.entry(injection.at.clone()).or_default() += 1;
                 }
@@ -593,6 +607,12 @@ impl Census {
                 self.totals.mixin_config_targets_report_only
             ));
         }
+        if !self.mixin_annotation_fields.is_empty() {
+            out.push_str("mixin annotation metadata (presence only; no weaving)\n");
+            for (field, count) in &self.mixin_annotation_fields {
+                out.push_str(&format!("{count:7} {field}\n"));
+            }
+        }
         for (title, map) in [
             ("classes", &self.classes),
             ("members", &self.members),
@@ -661,12 +681,13 @@ fn is_access_transformer(name: &str) -> bool {
 const MAX_MIXIN_CONFIG_BYTES: u64 = 1 << 20;
 const MAX_MIXIN_CONFIG_TARGETS: usize = 256;
 const MAX_MIXIN_CONFIG_FIELDS: usize = 256;
-const MIXIN_CONFIG_EDGE_FIELDS: [&str; 5] = [
+const MIXIN_CONFIG_EDGE_FIELDS: [&str; 6] = [
     "plugin",
     "refmap",
     "required",
     "minVersion",
     "compatibilityLevel",
+    "priority",
 ];
 
 /// Reads only bounded JSON config entries and reports safe class names under
@@ -978,7 +999,7 @@ mod tests {
         let mut zip = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default();
         zip.start_file("ruby.mixins.json", options).unwrap();
-        std::io::Write::write_all(&mut zip, br#"{"plugin":"example.Plugin","refmap":"ruby.refmap.json","required":true,"minVersion":"0.8","compatibilityLevel":"JAVA_25","mixins":[{"target":"net.minecraft.Foo"},{"target":"bad target"}],"client":[{"target":"a/b/C"}]}"#).unwrap();
+        std::io::Write::write_all(&mut zip, br#"{"plugin":"example.Plugin","refmap":"ruby.refmap.json","required":true,"minVersion":"0.8","compatibilityLevel":"JAVA_25","priority":1200,"mixins":[{"target":"net.minecraft.Foo"},{"target":"bad target"}],"client":[{"target":"a/b/C"}]}"#).unwrap();
         zip.finish().unwrap();
         let census = read(&path).unwrap();
         assert_eq!(
@@ -996,7 +1017,8 @@ mod tests {
                 "refmap",
                 "required",
                 "minVersion",
-                "compatibilityLevel"
+                "compatibilityLevel",
+                "priority"
             ]
         );
     }
@@ -1195,6 +1217,33 @@ mod tests {
     }
 
     #[test]
+    fn hook_catalog_normalizes_method_descriptors() {
+        let dir = std::env::temp_dir().join("horizon-census-hook-descriptor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hooks.json");
+        std::fs::write(
+            &file,
+            r#"{"hooks":[{"name":"destroy_block","vanilla":"net/minecraft/server/level/ServerPlayerGameMode#destroyBlock(Lnet/minecraft/core/BlockPos;)Z"}]}"#,
+        )
+        .unwrap();
+        let hooks = HookIndex::read(&file).unwrap();
+        let mut census = Census {
+            points: vec![PointCount {
+                target: "net/minecraft/server/level/ServerPlayerGameMode".to_owned(),
+                method: "destroyBlock".to_owned(),
+                kind: "inject".to_owned(),
+                at: "HEAD".to_owned(),
+                count: 1,
+                hooks: Vec::new(),
+            }],
+            ..Census::default()
+        };
+        census.join(&hooks);
+        assert_eq!(census.points[0].hooks, ["destroy_block"]);
+        assert_eq!(census.totals.points_covered, 1);
+    }
+
+    #[test]
     fn a_point_is_covered_by_a_hook_that_names_its_method() {
         let dir = std::env::temp_dir().join("horizon-census-hooks");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1307,6 +1356,22 @@ mod tests {
                 .summary(20)
                 .contains("mixin config targets: 2 report-only")
         );
+    }
+
+    #[test]
+    fn annotation_metadata_is_reported_without_interpreting_values() {
+        let census = Census {
+            mixin_annotation_fields: BTreeMap::from([
+                ("cancellable".to_owned(), 2),
+                ("require".to_owned(), 1),
+                ("expect".to_owned(), 1),
+                ("order".to_owned(), 1),
+            ]),
+            ..Census::default()
+        };
+        let summary = census.summary(20);
+        assert!(summary.contains("mixin annotation metadata (presence only; no weaving)"));
+        assert!(summary.contains("      2 cancellable"));
     }
 
     #[test]
