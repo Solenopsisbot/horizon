@@ -202,6 +202,10 @@ pub struct StdHost {
     /// `ClassLoader` query surface. The host never opens files or consults a
     /// process classpath.
     resources: BTreeMap<String, String>,
+    /// Explicitly seeded class names exposed through `ClassLoader.loadClass`.
+    /// Values are class markers, and no host classpath or filesystem lookup is
+    /// ever attempted.
+    classes: BTreeMap<String, String>,
     /// Explicitly seeded Java service providers. Native execution never scans
     /// the host classpath; callers must supply the service and provider class
     /// names they want visible to `ServiceLoader`.
@@ -251,6 +255,7 @@ impl StdHost {
             properties: BTreeMap::from([("line.separator".into(), "\n".into())]),
             environment: BTreeMap::new(),
             resources: BTreeMap::new(),
+            classes: BTreeMap::new(),
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
             mods: BTreeMap::new(),
@@ -310,6 +315,23 @@ impl StdHost {
     /// Alias named for callers that want to make the query boundary explicit.
     pub fn query_resource(&self, name: &str) -> Option<&str> {
         self.resource(name)
+    }
+
+    /// Seed one deterministic class marker for the bounded
+    /// `ClassLoader.loadClass` contract. Java binary names and internal names
+    /// are normalized to the same slash-separated key.
+    pub fn with_class(mut self, name: impl Into<String>) -> Self {
+        let internal = name.into().replace('.', "/");
+        self.classes.insert(internal.clone(), internal);
+        self
+    }
+
+    /// Query an explicitly seeded class marker without crossing into the host
+    /// classpath or filesystem.
+    pub fn class_marker(&self, name: &str) -> Option<&str> {
+        self.classes
+            .get(&name.replace('.', "/"))
+            .map(String::as_str)
     }
 
     /// Seed one deterministic provider for a Java service. Provider discovery
@@ -1209,6 +1231,14 @@ impl Host for StdHost {
                         .unwrap_or_else(|| "null".into())
                 ))))
             }
+            ("net/minecraft/tags/TagKey", "create", descriptor)
+                if descriptor.ends_with("Lnet/minecraft/tags/TagKey;") =>
+            {
+                Ok(tag_key_value(
+                    args.first().map(expect_string).unwrap_or_default(),
+                    args.get(1).map(expect_string).unwrap_or_default(),
+                ))
+            }
             ("java/lang/System", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;") => {
                 let key = match Self::argument(r, args, 0)? {
                     Value::Ref(Some(key)) => key,
@@ -1390,6 +1420,23 @@ impl Host for StdHost {
                 return Err(NativeError::Metadata(
                     "unsupported java/lang/ClassLoader marker".into(),
                 ));
+            }
+            if r.name == "loadClass"
+                && matches!(
+                    r.descriptor.as_str(),
+                    "(Ljava/lang/String;)Ljava/lang/Class;"
+                        | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+                )
+            {
+                let name = expect_string(Self::argument(r, args, 0)?);
+                return self
+                    .class_marker(name)
+                    .map(|marker| Value::Ref(Some(marker.to_owned())))
+                    .ok_or_else(|| {
+                        NativeError::Metadata(format!(
+                            "java/lang/ClassLoader.loadClass {name} was not explicitly seeded; host classpath scanning is disabled"
+                        ))
+                    });
             }
             if matches!(r.name.as_str(), "getResource" | "getResourceAsStream")
                 && r.descriptor == "(Ljava/lang/String;)Ljava/lang/Object;"
@@ -3424,6 +3471,33 @@ impl Host for StdHost {
                     _ => Ok(Value::default_for(&r.descriptor)),
                 }
             }
+            ("net/minecraft/tags/TagKey", name, descriptor) => {
+                let (registry, location) = tag_key_parts(receiver);
+                match (name, descriptor) {
+                    ("registry", "()Lnet/minecraft/resources/ResourceKey;") => {
+                        Ok(Value::Ref(Some(registry.to_owned())))
+                    }
+                    (
+                        "location",
+                        "()Lnet/minecraft/resources/Identifier;"
+                        | "()Lnet/minecraft/resources/ResourceLocation;",
+                    ) => Ok(Value::Ref(Some(location.to_owned()))),
+                    ("isFor", "(Lnet/minecraft/resources/ResourceKey;)Z") => Ok(Value::Int(
+                        (registry == expect_string(Self::argument(r, args, 0)?)) as i32,
+                    )),
+                    ("hashCode", "()I") => {
+                        Ok(Value::Int(stable_hash(&format!("{registry}|{location}"))))
+                    }
+                    ("equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
+                        (expect_string(Self::argument(r, args, 0)?) == expect_string(receiver))
+                            as i32,
+                    )),
+                    ("toString", "()Ljava/lang/String;") => {
+                        Ok(Value::Ref(Some(format!("TagKey[{registry} / {location}]"))))
+                    }
+                    _ => Ok(Value::default_for(&r.descriptor)),
+                }
+            }
             ("net/fabricmc/loader/api/FabricLoader", "isModLoaded", "(Ljava/lang/String;)Z") => {
                 let id = match Self::argument(r, args, 0)? {
                     Value::Ref(Some(id)) => id,
@@ -4079,6 +4153,17 @@ fn identifier_parts(value: &Value) -> (&str, &str) {
     let raw = expect_string(value);
     let value = raw.strip_prefix("identifier/").unwrap_or(raw);
     value.split_once(':').unwrap_or(("minecraft", value))
+}
+
+fn tag_key_value(registry: &str, location: &str) -> Value {
+    Value::Ref(Some(format!("tag-key/{registry}|{location}")))
+}
+
+fn tag_key_parts(value: &Value) -> (&str, &str) {
+    expect_string(value)
+        .strip_prefix("tag-key/")
+        .and_then(|value| value.split_once('|'))
+        .unwrap_or(("", ""))
 }
 
 fn stable_hash(value: &str) -> i32 {
@@ -8281,6 +8366,32 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_classloader_loads_only_explicit_classes() {
+        let mut host = StdHost::new().with_class("demo.Provider");
+        assert_eq!(host.class_marker("demo/Provider"), Some("demo/Provider"));
+        let loader = Value::Ref(Some("classloader/bootstrap".into()));
+        let load = MethodRef {
+            owner: "java/lang/ClassLoader".into(),
+            name: "loadClass".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/lang/Class;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&load, &loader, &[Value::Ref(Some("demo.Provider".into()))],)
+                .unwrap(),
+            Value::Ref(Some("demo/Provider".into()))
+        );
+        let missing = host
+            .invoke_instance(
+                &load,
+                &loader,
+                &[Value::Ref(Some("missing.Provider".into()))],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("not explicitly seeded"), "{missing}");
+    }
+
+    #[test]
     fn standard_host_maps_integer_floor_math() {
         let mut host = StdHost::new();
         let floor_div = MethodRef {
@@ -11197,6 +11308,36 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(&key_location, &key, &[]).unwrap(),
             host.invoke_instance(&key_id, &key, &[]).unwrap()
+        );
+        let tag_create = MethodRef {
+            owner: "net/minecraft/tags/TagKey".into(),
+            name: "create".into(),
+            descriptor: "(Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/resources/Identifier;)Lnet/minecraft/tags/TagKey;".into(),
+        };
+        let tag = host
+            .invoke(&tag_create, &[key.clone(), id.clone()])
+            .unwrap();
+        let tag_location = MethodRef {
+            owner: "net/minecraft/tags/TagKey".into(),
+            name: "location".into(),
+            descriptor: "()Lnet/minecraft/resources/Identifier;".into(),
+        };
+        assert_eq!(host.invoke_instance(&tag_location, &tag, &[]).unwrap(), id);
+        let tag_registry = MethodRef {
+            owner: "net/minecraft/tags/TagKey".into(),
+            name: "registry".into(),
+            descriptor: "()Lnet/minecraft/resources/ResourceKey;".into(),
+        };
+        assert_eq!(host.invoke_instance(&tag_registry, &tag, &[]).unwrap(), key);
+        let tag_is_for = MethodRef {
+            owner: "net/minecraft/tags/TagKey".into(),
+            name: "isFor".into(),
+            descriptor: "(Lnet/minecraft/resources/ResourceKey;)Z".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&tag_is_for, &tag, std::slice::from_ref(&key))
+                .unwrap(),
+            Value::Int(1)
         );
     }
 
