@@ -6018,16 +6018,18 @@ impl<H: Host> Runtime<'_, H> {
             && r.descriptor == "()[Ljava/lang/reflect/Field;"
         {
             let class = expect_string(receiver.unwrap_or(&Value::Ref(None))).to_owned();
+            let declared = r.name == "getDeclaredFields";
             let fields = self
                 .classes
                 .get(&class)
                 .map(|file| {
                     file.fields
                         .iter()
+                        .filter(|field| declared || field.access & 1 != 0)
                         .map(|field| {
                             Value::Ref(Some(format!(
-                                "reflect-field/{class}#{}:{}",
-                                field.name, field.descriptor
+                                "reflect-field/{class}#{}:{}:{}",
+                                field.name, field.descriptor, field.access
                             )))
                         })
                         .collect::<Vec<_>>()
@@ -6046,8 +6048,18 @@ impl<H: Host> Runtime<'_, H> {
             let marker = self
                 .classes
                 .get(&class)
-                .and_then(|file| file.fields.iter().find(|field| field.name == name))
-                .map(|field| format!("reflect-field/{class}#{}:{}", field.name, field.descriptor))
+                .and_then(|file| {
+                    file.fields.iter().find(|field| {
+                        field.name == name
+                            && (r.name == "getDeclaredField" || field.access & 1 != 0)
+                    })
+                })
+                .map(|field| {
+                    format!(
+                        "reflect-field/{class}#{}:{}:{}",
+                        field.name, field.descriptor, field.access
+                    )
+                })
                 .unwrap_or_else(|| format!("reflect-field/{class}#{name}"));
             return Ok(Some(Value::Ref(Some(marker))));
         }
@@ -12930,6 +12942,129 @@ mandatory = true
                 .class_for_name(&[Value::Ref(Some("demo.Missing".into()))])
                 .unwrap(),
             Value::Ref(None)
+        );
+    }
+
+    #[test]
+    fn parsed_fields_are_available_through_bounded_reflection() {
+        fn u2(bytes: &mut Vec<u8>, value: u16) {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        fn utf8(bytes: &mut Vec<u8>, value: &str) {
+            bytes.push(1);
+            u2(bytes, value.len() as u16);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+
+        // A minimal class file with one public and one private field.  Keeping
+        // this fixture in bytes exercises the same field-table parser used by
+        // NativeJar::from_jar rather than only testing hand-built metadata.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xCAFE_BABEu32.to_be_bytes());
+        u2(&mut bytes, 0); // minor
+        u2(&mut bytes, 52); // major
+        u2(&mut bytes, 9); // constant-pool count
+        utf8(&mut bytes, "demo/ReflectiveFields"); // 1
+        bytes.extend_from_slice(&[7, 0, 1]); // 2: Class
+        utf8(&mut bytes, "java/lang/Object"); // 3
+        bytes.extend_from_slice(&[7, 0, 3]); // 4: Class
+        utf8(&mut bytes, "PUBLIC"); // 5
+        utf8(&mut bytes, "I"); // 6
+        utf8(&mut bytes, "privateValue"); // 7
+        utf8(&mut bytes, "Ljava/lang/String;"); // 8
+        u2(&mut bytes, 0x0021); // access
+        u2(&mut bytes, 2); // this_class
+        u2(&mut bytes, 4); // super_class
+        u2(&mut bytes, 0); // interfaces
+        u2(&mut bytes, 2); // fields
+        u2(&mut bytes, 0x0009); // public static
+        u2(&mut bytes, 5);
+        u2(&mut bytes, 6);
+        u2(&mut bytes, 0); // attributes
+        u2(&mut bytes, 0x0002); // private
+        u2(&mut bytes, 7);
+        u2(&mut bytes, 8);
+        u2(&mut bytes, 0); // attributes
+        u2(&mut bytes, 0); // methods
+        u2(&mut bytes, 0); // class attributes
+
+        let target = ClassFile::parse(&bytes).unwrap();
+        assert_eq!(target.name, "demo/ReflectiveFields");
+        assert_eq!(target.fields.len(), 2);
+        assert_eq!(target.fields[0].name, "PUBLIC");
+        assert_eq!(target.fields[0].descriptor, "I");
+        assert!(target.fields[0].is_static());
+
+        let classes = BTreeMap::from([(target.name.clone(), target)]);
+        let mut host = NullHost;
+        let mut runtime = Runtime {
+            classes: &classes,
+            host: &mut host,
+            calls: 0,
+            fields: BTreeMap::new(),
+            static_fields: BTreeMap::new(),
+            initialized_classes: std::collections::BTreeSet::new(),
+            arrays: BTreeMap::new(),
+            next_array: 0,
+            next_object: 0,
+            streams: BTreeMap::new(),
+            next_stream: 0,
+        };
+        let class = Value::Ref(Some("demo/ReflectiveFields".into()));
+        let declared_fields = runtime
+            .invoke_reflect_method(
+                &MethodRef {
+                    owner: "java/lang/Class".into(),
+                    name: "getDeclaredFields".into(),
+                    descriptor: "()[Ljava/lang/reflect/Field;".into(),
+                },
+                Some(&class),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let declared_marker = expect_ref(&declared_fields).unwrap();
+        let declared = runtime.arrays.get(declared_marker).unwrap().clone();
+        assert_eq!(declared.len(), 2);
+
+        let public_fields = runtime
+            .invoke_reflect_method(
+                &MethodRef {
+                    owner: "java/lang/Class".into(),
+                    name: "getFields".into(),
+                    descriptor: "()[Ljava/lang/reflect/Field;".into(),
+                },
+                Some(&class),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let public_marker = expect_ref(&public_fields).unwrap();
+        let public = runtime.arrays.get(public_marker).unwrap();
+        assert_eq!(public, &[declared[0].clone()]);
+
+        let mut std_host = StdHost::new();
+        let field_name = MethodRef {
+            owner: "java/lang/reflect/Field".into(),
+            name: "getName".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            std_host
+                .invoke_instance(&field_name, &declared[0], &[])
+                .unwrap(),
+            Value::Ref(Some("PUBLIC".into()))
+        );
+        let field_modifiers = MethodRef {
+            owner: "java/lang/reflect/Field".into(),
+            name: "getModifiers".into(),
+            descriptor: "()I".into(),
+        };
+        assert_eq!(
+            std_host
+                .invoke_instance(&field_modifiers, &declared[0], &[])
+                .unwrap(),
+            Value::Int(9)
         );
     }
 
