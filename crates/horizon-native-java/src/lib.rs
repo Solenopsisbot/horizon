@@ -202,6 +202,10 @@ pub struct StdHost {
     /// `ClassLoader` query surface. The host never opens files or consults a
     /// process classpath.
     resources: BTreeMap<String, String>,
+    /// Bounded bytes for resources explicitly supplied by a loaded jar or
+    /// adapter. Marker-only resources keep an empty stream.
+    resource_bytes: BTreeMap<String, Vec<u8>>,
+    resource_streams: BTreeMap<String, (Vec<u8>, usize)>,
     /// Explicitly seeded class names exposed through `ClassLoader.loadClass`.
     /// Values are class markers, and no host classpath or filesystem lookup is
     /// ever attempted.
@@ -258,6 +262,8 @@ impl StdHost {
             properties: BTreeMap::from([("line.separator".into(), "\n".into())]),
             environment: BTreeMap::new(),
             resources: BTreeMap::new(),
+            resource_bytes: BTreeMap::new(),
+            resource_streams: BTreeMap::new(),
             classes: BTreeMap::new(),
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
@@ -304,7 +310,27 @@ impl StdHost {
     /// queries return this marker when `name` is requested; absent names stay
     /// null. This is metadata only and never reads a host file.
     pub fn with_resource(mut self, name: impl Into<String>, marker: impl Into<String>) -> Self {
-        self.resources.insert(name.into(), marker.into());
+        let name = name.into().trim_start_matches('/').to_owned();
+        let marker = marker.into();
+        self.resources.insert(name, marker.clone());
+        self.resource_streams
+            .entry(marker)
+            .or_insert((Vec::new(), 0));
+        self
+    }
+
+    /// Seed bounded bytes for an explicitly supplied resource. This never
+    /// opens a host path or consults a process classpath.
+    pub fn with_resource_bytes(mut self, name: impl Into<String>, bytes: Vec<u8>) -> Self {
+        let name = name.into().trim_start_matches('/').to_owned();
+        let marker = self
+            .resources
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| format!("resource-bytes/{name}"));
+        self.resources.insert(name.clone(), marker.clone());
+        self.resource_bytes.insert(name, bytes.clone());
+        self.resource_streams.insert(marker, (bytes, 0));
         self
     }
 
@@ -329,6 +355,20 @@ impl StdHost {
             .map(|value| vec![Value::Ref(Some(value.to_owned()))])
             .unwrap_or_default();
         self.iterators.insert(marker.clone(), (values, 0));
+        Value::Ref(Some(marker))
+    }
+
+    fn resource_stream(&mut self, name: &str) -> Value {
+        let Some(marker) = self.resource(name).map(str::to_owned) else {
+            return Value::Ref(None);
+        };
+        if let Some(bytes) = self.resource_bytes.get(name).cloned() {
+            self.resource_streams.insert(marker.clone(), (bytes, 0));
+        } else {
+            self.resource_streams
+                .entry(marker.clone())
+                .or_insert((Vec::new(), 0));
+        }
         Value::Ref(Some(marker))
     }
 
@@ -1350,14 +1390,17 @@ impl Host for StdHost {
                 "java/lang/ClassLoader",
                 "getSystemResource",
                 "(Ljava/lang/String;)Ljava/net/URL;",
-            )
-            | (
+            ) => {
+                let name = expect_string(Self::argument(r, args, 0)?);
+                Ok(Value::Ref(self.resource(name).map(str::to_owned)))
+            }
+            (
                 "java/lang/ClassLoader",
                 "getSystemResourceAsStream",
                 "(Ljava/lang/String;)Ljava/io/InputStream;",
             ) => {
                 let name = expect_string(Self::argument(r, args, 0)?);
-                Ok(Value::Ref(self.resource(name).map(str::to_owned)))
+                Ok(self.resource_stream(name))
             }
             (
                 "java/lang/ClassLoader",
@@ -1499,7 +1542,7 @@ impl Host for StdHost {
                 && r.descriptor == "(Ljava/lang/String;)Ljava/io/InputStream;"
             {
                 let name = expect_string(Self::argument(r, args, 0)?);
-                return Ok(Value::Ref(self.resource(name).map(str::to_owned)));
+                return Ok(self.resource_stream(name));
             }
             if r.name == "getResources"
                 && r.descriptor == "(Ljava/lang/String;)Ljava/util/Enumeration;"
@@ -1507,6 +1550,40 @@ impl Host for StdHost {
                 let name = expect_string(Self::argument(r, args, 0)?);
                 return Ok(self.resource_enumeration(name));
             }
+        }
+        if r.owner == "java/io/InputStream" || r.owner == "java/io/ByteArrayInputStream" {
+            let marker = expect_ref(receiver).ok_or_else(|| {
+                NativeError::Metadata("malformed java/io/InputStream marker".into())
+            })?;
+            let (bytes, index) = self.resource_streams.get_mut(marker).ok_or_else(|| {
+                NativeError::Metadata("unknown java/io/InputStream marker".into())
+            })?;
+            return match (r.name.as_str(), r.descriptor.as_str()) {
+                ("read", "()I") => {
+                    let value = bytes.get(*index).copied().map_or(-1, i32::from);
+                    if value >= 0 {
+                        *index += 1;
+                    }
+                    Ok(Value::Int(value))
+                }
+                ("available", "()I") => Ok(Value::Int(
+                    bytes.len().saturating_sub(*index).min(i32::MAX as usize) as i32,
+                )),
+                ("skip", "(J)J") => {
+                    let amount = expect_int(r, Self::argument(r, args, 0)?)?.max(0) as usize;
+                    let skipped = amount.min(bytes.len().saturating_sub(*index));
+                    *index += skipped;
+                    Ok(Value::Int(skipped as i32))
+                }
+                ("close", "()V") => {
+                    *index = bytes.len();
+                    Ok(Value::Void)
+                }
+                _ => Err(NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    r.owner, r.name, r.descriptor
+                ))),
+            };
         }
         if r.owner == "java/text/NumberFormat"
             && r.name == "format"
@@ -5308,6 +5385,7 @@ pub struct NativeJar {
     /// expose host file handles or arbitrary bytes, but loader code can still
     /// resolve the same resource names it would see on the jar classpath.
     resources: BTreeMap<String, String>,
+    resource_bytes: BTreeMap<String, Vec<u8>>,
     pub fabric_id: Option<String>,
     pub fabric_version: Option<String>,
     /// The first mod's id/version from Forge or NeoForge `mods.toml`.
@@ -5327,6 +5405,9 @@ pub struct NativeJar {
     pub native_id: Option<String>,
     pub native_declarations: Vec<RegistryEntry>,
 }
+
+const MAX_RESOURCE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RESOURCE_TOTAL: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entrypoint {
@@ -5369,6 +5450,8 @@ impl NativeJar {
         let mut zip = zip::ZipArchive::new(file).map_err(|e| NativeError::Zip(e.to_string()))?;
         let mut classes = Vec::new();
         let mut resources = BTreeMap::new();
+        let mut resource_bytes = BTreeMap::new();
+        let mut resource_total = 0usize;
         let mut neoforge_entrypoints = Vec::new();
         let mut metadata = None;
         let mut neoforge_metadata = None;
@@ -5383,27 +5466,46 @@ impl NativeJar {
                 resources
                     .entry(name.clone())
                     .or_insert_with(|| format!("jar-resource/{name}"));
-            }
-            if name == "fabric.mod.json" {
-                let mut text = String::new();
-                std::io::Read::read_to_string(&mut e, &mut text)
-                    .map_err(|e| NativeError::Metadata(e.to_string()))?;
-                metadata = Some(text);
-            } else if name == "META-INF/neoforge.mods.toml" {
-                let mut text = String::new();
-                std::io::Read::read_to_string(&mut e, &mut text)
-                    .map_err(|e| NativeError::Metadata(e.to_string()))?;
-                neoforge_metadata = Some(text);
-            } else if name == "META-INF/mods.toml" {
-                let mut text = String::new();
-                std::io::Read::read_to_string(&mut e, &mut text)
-                    .map_err(|e| NativeError::Metadata(e.to_string()))?;
-                forge_metadata = Some(text);
-            } else if name == "META-INF/horizon-native.json" {
-                let mut text = String::new();
-                std::io::Read::read_to_string(&mut e, &mut text)
-                    .map_err(|e| NativeError::Metadata(e.to_string()))?;
-                native_metadata = Some(text);
+                let metadata_entry = matches!(
+                    name.as_str(),
+                    "fabric.mod.json"
+                        | "META-INF/neoforge.mods.toml"
+                        | "META-INF/mods.toml"
+                        | "META-INF/horizon-native.json"
+                );
+                let exceeds_limit = e.size() > MAX_RESOURCE_BYTES as u64
+                    || e.size() > MAX_RESOURCE_TOTAL.saturating_sub(resource_total) as u64;
+                if exceeds_limit {
+                    if metadata_entry {
+                        return Err(NativeError::Metadata(format!(
+                            "resource {name} exceeds bounded native size limits"
+                        )));
+                    }
+                    continue;
+                }
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut e, &mut bytes)
+                    .map_err(|e| NativeError::Zip(e.to_string()))?;
+                if bytes.len() <= MAX_RESOURCE_BYTES
+                    && resource_total.saturating_add(bytes.len()) <= MAX_RESOURCE_TOTAL
+                {
+                    resource_total = resource_total.saturating_add(bytes.len());
+                    resource_bytes.insert(name.clone(), bytes.clone());
+                }
+                let text = || {
+                    String::from_utf8(bytes.clone())
+                        .map_err(|e| NativeError::Metadata(e.to_string()))
+                };
+                if name == "fabric.mod.json" {
+                    metadata = Some(text()?);
+                } else if name == "META-INF/neoforge.mods.toml" {
+                    neoforge_metadata = Some(text()?);
+                } else if name == "META-INF/mods.toml" {
+                    forge_metadata = Some(text()?);
+                } else if name == "META-INF/horizon-native.json" {
+                    native_metadata = Some(text()?);
+                }
+                continue;
             } else if name.ends_with(".class")
                 && !name.ends_with("module-info.class")
                 && !name.ends_with("package-info.class")
@@ -5439,6 +5541,7 @@ impl NativeJar {
             .unwrap_or((None, Vec::new()));
         let mut jar = Self::from_classes(classes);
         jar.resources = resources;
+        jar.resource_bytes = resource_bytes;
         jar.fabric_id = fabric_id;
         jar.fabric_version = fabric_version;
         jar.neoforge_id = neoforge_id;
@@ -5496,6 +5599,9 @@ impl NativeJar {
     pub fn seed_host(&self, mut host: StdHost) -> StdHost {
         for (name, marker) in &self.resources {
             host = host.with_resource(name, marker);
+            if let Some(bytes) = self.resource_bytes.get(name) {
+                host = host.with_resource_bytes(name, bytes.clone());
+            }
         }
         if let Some(id) = self.fabric_id.as_deref().or(self.neoforge_id.as_deref()) {
             let version = self
@@ -8091,7 +8197,7 @@ mandatory = true
                 "fabric.mod.json",
             ]
         );
-        let host = jar.seed_host(StdHost::new());
+        let mut host = jar.seed_host(StdHost::new());
         assert_eq!(
             host.resource("assets/resource-fixture/lang/en_us.json"),
             Some("jar-resource/assets/resource-fixture/lang/en_us.json")
@@ -8099,6 +8205,28 @@ mandatory = true
         assert_eq!(
             host.resource("/data/resource-fixture/recipes/wand.json"),
             Some("jar-resource/data/resource-fixture/recipes/wand.json")
+        );
+        let stream = MethodRef {
+            owner: "java/lang/ClassLoader".into(),
+            name: "getSystemResourceAsStream".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/io/InputStream;".into(),
+        };
+        let stream_value = host
+            .invoke(
+                &stream,
+                &[Value::Ref(Some(
+                    "assets/resource-fixture/lang/en_us.json".into(),
+                ))],
+            )
+            .unwrap();
+        let read = MethodRef {
+            owner: "java/io/InputStream".into(),
+            name: "read".into(),
+            descriptor: "()I".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&read, &stream_value, &[]).unwrap(),
+            Value::Int(i32::from(b'{'))
         );
         std::fs::remove_file(path).unwrap();
     }
@@ -8791,6 +8919,50 @@ mandatory = true
             host.invoke_instance(&stream, &loader, &[Value::Ref(Some("missing.txt".into()))])
                 .unwrap(),
             Value::Ref(None)
+        );
+        host = host.with_resource_bytes("assets/bytes.bin", vec![97, 98, 99]);
+        let byte_stream = host
+            .invoke_instance(
+                &stream,
+                &loader,
+                &[Value::Ref(Some("assets/bytes.bin".into()))],
+            )
+            .unwrap();
+        let read = MethodRef {
+            owner: "java/io/InputStream".into(),
+            name: "read".into(),
+            descriptor: "()I".into(),
+        };
+        let available = MethodRef {
+            owner: "java/io/InputStream".into(),
+            name: "available".into(),
+            descriptor: "()I".into(),
+        };
+        let skip = MethodRef {
+            owner: "java/io/InputStream".into(),
+            name: "skip".into(),
+            descriptor: "(J)J".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&available, &byte_stream, &[]).unwrap(),
+            Value::Int(3)
+        );
+        assert_eq!(
+            host.invoke_instance(&read, &byte_stream, &[]).unwrap(),
+            Value::Int(97)
+        );
+        assert_eq!(
+            host.invoke_instance(&skip, &byte_stream, &[Value::Int(1)])
+                .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(&read, &byte_stream, &[]).unwrap(),
+            Value::Int(99)
+        );
+        assert_eq!(
+            host.invoke_instance(&read, &byte_stream, &[]).unwrap(),
+            Value::Int(-1)
         );
 
         let resources = MethodRef {
