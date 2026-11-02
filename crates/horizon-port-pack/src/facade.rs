@@ -1882,13 +1882,10 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     // records (Success, Fail, Pass, TryEmptyHandInteraction), so preserve the
     // bounded result predicate and Success value accessors instead of treating
     // it as the old enum-shaped API.
-    if class == "net/minecraft/world/InteractionResult" {
-        match (method, ret, descriptor) {
-            ("consumesAction", "boolean", _) => {
-                return "return this instanceof InteractionResult.Success;".to_owned();
-            }
-            _ => {}
-        }
+    if class == "net/minecraft/world/InteractionResult"
+        && let ("consumesAction", "boolean", _) = (method, ret, descriptor)
+    {
+        return "return this instanceof InteractionResult.Success;".to_owned();
     }
     if class == "net/minecraft/world/InteractionResult$Success" {
         match (method, ret, descriptor) {
@@ -3445,6 +3442,7 @@ fn voxel_shape_placeholder() -> String {
         + "};"
 }
 
+#[cfg(test)]
 fn runtime_field_default(class: &str, descriptor: &str, fallback: &str) -> String {
     runtime_field_default_named(class, "", descriptor, fallback)
 }
