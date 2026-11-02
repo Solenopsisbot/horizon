@@ -212,9 +212,9 @@ JDK classpath discovery is reported with the same bounded rule. References to `S
 to `ServiceLoader.load`/`loadInstalled` or `ClassLoader.getResource*`/`loadClass` mark a jar as dynamic,
 with the exact owner and method in its diagnostic list. The census does not emulate providers or resource
 lookup. Native execution accepts `ServiceLoader.load` and `loadInstalled` only for providers explicitly
-seeded through the host contract, exposes a bounded iterator over those providers, and reports an
-unsupported diagnostic for unseeded services; it never scans the host class path. The embedded JVM remains
-responsible for arbitrary provider discovery.
+seeded through the host contract, and `ClassLoader.loadClass` only for explicitly seeded class markers.
+Both surfaces report an unsupported diagnostic for unseeded names and never scan the host class path; the
+embedded JVM remains responsible for arbitrary provider and class discovery.
 
 ## Phase 1, first slice (measured 1 November 2026)
 
@@ -226,6 +226,11 @@ resource through the bounded host, and hands every declaration to a typed regist
 checks that an unknown declaration kind is rejected at the jar boundary. This keeps the loader, resource,
 and registry boundaries deterministic without depending on a player's installed jars or committing a
 binary artifact.
+
+The native event path has a source-built Fabric fixture in
+`crates/horizon-native-java/tests/fixture_fabric_event.rs`. It compiles a tiny `EventFactory`/`Event`
+API, executes a real `invokedynamic` listener registration, and dispatches the recorded listener through
+`StdHost::dispatch_event`; this keeps event registration and callback routing covered with real classfiles.
 
 The Forge-family probe has a matching source-built fixture in
 `crates/horizon-native-java/tests/fixture_legacy_forge.rs`. It compiles a tiny legacy Forge `@Mod`
@@ -554,7 +559,9 @@ That bootstrap class-loader marker supports bounded `getResource(String)` and
 `getResourceAsStream(String)` queries against resources explicitly seeded with
 `StdHost::with_resource`. Missing names return null, and the native host never
 opens files or consults the process classpath; `StdHost::resource` exposes the
-same marker lookup to a game-owned adapter.
+same marker lookup to a game-owned adapter. `StdHost::with_class` supplies the matching bounded
+`ClassLoader.loadClass` marker for a known binary or internal class name; missing classes remain explicit
+errors.
 The native host also exposes `StdHost::with_service_provider` for deterministic `ServiceLoader`
 fixtures. `ServiceLoader.load`/`loadInstalled` return a seeded service marker, `iterator()` yields the
 seeded provider class markers, and `reload()` is a bounded no-op; missing services remain explicit errors.
