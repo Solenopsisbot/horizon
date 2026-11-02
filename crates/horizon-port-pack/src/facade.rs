@@ -1445,6 +1445,7 @@ fn render(
     if class.name == "net/minecraft/world/item/ItemStack" {
         let required = [
             ("getCount", "()I", "int", ""),
+            ("isDamageable", "()Z", "boolean", ""),
             (
                 "getItem",
                 "()Lnet/minecraft/world/item/Item;",
@@ -2175,6 +2176,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     if class.starts_with("net/minecraft/core/Holder$") {
         match (method, ret) {
             ("value", _) => return "return horizonValue;".to_owned(),
+            ("key", "net.minecraft.resources.ResourceKey") => {
+                return "return horizonKey;".to_owned();
+            }
             ("unwrapKey", "java.util.Optional") => {
                 return "return java.util.Optional.ofNullable(horizonKey);".to_owned();
             }
@@ -2303,6 +2307,7 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("getDamageValue", "int") => return "return horizonDamage;".to_owned(),
             ("setDamageValue", "void") => return "horizonDamage = Math.max(0, p0);".to_owned(),
             ("getMaxDamage", "int") => return "return 0;".to_owned(),
+            ("isDamageable", "boolean") => return "return false;".to_owned(),
             ("isEnchanted", "boolean") => return "return false;".to_owned(),
             ("getUseDuration", "int") => return "return 0;".to_owned(),
             ("getHoverName", "net.minecraft.network.chat.Component") => {
@@ -3698,6 +3703,14 @@ mod tests {
             "return 64;"
         );
         assert_eq!(
+            runtime_body(
+                "net/minecraft/world/item/ItemStack",
+                "isDamageable",
+                "boolean"
+            ),
+            "return false;"
+        );
+        assert_eq!(
             runtime_body("net/minecraft/world/item/ItemStack", "hasFoil", "boolean"),
             "return false;"
         );
@@ -4867,6 +4880,12 @@ mod tests {
                     access: 0x0001,
                     kind: MemberKind::Method,
                 },
+                Declared {
+                    name: "key".to_owned(),
+                    descriptor: "()Lnet/minecraft/resources/ResourceKey;".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
             ],
             ..Class::default()
         };
@@ -4876,6 +4895,10 @@ mod tests {
             Some(&BTreeSet::from([
                 ("value".to_owned(), "()Ljava/lang/Object;".to_owned()),
                 ("unwrapKey".to_owned(), "()Ljava/util/Optional;".to_owned()),
+                (
+                    "key".to_owned(),
+                    "()Lnet/minecraft/resources/ResourceKey;".to_owned(),
+                ),
             ])),
             &BTreeMap::new(),
             &BTreeSet::new(),
@@ -4888,6 +4911,16 @@ mod tests {
         assert!(source.contains("void horizonBind(Object value"));
         assert!(source.contains("return horizonValue;"));
         assert!(source.contains("return java.util.Optional.ofNullable(horizonKey);"));
+        assert!(source.contains("return horizonKey;"));
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/Holder$Reference",
+                "key",
+                "net.minecraft.resources.ResourceKey",
+                "()Lnet/minecraft/resources/ResourceKey;",
+            ),
+            "return horizonKey;"
+        );
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/core/Registry",

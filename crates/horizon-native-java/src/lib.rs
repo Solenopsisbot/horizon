@@ -2166,6 +2166,16 @@ impl Host for StdHost {
                 "()Ljava/lang/String;",
             ) => Ok(Value::Ref(Some(String::new()))),
             (
+                "net/fabricmc/loader/api/metadata/ModMetadata",
+                "getProvides",
+                "()Ljava/util/Collection;",
+            ) => Ok(collection_empty("list")),
+            (
+                "net/fabricmc/loader/api/metadata/ModMetadata",
+                "getDependencies",
+                "()Ljava/util/Map;",
+            ) => Ok(collection_empty("map")),
+            (
                 "net/fabricmc/loader/api/Version",
                 "getFriendlyString" | "getRaw" | "toString",
                 "()Ljava/lang/String;",
@@ -7097,6 +7107,56 @@ mandatory = true
             host.invoke_instance(&name, &Value::Ref(Some("metadata/demo/1.2.3".into())), &[])
                 .unwrap(),
             Value::Ref(Some("demo".into()))
+        );
+        let provides = MethodRef {
+            owner: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
+            name: "getProvides".into(),
+            descriptor: "()Ljava/util/Collection;".into(),
+        };
+        let provides_value = host
+            .invoke_instance(
+                &provides,
+                &Value::Ref(Some("metadata/demo/1.2.3".into())),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/Collection".into(),
+                    name: "size".into(),
+                    descriptor: "()I".into(),
+                },
+                &provides_value,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(0)
+        );
+        let dependencies = MethodRef {
+            owner: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
+            name: "getDependencies".into(),
+            descriptor: "()Ljava/util/Map;".into(),
+        };
+        let dependencies_value = host
+            .invoke_instance(
+                &dependencies,
+                &Value::Ref(Some("metadata/demo/1.2.3".into())),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/Map".into(),
+                    name: "size".into(),
+                    descriptor: "()I".into(),
+                },
+                &dependencies_value,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(0)
         );
         let version = MethodRef {
             owner: "net/fabricmc/loader/api/metadata/ModMetadata".into(),

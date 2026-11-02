@@ -481,8 +481,9 @@ String `replace` (character and `CharSequence` forms), `trim`, `strip`, and `isB
 deterministic, covering namespace/path normalization used by loader metadata and registration code.
 `System.getProperties()` exposes the seeded properties as a bounded `Properties` map, so bootstrap code
 can use the same key/value queries as `getProperty` without crossing the host boundary.
-`StdHost` also exposes deterministic Fabric loader values for mod-presence checks, metadata ids, names and
-versions (including `Version.getRaw`/`getFriendlyString`), environment type (`CLIENT` by default, or
+`StdHost` also exposes deterministic Fabric loader values for mod-presence checks, metadata ids, names,
+versions, empty `getProvides` and `getDependencies` collections (including
+`Version.getRaw`/`getFriendlyString`), environment type (`CLIENT` by default, or
 `SERVER` via `with_environment_type`, including `EnvType.isClient`, `name`, and `ordinal`), and the
 game/config/mods paths, plus a deterministic `getAllMods` list backed by the seeded containers; callers seed the loaded-mod map with
 `with_mod`. NeoForge's `ModList.get().isLoaded` and `getModContainerById` use the same seeded map and
@@ -639,7 +640,7 @@ with it, what Horizon has, and the bridge's answer.
 | Java side | What mods do with it | Horizon today | Bridge |
 |---|---|---|---|
 | `Registry`, `DeferredRegister`, `RegisterEvent` | register blocks, items, entities, menus | `mod_content` (`data/<ns>/horizon/*.json`), native registries | the native host records registration intent now; typed declarations must be exported before the immutable tables load so bridged and carried content share one namespace |
-| `Holder`, `Holder.Reference`, `HolderSet` | retain a registered value, compare its key, inspect optional bindings | native registry handles and typed declarations | generated holder references retain a bounded value/key/id triple; `registerForHolder` binds it, while `HolderSet` exposes empty-safe size, membership, stream, and factory defaults until live cross-mod membership is wired |
+| `Holder`, `Holder.Reference`, `HolderSet` | retain a registered value, compare its key, inspect optional bindings | native registry handles and typed declarations | generated holder references retain a bounded value/key/id triple and expose `key()`; `registerForHolder` binds it, while `HolderSet` exposes empty-safe size, membership, stream, and factory defaults until live cross-mod membership is wired |
 | `Block`, `BlockState`, `BlockBehaviour.Properties` | behaviour, states, shapes | `horizon-items/blocks.rs`, `horizon-world/level/` | façade superclass; calls route to Horizon's trait dispatch; unknown behaviours are reported per class |
 | `ItemStack`, `DataComponents` | item data, NBT-free components | `items.rs`, `item_data.rs` | mirrored value; the component map is 1:1 with Horizon's, which is the luckiest alignment in this design |
 | `BlockEntity`, `BlockEntityType`, `saveAdditional` | machines, NBT | `native_block_entity` family (API 15–18) | Java object owns the NBT mirror; Rust calls `tick`, `load`, `save` at the same points |
@@ -680,7 +681,7 @@ copy is a handful of small objects rather than an NBT tree walk. This one coinci
 would otherwise have been the worst hotspot in the design.
 The generated façade now preserves the common item/count value path (`getCount`, `setCount`, `isEmpty`,
 `getItem`, `copy`, `copyWithCount`, `grow`, and `shrink`) plus bounded stack inspection (`getMaxStackSize`,
-`hasFoil`, bounded damage/enchantment/use-duration inspection, and `getHoverName`) so bootstrap code
+`hasFoil`, `isDamageable`, bounded damage/enchantment/use-duration inspection, and `getHoverName`) so bootstrap code
 can inspect stacks before the full component bridge is attached. It also has a bounded erased component map: `get`,
 `getOrDefault`, `set`, `remove`, `has`, and `hasNonDefault` use the `DataComponentType` object as the
 key; generated `DataComponents` constants are distinct identity keys, absent values read as `null` (or
