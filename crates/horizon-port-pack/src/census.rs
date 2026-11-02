@@ -207,6 +207,9 @@ pub struct JarCensus {
     /// executed and these fields do not affect weaving.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mixin_config_fields: BTreeMap<String, Vec<String>>,
+    /// Scalar values for common Mixin config edge fields (report only).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mixin_config_values: BTreeMap<String, BTreeMap<String, String>>,
     /// Jars nested under `META-INF/jars/` that were read too.
     pub nested: usize,
     pub references: usize,
@@ -427,6 +430,7 @@ impl Census {
             mixin_config_names: jar::mixin_config_names(&names),
             mixin_config_targets: mixin_config_targets(&mut zip, &names),
             mixin_config_fields: mixin_config_fields(&mut zip, &names),
+            mixin_config_values: mixin_config_values(&mut zip, &names),
             nested,
             error,
             ..JarCensus::default()
@@ -774,6 +778,55 @@ fn mixin_config_fields(
     out
 }
 
+/// Reads scalar values for the common Mixin config edge fields. This is still
+/// report-only: values are never interpreted as loader or weaving policy.
+fn mixin_config_values(
+    zip: &mut zip::ZipArchive<fs::File>,
+    names: &[String],
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for name in jar::mixin_config_names(names)
+        .into_iter()
+        .take(MAX_MIXIN_CONFIG_FIELDS)
+    {
+        let Ok(mut entry) = zip.by_name(&name) else {
+            continue;
+        };
+        if entry.size() > MAX_MIXIN_CONFIG_BYTES {
+            continue;
+        }
+        let mut text = String::new();
+        if entry.read_to_string(&mut text).is_err() {
+            continue;
+        }
+        let Ok(serde_json::Value::Object(object)) = serde_json::from_str(&text) else {
+            continue;
+        };
+        let values = MIXIN_CONFIG_EDGE_FIELDS
+            .iter()
+            .filter_map(|field| {
+                object
+                    .get(*field)
+                    .and_then(config_scalar_text)
+                    .map(|value| ((*field).to_owned(), value))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if !values.is_empty() {
+            out.insert(name, values);
+        }
+    }
+    out
+}
+
+fn config_scalar_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::String(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
 fn collect_mixin_targets(value: &serde_json::Value, out: &mut Vec<String>) {
     if out.len() >= MAX_MIXIN_CONFIG_TARGETS {
         return;
@@ -1051,6 +1104,17 @@ mod tests {
                 "compatibilityLevel",
                 "priority"
             ]
+        );
+        assert_eq!(
+            census.jars[0].mixin_config_values["ruby.mixins.json"],
+            BTreeMap::from([
+                ("compatibilityLevel".to_owned(), "JAVA_25".to_owned()),
+                ("minVersion".to_owned(), "0.8".to_owned()),
+                ("plugin".to_owned(), "example.Plugin".to_owned()),
+                ("priority".to_owned(), "1200".to_owned()),
+                ("refmap".to_owned(), "ruby.refmap.json".to_owned()),
+                ("required".to_owned(), "true".to_owned()),
+            ])
         );
     }
 
