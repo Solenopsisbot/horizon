@@ -596,7 +596,7 @@ pub fn format_integer_us(value: i32) -> String {
         out.push('-');
     }
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
             out.push(',');
         }
         out.push(c);

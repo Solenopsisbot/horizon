@@ -864,6 +864,13 @@ impl Host for StdHost {
                     value => optional_wrap(value.clone()),
                 })
             }
+            // Keep Arrays.asList bounded when the interpreter passes an
+            // opaque array marker. The marker is retained as the list's
+            // single value; expanding runtime-owned array storage here would
+            // cross the host boundary and defeat invocation isolation.
+            ("java/util/Arrays", "asList", "([Ljava/lang/Object;)Ljava/util/List;") => {
+                Ok(collection_value("list", args))
+            }
             ("java/util/List", "of", descriptor) if descriptor.ends_with("Ljava/util/List;") => {
                 Ok(collection_value("list", args))
             }
@@ -898,6 +905,23 @@ impl Host for StdHost {
             ("java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => Ok(
                 Value::Int((Self::argument(r, args, 0)? == Self::argument(r, args, 1)?) as i32),
             ),
+            (
+                "java/util/Objects",
+                "requireNonNullElse",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ) => {
+                let value = Self::argument(r, args, 0)?;
+                if !matches!(value, Value::Ref(None)) {
+                    return Ok(value.clone());
+                }
+                let fallback = Self::argument(r, args, 1)?;
+                if matches!(fallback, Value::Ref(None)) {
+                    return Err(NativeError::Metadata(
+                        "java/util/Objects.requireNonNullElse received null fallback".into(),
+                    ));
+                }
+                Ok(fallback.clone())
+            }
             ("java/util/Objects", "requireNonNull", descriptor)
                 if descriptor.starts_with("(Ljava/lang/Object;")
                     && descriptor.ends_with(")Ljava/lang/Object;") =>
@@ -4056,7 +4080,7 @@ fn format_integer_us(value: i32) -> String {
     let digits = value.unsigned_abs().to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().enumerate() {
-        if index != 0 && (digits.len() - index).is_multiple_of(3) {
+        if index != 0 && (digits.len() - index) % 3 == 0 {
             grouped.push(',');
         }
         grouped.push(ch);
@@ -8025,6 +8049,21 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_maps_arrays_as_list_to_an_opaque_marker() {
+        let mut host = StdHost::new();
+        let as_list = MethodRef {
+            owner: "java/util/Arrays".into(),
+            name: "asList".into(),
+            descriptor: "([Ljava/lang/Object;)Ljava/util/List;".into(),
+        };
+        let array = Value::Ref(Some("array/java/lang/String/args/0".into()));
+        assert_eq!(
+            host.invoke(&as_list, std::slice::from_ref(&array)).unwrap(),
+            Value::Ref(Some("list/rarray/java/lang/String/args/0".into()))
+        );
+    }
+
+    #[test]
     fn standard_host_maps_component_text_values() {
         let mut host = StdHost::new();
         let literal = host
@@ -8230,6 +8269,34 @@ mandatory = true
             Value::Ref(Some("ok".into()))
         );
         assert!(host.invoke(&require, &[Value::Ref(None)]).is_err());
+        let require_else = MethodRef {
+            owner: "java/util/Objects".into(),
+            name: "requireNonNullElse".into(),
+            descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;".into(),
+        };
+        assert_eq!(
+            host.invoke(
+                &require_else,
+                &[
+                    Value::Ref(Some("value".into())),
+                    Value::Ref(Some("fallback".into()))
+                ],
+            )
+            .unwrap(),
+            Value::Ref(Some("value".into()))
+        );
+        assert_eq!(
+            host.invoke(
+                &require_else,
+                &[Value::Ref(None), Value::Ref(Some("fallback".into()))],
+            )
+            .unwrap(),
+            Value::Ref(Some("fallback".into()))
+        );
+        assert!(
+            host.invoke(&require_else, &[Value::Ref(None), Value::Ref(None)])
+                .is_err()
+        );
         let value_of = MethodRef {
             owner: "java/lang/String".into(),
             name: "valueOf".into(),
@@ -12074,18 +12141,64 @@ mandatory = true
     fn standard_host_maps_locale_us_integer_number_format() {
         let mut host = StdHost::new();
         let locale = host
-            .get_static(&MethodRef { owner: "java/util/Locale".into(), name: "US".into(), descriptor: "Ljava/util/Locale;".into() })
+            .get_static(&MethodRef {
+                owner: "java/util/Locale".into(),
+                name: "US".into(),
+                descriptor: "Ljava/util/Locale;".into(),
+            })
             .unwrap();
         assert_eq!(locale, Value::Ref(Some("locale/US".into())));
-        assert_eq!(host.invoke_instance(&MethodRef { owner: "java/util/Locale".into(), name: "toLanguageTag".into(), descriptor: "()Ljava/lang/String;".into() }, &locale, &[]).unwrap(), Value::Ref(Some("en-US".into())));
-        let format = host.invoke(&MethodRef { owner: "java/text/NumberFormat".into(), name: "getIntegerInstance".into(), descriptor: "(Ljava/util/Locale;)Ljava/text/NumberFormat;".into() }, &[locale]).unwrap();
-        assert_eq!(host.invoke_instance(&MethodRef { owner: "java/text/NumberFormat".into(), name: "format".into(), descriptor: "(I)Ljava/lang/String;".into() }, &format, &[Value::Int(-2_147_483_648)]).unwrap(), Value::Ref(Some("-2,147,483,648".into())));
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/Locale".into(),
+                    name: "toLanguageTag".into(),
+                    descriptor: "()Ljava/lang/String;".into()
+                },
+                &locale,
+                &[]
+            )
+            .unwrap(),
+            Value::Ref(Some("en-US".into()))
+        );
+        let format = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/text/NumberFormat".into(),
+                    name: "getIntegerInstance".into(),
+                    descriptor: "(Ljava/util/Locale;)Ljava/text/NumberFormat;".into(),
+                },
+                &[locale],
+            )
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/text/NumberFormat".into(),
+                    name: "format".into(),
+                    descriptor: "(I)Ljava/lang/String;".into()
+                },
+                &format,
+                &[Value::Int(-2_147_483_648)]
+            )
+            .unwrap(),
+            Value::Ref(Some("-2,147,483,648".into()))
+        );
     }
 
     #[test]
     fn standard_host_rejects_non_us_number_format_locale() {
         let mut host = StdHost::new();
-        let error = host.invoke(&MethodRef { owner: "java/text/NumberFormat".into(), name: "getIntegerInstance".into(), descriptor: "(Ljava/util/Locale;)Ljava/text/NumberFormat;".into() }, &[Value::Ref(Some("locale/FRANCE".into()))]).unwrap_err();
+        let error = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/text/NumberFormat".into(),
+                    name: "getIntegerInstance".into(),
+                    descriptor: "(Ljava/util/Locale;)Ljava/text/NumberFormat;".into(),
+                },
+                &[Value::Ref(Some("locale/FRANCE".into()))],
+            )
+            .unwrap_err();
         assert!(error.to_string().contains("only Locale.US"));
     }
 

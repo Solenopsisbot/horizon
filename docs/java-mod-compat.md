@@ -502,8 +502,8 @@ bounded `Number` primitive accessors across the supported boxed numeric markers,
 common `Character.isLetter`/`isDigit`/`toLowerCase` queries and
 `valueOf`/`charValue` boxing operations,
 `StringBuilder`/`StringBuffer` append and
-`toString` values, primitive `String.valueOf` overloads, plus `Objects.equals`, `requireNonNull`, and
-`toString`, which covers common loader bootstrap formatting and null checks without a JVM.
+`toString` values, primitive `String.valueOf` overloads, plus `Objects.equals`, `requireNonNull`,
+`requireNonNullElse`, and `toString`, which covers common loader bootstrap formatting and null checks without a JVM.
 String `replace` (character and `CharSequence` forms), `repeat`, `indexOf`, `lastIndexOf`, `trim`, `strip`, and `isBlank`
 are also deterministic, covering namespace/path normalization used by loader metadata and registration code. Repetition
 counts are bounded to keep native probes finite.
@@ -538,6 +538,8 @@ value semantics for loader bootstrap code, while unresolved callbacks remain exp
 key/value queries use escaped value markers; `Map.keySet`, `Map.values`, and `Collection.iterator` project those markers into bounded
 set/list views, while `Collection.forEach` invokes bounded `Consumer` callbacks, so bootstrap code can inspect
 immutable configuration collections without starting a JVM. Boxed
+`Arrays.asList(Object[])` is also available for bootstrap varargs; it preserves the opaque array marker as one bounded list value
+instead of exposing runtime-owned array storage.
 `Integer` and `Boolean` values preserve deterministic markers through `valueOf`, unboxing,
 equality, hashing, and string conversion. Bounded `Double` and `Float` parsing, boxing, unboxing,
 `isNaN`/`isInfinite`, and Java-style string conversion use deterministic floating-point markers;
