@@ -145,6 +145,11 @@ pub struct Injection {
     /// Values are intentionally not interpreted by the census.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata: Vec<String>,
+    /// Deterministic scalar values for the same report-only metadata. Nested
+    /// annotations such as `slice` are represented by the stable `present`
+    /// marker; no Mixin semantics are applied.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata_values: BTreeMap<String, String>,
 }
 
 /// The annotation that makes a class a Mixin.
@@ -537,6 +542,22 @@ fn injections(
                         .join("|")
                 })
                 .unwrap_or_default();
+            let metadata_values = [
+                "require",
+                "expect",
+                "cancellable",
+                "order",
+                "priority",
+                "slice",
+            ]
+            .into_iter()
+            .filter_map(|field| {
+                a.values
+                    .get(field)
+                    .and_then(metadata_text)
+                    .map(|value| (field.to_owned(), value))
+            })
+            .collect();
             out.push(Injection {
                 kind: kind.to_owned(),
                 method: if method.is_empty() {
@@ -557,6 +578,7 @@ fn injections(
                 .filter(|field| a.values.contains_key(*field))
                 .map(str::to_owned)
                 .collect(),
+                metadata_values,
             });
         }
     }
@@ -599,10 +621,15 @@ fn at_value(value: &Value) -> Option<String> {
 
 fn scalar_text(value: &Value) -> Option<String> {
     match value {
+        Value::Bool(value) => Some(value.to_string()),
         Value::Number(number) if number.fract() == 0.0 => Some(format!("{number:.0}")),
         Value::Number(number) => Some(number.to_string()),
         other => text(other),
     }
+}
+
+fn metadata_text(value: &Value) -> Option<String> {
+    scalar_text(value).or_else(|| matches!(value, Value::Ann(_)).then(|| "present".to_owned()))
 }
 
 /// The simple name of a Mixin annotation, if it is one.
@@ -1199,12 +1226,38 @@ mod tests {
                         values: BTreeMap::new(),
                     }),
                 ),
+                ("require".to_owned(), Value::Number(2.0)),
+                ("expect".to_owned(), Value::Number(4.0)),
+                ("cancellable".to_owned(), Value::Bool(true)),
+                ("order".to_owned(), Value::Number(900.0)),
+                ("priority".to_owned(), Value::Number(1200.0)),
             ]),
         };
         let methods = BTreeMap::from([("run".to_owned(), vec![inject])]);
         let parsed = injections(&methods, &BTreeMap::new());
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].metadata, ["slice"]);
+        assert_eq!(
+            parsed[0].metadata,
+            [
+                "require",
+                "expect",
+                "cancellable",
+                "order",
+                "priority",
+                "slice"
+            ]
+        );
+        assert_eq!(
+            parsed[0].metadata_values,
+            BTreeMap::from([
+                ("cancellable".to_owned(), "true".to_owned()),
+                ("expect".to_owned(), "4".to_owned()),
+                ("order".to_owned(), "900".to_owned()),
+                ("priority".to_owned(), "1200".to_owned()),
+                ("require".to_owned(), "2".to_owned()),
+                ("slice".to_owned(), "present".to_owned()),
+            ])
+        );
     }
 
     #[test]
