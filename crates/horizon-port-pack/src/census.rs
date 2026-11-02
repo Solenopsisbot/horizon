@@ -476,16 +476,22 @@ impl Census {
                 if !injection.at.is_empty() {
                     *self.at.entry(injection.at.clone()).or_default() += 1;
                 }
-                let method = strip_descriptor(&injection.method);
-                for target in &class.mixin_targets {
-                    *points
-                        .entry((
-                            target.clone(),
-                            method.to_owned(),
-                            injection.kind.clone(),
-                            injection.at.clone(),
-                        ))
-                        .or_default() += 1;
+                // Mixin permits one annotation to name several target
+                // methods. `classes::injections` keeps that source shape as
+                // a `|`-joined string; expand it here so each target method
+                // can match its own native hook instead of becoming one
+                // permanently report-only `foo|bar` point.
+                for method in injection_methods(&injection.method) {
+                    for target in &class.mixin_targets {
+                        *points
+                            .entry((
+                                target.clone(),
+                                method.to_owned(),
+                                injection.kind.clone(),
+                                injection.at.clone(),
+                            ))
+                            .or_default() += 1;
+                    }
                 }
             }
             jar.references += class.refs.len();
@@ -893,6 +899,13 @@ fn strip_descriptor(method: &str) -> &str {
     method.split(['(', ' ']).next().unwrap_or(method).trim()
 }
 
+/// Mixin's `method` element can be a scalar or an array. The class reader
+/// preserves arrays as `|`-joined text so this boundary can expand them into
+/// independently matchable native hook keys.
+fn injection_methods(methods: &str) -> impl Iterator<Item = &str> {
+    methods.split('|').map(strip_descriptor)
+}
+
 /// `count` first, then the name, so equal counts are stable.
 pub fn ranked(map: &BTreeMap<String, usize>, top: usize) -> Vec<(&String, usize)> {
     let mut rows: Vec<(&String, usize)> = map.iter().map(|(k, v)| (k, *v)).collect();
@@ -1234,6 +1247,14 @@ mod tests {
         assert_eq!(strip_descriptor("tick()V"), "tick");
         assert_eq!(strip_descriptor("tick"), "tick");
         assert_eq!(strip_descriptor("a b"), "a");
+    }
+
+    #[test]
+    fn mixin_method_lists_expand_into_independent_hook_keys() {
+        assert_eq!(
+            injection_methods("tick()V|render()V").collect::<Vec<_>>(),
+            ["tick", "render"]
+        );
     }
 
     #[test]
