@@ -484,6 +484,7 @@ The standard-library surface also includes deterministic `Integer.compare`/`toHe
 `Math.floorDiv`/`floorMod`/`addExact`, and
 bounded `Long.compare`/`toHexString`,
 `Long.parseLong`/`valueOf`/`toString`,
+bounded `Byte.parseByte`/`valueOf`/`byteValue`,
 `StringBuilder`/`StringBuffer` append and
 `toString` values, primitive `String.valueOf` overloads, plus `Objects.equals`, `requireNonNull`, and
 `toString`, which covers common loader bootstrap formatting and null checks without a JVM.
@@ -496,9 +497,10 @@ can use the same key/value queries as `getProperty` without crossing the host bo
 versions, empty `getProvides` and `getDependencies` collections (including
 `Version.getRaw`/`getFriendlyString`), environment type (`CLIENT` by default, or
 `SERVER` via `with_environment_type`, including `EnvType.isClient`, `name`, and `ordinal`), and the
-game/config/mods paths, plus a deterministic `getAllMods` list backed by the seeded containers; callers seed the loaded-mod map with
+game/config/mods paths, and a configurable `isDevelopmentEnvironment` marker (off by default), plus a deterministic `getAllMods` list backed by the seeded containers; callers seed the loaded-mod map with
 `with_mod`. NeoForge's `ModList.get().isLoaded`, `getMods`, and `getModContainerById` use the same seeded map and
-return deterministic container markers, covering the common loader-side dependency checks. Common
+return deterministic container markers, and `ModContainer.getModId` exposes the seeded id for
+NeoForge entrypoints. Common
 `Optional.empty`/`of`/`ofNullable` constructors and
 `isPresent`, `isEmpty`, `map`, `filter`, `equals`, `hashCode`, and `toString` preserve bounded optional
 value semantics for loader bootstrap code, while unresolved callbacks remain explicit markers. Common

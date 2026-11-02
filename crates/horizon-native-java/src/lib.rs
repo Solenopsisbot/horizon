@@ -197,6 +197,7 @@ pub struct StdHost {
     properties: BTreeMap<String, String>,
     mods: BTreeMap<String, String>,
     environment_type: String,
+    development_environment: bool,
     calls: Vec<MethodRef>,
     invocations: Vec<HostInvocation>,
     posted_events: Vec<Value>,
@@ -228,6 +229,7 @@ impl StdHost {
             properties: BTreeMap::from([("line.separator".into(), "\n".into())]),
             mods: BTreeMap::new(),
             environment_type: "CLIENT".into(),
+            development_environment: false,
             calls: Vec::new(),
             invocations: Vec::new(),
             posted_events: Vec::new(),
@@ -260,6 +262,13 @@ impl StdHost {
     /// behavior; server integrations should select `SERVER`.
     pub fn with_environment_type(mut self, environment_type: impl Into<String>) -> Self {
         self.environment_type = environment_type.into();
+        self
+    }
+
+    /// Set Fabric's development-environment marker returned by
+    /// `isDevelopmentEnvironment`.
+    pub fn with_development_environment(mut self, development_environment: bool) -> Self {
+        self.development_environment = development_environment;
         self
     }
 
@@ -558,6 +567,19 @@ impl Host for StdHost {
                     }
                 };
                 Ok(Value::Int(value))
+            }
+            ("java/lang/Byte", "parseByte", "(Ljava/lang/String;)B") => Ok(Value::Int(i32::from(
+                parse_java_byte(Self::argument(r, args, 0)?).map_err(|_| {
+                    NativeError::Metadata(
+                        "invalid byte argument for java/lang/Byte.parseByte".into(),
+                    )
+                })?,
+            ))),
+            ("java/lang/Byte", "valueOf", "(Ljava/lang/String;)Ljava/lang/Byte;") => {
+                let value = parse_java_byte(Self::argument(r, args, 0)?).map_err(|_| {
+                    NativeError::Metadata("invalid byte argument for java/lang/Byte.valueOf".into())
+                })?;
+                Ok(Value::Ref(Some(format!("byte:{value}"))))
             }
             ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
@@ -1890,6 +1912,11 @@ impl Host for StdHost {
                         .is_some_and(|other| Some(other) == boxed_integer(receiver)))
                     as i32,
             )),
+            ("java/lang/Byte", "byteValue", "()B") => {
+                Ok(Value::Int(boxed_byte(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Byte marker".into())
+                })? as i32))
+            }
             ("java/lang/Long", "longValue", "()J") => {
                 Ok(long_value(boxed_long(receiver).ok_or_else(|| {
                     NativeError::Metadata("malformed java/lang/Long marker".into())
@@ -2593,7 +2620,7 @@ impl Host for StdHost {
                 "()Lnet/fabricmc/api/EnvType;",
             ) => Ok(Value::Ref(Some(self.environment_type.clone()))),
             ("net/fabricmc/loader/api/FabricLoader", "isDevelopmentEnvironment", "()Z") => {
-                Ok(Value::Int(0))
+                Ok(Value::Int(self.development_environment as i32))
             }
             (
                 "net/fabricmc/loader/api/ModContainer",
@@ -2605,6 +2632,9 @@ impl Host for StdHost {
                     .unwrap_or_else(|| "mod-container/unknown/unknown".into())
                     .replacen("mod-container/", "metadata/", 1),
             ))),
+            ("net/neoforged/fml/ModContainer", "getModId", "()Ljava/lang/String;") => {
+                Ok(Value::Ref(Some(metadata_part(expect_ref(receiver), 1))))
+            }
             ("net/fabricmc/loader/api/metadata/ModMetadata", "getId", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(metadata_part(expect_ref(receiver), 1))))
             }
@@ -3159,6 +3189,20 @@ fn boxed_integer(value: &Value) -> Option<i32> {
         Value::Ref(Some(value)) => value
             .strip_prefix("integer:")
             .and_then(|value| value.parse::<i32>().ok()),
+        _ => None,
+    }
+}
+
+fn parse_java_byte(value: &Value) -> Result<i8, std::num::ParseIntError> {
+    expect_string(value).trim().parse::<i8>()
+}
+
+fn boxed_byte(value: &Value) -> Option<i8> {
+    match value {
+        Value::Int(value) => i8::try_from(*value).ok(),
+        Value::Ref(Some(value)) => value
+            .strip_prefix("byte:")
+            .and_then(|value| value.parse::<i8>().ok()),
         _ => None,
     }
 }
@@ -6593,6 +6637,47 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_maps_byte_wrapper_values() {
+        let mut host = StdHost::new();
+        let parse = MethodRef {
+            owner: "java/lang/Byte".into(),
+            name: "parseByte".into(),
+            descriptor: "(Ljava/lang/String;)B".into(),
+        };
+        assert_eq!(
+            host.invoke(&parse, &[Value::Ref(Some("-12".into()))])
+                .unwrap(),
+            Value::Int(-12)
+        );
+        let value_of = MethodRef {
+            owner: "java/lang/Byte".into(),
+            name: "valueOf".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/lang/Byte;".into(),
+        };
+        let boxed = host
+            .invoke(&value_of, &[Value::Ref(Some("127".into()))])
+            .unwrap();
+        assert_eq!(boxed, Value::Ref(Some("byte:127".into())));
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/lang/Byte".into(),
+                    name: "byteValue".into(),
+                    descriptor: "()B".into(),
+                },
+                &boxed,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(127)
+        );
+        assert!(
+            host.invoke(&parse, &[Value::Ref(Some("128".into()))])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn standard_host_maps_checked_integer_math() {
         let mut host = StdHost::new();
         let add_exact = MethodRef {
@@ -8144,6 +8229,22 @@ mandatory = true
                 .unwrap(),
             Value::Ref(Some("SERVER".into()))
         );
+        let development = MethodRef {
+            owner: "net/fabricmc/loader/api/FabricLoader".into(),
+            name: "isDevelopmentEnvironment".into(),
+            descriptor: "()Z".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&development, &loader, &[]).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            StdHost::new()
+                .with_development_environment(true)
+                .invoke_instance(&development, &loader, &[])
+                .unwrap(),
+            Value::Int(1)
+        );
         let loaded = MethodRef {
             owner: "net/fabricmc/loader/api/FabricLoader".into(),
             name: "isModLoaded".into(),
@@ -8421,6 +8522,19 @@ mandatory = true
             host.invoke_instance(&container, &list, &[Value::Ref(Some("demo".into()))])
                 .unwrap(),
             Value::Ref(Some("neoforge-mod-container/demo/1.2.3".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/neoforged/fml/ModContainer".into(),
+                    name: "getModId".into(),
+                    descriptor: "()Ljava/lang/String;".into(),
+                },
+                &Value::Ref(Some("neoforge-mod-container/demo/1.2.3".into())),
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("demo".into()))
         );
         let mods = MethodRef {
             owner: "net/neoforged/fml/ModList".into(),
