@@ -26,9 +26,18 @@ The JSON holds the ranked surface per jar and merged; the command prints the mer
 
 For native hook translation, `census.json` also includes `hook_points`: a map keyed by
 `target#method`. Its rows retain the injection `kind`, the exact `at` (`@At`) value, count,
-and any matching native hook names. Accessor, invoker, and shadow rows are omitted because
+and any matching native hook names in the explicit `native_hooks` array. An empty array is the
+unsupported-mixin diagnostic: the point needs a façade-owned Java method or a new native hook.
+Accessor, invoker, and shadow rows are omitted because
 they require member shape rather than a call-site hook. This keeps consumers from having to
 filter and regroup the ranked `points` array.
+
+The report labels the bounded diagnostic explicitly. Mixin targets found by reading a
+`*.mixins.json` file are **report-only declarations**; the census does not execute a config or
+weave bytecode. Injection points whose target method has a native hook are **hook-covered**.
+The remaining call-site points are **report-only** and are counted in `points_report_only`, so an
+unsupported transform is visible without implying that the tool implements weaving.
+`mixin_config_targets_report_only` counts the target declarations collected from config JSON.
 
 The census also discovers loader access metadata without applying it. A Fabric jar's
 `accessWidener` path in `fabric.mod.json` is read and its access, extendable, mutable (including

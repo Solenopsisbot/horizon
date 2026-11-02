@@ -1018,6 +1018,85 @@ pub(crate) mod tests_support {
     pub fn class_file(name: &str, superclass: &str) -> Vec<u8> {
         class_with(name, superclass, &[], &[], false)
     }
+
+    /// A tiny class carrying a real `@Mixin(targets=...)` and method
+    /// `@Inject(method=..., at=@At(...))` annotation payload. Used by the
+    /// census fixture to exercise class-file annotation decoding.
+    pub fn annotated_mixin(name: &str, target: &str, method: &str) -> Vec<u8> {
+        let mut pool: Vec<Vec<u8>> = Vec::new();
+        let utf = |pool: &mut Vec<Vec<u8>>, s: &str| -> u16 {
+            let mut e = vec![1];
+            e.extend((s.len() as u16).to_be_bytes());
+            e.extend(s.as_bytes());
+            pool.push(e);
+            pool.len() as u16
+        };
+        let class = |pool: &mut Vec<Vec<u8>>, s: &str| -> u16 {
+            let u = utf(pool, s);
+            let mut e = vec![7];
+            e.extend(u.to_be_bytes());
+            pool.push(e);
+            pool.len() as u16
+        };
+        let this = class(&mut pool, name);
+        let sup = class(&mut pool, "java/lang/Object");
+        let mixin_ty = utf(&mut pool, "Lorg/spongepowered/asm/mixin/Mixin;");
+        let targets_name = utf(&mut pool, "targets");
+        let target_str = utf(&mut pool, target);
+        let inject_ty = utf(&mut pool, "Lorg/spongepowered/asm/mixin/inject/Inject;");
+        let method_name = utf(&mut pool, "method");
+        let method_str = utf(&mut pool, method);
+        let at_name = utf(&mut pool, "at");
+        let at_ty = utf(&mut pool, "Lorg/spongepowered/asm/mixin/injection/At;");
+        let value_name = utf(&mut pool, "value");
+        let head = utf(&mut pool, "HEAD");
+        let runtime_annotations = utf(&mut pool, "RuntimeVisibleAnnotations");
+        let run = utf(&mut pool, "run");
+        let desc = utf(&mut pool, "()V");
+        let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 65];
+        out.extend(((pool.len() + 1) as u16).to_be_bytes());
+        for e in &pool {
+            out.extend(e);
+        }
+        out.extend([0, 0x21]);
+        out.extend(this.to_be_bytes());
+        out.extend(sup.to_be_bytes());
+        out.extend([0, 0, 0, 0]); // interfaces, fields
+        out.extend([0, 1]); // one method
+        out.extend([0, 1]);
+        out.extend(run.to_be_bytes());
+        out.extend(desc.to_be_bytes());
+        let mut ma = Vec::new();
+        ma.extend([0, 1]); // one annotation
+        ma.extend(inject_ty.to_be_bytes());
+        ma.extend([0, 2]); // method + at
+        ma.extend(method_name.to_be_bytes());
+        ma.extend(*b"s");
+        ma.extend(method_str.to_be_bytes());
+        ma.extend(at_name.to_be_bytes());
+        ma.extend(*b"@");
+        ma.extend(at_ty.to_be_bytes());
+        ma.extend([0, 1]);
+        ma.extend(value_name.to_be_bytes());
+        ma.extend(*b"s");
+        ma.extend(head.to_be_bytes());
+        out.extend([0, 1]);
+        out.extend(runtime_annotations.to_be_bytes());
+        out.extend((ma.len() as u32).to_be_bytes());
+        out.extend(ma);
+        out.extend([0, 1]); // one class attribute
+        out.extend(runtime_annotations.to_be_bytes());
+        let mut ca = Vec::new();
+        ca.extend([0, 1]);
+        ca.extend(mixin_ty.to_be_bytes());
+        ca.extend([0, 1]);
+        ca.extend(targets_name.to_be_bytes());
+        ca.extend(*b"s");
+        ca.extend(target_str.to_be_bytes());
+        out.extend((ca.len() as u32).to_be_bytes());
+        out.extend(ca);
+        out
+    }
 }
 
 #[cfg(test)]

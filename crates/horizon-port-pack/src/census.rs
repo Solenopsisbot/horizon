@@ -154,6 +154,14 @@ pub struct Totals {
     pub points_needing_hooks: usize,
     /// Of those, how many land on a method a hook already names.
     pub points_covered: usize,
+    /// Injection points for which no native hook is known. These remain
+    /// report-only: the census never attempts to weave or emulate them.
+    #[serde(default)]
+    pub points_report_only: usize,
+    /// Mixin targets found only by reading configuration JSON. These are
+    /// report-only declarations, not proof that a target class was woven.
+    #[serde(default)]
+    pub mixin_config_targets_report_only: usize,
     /// `@Accessor`, `@Invoker` and `@Shadow` points that need a member shape,
     /// but no Rust call-site hook.
     pub member_only_points: usize,
@@ -207,7 +215,16 @@ pub struct PointCount {
     pub at: String,
     pub count: usize,
     /// The hooks that name this method, if any.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// The explicit `native_hooks` JSON name distinguishes Horizon's native
+    /// hook contract from Mixin metadata. `hooks` remains an input alias for
+    /// census files written before this contract was named.
+    #[serde(
+        rename = "native_hooks",
+        alias = "hooks",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub hooks: Vec<String>,
 }
 
@@ -217,7 +234,14 @@ pub struct HookPoint {
     pub kind: String,
     pub at: String,
     pub count: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Native hook names whose catalog `vanilla` contract matches this
+    /// `target#method`. The old `hooks` spelling is accepted when reading.
+    #[serde(
+        rename = "native_hooks",
+        alias = "hooks",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub hooks: Vec<String>,
 }
 
@@ -295,9 +319,10 @@ pub fn read_with(path: &Path, hooks: Option<&HookIndex>) -> Result<Census, Strin
             hooks: Vec::new(),
         })
         .collect();
-    if let Some(hooks) = hooks {
-        census.join(hooks);
-    }
+    // Always classify points. Without --hooks every call-site point is
+    // explicitly report-only; no transform is attempted.
+    let empty_hooks = HookIndex::default();
+    census.join(hooks.unwrap_or(&empty_hooks));
     census.rebuild_hook_points();
     Ok(census)
 }
@@ -394,6 +419,7 @@ impl Census {
         for target in &jar.mixin_config_targets {
             *self.mixin_config_targets.entry(target.clone()).or_default() += 1;
         }
+        self.totals.mixin_config_targets_report_only += jar.mixin_config_targets.len();
         for target in &jar.access_widener_targets {
             *self
                 .access_widener_targets
@@ -466,6 +492,7 @@ impl Census {
     pub fn join(&mut self, hooks: &HookIndex) {
         self.totals.points_needing_hooks = 0;
         self.totals.points_covered = 0;
+        self.totals.points_report_only = 0;
         self.totals.member_only_points = 0;
         for point in &mut self.points {
             if !NEEDS_HOOK.contains(&point.kind.as_str()) {
@@ -479,6 +506,8 @@ impl Census {
                 .unwrap_or_default();
             if !point.hooks.is_empty() {
                 self.totals.points_covered += point.count;
+            } else {
+                self.totals.points_report_only += point.count;
             }
         }
         self.rebuild_hook_points();
@@ -534,6 +563,16 @@ impl Census {
             out.push_str(&format!(
                 "hooks: {} of {} injection points at a hooked method ({share:.1}%)\n",
                 self.totals.points_covered, self.totals.points_needing_hooks
+            ));
+            out.push_str(&format!(
+                "mixin injection points: {} hook-covered, {} report-only (no weaving)\n",
+                self.totals.points_covered, self.totals.points_report_only
+            ));
+        }
+        if self.totals.mixin_config_targets_report_only > 0 {
+            out.push_str(&format!(
+                "mixin config targets: {} report-only (declarations only; no weaving)\n",
+                self.totals.mixin_config_targets_report_only
             ));
         }
         for (title, map) in [
@@ -884,6 +923,54 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_mixin_jar_discovers_json_targets_and_hook_points() {
+        let dir = std::env::temp_dir().join("horizon-census-mixin-fixture");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fixture.jar");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fixture.mixins.json", options).unwrap();
+        std::io::Write::write_all(
+            &mut zip,
+            br#"{"mixins":[{"target":"net.minecraft.Target"}],"client":[{"target":"net.minecraft.ClientTarget"}]}"#,
+        )
+        .unwrap();
+        zip.start_file("example/FixtureMixin.class", options)
+            .unwrap();
+        std::io::Write::write_all(
+            &mut zip,
+            &classes::tests_support::annotated_mixin(
+                "example/FixtureMixin",
+                "net/minecraft/Target",
+                "destroyBlock()V",
+            ),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+
+        let hooks_path = dir.join("hooks.json");
+        std::fs::write(
+            &hooks_path,
+            br#"{"hooks":[{"name":"destroy_block","vanilla":"net/minecraft/Target#destroyBlock"}]}"#,
+        )
+        .unwrap();
+        let hooks = HookIndex::read(&hooks_path).unwrap();
+        let census = read_with(&path, Some(&hooks)).unwrap();
+        assert_eq!(
+            census.jars[0].mixin_config_targets,
+            ["net.minecraft.ClientTarget", "net.minecraft.Target"]
+        );
+        assert_eq!(census.mixin_targets.get("net/minecraft/Target"), Some(&1));
+        assert_eq!(census.injections.get("inject"), Some(&1));
+        assert_eq!(
+            census.hook_points["net/minecraft/Target#destroyBlock"][0].hooks,
+            ["destroy_block"]
+        );
+        assert_eq!(census.totals.points_covered, 1);
+    }
+
+    #[test]
     fn discovers_bounded_access_metadata_targets() {
         let aw = "accessWidener v2 named\naccessible class net/minecraft/Foo\nmutable field net/minecraft/Foo bar I\n# ignored\n";
         assert_eq!(
@@ -1014,6 +1101,27 @@ mod tests {
     }
 
     #[test]
+    fn hook_points_serialize_native_hook_contract_name() {
+        let point = HookPoint {
+            kind: "inject".to_owned(),
+            at: "HEAD".to_owned(),
+            count: 1,
+            hooks: vec!["server_tick".to_owned()],
+        };
+        let json = serde_json::to_value(&point).unwrap();
+        assert_eq!(json["native_hooks"], serde_json::json!(["server_tick"]));
+        assert!(json.get("hooks").is_none());
+        let old: HookPoint = serde_json::from_value(serde_json::json!({
+            "kind": "inject",
+            "at": "HEAD",
+            "count": 1,
+            "hooks": ["server_tick"]
+        }))
+        .unwrap();
+        assert_eq!(old.hooks, ["server_tick"]);
+    }
+
+    #[test]
     fn member_only_mixin_points_are_not_counted_as_rust_hooks() {
         let mut census = Census {
             points: vec![PointCount {
@@ -1030,6 +1138,43 @@ mod tests {
         assert_eq!(census.totals.member_only_points, 3);
         assert_eq!(census.totals.points_needing_hooks, 0);
         assert!(census.hook_points.is_empty());
+    }
+
+    #[test]
+    fn unhooked_points_are_explicitly_report_only() {
+        let mut census = Census {
+            points: vec![PointCount {
+                target: "net/minecraft/world/entity/Entity".to_owned(),
+                method: "tick".to_owned(),
+                kind: "inject".to_owned(),
+                at: "INVOKE".to_owned(),
+                count: 4,
+                hooks: Vec::new(),
+            }],
+            ..Census::default()
+        };
+        census.join(&HookIndex::default());
+        assert_eq!(census.totals.points_needing_hooks, 4);
+        assert_eq!(census.totals.points_covered, 0);
+        assert_eq!(census.totals.points_report_only, 4);
+        let summary = census.summary(20);
+        assert!(summary.contains("mixin injection points: 0 hook-covered, 4 report-only"));
+    }
+
+    #[test]
+    fn config_targets_are_report_only_in_summary() {
+        let census = Census {
+            totals: Totals {
+                mixin_config_targets_report_only: 2,
+                ..Totals::default()
+            },
+            ..Census::default()
+        };
+        assert!(
+            census
+                .summary(20)
+                .contains("mixin config targets: 2 report-only")
+        );
     }
 
     #[test]
