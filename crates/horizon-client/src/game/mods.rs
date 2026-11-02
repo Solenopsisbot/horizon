@@ -192,7 +192,10 @@ fn seeded_native_host(
     for dependency in &jar.required_mods {
         host = host.with_mod(dependency, "unknown");
     }
-    host
+    // Seed resources discovered in the explicitly supplied jar as well as its
+    // loader identity.  The native interpreter never scans the process
+    // classpath, so this is the game-facing bridge for bundled assets.
+    jar.seed_host(host)
 }
 
 pub(super) fn run_java_mods(
@@ -555,7 +558,7 @@ mod tests {
         std::fs::create_dir_all(&classes).unwrap();
         std::fs::write(
             &source,
-            "package demo; public final class TypedGameMod { public void onInitialize() {} }\n",
+            "package demo; public final class TypedGameMod { public void onInitialize() { if (ClassLoader.getSystemResource(\"assets/typed-game/probe.txt\") == null) throw new IllegalStateException(\"missing bundled resource\"); } }\n",
         )
         .unwrap();
         let status = Command::new("javac")
@@ -580,6 +583,9 @@ mod tests {
         zip.start_file("demo/TypedGameMod.class", options).unwrap();
         zip.write_all(&std::fs::read(classes.join("demo/TypedGameMod.class")).unwrap())
             .unwrap();
+        zip.start_file("assets/typed-game/probe.txt", options)
+            .unwrap();
+        zip.write_all(b"native-resource").unwrap();
         zip.start_file("META-INF/horizon-native.json", options)
             .unwrap();
         zip.write_all(

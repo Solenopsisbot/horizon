@@ -5210,6 +5210,11 @@ impl std::error::Error for NativeError {}
 #[derive(Debug, Clone, Default)]
 pub struct NativeJar {
     classes: BTreeMap<String, ClassFile>,
+    /// Resource paths present in the jar, represented by deterministic
+    /// markers for the bounded native host.  The native interpreter does not
+    /// expose host file handles or arbitrary bytes, but loader code can still
+    /// resolve the same resource names it would see on the jar classpath.
+    resources: BTreeMap<String, String>,
     pub fabric_id: Option<String>,
     pub fabric_version: Option<String>,
     /// The first mod's id/version from Forge or NeoForge `mods.toml`.
@@ -5266,6 +5271,7 @@ impl NativeJar {
         let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
         let mut zip = zip::ZipArchive::new(file).map_err(|e| NativeError::Zip(e.to_string()))?;
         let mut classes = Vec::new();
+        let mut resources = BTreeMap::new();
         let mut neoforge_entrypoints = Vec::new();
         let mut metadata = None;
         let mut neoforge_metadata = None;
@@ -5276,6 +5282,11 @@ impl NativeJar {
                 .by_index(i)
                 .map_err(|e| NativeError::Zip(e.to_string()))?;
             let name = e.name().to_owned();
+            if !name.ends_with('/') && !name.ends_with(".class") {
+                resources
+                    .entry(name.clone())
+                    .or_insert_with(|| format!("jar-resource/{name}"));
+            }
             if name == "fabric.mod.json" {
                 let mut text = String::new();
                 std::io::Read::read_to_string(&mut e, &mut text)
@@ -5329,6 +5340,7 @@ impl NativeJar {
             .transpose()?
             .unwrap_or((None, Vec::new()));
         let mut jar = Self::from_classes(classes);
+        jar.resources = resources;
         jar.fabric_id = fabric_id;
         jar.fabric_version = fabric_version;
         jar.neoforge_id = neoforge_id;
@@ -5383,6 +5395,9 @@ impl NativeJar {
     /// explicit and deterministic: dependency versions are represented by a
     /// stable `unknown` marker until the launcher supplies resolved versions.
     pub fn seed_host(&self, mut host: StdHost) -> StdHost {
+        for (name, marker) in &self.resources {
+            host = host.with_resource(name, marker);
+        }
         if let Some(id) = self.fabric_id.as_deref().or(self.neoforge_id.as_deref()) {
             let version = self
                 .fabric_version
@@ -5395,6 +5410,13 @@ impl NativeJar {
             host = host.with_mod(dependency, "unknown");
         }
         host
+    }
+
+    /// Return the resource paths discovered in the jar in deterministic order.
+    /// Entries are metadata only; callers must use the bounded host contract
+    /// rather than opening the jar through an arbitrary filesystem path.
+    pub fn resource_names(&self) -> impl Iterator<Item = &str> {
+        self.resources.keys().map(String::as_str)
     }
 
     pub fn execute<H: Host>(
@@ -7929,6 +7951,53 @@ mandatory = true
         assert_eq!(jar.native_declarations[0].id, "ruby:wand");
         std::fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn jar_seeds_bundled_resources_into_the_bounded_host() {
+        let path = std::env::temp_dir().join(format!(
+            "horizon-native-resource-seeding-{}.jar",
+            std::process::id()
+        ));
+        let file = File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(
+            br#"{"id":"resource-fixture","version":"1.0","entrypoints":{"main":"demo.Main"}}"#,
+        )
+        .unwrap();
+        zip.start_file("assets/resource-fixture/lang/en_us.json", options)
+            .unwrap();
+        zip.write_all(br#"{"item.resource-fixture.wand":"Wand"}"#)
+            .unwrap();
+        zip.start_file("data/resource-fixture/recipes/wand.json", options)
+            .unwrap();
+        zip.write_all(br#"{"type":"minecraft:crafting_shaped"}"#)
+            .unwrap();
+        zip.finish().unwrap();
+
+        let jar = NativeJar::from_path(&path).unwrap();
+        let names = jar.resource_names().collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "assets/resource-fixture/lang/en_us.json",
+                "data/resource-fixture/recipes/wand.json",
+                "fabric.mod.json",
+            ]
+        );
+        let host = jar.seed_host(StdHost::new());
+        assert_eq!(
+            host.resource("assets/resource-fixture/lang/en_us.json"),
+            Some("jar-resource/assets/resource-fixture/lang/en_us.json")
+        );
+        assert_eq!(
+            host.resource("/data/resource-fixture/recipes/wand.json"),
+            Some("jar-resource/data/resource-fixture/recipes/wand.json")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn unsupported_opcode_is_explicit() {
         let class = ClassFile {
