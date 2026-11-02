@@ -126,10 +126,7 @@ mandatory = true
         dispatches[0].listener.method.owner,
         "net/minecraftforge/eventbus/api/IEventBus"
     );
-    assert_eq!(
-        dispatches[0].event,
-        Value::Ref(Some("forge-event".into()))
-    );
+    assert_eq!(dispatches[0].event, Value::Ref(Some("forge-event".into())));
     let event_bus = MethodRef {
         owner: "net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext".into(),
         name: "getModEventBus".into(),
