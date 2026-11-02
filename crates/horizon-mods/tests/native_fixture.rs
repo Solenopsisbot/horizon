@@ -67,5 +67,11 @@ fn runtime_fabric_jar_reaches_native_content_adapter() {
     assert_eq!(declarations.effects.len(), 1);
     assert_eq!(declarations.effects[0].id, "typed:glow");
 
+    let content = horizon_mods::Content::from_native("typed-fixture", declarations).unwrap();
+    assert_eq!(content.namespaces, ["typed-fixture", "typed"]);
+    assert_eq!(content.blocks[0].id, "typed:lamp");
+    assert_eq!(content.items[0].id, "typed:wand");
+    assert_eq!(content.effects[0].id, "typed:glow");
+
     fs::remove_dir_all(root).unwrap();
 }
