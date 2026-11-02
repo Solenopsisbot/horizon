@@ -547,7 +547,7 @@ malformed values remain explicit metadata errors. `java.util.UUID.fromString`, d
 `toString`, `equals`, and `hashCode` preserve canonical UUID identity markers without process randomness;
 malformed UUID strings remain explicit metadata errors. `Enum.valueOf`, `name`, `ordinal`, `equals`,
 and `hashCode` preserve deterministic enum markers for loader and configuration branches. Collection `stream()` supports bounded `map`, `filter`, `distinct`,
-`limit`, `skip`, `count`, `toList`, `toArray`, `isEmpty`, `findFirst`, `findAny`, `anyMatch`, `allMatch`, `noneMatch`, and `forEach` chains using the same in-jar callback bridge. `Stream.toArray()` returns a runtime-owned object-array marker, and `Optional.stream()` produces a bounded zero-or-one-element stream, so optional registry lookups can enter those chains without a JVM.
+`limit`, `skip`, `count`, `toList`, `toArray`, `collect(Collectors.toList/toSet)`, `isEmpty`, `findFirst`, `findAny`, `anyMatch`, `allMatch`, `noneMatch`, and `forEach` chains using the same in-jar callback bridge. `Stream.toArray()` returns a runtime-owned object-array marker, and `Optional.stream()` produces a bounded zero-or-one-element stream, so optional registry lookups can enter those chains without a JVM.
 Native `ArrayList`, `HashMap`, `LinkedHashMap`, `HashSet`, and `LinkedHashSet` markers also retain bounded
 constructor, add/put, get, size, clear, indexed insertion/replacement, set duplicate suppression and removal,
 list removal and index queries, `List.addAll`, `Collection.containsAll`, `removeAll`, and `retainAll`,

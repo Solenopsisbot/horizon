@@ -871,6 +871,12 @@ impl Host for StdHost {
             ("java/util/Arrays", "asList", "([Ljava/lang/Object;)Ljava/util/List;") => {
                 Ok(collection_value("list", args))
             }
+            ("java/util/stream/Collectors", "toList", "()Ljava/util/stream/Collector;") => {
+                Ok(Value::Ref(Some("collector/list".into())))
+            }
+            ("java/util/stream/Collectors", "toSet", "()Ljava/util/stream/Collector;") => {
+                Ok(Value::Ref(Some("collector/set".into())))
+            }
             ("java/util/List", "of", descriptor) if descriptor.ends_with("Ljava/util/List;") => {
                 Ok(collection_value("list", args))
             }
@@ -5554,6 +5560,16 @@ impl<H: Host> Runtime<'_, H> {
                 let marker = self.new_array(class, method);
                 self.arrays.insert(marker.clone(), values);
                 Value::Ref(Some(marker))
+            }
+            ("collect", "(Ljava/util/stream/Collector;)Ljava/lang/Object;") => {
+                let collector = expect_ref(StdHost::argument(r, args, 0)?).ok_or_else(|| {
+                    NativeError::Metadata("Stream.collect needs a collector".into())
+                })?;
+                match collector.as_str() {
+                    "collector/list" => collection_value("list", &values),
+                    "collector/set" => collection_value("set", &values),
+                    _ => return Ok(None),
+                }
             }
             ("isEmpty", "()Z") => Value::Int(values.is_empty() as i32),
             ("forEach", "(Ljava/util/function/Consumer;)V") => {
@@ -11211,6 +11227,26 @@ mandatory = true
                     },
                     Some(&distinct),
                     &[],
+                    "demo/Stream",
+                    "probe",
+                )
+                .unwrap(),
+            Some(collection_value(
+                "list",
+                &[Value::Ref(Some("alpha".into())), Value::Int(2)],
+            ))
+        );
+        let collector = Value::Ref(Some("collector/list".into()));
+        assert_eq!(
+            runtime
+                .invoke_stream(
+                    &MethodRef {
+                        owner: "java/util/stream/Stream".into(),
+                        name: "collect".into(),
+                        descriptor: "(Ljava/util/stream/Collector;)Ljava/lang/Object;".into(),
+                    },
+                    Some(&distinct),
+                    std::slice::from_ref(&collector),
                     "demo/Stream",
                     "probe",
                 )
