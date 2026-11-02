@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `4852e578d`.
+Last checked: 3 November 2026, commit `50bf2c326`.
 
 ## Supported now
 
@@ -15,7 +15,7 @@ Last checked: 3 November 2026, commit `4852e578d`.
 - [x] Register and inspect bounded NeoForge and Forge deferred registrations, holders, registry objects, keys, ids, and entry collections.
 - [x] Record Fabric events, NeoForge events, and legacy Forge event-bus listeners with ordering, cancellation markers, and unregister support.
 - [x] Record custom payload registrations for the supported Fabric/NeoForge directions and the bounded legacy Forge `SimpleChannel.registerMessage` alias.
-- [x] Provide bounded NeoForge and legacy Forge capability/`LazyOptional` markers, NBT values, identifiers, resource keys, arrays, reflection metadata, collections (including `removeIf`), maps (including `computeIfPresent` and `merge`), primitive optionals, streams (including runtime-owned `toArray` results and `Collectors.toList/toSet`), and optionals.
+- [x] Provide bounded NeoForge and legacy Forge capability/`LazyOptional` markers, NBT values, identifiers, resource keys (including `ResourceKey.location`), arrays, reflection metadata, collections (including `removeIf`), maps (including `computeIfPresent` and `merge`), primitive optionals (`OptionalInt`, `OptionalLong`, `OptionalDouble`), streams (including runtime-owned `toArray` results and `Collectors.toList/toSet`), and optionals.
 - [x] Provide common Java wrapper/string/collection operations used by loader bootstrap code, including integer/long/float/double/byte/short/character conversion, `Number` accessors, checked math, seeded `System.currentTimeMillis`/`identityHashCode`, seeded `System.getProperty(key, default)` and `System.getenv` queries, deterministic `Thread.currentThread`/`getName`/`isDaemon`/`getContextClassLoader` markers, bounded callback combinators, `Arrays.asList`, `Objects.hashCode`/`requireNonNullElse`, and a restricted `String.format` subset.
 - [x] Provide bounded `ClassLoader.getResource`/`getResourceAsStream` markers from explicitly seeded `StdHost::with_resource` entries, plus explicitly seeded `ServiceLoader` providers and iterators; resource and provider queries never scan host files or the process classpath.
 - [x] Maintain a deterministic Fabric jar fixture covering entrypoint execution, seeded resources, multiple typed registry declarations, and unknown-kind diagnostics.
@@ -23,7 +23,7 @@ Last checked: 3 November 2026, commit `4852e578d`.
 - [x] Preserve bounded Throwable/Exception/Error messages and cause markers, including `getMessage`, `getCause`, `initCause`, and `toString` diagnostics.
 - [x] Mirror the common `Locale.US` integer grouping path used by the native statistics screen without emulating arbitrary locale patterns.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs, array-returning signatures, and common `Identifier` prefix/language-key/ordering helpers.
-- [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, `@At` and slice metadata preservation, access-widener/access-transformer discovery, Mojang support-API façade classification, and explicit report-only diagnostics.
+- [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, Mixin `@At` and slice metadata/value preservation, access-widener/access-transformer discovery, Mojang support-API façade classification, and explicit report-only diagnostics.
 
 ## Partial or report-only
 
@@ -46,8 +46,8 @@ Last checked: 3 November 2026, commit `4852e578d`.
 
 ## Validation snapshot
 
-- `horizon-native-java`: 94 unit tests passing, plus runtime-built Fabric, legacy Forge, and NeoForge fixture tests, including bounded `OptionalInt`, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread/class-loader markers, Throwable metadata, and explicit ServiceLoader provider boundaries.
-- `horizon-port-pack`: 157 unit tests passing, including Mixin `@At`/slice metadata, multi-method hook matching, Identifier façade bodies, and descriptor normalization coverage.
+- `horizon-native-java`: 95 unit tests passing, plus runtime-built Fabric, legacy Forge, and NeoForge fixture tests, including bounded primitive optionals, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread/class-loader markers, Throwable metadata, and explicit ServiceLoader provider boundaries.
+- `horizon-port-pack`: 157 unit tests passing, including Mixin `@At`/slice metadata and values, multi-method hook matching, Identifier façade bodies, and descriptor normalization coverage.
 - `horizon-jvm`: 8 unit tests passing, including explicit fallback labels.
 - Workspace check, targeted clippy, formatting, and `tools/native_java_smoke.py` passing.
 
