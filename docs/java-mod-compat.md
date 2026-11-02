@@ -212,9 +212,10 @@ JDK classpath discovery is reported with the same bounded rule. References to `S
 to `ServiceLoader.load`/`loadInstalled` or `ClassLoader.getResource*`/`loadClass` mark a jar as dynamic,
 with the exact owner and method in its diagnostic list. The census does not emulate providers or resource
 lookup. Native execution accepts `ServiceLoader.load` and `loadInstalled` only for providers explicitly
-seeded through the host contract, and `ClassLoader.loadClass` only for explicitly seeded class markers.
-Both surfaces report an unsupported diagnostic for unseeded names and never scan the host class path; the
-embedded JVM remains responsible for arbitrary provider and class discovery.
+seeded through the host contract, and `ClassLoader.loadClass` only for explicitly seeded class markers, and `Class.forName` only for classes
+already loaded from the current jar. These surfaces report an unsupported or empty result for unseeded
+names and never scan the host class path; the embedded JVM remains responsible for arbitrary provider and
+class discovery.
 
 ## Phase 1, first slice (measured 1 November 2026)
 
@@ -231,6 +232,11 @@ The native event path has a source-built Fabric fixture in
 `crates/horizon-native-java/tests/fixture_fabric_event.rs`. It compiles a tiny `EventFactory`/`Event`
 API, executes a real `invokedynamic` listener registration, and dispatches the recorded listener through
 `StdHost::dispatch_event`; this keeps event registration and callback routing covered with real classfiles.
+
+The legacy Forge event path has a source-built fixture in
+`crates/horizon-native-java/tests/fixture_legacy_forge_event.rs`. It compiles a tiny `@Mod` and
+`IEventBus`, executes `getModEventBus().addListener` with an `invokedynamic` callback, and validates
+listener dispatch through the bounded host.
 
 The Forge-family probe has a matching source-built fixture in
 `crates/horizon-native-java/tests/fixture_legacy_forge.rs`. It compiles a tiny legacy Forge `@Mod`
@@ -561,7 +567,8 @@ That bootstrap class-loader marker supports bounded `getResource(String)` and
 opens files or consults the process classpath; `StdHost::resource` exposes the
 same marker lookup to a game-owned adapter. `StdHost::with_class` supplies the matching bounded
 `ClassLoader.loadClass` marker for a known binary or internal class name; missing classes remain explicit
-errors.
+errors. `Class.forName` resolves only names already loaded from the current jar, preserving a useful
+reflection path without opening the process classpath.
 The native host also exposes `StdHost::with_service_provider` for deterministic `ServiceLoader`
 fixtures. `ServiceLoader.load`/`loadInstalled` return a seeded service marker, `iterator()` yields the
 seeded provider class markers, and `reload()` is a bounded no-op; missing services remain explicit errors.

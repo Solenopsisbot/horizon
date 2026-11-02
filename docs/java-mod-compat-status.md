@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `e3ff1093a`.
+Last checked: 3 November 2026, commit `715c5d5ec`.
 
 ## Supported now
 
@@ -17,9 +17,9 @@ Last checked: 3 November 2026, commit `e3ff1093a`.
 - [x] Record custom payload registrations for the supported Fabric/NeoForge directions and the bounded legacy Forge `SimpleChannel.registerMessage` alias.
 - [x] Provide bounded NeoForge and legacy Forge capability/`LazyOptional` markers, NBT values, identifiers, resource keys (including `ResourceKey.location`), arrays, reflection metadata, collections (including `removeIf`), maps (including `computeIfPresent` and `merge`), primitive optionals (`OptionalInt`, `OptionalLong`, `OptionalDouble`), streams (including runtime-owned `toArray` results and `Collectors.toList/toSet`), and optionals.
 - [x] Provide common Java wrapper/string/collection operations used by loader bootstrap code, including integer/long/float/double/byte/short/character conversion, `Number` accessors, checked math, seeded `System.currentTimeMillis`/`identityHashCode`, seeded `System.getProperty(key, default)` and `System.getenv` queries, deterministic `Thread.currentThread`/`getName`/`isDaemon`/`getContextClassLoader` markers, bounded callback combinators, `Arrays.asList`, `Objects.hashCode`/`requireNonNullElse`, and a restricted `String.format` subset.
-- [x] Provide bounded `ClassLoader.getResource`/`getResourceAsStream` markers from explicitly seeded `StdHost::with_resource` entries, explicitly seeded `ClassLoader.loadClass` markers, and explicitly seeded `ServiceLoader` providers and iterators; these queries never scan host files or the process classpath.
+- [x] Provide bounded `ClassLoader.getResource`/`getResourceAsStream` markers from explicitly seeded `StdHost::with_resource` entries, explicitly seeded `ClassLoader.loadClass` markers, current-jar `Class.forName`, and explicitly seeded `ServiceLoader` providers and iterators; these queries never scan host files or the process classpath.
 - [x] Maintain deterministic Fabric jar fixtures covering entrypoint execution, seeded resources, typed registry declarations, unknown-kind diagnostics, and an invokedynamic event listener dispatch.
-- [x] Maintain a runtime-built legacy Forge fixture covering `mods.toml`, `@Mod` discovery, `DeferredRegister`, and the bounded `SimpleChannel.registerMessage` alias; this remains probe coverage rather than live Forge runtime support.
+- [x] Maintain runtime-built legacy Forge fixtures covering `mods.toml`, `@Mod` discovery, `DeferredRegister`, `SimpleChannel.registerMessage`, and event-bus listener dispatch; this remains probe coverage rather than live Forge runtime support.
 - [x] Preserve bounded Throwable/Exception/Error messages and cause markers, including `getMessage`, `getCause`, `initCause`, and `toString` diagnostics.
 - [x] Mirror the common `Locale.US` integer grouping path used by the native statistics screen without emulating arbitrary locale patterns.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs, array-returning signatures, common `Identifier` prefix/language-key/ordering helpers, Holder serialization queries, and TagKey values.
@@ -31,13 +31,13 @@ Last checked: 3 November 2026, commit `e3ff1093a`.
 - [ ] Unmatched Mixin injection points. They are listed under `hook_points` with an empty `native_hooks` array and counted in `points_report_only`.
 - [ ] Java registration markers. Explicit `META-INF/horizon-native.json` declarations now cross the typed sink; opaque registrations observed during Java execution still need a Horizon adapter before they can create live game content.
 - [ ] JVM fallback coverage. Unsupported native calls, dynamic classpath failures, and reflective missing façade members now have explicit diagnostics; the JVM path still needs broader loader façades and real-mod fixtures.
-- [ ] Java classpath discovery. The census reports `ServiceLoader` and arbitrary `ClassLoader` class loading as dynamic diagnostics. Native `ServiceLoader.load`/`loadInstalled` and `ClassLoader.loadClass` now support only explicitly seeded values; arbitrary discovery and unseeded resources remain report-only.
+- [ ] Java classpath discovery. The census reports `ServiceLoader`, arbitrary `ClassLoader` loading, and `Class.forName` as dynamic diagnostics. Native `ServiceLoader.load`/`loadInstalled`, `ClassLoader.loadClass`, and current-jar `Class.forName` now support only explicitly bounded values; arbitrary discovery and unseeded resources remain report-only.
 
 ## Remaining work
 
 - [ ] Build an ABI corpus from representative Fabric, Forge, and NeoForge jars and rank missing calls by execution frequency.
 - [ ] Define the Mixin translation pipeline: resolve config targets, apply priority/order and cancellation, map supported injectors to Horizon hooks, and keep a JVM fallback for unsupported transforms.
-- [ ] Add broader real-mod integration fixtures for registries, networking, capabilities, entities, menus, resource loading, and client/server separation; the native Fabric event registration/dispatch path now has a source-built fixture.
+- [ ] Add broader real-mod integration fixtures for registries, networking, capabilities, entities, menus, resource loading, and client/server separation; Fabric and legacy Forge event registration/dispatch now have source-built fixtures.
 - [ ] Connect translated callbacks to the generated typed native API and Horizon's server-thread and dedicated-server boundaries.
 - [ ] Complete live content registration and registry synchronization for code-declared blocks, items, entities, recipes, data maps, attachments, and custom ingredients.
 - [ ] Expand client compatibility for HUDs, key mappings, tooltips, models, renderers, particles, screens, and shader-facing code.
@@ -46,8 +46,8 @@ Last checked: 3 November 2026, commit `e3ff1093a`.
 
 ## Validation snapshot
 
-- `horizon-native-java`: 96 unit tests passing, plus runtime-built Fabric, Forge, NeoForge, and Fabric-event fixture tests, including seeded class loading, TagKey values, bounded primitive optionals, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries.
-- `horizon-port-pack`: 157 unit tests passing, including Mixin `@At`/slice metadata and values, multi-method hook matching, Identifier façade bodies, and descriptor normalization coverage.
+- `horizon-native-java`: 96 unit tests passing, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection, TagKey values, bounded primitive optionals, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries.
+- `horizon-port-pack`: 158 unit tests passing, including Mixin `@At`/slice metadata and values, multi-method hook matching, Class.forName boundary diagnostics, Identifier façade bodies, and descriptor normalization coverage.
 - `horizon-jvm`: 8 unit tests passing, including explicit fallback labels.
 - Workspace check, targeted clippy, formatting, and `tools/native_java_smoke.py` passing with compiled OptionalLong/OptionalDouble paths.
 
