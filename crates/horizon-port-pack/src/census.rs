@@ -137,6 +137,10 @@ pub fn member_disposition(member: &classes::Member) -> AbiDisposition {
     } else if owner.starts_with("net/fabricmc/")
         || owner.starts_with("net/neoforged/")
         || owner.starts_with("net/minecraftforge/")
+        // Mixin's annotations and callback metadata are supplied by the
+        // loader/transform layer and are part of the generated façade
+        // contract, rather than an external carried dependency.
+        || owner.starts_with("org/spongepowered/asm/mixin/")
         || owner.starts_with("org/quiltmc/")
     {
         AbiDisposition::Loader
@@ -1469,6 +1473,10 @@ mod tests {
         );
         assert_eq!(
             member_disposition(&member("net/minecraftforge/eventbus/api/IEventBus")),
+            AbiDisposition::Loader
+        );
+        assert_eq!(
+            member_disposition(&member("org/spongepowered/asm/mixin/injection/Inject")),
             AbiDisposition::Loader
         );
         assert_eq!(
