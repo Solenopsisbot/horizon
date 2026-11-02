@@ -221,6 +221,11 @@ pub struct StdHost {
     lazy_optionals: BTreeMap<String, Option<Value>>,
     capability_values: BTreeMap<String, Value>,
     capability_requests: Vec<CapabilityRequest>,
+    /// Messages and causes captured by bounded Throwable constructors. The
+    /// interpreter keeps objects as markers, so this small side table is
+    /// enough for bootstrap diagnostics without modelling Java stack traces.
+    throwable_messages: BTreeMap<String, Option<String>>,
+    throwable_causes: BTreeMap<String, Option<Value>>,
     next_lazy_optional: usize,
     next_fabric_event: usize,
     next_iterator: usize,
@@ -252,6 +257,8 @@ impl StdHost {
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
             capability_requests: Vec::new(),
+            throwable_messages: BTreeMap::new(),
+            throwable_causes: BTreeMap::new(),
             next_lazy_optional: 0,
             next_fabric_event: 0,
             next_iterator: 0,
@@ -1164,6 +1171,9 @@ impl Host for StdHost {
             ("java/lang/System", "lineSeparator", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some("\n".into())))
             }
+            ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;") => {
+                Ok(Value::Ref(Some("thread/main".into())))
+            }
             (
                 "net/fabricmc/loader/api/FabricLoader",
                 "getInstance",
@@ -1180,6 +1190,79 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if is_throwable_owner(&r.owner) {
+            let marker = expect_ref(receiver)
+                .ok_or_else(|| NativeError::Metadata("malformed Throwable marker".into()))?;
+            if r.name == "<init>" {
+                let message = args.first().and_then(|value| match value {
+                    Value::Ref(Some(text)) => Some(text.clone()),
+                    Value::Ref(None) => None,
+                    _ => None,
+                });
+                let cause = args.iter().find_map(|value| match value {
+                    Value::Ref(Some(value)) if is_throwable_marker(value) => {
+                        Some(Value::Ref(Some(value.clone())))
+                    }
+                    _ => None,
+                });
+                self.throwable_messages.insert(marker.clone(), message);
+                self.throwable_causes.insert(marker.clone(), cause);
+                return Ok(Value::Void);
+            }
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getMessage", "()Ljava/lang/String;") => {
+                    return Ok(self
+                        .throwable_messages
+                        .get(marker)
+                        .and_then(|message| message.clone())
+                        .map_or(Value::Ref(None), |message| Value::Ref(Some(message))));
+                }
+                ("getCause", "()Ljava/lang/Throwable;") => {
+                    return Ok(self
+                        .throwable_causes
+                        .get(marker)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or(Value::Ref(None)));
+                }
+                ("initCause", "(Ljava/lang/Throwable;)Ljava/lang/Throwable;") => {
+                    let cause = args.first().cloned().unwrap_or(Value::Ref(None));
+                    self.throwable_causes.insert(marker.clone(), Some(cause));
+                    return Ok(receiver.clone());
+                }
+                ("toString", "()Ljava/lang/String;") => {
+                    let class = marker
+                        .split_once('#')
+                        .map_or(marker.as_str(), |(class, _)| class);
+                    let class = class.rsplit('/').next().unwrap_or(class);
+                    let Some(Some(message)) = self.throwable_messages.get(marker) else {
+                        return Ok(Value::Ref(Some(class.to_owned())));
+                    };
+                    return Ok(Value::Ref(Some(format!("{class}: {message}"))));
+                }
+                _ => {}
+            }
+        }
+        if r.owner == "java/lang/Thread" {
+            let marker = expect_ref(receiver)
+                .ok_or_else(|| NativeError::Metadata("malformed java/lang/Thread marker".into()))?;
+            if marker != "thread/main" {
+                return Err(NativeError::Metadata(
+                    "unsupported java/lang/Thread marker".into(),
+                ));
+            }
+            return match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some("main".into()))),
+                ("isDaemon", "()Z") => Ok(Value::Int(0)),
+                ("getContextClassLoader", "()Ljava/lang/ClassLoader;") => {
+                    Ok(Value::Ref(Some("classloader/bootstrap".into())))
+                }
+                _ => Err(NativeError::MissingMethod(format!(
+                    "java/lang/Thread#{}{}",
+                    r.name, r.descriptor
+                ))),
+            };
+        }
         if r.owner == "java/text/NumberFormat"
             && r.name == "format"
             && matches!(
@@ -3793,6 +3876,19 @@ fn value_marker(value: &Value) -> String {
         Value::Ref(None) => "null".to_owned(),
         Value::Void => "void".to_owned(),
     }
+}
+
+fn is_throwable_owner(owner: &str) -> bool {
+    owner == "java/lang/Throwable"
+        || owner.ends_with("Exception")
+        || owner.ends_with("Error")
+        || owner.ends_with("Throwable")
+}
+
+fn is_throwable_marker(marker: &str) -> bool {
+    marker
+        .split_once('#')
+        .is_some_and(|(owner, _)| is_throwable_owner(owner))
 }
 
 fn capability_text(value: &Value) -> String {
@@ -9640,6 +9736,46 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_maps_main_thread_bootstrap_markers() {
+        let mut host = StdHost::new();
+        let current_thread = MethodRef {
+            owner: "java/lang/Thread".into(),
+            name: "currentThread".into(),
+            descriptor: "()Ljava/lang/Thread;".into(),
+        };
+        let thread = host.invoke(&current_thread, &[]).unwrap();
+        assert_eq!(thread, Value::Ref(Some("thread/main".into())));
+
+        for (name, descriptor, expected) in [
+            (
+                "getName",
+                "()Ljava/lang/String;",
+                Value::Ref(Some("main".into())),
+            ),
+            ("isDaemon", "()Z", Value::Int(0)),
+            (
+                "getContextClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                Value::Ref(Some("classloader/bootstrap".into())),
+            ),
+        ] {
+            assert_eq!(
+                host.invoke_instance(
+                    &MethodRef {
+                        owner: "java/lang/Thread".into(),
+                        name: name.into(),
+                        descriptor: descriptor.into(),
+                    },
+                    &thread,
+                    &[],
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn standard_host_uses_only_seeded_environment_values() {
         let mut host = StdHost::new().with_environment_variable("DEMO_MODE", "native");
         let getenv = MethodRef {
@@ -12434,5 +12570,53 @@ mandatory = true
         ] {
             assert!(parse_native_metadata(text).is_err(), "accepted {text}");
         }
+    }
+
+    #[test]
+    fn standard_host_preserves_bounded_throwable_metadata() {
+        let mut host = StdHost::new();
+        let error = Value::Ref(Some("java/lang/IllegalStateException#0".into()));
+        let cause = Value::Ref(Some("java/lang/IllegalArgumentException#1".into()));
+        let init = MethodRef {
+            owner: "java/lang/IllegalStateException".into(),
+            name: "<init>".into(),
+            descriptor: "(Ljava/lang/String;Ljava/lang/Throwable;)V".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &init,
+                &error,
+                &[Value::Ref(Some("bad state".into())), cause.clone()],
+            )
+            .unwrap(),
+            Value::Void
+        );
+        let get_message = MethodRef {
+            owner: "java/lang/Throwable".into(),
+            name: "getMessage".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&get_message, &error, &[]).unwrap(),
+            Value::Ref(Some("bad state".into()))
+        );
+        let get_cause = MethodRef {
+            owner: "java/lang/Throwable".into(),
+            name: "getCause".into(),
+            descriptor: "()Ljava/lang/Throwable;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&get_cause, &error, &[]).unwrap(),
+            cause
+        );
+        let to_string = MethodRef {
+            owner: "java/lang/Throwable".into(),
+            name: "toString".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&to_string, &error, &[]).unwrap(),
+            Value::Ref(Some("IllegalStateException: bad state".into()))
+        );
     }
 }

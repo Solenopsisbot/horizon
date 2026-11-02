@@ -24,6 +24,11 @@ const DYNAMIC_PACKAGES: [&str; 7] = [
     "java/net/URLClassLoader",
 ];
 
+/// JDK service discovery is runtime classpath input.  Keep it in the census
+/// even when a class only names `ServiceLoader` (without a method reference),
+/// so a static translation never silently drops an optional provider.
+const SERVICE_LOADER: &str = "java/util/ServiceLoader";
+
 /// `java.lang.Class` methods that mean reflection.
 const DYNAMIC_CLASS_METHODS: [&str; 6] = [
     "forName",
@@ -882,6 +887,9 @@ fn dynamic_reason(class: &classes::Class) -> Option<String> {
         if INVOKE_SUGAR.contains(&r.as_str()) {
             continue;
         }
+        if r == SERVICE_LOADER {
+            return Some(r.clone());
+        }
         if DYNAMIC_PACKAGES.iter().any(|p| r.starts_with(p)) {
             return Some(r.clone());
         }
@@ -904,6 +912,9 @@ fn dynamic_reason(class: &classes::Class) -> Option<String> {
         if m.owner == "java/lang/ClassLoader"
             && (m.name == "loadClass" || m.name.starts_with("getResource"))
         {
+            return Some(format!("{}#{}", m.owner, m.name));
+        }
+        if m.owner == SERVICE_LOADER && matches!(m.name.as_str(), "load" | "loadInstalled") {
             return Some(format!("{}#{}", m.owner, m.name));
         }
     }
@@ -1111,6 +1122,46 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(dynamic_reason(&class), None);
+    }
+
+    #[test]
+    fn service_loader_is_reported_as_runtime_classpath_input() {
+        let class = classes::Class {
+            refs: [SERVICE_LOADER.to_owned()].into_iter().collect(),
+            ..classes::Class::default()
+        };
+        assert_eq!(dynamic_reason(&class).as_deref(), Some(SERVICE_LOADER));
+
+        let class = classes::Class {
+            members: vec![classes::Member {
+                owner: SERVICE_LOADER.to_owned(),
+                name: "load".to_owned(),
+                descriptor: "(Ljava/lang/Class;)Ljava/util/ServiceLoader;".to_owned(),
+                kind: classes::MemberKind::Method,
+            }],
+            ..classes::Class::default()
+        };
+        assert_eq!(
+            dynamic_reason(&class).as_deref(),
+            Some("java/util/ServiceLoader#load")
+        );
+    }
+
+    #[test]
+    fn class_loader_resource_lookups_are_reported() {
+        let class = classes::Class {
+            members: vec![classes::Member {
+                owner: "java/lang/ClassLoader".to_owned(),
+                name: "getResourceAsStream".to_owned(),
+                descriptor: "(Ljava/lang/String;)Ljava/io/InputStream;".to_owned(),
+                kind: classes::MemberKind::Method,
+            }],
+            ..classes::Class::default()
+        };
+        assert_eq!(
+            dynamic_reason(&class).as_deref(),
+            Some("java/lang/ClassLoader#getResourceAsStream")
+        );
     }
 
     #[test]

@@ -208,6 +208,11 @@ scoped by a number.
 The census is also a product: it is the "what runs" table the launcher shows for a jar before install,
 and the generated reference under `docs/api/`.
 Mixin configuration files are also inspected in report-only mode: bounded JSON reads collect safe class names from `target` fields into the per-jar and aggregate census. The parser does not execute configs or weave bytecode; malformed or oversized files are skipped.
+JDK classpath discovery is reported with the same bounded rule. References to `ServiceLoader` and calls
+to `ServiceLoader.load`/`loadInstalled` or `ClassLoader.getResource*`/`loadClass` mark a jar as dynamic,
+with the exact owner and method in its diagnostic list. The census does not emulate providers or resource
+lookup; the embedded JVM remains responsible for those calls until a deliberately bounded native contract
+is specified.
 
 ## Phase 1, first slice (measured 1 November 2026)
 
@@ -507,6 +512,9 @@ common `Character.isLetter`/`isDigit`/`toLowerCase` queries and
 String `replace` (character and `CharSequence` forms), `repeat`, `indexOf`, `lastIndexOf`, `trim`, `strip`, and `isBlank`
 are also deterministic, covering namespace/path normalization used by loader metadata and registration code. Repetition
 counts are bounded to keep native probes finite.
+Throwable and common Exception/Error subclasses retain constructor message and cause markers, with bounded
+`getMessage`, `getCause`, `initCause`, and `toString` accessors for loader diagnostics; stack traces and arbitrary
+throw/catch control flow remain outside this surface.
 `System.getProperties()` exposes the seeded properties as a bounded `Properties` map, so bootstrap code
 can use the same key/value queries as `getProperty` without crossing the host boundary.
 `System.getenv(String)` and the no-argument `System.getenv()` map are likewise backed only by values explicitly
@@ -514,6 +522,10 @@ seeded with `StdHost::with_environment_variable`; unknown keys return null and t
 `System.currentTimeMillis()` returns a seeded deterministic value (zero by default, configurable with
 `StdHost::with_current_time_millis`); it never reads the machine clock, and follows the interpreter's bounded
 wide-primitive representation.
+Thread bootstrap queries are likewise deterministic: `Thread.currentThread()` returns the `thread/main`
+marker, whose `getName()` is `main`, `isDaemon()` is false, and `getContextClassLoader()` returns the
+`classloader/bootstrap` marker. These markers keep common loader initialization paths alive without exposing
+native worker threads or a host class loader.
 For native client paths that mirror bootstrap-visible `NumberFormat.getIntegerInstance(Locale.US)`,
 `horizon_client::java_text::format_integer_us` provides deterministic ASCII digit grouping (including negative
 values) without emulating arbitrary locale or formatter patterns.
