@@ -82,12 +82,20 @@ pub struct Census {
     pub member_disposition: BTreeMap<AbiDisposition, usize>,
     /// Mixin target: how many mixins weave into it.
     pub mixin_targets: BTreeMap<String, usize>,
+    /// Mixin target classes declared by discovered JSON configs (report only).
+    #[serde(default)]
+    pub mixin_config_targets: BTreeMap<String, usize>,
     /// `inject`, `redirect`, `overwrite`...: how many.
     pub injections: BTreeMap<String, usize>,
     /// `HEAD`, `INVOKE|target:getBlockState`...: how many.
     pub at: BTreeMap<String, usize>,
     /// One row per (target, method, form, anchor), with the hooks at it.
     pub points: Vec<PointCount>,
+    /// Injection points grouped by the native hook lookup key (`target#method`).
+    /// Member-only Mixin points are omitted; each row retains its `@At` value,
+    /// form and count so native hook translation need not scan `points`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hook_points: BTreeMap<String, Vec<HookPoint>>,
     /// Access-widener targets, counted across jars (discovery only).
     #[serde(default)]
     pub access_widener_targets: BTreeMap<String, usize>,
@@ -167,6 +175,9 @@ pub struct JarCensus {
     /// Mixin configuration paths declared by this jar (entry names only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mixin_config_names: Vec<String>,
+    /// Bounded target classes read from this jar's Mixin config JSON (report only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixin_config_targets: Vec<String>,
     /// Jars nested under `META-INF/jars/` that were read too.
     pub nested: usize,
     pub references: usize,
@@ -196,6 +207,16 @@ pub struct PointCount {
     pub at: String,
     pub count: usize,
     /// The hooks that name this method, if any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<String>,
+}
+
+/// A call-site injection under [`Census::hook_points`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct HookPoint {
+    pub kind: String,
+    pub at: String,
+    pub count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hooks: Vec<String>,
 }
@@ -277,6 +298,7 @@ pub fn read_with(path: &Path, hooks: Option<&HookIndex>) -> Result<Census, Strin
     if let Some(hooks) = hooks {
         census.join(hooks);
     }
+    census.rebuild_hook_points();
     Ok(census)
 }
 
@@ -349,6 +371,7 @@ impl Census {
             entrypoints,
             classes: parsed.len(),
             mixin_config_names: jar::mixin_config_names(&names),
+            mixin_config_targets: mixin_config_targets(&mut zip, &names),
             nested,
             error,
             ..JarCensus::default()
@@ -368,6 +391,9 @@ impl Census {
         jar.access_widener_targets.dedup();
         jar.access_transformer_targets.sort();
         jar.access_transformer_targets.dedup();
+        for target in &jar.mixin_config_targets {
+            *self.mixin_config_targets.entry(target.clone()).or_default() += 1;
+        }
         for target in &jar.access_widener_targets {
             *self
                 .access_widener_targets
@@ -455,6 +481,24 @@ impl Census {
                 self.totals.points_covered += point.count;
             }
         }
+        self.rebuild_hook_points();
+    }
+
+    fn rebuild_hook_points(&mut self) {
+        self.hook_points.clear();
+        for point in &self.points {
+            if NEEDS_HOOK.contains(&point.kind.as_str()) {
+                self.hook_points
+                    .entry(format!("{}#{}", point.target, point.method))
+                    .or_default()
+                    .push(HookPoint {
+                        kind: point.kind.clone(),
+                        at: point.at.clone(),
+                        count: point.count,
+                        hooks: point.hooks.clone(),
+                    });
+            }
+        }
     }
 
     /// The ranked surface, `top` rows of each, as the tool prints it.
@@ -496,6 +540,7 @@ impl Census {
             ("classes", &self.classes),
             ("members", &self.members),
             ("mixin targets", &self.mixin_targets),
+            ("mixin config targets", &self.mixin_config_targets),
             ("injections", &self.injections),
             ("at", &self.at),
             ("access widener targets", &self.access_widener_targets),
@@ -554,6 +599,76 @@ fn read_zip_text(zip: &mut zip::ZipArchive<fs::File>, name: &str) -> Result<Stri
 
 fn is_access_transformer(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with("accesstransformer.cfg")
+}
+
+const MAX_MIXIN_CONFIG_BYTES: u64 = 1 << 20;
+const MAX_MIXIN_CONFIG_TARGETS: usize = 256;
+
+/// Reads only bounded JSON config entries and reports safe class names under
+/// `target` keys. No Mixin semantics are applied and malformed/oversized
+/// configs are ignored.
+fn mixin_config_targets(zip: &mut zip::ZipArchive<fs::File>, names: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in jar::mixin_config_names(names) {
+        let Ok(mut entry) = zip.by_name(&name) else {
+            continue;
+        };
+        if entry.size() > MAX_MIXIN_CONFIG_BYTES {
+            continue;
+        }
+        let mut text = String::new();
+        if entry.read_to_string(&mut text).is_err() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        collect_mixin_targets(&value, &mut out);
+        if out.len() >= MAX_MIXIN_CONFIG_TARGETS {
+            break;
+        }
+    }
+    out.sort();
+    out.dedup();
+    out.truncate(MAX_MIXIN_CONFIG_TARGETS);
+    out
+}
+
+fn collect_mixin_targets(value: &serde_json::Value, out: &mut Vec<String>) {
+    if out.len() >= MAX_MIXIN_CONFIG_TARGETS {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::String(target)) = object.get("target") {
+                let target = target.trim();
+                if safe_mixin_target(target) {
+                    out.push(target.to_owned());
+                }
+            }
+            for value in object.values() {
+                collect_mixin_targets(value, out);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_mixin_targets(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn safe_mixin_target(target: &str) -> bool {
+    target.len() <= 256
+        && (target.contains('.') || target.contains('/'))
+        && target
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && target
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.' | '/'))
 }
 
 /// Catalogs the target portion of Fabric's v1/v2 access-widener lines.
@@ -747,6 +862,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_safe_mixin_config_targets_only() {
+        let dir = std::env::temp_dir().join("horizon-census-mixin-config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.jar");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("ruby.mixins.json", options).unwrap();
+        std::io::Write::write_all(&mut zip, br#"{"mixins":[{"target":"net.minecraft.Foo"},{"target":"bad target"}],"client":[{"target":"a/b/C"}]}"#).unwrap();
+        zip.finish().unwrap();
+        let census = read(&path).unwrap();
+        assert_eq!(
+            census.jars[0].mixin_config_targets,
+            ["a/b/C", "net.minecraft.Foo"]
+        );
+        assert_eq!(
+            census.mixin_config_targets.get("net.minecraft.Foo"),
+            Some(&1)
+        );
+    }
+
+    #[test]
     fn discovers_bounded_access_metadata_targets() {
         let aw = "accessWidener v2 named\naccessible class net/minecraft/Foo\nmutable field net/minecraft/Foo bar I\n# ignored\n";
         assert_eq!(
@@ -865,6 +1002,15 @@ mod tests {
         assert_eq!(census.totals.points_needing_hooks, 2);
         assert_eq!(census.totals.points_covered, 2);
         assert_eq!(census.points[0].hooks, ["destroy_block"]);
+        assert_eq!(
+            census.hook_points["net/minecraft/server/level/ServerPlayerGameMode#destroyBlock"],
+            [HookPoint {
+                kind: "inject".to_owned(),
+                at: "HEAD".to_owned(),
+                count: 2,
+                hooks: vec!["destroy_block".to_owned()],
+            }]
+        );
     }
 
     #[test]
@@ -883,6 +1029,7 @@ mod tests {
         census.join(&HookIndex::default());
         assert_eq!(census.totals.member_only_points, 3);
         assert_eq!(census.totals.points_needing_hooks, 0);
+        assert!(census.hook_points.is_empty());
     }
 
     #[test]

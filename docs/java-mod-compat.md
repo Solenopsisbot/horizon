@@ -206,6 +206,7 @@ scoped by a number.
 
 The census is also a product: it is the "what runs" table the launcher shows for a jar before install,
 and the generated reference under `docs/api/`.
+Mixin configuration files are also inspected in report-only mode: bounded JSON reads collect safe class names from `target` fields into the per-jar and aggregate census. The parser does not execute configs or weave bytecode; malformed or oversized files are skipped.
 
 ## Phase 1, first slice (measured 1 November 2026)
 

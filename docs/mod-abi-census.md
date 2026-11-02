@@ -24,6 +24,12 @@ cargo run -q -p horizon-port-pack -- census <jar or folder> --hooks native-hooks
 
 The JSON holds the ranked surface per jar and merged; the command prints the merged top.
 
+For native hook translation, `census.json` also includes `hook_points`: a map keyed by
+`target#method`. Its rows retain the injection `kind`, the exact `at` (`@At`) value, count,
+and any matching native hook names. Accessor, invoker, and shadow rows are omitted because
+they require member shape rather than a call-site hook. This keeps consumers from having to
+filter and regroup the ranked `points` array.
+
 The census also discovers loader access metadata without applying it. A Fabric jar's
 `accessWidener` path in `fabric.mod.json` is read and its access, extendable, mutable (including
 transitive forms) targets are listed. NeoForge/Forge `accesstransformer.cfg` resources are listed by
