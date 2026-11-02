@@ -207,7 +207,7 @@ scoped by a number.
 
 The census is also a product: it is the "what runs" table the launcher shows for a jar before install,
 and the generated reference under `docs/api/`.
-Mixin configuration files are also inspected in report-only mode: bounded JSON reads collect safe class names from `target` fields and record edge-field presence (including `required` and `priority`) plus nested `injectors.defaultRequire`, `injectors.maxShiftBy`, and `injectors.injectionPoints` in the per-jar and aggregate census. Injection annotations report presence and deterministic scalar values for `require`, `expect`, `cancellable`, `order`, and `priority`, plus bounded `slice` presence, so native hook planning can preserve ordering, contracts, and selector context. Native hook names for one target method are sorted and deduplicated before they enter `native_hooks`;
+Mixin configuration files are also inspected in report-only mode: bounded JSON reads collect safe class names from `target` fields and record edge-field presence (including `required` and `priority`) plus nested `injectors.defaultRequire`, `injectors.maxShiftBy`, and `injectors.injectionPoints` in the per-jar and aggregate census. Injection annotations report presence and deterministic scalar values for `require`, `expect`, `cancellable`, `order`, and `priority`, plus bounded `slice` presence and `@At(args=...)` selectors, so native hook planning can preserve ordering, contracts, and selector context. Native hook names for one target method are sorted and deduplicated before they enter `native_hooks`;
 Mixin Extras `WrapMethod` and legacy `ModifyConst` names normalize into stable report buckets, nested slice `from`/`to` boundaries are preserved, and scalar config edge values remain report-only metadata. Values are not interpreted, configs are not executed, and no bytecode is woven; malformed or oversized files are skipped.
 JDK classpath discovery is reported with the same bounded rule. References to `ServiceLoader` and calls
 to `ServiceLoader.load`/`loadInstalled` or `ClassLoader.getResource*`/`loadClass` mark a jar as dynamic,
@@ -616,7 +616,7 @@ primitive-optional paths with `isPresent`, `isEmpty`, extraction, `orElse`, `equ
 `java.nio.file.Paths.get` and `Path.resolve`, `toString`, `normalize`, and
 `toAbsolutePath` calls use deterministic path markers. Common `List.of`, `Set.of`, `Map.of`, empty/singleton
 `Collections` factories, and bounded `size`, `isEmpty`, `contains`, `containsAll`, `get`, `Map.get`, `Map.getOrDefault`, and
-key/value queries use escaped value markers; `Map.keySet`, `Map.values`, `Map.entrySet`/`Map.Entry`, and `Collection.iterator` project those markers into bounded
+key/value queries use escaped value markers; `Map.keySet`, `Map.values`, and `Map.entrySet`/`Map.Entry` project bounded key/value views with `getKey`, `getValue`, equality, and hashing, while `Collection.iterator` projects those markers into bounded
 set/list views; `Iterator.forEachRemaining` drains a bounded iterator through the callback bridge, while `Collection.forEach` invokes bounded `Consumer` callbacks, so bootstrap code can inspect
 immutable configuration collections without starting a JVM. Boxed
 `Arrays.asList(Object[])` is also available for bootstrap varargs; it preserves the opaque array marker as one bounded list value

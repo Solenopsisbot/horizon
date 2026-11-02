@@ -2615,6 +2615,17 @@ impl Host for StdHost {
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 ("getKey", "()Ljava/lang/Object;") => Ok(key),
                 ("getValue", "()Ljava/lang/Object;") => Ok(value),
+                ("equals", "(Ljava/lang/Object;)Z") => {
+                    let equal = map_entry_parts(Self::argument(r, args, 0)?).is_ok_and(
+                        |(other_key, other_value)| key == other_key && value == other_value,
+                    );
+                    Ok(Value::Int(equal as i32))
+                }
+                ("hashCode", "()I") => Ok(Value::Int(stable_hash(&format!(
+                    "map-entry/{},{}",
+                    value_marker(&key),
+                    value_marker(&value)
+                )))),
                 ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
                     "{}={}",
                     value_marker(&key),
@@ -10266,6 +10277,34 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(&entry_value, &entry, &[]).unwrap(),
             Value::Ref(Some("value".into()))
+        );
+        let entry_equals = MethodRef {
+            owner: "java/util/Map$Entry".into(),
+            name: "equals".into(),
+            descriptor: "(Ljava/lang/Object;)Z".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&entry_equals, &entry, std::slice::from_ref(&entry))
+                .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &entry_equals,
+                &entry,
+                &[Value::Ref(Some("map-entry/rkey,rother".into()))],
+            )
+            .unwrap(),
+            Value::Int(0)
+        );
+        let entry_hash = MethodRef {
+            owner: "java/util/Map$Entry".into(),
+            name: "hashCode".into(),
+            descriptor: "()I".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&entry_hash, &entry, &[]).unwrap(),
+            Value::Int(stable_hash("map-entry/rkey,rvalue"))
         );
         let remove_if = MethodRef {
             owner: "java/util/Collection".into(),
