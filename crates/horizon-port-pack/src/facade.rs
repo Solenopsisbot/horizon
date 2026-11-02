@@ -1189,6 +1189,12 @@ fn render(
             "    protected net.minecraft.resources.Identifier horizonId = new net.minecraft.resources.Identifier();"
         );
     }
+    if class.name == "net/minecraft/network/FriendlyByteBuf" {
+        let _ = writeln!(
+            out,
+            "    protected java.util.List<Object> horizonValues = new java.util.ArrayList<>();\n    protected int horizonReadIndex;"
+        );
+    }
     if class.name == "net/minecraft/world/level/block/state/BlockState" {
         let _ = writeln!(
             out,
@@ -1914,6 +1920,66 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         && let ("consumesAction", "boolean", _) = (method, ret, descriptor)
     {
         return "return this instanceof InteractionResult.Success;".to_owned();
+    }
+    if class == "net/minecraft/network/FriendlyByteBuf" {
+        match (method, ret, descriptor) {
+            (
+                "writeUtf",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;",
+            )
+            | (
+                "writeUtf",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(Ljava/lang/String;I)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonValues.add(p0); return this;".to_owned();
+            }
+            ("readUtf", "java.lang.String", "()Ljava/lang/String;")
+            | ("readUtf", "java.lang.String", "(I)Ljava/lang/String;") => {
+                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof String ? (String) horizonValues.get(horizonReadIndex - 1) : \"\";".to_owned();
+            }
+            (
+                "writeVarInt",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
+            )
+            | (
+                "writeInt",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonValues.add(p0); return this;".to_owned();
+            }
+            ("readVarInt", "int", "()I") | ("readInt", "int", "()I") => {
+                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Integer ? ((Integer) horizonValues.get(horizonReadIndex - 1)).intValue() : 0;".to_owned();
+            }
+            (
+                "writeBoolean",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(Z)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonValues.add(p0); return this;".to_owned();
+            }
+            ("readBoolean", "boolean", "()Z") => {
+                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Boolean && ((Boolean) horizonValues.get(horizonReadIndex - 1)).booleanValue();".to_owned();
+            }
+            (
+                "writeResourceLocation",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(Lnet/minecraft/resources/Identifier;)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonValues.add(p0); return this;".to_owned();
+            }
+            (
+                "readResourceLocation",
+                "net.minecraft.resources.Identifier",
+                "()Lnet/minecraft/resources/Identifier;",
+            ) => {
+                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof net.minecraft.resources.Identifier ? (net.minecraft.resources.Identifier) horizonValues.get(horizonReadIndex - 1) : new net.minecraft.resources.Identifier();".to_owned();
+            }
+            _ => {}
+        }
     }
     if class == "net/minecraft/world/InteractionResult$Success" {
         match (method, ret, descriptor) {
@@ -4052,6 +4118,40 @@ mod tests {
         assert!(source.contains("Collections.synchronizedMap(new java.util.WeakHashMap<>)"));
         assert!(source.contains("if class.name == \"net/minecraft/world/item/ItemStack\""));
         assert!(source.contains("(\"getCount\", \"()I\", \"int\", \"\")"));
+    }
+
+    #[test]
+    fn friendly_byte_buf_keeps_bounded_payload_values() {
+        let source = include_str!("facade.rs");
+        assert!(source.contains("protected java.util.List<Object> horizonValues"));
+        assert!(source.contains("horizonValues.add(p0); return this;"));
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "writeUtf",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;",
+            ),
+            "horizonValues.add(p0); return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "readVarInt",
+                "int",
+                "()I",
+            ),
+            "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Integer ? ((Integer) horizonValues.get(horizonReadIndex - 1)).intValue() : 0;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "readResourceLocation",
+                "net.minecraft.resources.Identifier",
+                "()Lnet/minecraft/resources/Identifier;",
+            ),
+            "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof net.minecraft.resources.Identifier ? (net.minecraft.resources.Identifier) horizonValues.get(horizonReadIndex - 1) : new net.minecraft.resources.Identifier();"
+        );
     }
 
     #[test]

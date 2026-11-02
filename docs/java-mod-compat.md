@@ -504,6 +504,10 @@ Legacy Forge's `NetworkRegistry.newSimpleChannel` and `SimpleChannel.registerMes
 payload marker: the message class, encoder, and handler are retained as a bidirectional registration. The
 legacy message id and decoder remain opaque, and channel ownership plus byte encoding and sends are still
 unsupported at this boundary.
+The generated `FriendlyByteBuf` façade keeps a bounded FIFO of payload values for common bootstrap calls:
+`writeUtf`/`readUtf`, `writeVarInt`/`readVarInt`, `writeInt`/`readInt`, `writeBoolean`/`readBoolean`,
+and `writeResourceLocation`/`readResourceLocation` round trips. It preserves registration-time value
+semantics without claiming ownership of the live Netty channel or packet bytes.
 When a target references NeoForge, the generator emits these public ABI shims directly, so the path does not
 depend on shipping NeoForge's jar. A synthetic `@Mod` that creates a `DeferredRegister`, attaches it to the
 event bus, and registers an object now completes through both `horizon-jvm` and the native probe.
