@@ -212,6 +212,7 @@ pub struct StdHost {
     /// adapter. Marker-only resources keep an empty stream.
     resource_bytes: BTreeMap<String, Vec<u8>>,
     resource_streams: BTreeMap<String, (Vec<u8>, usize)>,
+    resource_marks: BTreeMap<String, usize>,
     /// Explicitly seeded class names exposed through `ClassLoader.loadClass`.
     /// Values are class markers, and no host classpath or filesystem lookup is
     /// ever attempted.
@@ -270,6 +271,7 @@ impl StdHost {
             resources: BTreeMap::new(),
             resource_bytes: BTreeMap::new(),
             resource_streams: BTreeMap::new(),
+            resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
@@ -1576,11 +1578,34 @@ impl Host for StdHost {
                 ("available", "()I") => Ok(Value::Int(
                     bytes.len().saturating_sub(*index).min(i32::MAX as usize) as i32,
                 )),
+                ("markSupported", "()Z") => Ok(Value::Int(1)),
+                ("mark", "(I)V") => {
+                    self.resource_marks.insert(marker.to_owned(), *index);
+                    Ok(Value::Void)
+                }
+                ("reset", "()V") => {
+                    let mark = self.resource_marks.get(marker).copied().ok_or_else(|| {
+                        NativeError::Metadata("java/io/InputStream has no mark".into())
+                    })?;
+                    *index = mark;
+                    Ok(Value::Void)
+                }
                 ("skip", "(J)J") => {
                     let amount = expect_int(r, Self::argument(r, args, 0)?)?.max(0) as usize;
                     let skipped = amount.min(bytes.len().saturating_sub(*index));
                     *index += skipped;
                     Ok(Value::Int(skipped as i32))
+                }
+                ("skipNBytes", "(J)V") => {
+                    let amount = expect_int(r, Self::argument(r, args, 0)?)?.max(0) as usize;
+                    let remaining = bytes.len().saturating_sub(*index);
+                    if amount > remaining {
+                        return Err(NativeError::Metadata(
+                            "java/io/InputStream skipNBytes exhausted".into(),
+                        ));
+                    }
+                    *index += amount;
+                    Ok(Value::Void)
                 }
                 ("close", "()V") => {
                     *index = bytes.len();
@@ -8989,6 +9014,53 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(&read, &byte_stream, &[]).unwrap(),
             Value::Int(-1)
+        );
+        let mark_supported = MethodRef {
+            owner: "java/io/InputStream".into(),
+            name: "markSupported".into(),
+            descriptor: "()Z".into(),
+        };
+        let mark = MethodRef {
+            owner: "java/io/InputStream".into(),
+            name: "mark".into(),
+            descriptor: "(I)V".into(),
+        };
+        let reset = MethodRef {
+            owner: "java/io/InputStream".into(),
+            name: "reset".into(),
+            descriptor: "()V".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&mark_supported, &byte_stream, &[])
+                .unwrap(),
+            Value::Int(1)
+        );
+        let marked_stream = host
+            .invoke_instance(
+                &stream,
+                &loader,
+                &[Value::Ref(Some("/assets/bytes.bin".into()))],
+            )
+            .unwrap();
+        host.invoke_instance(&mark, &marked_stream, &[Value::Int(0)])
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(&read, &marked_stream, &[]).unwrap(),
+            Value::Int(97)
+        );
+        host.invoke_instance(&reset, &marked_stream, &[]).unwrap();
+        assert_eq!(
+            host.invoke_instance(&read, &marked_stream, &[]).unwrap(),
+            Value::Int(97)
+        );
+        let skip_n = MethodRef {
+            owner: "java/io/InputStream".into(),
+            name: "skipNBytes".into(),
+            descriptor: "(J)V".into(),
+        };
+        assert!(
+            host.invoke_instance(&skip_n, &marked_stream, &[Value::Int(3)])
+                .is_err()
         );
 
         let resources = MethodRef {
