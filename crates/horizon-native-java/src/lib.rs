@@ -1628,7 +1628,11 @@ impl Host for StdHost {
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some(name.to_owned()))),
                 ("getType", "()Ljava/lang/Class;") => {
-                    Ok(Value::Ref(Some(format!("class-descriptor/{descriptor}"))))
+                    let class_name = descriptor
+                        .strip_prefix('L')
+                        .and_then(|value| value.strip_suffix(';'))
+                        .unwrap_or(descriptor);
+                    Ok(Value::Ref(Some(class_name.to_owned())))
                 }
                 ("getModifiers", "()I") => Ok(Value::Int(i32::from(access))),
                 ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(marker.to_owned()))),
@@ -13065,6 +13069,17 @@ mandatory = true
                 .invoke_instance(&field_modifiers, &declared[0], &[])
                 .unwrap(),
             Value::Int(9)
+        );
+        let field_type = MethodRef {
+            owner: "java/lang/reflect/Field".into(),
+            name: "getType".into(),
+            descriptor: "()Ljava/lang/Class;".into(),
+        };
+        assert_eq!(
+            std_host
+                .invoke_instance(&field_type, &declared[0], &[])
+                .unwrap(),
+            Value::Ref(Some("I".into()))
         );
     }
 
