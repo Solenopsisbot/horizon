@@ -46,10 +46,10 @@ Last checked: 3 November 2026, commit `37266bf0a`.
 
 ## Validation snapshot
 
-- `horizon-native-java`: 96 unit tests passing, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection, TagKey values, bounded primitive optionals, custom payload type identity, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries.
+- `horizon-native-java`: 97 unit tests passing, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection, TagKey values, bounded primitive optionals, custom payload type identity, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries.
 - `horizon-mods`: 27 unit tests passing, plus the runtime-built typed declaration adapter fixture.
 - `horizon-port-pack`: 159 unit tests passing, including Mixin `@At`/slice metadata and values, loader ABI classification, Mojang codec/datafixer ABI coverage, native declaration-kind reporting, multi-method hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, and descriptor normalization coverage.
-- `horizon-jvm`: 8 unit tests passing, including explicit fallback labels and NeoForge constructor-only entry selection.
-- Workspace check, targeted clippy, formatting, and `tools/native_java_smoke.py` passing with compiled OptionalLong/OptionalDouble paths.
+- `horizon-jvm`: 9 unit tests passing, including explicit fallback labels and NeoForge constructor-only entry selection.
+- Workspace check, compatibility-crate clippy, formatting, and `tools/native_java_smoke.py` passing with compiled OptionalLong/OptionalDouble paths; the full client clippy job still has a pre-existing render lint.
 
 Every compatibility commit should update this checklist when a surface moves between these sections and should include the focused test or probe that justifies the change.
