@@ -945,6 +945,12 @@ fn dynamic_reason(class: &classes::Class) -> Option<String> {
         if m.owner == "java/lang/Class"
             && DYNAMIC_CLASS_METHODS.iter().any(|n| m.name.starts_with(n))
         {
+            if m.name == "forName" {
+                return Some(
+                    "java/lang/Class#forName (native current-jar only; JVM fallback for arbitrary loading)"
+                        .to_owned(),
+                );
+            }
             return Some(format!("{}#{}", m.owner, m.name));
         }
         if m.owner == "java/lang/ClassLoader"
@@ -1218,6 +1224,25 @@ mod tests {
         assert_eq!(
             dynamic_reason(&class).as_deref(),
             Some("java/lang/ClassLoader#getResourceAsStream")
+        );
+    }
+
+    #[test]
+    fn class_for_name_reports_native_seeded_boundary() {
+        let class = classes::Class {
+            members: vec![classes::Member {
+                owner: "java/lang/Class".to_owned(),
+                name: "forName".to_owned(),
+                descriptor: "(Ljava/lang/String;)Ljava/lang/Class;".to_owned(),
+                kind: classes::MemberKind::Method,
+            }],
+            ..classes::Class::default()
+        };
+        assert_eq!(
+            dynamic_reason(&class).as_deref(),
+            Some(
+                "java/lang/Class#forName (native current-jar only; JVM fallback for arbitrary loading)"
+            )
         );
     }
 
