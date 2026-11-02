@@ -466,8 +466,8 @@ inside one native invocation.
 This is a real native execution boundary, not a claim of full JVM compatibility: general reflection,
 Kotlin runtime behavior, and loader APIs remain on the embedded-JVM path until their native host contracts are
 implemented. Class literals support bounded metadata queries (`getName`, `getSimpleName`, `getTypeName`,
-primitive/array checks, and nominal `isAssignableFrom`) without loading classes from disk; `Class.forName` and
-reflective member enumeration remain unavailable. `getMethod`/`getDeclaredMethod` can produce a bounded marker,
+primitive/array checks, and nominal `isAssignableFrom`) without loading classes from disk; `Class.forName` resolves
+only already-loaded jar classes, while reflective member enumeration remains unavailable. `getMethod`/`getDeclaredMethod` can produce a bounded marker,
 including an exact descriptor when the parameter `Class[]` is available, and `Method.invoke` dispatches only to a
 matching overload already loaded from the jar. The bounded runtime also
 handles `java.lang.reflect.Array` `newInstance`, `getLength`, `get`, and `set` against arrays it owns during the

@@ -3728,6 +3728,22 @@ impl<H: Host> Runtime<'_, H> {
         Value::Ref(Some(marker))
     }
 
+    /// Resolve `Class.forName` only against classes already loaded from the
+    /// current jar. This keeps reflection useful for bootstrap code without
+    /// permitting arbitrary classpath or filesystem loading.
+    fn class_for_name(&self, args: &[Value]) -> Result<Value, NativeError> {
+        let binary = expect_string(
+            args.first()
+                .ok_or_else(|| NativeError::Metadata("Class.forName needs a class name".into()))?,
+        );
+        let internal = binary.replace('.', "/");
+        Ok(if self.classes.contains_key(&internal) {
+            Value::Ref(Some(internal))
+        } else {
+            Value::Ref(None)
+        })
+    }
+
     /// Execute the small reflective-array surface used by Fabric API helpers.
     /// This operates on arrays owned by the current bounded invocation; it
     /// never loads classes or reaches the filesystem.
@@ -3763,6 +3779,17 @@ impl<H: Host> Runtime<'_, H> {
                         NativeError::Metadata(format!("array index {index} out of bounds"))
                     })?
             }
+            ("getBoolean", "(Ljava/lang/Object;I)Z") => {
+                let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
+                let value = self
+                    .array(StdHost::argument(r, args, 0)?)?
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        NativeError::Metadata(format!("array index {index} out of bounds"))
+                    })?;
+                Value::Int(expect_int(r, &value)?)
+            }
             ("set", "(Ljava/lang/Object;ILjava/lang/Object;)V") => {
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
                 let marker = expect_array_marker(StdHost::argument(r, args, 0)?)?;
@@ -3780,6 +3807,22 @@ impl<H: Host> Runtime<'_, H> {
                 Value::Void
             }
             ("setInt", "(Ljava/lang/Object;II)V") => {
+                let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
+                let marker = expect_array_marker(StdHost::argument(r, args, 0)?)?;
+                let slot = self
+                    .arrays
+                    .get_mut(marker)
+                    .ok_or_else(|| {
+                        NativeError::Metadata("array is not owned by this invocation".into())
+                    })?
+                    .get_mut(index)
+                    .ok_or_else(|| {
+                        NativeError::Metadata(format!("array index {index} out of bounds"))
+                    })?;
+                *slot = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
+                Value::Void
+            }
+            ("setBoolean", "(Ljava/lang/Object;IZ)V") => {
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
                 let marker = expect_array_marker(StdHost::argument(r, args, 0)?)?;
                 let slot = self
@@ -4608,6 +4651,11 @@ impl<H: Host> Runtime<'_, H> {
                             self.invoke_reflect_method(&r, receiver.as_ref(), &args)?
                         {
                             value
+                        } else if r.owner == "java/lang/Class"
+                            && r.name == "forName"
+                            && r.descriptor.ends_with(")Ljava/lang/Class;")
+                        {
+                            self.class_for_name(&args)?
                         } else if self.classes.contains_key(&r.owner) {
                             self.invoke(&r.owner, &r.name, &r.descriptor, receiver, &args)?
                         } else {
@@ -8206,9 +8254,46 @@ mandatory = true
         };
         assert_eq!(
             runtime
-                .invoke_reflect_array(&get, &[array, Value::Int(1)], "demo/Reflective", "probe",)
+                .invoke_reflect_array(
+                    &get,
+                    &[array.clone(), Value::Int(1)],
+                    "demo/Reflective",
+                    "probe",
+                )
                 .unwrap(),
             Some(Value::Ref(Some("beta".into())))
+        );
+        let set_boolean = MethodRef {
+            owner: "java/lang/reflect/Array".into(),
+            name: "setBoolean".into(),
+            descriptor: "(Ljava/lang/Object;IZ)V".into(),
+        };
+        assert_eq!(
+            runtime
+                .invoke_reflect_array(
+                    &set_boolean,
+                    &[array.clone(), Value::Int(0), Value::Int(1),],
+                    "demo/Reflective",
+                    "probe",
+                )
+                .unwrap(),
+            Some(Value::Void)
+        );
+        let get_boolean = MethodRef {
+            owner: "java/lang/reflect/Array".into(),
+            name: "getBoolean".into(),
+            descriptor: "(Ljava/lang/Object;I)Z".into(),
+        };
+        assert_eq!(
+            runtime
+                .invoke_reflect_array(
+                    &get_boolean,
+                    &[array, Value::Int(0)],
+                    "demo/Reflective",
+                    "probe",
+                )
+                .unwrap(),
+            Some(Value::Int(1))
         );
     }
 
@@ -8474,6 +8559,18 @@ mandatory = true
                 )
                 .unwrap(),
             Some(Value::Int(7))
+        );
+        assert_eq!(
+            runtime
+                .class_for_name(&[Value::Ref(Some("demo.Reflective".into()))])
+                .unwrap(),
+            Value::Ref(Some("demo/Reflective".into()))
+        );
+        assert_eq!(
+            runtime
+                .class_for_name(&[Value::Ref(Some("demo.Missing".into()))])
+                .unwrap(),
+            Value::Ref(None)
         );
     }
 

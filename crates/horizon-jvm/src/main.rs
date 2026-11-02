@@ -768,4 +768,29 @@ mod tests {
         );
         let _ = std::fs::remove_file(path);
     }
+
+    #[test]
+    fn discovers_all_neoforge_mod_classes_in_sorted_order() {
+        let path = std::env::temp_dir().join(format!(
+            "horizon-jvm-neoforge-many-{}-{}.jar",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = File::create(&path).unwrap();
+        let mut jar = zip::ZipWriter::new(file);
+        for name in ["zeta/Second.class", "alpha/First.class"] {
+            jar.start_file(name, SimpleFileOptions::default()).unwrap();
+            jar.write_all(b"CAFEBABE Lnet/neoforged/fml/common/Mod;")
+                .unwrap();
+        }
+        jar.finish().unwrap();
+        assert_eq!(
+            discover_entries(&path, "main").unwrap(),
+            vec!["alpha.First", "zeta.Second"]
+        );
+        let _ = std::fs::remove_file(path);
+    }
 }
