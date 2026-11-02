@@ -1151,6 +1151,13 @@ impl Host for StdHost {
                     .collect::<Vec<_>>();
                 Ok(collection_value("map", &values))
             }
+            ("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I") => {
+                let value = Self::argument(r, args, 0)?;
+                Ok(Value::Int(match value {
+                    Value::Ref(None) => 0,
+                    _ => stable_hash(&value_text(value)),
+                }))
+            }
             ("java/lang/System", "currentTimeMillis", "()J") => {
                 Ok(Value::Int(self.current_time_millis))
             }
@@ -9615,6 +9622,20 @@ mandatory = true
         assert_eq!(
             default_host.invoke(&current_time_millis, &[]).unwrap(),
             Value::Int(0)
+        );
+        let identity_hash = MethodRef {
+            owner: "java/lang/System".into(),
+            name: "identityHashCode".into(),
+            descriptor: "(Ljava/lang/Object;)I".into(),
+        };
+        assert_eq!(
+            host.invoke(&identity_hash, &[Value::Ref(None)]).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            host.invoke(&identity_hash, &[Value::Ref(Some("demo".into()))])
+                .unwrap(),
+            Value::Int(stable_hash("demo"))
         );
     }
 

@@ -488,7 +488,7 @@ metadata accessors expose that marker without loading classes. The bounded runti
 handles `java.lang.reflect.Array` `newInstance`, `getLength`, `get`, and `set` against arrays it owns during the
 current invocation. The crate
 also exposes a deterministic `StdHost` adapter for a small set of side-effect-free
-queries (`System.getProperty`, deterministic `System.currentTimeMillis`, primitive parsing, line separators, string receivers, and math helpers); every
+queries (`System.getProperty`, deterministic `System.currentTimeMillis`/`identityHashCode`, primitive parsing, line separators, string receivers, and math helpers); every
 external call is recorded with its receiver and arguments for later dispatch. The CLI keeps the neutral `NullHost` default so probe results remain independent of
 machine properties, while a game-facing host can opt into Horizon-owned mappings without coupling the
 interpreter crate to `horizon-client`. Unknown calls keep the neutral return contract.
