@@ -134,6 +134,12 @@ pub enum RegistryDeclaration {
         category: String,
         color: u32,
     },
+    /// A data recipe emitted into `data/<namespace>/recipe/<path>.json` by
+    /// the game-owned content adapter. The JSON is validated at metadata
+    /// load time and remains data-only; no recipe code executes here.
+    Recipe {
+        json: String,
+    },
     Custom {
         kind: String,
         properties: BTreeMap<String, String>,
@@ -7686,6 +7692,21 @@ fn parse_native_metadata(text: &str) -> Result<(Option<String>, Vec<RegistryEntr
                         NativeError::Metadata("native effect color is invalid".into())
                     })?,
             },
+            "recipe" => {
+                let json = object
+                    .get("recipe")
+                    .or_else(|| object.get("json"))
+                    .ok_or_else(|| NativeError::Metadata("native recipe is missing json".into()))?;
+                if !json.is_object() {
+                    return Err(NativeError::Metadata(
+                        "native recipe json is not an object".into(),
+                    ));
+                }
+                RegistryDeclaration::Recipe {
+                    json: serde_json::to_string(json)
+                        .map_err(|e| NativeError::Metadata(e.to_string()))?,
+                }
+            }
             "custom" => RegistryDeclaration::Custom {
                 kind: required_from(object, "custom_kind")?,
                 properties,
@@ -8153,14 +8174,18 @@ mandatory = true
         )
         .unwrap();
         zip.write_all(
-            br#"{"id":"ruby","registrations":[{"registry":"minecraft:item","id":"ruby:wand","kind":"item","template":"minecraft:stick"}]}"#,
+            br##"{"id":"ruby","registrations":[{"registry":"minecraft:item","id":"ruby:wand","kind":"item","template":"minecraft:stick"},{"registry":"minecraft:recipe","id":"ruby:lamp","kind":"recipe","recipe":{"type":"minecraft:crafting_shaped","pattern":["#"]}}]}"##,
         )
         .unwrap();
         zip.finish().unwrap();
         let jar = NativeJar::from_path(&path).unwrap();
         assert_eq!(jar.native_id.as_deref(), Some("ruby"));
-        assert_eq!(jar.native_declarations.len(), 1);
+        assert_eq!(jar.native_declarations.len(), 2);
         assert_eq!(jar.native_declarations[0].id, "ruby:wand");
+        assert!(matches!(
+            jar.native_declarations[1].declaration,
+            Some(RegistryDeclaration::Recipe { .. })
+        ));
         std::fs::remove_file(path).unwrap();
     }
 

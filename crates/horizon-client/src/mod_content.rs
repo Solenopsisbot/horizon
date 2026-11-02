@@ -1495,6 +1495,9 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
                 }
             }
         }
+        for (file, bytes) in &m.content.native_files {
+            overlay.write(file, bytes)?;
+        }
     }
     // A tag naming an id nobody registers fails as a whole in vanilla, and
     // carried-over mods name blocks left out or other mods' ids: such
@@ -1713,8 +1716,8 @@ fn stamp(base: &Path, mods: &[ContentMod]) -> Result<String> {
             // their typed values in the stamp so changing a declaration
             // invalidates the overlay just like changing a packaged file.
             parts.push(format!(
-                "native declarations: blocks={:?}; items={:?}; effects={:?}",
-                m.content.blocks, m.content.items, m.content.effects
+                "native declarations: blocks={:?}; items={:?}; effects={:?}; files={:?}",
+                m.content.blocks, m.content.items, m.content.effects, m.content.native_files
             ));
         } else if source.is_dir() {
             for file in &m.content.files {

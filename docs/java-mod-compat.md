@@ -462,10 +462,11 @@ and lists the loader kinds actually declared (`main`, `client`, `server`, or `ne
 wrong side of a split Fabric jar is immediately actionable.
 
 An explicitly supported jar may include `META-INF/horizon-native.json` to supply that typed adapter data:
-`{"id":"mod_id","registrations":[{"registry":"minecraft:block","id":"mod_id:block","kind":"block","template":"minecraft:stone","properties":{},"item":true}]}`.
-The loader validates block, item, and mob-effect declarations, turns them into declaration-only `Content`,
-and layers them through the same `content_root` planner as `.hmod` content. Unknown custom kinds fail the
-startup rather than silently entering the native registries.
+`{"id":"mod_id","registrations":[{"registry":"minecraft:block","id":"mod_id:block","kind":"block","template":"minecraft:stone","properties":{},"item":true},{"registry":"minecraft:recipe","id":"mod_id:block","kind":"recipe","recipe":{"type":"minecraft:crafting_shaped","pattern":["#"]}}]}`.
+The loader validates block, item, mob-effect, and recipe declarations, turns them into declaration-only
+`Content`, writes recipe declarations as `data/<namespace>/recipe/<path>.json`, and layers them through
+the same `content_root` planner as `.hmod` content. Unknown custom kinds fail the startup rather than
+silently entering the native registries.
 
 The embedded JVM runner treats a discovered `neoforge` entrypoint as constructor-only, invoking the
 mod constructor and optional Mixin `onLoad` hook without fabricating a Fabric `onInitialize` call.

@@ -191,6 +191,9 @@ pub struct Content {
     pub blocks: Vec<Block>,
     pub items: Vec<Item>,
     pub effects: Vec<MobEffect>,
+    /// Data files supplied by a native adapter (currently recipes). These
+    /// are written into the same resource overlay as packaged mod files.
+    pub native_files: BTreeMap<String, Vec<u8>>,
     /// The namespaces it owns: the mod id, then the manifest's `namespaces`.
     pub namespaces: Vec<String>,
 }
@@ -278,6 +281,7 @@ impl Content {
             blocks: Vec::new(),
             items: Vec::new(),
             effects: Vec::new(),
+            native_files: BTreeMap::new(),
             namespaces: manifest.owned_namespaces().map(str::to_owned).collect(),
         };
         content.check(manifest)?;
@@ -297,6 +301,7 @@ impl Content {
             && self.blocks.is_empty()
             && self.items.is_empty()
             && self.effects.is_empty()
+            && self.native_files.is_empty()
     }
 
     /// Builds the declaration-only content half of a native Java mod.
@@ -335,12 +340,24 @@ impl Content {
         for effect in &declarations.effects {
             add_namespace(&effect.id);
         }
+        let mut native_files = BTreeMap::new();
+        for recipe in &declarations.recipes {
+            add_namespace(&recipe.id);
+            let (namespace, path) = recipe
+                .id
+                .split_once(':')
+                .ok_or_else(|| format!("native recipe {} has no namespace", recipe.id))?;
+            let file = format!("data/{namespace}/recipe/{path}.json");
+            check_path(&file)?;
+            native_files.insert(file, recipe.json.clone());
+        }
         Ok(Self {
             source: Source::Dir(PathBuf::new()),
             files: Vec::new(),
             blocks: declarations.blocks,
             items: declarations.items,
             effects: declarations.effects,
+            native_files,
             namespaces,
         })
     }

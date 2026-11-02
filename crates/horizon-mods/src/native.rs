@@ -21,12 +21,21 @@ pub struct CustomDeclaration {
     pub properties: BTreeMap<String, String>,
 }
 
+/// A recipe declaration that becomes a data-pack JSON file before the
+/// resource root is loaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipeDeclaration {
+    pub id: String,
+    pub json: Vec<u8>,
+}
+
 /// Typed registrations waiting for the pre-resource load phase.
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct NativeDeclarations {
     pub blocks: Vec<Block>,
     pub items: Vec<Item>,
     pub effects: Vec<MobEffect>,
+    pub recipes: Vec<RecipeDeclaration>,
     pub custom: Vec<CustomDeclaration>,
 }
 
@@ -173,6 +182,25 @@ impl NativeDeclarations {
         });
         Ok(())
     }
+
+    fn add_recipe(&mut self, entry: &RegistryEntry, json: &str) -> Result<(), String> {
+        Self::ensure_id(&entry.id)?;
+        if self.recipes.iter().any(|recipe| recipe.id == entry.id) {
+            return Err(format!("duplicate native recipe {}", entry.id));
+        }
+        let value: serde_json::Value = serde_json::from_str(json)
+            .map_err(|error| format!("native recipe {} is invalid JSON: {error}", entry.id))?;
+        if !value.is_object() {
+            return Err(format!("native recipe {} is not a JSON object", entry.id));
+        }
+        let json = serde_json::to_vec(&value)
+            .map_err(|error| format!("native recipe {} cannot be encoded: {error}", entry.id))?;
+        self.recipes.push(RecipeDeclaration {
+            id: entry.id.clone(),
+            json,
+        });
+        Ok(())
+    }
 }
 
 impl TypedRegistrySink for NativeDeclarations {
@@ -211,6 +239,7 @@ impl TypedRegistrySink for NativeDeclarations {
                 });
                 Ok(())
             }
+            RegistryDeclaration::Recipe { json } => self.add_recipe(entry, json),
             RegistryDeclaration::Custom { kind, properties } => {
                 Self::ensure_id(&entry.id)?;
                 self.custom.push(CustomDeclaration {
@@ -318,6 +347,39 @@ mod tests {
         assert!(!content.is_empty());
         assert_eq!(content.namespaces, ["ruby"]);
         assert_eq!(content.blocks[0].id, "ruby:lamp");
+    }
+
+    #[test]
+    fn recipe_declaration_becomes_native_data_file() {
+        let recipe = RegistryEntry::typed(
+            "minecraft:recipe",
+            "ruby:lamp",
+            RegistryDeclaration::Recipe {
+                json: r##"{"type":"minecraft:crafting_shaped","pattern":["#"]}"##.into(),
+            },
+        );
+        let declarations = NativeDeclarations::from_registry_entries([&recipe]).unwrap();
+        assert_eq!(declarations.recipes.len(), 1);
+        let content = crate::Content::from_native("ruby", declarations).unwrap();
+        let recipe: serde_json::Value = serde_json::from_slice(
+            content
+                .native_files
+                .get("data/ruby/recipe/lamp.json")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.get("type").and_then(serde_json::Value::as_str),
+            Some("minecraft:crafting_shaped")
+        );
+        assert_eq!(
+            recipe
+                .get("pattern")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(serde_json::Value::as_str),
+            Some("#")
+        );
     }
 
     #[test]

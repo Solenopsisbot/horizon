@@ -600,7 +600,7 @@ mod tests {
         zip.start_file("META-INF/horizon-native.json", options)
             .unwrap();
         zip.write_all(
-            br#"{"id":"typed-game","registrations":[{"registry":"minecraft:block","id":"typed:game_lamp","kind":"block","template":"minecraft:stone","item":true,"properties":{}}]}"#,
+            br##"{"id":"typed-game","registrations":[{"registry":"minecraft:block","id":"typed:game_lamp","kind":"block","template":"minecraft:stone","item":true,"properties":{}},{"registry":"minecraft:recipe","id":"typed-game:game_lamp_recipe","kind":"recipe","recipe":{"type":"minecraft:crafting_shaped","pattern":["#"]}}]}"##,
         )
         .unwrap();
         zip.finish().unwrap();
@@ -610,6 +610,18 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0].id, "typed-game");
         assert_eq!(content[0].content.blocks[0].id, "typed:game_lamp");
+        assert_eq!(
+            content[0]
+                .content
+                .native_files
+                .get("data/typed-game/recipe/game_lamp_recipe.json")
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|json| json.get("type").cloned()),
+            Some(serde_json::Value::String(
+                "minecraft:crafting_shaped".into()
+            ))
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
