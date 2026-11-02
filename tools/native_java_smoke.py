@@ -5,7 +5,7 @@ This is intentionally independent of ``.local`` and a Minecraft installation.  I
 checks the complete native probe path with real classfiles: javac emits the
 bytecode, jar packages it with Fabric metadata, and horizon-native-java discovers
 and executes both lifecycle entries, including an Optional.filter predicate callback,
-plus a constructor-discovered NeoForge jar.
+plus a constructor-discovered NeoForge jar that registers a configuration payload.
 """
 
 from __future__ import annotations
@@ -88,10 +88,31 @@ package demo;
 @net.neoforged.fml.common.Mod("native-smoke-neo")
 public final class Neo {
     public Neo() {
+        new net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent()
+            .registrar("1")
+            .configurationToClient("config-type", "config-codec", "config-handler");
         int remaining = 2;
         while (remaining > 0) {
             remaining--;
         }
+    }
+}
+""",
+    "net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent.java": """
+package net.neoforged.neoforge.network.event;
+
+public final class RegisterPayloadHandlersEvent {
+    public net.neoforged.neoforge.network.registration.PayloadRegistrar registrar(String version) {
+        return new net.neoforged.neoforge.network.registration.PayloadRegistrar();
+    }
+}
+""",
+    "net/neoforged/neoforge/network/registration/PayloadRegistrar.java": """
+package net.neoforged.neoforge.network.registration;
+
+public final class PayloadRegistrar {
+    public PayloadRegistrar configurationToClient(Object type, Object codec, Object handler) {
+        return this;
     }
 }
 """,
@@ -197,7 +218,10 @@ def main() -> int:
                 str(neo_jar),
                 "-C",
                 str(classes),
-                ".",
+                "demo/Neo.class",
+                "-C",
+                str(classes),
+                "net/neoforged/fml/common/Mod.class",
                 "-C",
                 str(metadata),
                 "neoforge.mods.toml",
@@ -276,6 +300,7 @@ def main() -> int:
             or neo_report.get("kind") != "neoforge"
             or neo_report.get("entrypoints") != ["demo.Neo"]
             or not isinstance(neo_report.get("host_calls"), int)
+            or neo_report.get("payload_directions") != ["configurationToClient"]
         ):
             print(f"native NeoForge probe failed: {json.dumps(neo_report, sort_keys=True)}", file=sys.stderr)
             return 1

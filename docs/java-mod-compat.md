@@ -350,10 +350,11 @@ cargo run -q -p horizon-jvm -- [--entry <entrypoint class>] [--entry-kind main|c
 cargo run -q -p horizon-native-java -- --json mods/example.jar main
 ```
 
-When `--entry` is omitted, the runner discovers Fabric's `fabric.mod.json` entrypoint (including the
-string, object, and array forms) and selects `main` by default; `--entry-kind client` or `server`
-selects the other environment. NeoForge jars are scanned for top-level classes carrying `@Mod` and
-use the same explicit `--entry` override when more than one mod class is present. Full Mixin weaving,
+When `--entry` is omitted, the runner discovers Fabric's `fabric.mod.json` entrypoints (including the
+string, object, and array forms), selects `main` by default, and executes every declaration in metadata
+order; `--entry-kind client` or `server` selects the other environment. NeoForge jars are scanned for
+top-level classes carrying `@Mod` and each discovered class is executed in sorted order unless an explicit
+`--entry` override selects one. Full Mixin weaving,
 the object contract, and semantics for real game objects remain later phases.
 
 The selected Fabric kind now dispatches to its matching lifecycle method (`onInitialize`,
@@ -367,7 +368,8 @@ lifecycle call, which lets FabricProxy-Lite initialize its config. NeoForge
 classes without a Fabric lifecycle method are accepted after construction so their constructor-driven
 registration can be probed.
 
-The native CLI's `--json` form returns `{status,kind,entrypoints,host_calls}` on success and a structured
+The native CLI's `--json` form returns
+`{status,kind,entrypoints,host_calls,payload_directions}` on success and a structured
 `{status,error,stage}` object on load, discovery, or execution failure. A launcher can use that verdict to
 select the native path or fall back to `horizon-jvm` without parsing human diagnostics. `cargo horizon-mod
 check` runs the same bounded probe as an optional `native` field in its JSON report, trying Fabric `main`,

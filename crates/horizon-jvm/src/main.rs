@@ -164,25 +164,18 @@ fn run() -> Result<(), String> {
     if args.is_empty() {
         return Err("usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server>] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...".to_owned());
     }
-    let entry_spec = match entry {
-        Some(entry) => entry,
-        None => discover_entries(Path::new(&args[0]), &entry_kind)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                format!(
+    let entry_specs = match entry {
+        Some(entry) => vec![entry],
+        None => {
+            let entries = discover_entries(Path::new(&args[0]), &entry_kind)?;
+            if entries.is_empty() {
+                return Err(format!(
                     "no {entry_kind} entrypoint found in {}; pass --entry <class>",
                     args[0]
-                )
-            })?,
-    };
-    let (entry, explicit_initializer) = split_entrypoint(&entry_spec);
-    let has_explicit_initializer = explicit_initializer.is_some();
-    let (initializer, initializer_label) = if let Some(method) = explicit_initializer {
-        (method.to_owned(), method.to_owned())
-    } else {
-        let (method, label) = initializer_for_kind(&entry_kind)?;
-        (method.to_owned(), label.to_owned())
+                ));
+            }
+            entries
+        }
     };
 
     let mut classpath: Vec<PathBuf> = Vec::new();
@@ -232,66 +225,76 @@ fn run() -> Result<(), String> {
     seed_fabric_metadata(env, &classpath)?;
 
     println!(
-        "jvm up: {} jars on the classpath, entry {entry}",
-        classpath.len()
+        "jvm up: {} jars on the classpath, {} {} entrypoint(s)",
+        classpath.len(),
+        entry_kind,
+        entry_specs.len()
     );
-    let class = match env.find_class(entry.replace('.', "/")) {
-        Ok(class) => class,
-        Err(e) => return describe(env, "find_class", entry, e),
-    };
-    // Fabric invokes a mod's common initializer before a `Class::method`
-    // client/server entrypoint when both are declared on the same class. A
-    // number of real mods use that method to publish their singleton state.
-    if has_explicit_initializer && initializer != "onInitialize" {
-        if env.get_method_id(&class, "onInitialize", "()V").is_ok() {
-            let common = match env.new_object(&class, "()V", &[]) {
-                Ok(object) => object,
-                Err(e) => return describe(env, "new", entry, e),
-            };
-            call_mixin_on_load(env, &class, &common, entry)?;
-            if let Err(e) = env.call_method(&common, "onInitialize", "()V", &[]) {
-                return describe(env, "onInitialize", entry, e);
-            }
+    for entry_spec in &entry_specs {
+        let (entry, explicit_initializer) = split_entrypoint(entry_spec);
+        let has_explicit_initializer = explicit_initializer.is_some();
+        let (initializer, initializer_label) = if let Some(method) = explicit_initializer {
+            (method.to_owned(), method.to_owned())
         } else {
-            let _ = env.exception_clear();
-        }
-    }
-    if has_explicit_initializer
-        && env
-            .get_static_method_id(&class, &initializer, "()V")
-            .is_ok()
-    {
-        return match env.call_static_method(&class, &initializer, "()V", &[]) {
-            Ok(_) => {
-                println!("{initializer_label} returned");
-                Ok(())
-            }
-            Err(e) => describe(env, &initializer_label, entry, e),
+            let (method, label) = initializer_for_kind(&entry_kind)?;
+            (method.to_owned(), label.to_owned())
         };
-    }
-    let _ = env.exception_clear();
-    let object = match env.new_object(&class, "()V", &[]) {
-        Ok(object) => object,
-        Err(e) => return describe(env, "new", entry, e),
-    };
-    call_mixin_on_load(env, &class, &object, entry)?;
-    if env.get_method_id(&class, &initializer, "()V").is_err() {
+        let class = match env.find_class(entry.replace('.', "/")) {
+            Ok(class) => class,
+            Err(e) => return describe(env, "find_class", entry, e),
+        };
+        // Fabric invokes a mod's common initializer before a `Class::method`
+        // client/server entrypoint when both are declared on the same class. A
+        // number of real mods use that method to publish their singleton state.
+        if has_explicit_initializer && initializer != "onInitialize" {
+            if env.get_method_id(&class, "onInitialize", "()V").is_ok() {
+                let common = match env.new_object(&class, "()V", &[]) {
+                    Ok(object) => object,
+                    Err(e) => return describe(env, "new", entry, e),
+                };
+                call_mixin_on_load(env, &class, &common, entry)?;
+                if let Err(e) = env.call_method(&common, "onInitialize", "()V", &[]) {
+                    return describe(env, "onInitialize", entry, e);
+                }
+            } else {
+                let _ = env.exception_clear();
+            }
+        }
+        if has_explicit_initializer
+            && env
+                .get_static_method_id(&class, &initializer, "()V")
+                .is_ok()
+        {
+            match env.call_static_method(&class, &initializer, "()V", &[]) {
+                Ok(_) => {
+                    println!("{initializer_label} returned");
+                }
+                Err(e) => return describe(env, &initializer_label, entry, e),
+            }
+            continue;
+        }
         let _ = env.exception_clear();
-        if entry_kind == "main" && !has_explicit_initializer {
-            println!("{entry} constructor returned (no {initializer} method)");
-            return Ok(());
+        let object = match env.new_object(&class, "()V", &[]) {
+            Ok(object) => object,
+            Err(e) => return describe(env, "new", entry, e),
+        };
+        call_mixin_on_load(env, &class, &object, entry)?;
+        if env.get_method_id(&class, &initializer, "()V").is_err() {
+            let _ = env.exception_clear();
+            if entry_kind == "main" && !has_explicit_initializer {
+                println!("{entry} constructor returned (no {initializer} method)");
+                continue;
+            }
+            return Err(format!(
+                "{entry} has no {initializer}()V initializer for --entry-kind {entry_kind}"
+            ));
         }
-        return Err(format!(
-            "{entry} has no {initializer}()V initializer for --entry-kind {entry_kind}"
-        ));
-    }
-    match env.call_method(&object, &initializer, "()V", &[]) {
-        Ok(_) => {
-            println!("{initializer_label} returned");
-            Ok(())
+        match env.call_method(&object, &initializer, "()V", &[]) {
+            Ok(_) => println!("{initializer_label} returned"),
+            Err(e) => return describe(env, &initializer_label, entry, e),
         }
-        Err(e) => describe(env, &initializer_label, entry, e),
     }
+    Ok(())
 }
 
 fn split_entrypoint(spec: &str) -> (&str, Option<&str>) {
@@ -501,8 +504,8 @@ fn take(args: &mut Vec<String>, name: &str) -> Option<String> {
 }
 
 /// Finds a Fabric `entrypoints.<kind>` declaration, or NeoForge classes that
-/// carry `@Mod`. The runner deliberately chooses one entrypoint; callers that
-/// need a different environment select it with `--entry-kind`.
+/// carry `@Mod`. The runner executes the returned entries in metadata order;
+/// callers that need a different environment select it with `--entry-kind`.
 fn discover_entries(jar: &Path, kind: &str) -> Result<Vec<String>, String> {
     let file = File::open(jar).map_err(|e| format!("{}: {e}", jar.display()))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", jar.display()))?;

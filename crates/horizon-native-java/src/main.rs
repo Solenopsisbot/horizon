@@ -87,6 +87,11 @@ fn main() -> ExitCode {
                         "kind": kind,
                         "entrypoints": entrypoints.iter().map(|entry| &entry.class).collect::<Vec<_>>(),
                         "host_calls": calls,
+                        "payload_directions": host
+                            .payload_registrations()
+                            .iter()
+                            .map(|registration| registration.direction.clone())
+                            .collect::<Vec<_>>(),
                     })
                 );
             } else {

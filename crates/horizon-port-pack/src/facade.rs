@@ -483,7 +483,7 @@ pub fn generate_many(
                     "    static HorizonSlot horizonSlot(IItemHandler self, int slot) { return slot == 0 ? HORIZON_SLOTS.computeIfAbsent(self, key -> new HorizonSlot()) : null; }\n",
                     "    static int horizonCount(ItemStack stack) { if (stack == null) return 0; try { return ((Integer) stack.getClass().getMethod(\"getCount\").invoke(stack)).intValue(); } catch (Exception ignored) { return 0; } }\n",
                     "    static Item horizonItem(ItemStack stack) { if (stack == null) return null; try { return (Item) stack.getClass().getMethod(\"getItem\").invoke(stack); } catch (Exception ignored) { return null; } }\n",
-                    "    static ItemStack horizonCopy(ItemStack stack, int count) { if (stack == null || count <= 0) return new ItemStack(); try { return new ItemStack(horizonItem(stack), count); } catch (Exception ignored) { return new ItemStack(); } }\n",
+                    "    static ItemStack horizonCopy(ItemStack stack, int count) { if (stack == null || count <= 0) return new ItemStack(); try { return (ItemStack) stack.getClass().getMethod(\"copyWithCount\", int.class).invoke(stack, count); } catch (Exception ignored) { try { return new ItemStack(horizonItem(stack), count); } catch (Exception nested) { return new ItemStack(); } } }\n",
                     "    default int getSlots() { return 1; }\n",
                     "    default ItemStack getStackInSlot(int slot) { HorizonSlot value = horizonSlot(this, slot); return value == null || value.count <= 0 ? new ItemStack() : horizonCopy(value.stack, value.count); }\n",
                     "    default ItemStack insertItem(int slot, ItemStack stack, boolean simulate) { HorizonSlot value = horizonSlot(this, slot); int incoming = horizonCount(stack); if (value == null || incoming <= 0) return incoming <= 0 ? new ItemStack() : stack; Item existing = horizonItem(value.stack); Item incomingItem = horizonItem(stack); if (value.count > 0 && existing != incomingItem) return horizonCopy(stack, incoming); int amount = Math.min(incoming, Math.max(0, 64 - value.count)); if (!simulate && amount > 0) { if (value.count == 0) value.stack = stack; value.count += amount; } return amount == incoming ? new ItemStack() : horizonCopy(stack, incoming - amount); }\n",
@@ -3632,6 +3632,7 @@ mod tests {
         assert!(source.contains("Math.min(incoming, Math.max(0, 64 - value.count))"));
         assert!(source.contains("if (!simulate && amount > 0)"));
         assert!(source.contains("if (!simulate) { value.count -= moved;"));
+        assert!(source.contains("copyWithCount\\\", int.class"));
         assert!(source.contains("default void setStackInSlot(int slot, ItemStack stack)"));
         assert!(source.contains("Collections.synchronizedMap(new java.util.WeakHashMap<>)"));
         assert!(source.contains("if class.name == \"net/minecraft/world/item/ItemStack\""));

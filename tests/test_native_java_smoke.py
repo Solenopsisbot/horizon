@@ -25,6 +25,7 @@ class NativeJavaSmokeTests(unittest.TestCase):
         self.assertIn('"entrypoints": ["demo.Neo"]', result.stdout)
         report = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertGreaterEqual(report["fabric"]["host_calls"], 10)
+        self.assertEqual(report["neoforge"]["payload_directions"], ["configurationToClient"])
 
 
 if __name__ == "__main__":
