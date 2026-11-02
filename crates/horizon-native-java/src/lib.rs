@@ -905,6 +905,13 @@ impl Host for StdHost {
             ("java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => Ok(
                 Value::Int((Self::argument(r, args, 0)? == Self::argument(r, args, 1)?) as i32),
             ),
+            ("java/util/Objects", "hashCode", "(Ljava/lang/Object;)I") => {
+                let value = Self::argument(r, args, 0)?;
+                Ok(Value::Int(match value {
+                    Value::Ref(None) => 0,
+                    _ => stable_hash(&value_text(value)),
+                }))
+            }
             (
                 "java/util/Objects",
                 "requireNonNullElse",
@@ -8296,6 +8303,20 @@ mandatory = true
         assert!(
             host.invoke(&require_else, &[Value::Ref(None), Value::Ref(None)])
                 .is_err()
+        );
+        let hash_code = MethodRef {
+            owner: "java/util/Objects".into(),
+            name: "hashCode".into(),
+            descriptor: "(Ljava/lang/Object;)I".into(),
+        };
+        assert_eq!(
+            host.invoke(&hash_code, &[Value::Ref(None)]).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            host.invoke(&hash_code, &[Value::Ref(Some("ok".into()))])
+                .unwrap(),
+            Value::Int(stable_hash("ok"))
         );
         let value_of = MethodRef {
             owner: "java/lang/String".into(),

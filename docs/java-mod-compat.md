@@ -502,8 +502,8 @@ bounded `Number` primitive accessors across the supported boxed numeric markers,
 common `Character.isLetter`/`isDigit`/`toLowerCase` queries and
 `valueOf`/`charValue` boxing operations,
 `StringBuilder`/`StringBuffer` append and
-`toString` values, primitive `String.valueOf` overloads, plus `Objects.equals`, `requireNonNull`,
-`requireNonNullElse`, and `toString`, which covers common loader bootstrap formatting and null checks without a JVM.
+`toString` values, primitive `String.valueOf` overloads, plus `Objects.equals`, `hashCode`,
+`requireNonNull`, `requireNonNullElse`, and `toString`, which covers common loader bootstrap formatting and null checks without a JVM.
 String `replace` (character and `CharSequence` forms), `repeat`, `indexOf`, `lastIndexOf`, `trim`, `strip`, and `isBlank`
 are also deterministic, covering namespace/path normalization used by loader metadata and registration code. Repetition
 counts are bounded to keep native probes finite.
