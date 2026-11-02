@@ -2,16 +2,16 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `fc13716ee`.
+Last checked: 3 November 2026, commit `88f56b4a2`.
 
 ## Supported now
 
-- [x] Read Fabric `fabric.mod.json`, NeoForge `neoforge.mods.toml`, and legacy Forge `mods.toml` for bounded identity, dependencies, and entrypoint discovery.
+- [x] Read Fabric `fabric.mod.json`, NeoForge `neoforge.mods.toml`, and legacy Forge `mods.toml` for bounded identity, dependencies, client-only markers, and entrypoint discovery.
 - [x] Discover and run multiple Fabric entrypoints in deterministic order.
 - [x] Discover NeoForge and legacy Forge `@Mod` classes through the native probe path.
 - [x] Run unsupported entrypoints through the embedded JVM runner as a fallback.
 - [x] Expose bounded Fabric loader values: loaded-mod checks, metadata, versions, environment type, development marker, root paths, and seeded containers.
-- [x] Expose bounded NeoForge and legacy Forge loader values: mod lists, containers, event-bus access, and mod ids.
+- [x] Expose bounded NeoForge and legacy Forge loader values: mod lists, containers, event-bus access, mod ids, and role-aware client/server selection.
 - [x] Register and inspect bounded NeoForge and Forge deferred registrations, holders, registry objects, keys, ids, entry collections, generated `Registry.getHolder`/`getOrThrow` lookups, explicit typed-registration handoff, and `ItemStack.getUseAnimation`/tag-stream façade coverage, and custom payload type identity.
 - [x] Record Fabric events, NeoForge events, and legacy Forge event-bus listeners with ordering, cancellation markers, unregister support, and Forge `register(Object)` handlers.
 - [x] Record custom payload registrations for the supported Fabric/NeoForge directions, retain custom payload type identity, and support the bounded legacy Forge `SimpleChannel.registerMessage` alias.
@@ -22,7 +22,7 @@ Last checked: 3 November 2026, commit `fc13716ee`.
 - [x] Maintain runtime-built legacy Forge fixtures covering `mods.toml`, `@Mod` discovery, `DeferredRegister`, `SimpleChannel.registerMessage`, event-bus listener dispatch, Forge `register(Object)`/`unregister(Object)` handlers, and the game-facing `--java-mod` content path; role selection and typed-registration merge behavior are also covered.
 - [x] Preserve bounded Throwable/Exception/Error messages and cause markers, including `getMessage`, `getCause`, `initCause`, and `toString` diagnostics.
 - [x] Mirror the common `Locale.US` integer grouping path used by the native statistics screen without emulating arbitrary locale patterns.
-- [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs, array-returning signatures, common `Identifier` prefix/language-key/ordering helpers, Holder serialization queries, TagKey values, and the sealed 26.3 `InteractionResult` value records and constants.
+- [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs, array-returning signatures, common `Identifier` prefix/language-key/ordering helpers, Holder serialization queries, TagKey values, `InteractionHand` name/opposite semantics, and the sealed 26.3 `InteractionResult` value records and constants.
 - [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, Mixin `@At`, slice boundary/value preservation, top-level and nested `injectors` config edge values, and Mixin Extras injector normalization, loader ABI classification, access-widener/access-transformer discovery, Mojang support-API façade classification, and explicit report-only diagnostics.
 
 ## Partial or report-only
@@ -50,6 +50,7 @@ Last checked: 3 November 2026, commit `fc13716ee`.
 - `horizon-mods`: 27 unit tests passing, plus the runtime-built typed declaration adapter fixture.
 - `horizon-port-pack`: 163 unit tests passing, including Mixin `@At`/slice boundary metadata and values, config edge values, Mixin Extras injector normalization, loader ABI classification, Mojang codec/datafixer ABI coverage, native declaration-kind reporting, deduplicated Mixin hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, sealed InteractionResult façade values, and descriptor normalization coverage.
 - `horizon-jvm`: 9 unit tests passing, including explicit fallback labels, static-initialization fallback diagnostics, and NeoForge constructor-only entry selection.
+- `horizon-client` game mod tests: 12 passing, including bundled-resource loading, typed content, client/server role selection, and client-only NeoForge rejection.
 - Workspace check, full client clippy, compatibility-crate clippy, formatting, and `tools/native_java_smoke.py` passing with compiled OptionalLong/OptionalDouble paths.
 
 Every compatibility commit should update this checklist when a surface moves between these sections and should include the focused test or probe that justifies the change.

@@ -448,7 +448,7 @@ scanned from `mods/` implicitly. Registrations remain diagnostic until a typed d
 the content rows described below.
 `NativeJar` reads the first `[[mods]]` record in either `META-INF/neoforge.mods.toml` or legacy
 `META-INF/mods.toml` as the loader id and version, and carries required `[[dependencies.<id>]]` records into
-the same startup seed used for Fabric metadata. Forge and NeoForge `@Mod` annotations are both discoverable
+the same startup seed used for Fabric metadata. A Forge or NeoForge `clientSideOnly = true` marker is retained and server roles reject the jar before constructor loading. Forge and NeoForge `@Mod` annotations are both discoverable
 as `neoforge` probe entrypoints.
 Fabric entrypoint objects retain their optional `adapter` name; the native launcher reports that adapter
 explicitly and stops rather than invoking the target with the wrong lifecycle contract; the selected
