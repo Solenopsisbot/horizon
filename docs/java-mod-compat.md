@@ -466,8 +466,9 @@ and `DeferredRegister.create`/`register` yield façade register and holder objec
 also exposes the common `value`, `getOptional`, `getKey`, `getId`, and bounded holder serialization
 queries (including the modern
 `ResourceLocation` return type) with typed neutral return
-values, and `DeferredRegister.getEntries` returns a bounded holder collection, so constructors can inspect
-a registration without linking against NeoForge's implementation.
+values, and `DeferredRegister.getEntries` returns a bounded holder collection, while the generated `Registry.getHolder`
+lookup projects known entries into an optional holder reference, so constructors can inspect a registration
+without linking against NeoForge's implementation.
 `RegisterEvent` now
 also has its public registration overloads, a retained registry key and registry view, and a helper callback that
 writes registrations into that view. The networking
@@ -663,6 +664,12 @@ deliberately an export boundary today: Horizon's prepared block and item registr
 `content_root` has loaded, and an opaque Java object marker cannot safely become a native block or item.
 The typed declaration path runs before `Assets::load`; jars without declarations still report registrations
 without mutating the live game tables.
+
+The end-to-end typed adapter has a source-built regression fixture in
+`crates/horizon-mods/tests/native_fixture.rs`. It compiles a small Fabric entrypoint, packages block,
+item, and mob-effect declarations, executes the jar, and feeds those declarations through
+`NativeDeclarations::from_registry_entries`; this verifies that typed content reaches the Horizon adapter
+without requiring a game installation.
 
 The typed half of that boundary now lives in `horizon-mods::native::NativeDeclarations`. It implements
 `TypedRegistrySink`, validates names and block/item/effect properties, and collects Horizon's existing
