@@ -1165,6 +1165,18 @@ fn render(
             "    protected double horizonMinX;\n    protected double horizonMinY;\n    protected double horizonMinZ;\n    protected double horizonMaxX;\n    protected double horizonMaxY;\n    protected double horizonMaxZ;"
         );
     }
+    if class.name == "net/minecraft/world/phys/HitResult" {
+        let _ = writeln!(
+            out,
+            "    protected net.minecraft.world.phys.Vec3 horizonLocation = new net.minecraft.world.phys.Vec3();\n    protected net.minecraft.core.Direction horizonDirection = net.minecraft.core.Direction.UP;\n    protected boolean horizonInside;"
+        );
+    }
+    if class.name == "net/minecraft/world/phys/BlockHitResult" {
+        let _ = writeln!(
+            out,
+            "    protected net.minecraft.core.BlockPos horizonBlockPos = new net.minecraft.core.BlockPos();"
+        );
+    }
     if class.name == "net/minecraft/world/item/ItemStack" {
         let _ = writeln!(
             out,
@@ -1335,6 +1347,11 @@ fn render(
                 == "(Lnet/minecraft/world/phys/Vec3;Lnet/minecraft/world/phys/Vec3;)V"
         {
             "this.horizonMinX = Math.min(p0.x(), p1.x()); this.horizonMinY = Math.min(p0.y(), p1.y()); this.horizonMinZ = Math.min(p0.z(), p1.z()); this.horizonMaxX = Math.max(p0.x(), p1.x()); this.horizonMaxY = Math.max(p0.y(), p1.y()); this.horizonMaxZ = Math.max(p0.z(), p1.z()); this.minX = horizonMinX; this.minY = horizonMinY; this.minZ = horizonMinZ; this.maxX = horizonMaxX; this.maxY = horizonMaxY; this.maxZ = horizonMaxZ;"
+        } else if class.name == "net/minecraft/world/phys/BlockHitResult"
+            && method.descriptor
+                == "(Lnet/minecraft/world/phys/Vec3;Lnet/minecraft/core/Direction;Lnet/minecraft/core/BlockPos;Z)V"
+        {
+            "this.horizonLocation = p0; this.horizonDirection = p1; this.horizonBlockPos = p2; this.horizonInside = p3;"
         } else if class.name == "net/minecraft/world/level/block/Block" {
             "this.stateDefinition = new net.minecraft.world.level.block.state.StateDefinition();"
         } else if class.name == "net/minecraft/client/KeyMapping" {
@@ -2115,6 +2132,47 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
                     == "(Lnet/minecraft/world/phys/Vec3;DDD)Lnet/minecraft/world/phys/AABB;" =>
             {
                 return "return new net.minecraft.world.phys.AABB(p0.x() - p1 * 0.5, p0.y() - p2 * 0.5, p0.z() - p3 * 0.5, p0.x() + p1 * 0.5, p0.y() + p2 * 0.5, p0.z() + p3 * 0.5);".to_owned();
+            }
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/phys/HitResult" {
+        match (method, ret) {
+            ("getLocation", "net.minecraft.world.phys.Vec3") => {
+                return "return horizonLocation;".to_owned();
+            }
+            ("getDirection", "net.minecraft.core.Direction") => {
+                return "return horizonDirection;".to_owned();
+            }
+            ("isInside", "boolean") => return "return horizonInside;".to_owned(),
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/phys/BlockHitResult" {
+        match (method, ret, descriptor) {
+            ("getBlockPos", "net.minecraft.core.BlockPos", "()Lnet/minecraft/core/BlockPos;") => {
+                return "return horizonBlockPos;".to_owned();
+            }
+            (
+                "withDirection",
+                "net.minecraft.world.phys.BlockHitResult",
+                "(Lnet/minecraft/core/Direction;)Lnet/minecraft/world/phys/BlockHitResult;",
+            ) => {
+                return "return new BlockHitResult(horizonLocation, p0, horizonBlockPos, horizonInside);".to_owned();
+            }
+            (
+                "withPosition",
+                "net.minecraft.world.phys.BlockHitResult",
+                "(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/phys/BlockHitResult;",
+            ) => {
+                return "return new BlockHitResult(horizonLocation, horizonDirection, p0, horizonInside);".to_owned();
+            }
+            (
+                "miss",
+                "net.minecraft.world.phys.BlockHitResult",
+                "(Lnet/minecraft/world/phys/Vec3;Lnet/minecraft/core/Direction;Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/phys/BlockHitResult;",
+            ) => {
+                return "return new BlockHitResult(p0, p1, p2, false);".to_owned();
             }
             _ => {}
         }
@@ -7048,6 +7106,99 @@ mod tests {
             ),
             "return new net.minecraft.world.phys.AABB(horizonMinX - p0, horizonMinY - p0, horizonMinZ - p0, horizonMaxX + p0, horizonMaxY + p0, horizonMaxZ + p0);"
         );
+    }
+
+    #[test]
+    fn block_hit_result_facade_preserves_26_3_hit_state() {
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/phys/HitResult",
+                "getLocation",
+                "net.minecraft.world.phys.Vec3"
+            ),
+            "return horizonLocation;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/phys/HitResult",
+                "getDirection",
+                "net.minecraft.core.Direction"
+            ),
+            "return horizonDirection;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/phys/BlockHitResult",
+                "getBlockPos",
+                "net.minecraft.core.BlockPos",
+                "()Lnet/minecraft/core/BlockPos;",
+            ),
+            "return horizonBlockPos;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/phys/BlockHitResult",
+                "withDirection",
+                "net.minecraft.world.phys.BlockHitResult",
+                "(Lnet/minecraft/core/Direction;)Lnet/minecraft/world/phys/BlockHitResult;",
+            ),
+            "return new BlockHitResult(horizonLocation, p0, horizonBlockPos, horizonInside);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/phys/BlockHitResult",
+                "withPosition",
+                "net.minecraft.world.phys.BlockHitResult",
+                "(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/phys/BlockHitResult;",
+            ),
+            "return new BlockHitResult(horizonLocation, horizonDirection, p0, horizonInside);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/phys/BlockHitResult",
+                "miss",
+                "net.minecraft.world.phys.BlockHitResult",
+                "(Lnet/minecraft/world/phys/Vec3;Lnet/minecraft/core/Direction;Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/phys/BlockHitResult;",
+            ),
+            "return new BlockHitResult(p0, p1, p2, false);"
+        );
+
+        let class = Class {
+            name: "net/minecraft/world/phys/BlockHitResult".to_owned(),
+            superclass: "net/minecraft/world/phys/HitResult".to_owned(),
+            declared: vec![
+                Declared {
+                    name: "<init>".to_owned(),
+                    descriptor: "(Lnet/minecraft/world/phys/Vec3;Lnet/minecraft/core/Direction;Lnet/minecraft/core/BlockPos;Z)V".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
+                    name: "getBlockPos".to_owned(),
+                    descriptor: "()Lnet/minecraft/core/BlockPos;".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+            ],
+            ..Class::default()
+        };
+        let mut report = Report::default();
+        let source = render(
+            &class,
+            Some(&BTreeSet::from([(
+                "getBlockPos".to_owned(),
+                "()Lnet/minecraft/core/BlockPos;".to_owned(),
+            )])),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut report,
+            false,
+            &[],
+        );
+        assert!(source.contains("horizonBlockPos = new net.minecraft.core.BlockPos()"));
+        assert!(source.contains("this.horizonLocation = p0; this.horizonDirection = p1;"));
+        assert!(source.contains("public net.minecraft.core.BlockPos getBlockPos()"));
     }
 
     #[test]

@@ -737,7 +737,7 @@ The single most important design decision, because it decides whether the bounda
 Three classes of object, defined by who owns the truth:
 
 **1. Values.** `ResourceLocation`, `Direction`, `BlockPos`, `Vec3`, `AABB`, `Component`, `CompoundTag`, `ItemStack`,
-`BlockState`. Java owns the value; Rust reads it back at the boundary. `BlockState` is a singleton per
+`BlockState`, `HitResult`, and `BlockHitResult`. Java owns the value; Rust reads it back at the boundary. `BlockState` is a singleton per
 registry id (no allocation per read, as vanilla caches them); `ItemStack` is Java-owned with a dirty flag
 and is pushed to Rust at the points where the simulation can see it (use, menu click, container transfer,
 block-entity save, entity tick).
@@ -854,7 +854,9 @@ shape is represented by the nested `Success`, `Fail`, `Pass`, and `TryEmptyHandI
 state and item context, while the six public result constants are initialized to matching façade values.
 The interaction result does not perform live server-side effects; those remain in the native hook boundary.
 `InteractionHand.getName()` and `getOpposite()` preserve the two-hand value semantics used by item and
-block callbacks, so hand-dependent branches do not fall back to neutral enum stubs.
+block callbacks, so hand-dependent branches do not fall back to neutral enum stubs. `BlockHitResult`
+retains its location, face, block position, and inside flag; `withDirection`, `withPosition`, and `miss`
+return bounded copies used by item and block interaction callbacks.
 The `ItemStack.is(TagKey)` and `BlockState.is(TagKey)` overloads are also linked with an explicit empty
 membership result until registry-backed tag tables are attached.
 `TagKey` now retains its registry key and identifier as a value pair: `create`, `location`, `registry`,
