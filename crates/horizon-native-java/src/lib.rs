@@ -1410,6 +1410,36 @@ impl Host for StdHost {
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
+            if r.name == "removeIf"
+                && r.descriptor == "(Ljava/util/function/Predicate;)Z"
+                && !is_map_owner(&r.owner)
+            {
+                let predicate = Self::argument(r, args, 0)?.clone();
+                let values = host_collection_values(self, receiver)?
+                    .into_iter()
+                    .map(|value| parse_collection_value(&value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut kept = Vec::with_capacity(values.len());
+                let mut removed = false;
+                for value in values {
+                    let result = self.invoke_instance(
+                        &MethodRef {
+                            owner: "java/util/function/Predicate".into(),
+                            name: "test".into(),
+                            descriptor: "(Ljava/lang/Object;)Z".into(),
+                        },
+                        &predicate,
+                        std::slice::from_ref(&value),
+                    )?;
+                    if matches!(result, Value::Int(flag) if flag != 0) {
+                        removed = true;
+                    } else {
+                        kept.push(value);
+                    }
+                }
+                self.mutable_collections.insert(marker.to_owned(), kept);
+                return Ok(Value::Int(removed as i32));
+            }
             if r.name == "forEach"
                 && r.descriptor == "(Ljava/util/function/Consumer;)V"
                 && !is_map_owner(&r.owner)
@@ -8791,6 +8821,24 @@ mandatory = true
             Value::Int(0)
         );
         assert!(host.invoke_instance(&next, &iterator, &[]).is_err());
+        let remove_if = MethodRef {
+            owner: "java/util/Collection".into(),
+            name: "removeIf".into(),
+            descriptor: "(Ljava/util/function/Predicate;)Z".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &remove_if,
+                &list,
+                &[Value::Ref(Some("@indy:list-predicate".into()))],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(&size, &list, &[]).unwrap(),
+            Value::Int(0)
+        );
     }
 
     #[test]

@@ -551,7 +551,8 @@ and `hashCode` preserve deterministic enum markers for loader and configuration 
 Native `ArrayList`, `HashMap`, `LinkedHashMap`, `HashSet`, and `LinkedHashSet` markers also retain bounded
 constructor, add/put, get, size, clear, indexed insertion/replacement, set duplicate suppression and removal,
 list removal and index queries, `List.addAll`, `Collection.containsAll`, `removeAll`, and `retainAll`,
-and `Map.putAll`, `putIfAbsent`, `computeIfPresent`, `merge`, conditional `replace`, and conditional `remove` updates for bootstrap
+and `Map.putAll`, `putIfAbsent`, `computeIfPresent`, `merge`, conditional `replace`, and conditional `remove`, plus bounded
+`Collection.removeIf`, updates for bootstrap
 code that builds mutable registration tables. The bulk operations consume the same escaped collection
 markers produced by `List.of`/`Map.of`, and interface-owner calls (`List`/`Map`) dispatch to the mutable
 receiver where the marker is one of the supported concrete collections. The state is invocation-scoped
