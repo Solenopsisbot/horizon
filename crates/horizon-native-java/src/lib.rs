@@ -4002,6 +4002,30 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Value::Int(matched as i32)
             }
+            ("allMatch", "(Ljava/util/function/Predicate;)Z") => {
+                let callback = StdHost::argument(r, args, 0)?;
+                let mut matched = true;
+                for value in values {
+                    let result =
+                        match self.invoke_callback(callback, std::slice::from_ref(&value))? {
+                            Some(result) => result,
+                            None => self.host.invoke_instance(
+                                &MethodRef {
+                                    owner: "java/util/function/Predicate".into(),
+                                    name: "test".into(),
+                                    descriptor: "(Ljava/lang/Object;)Z".into(),
+                                },
+                                callback,
+                                std::slice::from_ref(&value),
+                            )?,
+                        };
+                    if !matches!(result, Value::Int(flag) if flag != 0) {
+                        matched = false;
+                        break;
+                    }
+                }
+                Value::Int(matched as i32)
+            }
             ("count", "()J") => Value::Int(values.len() as i32),
             ("toList", "()Ljava/util/List;") => collection_value("list", &values),
             ("isEmpty", "()Z") => Value::Int(values.is_empty() as i32),
@@ -8159,6 +8183,22 @@ mandatory = true
                     &MethodRef {
                         owner: "java/util/stream/Stream".into(),
                         name: "anyMatch".into(),
+                        descriptor: "(Ljava/util/function/Predicate;)Z".into(),
+                    },
+                    Some(&stream),
+                    &[Value::Ref(Some("@indy:stream-predicate".into()))],
+                    "demo/Stream",
+                    "probe",
+                )
+                .unwrap(),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            runtime
+                .invoke_stream(
+                    &MethodRef {
+                        owner: "java/util/stream/Stream".into(),
+                        name: "allMatch".into(),
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),

@@ -502,7 +502,7 @@ equality, hashing, and string conversion. `java.util.UUID.fromString`, determini
 `toString`, `equals`, and `hashCode` preserve canonical UUID identity markers without process randomness;
 malformed UUID strings remain explicit metadata errors. `Enum.valueOf`, `name`, `ordinal`, `equals`,
 and `hashCode` preserve deterministic enum markers for loader and configuration branches. Collection `stream()` supports bounded `map`, `filter`, `distinct`,
-`limit`, `skip`, `count`, `toList`, `isEmpty`, `anyMatch`, and `forEach` chains using the same in-jar callback bridge.
+`limit`, `skip`, `count`, `toList`, `isEmpty`, `anyMatch`, `allMatch`, and `forEach` chains using the same in-jar callback bridge.
 Native `ArrayList`, `HashMap`, `LinkedHashMap`, `HashSet`, and `LinkedHashSet` markers also retain bounded
 constructor, add/put, get, size, clear, indexed insertion/replacement, set duplicate suppression and removal,
 list removal and index queries, `List.addAll`, `Collection.containsAll`, `removeAll`, and `retainAll`,
@@ -682,7 +682,7 @@ copy is a handful of small objects rather than an NBT tree walk. This one coinci
 would otherwise have been the worst hotspot in the design.
 The generated façade now preserves the common item/count value path (`getCount`, `setCount`, `isEmpty`,
 `getItem`, `copy`, `copyWithCount`, `grow`, and `shrink`) plus bounded stack inspection (`getMaxStackSize`,
-`hasFoil`, `isDamageable`, bounded damage/enchantment/use-duration inspection, and `getHoverName`) so bootstrap code
+`hasFoil`, `isDamageable`, `isSameItem`/`isSameItemSameTags`, bounded damage/enchantment/use-duration inspection, and `getHoverName`) so bootstrap code
 can inspect stacks before the full component bridge is attached. `Item.getDefaultInstance` now creates a one-item
 stack retaining the item identity, and stack copies preserve damage alongside their component map. It also has a bounded erased component map: `get`,
 `getOrDefault`, `set`, `remove`, `has`, and `hasNonDefault` use the `DataComponentType` object as the

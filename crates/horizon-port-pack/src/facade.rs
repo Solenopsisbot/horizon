@@ -2373,6 +2373,16 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("is", "boolean") if descriptor == "(Lnet/minecraft/tags/TagKey;)Z" => {
                 return "return false;".to_owned();
             }
+            ("isSameItem", "boolean")
+                if descriptor == "(Lnet/minecraft/world/item/ItemStack;)Z" =>
+            {
+                return "return p0 != null && horizonItem == p0.horizonItem;".to_owned();
+            }
+            ("isSameItemSameTags", "boolean")
+                if descriptor == "(Lnet/minecraft/world/item/ItemStack;)Z" =>
+            {
+                return "return p0 != null && horizonItem == p0.horizonItem && horizonComponents.equals(p0.horizonComponents);".to_owned();
+            }
             // Data components are keyed by their identity-bearing type.  The
             // façade keeps the common typed operations after erasure; Java's
             // call site inserts the cast required by the generic API.
@@ -3807,6 +3817,24 @@ mod tests {
                 "(Lnet/minecraft/tags/TagKey;)Z",
             ),
             "return false;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/item/ItemStack",
+                "isSameItem",
+                "boolean",
+                "(Lnet/minecraft/world/item/ItemStack;)Z",
+            ),
+            "return p0 != null && horizonItem == p0.horizonItem;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/item/ItemStack",
+                "isSameItemSameTags",
+                "boolean",
+                "(Lnet/minecraft/world/item/ItemStack;)Z",
+            ),
+            "return p0 != null && horizonItem == p0.horizonItem && horizonComponents.equals(p0.horizonComponents);"
         );
         assert_eq!(
             runtime_body(
