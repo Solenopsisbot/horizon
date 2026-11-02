@@ -436,7 +436,8 @@ and multi-entrypoint regressions that an in-memory Rust fixture cannot; the full
 harness remains the check that needs prepared vanilla resources.
 
 The game-facing `run_java_mods` path has a source-built regression test that compiles a Fabric jar,
-executes it through the actual startup loader, and asserts that typed block content reaches `ContentMod`.
+executes it through the actual startup loader, reads the first byte of a bundled resource through
+`ClassLoader.getSystemResourceAsStream`, and asserts that typed block content reaches `ContentMod`.
 
 The game has an explicit `--java-mod <jar>` startup option for this bounded path. It runs the selected
 Fabric or NeoForge entrypoint before resource workers start, records host calls and registration intent,

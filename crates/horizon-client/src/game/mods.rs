@@ -569,7 +569,7 @@ mod tests {
         std::fs::create_dir_all(&classes).unwrap();
         std::fs::write(
             &source,
-            "package demo; public final class TypedGameMod { public void onInitialize() { if (ClassLoader.getSystemResource(\"assets/typed-game/probe.txt\") == null) throw new IllegalStateException(\"missing bundled resource\"); } }\n",
+            "package demo; public final class TypedGameMod { public void onInitialize() throws Exception { java.io.InputStream stream = ClassLoader.getSystemResourceAsStream(\"assets/typed-game/probe.txt\"); if (stream == null || stream.read() != 'n') throw new IllegalStateException(\"missing bundled resource bytes\"); } }\n",
         )
         .unwrap();
         let status = Command::new("javac")
