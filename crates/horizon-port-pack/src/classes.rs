@@ -606,6 +606,14 @@ fn at_value(value: &Value) -> Option<String> {
                 .filter_map(|v| text(v).map(|t| format!("target:{t}"))),
         );
     }
+    if let Some(v) = a.values.get("args") {
+        let args = items(v)
+            .iter()
+            .filter_map(scalar_text)
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push(format!("args:{args}"));
+    }
     for key in ["ordinal", "shift", "by"] {
         if let Some(v) = a.values.get(key) {
             out.extend(
@@ -1241,12 +1249,19 @@ mod tests {
                     ),
                 ),
                 ("by".to_owned(), Value::Number(1.0)),
+                (
+                    "args".to_owned(),
+                    Value::Array(vec![
+                        Value::Str("log=true".to_owned()),
+                        Value::Str("slice=outer".to_owned()),
+                    ]),
+                ),
             ]),
         };
         assert_eq!(
             at_value(&Value::Ann(at)),
             Some(
-                "INVOKE|target:Lnet/minecraft/Target;method()V|ordinal:2|shift:BY|by:1".to_owned()
+                "INVOKE|target:Lnet/minecraft/Target;method()V|args:log=true,slice=outer|ordinal:2|shift:BY|by:1".to_owned()
             )
         );
     }

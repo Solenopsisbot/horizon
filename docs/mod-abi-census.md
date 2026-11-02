@@ -25,7 +25,8 @@ cargo run -q -p horizon-port-pack -- census <jar or folder> --hooks native-hooks
 The JSON holds the ranked surface per jar and merged; the command prints the merged top.
 
 For native hook translation, `census.json` also includes `hook_points`: a map keyed by
-`target#method`. Its rows retain the injection `kind`, the exact `at` (`@At`) value, count,
+`target#method`. Its rows retain the injection `kind`, the exact `at` (`@At`) value including bounded
+`args` selectors, count,
 and any matching native hook names in the explicit `native_hooks` array. An empty array is the
 unsupported-mixin diagnostic: the point needs a façade-owned Java method or a new native hook.
 Accessor, invoker, and shadow rows are omitted because
