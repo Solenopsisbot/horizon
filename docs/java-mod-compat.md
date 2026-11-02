@@ -207,7 +207,7 @@ scoped by a number.
 
 The census is also a product: it is the "what runs" table the launcher shows for a jar before install,
 and the generated reference under `docs/api/`.
-Mixin configuration files are also inspected in report-only mode: bounded JSON reads collect safe class names from `target` fields into the per-jar and aggregate census. The parser does not execute configs or weave bytecode; malformed or oversized files are skipped.
+Mixin configuration files are also inspected in report-only mode: bounded JSON reads collect safe class names from `target` fields and record edge-field presence (including `required` and `priority`) in the per-jar and aggregate census. Injection annotations likewise report presence of `require`, `expect`, `cancellable`, `order`, and `priority` metadata so native hook planning can preserve ordering and contracts. Values are not interpreted, configs are not executed, and no bytecode is woven; malformed or oversized files are skipped.
 JDK classpath discovery is reported with the same bounded rule. References to `ServiceLoader` and calls
 to `ServiceLoader.load`/`loadInstalled` or `ClassLoader.getResource*`/`loadClass` mark a jar as dynamic,
 with the exact owner and method in its diagnostic list. The census does not emulate providers or resource
@@ -216,6 +216,14 @@ diagnostic rather than scanning the host class path; the embedded JVM remains re
 until a deliberately bounded native contract with explicitly seeded providers is specified.
 
 ## Phase 1, first slice (measured 1 November 2026)
+
+The native path has a checked-in smoke fixture at
+`crates/horizon-native-java/tests/fixtures/fixture-registry.jar`. It is a small Fabric jar with a real
+`fabric.mod.json` entrypoint, a classpath resource, and a typed item declaration in
+`META-INF/horizon-native.json`. `fixture_registry.rs` loads the jar, discovers and executes its
+entrypoint, seeds the resource through the bounded host, and hands the declaration to a typed registry
+sink. This keeps the loader, resource, and registry boundaries deterministic without depending on a
+player's installed jars.
 
 The attach path is real: a mod's entrypoint runs on an embedded JVM against a generated façade.
 

@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `710e00525`.
+Last checked: 3 November 2026, commit `dc2ec2055`.
 
 ## Supported now
 
@@ -18,6 +18,7 @@ Last checked: 3 November 2026, commit `710e00525`.
 - [x] Provide bounded NeoForge and legacy Forge capability/`LazyOptional` markers, NBT values, identifiers, resource keys, arrays, reflection metadata, collections (including `removeIf`), maps (including `computeIfPresent`), streams (including runtime-owned `toArray` results and `Collectors.toList/toSet`), and optionals.
 - [x] Provide common Java wrapper/string/collection operations used by loader bootstrap code, including integer/long/float/double/byte/short/character conversion, `Number` accessors, checked math, seeded `System.currentTimeMillis`/`identityHashCode`, explicitly seeded `System.getenv` queries, deterministic `Thread.currentThread`/`getName`/`isDaemon`/`getContextClassLoader` markers, bounded callback combinators, `Arrays.asList`, `Objects.hashCode`/`requireNonNullElse`, and a restricted `String.format` subset.
 - [x] Provide bounded `ClassLoader.getResource`/`getResourceAsStream` markers from explicitly seeded `StdHost::with_resource` entries; resource queries never read host files or the process classpath.
+- [x] Maintain a deterministic Fabric jar fixture covering entrypoint execution, seeded resources, and typed registry declarations.
 - [x] Preserve bounded Throwable/Exception/Error messages and cause markers, including `getMessage`, `getCause`, `initCause`, and `toString` diagnostics.
 - [x] Mirror the common `Locale.US` integer grouping path used by the native statistics screen without emulating arbitrary locale patterns.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs and array-returning signatures.
@@ -45,7 +46,7 @@ Last checked: 3 November 2026, commit `710e00525`.
 ## Validation snapshot
 
 - `horizon-native-java`: 91 unit tests passing, including bounded `Number` accessors, callback combinators, restricted string formatting, deterministic Thread/class-loader markers, Throwable metadata, and explicit `ServiceLoader` classpath boundaries.
-- `horizon-port-pack`: 152 unit tests passing.
+- `horizon-port-pack`: 154 unit tests passing, including Mixin metadata and descriptor normalization coverage.
 - `horizon-jvm`: 8 unit tests passing, including explicit fallback labels.
 - Workspace check, targeted clippy, formatting, and `tools/native_java_smoke.py` passing.
 
