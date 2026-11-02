@@ -30,7 +30,7 @@ Last checked: 3 November 2026, commit `7b621ee94`.
 - [ ] Full Mixin weaving. The census reads config targets, injection annotations, `@At`, plugins, refmaps, and access metadata; it does not execute plugins, apply access changes, or rewrite bytecode.
 - [ ] Unmatched Mixin injection points. They are listed under `hook_points` with an empty `native_hooks` array and counted in `points_report_only`.
 - [ ] Java registration markers. Explicit `META-INF/horizon-native.json` declarations now cross the typed sink; opaque registrations observed during Java execution still need a Horizon adapter before they can create live game content.
-- [ ] JVM fallback coverage. Unsupported native calls, dynamic classpath failures, and missing façade members now have explicit diagnostics; the JVM path still needs broader loader façades and real-mod fixtures.
+- [ ] JVM fallback coverage. Unsupported native calls, dynamic classpath failures, and reflective missing façade members now have explicit diagnostics; the JVM path still needs broader loader façades and real-mod fixtures.
 - [ ] Java classpath discovery. The census reports `ServiceLoader` and arbitrary `ClassLoader` class loading as dynamic diagnostics. Native `ServiceLoader.load`/`loadInstalled` now support only explicitly seeded providers and bounded iteration; arbitrary provider discovery, `ClassLoader.loadClass`, and unseeded resources remain report-only.
 
 ## Remaining work
