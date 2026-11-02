@@ -1195,6 +1195,12 @@ fn render(
             "    protected net.minecraft.world.level.block.Block horizonBlock = new net.minecraft.world.level.block.Block();\n    protected java.util.IdentityHashMap<Object, Object> horizonValues = new java.util.IdentityHashMap<>();"
         );
     }
+    if class.name == "net/minecraft/world/level/material/FluidState" {
+        let _ = writeln!(
+            out,
+            "    protected boolean horizonEmpty = true;\n    protected int horizonAmount;"
+        );
+    }
     if class.name == "net/minecraft/nbt/CompoundTag" {
         let _ = writeln!(
             out,
@@ -1584,6 +1590,11 @@ fn render(
     }
     if class.name == "net/minecraft/world/level/block/state/BlockState" {
         for (name, descriptor, ret) in [
+            (
+                "getFluidState",
+                "()Lnet/minecraft/world/level/material/FluidState;",
+                "net.minecraft.world.level.material.FluidState",
+            ),
             ("hasBlockEntity", "()Z", "boolean"),
             ("isRandomlyTicking", "()Z", "boolean"),
         ] {
@@ -2970,6 +2981,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     }
     if class == "net/minecraft/world/level/block/state/BlockState" {
         match method {
+            "getFluidState" if ret == "net.minecraft.world.level.material.FluidState" => {
+                return "return new net.minecraft.world.level.material.FluidState();".to_owned();
+            }
             "getBlock" if ret == "net.minecraft.world.level.block.Block" => {
                 return "return horizonBlock;".to_owned();
             }
@@ -3011,6 +3025,17 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             {
                 return "return horizonValues.keySet();".to_owned();
             }
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/level/material/FluidState" {
+        match (method, ret) {
+            ("isEmpty", "boolean") => return "return horizonEmpty;".to_owned(),
+            ("isSource", "boolean") => {
+                return "return !horizonEmpty && horizonAmount >= 8;".to_owned();
+            }
+            ("getAmount", "int") => return "return horizonAmount;".to_owned(),
+            ("getHeight", "float") => return "return horizonAmount / 9.0f;".to_owned(),
             _ => {}
         }
     }
@@ -5040,6 +5065,12 @@ mod tests {
                     access: 0x0001,
                     kind: MemberKind::Method,
                 },
+                Declared {
+                    name: "getFluidState".to_owned(),
+                    descriptor: "()Lnet/minecraft/world/level/material/FluidState;".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
             ],
             ..Class::default()
         };
@@ -5074,6 +5105,9 @@ mod tests {
         assert!(source.contains("return horizonValues.containsKey(p0);"));
         assert!(source.contains("public boolean hasBlockEntity()"));
         assert!(source.contains("public boolean isRandomlyTicking()"));
+        assert!(
+            source.contains("public net.minecraft.world.level.material.FluidState getFluidState()")
+        );
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/world/level/block/state/BlockState",
@@ -5100,6 +5134,15 @@ mod tests {
                 "()Lnet/minecraft/world/level/block/Block;",
             ),
             "return horizonBlock;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/block/state/BlockState",
+                "getFluidState",
+                "net.minecraft.world.level.material.FluidState",
+                "()Lnet/minecraft/world/level/material/FluidState;",
+            ),
+            "return new net.minecraft.world.level.material.FluidState();"
         );
         assert_eq!(
             runtime_body_with_descriptor(
@@ -5136,6 +5179,81 @@ mod tests {
                 "()Z",
             ),
             "return false;"
+        );
+    }
+
+    #[test]
+    fn fluid_state_facade_preserves_empty_source_and_amount_queries() {
+        let class = Class {
+            name: "net/minecraft/world/level/material/FluidState".to_owned(),
+            superclass: "java/lang/Object".to_owned(),
+            declared: vec![
+                Declared {
+                    name: "isEmpty".to_owned(),
+                    descriptor: "()Z".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
+                    name: "getAmount".to_owned(),
+                    descriptor: "()I".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+            ],
+            ..Class::default()
+        };
+        let mut report = Report::default();
+        let source = render(
+            &class,
+            Some(&BTreeSet::from([
+                ("isEmpty".to_owned(), "()Z".to_owned()),
+                ("getAmount".to_owned(), "()I".to_owned()),
+            ])),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut report,
+            false,
+            &[],
+        );
+        assert!(source.contains("protected boolean horizonEmpty = true;"));
+        assert!(source.contains("protected int horizonAmount;"));
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/material/FluidState",
+                "isEmpty",
+                "boolean",
+                "()Z",
+            ),
+            "return horizonEmpty;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/material/FluidState",
+                "getAmount",
+                "int",
+                "()I",
+            ),
+            "return horizonAmount;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/material/FluidState",
+                "isSource",
+                "boolean",
+                "()Z",
+            ),
+            "return !horizonEmpty && horizonAmount >= 8;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/material/FluidState",
+                "getHeight",
+                "float",
+                "()F",
+            ),
+            "return horizonAmount / 9.0f;"
         );
     }
 

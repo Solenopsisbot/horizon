@@ -845,6 +845,7 @@ BlockState bootstrap paths retain a bounded block identity and property map: `ge
 common state construction and inspection while the registry-backed state definition and vanilla default
 values remain follow-up work. `hasBlockEntity` and `isRandomlyTicking` expose explicit empty-safe defaults
 for bootstrap checks.
+`BlockState.getFluidState()` now returns a bounded `FluidState` value with deterministic empty, source, amount, and height queries, keeping common fluid checks linkable without inventing live fluid registries.
 `ItemStack.getUseAnimation()` now returns the deterministic `UseAnim.NONE` façade value, and `getTags()`
 returns a bounded empty stream alongside the existing count, copy, damage, component, and tag queries, keeping
 common item bootstrap branches linkable.
