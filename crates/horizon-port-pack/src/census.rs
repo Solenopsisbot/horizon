@@ -129,7 +129,10 @@ pub enum AbiDisposition {
 
 pub fn member_disposition(member: &classes::Member) -> AbiDisposition {
     let owner = member.owner.as_str();
-    if owner.starts_with("net/minecraft/") {
+    // Horizon's generated façade covers Mojang's companion APIs as well as
+    // the game namespace (Brigadier and DataFixer/Codec types are referenced
+    // directly by real mod entrypoints).
+    if owner.starts_with("net/minecraft/") || owner.starts_with("com/mojang/") {
         AbiDisposition::Facade
     } else if owner.starts_with("net/fabricmc/")
         || owner.starts_with("net/neoforged/")
@@ -1425,6 +1428,14 @@ mod tests {
         };
         assert_eq!(
             member_disposition(&member("net/minecraft/world/level/Level")),
+            AbiDisposition::Facade
+        );
+        assert_eq!(
+            member_disposition(&member("com/mojang/brigadier/CommandDispatcher")),
+            AbiDisposition::Facade
+        );
+        assert_eq!(
+            member_disposition(&member("com/mojang/serialization/Codec")),
             AbiDisposition::Facade
         );
         assert_eq!(
