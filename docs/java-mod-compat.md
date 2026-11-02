@@ -211,7 +211,8 @@ Mixin configuration files are also inspected in report-only mode: bounded JSON r
 JDK classpath discovery is reported with the same bounded rule. References to `ServiceLoader` and calls
 to `ServiceLoader.load`/`loadInstalled` or `ClassLoader.getResource*`/`loadClass` mark a jar as dynamic,
 with the exact owner and method in its diagnostic list. The census does not emulate providers or resource
-lookup. Native execution accepts `ServiceLoader.load` and `loadInstalled` only for providers explicitly
+lookup; jar reports now expose stable unique `native_declaration_kinds` from explicit metadata without
+validating the declarations at census time. Native execution accepts `ServiceLoader.load` and `loadInstalled` only for providers explicitly
 seeded through the host contract, and `ClassLoader.loadClass` only for explicitly seeded class markers, and `Class.forName` only for classes
 already loaded from the current jar. These surfaces report an unsupported or empty result for unseeded
 names and never scan the host class path; the embedded JVM remains responsible for arbitrary provider and
@@ -467,8 +468,9 @@ also exposes the common `value`, `getOptional`, `getKey`, `getId`, and bounded h
 queries (including the modern
 `ResourceLocation` return type) with typed neutral return
 values, and `DeferredRegister.getEntries` returns a bounded holder collection, while the generated `Registry.getHolder`
-lookup projects known entries into an optional holder reference, so constructors can inspect a registration
-without linking against NeoForge's implementation.
+lookup projects known entries into optional holder references, while `getOrThrow` returns a known value or
+throws an explicit missing-entry error, so constructors can inspect a registration without linking against
+NeoForge's implementation.
 `RegisterEvent` now
 also has its public registration overloads, a retained registry key and registry view, and a helper callback that
 writes registrations into that view. The networking
@@ -670,6 +672,11 @@ The end-to-end typed adapter has a source-built regression fixture in
 item, and mob-effect declarations, executes the jar, and feeds those declarations through
 `NativeDeclarations::from_registry_entries`; this verifies that typed content reaches the Horizon adapter
 without requiring a game installation.
+
+A game-owned adapter can enrich an opaque callback registration explicitly with
+`StdHost::attach_registration_declaration(registry, id, declaration)`. The handoff rejects missing or
+already-enriched entries and then uses the same all-or-nothing typed sink as metadata declarations, so a
+Java callback cannot silently install an untyped object into a live registry.
 
 The typed half of that boundary now lives in `horizon-mods::native::NativeDeclarations`. It implements
 `TypedRegistrySink`, validates names and block/item/effect properties, and collects Horizon's existing

@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `c0a137b8d`.
+Last checked: 3 November 2026, commit `51f88232d`.
 
 ## Supported now
 
@@ -12,7 +12,7 @@ Last checked: 3 November 2026, commit `c0a137b8d`.
 - [x] Run unsupported entrypoints through the embedded JVM runner as a fallback.
 - [x] Expose bounded Fabric loader values: loaded-mod checks, metadata, versions, environment type, development marker, root paths, and seeded containers.
 - [x] Expose bounded NeoForge and legacy Forge loader values: mod lists, containers, event-bus access, and mod ids.
-- [x] Register and inspect bounded NeoForge and Forge deferred registrations, holders, registry objects, keys, ids, entry collections, and generated `Registry.getHolder` lookups.
+- [x] Register and inspect bounded NeoForge and Forge deferred registrations, holders, registry objects, keys, ids, entry collections, generated `Registry.getHolder`/`getOrThrow` lookups, and explicit typed-registration handoff.
 - [x] Record Fabric events, NeoForge events, and legacy Forge event-bus listeners with ordering, cancellation markers, and unregister support.
 - [x] Record custom payload registrations for the supported Fabric/NeoForge directions and the bounded legacy Forge `SimpleChannel.registerMessage` alias.
 - [x] Provide bounded NeoForge and legacy Forge capability/`LazyOptional` markers, NBT values, identifiers, resource keys (including `ResourceKey.location`), arrays, reflection metadata, collections (including `removeIf`), maps (including `computeIfPresent` and `merge`), primitive optionals (`OptionalInt`, `OptionalLong`, `OptionalDouble`), streams (including runtime-owned `toArray` results and `Collectors.toList/toSet`), and optionals.
@@ -29,7 +29,7 @@ Last checked: 3 November 2026, commit `c0a137b8d`.
 
 - [ ] Full Mixin weaving. The census reads config targets, injection annotations, `@At`, plugins, refmaps, and access metadata; it does not execute plugins, apply access changes, or rewrite bytecode.
 - [ ] Unmatched Mixin injection points. They are listed under `hook_points` with an empty `native_hooks` array and counted in `points_report_only`.
-- [ ] Java registration markers. Explicit `META-INF/horizon-native.json` declarations now cross the typed sink; opaque registrations observed during Java execution still need a Horizon adapter before they can create live game content.
+- [ ] Java registration markers. Explicit `META-INF/horizon-native.json` declarations and registrations enriched through `StdHost::attach_registration_declaration` now cross the typed sink; opaque registrations still need an explicit adapter before they can create live game content.
 - [ ] JVM fallback coverage. Unsupported native calls, dynamic classpath failures, and reflective missing façade members now have explicit diagnostics; the JVM path still needs broader loader façades and real-mod fixtures.
 - [ ] Java classpath discovery. The census reports `ServiceLoader`, arbitrary `ClassLoader` loading, and `Class.forName` as dynamic diagnostics. Native `ServiceLoader.load`/`loadInstalled`, `ClassLoader.loadClass`, and current-jar `Class.forName` now support only explicitly bounded values; arbitrary discovery and unseeded resources remain report-only.
 
@@ -47,7 +47,8 @@ Last checked: 3 November 2026, commit `c0a137b8d`.
 ## Validation snapshot
 
 - `horizon-native-java`: 96 unit tests passing, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection, TagKey values, bounded primitive optionals, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries.
-- `horizon-port-pack`: 158 unit tests passing, including Mixin `@At`/slice metadata and values, loader ABI classification, multi-method hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, and descriptor normalization coverage.
+- `horizon-mods`: 27 unit tests passing, plus the runtime-built typed declaration adapter fixture.
+- `horizon-port-pack`: 159 unit tests passing, including Mixin `@At`/slice metadata and values, loader ABI classification, native declaration-kind reporting, multi-method hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, and descriptor normalization coverage.
 - `horizon-jvm`: 8 unit tests passing, including explicit fallback labels.
 - Workspace check, targeted clippy, formatting, and `tools/native_java_smoke.py` passing with compiled OptionalLong/OptionalDouble paths.
 
