@@ -1730,6 +1730,12 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     {
         return "return new net.neoforged.bus.api.IEventBus() {};".to_owned();
     }
+    if class == "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext"
+        && method == "getContainer"
+        && ret == "net.neoforged.fml.ModContainer"
+    {
+        return "return new net.neoforged.fml.ModContainer();".to_owned();
+    }
     if class == "net/neoforged/fml/ModContainer"
         && method == "getEventBus"
         && ret == "net.neoforged.bus.api.IEventBus"
@@ -3648,6 +3654,14 @@ mod tests {
                 "net.neoforged.bus.api.IEventBus"
             ),
             "return new net.neoforged.bus.api.IEventBus() {};"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext",
+                "getContainer",
+                "net.neoforged.fml.ModContainer"
+            ),
+            "return new net.neoforged.fml.ModContainer();"
         );
         assert_eq!(
             runtime_body(
