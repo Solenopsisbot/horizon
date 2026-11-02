@@ -670,8 +670,8 @@ without mutating the live game tables.
 The end-to-end typed adapter has a source-built regression fixture in
 `crates/horizon-mods/tests/native_fixture.rs`. It compiles a small Fabric entrypoint, packages block,
 item, and mob-effect declarations, executes the jar, and feeds those declarations through
-`NativeDeclarations::from_registry_entries`; this verifies that typed content reaches the Horizon adapter
-without requiring a game installation.
+`NativeDeclarations::from_registry_entries` and `Content::from_native`; this verifies that typed content
+reaches Horizon content planning without requiring a game installation.
 
 A game-owned adapter can enrich an opaque callback registration explicitly with
 `StdHost::attach_registration_declaration(registry, id, declaration)`. The handoff rejects missing or
@@ -827,6 +827,8 @@ BlockState bootstrap paths retain a bounded block identity and property map: `ge
 common state construction and inspection while the registry-backed state definition and vanilla default
 values remain follow-up work. `hasBlockEntity` and `isRandomlyTicking` expose explicit empty-safe defaults
 for bootstrap checks.
+`ItemStack.getUseAnimation()` now returns the deterministic `UseAnim.NONE` façade value alongside the existing
+count, copy, damage, component, and tag queries, keeping common item bootstrap branches linkable.
 The `ItemStack.is(TagKey)` and `BlockState.is(TagKey)` overloads are also linked with an explicit empty
 membership result until registry-backed tag tables are attached.
 `TagKey` now retains its registry key and identifier as a value pair: `create`, `location`, `registry`,
