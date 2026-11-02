@@ -583,6 +583,27 @@ pub fn format_fixed2(value: f64) -> String {
     format_fixed(value, 2)
 }
 
+/// `NumberFormat.getIntegerInstance(Locale.US).format(value)` for an integer.
+///
+/// This deliberately covers the locale and value shape used by vanilla's
+/// statistics screen: ASCII digits, comma grouping, and an optional minus
+/// sign. It does not attempt to emulate arbitrary `java.text.NumberFormat`
+/// patterns or locale data.
+pub fn format_integer_us(value: i32) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if value < 0 {
+        out.push('-');
+    }
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +630,12 @@ mod tests {
         assert!(parse_lenient("\"abc").is_err());
         assert_eq!(parse_lenient("  ").unwrap(), Json::Null);
         assert_eq!(gson_string("a=b"), "\"a\\u003db\"");
+    }
+
+    #[test]
+    fn integer_locale_us_grouping() {
+        assert_eq!(format_integer_us(0), "0");
+        assert_eq!(format_integer_us(1_234_567), "1,234,567");
+        assert_eq!(format_integer_us(-2_147_483_648), "-2,147,483,648");
     }
 }

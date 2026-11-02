@@ -1,7 +1,7 @@
 //! The Statistics screen (`StatsScreen`): General, Items and Mobs tabs over
 //! the player's statistics, with the Done button.
 use super::{Game, Screen};
-use horizon_client::{hud::HudBatch, items::ItemStack, text::Text, ui};
+use horizon_client::{hud::HudBatch, items::ItemStack, java_text, text::Text, ui};
 use std::fmt::Write as _;
 
 /// `Stats.CUSTOM` in registration order with its formatter.
@@ -98,21 +98,7 @@ fn two(v: f64) -> String {
 /// `StatFormatter`.
 fn format(f: Format, v: i32) -> String {
     match f {
-        Format::Default => {
-            // NumberFormat.getIntegerInstance(Locale.US): thousands separators.
-            let digits = v.unsigned_abs().to_string();
-            let mut out = String::new();
-            for (i, c) in digits.chars().enumerate() {
-                if i > 0 && (digits.len() - i).is_multiple_of(3) {
-                    out.push(',');
-                }
-                out.push(c);
-            }
-            if v < 0 {
-                out.insert(0, '-');
-            }
-            out
-        }
+        Format::Default => java_text::format_integer_us(v),
         Format::Tenths => two(f64::from(v) * 0.1),
         Format::Distance => {
             let m = f64::from(v) / 100.0;

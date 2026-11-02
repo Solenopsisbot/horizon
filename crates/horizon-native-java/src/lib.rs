@@ -195,6 +195,12 @@ impl Host for NullHost {}
 #[derive(Debug, Clone)]
 pub struct StdHost {
     properties: BTreeMap<String, String>,
+    /// Deterministic epoch value returned by `System.currentTimeMillis`.
+    ///
+    /// The native interpreter represents wide primitives with its bounded
+    /// integer value, so this is intentionally an `i32` rather than a host
+    /// clock read.  Keeping the value seeded makes bootstrap replayable.
+    current_time_millis: i32,
     mods: BTreeMap<String, String>,
     environment_type: String,
     development_environment: bool,
@@ -227,6 +233,7 @@ impl StdHost {
     pub fn new() -> Self {
         Self {
             properties: BTreeMap::from([("line.separator".into(), "\n".into())]),
+            current_time_millis: 0,
             mods: BTreeMap::new(),
             environment_type: "CLIENT".into(),
             development_environment: false,
@@ -249,6 +256,15 @@ impl StdHost {
 
     pub fn with_property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.properties.insert(key.into(), value.into());
+        self
+    }
+
+    /// Set the deterministic value returned by `System.currentTimeMillis`.
+    ///
+    /// Native probes must not read the machine clock; callers that need a
+    /// stable non-zero epoch can seed one explicitly for the invocation.
+    pub fn with_current_time_millis(mut self, value: i32) -> Self {
+        self.current_time_millis = value;
         self
     }
 
@@ -1044,6 +1060,9 @@ impl Host for StdHost {
                     .collect::<Vec<_>>();
                 Ok(collection_value("map", &values))
             }
+            ("java/lang/System", "currentTimeMillis", "()J") => {
+                Ok(Value::Int(self.current_time_millis))
+            }
             ("java/lang/System", "lineSeparator", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some("\n".into())))
             }
@@ -1064,6 +1083,67 @@ impl Host for StdHost {
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
         let receiver_marker = expect_ref(receiver).cloned();
+        if let Some(marker) = receiver_marker.as_deref() {
+            let callback_result = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+                (
+                    "java/util/function/Predicate",
+                    "and",
+                    "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
+                ) => args.first().map(|other| {
+                    Value::Ref(Some(format!(
+                        "@fn:predicate.and:{marker}|{}",
+                        expect_ref(other).map_or("@fn:predicate.false", String::as_str)
+                    )))
+                }),
+                (
+                    "java/util/function/Predicate",
+                    "or",
+                    "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
+                ) => args.first().map(|other| {
+                    Value::Ref(Some(format!(
+                        "@fn:predicate.or:{marker}|{}",
+                        expect_ref(other).map_or("@fn:predicate.false", String::as_str)
+                    )))
+                }),
+                ("java/util/function/Predicate", "negate", "()Ljava/util/function/Predicate;") => {
+                    Some(Value::Ref(Some(format!("@fn:predicate.not:{marker}"))))
+                }
+                (
+                    "java/util/function/Consumer",
+                    "andThen",
+                    "(Ljava/util/function/Consumer;)Ljava/util/function/Consumer;",
+                ) => args.first().map(|other| {
+                    Value::Ref(Some(format!(
+                        "@fn:consumer.then:{marker}|{}",
+                        expect_ref(other).map_or("@fn:consumer.empty", String::as_str)
+                    )))
+                }),
+                (
+                    "java/util/function/Function",
+                    "compose",
+                    "(Ljava/util/function/Function;)Ljava/util/function/Function;",
+                ) => args.first().map(|other| {
+                    Value::Ref(Some(format!(
+                        "@fn:function.compose:{marker}|{}",
+                        expect_ref(other).map_or("@fn:function.empty", String::as_str)
+                    )))
+                }),
+                (
+                    "java/util/function/Function",
+                    "andThen",
+                    "(Ljava/util/function/Function;)Ljava/util/function/Function;",
+                ) => args.first().map(|other| {
+                    Value::Ref(Some(format!(
+                        "@fn:function.then:{marker}|{}",
+                        expect_ref(other).map_or("@fn:function.empty", String::as_str)
+                    )))
+                }),
+                _ => None,
+            };
+            if let Some(value) = callback_result {
+                return Ok(value);
+            }
+        }
         if r.owner == "java/lang/reflect/Method"
             && matches!(
                 r.name.as_str(),
@@ -2646,14 +2726,23 @@ impl Host for StdHost {
                 "apply",
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             ) => Ok(Self::argument(r, args, 1)?.clone()),
-            ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V") => Ok(Value::Void),
+            ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V") => {
+                if let Some(marker) = receiver_marker.as_deref()
+                    && let Some(rest) = marker.strip_prefix("@fn:consumer.then:")
+                    && let Some((left, right)) = rest.split_once('|')
+                {
+                    self.invoke_instance(r, &Value::Ref(Some(left.to_owned())), args)?;
+                    self.invoke_instance(r, &Value::Ref(Some(right.to_owned())), args)?;
+                }
+                Ok(Value::Void)
+            }
             (
                 "java/util/function/BiConsumer",
                 "accept",
                 "(Ljava/lang/Object;Ljava/lang/Object;)V",
             ) => Ok(Value::Void),
             ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
-                expect_ref(receiver).is_some_and(|marker| marker.starts_with("@indy:")) as i32,
+                expect_ref(receiver).is_some_and(|marker| predicate_marker_value(marker)) as i32,
             )),
             ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => Ok(Value::Ref(None)),
             (
@@ -4486,6 +4575,26 @@ fn parse_callback_marker(marker: &str) -> Result<CallbackMarker, NativeError> {
     Ok(CallbackMarker { target, captures })
 }
 
+/// Evaluate the bounded truth surface of a predicate marker.  Java's default
+/// `Predicate` combinators are represented as markers, so they remain usable
+/// even though the interpreter does not materialize interface instances.
+fn predicate_marker_value(marker: &str) -> bool {
+    if let Some(rest) = marker.strip_prefix("@fn:predicate.not:") {
+        return !predicate_marker_value(rest);
+    }
+    if let Some(rest) = marker.strip_prefix("@fn:predicate.and:")
+        && let Some((left, right)) = rest.split_once('|')
+    {
+        return predicate_marker_value(left) && predicate_marker_value(right);
+    }
+    if let Some(rest) = marker.strip_prefix("@fn:predicate.or:")
+        && let Some((left, right)) = rest.split_once('|')
+    {
+        return predicate_marker_value(left) || predicate_marker_value(right);
+    }
+    marker.starts_with("@indy:")
+}
+
 fn split_capture_markers(value: &str) -> Result<Vec<String>, NativeError> {
     let mut captures = Vec::new();
     let mut current = String::new();
@@ -5714,6 +5823,7 @@ impl<H: Host> Runtime<'_, H> {
                                 "java/util/function/Function"
                                     | "java/util/function/UnaryOperator"
                                     | "java/util/function/Consumer"
+                                    | "java/util/function/Predicate"
                                     | "java/util/function/BiConsumer"
                                     | "java/util/function/BiFunction"
                                     | "java/util/function/Supplier"
@@ -8236,6 +8346,74 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_composes_function_markers() {
+        let mut host = StdHost::new();
+        let predicate = MethodRef {
+            owner: "java/util/function/Predicate".into(),
+            name: "and".into(),
+            descriptor: "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;".into(),
+        };
+        let combined = host
+            .invoke_instance(
+                &predicate,
+                &Value::Ref(Some("@indy:left".into())),
+                &[Value::Ref(Some("@indy:right".into()))],
+            )
+            .unwrap();
+        let test = MethodRef {
+            owner: "java/util/function/Predicate".into(),
+            name: "test".into(),
+            descriptor: "(Ljava/lang/Object;)Z".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&test, &combined, &[Value::Ref(Some("x".into()))])
+                .unwrap(),
+            Value::Int(1)
+        );
+        let negate = MethodRef {
+            owner: "java/util/function/Predicate".into(),
+            name: "negate".into(),
+            descriptor: "()Ljava/util/function/Predicate;".into(),
+        };
+        let negated = host.invoke_instance(&negate, &combined, &[]).unwrap();
+        assert_eq!(
+            host.invoke_instance(&test, &negated, &[Value::Ref(Some("x".into()))])
+                .unwrap(),
+            Value::Int(0)
+        );
+
+        let consumer = MethodRef {
+            owner: "java/util/function/Consumer".into(),
+            name: "andThen".into(),
+            descriptor: "(Ljava/util/function/Consumer;)Ljava/util/function/Consumer;".into(),
+        };
+        let chained = host
+            .invoke_instance(
+                &consumer,
+                &Value::Ref(Some("@indy:first".into())),
+                &[Value::Ref(Some("@indy:second".into()))],
+            )
+            .unwrap();
+        let accept = MethodRef {
+            owner: "java/util/function/Consumer".into(),
+            name: "accept".into(),
+            descriptor: "(Ljava/lang/Object;)V".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&accept, &chained, &[Value::Ref(Some("x".into()))])
+                .unwrap(),
+            Value::Void
+        );
+        assert_eq!(
+            host.calls()
+                .iter()
+                .filter(|call| call.owner == "java/util/function/Consumer" && call.name == "accept")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
     fn standard_host_preserves_mutable_list_and_map_updates() {
         let mut host = StdHost::new();
         let list = Value::Ref(Some("java/util/ArrayList".into()));
@@ -8902,6 +9080,27 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(&size, &properties, &[]).unwrap(),
             Value::Int(2)
+        );
+    }
+
+    #[test]
+    fn standard_host_uses_seeded_current_time_millis() {
+        let mut host = StdHost::new().with_current_time_millis(1_700_000_000);
+        let current_time_millis = MethodRef {
+            owner: "java/lang/System".into(),
+            name: "currentTimeMillis".into(),
+            descriptor: "()J".into(),
+        };
+        assert_eq!(
+            host.invoke(&current_time_millis, &[]).unwrap(),
+            Value::Int(1_700_000_000)
+        );
+
+        // The default is deterministic too; no host clock is consulted.
+        let mut default_host = StdHost::new();
+        assert_eq!(
+            default_host.invoke(&current_time_millis, &[]).unwrap(),
+            Value::Int(0)
         );
     }
 

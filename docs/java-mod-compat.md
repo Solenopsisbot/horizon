@@ -488,7 +488,7 @@ metadata accessors expose that marker without loading classes. The bounded runti
 handles `java.lang.reflect.Array` `newInstance`, `getLength`, `get`, and `set` against arrays it owns during the
 current invocation. The crate
 also exposes a deterministic `StdHost` adapter for a small set of side-effect-free
-queries (`System.getProperty`, primitive parsing, line separators, string receivers, and math helpers); every
+queries (`System.getProperty`, deterministic `System.currentTimeMillis`, primitive parsing, line separators, string receivers, and math helpers); every
 external call is recorded with its receiver and arguments for later dispatch. The CLI keeps the neutral `NullHost` default so probe results remain independent of
 machine properties, while a game-facing host can opt into Horizon-owned mappings without coupling the
 interpreter crate to `horizon-client`. Unknown calls keep the neutral return contract.
@@ -509,6 +509,12 @@ are also deterministic, covering namespace/path normalization used by loader met
 counts are bounded to keep native probes finite.
 `System.getProperties()` exposes the seeded properties as a bounded `Properties` map, so bootstrap code
 can use the same key/value queries as `getProperty` without crossing the host boundary.
+`System.currentTimeMillis()` returns a seeded deterministic value (zero by default, configurable with
+`StdHost::with_current_time_millis`); it never reads the machine clock, and follows the interpreter's bounded
+wide-primitive representation.
+For native client paths that mirror bootstrap-visible `NumberFormat.getIntegerInstance(Locale.US)`,
+`horizon_client::java_text::format_integer_us` provides deterministic ASCII digit grouping (including negative
+values) without emulating arbitrary locale or formatter patterns.
 `StdHost` also exposes deterministic Fabric loader values for mod-presence checks, metadata ids, names,
 versions, empty `getProvides` and `getDependencies` collections (including
 `ModMetadata.getType` as the deterministic `release` marker, and `Version.getRaw`/`getFriendlyString`), environment type (`CLIENT` by default, or
@@ -549,7 +555,10 @@ and bounded; distinct Java object identity and concurrent collection semantics r
 path.
 The common `Optional.map`/`filter`/`ifPresent`/`orElseGet`/`orElseThrow` callback flow executes supported in-jar
 `Function`, `Predicate`, `Consumer`, and `Supplier` targets and keeps neutral markers for unresolved callbacks. Its NeoForge mappings keep
-the context, event-bus listener, deferred-register, registry-event, and payload-registration chains alive;
+the context, event-bus listener, deferred-register, registry-event, and payload-registration chains alive.
+The standard callback host also maps `Predicate.and`/`or`/`negate`, `Consumer.andThen`, and
+`Function.compose`/`andThen` to bounded `@fn:...` markers; predicate tests and chained consumer
+dispatch preserve those marker semantics without allocating Java interface objects.
 listener lambdas arrive as captured `@indy:...` markers in the recorded invocation stream. `StdHost` exposes
 those listeners through `dispatch_event` and records deterministic `RegistryEntry` values and holder lookups,
 which is the first dispatchable host contract. `NativeJar::execute_dispatch` now resolves supported callback
