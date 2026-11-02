@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `9c562eac6`.
+Last checked: 3 November 2026, commit `c67bc235b`.
 
 ## Supported now
 
@@ -12,9 +12,9 @@ Last checked: 3 November 2026, commit `9c562eac6`.
 - [x] Run unsupported entrypoints through the embedded JVM runner as a fallback.
 - [x] Expose bounded Fabric loader values: loaded-mod checks, metadata, versions, environment type, development marker, root paths, and seeded containers.
 - [x] Expose bounded NeoForge and legacy Forge loader values: mod lists, containers, event-bus access, mod ids, and role-aware client/server selection.
-- [x] Register and inspect bounded NeoForge and Forge deferred registrations, holders, registry objects, keys, ids, entry collections, generated `Registry.getHolder`/`getOrThrow` lookups, explicit typed-registration handoff, and `ItemStack.getUseAnimation`/tag-stream façade coverage, and custom payload type identity.
+- [x] Register and inspect bounded NeoForge and Forge deferred registrations, holders, registry objects, keys, ids, entry collections, generated `Registry.getHolder`/`getOrThrow` lookups, explicit typed-registration handoff, typed recipe data-file declarations, and `ItemStack.getUseAnimation`/tag-stream façade coverage, and custom payload type identity.
 - [x] Record Fabric events, NeoForge events, and legacy Forge event-bus listeners with ordering, cancellation markers, unregister support, and Forge `register(Object)` handlers.
-- [x] Record custom payload registrations for the supported Fabric/NeoForge directions, retain custom payload type identity, and support the bounded legacy Forge `SimpleChannel.registerMessage` alias.
+- [x] Record custom payload registrations for the supported Fabric/NeoForge directions, retain custom payload type identity, and support the bounded legacy Forge `SimpleChannel.registerMessage` alias, with bounded `FriendlyByteBuf` value round trips.
 - [x] Provide bounded NeoForge and legacy Forge capability/`LazyOptional` markers, NBT values, identifiers, resource keys (including `ResourceKey.location`), capability `orEmpty` values, bounded declared-field reflection, arrays, reflection metadata, collections (including `removeIf` and `Iterator.forEachRemaining`), maps (including `entrySet`/`Map.Entry` equality and hashing, `computeIfPresent`, and `merge`), primitive optionals (`OptionalInt`, `OptionalLong`, `OptionalDouble`), streams (including runtime-owned `toArray` results and `Collectors.toList/toSet`), and optionals.
 - [x] Provide common Java wrapper/string/collection operations used by loader bootstrap code, including integer/long/float/double/byte/short/character conversion, `Number` accessors, checked math, seeded `System.currentTimeMillis`/`identityHashCode`, seeded `System.getProperty(key, default)` and `System.getenv` queries, deterministic `Thread.currentThread`/`getName`/`isDaemon`/`getContextClassLoader` markers, bounded callback combinators, `Arrays.asList`, `Objects.hashCode`/`requireNonNullElse`, and a restricted `String.format` subset.
 - [x] Provide bounded `ClassLoader.getResource`/`getResourceAsStream`/`getResources` markers from explicitly seeded `StdHost::with_resource` entries and every non-class file bundled in a `NativeJar::seed_host` jar with bounded byte-backed `InputStream` reads, explicitly seeded `ClassLoader.loadClass` markers, current-jar `Class.forName`, bounded field reflection, and explicitly seeded `ServiceLoader` providers and iterators, and capability `orEmpty` values; these queries never scan host files or the process classpath.
@@ -39,7 +39,7 @@ Last checked: 3 November 2026, commit `9c562eac6`.
 - [ ] Define the Mixin translation pipeline: resolve config targets, apply priority/order and cancellation, map supported injectors to Horizon hooks, and keep a JVM fallback for unsupported transforms.
 - [ ] Add broader real-mod integration fixtures for registries, networking, capabilities, entities, menus, resource loading, and client/server separation; current fixtures cover client/server role rejection and typed content merging.
 - [ ] Connect translated callbacks to the generated typed native API and Horizon's server-thread and dedicated-server boundaries.
-- [ ] Complete live content registration and registry synchronization for code-declared blocks, items, entities, recipes, data maps, attachments, and custom ingredients.
+- [ ] Complete live content registration and registry synchronization for code-declared blocks, items, entities, data maps, attachments, and custom ingredients.
 - [ ] Expand client compatibility for HUDs, key mappings, tooltips, models, renderers, particles, screens, and shader-facing code.
 - [ ] Add dedicated-server loading, performance measurements, crash isolation, permissions, and a clear unsupported-call report in the launcher.
 - [ ] Define the distribution policy for Java jars, native translations, signatures, and per-mod compatibility levels.
@@ -47,8 +47,8 @@ Last checked: 3 November 2026, commit `9c562eac6`.
 ## Validation snapshot
 
 - `horizon-native-java`: 100 unit tests passing, including bounded jar-resource stream reads, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection and bounded field metadata, TagKey values, bounded primitive optionals, custom payload type identity, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries, and bounded Map.Entry equality/hashing.
-- `horizon-mods`: 27 unit tests passing, plus the runtime-built typed declaration adapter fixture.
-- `horizon-port-pack`: 166 unit tests passing, including Mixin `@At`/slice boundary metadata and values, config edge values, Mixin Extras injector normalization, loader ABI classification, Mojang codec/datafixer ABI coverage, native declaration-kind reporting, deduplicated Mixin hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, sealed InteractionResult façade values, BlockHitResult state coverage, and descriptor normalization coverage.
+- `horizon-mods`: 28 unit tests passing, plus the runtime-built typed declaration adapter fixture.
+- `horizon-port-pack`: 167 unit tests passing, including Mixin `@At`/slice boundary metadata and values, config edge values, Mixin Extras injector normalization, loader ABI classification, Mojang codec/datafixer ABI coverage, native declaration-kind reporting, deduplicated Mixin hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, sealed InteractionResult façade values, BlockHitResult state coverage, FriendlyByteBuf façade values, and descriptor normalization coverage.
 - `horizon-jvm`: 9 unit tests passing, including explicit fallback labels, static-initialization fallback diagnostics, and NeoForge constructor-only entry selection.
 - `horizon-client` game mod tests: 12 passing, including bundled-resource loading, typed content, client/server role selection, and client-only NeoForge rejection.
 - Workspace check, full client clippy, compatibility-crate clippy, formatting, and `tools/native_java_smoke.py` passing with compiled OptionalLong/OptionalDouble paths.
