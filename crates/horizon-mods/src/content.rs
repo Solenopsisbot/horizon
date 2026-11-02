@@ -717,7 +717,10 @@ capabilities = ["registries"]
             properties: BTreeMap::new(),
         });
         let error = Content::from_native("ruby", declarations).unwrap_err();
-        assert!(error.contains("minecraft:entity_type/ruby:bird (entity)"), "{error}");
+        assert!(
+            error.contains("minecraft:entity_type/ruby:bird (entity)"),
+            "{error}"
+        );
     }
 
     #[test]
