@@ -560,6 +560,10 @@ fn fallback_label(class: &str, detail: Option<&str>) -> Option<String> {
             "JVM fallback selected for missing façade member{}",
             detail.map_or_else(String::new, |value| format!(": {value}"))
         )),
+        "java.lang.ExceptionInInitializerError" => Some(format!(
+            "JVM fallback selected for static initialization failure{}",
+            detail.map_or_else(String::new, |value| format!(": {value}"))
+        )),
         _ => None,
     }
 }
@@ -848,6 +852,16 @@ mod tests {
         assert_eq!(
             fallback_label("java.lang.NoSuchFieldException", None),
             Some("JVM fallback selected for missing façade member".to_owned())
+        );
+        assert_eq!(
+            fallback_label(
+                "java.lang.ExceptionInInitializerError",
+                Some("dev.mod.RegistryBootstrap")
+            ),
+            Some(
+                "JVM fallback selected for static initialization failure: dev.mod.RegistryBootstrap"
+                    .to_owned()
+            )
         );
     }
 
