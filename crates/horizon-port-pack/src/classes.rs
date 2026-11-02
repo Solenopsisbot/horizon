@@ -629,7 +629,28 @@ fn scalar_text(value: &Value) -> Option<String> {
 }
 
 fn metadata_text(value: &Value) -> Option<String> {
-    scalar_text(value).or_else(|| matches!(value, Value::Ann(_)).then(|| "present".to_owned()))
+    if let Value::Ann(annotation) = value {
+        let simple = annotation
+            .ty
+            .trim_start_matches('L')
+            .trim_end_matches(';')
+            .rsplit('/')
+            .next()
+            .unwrap_or_default();
+        if simple == "Slice" {
+            let from = annotation.values.get("from").and_then(text);
+            let to = annotation.values.get("to").and_then(text);
+            if from.is_some() || to.is_some() {
+                return Some(format!(
+                    "from:{}|to:{}",
+                    from.as_deref().unwrap_or(""),
+                    to.as_deref().unwrap_or("")
+                ));
+            }
+        }
+        return Some("present".to_owned());
+    }
+    scalar_text(value)
 }
 
 /// The simple name of a Mixin annotation, if it is one.
@@ -1274,6 +1295,30 @@ mod tests {
                 ("require".to_owned(), "2".to_owned()),
                 ("slice".to_owned(), "present".to_owned()),
             ])
+        );
+    }
+
+    #[test]
+    fn injection_metadata_preserves_slice_boundaries() {
+        let slice = Value::Ann(Annotation {
+            ty: "Lorg/spongepowered/asm/mixin/injection/Slice;".to_owned(),
+            values: BTreeMap::from([
+                ("from".to_owned(), Value::Str("head".to_owned())),
+                ("to".to_owned(), Value::Str("tail".to_owned())),
+            ]),
+        });
+        let inject = Annotation {
+            ty: "Lorg/spongepowered/asm/mixin/injection/Inject;".to_owned(),
+            values: BTreeMap::from([
+                ("method".to_owned(), Value::Str("tick()V".to_owned())),
+                ("slice".to_owned(), slice),
+            ]),
+        };
+        let methods = BTreeMap::from([("run".to_owned(), vec![inject])]);
+        let parsed = injections(&methods, &BTreeMap::new());
+        assert_eq!(
+            parsed[0].metadata_values.get("slice").map(String::as_str),
+            Some("from:head|to:tail")
         );
     }
 
