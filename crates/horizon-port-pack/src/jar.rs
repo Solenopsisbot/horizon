@@ -17,6 +17,9 @@ pub struct JarInfo {
     /// the right adapter (`main`, `client`, `server`, ...).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entrypoints: Vec<Entrypoint>,
+    /// Fabric's optional access-widener resource, relative to the jar root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_widener: Option<String>,
     pub census: Census,
 }
 
@@ -40,6 +43,11 @@ pub struct Census {
     pub sounds: usize,
     pub classes: usize,
     pub mixin_configs: usize,
+    /// Mixin configuration paths found in the jar. Kept alongside the count
+    /// so reports can identify the loader inputs without opening or executing
+    /// configuration files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixin_config_names: Vec<String>,
 }
 
 const NOT_MODS: [&str; 5] = ["minecraft", "neoforge", "forge", "fabricloader", "java"];
@@ -129,6 +137,7 @@ pub fn mods_toml(text: &str) -> Result<JarInfo, String> {
         mod_id,
         depends,
         entrypoints: Vec::new(),
+        access_widener: None,
         census: Census::default(),
     })
 }
@@ -187,6 +196,11 @@ pub fn fabric(text: &str) -> Result<JarInfo, String> {
         }
     }
     entrypoints.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.class.cmp(&b.class)));
+    let access_widener = v
+        .get("accessWidener")
+        .and_then(|value| value.as_str())
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned);
     Ok(JarInfo {
         mod_id: s("id"),
         name: s("name"),
@@ -194,17 +208,21 @@ pub fn fabric(text: &str) -> Result<JarInfo, String> {
         license,
         depends,
         entrypoints,
+        access_widener,
         census: Census::default(),
     })
 }
 
 pub fn census(names: &[String]) -> Census {
-    let mut c = Census::default();
+    let mut c = Census {
+        mixin_config_names: mixin_config_names(names),
+        ..Census::default()
+    };
     for n in names {
         let parts: Vec<&str> = n.split('/').collect();
         if n.ends_with(".class") {
             c.classes += 1;
-        } else if n.ends_with(".mixins.json") || (parts.len() == 1 && n.contains("mixins")) {
+        } else if is_mixin_config(n, parts.len()) {
             c.mixin_configs += 1;
         }
         // assets/<ns>/<kind>/... and data/<ns>/<kind>/...
@@ -227,6 +245,23 @@ pub fn census(names: &[String]) -> Census {
         }
     }
     c
+}
+
+/// Returns the mixin configuration paths in stable jar order. This only
+/// inspects entry names; config JSON is deliberately left opaque because the
+/// loader-specific schema is not needed by the census.
+pub fn mixin_config_names(names: &[String]) -> Vec<String> {
+    let mut configs: Vec<String> = names
+        .iter()
+        .filter(|name| is_mixin_config(name, name.split('/').count()))
+        .cloned()
+        .collect();
+    configs.sort();
+    configs
+}
+
+fn is_mixin_config(name: &str, path_parts: usize) -> bool {
+    name.ends_with(".mixins.json") || (path_parts == 1 && name.contains("mixins"))
 }
 
 #[cfg(test)]
@@ -273,11 +308,13 @@ mandatory = true
         let info = fabric(
             r#"{"id": "gem", "version": "3", "name": "Gem", "license": ["MIT", "Apache-2.0"],
                 "depends": {"fabricloader": "*", "fabric-api": "*", "minecraft": "1.21.1", "cloth-config": "*"},
-                "entrypoints": {"main": "com.example.Gem", "client": ["com.example.GemClient", ""], "server": {"value": "com.example.GemServer", "adapter": "default"}}}"#,
+                "entrypoints": {"main": "com.example.Gem", "client": ["com.example.GemClient", ""], "server": {"value": "com.example.GemServer", "adapter": "default"}},
+                "accessWidener": "gem.accesswidener"}"#,
         )
         .unwrap();
         assert_eq!(info.license, "MIT OR Apache-2.0");
         assert_eq!(info.depends, ["cloth-config"]);
+        assert_eq!(info.access_widener.as_deref(), Some("gem.accesswidener"));
         assert_eq!(
             info.entrypoints,
             [
@@ -323,5 +360,21 @@ mandatory = true
             (1, 1, 1, 1)
         );
         assert_eq!((c.classes, c.mixin_configs), (1, 1));
+        assert_eq!(c.mixin_config_names, ["ruby.mixins.json"]);
+    }
+
+    #[test]
+    fn mixin_config_names_are_sorted_and_ignore_unrelated_paths() {
+        let names = [
+            "z.mixins.json".to_owned(),
+            "META-INF/mixins.json".to_owned(),
+            "a.mixins.json".to_owned(),
+            "assets/example/mixins.json".to_owned(),
+            "readme.txt".to_owned(),
+        ];
+        assert_eq!(
+            mixin_config_names(&names),
+            ["a.mixins.json", "z.mixins.json"]
+        );
     }
 }

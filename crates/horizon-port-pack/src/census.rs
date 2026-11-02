@@ -88,6 +88,12 @@ pub struct Census {
     pub at: BTreeMap<String, usize>,
     /// One row per (target, method, form, anchor), with the hooks at it.
     pub points: Vec<PointCount>,
+    /// Access-widener targets, counted across jars (discovery only).
+    #[serde(default)]
+    pub access_widener_targets: BTreeMap<String, usize>,
+    /// Access-transformer targets, counted across jars (discovery only).
+    #[serde(default)]
+    pub access_transformer_targets: BTreeMap<String, usize>,
 }
 
 /// The first routing decision for a descriptor-bearing ABI reference.
@@ -158,12 +164,21 @@ pub struct JarCensus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entrypoints: Vec<crate::jar::Entrypoint>,
     pub classes: usize,
+    /// Mixin configuration paths declared by this jar (entry names only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixin_config_names: Vec<String>,
     /// Jars nested under `META-INF/jars/` that were read too.
     pub nested: usize,
     pub references: usize,
     pub members: usize,
     pub mixins: usize,
     pub injections: usize,
+    /// Bounded Fabric access-widener targets found in this jar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_widener_targets: Vec<String>,
+    /// Bounded NeoForge/Forge access-transformer targets found in this jar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_transformer_targets: Vec<String>,
     pub static_code: bool,
     /// Why not, if not (up to eight).
     pub dynamic: Vec<String>,
@@ -333,10 +348,38 @@ impl Census {
             minecraft,
             entrypoints,
             classes: parsed.len(),
+            mixin_config_names: jar::mixin_config_names(&names),
             nested,
             error,
             ..JarCensus::default()
         };
+        if let Some(path) = info.access_widener.as_deref() {
+            if let Ok(text) = read_zip_text(&mut zip, path) {
+                jar.access_widener_targets = access_widener_targets(&text);
+            }
+        }
+        for name in names.iter().filter(|name| is_access_transformer(name)) {
+            if let Ok(text) = read_zip_text(&mut zip, name) {
+                jar.access_transformer_targets
+                    .extend(access_transformer_targets(&text));
+            }
+        }
+        jar.access_widener_targets.sort();
+        jar.access_widener_targets.dedup();
+        jar.access_transformer_targets.sort();
+        jar.access_transformer_targets.dedup();
+        for target in &jar.access_widener_targets {
+            *self
+                .access_widener_targets
+                .entry(target.clone())
+                .or_default() += 1;
+        }
+        for target in &jar.access_transformer_targets {
+            *self
+                .access_transformer_targets
+                .entry(target.clone())
+                .or_default() += 1;
+        }
         for class in &parsed {
             for r in &class.refs {
                 *self.classes.entry(r.clone()).or_default() += 1;
@@ -455,6 +498,11 @@ impl Census {
             ("mixin targets", &self.mixin_targets),
             ("injections", &self.injections),
             ("at", &self.at),
+            ("access widener targets", &self.access_widener_targets),
+            (
+                "access transformer targets",
+                &self.access_transformer_targets,
+            ),
         ] {
             out.push_str(&format!("\n{title}\n"));
             for (name, count) in ranked(map, top) {
@@ -491,6 +539,91 @@ impl Census {
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         fs::write(path, json).map_err(|e| format!("{}: {e}", path.display()))
     }
+}
+
+const MAX_ACCESS_TARGETS: usize = 256;
+
+fn read_zip_text(zip: &mut zip::ZipArchive<fs::File>, name: &str) -> Result<String, String> {
+    let mut text = String::new();
+    zip.by_name(name)
+        .map_err(|e| e.to_string())?
+        .read_to_string(&mut text)
+        .map_err(|e| e.to_string())?;
+    Ok(text)
+}
+
+fn is_access_transformer(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with("accesstransformer.cfg")
+}
+
+/// Catalogs the target portion of Fabric's v1/v2 access-widener lines.
+/// Modifiers and descriptors stay in the key so overloads remain distinct;
+/// the parser never changes classfile access.
+fn access_widener_targets(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with("accessWidener ") {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(kind) = fields.next() else { continue };
+        if !matches!(
+            kind,
+            "accessible"
+                | "extendable"
+                | "mutable"
+                | "transitive-accessible"
+                | "transitive-extendable"
+                | "transitive-mutable"
+        ) {
+            continue;
+        }
+        let target = fields.collect::<Vec<_>>().join(" ");
+        if target.is_empty() {
+            continue;
+        }
+        out.push(format!("{kind} {target}"));
+        if out.len() >= MAX_ACCESS_TARGETS {
+            break;
+        }
+    }
+    out
+}
+
+/// Catalogs NeoForge/Forge AT lines after the access/final modifiers. This is
+/// intentionally a report-only parser: no transformer semantics are applied.
+fn access_transformer_targets(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(access) = fields.next() else {
+            continue;
+        };
+        if !matches!(
+            access,
+            "public"
+                | "protected"
+                | "private"
+                | "default"
+                | "public-f"
+                | "protected-f"
+                | "private-f"
+        ) {
+            continue;
+        }
+        let rest = fields.collect::<Vec<_>>().join(" ");
+        if rest.is_empty() {
+            continue;
+        }
+        out.push(rest);
+        if out.len() >= MAX_ACCESS_TARGETS {
+            break;
+        }
+    }
+    out
 }
 
 /// NeoForge discovers a mod's bootstrap class from its `@Mod("id")`
@@ -612,6 +745,27 @@ fn minecraft_version(zip: &mut zip::ZipArchive<fs::File>, loader: &str) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovers_bounded_access_metadata_targets() {
+        let aw = "accessWidener v2 named\naccessible class net/minecraft/Foo\nmutable field net/minecraft/Foo bar I\n# ignored\n";
+        assert_eq!(
+            access_widener_targets(aw),
+            [
+                "accessible class net/minecraft/Foo",
+                "mutable field net/minecraft/Foo bar I"
+            ]
+        );
+        let at = "# comment\npublic net.minecraft.Foo\nprotected-f net.minecraft.Foo field I\nprivate net.minecraft.Foo method (I)V\n";
+        assert_eq!(
+            access_transformer_targets(at),
+            [
+                "net.minecraft.Foo",
+                "net.minecraft.Foo field I",
+                "net.minecraft.Foo method (I)V"
+            ]
+        );
+    }
 
     #[test]
     fn ranks_by_count_then_name() {

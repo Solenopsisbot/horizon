@@ -3313,6 +3313,11 @@ fn safe_mixin_method(method: &Declared) -> bool {
         return_descriptor.as_bytes().first(),
         Some(b'V' | b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D')
     ) || return_descriptor.starts_with("Ljava/")
+        // Array accessors are common for model parts and registry tables. The
+        // generated body can safely return an empty one-dimensional array (or
+        // null for nested arrays), while the descriptor still preserves the
+        // castable JVM ABI.
+        || return_descriptor.starts_with('[')
 }
 
 fn java_type(descriptor: &str) -> String {
@@ -6632,6 +6637,12 @@ mod tests {
         assert!(safe_mixin_method(&Declared {
             name: "getThread".to_owned(),
             descriptor: "()Ljava/lang/Thread;".to_owned(),
+            access: 0x0001,
+            kind: MemberKind::Method,
+        }));
+        assert!(safe_mixin_method(&Declared {
+            name: "getParts".to_owned(),
+            descriptor: "()[Lnet/minecraft/client/model/ModelPart;".to_owned(),
             access: 0x0001,
             kind: MemberKind::Method,
         }));

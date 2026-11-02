@@ -331,7 +331,7 @@ Kotlin configuration bootstrap.
 
 The façade also materializes a bounded Mixin ABI slice: when a target mod contains a public interface
 annotated with `@Mixin` and method-level `@Accessor` or `@Invoker`, the generated target stub implements
-that interface when its methods have primitive, `void`, or common erased JDK/collection return types and
+that interface when its methods have primitive, `void`, array, or common erased JDK/collection return types and
 supplies neutral linkage bodies. Object-returning accessors use empty values for common collections,
 optionals, and one-dimensional arrays; the real field or call semantics remain a later hook. Spark's client
 entrypoint now exercises this path through its `MinecraftAccessor` cast. Static Fabric attachment constants

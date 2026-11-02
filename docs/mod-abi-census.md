@@ -24,6 +24,13 @@ cargo run -q -p horizon-port-pack -- census <jar or folder> --hooks native-hooks
 
 The JSON holds the ranked surface per jar and merged; the command prints the merged top.
 
+The census also discovers loader access metadata without applying it. A Fabric jar's
+`accessWidener` path in `fabric.mod.json` is read and its access, extendable, mutable (including
+transitive forms) targets are listed. NeoForge/Forge `accesstransformer.cfg` resources are listed by
+target after their access modifier. Each jar contributes at most 256 targets of each kind;
+the merged JSON and text summary include counts by target. This is an attachment-surface
+report only: bytecode access changes remain outside the census.
+
 ## Fabric API 26.3
 
 2,099 classes making **18,627** class references, **21,779** member references, **570** mixins and
