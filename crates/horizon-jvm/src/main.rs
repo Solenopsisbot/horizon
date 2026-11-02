@@ -162,7 +162,7 @@ fn run() -> Result<(), String> {
     let libs = take(&mut args, "--libs").map(PathBuf::from);
     let heap = take(&mut args, "--heap").unwrap_or_else(|| "-Xmx1g".to_owned());
     if args.is_empty() {
-        return Err("usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server>] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...".to_owned());
+        return Err("usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|neoforge>] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...".to_owned());
     }
     let entry_specs = match entry {
         Some(entry) => vec![entry],
@@ -235,6 +235,8 @@ fn run() -> Result<(), String> {
         let has_explicit_initializer = explicit_initializer.is_some();
         let (initializer, initializer_label) = if let Some(method) = explicit_initializer {
             (method.to_owned(), method.to_owned())
+        } else if constructor_only_entry_kind(&entry_kind) {
+            (String::new(), "constructor".to_owned())
         } else {
             let (method, label) = initializer_for_kind(&entry_kind)?;
             (method.to_owned(), label.to_owned())
@@ -243,6 +245,15 @@ fn run() -> Result<(), String> {
             Ok(class) => class,
             Err(e) => return describe(env, "find_class", entry, e),
         };
+        if constructor_only_entry_kind(&entry_kind) && !has_explicit_initializer {
+            let object = match env.new_object(&class, "()V", &[]) {
+                Ok(object) => object,
+                Err(e) => return describe(env, "new", entry, e),
+            };
+            call_mixin_on_load(env, &class, &object, entry)?;
+            println!("{entry} constructor returned");
+            continue;
+        }
         // Fabric invokes a mod's common initializer before a `Class::method`
         // client/server entrypoint when both are declared on the same class. A
         // number of real mods use that method to publish their singleton state.
@@ -300,6 +311,10 @@ fn run() -> Result<(), String> {
 fn split_entrypoint(spec: &str) -> (&str, Option<&str>) {
     spec.split_once("::")
         .map_or((spec, None), |(class, method)| (class, Some(method)))
+}
+
+fn constructor_only_entry_kind(kind: &str) -> bool {
+    kind == "neoforge"
 }
 
 fn call_mixin_on_load(
@@ -476,7 +491,7 @@ fn initializer_for_kind(kind: &str) -> Result<(&'static str, &'static str), Stri
         "client" => Ok(("onInitializeClient", "onInitializeClient")),
         "server" => Ok(("onInitializeServer", "onInitializeServer")),
         other => Err(format!(
-            "invalid --entry-kind {other}; expected main, client, or server"
+            "invalid --entry-kind {other}; expected main, client, server, or neoforge"
         )),
     }
 }
@@ -726,8 +741,8 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_entries, fabric_entries, fabric_metadata, fallback_label, is_minecraft_class,
-        nested_jar_name, split_entrypoint,
+        constructor_only_entry_kind, discover_entries, fabric_entries, fabric_metadata,
+        fallback_label, is_minecraft_class, nested_jar_name, split_entrypoint,
     };
     use std::{fs::File, io::Write};
     use zip::write::SimpleFileOptions;
@@ -775,6 +790,13 @@ mod tests {
             ("example.Client", Some("initializeClient"))
         );
         assert_eq!(split_entrypoint("example.Main"), ("example.Main", None));
+    }
+
+    #[test]
+    fn treats_neoforge_entrypoints_as_constructor_only() {
+        assert!(constructor_only_entry_kind("neoforge"));
+        assert!(!constructor_only_entry_kind("main"));
+        assert!(!constructor_only_entry_kind("client"));
     }
 
     #[test]
