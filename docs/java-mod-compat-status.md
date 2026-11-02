@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 2 November 2026, commit `c8294c288`.
+Last checked: 2 November 2026, commit `5371dda57`.
 
 ## Supported now
 
@@ -16,7 +16,8 @@ Last checked: 2 November 2026, commit `c8294c288`.
 - [x] Record Fabric events, NeoForge events, and legacy Forge event-bus listeners with ordering, cancellation markers, and unregister support.
 - [x] Record custom payload registrations for the supported Fabric/NeoForge directions and the bounded legacy Forge `SimpleChannel.registerMessage` alias.
 - [x] Provide bounded NeoForge and legacy Forge capability/`LazyOptional` markers, NBT values, identifiers, resource keys, arrays, reflection metadata, collections, maps, streams, and optionals.
-- [x] Provide common Java wrapper/string operations used by loader bootstrap code, including integer/long/float/double/byte/short/character conversion, `Number` accessors, and checked math.
+- [x] Provide common Java wrapper/string operations used by loader bootstrap code, including integer/long/float/double/byte/short/character conversion, `Number` accessors, checked math, seeded `System.currentTimeMillis`, and bounded callback combinators.
+- [x] Mirror the common `Locale.US` integer grouping path used by the native statistics screen without emulating arbitrary locale patterns.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs and array-returning signatures.
 - [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, access-widener/access-transformer discovery, and explicit report-only diagnostics.
 
@@ -40,7 +41,7 @@ Last checked: 2 November 2026, commit `c8294c288`.
 
 ## Validation snapshot
 
-- `horizon-native-java`: 79 unit tests passing, including bounded `Number` accessors across boxed integer and floating markers.
+- `horizon-native-java`: 81 unit tests passing, including bounded `Number` accessors and callback combinators.
 - `horizon-port-pack`: 150 unit tests passing.
 - `horizon-jvm`: 7 unit tests passing.
 - Workspace check, targeted clippy, formatting, and `tools/native_java_smoke.py` passing.
