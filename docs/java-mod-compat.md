@@ -477,7 +477,8 @@ queries (`System.getProperty`, primitive parsing, line separators, string receiv
 external call is recorded with its receiver and arguments for later dispatch. The CLI keeps the neutral `NullHost` default so probe results remain independent of
 machine properties, while a game-facing host can opt into Horizon-owned mappings without coupling the
 interpreter crate to `horizon-client`. Unknown calls keep the neutral return contract.
-The standard-library surface also includes deterministic `Integer.compare`/`toHexString` and
+The standard-library surface also includes deterministic `Integer.compare`/`toHexString`, integer
+`Math.floorDiv`/`floorMod`, and
 bounded `Long.compare`/`toHexString`,
 `StringBuilder`/`StringBuffer` append and
 `toString` values, primitive `String.valueOf` overloads, plus `Objects.equals`, `requireNonNull`, and
@@ -516,7 +517,7 @@ markers produced by `List.of`/`Map.of`, and interface-owner calls (`List`/`Map`)
 receiver where the marker is one of the supported concrete collections. The state is invocation-scoped
 and bounded; distinct Java object identity and concurrent collection semantics remain on the JVM fallback
 path.
-The common `Optional.map`/`filter`/`ifPresent`/`orElseGet` callback flow executes supported in-jar
+The common `Optional.map`/`filter`/`ifPresent`/`orElseGet`/`orElseThrow` callback flow executes supported in-jar
 `Function`, `Predicate`, `Consumer`, and `Supplier` targets and keeps neutral markers for unresolved callbacks. Its NeoForge mappings keep
 the context, event-bus listener, deferred-register, registry-event, and payload-registration chains alive;
 listener lambdas arrive as captured `@indy:...` markers in the recorded invocation stream. `StdHost` exposes

@@ -733,6 +733,32 @@ impl Host for StdHost {
                 expect_int(r, Self::argument(r, args, 0)?)?
                     .min(expect_int(r, Self::argument(r, args, 1)?)?),
             )),
+            ("java/lang/Math", "floorDiv", "(II)I") => {
+                let left = expect_int(r, Self::argument(r, args, 0)?)?;
+                let right = expect_int(r, Self::argument(r, args, 1)?)?;
+                if right == 0 {
+                    return Err(NativeError::Arithmetic {
+                        class: r.owner.clone(),
+                        method: r.name.clone(),
+                    });
+                }
+                Ok(Value::Int(if left == i32::MIN && right == -1 {
+                    i32::MIN
+                } else {
+                    left.div_euclid(right)
+                }))
+            }
+            ("java/lang/Math", "floorMod", "(II)I") => {
+                let left = expect_int(r, Self::argument(r, args, 0)?)?;
+                let right = expect_int(r, Self::argument(r, args, 1)?)?;
+                if right == 0 {
+                    return Err(NativeError::Arithmetic {
+                        class: r.owner.clone(),
+                        method: r.name.clone(),
+                    });
+                }
+                Ok(Value::Int(left.rem_euclid(right)))
+            }
             ("java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(value_text(Self::argument(r, args, 0)?))))
             }
@@ -846,6 +872,36 @@ impl Host for StdHost {
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
         let receiver_marker = expect_ref(receiver).cloned();
+        if r.owner == "java/lang/reflect/Method"
+            && matches!(
+                r.name.as_str(),
+                "getName" | "getParameterCount" | "toString"
+            )
+        {
+            let marker = receiver_marker.as_deref().ok_or_else(|| {
+                NativeError::Metadata("malformed java/lang/reflect/Method marker".into())
+            })?;
+            let method = marker.strip_prefix("reflect-method/").ok_or_else(|| {
+                NativeError::Metadata("malformed java/lang/reflect/Method marker".into())
+            })?;
+            let (_, member) = method.split_once('#').ok_or_else(|| {
+                NativeError::Metadata("reflective method marker has no name separator".into())
+            })?;
+            let (name, descriptor) = member
+                .find('(')
+                .map_or((member, None), |at| (&member[..at], Some(&member[at..])));
+            return match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some(name.to_owned()))),
+                ("getParameterCount", "()I") => {
+                    Ok(Value::Int(descriptor.map_or(0, arg_count) as i32))
+                }
+                ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(marker.to_owned()))),
+                _ => Err(NativeError::MissingMethod(format!(
+                    "java/lang/reflect/Method#{}{}",
+                    r.name, r.descriptor
+                ))),
+            };
+        }
         if r.owner == "net/neoforged/neoforge/capabilities/Capability"
             && r.name == "isRegistered"
             && r.descriptor == "()Z"
@@ -2076,6 +2132,51 @@ impl Host for StdHost {
             (
                 "java/util/Optional",
                 "orElseGet",
+                "(Ljava/util/function/Supplier;)Ljava/lang/Object;",
+            ) => {
+                if expect_ref(receiver).is_some() {
+                    self.invoke_instance(
+                        &MethodRef {
+                            owner: "java/util/Optional".into(),
+                            name: "get".into(),
+                            descriptor: "()Ljava/lang/Object;".into(),
+                        },
+                        receiver,
+                        &[],
+                    )
+                } else {
+                    let supplier = Self::argument(r, args, 0)?;
+                    self.invoke_instance(
+                        &MethodRef {
+                            owner: "java/util/function/Supplier".into(),
+                            name: "get".into(),
+                            descriptor: "()Ljava/lang/Object;".into(),
+                        },
+                        supplier,
+                        &[],
+                    )
+                }
+            }
+            ("java/util/Optional", "orElseThrow", "()Ljava/lang/Object;") => {
+                if expect_ref(receiver).is_some() {
+                    self.invoke_instance(
+                        &MethodRef {
+                            owner: "java/util/Optional".into(),
+                            name: "get".into(),
+                            descriptor: "()Ljava/lang/Object;".into(),
+                        },
+                        receiver,
+                        &[],
+                    )
+                } else {
+                    Err(NativeError::Metadata(
+                        "Optional.orElseThrow on empty optional".into(),
+                    ))
+                }
+            }
+            (
+                "java/util/Optional",
+                "orElseThrow",
                 "(Ljava/util/function/Supplier;)Ljava/lang/Object;",
             ) => {
                 if expect_ref(receiver).is_some() {
@@ -6040,6 +6141,31 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_maps_integer_floor_math() {
+        let mut host = StdHost::new();
+        let floor_div = MethodRef {
+            owner: "java/lang/Math".into(),
+            name: "floorDiv".into(),
+            descriptor: "(II)I".into(),
+        };
+        assert_eq!(
+            host.invoke(&floor_div, &[Value::Int(-7), Value::Int(3)])
+                .unwrap(),
+            Value::Int(-3)
+        );
+        let floor_mod = MethodRef {
+            owner: "java/lang/Math".into(),
+            name: "floorMod".into(),
+            descriptor: "(II)I".into(),
+        };
+        assert_eq!(
+            host.invoke(&floor_mod, &[Value::Int(-7), Value::Int(3)])
+                .unwrap(),
+            Value::Int(2)
+        );
+    }
+
+    #[test]
     fn standard_host_maps_uuid_identity_without_randomness() {
         let mut host = StdHost::new();
         let from_string = MethodRef {
@@ -6482,6 +6608,43 @@ mandatory = true
             host.calls().iter().any(|call| {
                 call.owner == "java/util/function/Consumer" && call.name == "accept"
             })
+        );
+        let or_else_throw = MethodRef {
+            owner: "java/util/Optional".into(),
+            name: "orElseThrow".into(),
+            descriptor: "()Ljava/lang/Object;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &or_else_throw,
+                &Value::Ref(Some("optional/demo".into())),
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("demo".into()))
+        );
+        assert!(
+            host.invoke_instance(&or_else_throw, &Value::Ref(None), &[])
+                .is_err()
+        );
+        let or_else_throw_supplier = MethodRef {
+            owner: "java/util/Optional".into(),
+            name: "orElseThrow".into(),
+            descriptor: "(Ljava/util/function/Supplier;)Ljava/lang/Object;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &or_else_throw_supplier,
+                &Value::Ref(None),
+                &[Value::Ref(Some("@indy:optional-error".into()))],
+            )
+            .unwrap(),
+            Value::Ref(None)
+        );
+        assert!(
+            host.calls()
+                .iter()
+                .any(|call| { call.owner == "java/util/function/Supplier" && call.name == "get" })
         );
     }
 
