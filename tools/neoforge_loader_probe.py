@@ -225,6 +225,36 @@ def main() -> int:
         for line in output.splitlines():
             if line.startswith("mods=") or line.startswith("mod=") or "fml-fixture-ok" in line:
                 print(f"  {line}")
+
+        # The same probe through `horizon-jvm --real-loader`, which starts the
+        # child JVM with FML's recorded classpath.
+        jvm = run(
+            [
+                "cargo",
+                "run",
+                "--quiet",
+                "--manifest-path",
+                str(ROOT / "Cargo.toml"),
+                "-p",
+                "horizon-jvm",
+                "--",
+                "--real-loader",
+                "--entry-kind",
+                "neoforge",
+                "--libs",
+                str(server / "libraries"),
+                str(jar),
+            ]
+        )
+        jvm_output = f"{jvm.stderr}{jvm.stdout}"
+        if (
+            jvm.returncode != 0
+            or "fml-fixture-ok:demo.RealMod" not in jvm_output
+            or "real loader: FML probe completed" not in jvm_output
+        ):
+            print(f"horizon-jvm FML probe failed ({jvm.returncode}):\n{jvm_output}", file=sys.stderr)
+            return 1
+        print("horizon-jvm FML: ok")
     return 0
 
 

@@ -294,7 +294,7 @@ fn run() -> Result<(), String> {
     // production default, and the flag never reaches the jar list.
     let fabric_development = args.iter().any(|arg| arg == "--fabric-development");
     args.retain(|arg| arg != "--fabric-development");
-    // Run the real Fabric loader instead of this probe's own entrypoint scan.
+    // Run the real Fabric or NeoForge loader instead of this probe's own scan.
     let real_loader = args.iter().any(|arg| arg == "--real-loader");
     args.retain(|arg| arg != "--real-loader");
     let mixin_config_args = take_all(&mut args, "--mixin-config");
@@ -315,6 +315,18 @@ fn run() -> Result<(), String> {
     }
     if list_entrypoints_only {
         return list_entrypoints(&args);
+    }
+    // The FML path starts its own Java process with the loader's exact
+    // classpath; an embedded JVM changes how FML's in-dev locator sees it.
+    if real_loader && entry_kind == "neoforge" {
+        let Some(libs) = libs.as_ref() else {
+            return Err(
+                "--real-loader --entry-kind neoforge needs --libs <installed server>/libraries"
+                    .to_owned(),
+            );
+        };
+        let mods: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
+        return run_real_neoforge(libs, &mods);
     }
     let (entry_specs, pre_launch) = if real_loader {
         (Vec::new(), Vec::new())
@@ -1730,6 +1742,201 @@ fn fallback_label(class: &str, detail: Option<&str>) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+const FML_PROBE_SOURCE: &str = r#"
+package horizon;
+
+import java.nio.file.*;
+import java.util.*;
+import net.neoforged.api.distmarker.Dist;
+import net.neoforged.fml.ModLoader;
+import net.neoforged.fml.loading.FMLLoader;
+import net.neoforged.fml.loading.LoadingModList;
+import net.neoforged.fml.startup.StartupArgs;
+
+public final class FmlProbe {
+  public static void main(String[] args) throws Exception {
+    List<String> program = new ArrayList<>();
+    for (String name : new String[]{"mcVersion", "neoForgeVersion", "neoFormVersion"}) {
+      String value = System.getProperty("horizon.fml." + name);
+      if (value != null) { program.add("--fml." + name); program.add(value); }
+    }
+    StartupArgs startup = new StartupArgs(Paths.get(System.getProperty("user.dir")), true,
+        Dist.DEDICATED_SERVER, true, program.toArray(new String[0]), Set.of(), List.of(),
+        ClassLoader.getSystemClassLoader());
+    FMLLoader loader = FMLLoader.create(startup);
+    LoadingModList list = loader.getLoadingModList();
+    System.out.println("mods=" + list.getMods().size());
+    for (var mod : list.getMods()) System.out.println("mod=" + mod.getModId());
+    ClassLoader game = loader.getGameLayer().findLoader("minecraft");
+    Class<?> constants = Class.forName("net.minecraft.SharedConstants", true, game);
+    constants.getMethod("tryDetectVersion").invoke(null);
+    Class<?> bootstrap = Class.forName("net.minecraft.server.Bootstrap", true, game);
+    bootstrap.getMethod("bootStrap").invoke(null);
+    ModLoader.gatherAndInitializeMods(Runnable::run, Runnable::run, () -> {});
+    System.out.println("initialized");
+  }
+}
+"#;
+
+/// Run the FML probe in a child JVM: FML's game locator assumes an ordinary
+/// `java -cp` launch, which an embedded JNI VM does not reproduce.
+fn run_real_neoforge(libs: &Path, mods: &[PathBuf]) -> Result<(), String> {
+    let classpath = fml_classpath(libs);
+    if classpath.is_empty() {
+        return Err(format!(
+            "{}: no NeoForge unix_args.txt classpath found",
+            libs.display()
+        ));
+    }
+    let root = std::env::temp_dir().join(format!(
+        "horizon-fml-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let game = root.join("game");
+    let mods_dir = game.join("mods");
+    fs::create_dir_all(&mods_dir).map_err(|e| format!("{}: {e}", mods_dir.display()))?;
+    for mod_jar in mods {
+        let name = mod_jar
+            .file_name()
+            .ok_or_else(|| format!("{}: no file name", mod_jar.display()))?;
+        fs::copy(mod_jar, mods_dir.join(name))
+            .map_err(|e| format!("{}: {e}", mod_jar.display()))?;
+    }
+    let source = root.join("FmlProbe.java");
+    let classes = root.join("classes");
+    fs::create_dir_all(&classes).map_err(|e| format!("{}: {e}", classes.display()))?;
+    fs::write(&source, FML_PROBE_SOURCE).map_err(|e| format!("{}: {e}", source.display()))?;
+    let javac = std::env::var_os("JAVA_HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("bin").join("javac"))
+        .unwrap_or_else(|| PathBuf::from("javac"));
+    let runtime = std::env::join_paths(&classpath).map_err(|e| e.to_string())?;
+    let compiled = Command::new(javac)
+        .arg("-cp")
+        .arg(&runtime)
+        .arg("-d")
+        .arg(&classes)
+        .arg(&source)
+        .output()
+        .map_err(|e| format!("javac: {e}"))?;
+    if !compiled.status.success() {
+        return Err(format!(
+            "FML probe did not compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        ));
+    }
+    let mut classpath = classpath;
+    classpath.push(classes);
+    let classpath = std::env::join_paths(&classpath).map_err(|e| e.to_string())?;
+    let java = std::env::var_os("JAVA_HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("bin").join("java"))
+        .unwrap_or_else(|| PathBuf::from("java"));
+    let mut command = Command::new(java);
+    command
+        .current_dir(&game)
+        .arg("--add-opens")
+        .arg("java.base/java.lang.invoke=ALL-UNNAMED")
+        .arg("-Djdk.attach.allowAttachSelf=true")
+        .arg(format!("-DlibraryDirectory={}", libs.display()))
+        .arg("-cp")
+        .arg(&classpath);
+    for (name, value) in fml_versions(Some(libs)) {
+        command.arg(format!("-Dhorizon.fml.{name}={value}"));
+    }
+    command.arg("horizon.FmlProbe");
+    let output = command
+        .output()
+        .map_err(|e| format!("could not start Java: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    print!("{text}");
+    let _ = fs::remove_dir_all(&root);
+    if !output.status.success() {
+        return Err(format!("FML probe failed ({})", output.status));
+    }
+    println!("real loader: FML probe completed");
+    Ok(())
+}
+
+/// The exact runtime classpath an installed NeoForge server's `unix_args.txt`
+/// records, resolved against the server directory.
+fn fml_classpath(libs: &Path) -> Vec<PathBuf> {
+    let mut args = Vec::new();
+    let Ok(entries) = fs::read_dir(libs.join("net/neoforged/neoforge")) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("unix_args.txt");
+        if path.is_file() {
+            args.push(path);
+        }
+    }
+    args.sort();
+    let Some(path) = args.pop() else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Some(index) = text.lines().position(|line| line == "-classpath") else {
+        return Vec::new();
+    };
+    let Some(entries) = text.lines().nth(index + 1) else {
+        return Vec::new();
+    };
+    let server = libs.parent().unwrap_or(libs);
+    entries
+        .split(if cfg!(windows) { ';' } else { ':' })
+        .map(|entry| {
+            if Path::new(entry).is_absolute() {
+                PathBuf::from(entry)
+            } else {
+                server.join(entry)
+            }
+        })
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+/// The `--fml.*` version arguments the installed server records.
+fn fml_versions(libs: Option<&Path>) -> Vec<(String, String)> {
+    let Some(libs) = libs else {
+        return Vec::new();
+    };
+    let mut args = Vec::new();
+    let Ok(entries) = fs::read_dir(libs.join("net/neoforged/neoforge")) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("unix_args.txt");
+        if path.is_file() {
+            args.push(path);
+        }
+    }
+    args.sort();
+    let Some(path) = args.pop() else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            key.strip_prefix("--fml.")
+                .filter(|name| !name.is_empty() && !value.is_empty())
+                .map(|name| (name.to_owned(), value.trim().to_owned()))
+        })
+        .collect()
 }
 
 fn take(args: &mut Vec<String>, name: &str) -> Option<String> {
@@ -4915,5 +5122,56 @@ mod real_loader_tests {
             assert!(LOADER_BRIDGE_SOURCE.contains(needed), "missing {needed}");
         }
         assert!(USAGE.contains("--real-loader"));
+    }
+}
+
+/// The FML probe and its classpath/version discovery, without starting FML.
+#[cfg(test)]
+mod fml_probe_tests {
+    use super::{FML_PROBE_SOURCE, USAGE, fml_classpath, fml_versions};
+    use std::{fs, path::Path};
+
+    #[test]
+    fn the_fml_probe_drives_the_loaders_entrypoints() {
+        for needed in [
+            "net.neoforged.fml.loading.FMLLoader",
+            "net.neoforged.fml.ModLoader",
+            "getMods()",
+            "gatherAndInitializeMods",
+            "bootStrap",
+            "initialized",
+        ] {
+            assert!(FML_PROBE_SOURCE.contains(needed), "missing {needed}");
+        }
+        assert!(USAGE.contains("--real-loader"));
+    }
+
+    #[test]
+    fn reads_versions_and_the_recorded_runtime_classpath() {
+        let root = std::env::temp_dir().join(format!("horizon-fml-test-{}", std::process::id()));
+        let server = root.join("server");
+        let libraries = server.join("libraries");
+        let args_dir = libraries.join("net/neoforged/neoforge/1.0");
+        fs::create_dir_all(&args_dir).unwrap();
+        let lib = server.join("libraries/demo.jar");
+        fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        fs::write(&lib, b"jar").unwrap();
+        fs::write(
+            args_dir.join("unix_args.txt"),
+            "-classpath\nlibraries/demo.jar\n--fml.mcVersion 26.3\n--fml.neoForgeVersion 1.0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fml_classpath(&libraries),
+            vec![server.join("libraries/demo.jar")]
+        );
+        assert_eq!(
+            fml_versions(Some(&libraries)),
+            vec![
+                ("mcVersion".to_owned(), "26.3".to_owned()),
+                ("neoForgeVersion".to_owned(), "1.0".to_owned())
+            ]
+        );
+        let _ = fs::remove_dir_all(Path::new(&root));
     }
 }
