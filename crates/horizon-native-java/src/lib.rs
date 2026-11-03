@@ -6078,6 +6078,138 @@ impl NativeJar {
         })
     }
 
+    /// Execute the bounded void-only form of `@Inject(at = RETURN|TAIL)`.
+    ///
+    /// Return-value callbacks need a `CallbackInfoReturnable` object and a
+    /// replacement-value contract.  Rather than inventing either, the native
+    /// path accepts only void targets and invokes a void callback after the
+    /// target, optionally supplying the same deterministic `CallbackInfo`
+    /// marker used by the HEAD path.  Non-void targets stay on the JVM
+    /// fallback with an explicit diagnostic.
+    pub fn execute_mixin_at_return<H: Host>(
+        &self,
+        plan: &MixinInjectionPlan,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        if plan.at != "RETURN" && plan.at != "TAIL" {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin return translation supports only @Inject(at = RETURN|TAIL), got {}",
+                plan.at
+            )));
+        }
+        if plan.cancellable {
+            return Err(NativeError::Metadata(
+                "native @Inject(at = RETURN|TAIL) does not support cancellable callbacks".into(),
+            ));
+        }
+
+        let target_class = self.classes.get(&plan.target.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                plan.target.owner, plan.target.name, plan.target.descriptor
+            ))
+        })?;
+        let target_method = target_class
+            .method(&plan.target.name, &plan.target.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    plan.target.owner, plan.target.name, plan.target.descriptor
+                ))
+            })?;
+        if return_desc(&plan.target.descriptor) != "V" {
+            return Err(NativeError::Metadata(
+                "native @Inject(at = RETURN|TAIL) supports only void targets; return-value callbacks use the JVM fallback".into(),
+            ));
+        }
+        if args.len() != arg_count(&plan.target.descriptor) {
+            return Err(NativeError::Metadata(format!(
+                "Mixin target {}#{}{} expected {} arguments, got {}",
+                plan.target.owner,
+                plan.target.name,
+                plan.target.descriptor,
+                arg_count(&plan.target.descriptor),
+                args.len()
+            )));
+        }
+
+        let callback_class = self.classes.get(&plan.callback.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                plan.callback.owner, plan.callback.name, plan.callback.descriptor
+            ))
+        })?;
+        let callback_method = callback_class
+            .method(&plan.callback.name, &plan.callback.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                ))
+            })?;
+        if return_desc(&plan.callback.descriptor) != "V" {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin callback {}#{}{} must return void",
+                plan.callback.owner, plan.callback.name, plan.callback.descriptor
+            )));
+        }
+
+        let target_args = descriptor_arguments(&plan.target.descriptor);
+        let callback_args = descriptor_arguments(&plan.callback.descriptor);
+        let mut callback_values = args.to_vec();
+        if callback_args != target_args {
+            if callback_args.len() == target_args.len() + 1
+                && callback_args
+                    .last()
+                    .is_some_and(|arg| is_callback_info_descriptor(arg))
+                && callback_args[..target_args.len()] == target_args[..]
+            {
+                callback_values.push(Value::Ref(Some(format!(
+                    "mixin/callback-info/{}#{}",
+                    plan.target.owner, plan.target.name
+                ))));
+            } else {
+                return Err(NativeError::Metadata(format!(
+                    "native Mixin callback {}#{}{} must mirror target arguments and may add one trailing CallbackInfo",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                )));
+            }
+        }
+
+        let target_receiver = (!target_method.is_static()).then(|| {
+            receiver
+                .clone()
+                .unwrap_or_else(|| Value::Ref(Some(plan.target.owner.clone())))
+        });
+        let target_result = self.invoke_method_with_args(
+            &plan.target.owner,
+            &plan.target.name,
+            &plan.target.descriptor,
+            target_receiver,
+            args,
+            host,
+        )?;
+        let callback_receiver = (!callback_method.is_static()).then(|| {
+            receiver
+                .clone()
+                .unwrap_or_else(|| Value::Ref(Some(plan.callback.owner.clone())))
+        });
+        let callback_result = self.invoke_method_with_args(
+            &plan.callback.owner,
+            &plan.callback.name,
+            &plan.callback.descriptor,
+            callback_receiver,
+            &callback_values,
+            host,
+        )?;
+        Ok(MixinExecutionReport {
+            callback_result,
+            target_result,
+        })
+    }
+
     /// Execute one listener work item produced by [`StdHost::dispatch_event`].
     ///
     /// The callback marker carries the resolved method handle and captured
@@ -15098,6 +15230,117 @@ mandatory = true
             .unwrap();
         assert_eq!(report.callback_result, Value::Void);
         assert_eq!(report.target_result, Value::Int(5));
+    }
+
+    #[test]
+    fn executes_bounded_mixin_injection_at_return_after_target() {
+        let target = ClassFile {
+            name: "demo/Target".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "tick".into(),
+                descriptor: "()V".into(),
+                access: 9,
+                code: Some(vec![0xb1]),
+                max_locals: 0,
+            }],
+        };
+        let callback = ClassFile {
+            name: "demo/Mixin".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "onTick".into(),
+                descriptor: "(Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;)V"
+                    .into(),
+                access: 9,
+                code: Some(vec![0xb1]),
+                max_locals: 1,
+            }],
+        };
+        let jar = NativeJar::from_classes([target, callback]);
+        let mut plan = MixinInjectionPlan::inject_at_head(
+            MethodRef {
+                owner: "demo/Target".into(),
+                name: "tick".into(),
+                descriptor: "()V".into(),
+            },
+            MethodRef {
+                owner: "demo/Mixin".into(),
+                name: "onTick".into(),
+                descriptor: "(Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;)V"
+                    .into(),
+            },
+        );
+        plan.at = "RETURN".into();
+        let report = jar
+            .execute_mixin_at_return(&plan, None, &[], &mut NullHost)
+            .unwrap();
+        assert_eq!(report.target_result, Value::Void);
+        assert_eq!(report.callback_result, Value::Void);
+        plan.at = "TAIL".into();
+        jar.execute_mixin_at_return(&plan, None, &[], &mut NullHost)
+            .unwrap();
+    }
+
+    #[test]
+    fn return_mixin_rejects_non_void_target_and_unsupported_anchor() {
+        let target = ClassFile {
+            name: "demo/Target".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "tick".into(),
+                descriptor: "()I".into(),
+                access: 9,
+                code: Some(vec![0x03, 0xac]),
+                max_locals: 0,
+            }],
+        };
+        let callback = ClassFile {
+            name: "demo/Mixin".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "onTick".into(),
+                descriptor: "()V".into(),
+                access: 9,
+                code: Some(vec![0xb1]),
+                max_locals: 0,
+            }],
+        };
+        let jar = NativeJar::from_classes([target, callback]);
+        let mut plan = MixinInjectionPlan::inject_at_head(
+            MethodRef {
+                owner: "demo/Target".into(),
+                name: "tick".into(),
+                descriptor: "()I".into(),
+            },
+            MethodRef {
+                owner: "demo/Mixin".into(),
+                name: "onTick".into(),
+                descriptor: "()V".into(),
+            },
+        );
+        plan.at = "RETURN".into();
+        let error = jar
+            .execute_mixin_at_return(&plan, None, &[], &mut NullHost)
+            .unwrap_err();
+        assert!(error.to_string().contains("only void targets"));
+        plan.at = "INVOKE".into();
+        let error = jar
+            .execute_mixin_at_return(&plan, None, &[], &mut NullHost)
+            .unwrap_err();
+        assert!(error.to_string().contains("RETURN|TAIL"));
     }
 
     #[test]
