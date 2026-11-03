@@ -142,7 +142,10 @@ public final class HorizonLoaderBridge {
       System.setProperty("fabric.gameJarPath", gameJars[0]);
       System.setProperty(client ? "fabric.gameJarPath.client" : "fabric.gameJarPath.server", gameJars[0]);
       Class<?> launcherIface = Class.forName("net.fabricmc.loader.impl.launch.FabricLauncher");
-      Object launcher = makeLauncher(gameLoader, client, gameJars, gameVersion);
+      // The game jars are already on the JVM classpath (see `run`), so the
+      // system loader sees both the loader and the game; a child URL loader
+      // would only hide loader classes from the provider.
+      Object launcher = makeLauncher(ClassLoader.getSystemClassLoader(), client, gameJars, gameVersion);
       installLauncher(launcher);
       Class<?> providerClass = Class.forName("net.fabricmc.loader.impl.game.minecraft.MinecraftGameProvider");
       Object provider = providerClass.getConstructor().newInstance();
@@ -169,12 +172,21 @@ public final class HorizonLoaderBridge {
     } catch (Throwable failure) {
       String reason = summarize(failure);
       try {
+        resetLauncher();
         return "test\t" + bootstrap() + "\t" + reason;
       } catch (Throwable fallbackFailure) {
         throw new RuntimeException("production provider failed: " + reason
             + "; test provider failed: " + summarize(fallbackFailure));
       }
     }
+  }
+
+  /** Clear the launcher Fabric's `setLauncher` refuses to replace. */
+  private static void resetLauncher() throws Exception {
+    Class<?> base = Class.forName("net.fabricmc.loader.impl.launch.FabricLauncherBase");
+    Field field = base.getDeclaredField("launcher");
+    field.setAccessible(true);
+    field.set(null, null);
   }
 
   /** The launcher Fabric's provider sees: the supplied classpath plus game jars. */
@@ -207,7 +219,7 @@ public final class HorizonLoaderBridge {
         case "getManifest": return null;
         case "getMappingConfiguration": return mappingConfiguration(gameVersion);
         case "isClassLoaded": return false;
-        case "loadIntoTarget": throw new ClassNotFoundException((String) a[0]);
+        case "loadIntoTarget": return Class.forName((String) a[0], false, target);
         default: return defaultValue(m.getReturnType());
       }
     });
@@ -314,6 +326,14 @@ public final class HorizonLoaderBridge {
     setField(type, config, "namespaces", Arrays.asList("official", "intermediary", "named"));
     setField(type, config, "initializedMetadata", true);
     setField(type, config, "initializedMappings", true);
+    // The provider dereferences the mapping tree unconditionally; a tree whose
+    // only namespace is the runtime one means every supplied class already
+    // carries its runtime names, so no remap is needed.
+    Class<?> tree = Class.forName("net.fabricmc.loader.impl.lib.mappingio.tree.MemoryMappingTree");
+    Object mappings = tree.getConstructor().newInstance();
+    tree.getMethod("visitNamespaces", String.class, java.util.List.class)
+        .invoke(mappings, "named", Arrays.asList("official"));
+    setField(type, config, "mappings", mappings);
     return config;
   }
 
