@@ -249,25 +249,8 @@ fn rejection_names_the_reason() {
     let bytes = read_class(&classes, "demo/Target");
     let class = ClassFile::parse(&bytes).unwrap();
 
-    let branchy = weave_head(
-        &class,
-        &method("demo/Target", "branchy", "(I)I"),
-        &method("demo/Callback", "onAdd", "(Ldemo/Target;I)V"),
-    )
-    .unwrap_err();
-    assert!(
-        branchy.contains("StackMapTable") || branchy.contains("branch") || branchy.contains("if"),
-        "{branchy}"
-    );
-
-    let guarded = weave_head(
-        &class,
-        &method("demo/Target", "guarded", "(I)I"),
-        &method("demo/Callback", "onAdd", "(Ldemo/Target;I)V"),
-    )
-    .unwrap_err();
-    assert!(guarded.contains("exception"), "{guarded}");
-
+    // `branchy` and `guarded` are now supported: their branches, exception
+    // table and `StackMapTable` are relocated (see `fixture_weaver_frames.rs`).
     let static_receiver = weave_head(
         &class,
         &method("demo/Target", "addStatic", "(II)I"),

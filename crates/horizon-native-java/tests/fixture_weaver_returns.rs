@@ -376,21 +376,28 @@ fn return_rejects_a_non_void_target() {
 }
 
 #[test]
-fn return_rejects_a_javac_method_with_two_returns() {
+fn return_weaves_a_javac_method_with_two_returns() {
     let classes = compile("branchy");
     let class = ClassFile::parse(&read_class(&classes, "demo/Target")).unwrap();
-    let error = weave_return(
+    // `javac` gives the second return a branch and a `StackMapTable`; both are
+    // relocated now, so the plan lands on every return.
+    let woven = weave_return(
         &class,
         &method("demo/Target", "branchy", "(Z)V"),
         &method("demo/Callback", "onBranchy", "(Ldemo/Target;Z)V"),
         ReturnMode::Return,
     )
-    .unwrap_err();
-    // `javac` gives the second return a branch and a `StackMapTable`.
-    assert!(
-        error.contains("StackMapTable") || error.contains("branch") || error.contains("if"),
-        "{error}"
-    );
+    .unwrap();
+    let reparsed = ClassFile::parse(&woven).unwrap();
+    assert_eq!(reparsed.write().unwrap(), woven, "woven class round-trips");
+    let code = reparsed
+        .method("branchy", "(Z)V")
+        .unwrap()
+        .code
+        .as_ref()
+        .unwrap();
+    assert_eq!(code.iter().filter(|opcode| **opcode == 0xb8).count(), 2);
+    assert_eq!(code.iter().filter(|opcode| **opcode == 0xb1).count(), 2);
 }
 
 #[test]

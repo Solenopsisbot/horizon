@@ -1,10 +1,10 @@
-//! A bounded class-file writer and straight-line injection weaver.
+//! A bounded class-file writer and injection weaver.
 //!
 //! The interpreter in [`crate`] never needed to write a class: it reads a
 //! `ClassFile` and executes a bytecode subset.  This module adds the other
 //! direction, for the shapes a native Mixin translation can prepare before an
-//! embedded JVM sees them: a straight-line method that gets a `HEAD` callback
-//! at offset 0, or one that gets a callback immediately before each `return`.
+//! embedded JVM sees them: a method that gets a `HEAD` callback at offset 0, or
+//! one that gets a callback immediately before each `return`.
 //!
 //! [`ClassFile::write`] re-encodes a parsed class from the bytes it was parsed from.
 //! Every byte range the parser does not need to understand (the constant pool
@@ -29,20 +29,33 @@
 //! the callback carries the target's arguments, plus the receiver when it
 //! declares it.
 //!
-//! Both anchors update `max_stack` conservatively (HEAD:
-//! `original + argument slots + 1`; RETURN/TAIL: `original + argument slots`),
-//! the `code_length`, and the `Code` attribute length.  Every other attribute,
-//! including a `Code` attribute's own `LineNumberTable`, is copied byte-for-byte
-//! (their `start_pc` values are not shifted; they are debug data only, and a
-//! straight-line method has no branch target that depends on an offset).
+//! Because an insert moves every byte after it, both anchors relocate everything
+//! in the method that names a bytecode offset, each by the delta that applies at
+//! its own offset (a `RETURN` insert only moves the bytes after that `return`):
 //!
-//! The target method must be straight-line: no `if*`, `goto`, `tableswitch`,
-//! `lookupswitch`, `jsr`/`ret`, no exception table, no `StackMapTable`, no
-//! `wide`, and the class's constant pool must not use `CONSTANT_Dynamic`
-//! (condy).  The callback descriptor must consume exactly the target's
-//! arguments and return `void`.  An instance target's callback may instead take
-//! the target instance as an extra first parameter, which the inserted
-//! `aload_0` supplies.
+//! - 16-bit branch offsets (`if*`, `goto`, `jsr`, `ifnull`, `ifnonnull`) and the
+//!   32-bit `goto_w`/`jsr_w`, keeping each target on the instruction it named;
+//! - the exception table's `start_pc`, `end_pc` and `handler_pc`: the inserted
+//!   callback is never caught by the target's own handler, because an insert at
+//!   a range start lands before it and an insert at the exclusive end lands
+//!   after it;
+//! - `LineNumberTable`, `LocalVariableTable` and `LocalVariableTypeTable`
+//!   `start_pc` (and the local range's end, so its length grows with the code);
+//! - `StackMapTable` frame offsets, re-derived from the shifted absolute
+//!   offsets as cumulative `offset_delta`s, plus the `uninitialized` offsets
+//!   inside frames.  A frame whose delta no longer fits its compact form is
+//!   widened (`same_frame` to `same_frame_extended`, and so on).
+//!
+//! `max_stack` is raised conservatively (HEAD: `original + argument slots + 1`;
+//! RETURN/TAIL: `original + argument slots`), `max_locals` is raised to the
+//! argument slots when the class declares fewer, and the `code_length` and
+//! `Code` attribute length follow the rewritten code.  Attributes the weaver
+//! does not read (`Exceptions`, type annotations, ...) are still copied
+//! byte-for-byte.
+//!
+//! The callback descriptor must consume exactly the target's arguments and
+//! return `void`.  An instance target's callback may instead take the target
+//! instance as an extra first parameter, which the inserted `aload_0` supplies.
 //!
 //! [`weave_class`] applies every matching `HEAD` plan first, then every
 //! `RETURN`/`TAIL` plan, re-parsing the class between edits and skipping plans
@@ -56,15 +69,21 @@
 //! that target another class or ask for cancellation; [`weave_class`] instead
 //! rejects a cancellable or `INVOKE` plan that targets its class with a reason.
 //!
-//! Branches (so no frame or local-variable rewriting), exception handlers,
-//! non-void returns, cancellation and `@At("INVOKE")` stay on the interpreter
-//! path.  A non-void `RETURN` callback needs a `CallbackInfoReturnable` object
-//! carrying the target's boxed result, cancellation needs a runtime-owned
-//! `CallbackInfo`, and `INVOKE` moves or guards a call site - all three need
-//! object construction or call-site rewriting a plain insert cannot express.
-//! Non-ASCII constant pool strings, local slots above 255 (`wide`) and code
-//! that would exceed the class-file `code_length` limit are rejected with a
-//! reason rather than written.
+//! Non-void `RETURN`/`TAIL` callbacks, cancellation and `@At("INVOKE")` stay on
+//! the interpreter path.  A non-void `RETURN` callback needs a
+//! `CallbackInfoReturnable` object carrying the target's boxed result,
+//! cancellation needs a runtime-owned `CallbackInfo`, and `INVOKE` moves or
+//! guards a call site - all three need object construction or call-site
+//! rewriting a plain insert cannot express.
+//!
+//! `tableswitch`/`lookupswitch` are rejected because their alignment padding
+//! depends on the instruction's own offset, so relocating them needs a second
+//! pass over the rewritten buffer.  `wide` is rejected because the weaver never
+//! grows a local-slot operand and a slot above 255 would need one.  A class
+//! whose constant pool uses `CONSTANT_Dynamic` (condy) is rejected because the
+//! writer cannot re-encode its bootstrap arguments.  Non-ASCII constant pool
+//! strings and code that would exceed the class-file `code_length` limit are
+//! rejected with a reason rather than written.
 
 use std::collections::BTreeMap;
 
@@ -139,15 +158,92 @@ impl<'a> Bytes<'a> {
     }
 }
 
+/// One entry of a `Code` attribute's exception table.
+#[derive(Debug, Clone, Copy)]
+struct ExceptionHandler {
+    start_pc: u16,
+    end_pc: u16,
+    handler_pc: u16,
+    catch_type: u16,
+}
+
 /// One `Code` attribute, split at the bytes a rewrite touches.
 struct CodeLayout<'a> {
     max_stack: u16,
     max_locals: u16,
     code: &'a [u8],
-    /// `exception_table_length` and its entries, copied verbatim.
-    exception_table: &'a [u8],
-    /// The Code attribute's own attributes (count included), copied verbatim.
-    attributes: &'a [u8],
+    exception_table: Vec<ExceptionHandler>,
+    /// The Code attribute's own attributes, in file order.  Tables that name a
+    /// bytecode offset are parsed so a rewrite can shift them; every other
+    /// attribute keeps its bytes.
+    attributes: Vec<CodeAttribute<'a>>,
+}
+
+/// One attribute of a `Code` attribute.
+enum CodeAttribute<'a> {
+    /// An attribute the weaver does not read: copied verbatim.
+    Raw { name_index: u16, body: &'a [u8] },
+    /// `LineNumberTable`.
+    LineNumbers {
+        name_index: u16,
+        lines: Vec<LineNumber>,
+    },
+    /// `LocalVariableTable` or `LocalVariableTypeTable`, whose rows share a
+    /// layout.
+    LocalVariables {
+        name_index: u16,
+        entries: Vec<LocalVariable>,
+    },
+    /// `StackMapTable`, the verifier's frames.
+    StackMap {
+        name_index: u16,
+        frames: Vec<StackMapFrame>,
+    },
+}
+
+impl CodeAttribute<'_> {
+    fn name_index(&self) -> u16 {
+        match self {
+            Self::Raw { name_index, .. }
+            | Self::LineNumbers { name_index, .. }
+            | Self::LocalVariables { name_index, .. }
+            | Self::StackMap { name_index, .. } => *name_index,
+        }
+    }
+}
+
+struct LineNumber {
+    start_pc: u16,
+    line_number: u16,
+}
+
+struct LocalVariable {
+    start_pc: u16,
+    length: u16,
+    name_index: u16,
+    descriptor_index: u16,
+    index: u16,
+}
+
+/// One `StackMapTable` frame with its absolute bytecode offset.
+struct StackMapFrame {
+    /// The parsed `frame_type`, kept so an unshifted table re-encodes
+    /// byte-exactly; a shifted table widens the type only when the new
+    /// `offset_delta` no longer fits it.
+    frame_type: u8,
+    offset: usize,
+    locals: Vec<VerificationType>,
+    stack: Vec<VerificationType>,
+}
+
+/// One `verification_type_info`.
+#[derive(Debug, Clone, Copy)]
+enum VerificationType {
+    /// Tags 0..=6 (`Top`, `Integer`, ... `Null`).
+    Simple(u8),
+    Object(u16),
+    /// A `new` offset, which a rewrite shifts like a branch target.
+    Uninitialized(u16),
 }
 
 struct AttributeLayout<'a> {
@@ -235,7 +331,7 @@ impl<'a> Layout<'a> {
                 let body = r.bytes(length)?;
                 let code = if pool_utf8.get(name_index as usize).copied().flatten() == Some("Code")
                 {
-                    Some(parse_code(body)?)
+                    Some(parse_code(body, &pool_utf8)?)
                 } else {
                     None
                 };
@@ -341,21 +437,30 @@ fn parse_pool<'a>(
     Ok((utf8, tags))
 }
 
-fn parse_code(body: &[u8]) -> Result<CodeLayout<'_>, String> {
+fn parse_code<'a>(body: &'a [u8], pool: &[Option<&'a str>]) -> Result<CodeLayout<'a>, String> {
     let mut r = Bytes::new(body);
     let max_stack = r.u2()?;
     let max_locals = r.u2()?;
     let code_length = r.u4()? as usize;
     let code = r.bytes(code_length)?;
-    let exception_start = r.at;
     let handlers = r.u2()? as usize;
-    r.skip(
-        handlers
-            .checked_mul(8)
-            .ok_or("exception table length overflow")?,
-    )?;
-    let exception_table = &body[exception_start..r.at];
-    let attributes = &body[r.at..];
+    let mut exception_table = Vec::with_capacity(handlers);
+    for _ in 0..handlers {
+        exception_table.push(ExceptionHandler {
+            start_pc: r.u2()?,
+            end_pc: r.u2()?,
+            handler_pc: r.u2()?,
+            catch_type: r.u2()?,
+        });
+    }
+    let attribute_count = r.u2()? as usize;
+    let mut attributes = Vec::with_capacity(attribute_count);
+    for _ in 0..attribute_count {
+        let name_index = r.u2()?;
+        let length = r.u4()? as usize;
+        let attribute = r.bytes(length)?;
+        attributes.push(parse_code_attribute(pool, name_index, attribute)?);
+    }
     Ok(CodeLayout {
         max_stack,
         max_locals,
@@ -363,6 +468,128 @@ fn parse_code(body: &[u8]) -> Result<CodeLayout<'_>, String> {
         exception_table,
         attributes,
     })
+}
+
+fn parse_code_attribute<'a>(
+    pool: &[Option<&'a str>],
+    name_index: u16,
+    body: &'a [u8],
+) -> Result<CodeAttribute<'a>, String> {
+    let name = pool.get(name_index as usize).copied().flatten();
+    Ok(match name {
+        Some("LineNumberTable") => CodeAttribute::LineNumbers {
+            name_index,
+            lines: parse_line_numbers(body)?,
+        },
+        Some("LocalVariableTable" | "LocalVariableTypeTable") => CodeAttribute::LocalVariables {
+            name_index,
+            entries: parse_local_variables(body)?,
+        },
+        Some("StackMapTable") => CodeAttribute::StackMap {
+            name_index,
+            frames: parse_stack_map(body)?,
+        },
+        _ => CodeAttribute::Raw { name_index, body },
+    })
+}
+
+fn parse_line_numbers(body: &[u8]) -> Result<Vec<LineNumber>, String> {
+    let mut r = Bytes::new(body);
+    let count = r.u2()? as usize;
+    let mut lines = Vec::with_capacity(count);
+    for _ in 0..count {
+        lines.push(LineNumber {
+            start_pc: r.u2()?,
+            line_number: r.u2()?,
+        });
+    }
+    Ok(lines)
+}
+
+fn parse_local_variables(body: &[u8]) -> Result<Vec<LocalVariable>, String> {
+    let mut r = Bytes::new(body);
+    let count = r.u2()? as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        entries.push(LocalVariable {
+            start_pc: r.u2()?,
+            length: r.u2()?,
+            name_index: r.u2()?,
+            descriptor_index: r.u2()?,
+            index: r.u2()?,
+        });
+    }
+    Ok(entries)
+}
+
+fn parse_verification(r: &mut Bytes<'_>) -> Result<VerificationType, String> {
+    let tag = r.u1()?;
+    Ok(match tag {
+        0..=6 => VerificationType::Simple(tag),
+        7 => VerificationType::Object(r.u2()?),
+        8 => VerificationType::Uninitialized(r.u2()?),
+        other => return Err(format!("stack-map verification type {other} is reserved")),
+    })
+}
+
+fn parse_stack_map(body: &[u8]) -> Result<Vec<StackMapFrame>, String> {
+    let mut r = Bytes::new(body);
+    let count = r.u2()? as usize;
+    let mut frames: Vec<StackMapFrame> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let frame_type = r.u1()?;
+        let (delta, locals, stack) = match frame_type {
+            0..=63 => (frame_type as usize, Vec::new(), Vec::new()),
+            64..=127 => (
+                frame_type as usize - 64,
+                Vec::new(),
+                vec![parse_verification(&mut r)?],
+            ),
+            128..=246 => {
+                return Err(format!(
+                    "StackMapTable frame type {frame_type} is reserved; the bounded weaver cannot re-encode it"
+                ));
+            }
+            247 => (
+                r.u2()? as usize,
+                Vec::new(),
+                vec![parse_verification(&mut r)?],
+            ),
+            248..=251 => (r.u2()? as usize, Vec::new(), Vec::new()),
+            252..=254 => {
+                let delta = r.u2()? as usize;
+                let locals = parse_verifications(&mut r, frame_type as usize - 251)?;
+                (delta, locals, Vec::new())
+            }
+            _ => {
+                let delta = r.u2()? as usize;
+                let local_count = r.u2()? as usize;
+                let locals = parse_verifications(&mut r, local_count)?;
+                let stack_count = r.u2()? as usize;
+                let stack = parse_verifications(&mut r, stack_count)?;
+                (delta, locals, stack)
+            }
+        };
+        let offset = match frames.last() {
+            Some(previous) => previous.offset + delta + 1,
+            None => delta,
+        };
+        frames.push(StackMapFrame {
+            frame_type,
+            offset,
+            locals,
+            stack,
+        });
+    }
+    Ok(frames)
+}
+
+fn parse_verifications(r: &mut Bytes<'_>, count: usize) -> Result<Vec<VerificationType>, String> {
+    let mut types = Vec::with_capacity(count);
+    for _ in 0..count {
+        types.push(parse_verification(r)?);
+    }
+    Ok(types)
 }
 
 /// One appended constant: only the shapes the weaver interns.
@@ -494,14 +721,26 @@ impl<'a> PoolBuilder<'a> {
     }
 }
 
-struct Patch {
-    method: usize,
-    attribute: usize,
+/// The rewritten `Code` attribute of one method.
+struct CodePatch<'a> {
     code: Vec<u8>,
     max_stack: u16,
+    max_locals: u16,
+    exception_table: Vec<ExceptionHandler>,
+    attributes: Vec<CodeAttribute<'a>>,
 }
 
-fn emit(layout: &Layout<'_>, patch: Option<Patch>, added: &[Cp]) -> Result<Vec<u8>, String> {
+struct Patch<'a> {
+    method: usize,
+    attribute: usize,
+    code: CodePatch<'a>,
+}
+
+fn emit<'a>(
+    layout: &Layout<'a>,
+    patch: Option<Patch<'a>>,
+    added: &[Cp],
+) -> Result<Vec<u8>, String> {
     let pool_count = layout.pool_count as usize + added.len();
     let pool_count =
         u16::try_from(pool_count).map_err(|_| "constant pool has no free entries".to_owned())?;
@@ -526,15 +765,16 @@ fn emit(layout: &Layout<'_>, patch: Option<Patch>, added: &[Cp]) -> Result<Vec<u
         out.extend_from_slice(&attribute_count.to_be_bytes());
         for (attribute_index, attribute) in method.attributes.iter().enumerate() {
             out.extend_from_slice(&attribute.name_index.to_be_bytes());
-            if let (Some(patch), Some(code)) = (patch.as_ref(), attribute.code.as_ref()) {
-                if patch.method == method_index && patch.attribute == attribute_index {
-                    let body = encode_code(code, &patch.code, patch.max_stack)?;
-                    let length = u32::try_from(body.len())
-                        .map_err(|_| "Code attribute is longer than 4 GiB".to_owned())?;
-                    out.extend_from_slice(&length.to_be_bytes());
-                    out.extend_from_slice(&body);
-                    continue;
-                }
+            if let Some(patch) = patch.as_ref()
+                && patch.method == method_index
+                && patch.attribute == attribute_index
+            {
+                let body = encode_code(&patch.code)?;
+                let length = u32::try_from(body.len())
+                    .map_err(|_| "Code attribute is longer than 4 GiB".to_owned())?;
+                out.extend_from_slice(&length.to_be_bytes());
+                out.extend_from_slice(&body);
+                continue;
             }
             let length = u32::try_from(attribute.body.len())
                 .map_err(|_| "attribute is longer than 4 GiB".to_owned())?;
@@ -547,23 +787,159 @@ fn emit(layout: &Layout<'_>, patch: Option<Patch>, added: &[Cp]) -> Result<Vec<u
     Ok(out)
 }
 
-fn encode_code(code: &CodeLayout<'_>, woven: &[u8], max_stack: u16) -> Result<Vec<u8>, String> {
-    if woven.len() > MAX_CODE_LENGTH {
+fn encode_code(patch: &CodePatch<'_>) -> Result<Vec<u8>, String> {
+    if patch.code.len() > MAX_CODE_LENGTH {
         return Err(format!(
             "method code is longer than the class-file limit of {MAX_CODE_LENGTH} bytes"
         ));
     }
-    let length =
-        u32::try_from(woven.len()).map_err(|_| "method code is longer than 4 GiB".to_owned())?;
-    let mut body =
-        Vec::with_capacity(woven.len() + code.exception_table.len() + code.attributes.len() + 12);
-    body.extend_from_slice(&max_stack.to_be_bytes());
-    body.extend_from_slice(&code.max_locals.to_be_bytes());
+    let length = u32::try_from(patch.code.len())
+        .map_err(|_| "method code is longer than 4 GiB".to_owned())?;
+    let mut body = Vec::with_capacity(patch.code.len() + patch.exception_table.len() * 8 + 64);
+    body.extend_from_slice(&patch.max_stack.to_be_bytes());
+    body.extend_from_slice(&patch.max_locals.to_be_bytes());
     body.extend_from_slice(&length.to_be_bytes());
-    body.extend_from_slice(woven);
-    body.extend_from_slice(code.exception_table);
-    body.extend_from_slice(code.attributes);
+    body.extend_from_slice(&patch.code);
+    let handlers = u16::try_from(patch.exception_table.len())
+        .map_err(|_| "exception table has too many entries".to_owned())?;
+    body.extend_from_slice(&handlers.to_be_bytes());
+    for handler in &patch.exception_table {
+        body.extend_from_slice(&handler.start_pc.to_be_bytes());
+        body.extend_from_slice(&handler.end_pc.to_be_bytes());
+        body.extend_from_slice(&handler.handler_pc.to_be_bytes());
+        body.extend_from_slice(&handler.catch_type.to_be_bytes());
+    }
+    let attributes = u16::try_from(patch.attributes.len())
+        .map_err(|_| "Code attribute has too many attributes".to_owned())?;
+    body.extend_from_slice(&attributes.to_be_bytes());
+    for attribute in &patch.attributes {
+        body.extend_from_slice(&attribute.name_index().to_be_bytes());
+        let encoded = encode_code_attribute(attribute)?;
+        let length = u32::try_from(encoded.len())
+            .map_err(|_| "Code attribute is longer than 4 GiB".to_owned())?;
+        body.extend_from_slice(&length.to_be_bytes());
+        body.extend_from_slice(&encoded);
+    }
     Ok(body)
+}
+
+fn encode_code_attribute(attribute: &CodeAttribute<'_>) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    match attribute {
+        CodeAttribute::Raw { body, .. } => out.extend_from_slice(body),
+        CodeAttribute::LineNumbers { lines, .. } => {
+            let count = u16::try_from(lines.len())
+                .map_err(|_| "LineNumberTable has too many entries".to_owned())?;
+            out.extend_from_slice(&count.to_be_bytes());
+            for line in lines {
+                out.extend_from_slice(&line.start_pc.to_be_bytes());
+                out.extend_from_slice(&line.line_number.to_be_bytes());
+            }
+        }
+        CodeAttribute::LocalVariables { entries, .. } => {
+            let count = u16::try_from(entries.len())
+                .map_err(|_| "local-variable table has too many entries".to_owned())?;
+            out.extend_from_slice(&count.to_be_bytes());
+            for entry in entries {
+                out.extend_from_slice(&entry.start_pc.to_be_bytes());
+                out.extend_from_slice(&entry.length.to_be_bytes());
+                out.extend_from_slice(&entry.name_index.to_be_bytes());
+                out.extend_from_slice(&entry.descriptor_index.to_be_bytes());
+                out.extend_from_slice(&entry.index.to_be_bytes());
+            }
+        }
+        CodeAttribute::StackMap { frames, .. } => encode_frames(&mut out, frames)?,
+    }
+    Ok(out)
+}
+
+fn encode_frames(out: &mut Vec<u8>, frames: &[StackMapFrame]) -> Result<(), String> {
+    let count =
+        u16::try_from(frames.len()).map_err(|_| "StackMapTable has too many frames".to_owned())?;
+    out.extend_from_slice(&count.to_be_bytes());
+    let mut previous: Option<usize> = None;
+    for frame in frames {
+        let delta = match previous {
+            None => frame.offset,
+            Some(previous) => frame
+                .offset
+                .checked_sub(previous + 1)
+                .ok_or_else(|| "stack-map frames are out of order".to_owned())?,
+        };
+        let delta = u16::try_from(delta).map_err(|_| {
+            format!(
+                "a stack-map frame would move past the class-file offset limit of {MAX_CODE_LENGTH}"
+            )
+        })?;
+        previous = Some(frame.offset);
+        match frame.frame_type {
+            0..=63 => {
+                if delta <= 63 {
+                    out.push(delta as u8);
+                } else {
+                    out.push(251); // same_frame_extended
+                    out.extend_from_slice(&delta.to_be_bytes());
+                }
+            }
+            64..=127 => {
+                if delta <= 63 {
+                    out.push(64 + delta as u8);
+                } else {
+                    out.push(247); // same_locals_1_stack_item_frame_extended
+                    out.extend_from_slice(&delta.to_be_bytes());
+                }
+                encode_verifications(out, &frame.stack);
+            }
+            247 => {
+                out.push(247);
+                out.extend_from_slice(&delta.to_be_bytes());
+                encode_verifications(out, &frame.stack);
+            }
+            248..=251 => {
+                out.push(frame.frame_type);
+                out.extend_from_slice(&delta.to_be_bytes());
+            }
+            252..=254 => {
+                out.push(frame.frame_type);
+                out.extend_from_slice(&delta.to_be_bytes());
+                encode_verifications(out, &frame.locals);
+            }
+            255 => {
+                out.push(255);
+                out.extend_from_slice(&delta.to_be_bytes());
+                let locals = u16::try_from(frame.locals.len())
+                    .map_err(|_| "stack-map frame has too many locals".to_owned())?;
+                out.extend_from_slice(&locals.to_be_bytes());
+                encode_verifications(out, &frame.locals);
+                let stack = u16::try_from(frame.stack.len())
+                    .map_err(|_| "stack-map frame has too many stack items".to_owned())?;
+                out.extend_from_slice(&stack.to_be_bytes());
+                encode_verifications(out, &frame.stack);
+            }
+            other => {
+                return Err(format!(
+                    "stack-map frame type {other} is reserved; the bounded weaver cannot re-encode it"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_verifications(out: &mut Vec<u8>, types: &[VerificationType]) {
+    for verification in types {
+        match verification {
+            VerificationType::Simple(tag) => out.push(*tag),
+            VerificationType::Object(index) => {
+                out.push(7);
+                out.extend_from_slice(&index.to_be_bytes());
+            }
+            VerificationType::Uninitialized(offset) => {
+                out.push(8);
+                out.extend_from_slice(&offset.to_be_bytes());
+            }
+        }
+    }
 }
 
 /// Re-encode a class file from its parsed bytes.
@@ -629,13 +1005,21 @@ fn opcode_name(opcode: u8) -> &'static str {
     }
 }
 
-/// Whether an opcode changes control flow, so a plain byte insert cannot keep
-/// its targets or frames valid.
-fn is_control_flow(opcode: u8) -> bool {
-    matches!(
-        opcode,
-        0x99..=0xa8 | 0xa9..=0xab | 0xc4 | 0xc6..=0xc9
-    )
+/// A branch instruction that names a bytecode offset, and therefore has to be
+/// rewritten when an insert moves the code after it.
+struct BranchSite {
+    /// Offset of the opcode in the original code.
+    at: usize,
+    /// Whether the offset field is 32 bits (`goto_w`/`jsr_w`).
+    wide: bool,
+    /// Absolute target offset in the original code.
+    target: usize,
+}
+
+/// One pass over a method's code: its branches and its return instructions.
+struct CodeScan {
+    branches: Vec<BranchSite>,
+    returns: Vec<usize>,
 }
 
 /// The byte size of one fixed-length instruction, or `None` for an unknown or
@@ -671,66 +1055,366 @@ fn instruction_size(opcode: u8) -> Option<usize> {
     })
 }
 
-/// Reject every opcode whose control flow a plain insert cannot preserve.
-fn scan_straight_line(label: &str, code: &[u8]) -> Result<(), String> {
+/// Walk a method's code, rejecting the opcodes whose size a plain insert cannot
+/// keep valid, and recording every branch target and return offset.
+///
+/// `tableswitch`/`lookupswitch` are rejected because their alignment padding
+/// depends on the instruction's own offset, so relocating them needs a second
+/// pass over the rewritten buffer; `wide` is rejected because the weaver never
+/// grows a local-slot operand and a 16-bit slot would need one.
+fn scan_code(label: &str, code: &[u8]) -> Result<CodeScan, String> {
+    let mut scan = CodeScan {
+        branches: Vec::new(),
+        returns: Vec::new(),
+    };
     let mut at = 0usize;
     while at < code.len() {
         let opcode = code[at];
-        if is_control_flow(opcode) {
-            return Err(format!(
-                "{label} contains {} at offset {at}; the bounded weaver needs a straight-line method (no branches, switches, jsr/ret or wide)",
-                opcode_name(opcode)
-            ));
+        match opcode {
+            0xaa | 0xab => {
+                return Err(format!(
+                    "{label} contains {} at offset {at}; the bounded weaver rejects switches because their alignment padding makes relocation iterative",
+                    opcode_name(opcode)
+                ));
+            }
+            0xc4 => {
+                return Err(format!(
+                    "{label} contains wide at offset {at}; the bounded weaver does not rewrite local-variable operands"
+                ));
+            }
+            _ => {}
         }
         let size = instruction_size(opcode).ok_or_else(|| {
             format!("{label} uses unknown or reserved opcode 0x{opcode:02x} at offset {at}")
         })?;
-        at = at
+        let end = at
             .checked_add(size)
             .ok_or_else(|| "code offset overflow".to_owned())?;
-        if at > code.len() {
+        if end > code.len() {
             return Err(format!(
-                "{label} has a truncated instruction at offset {}",
-                at - size
+                "{label} has a truncated instruction at offset {at}"
             ));
         }
+        if matches!(opcode, 0xac..=0xb1) {
+            scan.returns.push(at);
+        }
+        if let Some((wide, target)) = branch_target(opcode, code, at)? {
+            scan.branches.push(BranchSite { at, wide, target });
+        }
+        at = end;
     }
-    Ok(())
+    Ok(scan)
 }
 
-/// Offsets of every return-family instruction in a straight-line method.
-fn return_offsets(code: &[u8]) -> Vec<usize> {
-    let mut offsets = Vec::new();
+/// The signed relative offset of one branch instruction, or `None` when the
+/// opcode has no bytecode offset operand.
+fn branch_target(opcode: u8, code: &[u8], at: usize) -> Result<Option<(bool, usize)>, String> {
+    let wide = match opcode {
+        0x99..=0xa8 | 0xc6 | 0xc7 => false,
+        0xc8 | 0xc9 => true,
+        _ => return Ok(None),
+    };
+    let field = at + 1;
+    let relative = if wide {
+        let bytes = code
+            .get(field..field + 4)
+            .ok_or_else(|| format!("branch at offset {at} is truncated"))?;
+        i64::from(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    } else {
+        let bytes = code
+            .get(field..field + 2)
+            .ok_or_else(|| format!("branch at offset {at} is truncated"))?;
+        i64::from(i16::from_be_bytes([bytes[0], bytes[1]]))
+    };
+    let target = at as i64 + relative;
+    if target < 0 || target as usize >= code.len() {
+        return Err(format!(
+            "{} at offset {at} jumps to {target}, which is outside the {}-byte code",
+            opcode_name(opcode),
+            code.len()
+        ));
+    }
+    Ok(Some((wide, target as usize)))
+}
+
+/// Shift an original code offset by every insert that lands at or before it.
+///
+/// `inclusive` selects the two cases a rewrite distinguishes.  With `true` the
+/// result is where the original byte at `offset` now sits: an insert exactly at
+/// that offset goes *before* it, which is what an instruction, a branch target,
+/// an exception handler, a stack-map frame, an `uninitialized` offset and a
+/// debug-table start all name.  With `false` the result is the start of the
+/// inserted block at `offset`, which is where an exclusive range end belongs so
+/// the inserted bytes stay outside the range.
+fn shift_offset(
+    label: &str,
+    insertions: &[(usize, usize)],
+    offset: usize,
+    inclusive: bool,
+) -> Result<usize, String> {
+    let mut shifted = offset;
+    for (at, length) in insertions {
+        if *at < offset || (inclusive && *at == offset) {
+            shifted = shifted
+                .checked_add(*length)
+                .ok_or_else(|| format!("{label}: code offset overflow"))?;
+        }
+    }
+    Ok(shifted)
+}
+
+/// Where the original byte at `offset` now sits.
+fn shifted_position(
+    label: &str,
+    insertions: &[(usize, usize)],
+    offset: usize,
+) -> Result<usize, String> {
+    shift_offset(label, insertions, offset, true)
+}
+
+/// The start of the inserted block at `offset`, i.e. the position an exclusive
+/// range end keeps the inserted bytes outside of.
+fn shifted_boundary(
+    label: &str,
+    insertions: &[(usize, usize)],
+    offset: usize,
+) -> Result<usize, String> {
+    shift_offset(label, insertions, offset, false)
+}
+
+fn shifted_u2(label: &str, value: usize, what: &str) -> Result<u16, String> {
+    u16::try_from(value).map_err(|_| format!("{label}: {what} moves past the 65535-byte limit"))
+}
+
+/// Splice `bytes` in at every `(offset, len)` site.
+fn splice(
+    label: &str,
+    code: &[u8],
+    insertions: &[(usize, usize)],
+    bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    let extra = insertions
+        .len()
+        .checked_mul(bytes.len())
+        .ok_or_else(|| format!("{label}: woven code length overflow"))?;
+    let mut out = Vec::with_capacity(code.len() + extra);
     let mut at = 0usize;
-    while at < code.len() {
-        let Some(size) = instruction_size(code[at]) else {
-            break;
-        };
-        if matches!(code[at], 0xac..=0xb1) {
-            offsets.push(at);
+    for (offset, length) in insertions {
+        if *length != bytes.len() || *offset < at || *offset > code.len() {
+            return Err(format!("{label}: inconsistent insert sites"));
         }
-        at += size;
+        out.extend_from_slice(&code[at..*offset]);
+        out.extend_from_slice(bytes);
+        at = *offset;
     }
-    offsets
+    out.extend_from_slice(&code[at..]);
+    Ok(out)
 }
 
-/// Reject a `StackMapTable`, which would describe the code before the insert.
-fn reject_frames(layout: &Layout<'_>, label: &str, code: &CodeLayout<'_>) -> Result<(), String> {
-    let mut attributes = Bytes::new(code.attributes);
-    let count = attributes
-        .u2()
-        .map_err(|_| format!("{label} has a truncated Code attribute"))?;
-    for _ in 0..count {
-        let name_index = attributes.u2()?;
-        let length = attributes.u4()? as usize;
-        attributes.skip(length)?;
-        if layout.utf8(name_index) == Some("StackMapTable") {
-            return Err(format!(
-                "{label} carries a StackMapTable; the bounded weaver does not rewrite stack-map frames"
-            ));
+/// Rewrite one method's code around a set of same-size inserts.
+///
+/// Every structure that names a bytecode offset is shifted by the insert delta
+/// that applies at that offset: branch offsets, `goto_w`/`jsr_w`, exception
+/// table ranges, `LineNumberTable`/`LocalVariableTable`/`LocalVariableTypeTable`
+/// `start_pc`, `StackMapTable` frame deltas and `uninitialized` offsets.
+fn relocate<'a>(
+    label: &str,
+    code: &CodeLayout<'a>,
+    scan: &CodeScan,
+    insertions: &[(usize, usize)],
+    bytes: &[u8],
+    max_stack: u16,
+    max_locals: u16,
+) -> Result<CodePatch<'a>, String> {
+    let mut woven = splice(label, code.code, insertions, bytes)?;
+    for branch in &scan.branches {
+        let opcode_at = shifted_position(label, insertions, branch.at)?;
+        let target = shifted_position(label, insertions, branch.target)?;
+        let field = opcode_at + 1;
+        // JVM branch offsets are relative to the address of the branch opcode,
+        // not to the end of the instruction.
+        if branch.wide {
+            let delta = target as i64 - opcode_at as i64;
+            let delta = i32::try_from(delta).map_err(|_| {
+                format!(
+                    "{label}: relocating the branch at offset {} would exceed the 32-bit branch range",
+                    branch.at
+                )
+            })?;
+            woven[field..field + 4].copy_from_slice(&delta.to_be_bytes());
+        } else {
+            let delta = target as i64 - opcode_at as i64;
+            let delta = i16::try_from(delta).map_err(|_| {
+                format!(
+                    "{label}: relocating the branch at offset {} would exceed the 16-bit branch range and the weaver does not emit goto_w",
+                    branch.at
+                )
+            })?;
+            woven[field..field + 2].copy_from_slice(&delta.to_be_bytes());
         }
     }
-    Ok(())
+
+    let mut exception_table = Vec::with_capacity(code.exception_table.len());
+    for handler in &code.exception_table {
+        // The range keeps the original instructions: an insert exactly at the
+        // start lands before it, an insert exactly at the exclusive end lands
+        // after it, so the callback is never caught by the target's own handler.
+        let (start, end) = if handler.start_pc == handler.end_pc {
+            (
+                shifted_boundary(label, insertions, handler.start_pc as usize)?,
+                shifted_boundary(label, insertions, handler.end_pc as usize)?,
+            )
+        } else {
+            (
+                shifted_position(label, insertions, handler.start_pc as usize)?,
+                shifted_boundary(label, insertions, handler.end_pc as usize)?,
+            )
+        };
+        let handler_pc = shifted_position(label, insertions, handler.handler_pc as usize)?;
+        if start > end || handler_pc >= woven.len() {
+            return Err(format!(
+                "{label}: relocating the exception table produced an invalid range"
+            ));
+        }
+        exception_table.push(ExceptionHandler {
+            start_pc: shifted_u2(label, start, "an exception range")?,
+            end_pc: shifted_u2(label, end, "an exception range")?,
+            handler_pc: shifted_u2(label, handler_pc, "an exception handler")?,
+            catch_type: handler.catch_type,
+        });
+    }
+
+    let attributes = code
+        .attributes
+        .iter()
+        .map(|attribute| relocate_attribute(label, attribute, insertions))
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(CodePatch {
+        code: woven,
+        max_stack,
+        max_locals,
+        exception_table,
+        attributes,
+    })
+}
+
+fn relocate_attribute<'a>(
+    label: &str,
+    attribute: &CodeAttribute<'a>,
+    insertions: &[(usize, usize)],
+) -> Result<CodeAttribute<'a>, String> {
+    Ok(match attribute {
+        CodeAttribute::Raw { name_index, body } => CodeAttribute::Raw {
+            name_index: *name_index,
+            body,
+        },
+        CodeAttribute::LineNumbers { name_index, lines } => CodeAttribute::LineNumbers {
+            name_index: *name_index,
+            lines: lines
+                .iter()
+                .map(|line| {
+                    Ok(LineNumber {
+                        start_pc: shifted_u2(
+                            label,
+                            shifted_position(label, insertions, line.start_pc as usize)?,
+                            "a line number",
+                        )?,
+                        line_number: line.line_number,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        },
+        CodeAttribute::LocalVariables {
+            name_index,
+            entries,
+        } => CodeAttribute::LocalVariables {
+            name_index: *name_index,
+            entries: entries
+                .iter()
+                .map(|entry| relocate_local(label, entry, insertions))
+                .collect::<Result<Vec<_>, String>>()?,
+        },
+        CodeAttribute::StackMap { name_index, frames } => CodeAttribute::StackMap {
+            name_index: *name_index,
+            frames: relocate_frames(label, frames, insertions)?,
+        },
+    })
+}
+
+fn relocate_local(
+    label: &str,
+    entry: &LocalVariable,
+    insertions: &[(usize, usize)],
+) -> Result<LocalVariable, String> {
+    let start = shifted_position(label, insertions, entry.start_pc as usize)?;
+    let end = shifted_boundary(
+        label,
+        insertions,
+        entry.start_pc as usize + entry.length as usize,
+    )?;
+    if end < start {
+        return Err(format!(
+            "{label}: relocating a local-variable range produced an invalid range"
+        ));
+    }
+    Ok(LocalVariable {
+        start_pc: shifted_u2(label, start, "a local-variable range")?,
+        length: shifted_u2(label, end - start, "a local-variable range")?,
+        name_index: entry.name_index,
+        descriptor_index: entry.descriptor_index,
+        index: entry.index,
+    })
+}
+
+fn relocate_frames(
+    label: &str,
+    frames: &[StackMapFrame],
+    insertions: &[(usize, usize)],
+) -> Result<Vec<StackMapFrame>, String> {
+    let mut out = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let offset = shifted_position(label, insertions, frame.offset)?;
+        if let Some(previous) = out.last() {
+            let previous: &StackMapFrame = previous;
+            if offset <= previous.offset {
+                return Err(format!(
+                    "{label}: relocating stack-map frames produced a duplicate"
+                ));
+            }
+        }
+        out.push(StackMapFrame {
+            frame_type: frame.frame_type,
+            offset,
+            locals: frame
+                .locals
+                .iter()
+                .map(|verification| relocate_verification(label, verification, insertions))
+                .collect::<Result<Vec<_>, String>>()?,
+            stack: frame
+                .stack
+                .iter()
+                .map(|verification| relocate_verification(label, verification, insertions))
+                .collect::<Result<Vec<_>, String>>()?,
+        });
+    }
+    Ok(out)
+}
+
+fn relocate_verification(
+    label: &str,
+    verification: &VerificationType,
+    insertions: &[(usize, usize)],
+) -> Result<VerificationType, String> {
+    Ok(match verification {
+        VerificationType::Simple(tag) => VerificationType::Simple(*tag),
+        VerificationType::Object(index) => VerificationType::Object(*index),
+        VerificationType::Uninitialized(offset) => VerificationType::Uninitialized(shifted_u2(
+            label,
+            shifted_position(label, insertions, *offset as usize)?,
+            "an uninitialized offset",
+        )?),
+    })
 }
 
 fn find_target(class_name: &str, layout: &Layout<'_>, target: &MethodRef) -> Result<usize, String> {
@@ -858,7 +1542,7 @@ impl<'a> Target<'a> {
 }
 
 /// Shared validation for every anchor: owner match, condy, the target method,
-/// its `Code` attribute, and the straight-line subset.
+/// its `Code` attribute, and the opcodes no insert can keep valid.
 fn prepare_target<'a>(class: &'a ClassFile, target: &MethodRef) -> Result<Target<'a>, String> {
     if target.owner != class.name {
         return Err(format!(
@@ -910,15 +1594,9 @@ fn prepare_target<'a>(class: &'a ClassFile, target: &MethodRef) -> Result<Target
         .as_ref()
         .ok_or_else(|| "missing Code attribute".to_owned())?;
 
+    // Reject the opcodes no insert can keep valid before any plan runs.
     let label = format!("{}.{name}{descriptor}", class.name);
-    let handlers = u16::from_be_bytes([code.exception_table[0], code.exception_table[1]]);
-    if handlers != 0 {
-        return Err(format!(
-            "{label} declares {handlers} exception handler(s); the bounded weaver needs a method with no exception table"
-        ));
-    }
-    reject_frames(&layout, &label, code)?;
-    scan_straight_line(&label, code.code)?;
+    scan_code(&label, code.code)?;
 
     let is_static = method.access & ACC_STATIC != 0;
     Ok(Target {
@@ -932,16 +1610,28 @@ fn prepare_target<'a>(class: &'a ClassFile, target: &MethodRef) -> Result<Target
     })
 }
 
+/// The instruction bytes for one callback call, and the stack/local slots they
+/// need.
+struct CallbackCall {
+    bytes: Vec<u8>,
+    /// Operand-stack slots the loads push at their peak.
+    stack_slots: u16,
+    /// Local slots the target's arguments (and receiver) occupy.
+    local_slots: u16,
+}
+
 /// Emit the loads for one callback and its `invokestatic`.
 ///
-/// Returns the instruction bytes and the number of operand-stack slots they
-/// push at their peak, so the caller can raise `max_stack` conservatively.
+/// `local_slots` is the highest local slot the loads read plus one, so the
+/// caller can raise `max_locals` when the class declares fewer; `stack_slots`
+/// is the number of operand-stack slots they push at their peak, so the caller
+/// can raise `max_stack` conservatively.
 fn callback_call(
     target: &Target<'_>,
     callback: &MethodRef,
     takes_receiver: bool,
     pool: &mut PoolBuilder<'_>,
-) -> Result<(Vec<u8>, u16), String> {
+) -> Result<CallbackCall, String> {
     let label = target.label();
     let arguments = crate::descriptor_arguments(&target.descriptor);
     let mut inserted = Vec::new();
@@ -963,16 +1653,14 @@ fn callback_call(
         slot = slot.checked_add(width).ok_or("local slot overflow")?;
         slots = slots.checked_add(width).ok_or("argument slot overflow")?;
     }
-    let max_locals = target.code()?.max_locals;
-    if slot > max_locals {
-        return Err(format!(
-            "{label} declares max_locals {max_locals} but its arguments occupy {slot} slots"
-        ));
-    }
     let callback_index = pool.method_ref(callback)?;
     inserted.push(0xb8); // invokestatic
     inserted.extend_from_slice(&callback_index.to_be_bytes());
-    Ok((inserted, slots))
+    Ok(CallbackCall {
+        bytes: inserted,
+        stack_slots: slots,
+        local_slots: slot,
+    })
 }
 
 /// Insert a `HEAD` callback at offset 0 of `target`.
@@ -987,10 +1675,13 @@ fn callback_call(
 /// what the inserted `aload_0` supplies; a callback that does not declare it
 /// gets the arguments only, and no receiver is pushed.
 ///
+/// The insert moves every branch target, exception range, stack-map frame and
+/// debug-table offset after it; see [`crate::weaver`] for the rewrite.
+///
 /// Errors name the reason a method is outside the subset instead of guessing:
-/// branches, switches, `jsr`/`ret`, `wide`, an exception table, a
-/// `StackMapTable`, condy, abstract/native methods, a local slot above 255, a
-/// mismatched callback descriptor, or `CallbackInfo` parameters.
+/// switches, `wide`, `ret` outside `jsr`, condy, abstract/native methods, a
+/// local slot above 255, a mismatched callback descriptor, or `CallbackInfo`
+/// parameters.
 pub fn weave_head(
     class: &ClassFile,
     target: &MethodRef,
@@ -1007,29 +1698,36 @@ pub fn weave_head(
     )?;
 
     let mut pool = PoolBuilder::new(&class.pool);
-    let (inserted, argument_slots) = callback_call(&target, callback, takes_receiver, &mut pool)?;
+    let call = callback_call(&target, callback, takes_receiver, &mut pool)?;
     let code = target.code()?;
-
-    let mut woven = inserted;
-    woven.extend_from_slice(code.code);
-    if woven.len() > MAX_CODE_LENGTH {
+    let scan = scan_code(&label, code.code)?;
+    if code.code.len() + call.bytes.len() > MAX_CODE_LENGTH {
         return Err(format!(
             "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
         ));
     }
     let max_stack = u32::from(code.max_stack)
-        .checked_add(u32::from(argument_slots))
+        .checked_add(u32::from(call.stack_slots))
         .and_then(|value| value.checked_add(1))
         .and_then(|value| u16::try_from(value).ok())
         .ok_or_else(|| format!("{label}: woven max_stack overflows u16"))?;
+    let max_locals = code.max_locals.max(call.local_slots);
+    let patch = relocate(
+        &label,
+        code,
+        &scan,
+        &[(0, call.bytes.len())],
+        &call.bytes,
+        max_stack,
+        max_locals,
+    )?;
 
     emit(
         &target.layout,
         Some(Patch {
             method: target.method_index,
             attribute: target.attribute_index,
-            code: woven,
-            max_stack,
+            code: patch,
         }),
         &pool.added,
     )
@@ -1040,7 +1738,7 @@ pub fn weave_head(
 ///
 /// [`ReturnMode::Return`] inserts before every return-family instruction in
 /// the method; [`ReturnMode::Tail`] inserts before the last one only, matching
-/// Mixin's `RETURN` and `TAIL` anchors in a method without branches.
+/// Mixin's `RETURN` and `TAIL` anchors.
 ///
 /// Only `void` targets are woven.  A non-void target would need a
 /// `CallbackInfoReturnable` carrying the target's boxed result, which needs
@@ -1050,10 +1748,11 @@ pub fn weave_head(
 /// The callback is invoked with `invokestatic`.  A callback takes the target's
 /// arguments in order and returns `void`.  An instance target's callback may
 /// take the target instance first, which the inserted `aload_0` supplies.
-/// Every other rejection matches [`weave_head`]: branches, switches,
-/// `jsr`/`ret`, `wide`, an exception table, a `StackMapTable`, condy,
-/// abstract/native methods, a local slot above 255, a mismatched callback
-/// descriptor, or `CallbackInfo`/`CallbackInfoReturnable` parameters.
+/// Each insert relocates the offsets after it exactly as [`weave_head`] does,
+/// so a branchy method, a loop and an exception handler keep their targets and
+/// frames.  Every other rejection matches [`weave_head`]: switches, `wide`,
+/// condy, abstract/native methods, a local slot above 255, a mismatched
+/// callback descriptor, or `CallbackInfo`/`CallbackInfoReturnable` parameters.
 pub fn weave_return(
     class: &ClassFile,
     target: &MethodRef,
@@ -1077,44 +1776,49 @@ pub fn weave_return(
     )?;
 
     let code = target.code()?;
-    let returns = return_offsets(code.code);
+    let scan = scan_code(&label, code.code)?;
     let sites: Vec<usize> = match mode {
-        ReturnMode::Return => returns,
-        ReturnMode::Tail => returns.last().copied().into_iter().collect(),
+        ReturnMode::Return => scan.returns.clone(),
+        ReturnMode::Tail => scan.returns.last().copied().into_iter().collect(),
     };
     if sites.is_empty() {
         return Err(format!(
-            "{label}: {anchor} weaving found no return instruction in a straight-line method"
+            "{label}: {anchor} weaving found no return instruction"
         ));
     }
 
     let mut pool = PoolBuilder::new(&class.pool);
-    let (call, argument_slots) = callback_call(&target, callback, takes_receiver, &mut pool)?;
-    let mut woven = Vec::with_capacity(code.code.len() + call.len() * sites.len());
-    let mut at = 0usize;
-    for site in &sites {
-        woven.extend_from_slice(&code.code[at..*site]);
-        woven.extend_from_slice(&call);
-        at = *site;
-    }
-    woven.extend_from_slice(&code.code[at..]);
-    if woven.len() > MAX_CODE_LENGTH {
+    let call = callback_call(&target, callback, takes_receiver, &mut pool)?;
+    if code.code.len() + call.bytes.len() * sites.len() > MAX_CODE_LENGTH {
         return Err(format!(
             "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
         ));
     }
     let max_stack = u32::from(code.max_stack)
-        .checked_add(u32::from(argument_slots))
+        .checked_add(u32::from(call.stack_slots))
         .and_then(|value| u16::try_from(value).ok())
         .ok_or_else(|| format!("{label}: woven max_stack overflows u16"))?;
+    let max_locals = code.max_locals.max(call.local_slots);
+    let insertions = sites
+        .iter()
+        .map(|site| (*site, call.bytes.len()))
+        .collect::<Vec<_>>();
+    let patch = relocate(
+        &label,
+        code,
+        &scan,
+        &insertions,
+        &call.bytes,
+        max_stack,
+        max_locals,
+    )?;
 
     emit(
         &target.layout,
         Some(Patch {
             method: target.method_index,
             attribute: target.attribute_index,
-            code: woven,
-            max_stack,
+            code: patch,
         }),
         &pool.added,
     )
@@ -1190,11 +1894,10 @@ pub fn weave_class(class: &ClassFile, plans: &[MixinInjectionPlan]) -> Result<Ve
 /// instead of skipping them.
 ///
 /// Not supported here, and left on the interpreter path: `RETURN`, `TAIL` and
-/// `INVOKE` anchors; targets with branches or stack-map frames (so no
-/// `RETURN`/`TAIL` rewriting); exception handlers; cancellation; and
-/// `CallbackInfo`/`CallbackInfoReturnable` parameters.  Errors from a matching
-/// plan (ambiguous target descriptor, callback mismatch, unsupported target)
-/// propagate rather than being silently skipped.
+/// `INVOKE` anchors; cancellation; and `CallbackInfo`/`CallbackInfoReturnable`
+/// parameters.  Errors from a matching plan (ambiguous target descriptor,
+/// callback mismatch, a switch/`wide`/condy target) propagate rather than being
+/// silently skipped.
 ///
 /// Every insert lands at offset 0, so when several plans match one method the
 /// last plan applied is the first callback to run.  Callers that need Mixin's
@@ -1327,6 +2030,99 @@ mod tests {
         }
     }
 
+    /// A `demo/T.m(II)I` whose `Code` carries a `LineNumberTable`, a
+    /// `LocalVariableTable` and a one-frame `StackMapTable`:
+    ///
+    /// ```text
+    /// 0: iload_1
+    /// 1: ifne +4      -> 5
+    /// 4: ireturn
+    /// 5: iload_2
+    /// 6: ireturn
+    /// ```
+    ///
+    /// Pool: 1 `demo/T`, 2 Class 1, 3 `java/lang/Object`, 4 Class 3, 5 `m`,
+    /// 6 `(II)I`, 7 `Code`, 8 `LineNumberTable`, 9 `LocalVariableTable`,
+    /// 10 `StackMapTable`.
+    fn frames_fixture() -> Vec<u8> {
+        let mut out = Vec::new();
+        u4(&mut out, 0xCAFE_BABE);
+        u2(&mut out, 0);
+        u2(&mut out, 52);
+        u2(&mut out, 11);
+        utf8(&mut out, "demo/T");
+        out.extend_from_slice(&[7, 0, 1]);
+        utf8(&mut out, "java/lang/Object");
+        out.extend_from_slice(&[7, 0, 3]);
+        utf8(&mut out, "m");
+        utf8(&mut out, "(II)I");
+        utf8(&mut out, "Code");
+        utf8(&mut out, "LineNumberTable");
+        utf8(&mut out, "LocalVariableTable");
+        utf8(&mut out, "StackMapTable");
+        u2(&mut out, 0x0021); // access
+        u2(&mut out, 2); // this
+        u2(&mut out, 4); // super
+        u2(&mut out, 0); // interfaces
+        u2(&mut out, 0); // fields
+        u2(&mut out, 1); // methods
+        u2(&mut out, 0x0001); // public
+        u2(&mut out, 5);
+        u2(&mut out, 6);
+        u2(&mut out, 1); // attributes
+        u2(&mut out, 7);
+
+        let mut code_attributes = Vec::new();
+        // LineNumberTable: (0, 1) and (5, 2).
+        u2(&mut code_attributes, 8);
+        let mut attribute = Vec::new();
+        u2(&mut attribute, 2);
+        for (start_pc, line) in [(0u16, 1u16), (5, 2)] {
+            u2(&mut attribute, start_pc);
+            u2(&mut attribute, line);
+        }
+        u4(&mut code_attributes, attribute.len() as u32);
+        code_attributes.extend_from_slice(&attribute);
+        // LocalVariableTable: slot 1 over [0, 7).
+        u2(&mut code_attributes, 9);
+        let mut attribute = Vec::new();
+        u2(&mut attribute, 1);
+        u2(&mut attribute, 0); // start_pc
+        u2(&mut attribute, 7); // length
+        u2(&mut attribute, 5); // name
+        u2(&mut attribute, 6); // descriptor
+        u2(&mut attribute, 1); // slot
+        u4(&mut code_attributes, attribute.len() as u32);
+        code_attributes.extend_from_slice(&attribute);
+        // StackMapTable: one full frame at offset 5.
+        u2(&mut code_attributes, 10);
+        let mut attribute = Vec::new();
+        u2(&mut attribute, 1);
+        attribute.push(255);
+        u2(&mut attribute, 5); // offset_delta
+        u2(&mut attribute, 3); // locals
+        attribute.push(7);
+        u2(&mut attribute, 2); // demo/T
+        attribute.push(1); // Integer
+        attribute.push(1); // Integer
+        u2(&mut attribute, 0); // stack
+        u4(&mut code_attributes, attribute.len() as u32);
+        code_attributes.extend_from_slice(&attribute);
+
+        let mut body = Vec::new();
+        u2(&mut body, 1); // max_stack
+        u2(&mut body, 3); // max_locals
+        u4(&mut body, 7);
+        body.extend_from_slice(&[0x1b, 0x9a, 0x00, 0x04, 0xac, 0x1c, 0xac]);
+        u2(&mut body, 0); // exception table
+        u2(&mut body, 3); // Code attributes
+        body.extend_from_slice(&code_attributes);
+        u4(&mut out, body.len() as u32);
+        out.extend_from_slice(&body);
+        u2(&mut out, 0); // class attributes
+        out
+    }
+
     fn target() -> MethodRef {
         MethodRef {
             owner: "demo/T".into(),
@@ -1437,24 +2233,144 @@ mod tests {
         assert!(error.contains("CallbackInfo"), "{error}");
     }
 
+    /// Parse `Code` out of a woven class so the assertions read the written
+    /// bytes, not the in-memory patch.
+    fn woven_code(woven: &[u8], name: &str, descriptor: &str) -> (Vec<u8>, u16, u16) {
+        let class = ClassFile::parse(woven).unwrap();
+        assert_eq!(class.write().unwrap(), woven, "woven class round-trips");
+        let method = class.method(name, descriptor).unwrap();
+        (
+            method.code.clone().unwrap(),
+            method.max_stack,
+            method.max_locals,
+        )
+    }
+
     #[test]
-    fn head_rejects_a_branch() {
+    fn head_relocates_a_branch_target() {
+        // `ifne +3; return` — the branch jumps over the return to offset 3.
         let bytes = fixture(0x0001, "(I)I", 2, &[0x99, 0x00, 0x03, 0xb1], &[]);
         let class = ClassFile::parse(&bytes).unwrap();
         let branchy = MethodRef {
             descriptor: "(I)I".into(),
             ..target()
         };
-        let error = weave_head(&class, &branchy, &callback("(Ldemo/T;I)V")).unwrap_err();
-        assert!(error.contains("ifeq"), "{error}");
+        let woven = weave_head(&class, &branchy, &callback("(Ldemo/T;I)V")).unwrap();
+        let (code, max_stack, max_locals) = woven_code(&woven, "m", "(I)I");
+        // aload_0 (1) + iload_1 (2) + invokestatic (3) = 6 bytes.
+        assert_eq!(&code[..6], &[0x2a, 0x15, 0x01, 0xb8, 0x00, 0x0d]);
+        assert_eq!(code[6], 0x99);
+        // The return moved to 9, and the branch now sits at 6.  JVM offsets are
+        // relative to the opcode, so the operand is 9 - 6 = 3.
+        assert_eq!(i16::from_be_bytes([code[7], code[8]]), 3);
+        assert_eq!(code[9], 0xb1);
+        assert_eq!(max_stack, 2 + 2 + 1);
+        assert_eq!(max_locals, 2);
     }
 
     #[test]
-    fn head_rejects_an_exception_table() {
-        let handler = [0u8; 8];
-        let bytes = fixture(0x0001, "(II)I", 3, &[0xac], &handler);
+    fn head_relocates_an_exception_table() {
+        // `ifne +4; return; ireturn` with a handler covering [3, 5) that starts
+        // at offset 4, so every column has to move by the insert.
+        let mut handler = Vec::new();
+        u2(&mut handler, 3); // start_pc
+        u2(&mut handler, 5); // end_pc
+        u2(&mut handler, 4); // handler_pc
+        u2(&mut handler, 0); // catch_type: catch-all
+        let bytes = fixture(
+            0x0001,
+            "(II)I",
+            3,
+            &[0x99, 0x00, 0x04, 0xb1, 0xac],
+            &handler,
+        );
+        let class = ClassFile::parse(&bytes).unwrap();
+        let woven = weave_head(&class, &target(), &callback("(Ldemo/T;II)V")).unwrap();
+        let (code, _, _) = woven_code(&woven, "m", "(II)I");
+        // aload_0 + iload_1 + iload_2 + invokestatic = 8 bytes.
+        assert_eq!(code.len(), 5 + 8);
+        // The table sits between the code and the two (empty) attribute counts.
+        let table = &woven[woven.len() - 12..woven.len() - 4];
+        assert_eq!(
+            table,
+            &[
+                0, 11, // start_pc: 3 + 8
+                0, 13, // end_pc: 5 + 8
+                0, 12, // handler_pc: 4 + 8
+                0, 0, // catch-all
+            ]
+        );
+    }
+
+    #[test]
+    fn head_relocates_debug_tables_and_frames() {
+        let bytes = frames_fixture();
+        let class = ClassFile::parse(&bytes).unwrap();
+        let woven = weave_head(&class, &target(), &callback("(Ldemo/T;II)V")).unwrap();
+        let (_, _, _) = woven_code(&woven, "m", "(II)I");
+        let layout = Layout::parse(&woven).unwrap();
+        let method = &layout.methods[0];
+        let code = method.attributes[0].code.as_ref().unwrap();
+        let mut frame_lines = Vec::new();
+        for attribute in &code.attributes {
+            match attribute {
+                CodeAttribute::LineNumbers { lines, .. } => {
+                    for line in lines {
+                        frame_lines.push(("line", line.start_pc));
+                    }
+                }
+                CodeAttribute::LocalVariables { entries, .. } => {
+                    for entry in entries {
+                        frame_lines.push(("local", entry.start_pc));
+                        frame_lines.push(("length", entry.length));
+                    }
+                }
+                CodeAttribute::StackMap { frames, .. } => {
+                    for frame in frames {
+                        frame_lines.push(("frame", frame.offset as u16));
+                    }
+                }
+                CodeAttribute::Raw { .. } => {}
+            }
+        }
+        // The fixture inserts 8 bytes at offset 0; every recorded offset moves
+        // with it and the local-variable range keeps its own length.
+        assert_eq!(
+            frame_lines,
+            vec![
+                ("line", 8),
+                ("line", 13),
+                ("local", 8),
+                ("length", 7),
+                ("frame", 13),
+            ]
+        );
+    }
+
+    #[test]
+    fn head_rejects_a_switch() {
+        // `tableswitch`, which the weaver cannot relocate: its padding depends
+        // on the instruction's own offset.
+        let code = [
+            0xaa, 0, 0, 0, // opcode and alignment padding
+            0, 0, 0, 4, // default
+            0, 0, 0, 0, // low
+            0, 0, 0, 0, // high
+            0, 0, 0, 4, // one jump
+        ];
+        let bytes = fixture(0x0001, "(II)I", 3, &code, &[]);
         let class = ClassFile::parse(&bytes).unwrap();
         let error = weave_head(&class, &target(), &callback("(Ldemo/T;II)V")).unwrap_err();
-        assert!(error.contains("exception"), "{error}");
+        assert!(error.contains("tableswitch"), "{error}");
+        assert!(error.contains("iterative"), "{error}");
+    }
+
+    #[test]
+    fn head_rejects_wide() {
+        let code = [0xc4, 0x15, 0x01, 0x00, 0xb1];
+        let bytes = fixture(0x0001, "(II)I", 3, &code, &[]);
+        let class = ClassFile::parse(&bytes).unwrap();
+        let error = weave_head(&class, &target(), &callback("(Ldemo/T;II)V")).unwrap_err();
+        assert!(error.contains("wide"), "{error}");
     }
 }
