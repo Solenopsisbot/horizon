@@ -91,7 +91,7 @@ fn mixin_plan_sort_key(
 /// `callback_descriptor` holds the rest of its signature.
 fn mixin_plan_entries(plans: &[MixinInjectionPlan]) -> Vec<serde_json::Value> {
     let mut plans = plans.to_vec();
-    plans.sort_by(|a, b| mixin_plan_sort_key(a).cmp(&mixin_plan_sort_key(b)));
+    plans.sort_by_key(mixin_plan_sort_key);
     plans.dedup();
     plans
         .iter()
