@@ -623,6 +623,7 @@ pub(super) fn run_java_mods_with_report(
         }
     };
     let mut native_content = Vec::new();
+    let mut payload_declarations = Vec::new();
     for path in paths {
         let jar = horizon_native_java::NativeJar::from_path(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
@@ -688,6 +689,21 @@ pub(super) fn run_java_mods_with_report(
                     format!("{} ({kind}, {}): {error}", path.display(), entry.class)
                 })?;
             calls += report.calls;
+        }
+        for (id, direction, codec) in host.payload_channels() {
+            match horizon_mods::payloads::PayloadDirection::parse(&direction) {
+                Ok(direction) => {
+                    payload_declarations.push(horizon_mods::payloads::PayloadDeclaration {
+                        id,
+                        direction,
+                        codec,
+                    })
+                }
+                Err(error) => log::warn!(
+                    "Horizon: native Java {} payload channel {id} was skipped: {error}",
+                    path.display()
+                ),
+            }
         }
         let listeners = host.listener_registrations().count();
         log::info!(
@@ -772,6 +788,9 @@ pub(super) fn run_java_mods_with_report(
         log::info!("{line}");
     }
     log::info!("{}", aggregate_line(&reports, &summary));
+    if let Err(error) = horizon_client::lan::payloads::store_declared(payload_declarations) {
+        log::warn!("Horizon: Java payload channels were not registered: {error}");
+    }
     Ok((native_content, reports))
 }
 

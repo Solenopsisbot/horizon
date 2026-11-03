@@ -1110,6 +1110,27 @@ impl StdHost {
         &self.payload_registrations
     }
 
+    /// The registered payload channels as `(id, direction, codec)` for the
+    /// game's transport: the `CustomPacketPayload.Type` marker resolves to the
+    /// identifier it was built with, and a `codec/...` marker names the codec.
+    pub fn payload_channels(&self) -> Vec<(String, String, Option<String>)> {
+        self.payload_registrations
+            .iter()
+            .filter_map(|registration| {
+                let marker = match &registration.payload_type {
+                    Value::Ref(Some(marker)) => marker,
+                    _ => return None,
+                };
+                let id = self.packet_types.get(marker)?.clone();
+                let codec = match &registration.codec {
+                    Value::Ref(Some(codec)) => codec.strip_prefix("codec/").map(str::to_owned),
+                    _ => None,
+                };
+                Some((id, registration.direction.clone(), codec))
+            })
+            .collect()
+    }
+
     /// Add one bounded Fabric entrypoint container to the loader view.
     /// Duplicate `(kind, class, provider)` rows are ignored to keep discovery
     /// deterministic when a launcher seeds the same jar more than once.
