@@ -4,8 +4,10 @@
 //! an opaque marker: its `payload_type` is a value, not an id. A loader
 //! adapter resolves it to a namespaced [`PayloadDeclaration`]; this module
 //! carries those declarations and the length-prefixed [`PayloadFrame`] once a
-//! payload has bytes. Channel ownership, ordering and sending stay with the
-//! game's transport.
+//! payload has bytes. A frame's bytes decode to a bounded [`PayloadValue`], so
+//! a handler receives bytes, text, empty or a bounded marker rather than an
+//! opaque blob. Channel ownership, ordering and sending stay with the game's
+//! transport.
 
 use std::collections::BTreeMap;
 
@@ -145,6 +147,109 @@ impl PayloadCodec {
             Self::Empty => Ok(()),
         }
     }
+
+    /// Decode a frame's bytes into the value this codec models, inside the same
+    /// payload bound [`PayloadFrame`] enforces.
+    pub fn decode(self, bytes: &[u8]) -> Result<PayloadValue, String> {
+        check_payload_len(bytes)?;
+        match self {
+            Self::Raw => Ok(PayloadValue::Bytes(bytes.to_vec())),
+            Self::Utf8 => std::str::from_utf8(bytes)
+                .map(|text| PayloadValue::Text(text.to_owned()))
+                .map_err(|error| {
+                    format!("payload codec minecraft:string expects UTF-8 bytes: {error}")
+                }),
+            Self::Empty if bytes.is_empty() => Ok(PayloadValue::Empty),
+            Self::Empty => Err(format!(
+                "payload codec minecraft:empty expects no bytes, got {}",
+                bytes.len()
+            )),
+        }
+    }
+
+    /// Encode a value this codec models. A [`PayloadValue::Marker`] is not
+    /// encodable: its hex is truncated by construction.
+    pub fn encode(self, value: &PayloadValue) -> Result<Vec<u8>, String> {
+        let bytes = match (self, value) {
+            (Self::Raw, PayloadValue::Bytes(bytes)) => bytes.clone(),
+            (Self::Utf8, PayloadValue::Text(text)) => text.as_bytes().to_vec(),
+            (Self::Empty, PayloadValue::Empty) => Vec::new(),
+            (Self::Raw, other) => {
+                return Err(format!(
+                    "payload codec minecraft:byte_array cannot encode {other:?}"
+                ));
+            }
+            (Self::Utf8, other) => {
+                return Err(format!(
+                    "payload codec minecraft:string cannot encode {other:?}"
+                ));
+            }
+            (Self::Empty, other) => {
+                return Err(format!(
+                    "payload codec minecraft:empty cannot encode {other:?}"
+                ));
+            }
+        };
+        check_payload_len(&bytes)?;
+        Ok(bytes)
+    }
+}
+
+/// What a handler could receive from a payload frame.
+///
+/// The three modelled codecs decode to [`Bytes`](Self::Bytes),
+/// [`Text`](Self::Text) or [`Empty`](Self::Empty); a codec id the transport
+/// does not model (`Some("demo:codec")` or none at all) can only keep the
+/// bounded hex of the bytes, [`Marker`](Self::Marker).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PayloadValue {
+    /// Opaque bytes (`minecraft:byte_array`).
+    Bytes(Vec<u8>),
+    /// A UTF-8 string (`minecraft:string`).
+    Text(String),
+    /// No payload bytes (`minecraft:unit`).
+    Empty,
+    /// A codec the transport does not model: the first [`MAX_MARKER_BYTES`]
+    /// bytes as lowercase hex.
+    Marker(String),
+}
+
+impl PayloadValue {
+    /// Decode a frame's bytes through a declaration's codec id. An id that
+    /// [`PayloadCodec::parse`] does not know keeps only its bounded hex.
+    pub fn decode(codec: Option<&str>, bytes: &[u8]) -> Result<Self, String> {
+        match codec.and_then(PayloadCodec::parse) {
+            Some(codec) => codec.decode(bytes),
+            None => {
+                check_payload_len(bytes)?;
+                Ok(Self::Marker(marker_hex(bytes)))
+            }
+        }
+    }
+}
+
+/// The most bytes a marker spells out; the previous `payload/<id>/<hex>`
+/// marker carried the same prefix.
+pub const MAX_MARKER_BYTES: usize = 256;
+
+/// The bounded lowercase hex a marker spells: the first [`MAX_MARKER_BYTES`]
+/// bytes, so even a maximal payload stays small in a log.
+pub fn marker_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(MAX_MARKER_BYTES)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn check_payload_len(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "payload value is {} bytes (max {MAX_PAYLOAD_BYTES})",
+            bytes.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Validate a frame against its declaration's codec, when the codec is one
@@ -618,5 +723,89 @@ mod tests {
         };
         assert!(validate_payload(&declaration, b"ok").is_ok());
         assert!(validate_payload(&declaration, &[0xff]).is_err());
+    }
+
+    #[test]
+    fn codecs_encode_what_they_decode() {
+        // Every byte value survives Raw both ways.
+        let all: Vec<u8> = (0..=255).collect();
+        let bytes = PayloadCodec::Raw.decode(&all).unwrap();
+        assert_eq!(bytes, PayloadValue::Bytes(all.clone()));
+        assert_eq!(PayloadCodec::Raw.encode(&bytes).unwrap(), all);
+
+        // UTF-8 text, empty included, round trips as text.
+        for text in ["", "hello", "hé 灯"] {
+            let value = PayloadCodec::Utf8.decode(text.as_bytes()).unwrap();
+            assert_eq!(value, PayloadValue::Text(text.to_owned()));
+            assert_eq!(PayloadCodec::Utf8.encode(&value).unwrap(), text.as_bytes());
+        }
+        let empty = PayloadCodec::Empty.decode(&[]).unwrap();
+        assert_eq!(empty, PayloadValue::Empty);
+        assert_eq!(
+            PayloadCodec::Empty.encode(&empty).unwrap(),
+            Vec::<u8>::new()
+        );
+
+        // A decoded value is never the wrong shape for its codec; an
+        // unmodelled marker cannot be written back.
+        assert!(PayloadCodec::Raw.decode(b"x").is_ok());
+        assert!(
+            PayloadCodec::Utf8
+                .encode(&PayloadValue::Bytes(vec![1]))
+                .is_err()
+        );
+        assert!(PayloadCodec::Raw.encode(&PayloadValue::Empty).is_err());
+        assert!(
+            PayloadCodec::Empty
+                .encode(&PayloadValue::Marker("ff".into()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decode_refuses_bad_or_unbounded_bytes() {
+        assert!(PayloadCodec::Utf8.decode(&[0xff]).is_err());
+        assert!(PayloadCodec::Empty.decode(&[0]).is_err());
+        assert!(
+            PayloadCodec::Raw
+                .decode(&vec![0; MAX_PAYLOAD_BYTES + 1])
+                .is_err()
+        );
+        assert!(
+            PayloadCodec::Utf8
+                .encode(&PayloadValue::Text("x".repeat(MAX_PAYLOAD_BYTES + 1)))
+                .is_err()
+        );
+        assert!(
+            PayloadValue::decode(Some("demo:custom"), &vec![0; MAX_PAYLOAD_BYTES + 1]).is_err()
+        );
+    }
+
+    #[test]
+    fn unmodelled_codecs_keep_a_bounded_marker() {
+        assert_eq!(
+            PayloadValue::decode(Some("demo:custom"), &[0x00, 0xff, 0x10]).unwrap(),
+            PayloadValue::Marker("00ff10".to_owned())
+        );
+        // No codec at all is unmodelled too, and a modelled one stays decoded.
+        assert_eq!(
+            PayloadValue::decode(None, b"hi").unwrap(),
+            PayloadValue::Marker("6869".to_owned())
+        );
+        assert_eq!(
+            PayloadValue::decode(Some("minecraft:utf8"), b"hi").unwrap(),
+            PayloadValue::Text("hi".to_owned())
+        );
+
+        // Truncation is deterministic: exactly MAX_MARKER_BYTES bytes of hex.
+        let long = vec![0xab; MAX_MARKER_BYTES + 64];
+        let PayloadValue::Marker(hex) = PayloadValue::decode(Some("demo:custom"), &long).unwrap()
+        else {
+            panic!("an unmodelled codec decodes to a marker");
+        };
+        assert_eq!(hex.len(), MAX_MARKER_BYTES * 2);
+        assert_eq!(hex, "ab".repeat(MAX_MARKER_BYTES));
+        assert_eq!(marker_hex(&long), hex);
+        assert_eq!(marker_hex(&[]), "");
     }
 }

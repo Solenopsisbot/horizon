@@ -8,7 +8,7 @@
 //! client can drive the same state machine.
 
 use horizon_mods::payloads::{
-    PayloadCodec, PayloadDeclaration, PayloadDirection, PayloadFrame, PayloadRegistry,
+    PayloadDeclaration, PayloadDirection, PayloadFrame, PayloadRegistry, PayloadValue, marker_hex,
     validate_payload,
 };
 use horizon_native_java::{
@@ -256,36 +256,33 @@ pub fn dispatch_received(frame: &PayloadFrame) -> Result<bool, String> {
 }
 
 /// The payload and context a handler receives. A supported codec gives it the
-/// decoded string or an empty marker; anything else stays the bounded
-/// `payload/<id>/<hex>` marker.
+/// decoded string, an empty marker or the bounded bytes marker; a codec the
+/// transport does not model stays the bounded `payload/<id>/<hex>` marker.
 fn payload_values(
     declaration: Option<&PayloadDeclaration>,
     frame: &PayloadFrame,
 ) -> (Value, Value) {
     let id = frame.id();
     let context = Value::Ref(Some(format!("payload-context/{id}")));
-    let codec = declaration
-        .and_then(|declaration| declaration.codec.as_deref())
-        .and_then(PayloadCodec::parse);
-    let payload = match codec {
-        Some(PayloadCodec::Utf8) => match std::str::from_utf8(frame.bytes()) {
-            Ok(text) => Value::Ref(Some(text.to_owned())),
-            Err(_) => payload_marker(frame),
-        },
-        Some(PayloadCodec::Empty) => Value::Ref(Some(format!("payload-empty/{id}"))),
-        Some(PayloadCodec::Raw) | None => payload_marker(frame),
-    };
-    (payload, context)
+    let codec = declaration.and_then(|declaration| declaration.codec.as_deref());
+    let value = PayloadValue::decode(codec, frame.bytes())
+        .unwrap_or_else(|_| PayloadValue::Marker(marker_hex(frame.bytes())));
+    (payload_value(&value, id), context)
 }
 
-fn payload_marker(frame: &PayloadFrame) -> Value {
-    let hex: String = frame
-        .bytes()
-        .iter()
-        .take(256)
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    Value::Ref(Some(format!("payload/{}/{}", frame.id(), hex)))
+/// The native host has no byte-array value, so a raw payload crosses as its
+/// bounded hex. `payload-bytes/<hex>` keeps it distinct from the
+/// `payload/<id>/<hex>` marker of an unmodelled codec; both spell at most
+/// [`MAX_MARKER_BYTES`](horizon_mods::payloads::MAX_MARKER_BYTES) bytes.
+fn payload_value(value: &PayloadValue, id: &str) -> Value {
+    match value {
+        PayloadValue::Text(text) => Value::Ref(Some(text.clone())),
+        PayloadValue::Empty => Value::Ref(Some(format!("payload-empty/{id}"))),
+        PayloadValue::Bytes(bytes) => {
+            Value::Ref(Some(format!("payload-bytes/{}", marker_hex(bytes))))
+        }
+        PayloadValue::Marker(hex) => Value::Ref(Some(format!("payload/{id}/{hex}"))),
+    }
 }
 
 /// Frames a Java host asked to send, waiting for the server's next tick.
@@ -704,7 +701,54 @@ mod tests {
             PayloadFrame::new("demo:raw", PayloadDirection::PlayToServer, vec![0xff]).unwrap();
         assert_eq!(
             payload_values(Some(&raw), &frame).0,
-            Value::Ref(Some("payload/demo:raw/ff".into()))
+            Value::Ref(Some("payload-bytes/ff".into()))
+        );
+    }
+
+    #[test]
+    fn dispatch_distinguishes_raw_text_empty_and_markers() {
+        let frame = |id: &str, bytes: Vec<u8>| {
+            PayloadFrame::new(id, PayloadDirection::PlayToServer, bytes).unwrap()
+        };
+        // Raw bytes cross as their bounded hex, not the id-carrying marker.
+        let raw = declaration(
+            "demo:raw",
+            PayloadDirection::PlayToServer,
+            Some("minecraft:byte_array"),
+        );
+        assert_eq!(
+            payload_values(Some(&raw), &frame("demo:raw", vec![0x00, 0xff])).0,
+            Value::Ref(Some("payload-bytes/00ff".into()))
+        );
+        // An unmodelled codec and an undeclared channel keep the old marker.
+        let custom = declaration(
+            "demo:custom",
+            PayloadDirection::PlayToServer,
+            Some("demo:codec"),
+        );
+        assert_eq!(
+            payload_values(Some(&custom), &frame("demo:custom", b"A".to_vec())).0,
+            Value::Ref(Some("payload/demo:custom/41".into()))
+        );
+        assert_eq!(
+            payload_values(None, &frame("demo:none", b"A".to_vec())).0,
+            Value::Ref(Some("payload/demo:none/41".into()))
+        );
+        // Invalid UTF-8 falls back to the marker instead of a lossy string.
+        let text = declaration(
+            "demo:text",
+            PayloadDirection::PlayToServer,
+            Some("minecraft:string"),
+        );
+        assert_eq!(
+            payload_values(Some(&text), &frame("demo:text", vec![0xff])).0,
+            Value::Ref(Some("payload/demo:text/ff".into()))
+        );
+        // A large raw payload is bounded: 256 bytes of hex, not the whole frame.
+        let marker = payload_values(Some(&raw), &frame("demo:raw", vec![0xab; 4096])).0;
+        assert_eq!(
+            marker,
+            Value::Ref(Some(format!("payload-bytes/{}", "ab".repeat(256))))
         );
     }
 }
