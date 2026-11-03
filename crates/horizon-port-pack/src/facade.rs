@@ -222,6 +222,21 @@ pub fn generate_many(
                 )
             })
         });
+    // Fabric's client screen API: the ordered screen hooks and the widget
+    // lookup helper. Neither draws a screen, so a target that never touches one
+    // pays nothing.
+    let uses_fabric_screen_events = names_fabric(FABRIC_SCREEN_EVENTS);
+    let uses_fabric_screens = names_fabric(FABRIC_SCREENS);
+    let uses_fabric_screen_api = uses_fabric_screen_events || uses_fabric_screens;
+    // NeoForge's screen events are nested classes of one library class, so the
+    // outer name selects `Init`/`Render` and their `Pre`/`Post` phases.
+    let uses_neoforge_screens = uses_neoforge
+        && target.iter().any(|class| {
+            class
+                .refs
+                .iter()
+                .any(|r| r.split('$').next() == Some(NEOFORGE_SCREEN_EVENT))
+        });
     // Fabric API's event holders, command callback and the loader's bootstrap
     // queries are library classes too. They are only filled in below when the
     // target's jars do not carry the real class, so a real API jar is never
@@ -378,6 +393,8 @@ pub fn generate_many(
     // below, rather than fabricating client types a mod would then call into.
     let client = if uses_fabric_client
         || uses_neoforge_client
+        || uses_fabric_screen_api
+        || uses_neoforge_screens
         || uses_fabric_item_groups
         || uses_fabric_renderers
         || uses_neoforge_registration
@@ -421,6 +438,18 @@ pub fn generate_many(
     }
     if uses_model_layers {
         needed_roles.extend(["model_layer_location", "textured_model_data"]);
+    }
+    // The screen hooks name the client, the screen and the GUI the render
+    // phases draw into; `Screens` also binds to the widget base, and the
+    // NeoForge markers carry only the screen.
+    if uses_fabric_screen_events {
+        needed_roles.extend(["minecraft", "screen", "gui"]);
+    }
+    if uses_fabric_screens {
+        needed_roles.extend(["screen", "clickable_widget"]);
+    }
+    if uses_neoforge_screens {
+        needed_roles.insert("screen");
     }
     if uses_fabric_models {
         needed_roles.extend(["identifier", "unbaked_model", "baked_model", "model_loader"]);
@@ -996,6 +1025,43 @@ pub fn generate_many(
                 || fill_client(FABRIC_ITEM_TOOLTIP_CALLBACK),
             )?;
         }
+    }
+    // Fabric's client screen API: the ordered hooks a mod attaches to a
+    // screen's lifecycle (`AFTER_INIT`'s four-argument callback is the one a
+    // ported screen registers) and the widget lookups. The host posts the hooks
+    // and owns the widget tree.
+    if uses_fabric_screen_events {
+        let event_base = "net/fabricmc/fabric/api/event/Event";
+        if available.contains(event_base) {
+            if !available.contains(FABRIC_SCREEN_EVENTS) {
+                report.missing.push(format!(
+                    "{FABRIC_SCREEN_EVENTS} (needs {event_base} absent)"
+                ));
+            }
+        } else {
+            // `Event.horizon` is this slice's factory; the event base may have
+            // been written by the server, client or item-group slice already.
+            let event_file = format!("{event_base}.java");
+            if !files.iter().any(|file| file.ends_with(&event_file)) {
+                write_shim(&mut files, &src, event_base, FABRIC_EVENT)?;
+            }
+            client_shims.emit(
+                &mut files,
+                &mut report,
+                FABRIC_SCREEN_EVENTS,
+                &["minecraft", "screen", "gui"],
+                || fill_client(FABRIC_SCREEN_EVENTS_SOURCE),
+            )?;
+        }
+    }
+    if uses_fabric_screens {
+        client_shims.emit(
+            &mut files,
+            &mut report,
+            FABRIC_SCREENS,
+            &["screen", "clickable_widget"],
+            || fill_client(FABRIC_SCREENS_SOURCE),
+        )?;
     }
     // Fabric API's item-group registration: the same bounded `Event` shape as
     // the client holders (registration order, `invoker()` walks them), one per
@@ -1650,6 +1716,17 @@ pub fn generate_many(
             client_shims.emit(&mut files, &mut report, render, &["gui"], || {
                 fill_client(NEOFORGE_RENDER_GUI_EVENT)
             })?;
+        }
+        // NeoForge's screen events: `Init` and `Render` and their `Pre`/`Post`
+        // phases are markers the host posts, each carrying its screen.
+        if uses_neoforge_screens {
+            client_shims.emit(
+                &mut files,
+                &mut report,
+                NEOFORGE_SCREEN_EVENT,
+                &["screen"],
+                || fill_client(NEOFORGE_SCREEN_EVENT_SOURCE),
+            )?;
         }
         // NeoForge's registration events: the creative-tab contents event keeps
         // the stacks a listener accepts, and the renderer registration event
@@ -2566,6 +2643,96 @@ public interface HudRenderCallback {
 }
 "#;
 
+/// Fabric API's client screen events: one bounded `Event` per screen hook.
+/// Listeners are retained in registration order and `invoker()` walks that
+/// snapshot, so a hook registered during a dispatch cannot change the one in
+/// flight. `AFTER_INIT` is the four-argument shape a ported screen registers
+/// (`(client, screen, scaledWidth, scaledHeight) -> ...`); the two `ALLOW_*`
+/// hooks answer `true` unless a listener vetoes, which is how the host cancels
+/// the click or key press. Nothing opens, draws or clicks a screen here: the
+/// host posts each hook at the point its name says.
+const FABRIC_SCREEN_EVENTS: &str = "net/fabricmc/fabric/api/client/screen/v1/ScreenEvents";
+const FABRIC_SCREEN_EVENTS_SOURCE: &str = r#"package net.fabricmc.fabric.api.client.screen.v1;
+
+import net.fabricmc.fabric.api.event.Event;
+import {gui};
+import {minecraft};
+import {screen};
+
+public final class ScreenEvents {
+    private ScreenEvents() {}
+
+    public static final Event<BeforeInit> BEFORE_INIT = Event.horizon(horizonListeners ->
+        (client, screen, scaledWidth, scaledHeight) -> {
+            for (BeforeInit horizonListener : horizonListeners) horizonListener.beforeInit(client, screen, scaledWidth, scaledHeight);
+        });
+    public static final Event<AfterInit> AFTER_INIT = Event.horizon(horizonListeners ->
+        (client, screen, scaledWidth, scaledHeight) -> {
+            for (AfterInit horizonListener : horizonListeners) horizonListener.afterInit(client, screen, scaledWidth, scaledHeight);
+        });
+    public static final Event<BeforeRender> BEFORE_RENDER = Event.horizon(horizonListeners ->
+        (screen, context, mouseX, mouseY, tickDelta) -> {
+            for (BeforeRender horizonListener : horizonListeners) horizonListener.beforeRender(screen, context, mouseX, mouseY, tickDelta);
+        });
+    public static final Event<AfterRender> AFTER_RENDER = Event.horizon(horizonListeners ->
+        (screen, context, mouseX, mouseY, tickDelta) -> {
+            for (AfterRender horizonListener : horizonListeners) horizonListener.afterRender(screen, context, mouseX, mouseY, tickDelta);
+        });
+    public static final Event<AllowMouseClick> ALLOW_MOUSE_CLICK = Event.horizon(horizonListeners ->
+        (screen, mouseX, mouseY, button) -> {
+            for (AllowMouseClick horizonListener : horizonListeners) if (!horizonListener.allowMouseClick(screen, mouseX, mouseY, button)) return false;
+            return true;
+        });
+    public static final Event<AllowKeyPress> ALLOW_KEY_PRESS = Event.horizon(horizonListeners ->
+        (screen, keyCode, scanCode, modifiers) -> {
+            for (AllowKeyPress horizonListener : horizonListeners) if (!horizonListener.allowKeyPress(screen, keyCode, scanCode, modifiers)) return false;
+            return true;
+        });
+
+    @FunctionalInterface
+    public interface BeforeInit { void beforeInit({minecraft} client, {screen} screen, int scaledWidth, int scaledHeight); }
+    @FunctionalInterface
+    public interface AfterInit { void afterInit({minecraft} client, {screen} screen, int scaledWidth, int scaledHeight); }
+    @FunctionalInterface
+    public interface BeforeRender { void beforeRender({screen} screen, {gui} context, int mouseX, int mouseY, float tickDelta); }
+    @FunctionalInterface
+    public interface AfterRender { void afterRender({screen} screen, {gui} context, int mouseX, int mouseY, float tickDelta); }
+    @FunctionalInterface
+    public interface AllowMouseClick { boolean allowMouseClick({screen} screen, double mouseX, double mouseY, int button); }
+    @FunctionalInterface
+    public interface AllowKeyPress { boolean allowKeyPress({screen} screen, int keyCode, int scanCode, int modifiers); }
+}
+"#;
+
+/// Fabric API's `Screens` helper: the widget lookups a screen makes while it
+/// initializes. The host owns the widget tree, so these are bounded markers —
+/// no buttons exist behind the façade and `getWidget`/`getFocused` answer
+/// `null`, which stops a port at the lookup that has to be wired.
+const FABRIC_SCREENS: &str = "net/fabricmc/fabric/api/client/screen/v1/Screens";
+const FABRIC_SCREENS_SOURCE: &str = r#"package net.fabricmc.fabric.api.client.screen.v1;
+
+import java.util.Collections;
+import java.util.List;
+import {clickable_widget};
+import {screen};
+
+public final class Screens {
+    private Screens() {}
+
+    public static List<{clickable_widget}> getButtons({screen} screen) {
+        return Collections.emptyList();
+    }
+
+    public static <T extends {clickable_widget}> T getWidget({screen} screen, Class<T> widgetClass) {
+        return null;
+    }
+
+    public static <T extends {clickable_widget}> T getFocused({screen} screen, Class<T> widgetClass) {
+        return null;
+    }
+}
+"#;
+
 /// Fabric API's item tooltip callback: listeners may append to the mutable
 /// line list the host passes, in registration order. The stack, tooltip
 /// context, flag and text types are the resolved game types, because a mod
@@ -3437,6 +3604,37 @@ public class RenderGuiEvent extends Event {
 }
 "#;
 
+/// NeoForge's `ScreenEvent` and the `Init`/`Render` phases a listener takes.
+/// They are markers: the host posts one per screen transition, each carrying
+/// the screen it was posted for, and the phase classes only need the type
+/// hierarchy plus the bounded `getScreen()` accessor.
+const NEOFORGE_SCREEN_EVENT: &str = "net/neoforged/neoforge/client/event/ScreenEvent";
+const NEOFORGE_SCREEN_EVENT_SOURCE: &str = r#"package net.neoforged.neoforge.client.event;
+
+import net.neoforged.bus.api.Event;
+import {screen};
+
+public abstract class ScreenEvent extends Event {
+    private final {screen} horizonScreen;
+
+    protected ScreenEvent({screen} screen) { this.horizonScreen = screen; }
+
+    public {screen} getScreen() { return horizonScreen; }
+
+    public static class Init extends ScreenEvent {
+        public Init({screen} screen) { super(screen); }
+        public static class Pre extends Init { public Pre({screen} screen) { super(screen); } }
+        public static final class Post extends Init { public Post({screen} screen) { super(screen); } }
+    }
+
+    public static class Render extends ScreenEvent {
+        public Render({screen} screen) { super(screen); }
+        public static class Pre extends Render { public Pre({screen} screen) { super(screen); } }
+        public static final class Post extends Render { public Post({screen} screen) { super(screen); } }
+    }
+}
+"#;
+
 /// NeoForge's creative-tab contents event: the tab it is posted for and the
 /// stacks a listener accepts, in call order. The real event also implements
 /// `CreativeModeTab.Output`; the bounded shape keeps only `accept`/`getTab`,
@@ -3694,6 +3892,29 @@ const CLIENT_TYPE_CANDIDATES: &[(&str, &[&str])] = &[
         &[
             "net/minecraft/network/chat/Component",
             "net/minecraft/text/Text",
+        ],
+    ),
+    // The client screen slice's roles. A jar built against the older package
+    // (`gui/screen/...`) still binds through the second candidate.
+    (
+        "screen",
+        &[
+            "net/minecraft/client/gui/screens/Screen",
+            "net/minecraft/client/gui/screen/Screen",
+        ],
+    ),
+    (
+        "abstract_container_screen",
+        &[
+            "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen",
+            "net/minecraft/client/gui/screen/ingame/AbstractContainerScreen",
+        ],
+    ),
+    (
+        "clickable_widget",
+        &[
+            "net/minecraft/client/gui/components/ClickableWidget",
+            "net/minecraft/client/gui/components/AbstractWidget",
         ],
     ),
     (
@@ -13584,6 +13805,310 @@ mod tests {
         assert!(output.status.success(), "client probe failed: {stderr}");
         assert!(
             stdout.contains("horizon client facade ok"),
+            "probe output: {stdout}{stderr}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn screen_facade_shapes_are_guarded_and_resolved() {
+        let types = BTreeMap::from([
+            ("minecraft", "net/minecraft/client/Minecraft".to_owned()),
+            (
+                "screen",
+                "net/minecraft/client/gui/screens/Screen".to_owned(),
+            ),
+            (
+                "gui",
+                "net/minecraft/client/gui/GuiGraphicsExtractor".to_owned(),
+            ),
+            (
+                "clickable_widget",
+                "net/minecraft/client/gui/components/ClickableWidget".to_owned(),
+            ),
+        ]);
+        // The widget lookups are markers: no widget tree exists behind them.
+        for fragment in [
+            "public static List<{clickable_widget}> getButtons({screen} screen) {",
+            "return Collections.emptyList();",
+            "public static <T extends {clickable_widget}> T getWidget({screen} screen, Class<T> widgetClass) {",
+            "public static <T extends {clickable_widget}> T getFocused({screen} screen, Class<T> widgetClass) {",
+            "return null;",
+        ] {
+            assert!(
+                FABRIC_SCREENS_SOURCE.contains(fragment),
+                "missing Screens fragment: {fragment}"
+            );
+        }
+        // NeoForge's markers: `Init`/`Render` phases with their `Pre`/`Post`
+        // nested classes and the bounded screen accessor.
+        for fragment in [
+            "public abstract class ScreenEvent extends Event {",
+            "public {screen} getScreen() { return horizonScreen; }",
+            "public static final class Post extends Init {",
+            "public static class Pre extends Render {",
+            "public static final class Post extends Render {",
+        ] {
+            assert!(
+                NEOFORGE_SCREEN_EVENT_SOURCE.contains(fragment),
+                "missing ScreenEvent fragment: {fragment}"
+            );
+        }
+        // Every game type is a role placeholder, never a frozen 26.3 name.
+        for template in [
+            FABRIC_SCREEN_EVENTS_SOURCE,
+            FABRIC_SCREENS_SOURCE,
+            NEOFORGE_SCREEN_EVENT_SOURCE,
+        ] {
+            assert!(
+                !template.contains("net.minecraft."),
+                "hard-coded client type in a screen template"
+            );
+        }
+
+        // The roles resolve from the game jar; a server-shaped jar resolves
+        // none of them.
+        let client_game: BTreeMap<String, Class> = [
+            "net/minecraft/client/Minecraft",
+            "net/minecraft/client/gui/GuiGraphicsExtractor",
+            "net/minecraft/client/gui/screens/Screen",
+            "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen",
+            "net/minecraft/client/gui/components/ClickableWidget",
+            "net/minecraft/network/chat/Component",
+        ]
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_owned(),
+                Class {
+                    name: (*name).to_owned(),
+                    ..Class::default()
+                },
+            )
+        })
+        .collect();
+        let resolved = resolve_client_types(&client_game, &BTreeSet::new(), &BTreeSet::new());
+        for role in [
+            "screen",
+            "minecraft",
+            "gui",
+            "abstract_container_screen",
+            "clickable_widget",
+            "component",
+        ] {
+            assert!(
+                resolved.contains_key(role),
+                "screen role did not resolve: {role}"
+            );
+        }
+        assert!(
+            resolve_client_types(&BTreeMap::new(), &BTreeSet::new(), &BTreeSet::new()).is_empty()
+        );
+
+        // Emission: a real API class is never shadowed, a missing role is
+        // reported, and an emitted shim lands at the API's path.
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-screen-shim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create shim directory");
+        let mut files = Vec::new();
+        let mut report = Report::default();
+        let available = BTreeSet::from([FABRIC_SCREEN_EVENTS.to_owned()]);
+        let shims = ClientShims {
+            src: &root,
+            available: &available,
+            types: &types,
+        };
+        assert!(
+            !shims
+                .emit(
+                    &mut files,
+                    &mut report,
+                    FABRIC_SCREEN_EVENTS,
+                    &["minecraft", "screen", "gui"],
+                    || "shadowed".to_owned(),
+                )
+                .expect("guard the real API class")
+        );
+        assert!(files.is_empty() && report.missing.is_empty());
+        let empty = BTreeMap::new();
+        let shims = ClientShims {
+            src: &root,
+            available: &BTreeSet::new(),
+            types: &empty,
+        };
+        assert!(
+            !shims
+                .emit(
+                    &mut files,
+                    &mut report,
+                    FABRIC_SCREEN_EVENTS,
+                    &["minecraft", "screen", "gui"],
+                    || "invented".to_owned(),
+                )
+                .expect("report a missing role")
+        );
+        assert_eq!(
+            report.missing,
+            vec![
+                "net/fabricmc/fabric/api/client/screen/v1/ScreenEvents \
+                 (needs client type minecraft, screen, gui)"
+            ]
+        );
+        let shims = ClientShims {
+            src: &root,
+            available: &BTreeSet::new(),
+            types: &types,
+        };
+        for (class, requires, source) in [
+            (
+                FABRIC_SCREENS,
+                &["screen", "clickable_widget"][..],
+                FABRIC_SCREENS_SOURCE,
+            ),
+            (
+                NEOFORGE_SCREEN_EVENT,
+                &["screen"][..],
+                NEOFORGE_SCREEN_EVENT_SOURCE,
+            ),
+        ] {
+            assert!(
+                shims
+                    .emit(&mut files, &mut report, class, requires, || fill_types(
+                        source, &types
+                    ))
+                    .expect("emit the screen shim")
+            );
+        }
+        assert_eq!(files.len(), 2);
+        assert!(files[0].ends_with("net/fabricmc/fabric/api/client/screen/v1/Screens.java"));
+        assert!(files[1].ends_with("net/neoforged/neoforge/client/event/ScreenEvent.java"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The screen hooks and markers are compiled and run for real: ordered
+    /// dispatch, the boolean veto, and the widget lookups. Skipped cleanly when
+    /// no JDK is installed.
+    #[test]
+    fn fabric_screen_events_compile_and_dispatch_in_order() {
+        use std::{path::PathBuf, process::Command};
+        let types: BTreeMap<&'static str, String> = BTreeMap::from([
+            ("minecraft", "net/minecraft/client/Minecraft".to_owned()),
+            (
+                "screen",
+                "net/minecraft/client/gui/screens/Screen".to_owned(),
+            ),
+            (
+                "gui",
+                "net/minecraft/client/gui/GuiGraphicsExtractor".to_owned(),
+            ),
+            (
+                "clickable_widget",
+                "net/minecraft/client/gui/components/ClickableWidget".to_owned(),
+            ),
+        ]);
+        let probe = r#"public class ScreenProbe {
+    public static void main(String[] args) {
+        java.util.List<String> seen = new java.util.ArrayList<>();
+        net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.AFTER_INIT.register((client, screen, scaledWidth, scaledHeight) -> seen.add("first:" + scaledWidth + "x" + scaledHeight));
+        net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.AFTER_INIT.register((client, screen, scaledWidth, scaledHeight) -> seen.add("second:" + scaledWidth + "x" + scaledHeight));
+        net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.AFTER_INIT.invoker().afterInit(null, null, 320, 240);
+        if (!seen.equals(java.util.Arrays.asList("first:320x240", "second:320x240"))) throw new AssertionError("after init order " + seen);
+
+        seen.clear();
+        net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.BEFORE_RENDER.register((screen, context, mouseX, mouseY, tickDelta) -> seen.add("before"));
+        net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.AFTER_RENDER.register((screen, context, mouseX, mouseY, tickDelta) -> seen.add("after"));
+        net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.BEFORE_RENDER.invoker().beforeRender(null, null, 1, 2, 0.5f);
+        net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.AFTER_RENDER.invoker().afterRender(null, null, 1, 2, 0.5f);
+        if (!seen.equals(java.util.Arrays.asList("before", "after"))) throw new AssertionError("render order " + seen);
+
+        if (!net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.ALLOW_MOUSE_CLICK.invoker().allowMouseClick(null, 1, 2, 0)) throw new AssertionError("mouse click default");
+        net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.ALLOW_MOUSE_CLICK.register((screen, mouseX, mouseY, button) -> button != 1);
+        if (!net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.ALLOW_MOUSE_CLICK.invoker().allowMouseClick(null, 1, 2, 0)) throw new AssertionError("mouse click allow");
+        if (net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.ALLOW_MOUSE_CLICK.invoker().allowMouseClick(null, 1, 2, 1)) throw new AssertionError("mouse click veto");
+        if (!net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.ALLOW_KEY_PRESS.invoker().allowKeyPress(null, 65, 0, 0)) throw new AssertionError("key press default");
+
+        if (net.fabricmc.fabric.api.client.screen.v1.Screens.getWidget(null, net.minecraft.client.gui.components.ClickableWidget.class) != null) throw new AssertionError("get widget marker");
+        if (net.fabricmc.fabric.api.client.screen.v1.Screens.getFocused(null, net.minecraft.client.gui.components.ClickableWidget.class) != null) throw new AssertionError("get focused marker");
+        if (!net.fabricmc.fabric.api.client.screen.v1.Screens.getButtons(null).isEmpty()) throw new AssertionError("get buttons marker");
+        System.out.println("horizon screen facade ok");
+    }
+}
+"#;
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-screen-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let mut files = Vec::new();
+        let mut write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write java shim");
+            files.push(file);
+        };
+        write("net/fabricmc/fabric/api/event/Event.java", FABRIC_EVENT);
+        write(
+            "net/fabricmc/fabric/api/client/screen/v1/ScreenEvents.java",
+            &fill_types(FABRIC_SCREEN_EVENTS_SOURCE, &types),
+        );
+        write(
+            "net/fabricmc/fabric/api/client/screen/v1/Screens.java",
+            &fill_types(FABRIC_SCREENS_SOURCE, &types),
+        );
+        // The smallest game types the signatures name.
+        write(
+            "net/minecraft/client/Minecraft.java",
+            "package net.minecraft.client;\npublic class Minecraft {}\n",
+        );
+        write(
+            "net/minecraft/client/gui/GuiGraphicsExtractor.java",
+            "package net.minecraft.client.gui;\npublic class GuiGraphicsExtractor {}\n",
+        );
+        write(
+            "net/minecraft/client/gui/screens/Screen.java",
+            "package net.minecraft.client.gui.screens;\npublic class Screen {}\n",
+        );
+        write(
+            "net/minecraft/client/gui/components/ClickableWidget.java",
+            "package net.minecraft.client.gui.components;\npublic class ClickableWidget {}\n",
+        );
+        write("ScreenProbe.java", probe);
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(javac_status) = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(
+            javac_status.success(),
+            "javac rejected the generated screen façade"
+        );
+        let java = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("java"))
+            .unwrap_or_else(|| PathBuf::from("java"));
+        let output = Command::new(&java)
+            .arg("-cp")
+            .arg(&classes)
+            .arg("ScreenProbe")
+            .output()
+            .expect("run the screen probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "screen probe failed: {stderr}");
+        assert!(
+            stdout.contains("horizon screen facade ok"),
             "probe output: {stdout}{stderr}"
         );
         let _ = fs::remove_dir_all(&root);
