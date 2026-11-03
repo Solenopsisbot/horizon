@@ -3,7 +3,7 @@
 //! (`native_hooks.rs`); WebAssembly code mods don't run any more.
 use super::{Game, execution_role::ExecutionRole};
 use horizon_client::{
-    mod_content::ContentMod,
+    mod_content::{self, ContentMod, DeclarationSummary},
     mod_list::{self, Installed},
     text::Text,
 };
@@ -27,7 +27,6 @@ pub(super) fn content_root(
     dev: &[std::path::PathBuf],
     native: &[ContentMod],
 ) -> std::path::PathBuf {
-    use horizon_client::mod_content::{self, ContentMod};
     use horizon_mods::{Capability, Content, Package};
     let here = std::env::current_dir().unwrap_or_default();
     let mut paths = horizon_mods::find(&here.join(mod_list::DIR));
@@ -517,6 +516,85 @@ fn seeded_native_host(
     jar.seed_host(host)
 }
 
+/// The kinds a [`DeclarationSummary`] counts, in the order its lines print
+/// them, with the name each count is logged under: the aggregate line and the
+/// content lines read the same table, so they never disagree.
+fn declared_counts(summary: &DeclarationSummary) -> [(usize, &'static str); 10] {
+    [
+        (summary.blocks, "block"),
+        (summary.items, "item"),
+        (summary.effects, "mob effect"),
+        (summary.entities, "entity"),
+        (summary.data_components, "data component"),
+        (summary.attachments, "attachment"),
+        (summary.menus, "menu"),
+        (summary.block_entities, "block entity"),
+        (summary.recipes, "recipe"),
+        (summary.ingredients, "ingredient"),
+    ]
+}
+
+/// The run's typed declarations as log lines: each of the summary's own lines,
+/// prefixed so the game log groups them. Nothing declared logs nothing.
+fn declaration_lines(summary: &DeclarationSummary) -> Vec<String> {
+    summary
+        .lines()
+        .into_iter()
+        .map(|line| format!("Horizon: Java content: {line}"))
+        .collect()
+}
+
+/// The aggregate line for a run: the reports' totals, then what the typed
+/// tables declared. The declared part is bounded to three fields — the blocks
+/// and items by name, every other kind in one count — and is left off
+/// entirely when nothing was declared, so a run of code-only jars logs exactly
+/// the line it always did.
+fn aggregate_line(reports: &[JavaCompatibilityReport], summary: &DeclarationSummary) -> String {
+    let typed = reports
+        .iter()
+        .map(|report| report.typed_registrations)
+        .sum::<usize>();
+    let opaque = reports
+        .iter()
+        .map(|report| report.opaque_registrations.len())
+        .sum::<usize>();
+    let payloads = reports
+        .iter()
+        .map(|report| report.payload_directions.len())
+        .sum::<usize>();
+    let mixin_plans = reports
+        .iter()
+        .map(|report| report.mixin_plans)
+        .sum::<usize>();
+    let mixin_unresolved = reports
+        .iter()
+        .map(|report| report.mixin_unresolved)
+        .sum::<usize>();
+    let counts = declared_counts(summary);
+    let mut declared: Vec<String> = counts
+        .iter()
+        .filter(|(count, kind)| *count > 0 && matches!(*kind, "block" | "item"))
+        .map(|(count, kind)| format!("{count} declared {kind}(s)"))
+        .collect();
+    let other = counts
+        .iter()
+        .filter(|(count, kind)| *count > 0 && !matches!(*kind, "block" | "item"))
+        .map(|(count, _)| count)
+        .sum::<usize>();
+    if other > 0 {
+        declared.push(format!("{other} other declared row(s)"));
+    }
+    let declared = if declared.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", declared.join(", "))
+    };
+    format!(
+        "Horizon: Java compatibility: {} jar(s), {typed} typed registrations, {opaque} opaque, {payloads} payload directions, {mixin_plans} mixin plan(s), {mixin_unresolved} unresolved{declared}",
+        reports.len(),
+    )
+}
+
 /// Runs explicitly supplied Java entrypoints through the bounded native
 /// interpreter before resource workers start. Java jars are never discovered
 /// implicitly: a launcher or developer must pass `--java-mod PATH`.
@@ -685,30 +763,15 @@ pub(super) fn run_java_mods_with_report(
         }
         reports.push(report);
     }
-    let typed = reports
-        .iter()
-        .map(|report| report.typed_registrations)
-        .sum::<usize>();
-    let opaque = reports
-        .iter()
-        .map(|report| report.opaque_registrations.len())
-        .sum::<usize>();
-    let payloads = reports
-        .iter()
-        .map(|report| report.payload_directions.len())
-        .sum::<usize>();
-    let mixin_plans = reports
-        .iter()
-        .map(|report| report.mixin_plans)
-        .sum::<usize>();
-    let mixin_unresolved = reports
-        .iter()
-        .map(|report| report.mixin_unresolved)
-        .sum::<usize>();
-    log::info!(
-        "Horizon: Java compatibility: {} jar(s), {typed} typed registrations, {opaque} opaque, {payloads} payload directions, {mixin_plans} mixin plan(s), {mixin_unresolved} unresolved",
-        reports.len(),
-    );
+    let summary = mod_content::declaration_summary(&native_content);
+    // No warning for a jar whose typed rows leave the summary empty: every
+    // typed declaration that reaches `Content::from_native` lands in a table
+    // the summary counts (a custom row stops the load with an error instead),
+    // and rows the resource planner refuses later are not visible here.
+    for line in declaration_lines(&summary) {
+        log::info!("{line}");
+    }
+    log::info!("{}", aggregate_line(&reports, &summary));
     Ok((native_content, reports))
 }
 
@@ -1726,6 +1789,125 @@ clientSideOnly = true
         assert_eq!(content.len(), 2);
         assert_eq!(content[0].content.items[0].id, "report:gem");
         assert_eq!(content[1].content.items[0].id, "report:ore");
+        // A synthetic content mod joining the run's native ones: the summary
+        // is over the merged tables, not one jar. Items only, so the aggregate
+        // keeps its shape and appends one bounded count.
+        let mut merged = content.clone();
+        merged.push(item_mod("synthetic"));
+        let summary = mod_content::declaration_summary(&merged);
+        assert_eq!((summary.blocks, summary.items), (0, 3));
+        let lines = declaration_lines(&summary);
+        assert_eq!(lines[0], "Horizon: Java content: 3 items");
+        assert_eq!(
+            lines.last().unwrap(),
+            "Horizon: Java content: ids: report:gem, report:ore, synthetic:widget"
+        );
+        assert_eq!(
+            aggregate_line(&reports, &summary),
+            "Horizon: Java compatibility: 2 jar(s), 2 typed registrations, 3 opaque, \
+             0 payload directions, 0 mixin plan(s), 0 unresolved, 3 declared item(s)"
+        );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Declarations holding one item with `id`, for the summary tests below.
+    fn one_item(id: &str) -> horizon_mods::native::NativeDeclarations {
+        horizon_mods::native::NativeDeclarations {
+            items: vec![horizon_mods::content::Item {
+                id: id.into(),
+                template: "minecraft:diamond".into(),
+                max_stack_size: None,
+                rarity: None,
+                components: Default::default(),
+                crafting_remainder: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A content mod declaring `<mod_id>:widget`.
+    fn item_mod(mod_id: &str) -> ContentMod {
+        ContentMod {
+            id: mod_id.into(),
+            content: horizon_mods::content::Content::from_native(
+                mod_id,
+                one_item(&format!("{mod_id}:widget")),
+            )
+            .unwrap(),
+        }
+    }
+
+    /// A run whose jars declare no typed rows logs no content lines and keeps
+    /// the aggregate line exactly as it was before the summary joined it. A
+    /// content mod with files or a namespace alone counts as no declaration.
+    #[test]
+    fn java_run_without_declarations_logs_no_content_lines() {
+        let jar = horizon_native_java::NativeJar::default();
+        let reports = [JavaCompatibilityReport::new(
+            &jar,
+            std::path::Path::new("/mods/code-only.jar"),
+            ExecutionRole::Client,
+            NativeRunFacts::default(),
+        )];
+        let legacy = "Horizon: Java compatibility: 1 jar(s), 0 typed registrations, 0 opaque, \
+                      0 payload directions, 0 mixin plan(s), 0 unresolved";
+        for summary in [
+            mod_content::declaration_summary(&[]),
+            mod_content::declaration_summary(&[ContentMod {
+                id: "helper".into(),
+                content: horizon_mods::content::Content::from_native(
+                    "helper",
+                    horizon_mods::native::NativeDeclarations::default(),
+                )
+                .unwrap(),
+            }]),
+        ] {
+            assert!(summary.is_empty());
+            assert!(declaration_lines(&summary).is_empty());
+            assert_eq!(aggregate_line(&reports, &summary), legacy);
+        }
+    }
+
+    /// The declared part of the aggregate line stays bounded: blocks and items
+    /// are named, every other kind folds into one count, and a run that
+    /// declares nothing but those other kinds still says so.
+    #[test]
+    fn java_aggregate_line_bounds_the_other_declared_kinds() {
+        let reports = [JavaCompatibilityReport::new(
+            &horizon_native_java::NativeJar::default(),
+            std::path::Path::new("/mods/demo.jar"),
+            ExecutionRole::Client,
+            NativeRunFacts::default(),
+        )];
+        let mut mods = vec![item_mod("ruby")];
+        mods.push(ContentMod {
+            id: "ruby".into(),
+            content: horizon_mods::content::Content::from_native(
+                "ruby",
+                horizon_mods::native::NativeDeclarations {
+                    recipes: vec![horizon_mods::native::RecipeDeclaration {
+                        id: "ruby:widget_recipe".into(),
+                        json: b"{}".to_vec(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        });
+        let summary = mod_content::declaration_summary(&mods);
+        assert_eq!((summary.items, summary.recipes), (1, 1));
+        assert_eq!(
+            aggregate_line(&reports, &summary),
+            "Horizon: Java compatibility: 1 jar(s), 0 typed registrations, 0 opaque, \
+             0 payload directions, 0 mixin plan(s), 0 unresolved, 1 declared item(s), \
+             1 other declared row(s)"
+        );
+        // Recipes alone: named as one other count rather than losing them.
+        let summary = mod_content::declaration_summary(&mods[1..]);
+        assert_eq!(
+            aggregate_line(&reports, &summary),
+            "Horizon: Java compatibility: 1 jar(s), 0 typed registrations, 0 opaque, \
+             0 payload directions, 0 mixin plan(s), 0 unresolved, 1 other declared row(s)"
+        );
     }
 }
