@@ -393,11 +393,11 @@ methods with `method` (name or `name(descriptor)`), nested `@At` anchors (`HEAD`
 HEAD callbacks in declaration order, invokes the target once, then runs RETURN/TAIL callbacks, and rejects
 mixed-anchor or non-void-callback plans before executing any of them. A cancellable HEAD plan receives a
 runtime-owned `CallbackInfo`; `cancel()` stops the remaining HEAD callbacks and the target body and returns
-the target's default value, and the report says `cancelled`. Cancellable RETURN/TAIL plans (which need
-`CallbackInfoReturnable.setReturnValue`) still reject. `--mixin-plans` reports the same plans without
-running an entrypoint. This is planning and bounded native invocation, not bytecode weaving: no class is
-rewritten, and `@Redirect`, `@ModifyArg`/`@ModifyVariable`, slices, and return-value injection remain on the
-JVM fallback.
+the target's default value, and the report says `cancelled`. RETURN/TAIL callbacks receive a
+`CallbackInfoReturnable` seeded with the real result; `setReturnValue` overrides it, and a non-void target
+requires the returnable marker. `--mixin-plans` reports the same plans without running an entrypoint. This is
+planning and bounded native invocation, not bytecode weaving: no class is rewritten, and `@Redirect`,
+`@ModifyArg`/`@ModifyVariable`, slices, and injection-point matching remain on the JVM fallback.
 
 Reproduce:
 
