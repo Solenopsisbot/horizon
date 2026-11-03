@@ -15,6 +15,7 @@ use horizon_launcher::browser::{
 };
 use servers_page::Field;
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use theme::night;
@@ -22,8 +23,86 @@ use theme::night;
 /// A turned-off jar's suffix, which the loaders don't read.
 const OFF: &str = ".disabled";
 
+/// Reading a jar's own metadata is bounded: at most this many archive entries are looked at
+/// (for mixin configs), and each metadata file is read up to [`MAX_META_BYTES`]. No temp files.
+const MAX_JAR_ENTRIES: usize = 64;
+const MAX_META_BYTES: u64 = 256 * 1024;
+/// One reported reason stays one bounded line.
+const MAX_REASON: usize = 160;
+
+/// The loader a jar's own metadata names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum LoaderKind {
+    Fabric,
+    NeoForge,
+    /// The old `mods.toml` family, out of the Java runtime's scope (`docs/java-mod-compat.md`).
+    Forge,
+    #[default]
+    Unknown,
+}
+
+impl LoaderKind {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            LoaderKind::Fabric => "Fabric",
+            LoaderKind::NeoForge => "NeoForge",
+            LoaderKind::Forge => "Forge",
+            LoaderKind::Unknown => "Unknown",
+        }
+    }
+
+    fn modern(self) -> bool {
+        matches!(self, LoaderKind::Fabric | LoaderKind::NeoForge)
+    }
+}
+
+/// A bounded hint about whether a jar might run under Horizon's Java support. It is read from
+/// the jar's loader metadata and mixin markers alone: a hint, never a verdict. A jar without
+/// mixins is not promised to work, and one with mixins is not promised to fail.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum JavaHint {
+    /// It declares mixins or is legacy Forge: trust only its own loader (native).
+    NativeOnly,
+    /// A Fabric/NeoForge jar without mixin configs: the Java fallback may load it.
+    JvmFallback,
+    /// No loader we can read, so no hint.
+    #[default]
+    Unknown,
+}
+
+impl JavaHint {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            JavaHint::NativeOnly => "Needs its own loader",
+            JavaHint::JvmFallback => "Java fallback may run it",
+            JavaHint::Unknown => "Loader not identified",
+        }
+    }
+}
+
+/// The identity a jar declares for itself in `fabric.mod.json` or `mods.toml`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct JavaMeta {
+    pub(super) loader: LoaderKind,
+    pub(super) id: Option<String>,
+    pub(super) version: Option<String>,
+    /// Whether the archive holds any mixin config.
+    pub(super) mixins: bool,
+}
+
+impl JavaMeta {
+    pub(super) fn hint(&self) -> JavaHint {
+        match (self.loader, self.mixins) {
+            (LoaderKind::Forge, _) => JavaHint::NativeOnly,
+            (loader, _) if !loader.modern() => JavaHint::Unknown,
+            (_, true) => JavaHint::NativeOnly,
+            _ => JavaHint::JvmFallback,
+        }
+    }
+}
+
 /// A mod as the tab lists it.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct ModRow {
     /// Its file in the instance, as it is when on (`mods/lumen-0.6.2.jar`).
     file: String,
@@ -34,6 +113,121 @@ pub(super) struct ModRow {
     entry: Option<installed::Entry>,
     /// The icon its jar names, scaled to the row (`images::ROW`) and decoded once by the UI.
     icon: Option<Arc<gpui::Image>>,
+    /// The jar's own loader metadata, when it declares any (a Java instance's jars).
+    java: Option<JavaMeta>,
+    /// Why its metadata couldn't be read, when it couldn't: one short reason.
+    java_error: Option<String>,
+}
+
+impl InstanceMods {
+    /// The rows' files with their jar metadata, for the Mods page's installed list.
+    pub(super) fn java_rows(
+        &self,
+    ) -> impl Iterator<Item = (&str, Option<&JavaMeta>, Option<&str>)> {
+        self.list
+            .iter()
+            .map(|r| (r.file.as_str(), r.java.as_ref(), r.java_error.as_deref()))
+    }
+}
+
+/// Reads a jar's own loader metadata, bounded: the first [`MAX_JAR_ENTRIES`] entry names are
+/// inspected for mixin configs, and each metadata file is read up to [`MAX_META_BYTES`]. The
+/// archive is read in place, so no temporary files are made. `None` metadata means the jar
+/// names no loader (a plain library) or its metadata was malformed, in which case `err` says
+/// why in one short line.
+pub(super) fn read_java_meta(path: &Path) -> (Option<JavaMeta>, Option<String>) {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => return (None, Some(bound_reason(format!("{}: {e}", path.display())))),
+    };
+    let mut zip = match zip::ZipArchive::new(file) {
+        Ok(zip) => zip,
+        Err(e) => return (None, Some(bound_reason(format!("{}: {e}", path.display())))),
+    };
+    let names: Vec<String> = zip
+        .file_names()
+        .take(MAX_JAR_ENTRIES)
+        .map(str::to_owned)
+        .collect();
+    let entry_mixins = names.iter().any(|name| declares_mixin_entry(name));
+    for (entry, loader) in [
+        ("fabric.mod.json", LoaderKind::Fabric),
+        ("META-INF/neoforge.mods.toml", LoaderKind::NeoForge),
+        ("META-INF/mods.toml", LoaderKind::Forge),
+    ] {
+        match read_entry_text(&mut zip, entry) {
+            Ok(Some(text)) => {
+                let parsed = match loader {
+                    LoaderKind::Fabric => horizon_port_pack::jar::fabric(&text),
+                    _ => horizon_port_pack::jar::mods_toml(&text),
+                };
+                return match parsed {
+                    Ok(info) => (
+                        Some(JavaMeta {
+                            loader,
+                            id: non_empty(info.mod_id),
+                            version: non_empty(info.version),
+                            mixins: entry_mixins,
+                        }),
+                        None,
+                    ),
+                    Err(e) => (None, Some(bound_reason(e))),
+                };
+            }
+            Ok(None) => {}
+            Err(e) => return (None, Some(bound_reason(e))),
+        }
+    }
+    (None, None)
+}
+
+/// One metadata entry's text, bounded by size.
+fn read_entry_text<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let Some(index) = zip.index_for_name(name) else {
+        return Ok(None);
+    };
+    let entry = zip.by_index(index).map_err(|e| format!("{name}: {e}"))?;
+    if entry.size() > MAX_META_BYTES {
+        return Err(format!("{name} exceeds {MAX_META_BYTES} bytes"));
+    }
+    let mut text = String::new();
+    entry
+        .take(MAX_META_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("{name}: {e}"))?;
+    if text.len() as u64 > MAX_META_BYTES {
+        return Err(format!("{name} exceeds {MAX_META_BYTES} bytes"));
+    }
+    Ok(Some(text))
+}
+
+/// A declared field as `Some`, unless it is empty.
+fn non_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+/// Mixin configs are the root `*.mixins.json` files and plain root entries naming mixins.
+fn declares_mixin_entry(name: &str) -> bool {
+    name.ends_with(".mixins.json") || (!name.contains('/') && name.contains("mixins"))
+}
+
+fn bound_reason(reason: String) -> String {
+    reason
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .take(MAX_REASON)
+        .collect()
+}
+
+/// A hint's colour: the warning tone only where it says the jar needs its own loader.
+fn hint_color(hint: JavaHint, n: &night::Night) -> u32 {
+    match hint {
+        JavaHint::NativeOnly => n.warn,
+        _ => n.muted,
+    }
 }
 
 /// Modrinth projects' icon URLs by project id, kept on disk beside the image cache so the icons
@@ -93,6 +287,7 @@ fn read(home: &Path, java_instance: bool) -> Vec<ModRow> {
                     };
                     let icon = images::jar_icon(&f.path(), images::ROW)
                         .map(|png| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png)));
+                    let (java, java_error) = read_java_meta(&f.path());
                     ModRow {
                         file,
                         name,
@@ -100,6 +295,8 @@ fn read(home: &Path, java_instance: bool) -> Vec<ModRow> {
                         on,
                         entry,
                         icon,
+                        java,
+                        java_error,
                     }
                 })
             })
@@ -114,6 +311,8 @@ fn read(home: &Path, java_instance: bool) -> Vec<ModRow> {
                 on: horizon::mod_id(&e).is_some_and(|id| java::is_enabled(home, id)),
                 entry: Some(e),
                 icon: None,
+                java: None,
+                java_error: None,
             })
             .collect()
     };
@@ -136,7 +335,8 @@ impl Launcher {
     }
 
     /// Reads the selected instance's mods off the UI thread, once until something changes them.
-    fn load_instance_mods(&mut self, cx: &mut Context<Self>) {
+    /// The Mods page (`mods_page.rs`) borrows this list for installed jars' metadata too.
+    pub(super) fn load_instance_mods(&mut self, cx: &mut Context<Self>) {
         let Some(i) = self.selected_instance() else {
             return;
         };
@@ -471,7 +671,28 @@ impl Launcher {
                         shell::text(night::CAPTION, c(n.muted))
                             .truncate()
                             .child(source),
-                    ),
+                    )
+                    .children(row.java.as_ref().map(|meta| {
+                        let hint = meta.hint();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                shell::text(night::CAPTION, c(n.muted))
+                                    .truncate()
+                                    .child(mods_page::java_identity(meta)),
+                            )
+                            .child(
+                                shell::text(night::CAPTION, c(hint_color(hint, &n)))
+                                    .child(tr(hint.label())),
+                            )
+                    }))
+                    .children(row.java_error.as_ref().map(|reason| {
+                        shell::text(night::CAPTION, c(n.muted))
+                            .truncate()
+                            .child(trf("Not checked: {error}", &[("error", reason)]))
+                    })),
             )
             .children(update)
             .child(
@@ -488,6 +709,147 @@ impl Launcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A jar with `entries`, built at test time; the metadata reader never needs the network.
+    fn jar(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, body) in entries {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("instance-mods-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("mods")).unwrap();
+        home
+    }
+
+    #[test]
+    fn reads_fabric_identity_mixins_and_hint() {
+        let home = temp("fabric");
+        let lumen = home.join("mods/lumen.jar");
+        jar(
+            &lumen,
+            &[
+                ("fabric.mod.json", br#"{"id":"lumen","version":"0.6.2"}"#),
+                ("lumen.mixins.json", b"{}"),
+            ],
+        );
+        let (meta, error) = read_java_meta(&lumen);
+        let meta = meta.unwrap();
+        assert!(error.is_none());
+        assert_eq!(
+            (
+                meta.loader,
+                meta.id.as_deref(),
+                meta.version.as_deref(),
+                meta.hint()
+            ),
+            (
+                LoaderKind::Fabric,
+                Some("lumen"),
+                Some("0.6.2"),
+                JavaHint::NativeOnly
+            )
+        );
+
+        let plain = home.join("mods/plain.jar");
+        jar(
+            &plain,
+            &[("fabric.mod.json", br#"{"id":"plain","version":"1.0"}"#)],
+        );
+        let meta = read_java_meta(&plain).0.unwrap();
+        assert!(!meta.mixins);
+        assert_eq!(meta.hint(), JavaHint::JvmFallback);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn reads_neoforge_identity_and_hint() {
+        let home = temp("neoforge");
+        let ruby = home.join("mods/ruby.jar");
+        jar(
+            &ruby,
+            &[(
+                "META-INF/neoforge.mods.toml",
+                br#"[[mods]]
+modId = "ruby"
+version = "1.2.0"
+"#,
+            )],
+        );
+        let meta = read_java_meta(&ruby).0.unwrap();
+        assert_eq!(
+            (
+                meta.loader,
+                meta.id.as_deref(),
+                meta.version.as_deref(),
+                meta.hint()
+            ),
+            (
+                LoaderKind::NeoForge,
+                Some("ruby"),
+                Some("1.2.0"),
+                JavaHint::JvmFallback
+            )
+        );
+
+        let shaded = home.join("mods/shaded.jar");
+        jar(
+            &shaded,
+            &[
+                (
+                    "META-INF/neoforge.mods.toml",
+                    br#"[[mods]]
+modId = "shaded"
+version = "2.0"
+[[mixins]]
+config = "shaded.mixins.json"
+"#,
+                ),
+                ("shaded.mixins.json", b"{}"),
+            ],
+        );
+        let meta = read_java_meta(&shaded).0.unwrap();
+        assert!(meta.mixins);
+        assert_eq!(meta.hint(), JavaHint::NativeOnly);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_malformed_jar_keeps_its_row_with_a_reason() {
+        let home = temp("malformed");
+        jar(
+            &home.join("mods/broken.jar"),
+            &[("fabric.mod.json", b"{not json")],
+        );
+        std::fs::write(home.join("mods/plain.jar"), b"nope").unwrap();
+        let rows = read(&home, true);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.on));
+
+        let broken = rows
+            .iter()
+            .find(|r| r.file.ends_with("broken.jar"))
+            .unwrap();
+        assert!(broken.java.is_none());
+        assert!(broken
+            .java_error
+            .as_deref()
+            .unwrap()
+            .contains("fabric.mod.json"));
+
+        let not_zip = rows.iter().find(|r| r.file.ends_with("plain.jar")).unwrap();
+        assert!(not_zip.java.is_none());
+        assert!(not_zip.java_error.is_some());
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn a_java_instance_lists_its_jars_on_and_off() {

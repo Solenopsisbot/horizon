@@ -267,6 +267,19 @@ pub(super) fn stars(id: &str, t: &theme::Theme) -> Option<Div> {
     })
 }
 
+/// A Java jar's identity as its rows show it: `Fabric · lumen · 0.6.2`, with whichever of the
+/// id and version its metadata declares. It is empty only for a jar with no metadata.
+pub(super) fn java_identity(meta: &instance_mods::JavaMeta) -> String {
+    let mut parts = vec![meta.loader.name()];
+    if let Some(id) = &meta.id {
+        parts.push(id);
+    }
+    if let Some(version) = &meta.version {
+        parts.push(version);
+    }
+    parts.join(" · ")
+}
+
 /// A checksum as the page shows it: the algorithm and the first and last hex digits.
 fn short_sum(checksum: &str) -> String {
     let (algo, hex) = checksum.split_once(':').unwrap_or(("", checksum));
@@ -872,6 +885,8 @@ impl Launcher {
     pub(super) fn mods_page(&mut self, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         self.mods_load();
+        // The installed rows show jars' own metadata, read with Home's mod list.
+        self.load_instance_mods(cx);
         if !self.mods.asked {
             self.mods.asked = true;
             self.mods_search(0);
@@ -1155,8 +1170,22 @@ impl Launcher {
             return None;
         }
         let busy = self.mods.busy.is_some();
+        // A Java jar's own metadata, read with the instance's mod list (`instance_mods.rs`).
+        let java_meta: HashMap<&str, (Option<&instance_mods::JavaMeta>, Option<&str>)> =
+            if self.mods.java.is_some() {
+                self.instance_mods
+                    .java_rows()
+                    .map(|(file, meta, error)| (file, (meta, error)))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
         let row = |i: usize| {
             let e = entries[i];
+            let (java, meta_error) = java_meta
+                .get(e.file.as_str())
+                .copied()
+                .unwrap_or((None, None));
             let key = (e.source, e.project.clone());
             let mut right = div().flex().items_center().gap(px(8.));
             if let Some(number) = self.mods.updates.get(&key) {
@@ -1264,6 +1293,25 @@ impl Launcher {
                     div()
                         .text_color(t.ink_soft)
                         .child(trf("Not ported: {item}", &[("item", s)]))
+                }))
+                .children(java.map(|meta| {
+                    let hint = meta.hint();
+                    let color = if hint == instance_mods::JavaHint::NativeOnly {
+                        t.warn
+                    } else {
+                        t.muted
+                    };
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(java_identity(meta))
+                        .child(div().text_color(color).child(tr(hint.label())))
+                }))
+                .children(meta_error.map(|reason| {
+                    div()
+                        .text_color(t.ink_soft)
+                        .child(trf("Not checked: {error}", &[("error", reason)]))
                 }))
                 .child(div().font_family(theme::MONO).child(trf(
                     "checked: {checksum}",
@@ -1536,6 +1584,31 @@ fn source_switch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_identity_reads_loader_id_version() {
+        let meta = instance_mods::JavaMeta {
+            loader: instance_mods::LoaderKind::Fabric,
+            id: Some("lumen".into()),
+            version: Some("0.6.2".into()),
+            mixins: true,
+        };
+        assert_eq!(java_identity(&meta), "Fabric · lumen · 0.6.2");
+        assert_eq!(meta.hint(), instance_mods::JavaHint::NativeOnly);
+        assert_eq!(
+            instance_mods::JavaHint::JvmFallback.label(),
+            "Java fallback may run it"
+        );
+
+        let partial = instance_mods::JavaMeta {
+            loader: instance_mods::LoaderKind::NeoForge,
+            id: Some("ruby".into()),
+            version: None,
+            mixins: false,
+        };
+        assert_eq!(java_identity(&partial), "NeoForge · ruby");
+        assert_eq!(partial.hint(), instance_mods::JavaHint::JvmFallback);
+    }
 
     #[test]
     fn counts_and_checksums_read_short() {
