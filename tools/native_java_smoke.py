@@ -352,6 +352,7 @@ def expect_probe(
     payload_directions: list[str],
     minimum_calls: int,
     covered: str = "",
+    registrations: list[tuple[str, str]] | None = None,
 ) -> dict | None:
     """Probe one jar and check its whole JSON report; ``None`` means failure."""
     status, report, output = probe_json(archive, kind)
@@ -377,6 +378,16 @@ def expect_probe(
             f"payload directions {report.get('payload_directions')!r}, "
             f"expected {payload_directions!r}"
         )
+    if registrations is not None:
+        recorded = [
+            (entry.get("registry"), entry.get("id"))
+            for entry in report.get("registrations", [])
+            if isinstance(entry, dict)
+        ]
+        if recorded != registrations:
+            problems.append(
+                f"registrations {recorded!r}, expected {registrations!r}"
+            )
     if problems:
         print(
             f"native {name} probe failed: {', '.join(problems)}: "
@@ -389,19 +400,16 @@ def expect_probe(
 
 def expect_rejected(archive: Path, class_name: str, method: str) -> bool:
     """A jar whose entrypoint lacks ``method`` must fail and name both."""
-    # ``--json`` is the probe's only working invocation form today: the plain
-    # CLI consumes the jar path as its optional switch, so the JSON error report
-    # is the channel that carries the failure text.
     result = run_probe(archive)
     try:
         report = json.loads(result.stdout.strip().splitlines()[-1])
     except (IndexError, json.JSONDecodeError):
         report = {}
-    error = str(report.get("error", ""))
+    error = str(report.get("error", "")) + result.stderr
     if (
         result.returncode != 0
-        and report.get("status") == "error"
-        and report.get("stage") == "execute"
+        and report.get("status", "error") in ("error", None)
+        and (report.get("stage") in ("execute", None))
         and class_name in error
         and method in error
     ):
@@ -561,8 +569,29 @@ def main() -> int:
             20,
             "Optional/OptionalLong/OptionalDouble, Map.forEach, Identifier, "
             "Registry.register and void host paths",
+            [("minecraft:item", "demo:ruby")],
         )
         if report is None:
+            return 1
+        # The plain (non-JSON) invocation has to accept a bare jar path: the
+        # old parser consumed it as an optional switch and printed usage.
+        plain = run(
+            [
+                "cargo",
+                "run",
+                "--quiet",
+                "-p",
+                "horizon-native-java",
+                "--",
+                str(fabric_jar),
+            ]
+        )
+        if plain.returncode != 0 or "entrypoint(s) ran" not in plain.stdout:
+            print(
+                f"native plain CLI failed ({plain.returncode}):\n"
+                f"{plain.stderr}{plain.stdout}",
+                file=sys.stderr,
+            )
             return 1
         neo_report = expect_probe(
             "neoforge", neo_jar, "neoforge", ["demo.Neo"], ["configurationToClient"], 4, ""

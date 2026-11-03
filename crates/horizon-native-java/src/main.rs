@@ -1,16 +1,50 @@
 use horizon_native_java::{NativeJar, StdHost};
 use std::{path::PathBuf, process::ExitCode};
 
+/// Command-line shape: `--json` may appear anywhere, the remaining arguments
+/// are the jar, an optional loader kind, and an optional explicit class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cli {
+    json: bool,
+    path: String,
+    kind: Option<String>,
+    class: Option<String>,
+}
+
+impl Cli {
+    fn parse(args: impl IntoIterator<Item = String>) -> Option<Self> {
+        let mut json = false;
+        let mut positional = Vec::new();
+        for arg in args {
+            if arg == "--json" {
+                json = true;
+            } else {
+                positional.push(arg);
+            }
+        }
+        let mut positional = positional.into_iter();
+        Some(Self {
+            json,
+            path: positional.next()?,
+            kind: positional.next(),
+            class: positional.next(),
+        })
+    }
+}
+
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    let json = args.next().is_some_and(|arg| arg == "--json");
-    let Some(path) = args.next() else {
+    let Some(cli) = Cli::parse(std::env::args().skip(1)) else {
         eprintln!(
             "usage: horizon-native-java [--json] <mod.jar> [main|client|server|neoforge] [class]"
         );
         return ExitCode::FAILURE;
     };
-    let requested_kind = args.next();
+    let Cli {
+        json,
+        path,
+        kind: requested_kind,
+        class: explicit_class,
+    } = cli;
     let mut kind = requested_kind.clone().unwrap_or_else(|| "main".to_owned());
     let jar = match NativeJar::from_path(&PathBuf::from(path)) {
         Ok(jar) => jar,
@@ -26,7 +60,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let entrypoints = if let Some(class) = args.next() {
+    let entrypoints = if let Some(class) = explicit_class {
         vec![horizon_native_java::Entrypoint {
             class,
             method: None,
@@ -92,6 +126,17 @@ fn main() -> ExitCode {
                             .iter()
                             .map(|registration| registration.direction.clone())
                             .collect::<Vec<_>>(),
+                        "registrations": host
+                            .registrations()
+                            .iter()
+                            .map(|entry| serde_json::json!({
+                                "registry": entry.registry,
+                                "id": entry.id,
+                                "typed": entry.declaration.is_some(),
+                            }))
+                            .collect::<Vec<_>>(),
+                        "listeners": host.listener_registrations().count(),
+                        "events": host.posted_events().len(),
                     })
                 );
             } else {
@@ -114,5 +159,40 @@ fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+
+    fn parse(args: &[&str]) -> Option<Cli> {
+        Cli::parse(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    fn json_flag_is_position_independent() {
+        let expected = Cli {
+            json: true,
+            path: "mod.jar".into(),
+            kind: Some("client".into()),
+            class: Some("demo.Main".into()),
+        };
+        assert_eq!(parse(&["--json", "mod.jar", "client", "demo.Main"]), Some(expected.clone()));
+        assert_eq!(parse(&["mod.jar", "--json", "client", "demo.Main"]), Some(expected));
+    }
+
+    #[test]
+    fn bare_jar_is_a_valid_invocation() {
+        assert_eq!(
+            parse(&["mod.jar"]),
+            Some(Cli {
+                json: false,
+                path: "mod.jar".into(),
+                kind: None,
+                class: None,
+            })
+        );
+        assert_eq!(parse(&[]), None);
     }
 }
