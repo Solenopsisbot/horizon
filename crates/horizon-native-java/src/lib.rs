@@ -6554,6 +6554,15 @@ pub struct NativeJar {
 
 const MAX_RESOURCE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESOURCE_TOTAL: usize = 32 * 1024 * 1024;
+/// Mixin JSON configs one jar may declare. Configs past this bound are
+/// reported through [`NativeJar::mixin_config_errors`] instead of growing the
+/// report.
+const MAX_MIXIN_CONFIGS: usize = 256;
+/// Class entries (`mixins` + `client` + `server`) one config may list.
+const MAX_MIXIN_CONFIG_CLASSES: usize = 4096;
+/// Bytes one Mixin config may occupy. This sits below the jar-wide resource
+/// bound so one oversized config cannot hide the rest of the jar's metadata.
+const MAX_MIXIN_CONFIG_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entrypoint {
@@ -6569,6 +6578,35 @@ pub struct ExecutionReport {
     pub class: String,
     pub method: String,
     pub calls: usize,
+}
+
+/// One Mixin JSON config a native jar declares.
+///
+/// Only the bounded metadata a loader needs to find the mixin classes is
+/// modelled: the config's own package, its three class lists, and the scalar
+/// settings Mixin applies before it prepares a class. The entries in
+/// `mixins`/`client`/`server` are already qualified with `package`, so a
+/// caller can resolve them as Java binary names without re-reading the config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixinConfig {
+    /// Jar resource path, e.g. `demo.mixins.json`.
+    pub path: String,
+    /// The `package` the config declares, if any.
+    pub package: Option<String>,
+    /// `mixins` entries, package-qualified, in declaration order.
+    pub mixins: Vec<String>,
+    /// `client` entries, package-qualified, in declaration order.
+    pub client: Vec<String>,
+    /// `server` entries, package-qualified, in declaration order.
+    pub server: Vec<String>,
+    /// Mixin's `required` flag; true when the config omits it.
+    pub required: bool,
+    /// Mixin's `priority`; absent when the config omits it.
+    pub priority: Option<i32>,
+    /// Optional Mixin config plugin class.
+    pub plugin: Option<String>,
+    /// Optional refmap resource name.
+    pub refmap: Option<String>,
 }
 
 impl NativeJar {
@@ -6713,6 +6751,66 @@ impl NativeJar {
         });
         targets.dedup();
         targets
+    }
+
+    /// Read the Mixin JSON configs this jar declares.
+    ///
+    /// Config paths come from `fabric.mod.json`'s `mixins` list (bare strings
+    /// and `{config, environment}` objects) and from every root-level
+    /// `*.mixins.json` resource; `nested/x.mixins.json` is read only when the
+    /// metadata names it. Configs are sorted by path, and a malformed,
+    /// oversized or out-of-bound config is skipped and reported by
+    /// [`Self::mixin_config_errors`] so it never hides the rest.
+    pub fn mixin_configs(&self) -> Vec<MixinConfig> {
+        self.mixin_config_scan().0
+    }
+
+    /// Config paths that could not be read, as `(path, reason)`, sorted by
+    /// path. These are diagnostics, not a failure: the remaining configs are
+    /// still returned by [`Self::mixin_configs`].
+    pub fn mixin_config_errors(&self) -> Vec<(String, String)> {
+        self.mixin_config_scan().1
+    }
+
+    fn mixin_config_scan(&self) -> (Vec<MixinConfig>, Vec<(String, String)>) {
+        let mut paths = BTreeSet::new();
+        if let Some(text) = self
+            .resource_bytes
+            .get("fabric.mod.json")
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        {
+            paths.extend(fabric_mixin_config_paths(text));
+        }
+        for name in self.resources.keys() {
+            if !name.contains('/') && name.ends_with(".mixins.json") {
+                paths.insert(name.clone());
+            }
+        }
+        let mut configs = Vec::new();
+        let mut errors = Vec::new();
+        for path in paths {
+            if configs.len() >= MAX_MIXIN_CONFIGS {
+                errors.push((
+                    path,
+                    format!(
+                        "mixin config discovery reached the bound of {MAX_MIXIN_CONFIGS} configs"
+                    ),
+                ));
+                continue;
+            }
+            let Some(bytes) = self.resource_bytes.get(&path) else {
+                errors.push((
+                    path,
+                    "mixin config is not available in the jar's bounded resource table".to_owned(),
+                ));
+                continue;
+            };
+            match parse_mixin_config(&path, bytes) {
+                Ok(config) => configs.push(config),
+                Err(reason) => errors.push((path, reason)),
+            }
+        }
+        (configs, errors)
     }
 
     /// Select and validate the discovered plans for one requested target.
@@ -9771,6 +9869,156 @@ fn parse_metadata(
     Ok((id, version, entrypoints, required_mods))
 }
 
+/// Config paths `fabric.mod.json` names under `mixins`.
+///
+/// Fabric accepts a bare string or a `{config, environment}` object per entry.
+/// The environment picks which side loads the config and does not change the
+/// classes it lists, so it is not part of the bounded row here.
+fn fabric_mixin_config_paths(text: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(mixins) = value.get("mixins") else {
+        return Vec::new();
+    };
+    let values = match mixins {
+        serde_json::Value::Array(values) => values.clone(),
+        value => vec![value.clone()],
+    };
+    values
+        .into_iter()
+        .filter_map(|value| match value {
+            serde_json::Value::String(path) => Some(path),
+            serde_json::Value::Object(object) => object
+                .get("config")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Read one Mixin JSON config under the bounded native limits.
+///
+/// The root must be an object. A one-entry class list may be a bare string as
+/// well as an array, because hand-written configs collapse it; every other
+/// shape is a diagnostic. Missing scalars keep Mixin's defaults: `required`
+/// is true and `priority` is absent.
+fn parse_mixin_config(path: &str, bytes: &[u8]) -> Result<MixinConfig, String> {
+    if bytes.len() > MAX_MIXIN_CONFIG_BYTES {
+        return Err(format!(
+            "mixin config exceeds the {MAX_MIXIN_CONFIG_BYTES}-byte bound"
+        ));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| "mixin config is not UTF-8".to_owned())?;
+    let value = serde_json::from_str::<serde_json::Value>(text)
+        .map_err(|error| format!("malformed mixin JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "mixin config root is not a JSON object".to_owned())?;
+    let package = object
+        .get("package")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    if let Some(package) = package.as_deref()
+        && !is_java_binary_name(package)
+    {
+        return Err(format!("invalid mixin package {package}"));
+    }
+    let mixins = mixin_class_list(object, "mixins", package.as_deref())?;
+    let client = mixin_class_list(object, "client", package.as_deref())?;
+    let server = mixin_class_list(object, "server", package.as_deref())?;
+    if mixins.len() + client.len() + server.len() > MAX_MIXIN_CONFIG_CLASSES {
+        return Err(format!(
+            "mixin config declares more than {MAX_MIXIN_CONFIG_CLASSES} class entries"
+        ));
+    }
+    Ok(MixinConfig {
+        path: path.to_owned(),
+        package,
+        mixins,
+        client,
+        server,
+        required: object
+            .get("required")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        priority: object
+            .get("priority")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|priority| i32::try_from(priority).ok()),
+        plugin: object
+            .get("plugin")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        refmap: object
+            .get("refmap")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// Read and qualify one class list of a Mixin config.
+///
+/// Entries stay in declaration order; a class named twice is kept once, the
+/// way Mixin's own config model deduplicates it.
+fn mixin_class_list(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    package: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let values = match object.get(key) {
+        Some(serde_json::Value::Array(values)) => values.clone(),
+        Some(serde_json::Value::String(value)) => vec![serde_json::Value::String(value.clone())],
+        Some(serde_json::Value::Null) | None => Vec::new(),
+        Some(_) => return Err(format!("mixin config {key} is not a string list")),
+    };
+    let mut names = Vec::new();
+    for value in values {
+        let name = value
+            .as_str()
+            .ok_or_else(|| format!("mixin config {key} has a non-string entry"))?;
+        let qualified = qualify_mixin_class(package, name);
+        if !is_java_binary_name(&qualified) {
+            return Err(format!("invalid mixin class name {name}"));
+        }
+        if !names.contains(&qualified) {
+            names.push(qualified);
+        }
+    }
+    Ok(names)
+}
+
+/// Qualify one config class entry with the config's package.
+///
+/// Entries are relative to `package` in Mixin, but a config that already
+/// spells the package out keeps its name instead of gaining a second copy.
+fn qualify_mixin_class(package: Option<&str>, name: &str) -> String {
+    match package {
+        Some(package)
+            if !name
+                .strip_prefix(package)
+                .is_some_and(|rest| rest.starts_with('.')) =>
+        {
+            format!("{package}.{name}")
+        }
+        _ => name.to_owned(),
+    }
+}
+
+/// Whether `name` is a Java binary name under this crate's bounded grammar:
+/// dot-separated segments of ASCII letters, digits, `_` and `$`, with no empty
+/// segment.
+fn is_java_binary_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+        })
+}
+
 /// Forge 1.x and NeoForge use the same `@Mod` bootstrap convention, but the
 /// annotation moved packages when NeoForge forked. Keep both markers so a
 /// legacy Forge 26.3 jar is discoverable by the bounded native probe.
@@ -10604,6 +10852,92 @@ mandatory = true
             Some(RegistryDeclaration::Recipe { .. })
         ));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mixin_configs_discover_root_configs_without_fabric_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "horizon-native-mixin-config-discovery-{}.jar",
+            std::process::id()
+        ));
+        let file = File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("auto.mixins.json", options).unwrap();
+        zip.write_all(br#"{"mixins":["demo.AutoMixin"]}"#).unwrap();
+        zip.start_file("nested/nested.mixins.json", options)
+            .unwrap();
+        zip.write_all(br#"{"mixins":["demo.NestedMixin"]}"#)
+            .unwrap();
+        zip.finish().unwrap();
+
+        let jar = NativeJar::from_path(&path).unwrap();
+        let configs = jar.mixin_configs();
+        assert_eq!(
+            configs
+                .iter()
+                .map(|config| config.path.as_str())
+                .collect::<Vec<_>>(),
+            ["auto.mixins.json"],
+            "only root-level configs are discovered without metadata"
+        );
+        assert_eq!(configs[0].mixins, ["demo.AutoMixin"]);
+        // Mixin's defaults: required unless declared, no priority.
+        assert!(configs[0].required);
+        assert_eq!(configs[0].priority, None);
+        assert!(jar.mixin_config_errors().is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mixin_config_bounds_reject_oversized_files_and_entry_lists() {
+        let oversized = vec![b' '; MAX_MIXIN_CONFIG_BYTES + 1];
+        let error = parse_mixin_config("big.mixins.json", &oversized).unwrap_err();
+        assert!(error.contains("byte bound"), "unexpected reason: {error}");
+
+        let mixins = (0..=MAX_MIXIN_CONFIG_CLASSES)
+            .map(|index| format!("\"Mixin{index}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let text = format!("{{\"package\":\"demo.mixin\",\"mixins\":[{mixins}]}}");
+        let error = parse_mixin_config("many.mixins.json", text.as_bytes()).unwrap_err();
+        assert!(
+            error.contains("more than 4096 class entries"),
+            "unexpected reason: {error}"
+        );
+    }
+
+    #[test]
+    fn mixin_config_rejects_invalid_class_and_package_names() {
+        let text = br#"{"package":"demo.mixin","mixins":["Bad/Name"]}"#;
+        let error = parse_mixin_config("bad.mixins.json", text).unwrap_err();
+        assert!(
+            error.contains("invalid mixin class name Bad/Name"),
+            "unexpected reason: {error}"
+        );
+
+        let text = br#"{"package":"demo..mixin","mixins":["Fine"]}"#;
+        let error = parse_mixin_config("package.mixins.json", text).unwrap_err();
+        assert!(
+            error.contains("invalid mixin package demo..mixin"),
+            "unexpected reason: {error}"
+        );
+    }
+
+    #[test]
+    fn mixin_config_keeps_declaration_order_and_deduplicates() {
+        let text = br#"{"package":"demo.mixin","mixins":["Beta","Alpha","Beta"],"client":["demo.mixin.Alpha"]}"#;
+        let config = parse_mixin_config("demo.mixins.json", text).unwrap();
+        assert_eq!(
+            config.mixins,
+            ["demo.mixin.Beta", "demo.mixin.Alpha"],
+            "declaration order survives, a repeated class appears once"
+        );
+        assert_eq!(
+            config.client,
+            ["demo.mixin.Alpha"],
+            "an already-qualified entry is not prefixed twice"
+        );
     }
 
     #[test]

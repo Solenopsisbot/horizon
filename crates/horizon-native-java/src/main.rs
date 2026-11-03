@@ -99,10 +99,31 @@ fn mixin_plan_entries(plans: &[MixinInjectionPlan]) -> Vec<serde_json::Value> {
 /// The `--mixin-plans` report: planning only, no entrypoint is required.
 fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
     let plans = jar.mixin_injection_plans();
+    let configs = jar
+        .mixin_configs()
+        .iter()
+        .map(|config| {
+            serde_json::json!({
+                "path": config.path,
+                "package": config.package,
+                "mixins": config.mixins,
+                "client": config.client,
+                "server": config.server,
+                "required": config.required,
+                "priority": config.priority,
+            })
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "status": "ok",
         "targets": mixin_target_labels(plans.iter().map(|plan| &plan.target)),
         "plans": mixin_plan_entries(&plans),
+        "configs": configs,
+        "config_errors": jar
+            .mixin_config_errors()
+            .iter()
+            .map(|(path, reason)| serde_json::json!([path, reason]))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -223,6 +244,7 @@ fn main() -> ExitCode {
                             jar.discovered_mixin_targets().iter()
                         ),
                         "mixin_plans": jar.mixin_injection_plans().len(),
+                        "mixin_configs": jar.mixin_configs().len(),
                     })
                 );
             } else {
@@ -301,5 +323,57 @@ mod tests {
             })
         );
         assert_eq!(parse(&[]), None);
+    }
+
+    #[test]
+    fn mixin_plan_report_carries_configs_and_errors() {
+        use super::mixin_plans_json;
+        use horizon_native_java::NativeJar;
+        use std::io::Write;
+
+        let root = std::env::temp_dir().join(format!(
+            "horizon-native-java-plan-report-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("report.jar");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(br#"{"id":"report","mixins":["demo.mixins.json","broken.mixins.json"]}"#)
+            .unwrap();
+        zip.start_file("demo.mixins.json", options).unwrap();
+        zip.write_all(
+            br#"{"package":"demo.mixin","mixins":["DemoMixin"],"required":false,"priority":1500}"#,
+        )
+        .unwrap();
+        zip.start_file("broken.mixins.json", options).unwrap();
+        zip.write_all(br#"[]"#).unwrap();
+        zip.finish().unwrap();
+
+        let jar = NativeJar::from_path(&path).unwrap();
+        let report = mixin_plans_json(&jar);
+        assert_eq!(report["status"], "ok");
+        assert!(report["plans"].as_array().unwrap().is_empty());
+        let configs = report["configs"].as_array().unwrap();
+        assert_eq!(configs.len(), 1, "unexpected configs: {configs:#?}");
+        assert_eq!(configs[0]["path"], "demo.mixins.json");
+        assert_eq!(configs[0]["package"], "demo.mixin");
+        assert_eq!(
+            configs[0]["mixins"],
+            serde_json::json!(["demo.mixin.DemoMixin"])
+        );
+        assert_eq!(configs[0]["required"], false);
+        assert_eq!(configs[0]["priority"], 1500);
+        let errors = report["config_errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "unexpected errors: {errors:#?}");
+        assert_eq!(errors[0][0], "broken.mixins.json");
+        assert!(
+            errors[0][1].as_str().unwrap().contains("JSON object"),
+            "reason names the shape: {}",
+            errors[0][1]
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
