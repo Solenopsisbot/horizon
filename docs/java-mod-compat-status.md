@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `0cb1465ce`.
+Last checked: 3 November 2026, commit `56e32c553`.
 
 ## Supported now
 
@@ -46,7 +46,7 @@ Last checked: 3 November 2026, commit `0cb1465ce`.
 
 ## Validation snapshot
 
-- `horizon-native-java`: 108 unit tests passing, including bounded jar-resource stream reads and cursor operations, compiled HEAD/RETURN/TAIL injector fixtures and overwrite replacement execution, Fabric `MappingResolver` identity queries, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection and bounded field metadata, TagKey values, bounded primitive optionals, custom payload type identity, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries, and bounded Map.Entry equality/hashing.
+- `horizon-native-java`: 108 unit tests passing, including bounded jar-resource stream reads and cursor operations, compiled HEAD/RETURN/TAIL injector fixtures, ordered callback chains, and overwrite replacement execution, Fabric `MappingResolver` identity queries, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection and bounded field metadata, TagKey values, bounded primitive optionals, custom payload type identity, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries, and bounded Map.Entry equality/hashing.
 - `horizon-mods`: 36 unit tests passing, plus the runtime-built typed declaration adapter fixture.
 - `horizon-port-pack`: 177 unit tests passing, including bounded Item.Properties and BlockBehaviour.Properties façade values, Mixin `@At`/slice boundary metadata and values (including descriptor-bearing `@At(target:...)` selectors), config edge values, Mixin Extras injector normalization, loader ABI classification, Mojang codec/datafixer ABI coverage, native declaration-kind reporting, deduplicated Mixin hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, sealed InteractionResult façade values, BlockHitResult state coverage, FriendlyByteBuf façade values, and descriptor normalization coverage.
 - `horizon-jvm`: 12 unit tests passing, including explicit fallback labels, static-initialization fallback diagnostics, and NeoForge constructor-only entry selection.
