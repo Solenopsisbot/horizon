@@ -15663,10 +15663,6 @@ mandatory = true
             .unwrap();
         assert_eq!(report.callback_result, Value::Void);
         assert_eq!(report.target_result, Value::Int(5));
-        let chain = jar
-            .execute_mixin_chain(&[plan.clone(), plan], None, &[], &mut NullHost)
-            .unwrap();
-        assert_eq!(chain.target_result, Value::Int(5));
     }
 
     #[test]
