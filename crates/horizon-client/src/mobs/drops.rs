@@ -395,10 +395,63 @@ pub fn orb_value(amount: i32) -> i32 {
     1
 }
 
+/// The `LivingEntity` loot table for an entity id: `entities/<path>` in the
+/// id's own namespace (`minecraft:entities/cow`, `ruby:entities/goblin`).
+fn entity_table(id: &str) -> String {
+    let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
+    format!("{namespace}:entities/{path}")
+}
+
+/// The vanilla entity id a species' own type has without its namespace
+/// (`zombie`), which names the loot table a declared entity inherits:
+/// `MobTypes::add_alias` copies the template whole, species included, so a
+/// declared id's species still says which vanilla entity it is. `None` for a
+/// species that has no vanilla type of its own.
+pub fn species_entity_id(s: Species) -> Option<&'static str> {
+    species::ALL
+        .iter()
+        .find(|def| def.species == s)
+        .map(|def| def.name)
+}
+
+/// The loot table a dying mob rolls (`getLootTable`), in precedence order:
+///
+/// 1. the mob's own table, when the pack holds it: a declared entity may
+///    write `data/<namespace>/loot_table/entities/<name>.json` and that
+///    table wins over everything;
+/// 2. the table of the vanilla template a declared entity copies (its
+///    [`species_entity_id`], or `MobTypes::template_of` when a caller keeps
+///    the declared template), so an alias with no table of its own drops what
+///    its template drops;
+/// 3. the mob's own table anyway, which for a vanilla mob is exactly
+///    vanilla's and for an undeclared alias rolls nothing.
+pub fn death_loot(id: &str, template: Option<&str>, has_table: impl Fn(&str) -> bool) -> String {
+    let own = entity_table(id);
+    if has_table(&own) {
+        return own;
+    }
+    if let Some(table) = template.map(entity_table).filter(|t| has_table(t)) {
+        return table;
+    }
+    own
+}
+
 /// `LivingEntity.die`'s drops for `m` (equipment it loses is removed from
 /// it). Returns the drops in spawn order and whether a charged creeper
 /// killer dropped a head (`Creeper.droppedSkulls`).
 pub fn die(m: &mut Mob, d: &Death, sequences: &mut RandomSequences) -> (Vec<Drop>, bool) {
+    die_with_template(m, d, None, sequences)
+}
+
+/// [`die`] for a mob that may be a declared entity: `template` is the vanilla
+/// entity it copies ([`species_entity_id`]), whose loot table it inherits
+/// unless the pack declares one for its own id ([`death_loot`]).
+pub fn die_with_template(
+    m: &mut Mob,
+    d: &Death,
+    template: Option<&str>,
+    sequences: &mut RandomSequences,
+) -> (Vec<Drop>, bool) {
     let mut out = Vec::new();
     let this = loot_entity(m, d.vehicle.clone());
     let mut skulls = false;
@@ -438,10 +491,7 @@ pub fn die(m: &mut Mob, d: &Death, sequences: &mut RandomSequences) -> (Vec<Drop
         .flatten();
     let drops_loot = d.mob_drops && (is_monster(s) || !m.is_baby());
     if drops_loot {
-        let table = format!(
-            "minecraft:entities/{}",
-            m.kind.id.trim_start_matches("minecraft:")
-        );
+        let table = death_loot(&m.kind.id, template, |t| d.loot.has_table(t));
         let params = EntityLootParams {
             this: this.clone(),
             damage: d.damage.clone(),
@@ -602,5 +652,85 @@ pub fn base_experience(m: &mut Mob) -> i32 {
                 reward
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{death_loot, species_entity_id};
+    use crate::mobs::Species;
+
+    /// A pack holding exactly `tables`.
+    fn pack(tables: &[&str]) -> impl Fn(&str) -> bool {
+        move |table| tables.contains(&table)
+    }
+
+    #[test]
+    fn a_species_names_the_vanilla_entity_its_type_copies() {
+        // The template a declared entity copied, recovered from its species:
+        // vanilla builds every type as `minecraft:<species name>`.
+        assert_eq!(species_entity_id(Species::Cow), Some("cow"));
+        assert_eq!(species_entity_id(Species::Zombie), Some("zombie"));
+        assert_eq!(
+            species_entity_id(Species::ZombieVillager),
+            Some("zombie_villager")
+        );
+    }
+
+    #[test]
+    fn a_declared_entity_drops_its_templates_table() {
+        // `ruby:goblin` copies `cow` and declares no table: it drops a cow's.
+        let tables = pack(&["minecraft:entities/cow"]);
+        assert_eq!(
+            death_loot("ruby:goblin", Some("cow"), &tables),
+            "minecraft:entities/cow"
+        );
+        // A qualified template names the same table; a template's own
+        // namespace is kept.
+        assert_eq!(
+            death_loot("ruby:goblin", Some("minecraft:cow"), &tables),
+            "minecraft:entities/cow"
+        );
+        // A template in another namespace keeps that namespace.
+        assert_eq!(
+            death_loot(
+                "ruby:goblin",
+                Some("other:beast"),
+                pack(&["other:entities/beast"])
+            ),
+            "other:entities/beast"
+        );
+    }
+
+    #[test]
+    fn a_vanilla_mob_keeps_its_own_table() {
+        // No template: exactly vanilla's `minecraft:entities/<path>`, both
+        // when the table exists and when it does not.
+        let tables = pack(&["minecraft:entities/cow"]);
+        assert_eq!(
+            death_loot("minecraft:cow", None, &tables),
+            "minecraft:entities/cow"
+        );
+        assert_eq!(
+            death_loot("minecraft:not_a_mob", None, &tables),
+            "minecraft:entities/not_a_mob"
+        );
+        // A bare id means the `minecraft` namespace.
+        assert_eq!(death_loot("cow", None, &tables), "minecraft:entities/cow");
+    }
+
+    #[test]
+    fn a_declared_table_wins_over_the_template() {
+        let tables = pack(&["ruby:entities/goblin", "minecraft:entities/cow"]);
+        assert_eq!(
+            death_loot("ruby:goblin", Some("cow"), &tables),
+            "ruby:entities/goblin"
+        );
+        // An alias whose template has no table either rolls its own (absent)
+        // table: no drops, like an unported entity.
+        assert_eq!(
+            death_loot("ruby:goblin", Some("cow"), pack(&[])),
+            "ruby:entities/goblin"
+        );
     }
 }

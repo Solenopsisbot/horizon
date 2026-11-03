@@ -1106,6 +1106,8 @@ impl Game<'_> {
         }
         own(self)
     }
+    /// A declared entity's table: the pack's own table for its id when it has
+    /// one, else its vanilla template's (`mobs::drops::death_loot`).
     fn drop_death_loot(
         &mut self,
         m: &mut Mob,
@@ -1174,7 +1176,13 @@ impl Game<'_> {
             mob_drops: self.ui.rules.bool("mob_drops"),
             world_seed: self.level.seed,
         };
-        let (items, skulls) = drops::die(m, &death, &mut self.rand_sequences);
+        // A declared entity drops from its own declared table when the pack
+        // has one, else from its vanilla template's: `add_alias` keeps the
+        // template's species, so that species names the entity whose table it
+        // inherits. A vanilla mob's own table is always its species' table.
+        let template = drops::species_entity_id(m.species());
+        let (items, skulls) =
+            drops::die_with_template(m, &death, template, &mut self.rand_sequences);
         if skulls && let Some(Who::Mob(id)) = m.last_damage.and_then(|(d, _)| d.attacker) {
             // Creeper.droppedSkulls: one head per charged explosion.
             self.combat.charged_exploders.retain(|c| *c != id);
