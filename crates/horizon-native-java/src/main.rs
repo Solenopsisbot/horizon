@@ -269,7 +269,10 @@ mod tests {
             parse(&["--json", "mod.jar", "client", "demo.Main"]),
             Some(expected.clone())
         );
-        assert_eq!(parse(&["mod.jar", "--json", "client", "demo.Main"]), Some(expected));
+        assert_eq!(
+            parse(&["mod.jar", "--json", "client", "demo.Main"]),
+            Some(expected)
+        );
     }
 
     #[test]
