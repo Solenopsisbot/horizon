@@ -11642,6 +11642,51 @@ mandatory = true
             host.invoke_instance(&environment, &loader, &[]).unwrap(),
             Value::Ref(Some("CLIENT".into()))
         );
+        let resolver_method = MethodRef {
+            owner: "net/fabricmc/loader/api/FabricLoader".into(),
+            name: "getMappingResolver".into(),
+            descriptor: "()Lnet/fabricmc/loader/api/MappingResolver;".into(),
+        };
+        let resolver = host
+            .invoke_instance(&resolver_method, &loader, &[])
+            .unwrap();
+        assert_eq!(resolver, Value::Ref(Some("fabric-mapping-resolver".into())));
+        let map_class = MethodRef {
+            owner: "net/fabricmc/loader/api/MappingResolver".into(),
+            name: "mapClassName".into(),
+            descriptor: "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &map_class,
+                &resolver,
+                &[
+                    Value::Ref(Some("named".into())),
+                    Value::Ref(Some("net.minecraft.Example".into())),
+                ],
+            )
+            .unwrap(),
+            Value::Ref(Some("net.minecraft.Example".into()))
+        );
+        let map_method = MethodRef {
+            owner: "net/fabricmc/loader/api/MappingResolver".into(),
+            name: "mapMethodName".into(),
+            descriptor: "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(
+                &map_method,
+                &resolver,
+                &[
+                    Value::Ref(Some("named".into())),
+                    Value::Ref(Some("net.minecraft.Example".into())),
+                    Value::Ref(Some("tick".into())),
+                    Value::Ref(Some("()V".into())),
+                ],
+            )
+            .unwrap(),
+            Value::Ref(Some("tick".into()))
+        );
         let server_host = StdHost::new().with_environment_type("SERVER");
         assert_eq!(
             server_host

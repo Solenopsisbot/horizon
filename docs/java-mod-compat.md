@@ -617,7 +617,9 @@ versions, empty `getProvides` and `getDependencies` collections (including
 `SERVER` via `with_environment_type`, including `EnvType.isClient`, `name`, and `ordinal`), and the
 game/config/mods paths, Fabric `ModContainer.getRootPaths` (a bounded mod-root marker), and a configurable
 `isDevelopmentEnvironment` marker (off by default), plus a deterministic `getAllMods` list backed by the seeded containers; callers seed the loaded-mod map with
-`with_mod`. NeoForge's `ModList.get().isLoaded`, `getMods`, and `getModContainerById` use the same seeded map and
+`with_mod`. Fabric's `getMappingResolver` returns an identity mapping marker for bounded
+`mapClassName`, `mapFieldName`, `mapMethodName`, `mapDescriptor`, and `unmapClassName` calls;
+the native path does not invent intermediary or obfuscated names. NeoForge's `ModList.get().isLoaded`, `getMods`, and `getModContainerById` use the same seeded map and
 return deterministic container markers, and `ModContainer.getModId` exposes the seeded id for
 NeoForge entrypoints. The corresponding legacy Forge owners (`net.minecraftforge.fml.ModList`,
 `ModContainer`, and `FMLJavaModLoadingContext`) are accepted as aliases and use the same deterministic
