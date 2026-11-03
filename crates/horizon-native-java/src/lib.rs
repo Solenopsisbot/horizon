@@ -6306,6 +6306,101 @@ impl NativeJar {
         })
     }
 
+    /// Execute a bounded single-hook Mixin `@Overwrite` replacement.
+    ///
+    /// The census emits this plan only when one native hook names the target
+    /// method and the overwrite has no call-site anchor. The replacement body
+    /// must have the exact target descriptor; arbitrary bytecode rewriting,
+    /// multiple competing overwrites, and cancellation remain JVM fallback.
+    pub fn execute_mixin_overwrite<H: Host>(
+        &self,
+        plan: &MixinInjectionPlan,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        if !plan.at.is_empty() {
+            return Err(NativeError::Metadata(
+                "native @Overwrite replacement requires an empty @At anchor".into(),
+            ));
+        }
+        if plan.cancellable {
+            return Err(NativeError::Metadata(
+                "native @Overwrite replacement does not support cancellation".into(),
+            ));
+        }
+        let target_class = self.classes.get(&plan.target.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                plan.target.owner, plan.target.name, plan.target.descriptor
+            ))
+        })?;
+        let target_method = target_class
+            .method(&plan.target.name, &plan.target.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    plan.target.owner, plan.target.name, plan.target.descriptor
+                ))
+            })?;
+        let callback_class = self.classes.get(&plan.callback.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                plan.callback.owner, plan.callback.name, plan.callback.descriptor
+            ))
+        })?;
+        let callback_method = callback_class
+            .method(&plan.callback.name, &plan.callback.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                ))
+            })?;
+        if plan.callback.descriptor != plan.target.descriptor {
+            return Err(NativeError::Metadata(format!(
+                "native @Overwrite {}#{}{} must match target {}#{}{}",
+                plan.callback.owner,
+                plan.callback.name,
+                plan.callback.descriptor,
+                plan.target.owner,
+                plan.target.name,
+                plan.target.descriptor
+            )));
+        }
+        if args.len() != arg_count(&plan.target.descriptor) {
+            return Err(NativeError::Metadata(format!(
+                "Mixin overwrite target {}#{}{} expected {} arguments, got {}",
+                plan.target.owner,
+                plan.target.name,
+                plan.target.descriptor,
+                arg_count(&plan.target.descriptor),
+                args.len()
+            )));
+        }
+        let callback_receiver = (!callback_method.is_static()).then(|| {
+            receiver
+                .clone()
+                .unwrap_or_else(|| Value::Ref(Some(plan.target.owner.clone())))
+        });
+        let replacement = self.invoke_method_with_args(
+            &plan.callback.owner,
+            &plan.callback.name,
+            &plan.callback.descriptor,
+            callback_receiver,
+            args,
+            host,
+        )?;
+        // `target_method` is deliberately looked up above: a replacement for
+        // an absent native hook is unsafe, even though the original body is
+        // not invoked on this path.
+        let _ = target_method;
+        Ok(MixinExecutionReport {
+            callback_result: replacement.clone(),
+            target_result: replacement,
+        })
+    }
+
     /// Execute one listener work item produced by [`StdHost::dispatch_event`].
     ///
     /// The callback marker carries the resolved method handle and captured
@@ -15503,6 +15598,62 @@ mandatory = true
             .execute_mixin_at_return(&plan, None, &[], &mut NullHost)
             .unwrap_err();
         assert!(error.to_string().contains("RETURN|TAIL"));
+    }
+
+    #[test]
+    fn executes_bounded_single_hook_mixin_overwrite_replacement() {
+        let target = ClassFile {
+            name: "demo/Target".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "tick".into(),
+                descriptor: "()I".into(),
+                access: 9,
+                code: Some(vec![0x08, 0xac]), // iconst_5; ireturn
+                max_locals: 0,
+            }],
+        };
+        let replacement = ClassFile {
+            name: "demo/Mixin".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "tick".into(),
+                descriptor: "()I".into(),
+                access: 9,
+                code: Some(vec![0x10, 9, 0xac]), // bipush 9; ireturn
+                max_locals: 0,
+            }],
+        };
+        let jar = NativeJar::from_classes([target, replacement]);
+        let mut plan = MixinInjectionPlan::inject_at_head(
+            MethodRef {
+                owner: "demo/Target".into(),
+                name: "tick".into(),
+                descriptor: "()I".into(),
+            },
+            MethodRef {
+                owner: "demo/Mixin".into(),
+                name: "tick".into(),
+                descriptor: "()I".into(),
+            },
+        );
+        plan.at.clear();
+        let report = jar
+            .execute_mixin_overwrite(&plan, None, &[], &mut NullHost)
+            .unwrap();
+        assert_eq!(report.callback_result, Value::Int(9));
+        assert_eq!(report.target_result, Value::Int(9));
+        plan.at = "HEAD".into();
+        let error = jar
+            .execute_mixin_overwrite(&plan, None, &[], &mut NullHost)
+            .unwrap_err();
+        assert!(error.to_string().contains("empty @At"));
     }
 
     #[test]
