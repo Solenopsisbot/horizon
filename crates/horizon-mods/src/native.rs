@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 pub const MAX_NATIVE_DECLARATIONS: usize = 8_192;
 pub const MAX_NATIVE_PROPERTIES: usize = 32;
 pub const MAX_NATIVE_TEXT: usize = 4_096;
+/// Recipe and ingredient JSON is data, not executable code; keep each declaration bounded.
+pub const MAX_NATIVE_JSON: usize = 1 << 20;
 
 /// A custom registration kind whose concrete Horizon adapter is not available
 /// yet. It is retained so diagnostics can name the registration precisely.
@@ -225,6 +227,16 @@ impl NativeDeclarations {
         Ok(())
     }
 
+    fn ensure_registration_id(id: &str) -> Result<(), String> {
+        Self::ensure_id(id)?;
+        if id.starts_with("minecraft:") {
+            return Err(format!(
+                "native registration {id:?} cannot redefine the minecraft namespace"
+            ));
+        }
+        Ok(())
+    }
+
     fn check_properties(kind: &str, properties: &BTreeMap<String, String>) -> Result<(), String> {
         if properties.len() > MAX_NATIVE_PROPERTIES {
             return Err(format!(
@@ -267,11 +279,14 @@ impl NativeDeclarations {
         properties: &BTreeMap<String, String>,
         item: bool,
     ) -> Result<(), String> {
-        Self::ensure_id(&entry.id)?;
+        Self::ensure_registration_id(&entry.id)?;
         Self::check_properties("block", properties)?;
         Self::ensure_id(template)?;
         if self.blocks.iter().any(|block| block.id == entry.id) {
             return Err(format!("duplicate native block {}", entry.id));
+        }
+        if item && self.items.iter().any(|existing| existing.id == entry.id) {
+            return Err(format!("native block {} conflicts with an item", entry.id));
         }
         self.blocks.push(Block {
             id: entry.id.clone(),
@@ -291,11 +306,21 @@ impl NativeDeclarations {
         template: &str,
         properties: &BTreeMap<String, String>,
     ) -> Result<(), String> {
-        Self::ensure_id(&entry.id)?;
+        Self::ensure_registration_id(&entry.id)?;
         Self::check_properties("item", properties)?;
         Self::ensure_id(template)?;
         if self.items.iter().any(|item| item.id == entry.id) {
             return Err(format!("duplicate native item {}", entry.id));
+        }
+        if self
+            .blocks
+            .iter()
+            .any(|block| block.id == entry.id && block.item)
+        {
+            return Err(format!(
+                "native item {} conflicts with a block item",
+                entry.id
+            ));
         }
         let mut max_stack_size = None;
         let mut rarity = None;
@@ -338,7 +363,13 @@ impl NativeDeclarations {
     }
 
     fn add_recipe(&mut self, entry: &RegistryEntry, json: &str) -> Result<(), String> {
-        Self::ensure_id(&entry.id)?;
+        Self::ensure_registration_id(&entry.id)?;
+        if json.len() > MAX_NATIVE_JSON {
+            return Err(format!(
+                "native recipe {} exceeds {MAX_NATIVE_JSON} bytes",
+                entry.id
+            ));
+        }
         if self.recipes.iter().any(|recipe| recipe.id == entry.id) {
             return Err(format!("duplicate native recipe {}", entry.id));
         }
@@ -349,6 +380,12 @@ impl NativeDeclarations {
         }
         let json = serde_json::to_vec(&value)
             .map_err(|error| format!("native recipe {} cannot be encoded: {error}", entry.id))?;
+        if json.len() > MAX_NATIVE_JSON {
+            return Err(format!(
+                "native recipe {} exceeds {MAX_NATIVE_JSON} bytes",
+                entry.id
+            ));
+        }
         self.recipes.push(RecipeDeclaration {
             id: entry.id.clone(),
             json,
@@ -357,7 +394,13 @@ impl NativeDeclarations {
     }
 
     fn add_ingredient(&mut self, entry: &RegistryEntry, json: &str) -> Result<(), String> {
-        Self::ensure_id(&entry.id)?;
+        Self::ensure_registration_id(&entry.id)?;
+        if json.len() > MAX_NATIVE_JSON {
+            return Err(format!(
+                "native ingredient {} exceeds {MAX_NATIVE_JSON} bytes",
+                entry.id
+            ));
+        }
         if self
             .ingredients
             .iter()
@@ -376,6 +419,12 @@ impl NativeDeclarations {
         let json = serde_json::to_vec(&value).map_err(|error| {
             format!("native ingredient {} cannot be encoded: {error}", entry.id)
         })?;
+        if json.len() > MAX_NATIVE_JSON {
+            return Err(format!(
+                "native ingredient {} exceeds {MAX_NATIVE_JSON} bytes",
+                entry.id
+            ));
+        }
         self.ingredients.push(IngredientDeclaration {
             id: entry.id.clone(),
             json,
@@ -388,7 +437,7 @@ impl NativeDeclarations {
         entry: &RegistryEntry,
         properties: &BTreeMap<String, String>,
     ) -> Result<(), String> {
-        Self::ensure_id(&entry.id)?;
+        Self::ensure_registration_id(&entry.id)?;
         Self::check_properties("entity", properties)?;
         let template = properties
             .get("template")
@@ -452,7 +501,7 @@ impl NativeDeclarations {
         entry: &RegistryEntry,
         properties: &BTreeMap<String, String>,
     ) -> Result<(), String> {
-        Self::ensure_id(&entry.id)?;
+        Self::ensure_registration_id(&entry.id)?;
         Self::check_properties("data component", properties)?;
         let codec = properties
             .get("codec")
@@ -494,7 +543,7 @@ impl NativeDeclarations {
         entry: &RegistryEntry,
         properties: &BTreeMap<String, String>,
     ) -> Result<(), String> {
-        Self::ensure_id(&entry.id)?;
+        Self::ensure_registration_id(&entry.id)?;
         Self::check_properties("attachment", properties)?;
         let codec = properties
             .get("codec")
@@ -559,7 +608,13 @@ impl TypedRegistrySink for NativeDeclarations {
                 properties,
             } => self.add_item(entry, template, properties),
             RegistryDeclaration::MobEffect { category, color } => {
-                Self::ensure_id(&entry.id)?;
+                Self::ensure_registration_id(&entry.id)?;
+                if *color > 0xFF_FFFF {
+                    return Err(format!(
+                        "native mob effect {} color is RGB, 0 to 16777215 (0xFFFFFF)",
+                        entry.id
+                    ));
+                }
                 if self.effects.iter().any(|effect| effect.id == entry.id) {
                     return Err(format!("duplicate native mob effect {}", entry.id));
                 }
@@ -591,7 +646,8 @@ impl TypedRegistrySink for NativeDeclarations {
                     }
                     _ => {}
                 }
-                Self::ensure_id(&entry.id)?;
+                Self::ensure_registration_id(&entry.id)?;
+                Self::check_properties("custom", properties)?;
                 self.custom.push(CustomDeclaration {
                     registry: entry.registry.clone(),
                     id: entry.id.clone(),
@@ -1054,6 +1110,65 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("conflicting native entity"), "{error}");
         assert_eq!(declarations.entities[0].template, "minecraft:chicken");
+    }
+
+    #[test]
+    fn native_registration_fences_and_payloads_are_bounded() {
+        let vanilla = RegistryEntry::typed(
+            "minecraft:item",
+            "minecraft:stone",
+            RegistryDeclaration::Item {
+                template: "minecraft:stick".into(),
+                properties: BTreeMap::new(),
+            },
+        );
+        let error = NativeDeclarations::from_registry_entries([&vanilla]).unwrap_err();
+        assert!(
+            error.contains("cannot redefine the minecraft namespace"),
+            "{error}"
+        );
+
+        let block = RegistryEntry::typed(
+            "minecraft:block",
+            "ruby:shared",
+            RegistryDeclaration::Block {
+                template: "minecraft:stone".into(),
+                properties: BTreeMap::new(),
+                item: true,
+            },
+        );
+        let item = RegistryEntry::typed(
+            "minecraft:item",
+            "ruby:shared",
+            RegistryDeclaration::Item {
+                template: "minecraft:stick".into(),
+                properties: BTreeMap::new(),
+            },
+        );
+        let mut declarations = NativeDeclarations::default();
+        declarations.register_typed(&block).unwrap();
+        let error = declarations.register_typed(&item).unwrap_err();
+        assert!(error.contains("conflicts with a block item"), "{error}");
+
+        let effect = RegistryEntry::typed(
+            "minecraft:mob_effect",
+            "ruby:bad_color",
+            RegistryDeclaration::MobEffect {
+                category: "beneficial".into(),
+                color: 0x1_00_00_00,
+            },
+        );
+        let error = NativeDeclarations::from_registry_entries([&effect]).unwrap_err();
+        assert!(error.contains("color is RGB"), "{error}");
+
+        let oversized = format!(r#"{{"payload":"{}"}}"#, "x".repeat(MAX_NATIVE_JSON));
+        let recipe = RegistryEntry::typed(
+            "minecraft:recipe",
+            "ruby:oversized",
+            RegistryDeclaration::Recipe { json: oversized },
+        );
+        let error = NativeDeclarations::from_registry_entries([&recipe]).unwrap_err();
+        assert!(error.contains("exceeds"), "{error}");
     }
 
     #[test]

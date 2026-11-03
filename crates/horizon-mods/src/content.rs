@@ -57,6 +57,22 @@ fn vanilla_id(id: &str) -> bool {
     })
 }
 
+/// Native declarations may add new namespaces, but never redefine vanilla ids.
+fn native_id(id: &str) -> bool {
+    let Some((namespace, path)) = id.split_once(':') else {
+        return false;
+    };
+    namespace != "minecraft"
+        && !namespace.is_empty()
+        && !path.is_empty()
+        && namespace
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b))
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_./-".contains(&b))
+}
+
 /// What a declared block changes from its template; unset keeps the
 /// template's value.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -327,6 +343,93 @@ impl Content {
         declarations: crate::native::NativeDeclarations,
     ) -> Result<Self, String> {
         let id = id.into();
+        let check_id = |kind: &str, value: &str| {
+            native_id(value).then_some(()).ok_or_else(|| {
+                format!("native {kind} declaration {value:?} is outside a mod namespace")
+            })
+        };
+        let mut block_items = BTreeSet::new();
+        let mut block_ids = BTreeSet::new();
+        for block in &declarations.blocks {
+            check_id("block", &block.id)?;
+            if !block_ids.insert(block.id.clone()) {
+                return Err(format!("duplicate native block {}", block.id));
+            }
+            if block.item {
+                block_items.insert(block.id.clone());
+            }
+        }
+        let mut item_ids = BTreeSet::new();
+        for item in &declarations.items {
+            check_id("item", &item.id)?;
+            if !item_ids.insert(item.id.clone()) {
+                return Err(format!("duplicate native item {}", item.id));
+            }
+            if block_items.contains(&item.id) {
+                return Err(format!(
+                    "native item {} conflicts with a block item",
+                    item.id
+                ));
+            }
+        }
+        let check_unique = |kind: &str, ids: Vec<&str>| -> Result<(), String> {
+            let mut seen = BTreeSet::new();
+            for value in ids {
+                check_id(kind, value)?;
+                if !seen.insert(value) {
+                    return Err(format!("duplicate native {kind} {value}"));
+                }
+            }
+            Ok(())
+        };
+        check_unique(
+            "mob effect",
+            declarations
+                .effects
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect(),
+        )?;
+        check_unique(
+            "entity",
+            declarations
+                .entities
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect(),
+        )?;
+        check_unique(
+            "data component",
+            declarations
+                .data_components
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect(),
+        )?;
+        check_unique(
+            "attachment",
+            declarations
+                .attachments
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect(),
+        )?;
+        check_unique(
+            "recipe",
+            declarations
+                .recipes
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect(),
+        )?;
+        check_unique(
+            "ingredient",
+            declarations
+                .ingredients
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect(),
+        )?;
         if !declarations.custom.is_empty() {
             let mut details = declarations
                 .custom
