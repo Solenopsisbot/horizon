@@ -982,6 +982,8 @@ and leaves arbitrary weaving, reflection and unmodelled cancellation to `horizon
 | `@Shadow` | yes | fields and methods exist because the façade was generated with them |
 | Mixin into a class with no façade | no | the census lists it; adding a façade class is the fix, not a workaround |
 
+The native probe also executes the bounded single-hook `@Overwrite` replacement plan when its target and replacement descriptors match exactly; cancellation and mismatched signatures remain explicit fallback diagnostics.
+
 The native probe now has executable boundaries for the common void-only injector shapes: `NativeJar`
 runs `@Inject(at = HEAD)` before its target and `RETURN`/`TAIL` after it, mirroring target arguments and
 using deterministic `CallbackInfo` markers when requested. Non-void return-value callbacks, cancellation,
@@ -1087,7 +1089,7 @@ worse than a native mod, which at least passed a human.
   the deprecated in-frame path emits no lifecycle events.
 - Typed bridged registrations are converted into the same bounded `ContentMod` planning input as carried
   content. Integrated startup currently appends those declarations to server options after shared resources
-  load; authoritative live-table synchronization to hosts and guests remains future work. An opaque callback registration, or a payload whose codec/handler has not crossed
+  load; authoritative live-table synchronization to hosts and guests remains future work. The server thread now atomically snapshots sorted entity, data-component, attachment, block, and item IDs after Java content loading, while effect rows are applied through the bounded server registration helper. An opaque callback registration, or a payload whose codec/handler has not crossed
   the network ABI, remains diagnostic and cannot alter a remote client's registry.
 - Dedicated server startup is implemented; live Java event dispatch, registry sync for runtime-created
   objects, and arbitrary mod packet handling are still later work. A client without the server's typed
