@@ -17,7 +17,9 @@ the plan report (``--mixin-plans`` and the normal JSON run) end to end:
 ``HEAD``/``RETURN``/``INVOKE`` callbacks become plans (the INVOKE one carrying
 its resolved call site), the Fabric ``mixins`` declaration and the root config
 are reported with every modelled field, and one malformed root config stays a
-visible error instead of hiding the rest.
+visible error instead of hiding the rest.  The same mixin jar is then woven with
+``--weave``: the woven copy keeps every resource, reports the ``INVOKE`` plan it
+cannot apply as skipped, and still loads and runs through the probe.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 
@@ -694,6 +697,86 @@ def expect_mixin_probe(archive: Path) -> dict | None:
     return {"plans": plans_report, "run": run_report}
 
 
+def expect_weave(archive: Path, root: Path, plan_count: int) -> dict | None:
+    """``--weave`` writes a jar that keeps its resources and still runs.
+
+    The fixture's ``INVOKE`` plan is outside the bounded weaver, so the report
+    must count it as skipped instead of failing the jar; the ``HEAD`` and
+    ``RETURN`` plans must still reach ``demo/Target``.
+    """
+    out = root / "native-smoke-mixin-woven.jar"
+    status, report, output = probe_json(archive, "--weave", str(out))
+    if report is None:
+        print(f"native weave failed ({status}):\n{output}", file=sys.stderr)
+        return None
+    problems = []
+    if report.get("status") != "ok":
+        problems.append(f"weave status {report.get('status')!r}")
+    if not isinstance(report.get("woven_classes"), int) or report["woven_classes"] < 1:
+        problems.append(f"woven classes {report.get('woven_classes')!r}, expected >= 1")
+    if not isinstance(report.get("woven_plans"), int) or report["woven_plans"] < 1:
+        problems.append(f"woven plans {report.get('woven_plans')!r}, expected >= 1")
+    if not isinstance(report.get("skipped_plans"), int) or report["skipped_plans"] < 1:
+        problems.append(
+            f"skipped plans {report.get('skipped_plans')!r}, expected >= 1 for the INVOKE plan"
+        )
+    if report.get("out") != str(out):
+        problems.append(f"weave out {report.get('out')!r}, expected {str(out)!r}")
+    if not out.exists():
+        problems.append(f"{out.name} was not written")
+    else:
+        try:
+            with zipfile.ZipFile(archive) as source, zipfile.ZipFile(out) as woven:
+                missing = sorted(set(source.namelist()) - set(woven.namelist()))
+                if missing:
+                    problems.append(f"woven jar lost entries {missing!r}")
+                for resource in ("fabric.mod.json", "demo.mixins.json"):
+                    if woven.read(resource) != source.read(resource):
+                        problems.append(f"woven jar changed {resource}")
+        except (OSError, KeyError) as error:
+            problems.append(f"woven jar unreadable: {error}")
+    if problems:
+        print(
+            f"native weave failed: {', '.join(problems)}: "
+            f"{json.dumps(report, sort_keys=True)}",
+            file=sys.stderr,
+        )
+        return None
+
+    # The woven jar is still a mod the probe loads and runs: the entrypoint
+    # executes, the plan report is unchanged, and the target still crosses the
+    # host through Probe.mark.
+    status, run_report, output = probe_json(out, "main")
+    if run_report is None:
+        print(f"native woven run failed ({status}):\n{output}", file=sys.stderr)
+        return None
+    run_problems = []
+    if run_report.get("status") != "ok":
+        run_problems.append(f"woven run status {run_report.get('status')!r}")
+    if run_report.get("entrypoints") != ["demo.MixinEntry"]:
+        run_problems.append(f"woven run entrypoints {run_report.get('entrypoints')!r}")
+    if run_report.get("mixin_plans") != plan_count:
+        run_problems.append(
+            f"woven run mixin plans {run_report.get('mixin_plans')!r}, expected {plan_count}"
+        )
+    if run_report.get("mixin_targets") != ["demo/Target#run(I)V"]:
+        run_problems.append(
+            f"woven run mixin targets {run_report.get('mixin_targets')!r}"
+        )
+    if not isinstance(run_report.get("host_calls"), int) or run_report["host_calls"] < 1:
+        run_problems.append(
+            f"woven run host calls {run_report.get('host_calls')!r}, expected >= 1"
+        )
+    if run_problems:
+        print(
+            f"native woven run failed: {', '.join(run_problems)}: "
+            f"{json.dumps(run_report, sort_keys=True)}",
+            file=sys.stderr,
+        )
+        return None
+    return {"report": report, "run": run_report}
+
+
 def expect_rejected(archive: Path, class_name: str, method: str) -> bool:
     """A jar whose entrypoint lacks ``method`` must fail and name both."""
     result = run_probe(archive)
@@ -946,6 +1029,14 @@ def main() -> int:
         mixin_report = expect_mixin_probe(mixin_jar)
         if mixin_report is None:
             return 1
+        # ``--weave`` must produce a jar that keeps every resource, carries the
+        # plans the bounded weaver can apply, and still loads.
+        weave_report = expect_weave(
+            mixin_jar, root, len(mixin_report["plans"]["plans"])
+        )
+        if weave_report is None:
+            return 1
+        print("weave: ok")
         neo_report = expect_probe(
             "neoforge", neo_jar, "neoforge", ["demo.Neo"], ["configurationToClient"], 4, ""
         )
@@ -978,6 +1069,7 @@ def main() -> int:
                     "fabric": report,
                     "forge": forge_report,
                     "mixin": mixin_report,
+                    "weave": weave_report,
                     "neoforge": neo_report,
                     "neoforge_payload": payload_report,
                 },
