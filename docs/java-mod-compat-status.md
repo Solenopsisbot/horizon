@@ -10,7 +10,7 @@ Last checked: 3 November 2026, commit `5b9c71dfc`.
 - [x] Discover and run multiple Fabric entrypoints in deterministic order.
 - [x] Discover NeoForge and legacy Forge `@Mod` classes through the native probe path.
 - [x] Run unsupported entrypoints through the embedded JVM runner as a fallback.
-- [x] Expose bounded Fabric loader values: loaded-mod checks, metadata (including authors/license collections and icon-path optionals), versions, environment type, development marker, root paths, seeded containers, and identity `MappingResolver` queries.
+- [x] Expose bounded Fabric loader values: loaded-mod checks, metadata (including authors/contributors/license collections and icon-path optionals), versions, environment type, development marker, root paths, seeded containers, and identity `MappingResolver` queries.
 - [x] Expose bounded NeoForge and legacy Forge loader values: mod lists, containers, event-bus access, mod ids, and role-aware client/server selection.
 - [x] Register and inspect bounded NeoForge and Forge deferred registrations, holders, registry objects, keys, ids, entry collections, generated `Registry.getHolder`/`getOrThrow` lookups, explicit typed-registration handoff, typed recipe data-file declarations, `Item.Properties` stack/durability/crafting-remainder/fire-resistance values, and `ItemStack.getUseAnimation`/tag-stream façade coverage, and custom payload type identity.
 - [x] Record Fabric events, NeoForge events, and legacy Forge event-bus listeners with ordering, cancellation markers, unregister support, and Forge `register(Object)` handlers.
@@ -23,7 +23,7 @@ Last checked: 3 November 2026, commit `5b9c71dfc`.
 - [x] Preserve bounded Throwable/Exception/Error messages and cause markers, including `getMessage`, `getCause`, `initCause`, and `toString` diagnostics.
 - [x] Mirror the common `Locale.US` integer grouping path used by the native statistics screen without emulating arbitrary locale patterns.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs, array-returning signatures, common `Identifier` prefix/language-key/ordering helpers, Holder serialization queries, TagKey values, `HitResult`/`BlockHitResult` state and copy factories, bounded `FluidState` queries, bounded `EntityType.Builder` values, bounded `Item.Properties` stack/durability/crafting-remainder/fire-resistance values, `InteractionHand` name/opposite semantics, and the sealed 26.3 `InteractionResult` value records and constants.
-- [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, Mixin `@At` values and bounded `args` selectors, report-only `@Group` constraints, slice boundary/value preservation, top-level and nested `injectors` config edge values, and Mixin Extras injector normalization, loader ABI classification, access-widener/access-transformer discovery, Mojang support-API façade classification, and explicit report-only diagnostics.
+- [x] Maintain a class/member/Mixin census with native hook matching, config target discovery, Mixin `@At` values and bounded `args` selectors, report-only `@Group` constraints, slice boundary/value preservation, top-level and nested `injectors` config edge values, and Mixin Extras injector normalization, loader ABI classification, access-widener/access-transformer discovery (including access-widener namespaces), Mojang support-API façade classification, and explicit report-only diagnostics.
 
 ## Partial or report-only
 

@@ -57,7 +57,10 @@ target after their access modifier. Each jar contributes at most 256 targets of 
 the merged JSON and text summary include counts by target. This is an attachment-surface
 report only: bytecode access changes remain outside the census. The CLI summary also prints a
 single `access metadata` line with the total target declarations and an explicit report-only
-marker, so a run's output makes clear that no access changes were applied.
+marker, so a run's output makes clear that no access changes were applied. Fabric access-widener
+headers also contribute their namespace (`named`, `intermediary`, or another bounded label) to
+`access_widener_namespace` and the aggregate summary; non-`named` targets need a mapping table
+before a native translator can match them to Horizon's named façade.
 
 ## Fabric API 26.3
 

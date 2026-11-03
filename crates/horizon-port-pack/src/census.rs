@@ -118,6 +118,10 @@ pub struct Census {
     /// Access-widener targets, counted across jars (discovery only).
     #[serde(default)]
     pub access_widener_targets: BTreeMap<String, usize>,
+    /// Access-widener header namespaces, counted across jars. A namespace
+    /// other than `named` needs a mapping table before native translation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub access_widener_namespaces: BTreeMap<String, usize>,
     /// Access-transformer targets, counted across jars (discovery only).
     #[serde(default)]
     pub access_transformer_targets: BTreeMap<String, usize>,
@@ -234,6 +238,11 @@ pub struct JarCensus {
     /// Bounded Fabric access-widener targets found in this jar.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_widener_targets: Vec<String>,
+    /// Fabric access-widener namespace from its header (`named`,
+    /// `intermediary`, or another bounded label). This is diagnostic only;
+    /// the census does not apply mappings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_widener_namespace: Option<String>,
     /// Bounded NeoForge/Forge access-transformer targets found in this jar.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_transformer_targets: Vec<String>,
@@ -460,6 +469,7 @@ impl Census {
         };
         if let Some(path) = info.access_widener.as_deref() {
             if let Ok(text) = read_zip_text(&mut zip, path) {
+                jar.access_widener_namespace = access_widener_namespace(&text);
                 jar.access_widener_targets = access_widener_targets(&text);
             }
         }
@@ -481,6 +491,12 @@ impl Census {
             *self
                 .access_widener_targets
                 .entry(target.clone())
+                .or_default() += 1;
+        }
+        if let Some(namespace) = &jar.access_widener_namespace {
+            *self
+                .access_widener_namespaces
+                .entry(namespace.clone())
                 .or_default() += 1;
         }
         for target in &jar.access_transformer_targets {
@@ -651,6 +667,17 @@ impl Census {
         if widener_targets > 0 || transformer_targets > 0 {
             out.push_str(&format!(
                 "access metadata: {widener_targets} access widener targets, {transformer_targets} access transformer targets (report-only; no bytecode changes)\n"
+            ));
+        }
+        if !self.access_widener_namespaces.is_empty() {
+            let namespaces = self
+                .access_widener_namespaces
+                .iter()
+                .map(|(namespace, count)| format!("{namespace}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "access widener namespaces: {namespaces} (report-only; mappings not applied)\n"
             ));
         }
         if self.totals.points_needing_hooks > 0 {
@@ -961,6 +988,34 @@ fn access_widener_targets(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Reads the namespace from a Fabric access-widener header. The namespace is
+/// needed to decide whether a target can be matched directly against the
+/// generated named façade; no remapping is attempted here.
+fn access_widener_namespace(text: &str) -> Option<String> {
+    let mut fields = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("accessWidener "))?
+        .split_whitespace();
+    let magic = fields.next()?;
+    let version = fields.next()?;
+    let namespace = fields.next()?;
+    if magic == "accessWidener"
+        && version
+            .strip_prefix('v')
+            .is_some_and(|v| v.parse::<u32>().is_ok())
+        && !namespace.is_empty()
+        && namespace.len() <= 32
+        && namespace
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    {
+        Some(namespace.to_owned())
+    } else {
+        None
+    }
 }
 
 /// Catalogs NeoForge/Forge AT lines after the access/final modifiers. This is
@@ -1278,6 +1333,7 @@ mod tests {
     #[test]
     fn discovers_bounded_access_metadata_targets() {
         let aw = "accessWidener v2 named\naccessible class net/minecraft/Foo\nmutable field net/minecraft/Foo bar I\n# ignored\n";
+        assert_eq!(access_widener_namespace(aw).as_deref(), Some("named"));
         assert_eq!(
             access_widener_targets(aw),
             [
@@ -1294,6 +1350,12 @@ mod tests {
                 "net.minecraft.Foo method (I)V"
             ]
         );
+        assert_eq!(
+            access_widener_namespace("accessWidener v2 intermediary\naccessible class a/B\n")
+                .as_deref(),
+            Some("intermediary")
+        );
+        assert_eq!(access_widener_namespace("accessWidener v2\n"), None);
     }
 
     #[test]
@@ -1313,11 +1375,15 @@ mod tests {
         let census = Census {
             access_widener_targets: BTreeMap::from([(String::from("net/minecraft/Foo"), 2)]),
             access_transformer_targets: BTreeMap::from([(String::from("net.minecraft.Bar"), 1)]),
+            access_widener_namespaces: BTreeMap::from([(String::from("intermediary"), 1)]),
             ..Census::default()
         };
         let summary = census.summary(20);
         assert!(summary.contains(
             "access metadata: 2 access widener targets, 1 access transformer targets (report-only; no bytecode changes)"
+        ));
+        assert!(summary.contains(
+            "access widener namespaces: intermediary=1 (report-only; mappings not applied)"
         ));
     }
 
