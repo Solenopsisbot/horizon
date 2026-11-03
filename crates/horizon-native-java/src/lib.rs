@@ -10,6 +10,10 @@ use std::{
     path::Path,
 };
 
+pub mod weaver;
+
+pub use weaver::{weave_head, weave_plans};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Int(i32),
@@ -6434,6 +6438,7 @@ pub struct Method {
     pub descriptor: String,
     pub access: u16,
     pub code: Option<Vec<u8>>,
+    pub max_stack: u16,
     pub max_locals: u16,
     pub annotations: Vec<Annotation>,
 }
@@ -6465,6 +6470,10 @@ pub struct ClassFile {
     pub methods: Vec<Method>,
     pub fields: Vec<Field>,
     pub annotations: Vec<Annotation>,
+    /// The class file these values were parsed from, kept so
+    /// [`Self::write`] and [`weaver::weave_head`] can reproduce and rewrite
+    /// the byte ranges the parser does not model.
+    raw: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -6499,7 +6508,21 @@ impl ClassFile {
             methods,
             fields,
             annotations,
+            raw: bytes.to_vec(),
         })
+    }
+
+    /// Re-encode this class file.
+    ///
+    /// Everything the parser does not model is copied from the bytes the class
+    /// was parsed from, so an unmodified class round-trips byte-for-byte.  The
+    /// writer handles the constant pool tags the parser accepts
+    /// (`Utf8`, `Integer`, `Float`, `Long`, `Double`, `Class`, `String`,
+    /// `Fieldref`, `Methodref`, `InterfaceMethodref`, `NameAndType`,
+    /// `MethodHandle`, `MethodType`, `Dynamic`, `InvokeDynamic`, `Module`,
+    /// `Package`); any other tag is an error rather than garbage.
+    pub fn write(&self) -> Result<Vec<u8>, String> {
+        weaver::write_class(&self.raw)
     }
 
     pub fn method(&self, name: &str, desc: &str) -> Option<&Method> {
@@ -10800,6 +10823,7 @@ fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeEr
         let descriptor = utf8(pool, r.u2()?)?;
         let attrs = r.u2()? as usize;
         let mut code = None;
+        let mut max_stack = 0;
         let mut max_locals = 0;
         let mut annotations = Vec::new();
         for _ in 0..attrs {
@@ -10808,7 +10832,7 @@ fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeEr
             let bytes = r.bytes(len)?;
             if attr == "Code" {
                 let mut c = Reader::new(bytes);
-                let _ = c.u2()?;
+                max_stack = c.u2()?;
                 max_locals = c.u2()?;
                 let len = c.u4()? as usize;
                 code = Some(c.bytes(len)?.to_owned());
@@ -10825,6 +10849,7 @@ fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeEr
             descriptor,
             access,
             code,
+            max_stack,
             max_locals,
             annotations,
         });
@@ -11631,11 +11656,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xfe]),
                 max_locals: 0,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let e = jar
@@ -11662,6 +11689,7 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x05, 0x06, 0x60, 0xac]),
                     max_locals: 0,
+                    max_stack: 0,
 
                     annotations: Vec::new(),
                 },
@@ -11671,6 +11699,7 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x03, 0x99, 0, 5, 0x04, 0xac, 0x08, 0xac]),
                     max_locals: 0,
+                    max_stack: 0,
 
                     annotations: Vec::new(),
                 },
@@ -11680,6 +11709,7 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x02, 0x91, 0xac]),
                     max_locals: 0,
+                    max_stack: 0,
 
                     annotations: Vec::new(),
                 },
@@ -11689,12 +11719,14 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x2a, 0x2b, 0xa5, 0, 5, 0x03, 0xac, 0x04, 0xac]),
                     max_locals: 2,
+                    max_stack: 0,
 
                     annotations: Vec::new(),
                 },
             ],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let mut host = NullHost;
@@ -11753,6 +11785,7 @@ mandatory = true
             access: 9,
             code: Some(code),
             max_locals: 0,
+            max_stack: 0,
 
             annotations: Vec::new(),
         };
@@ -11782,6 +11815,7 @@ mandatory = true
             ],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let expected = [
@@ -11811,6 +11845,7 @@ mandatory = true
             access: 9,
             code: Some(code),
             max_locals: 0,
+            max_stack: 0,
 
             annotations: Vec::new(),
         };
@@ -11831,6 +11866,7 @@ mandatory = true
             ],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let expected = [
@@ -11866,11 +11902,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x15, 0x00, 0xac]),
                 max_locals: 1,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -11908,11 +11946,13 @@ mandatory = true
                     0x08, 0xac,
                 ]),
                 max_locals: 0,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -11936,11 +11976,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xa7, 0x7f, 0xff]),
                 max_locals: 0,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let error = jar
@@ -11960,6 +12002,7 @@ mandatory = true
             methods: vec![],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -11984,6 +12027,7 @@ mandatory = true
             methods: vec![],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -12094,11 +12138,13 @@ mandatory = true
                 access: 1,
                 code: Some(vec![0xb1]),
                 max_locals: 3,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let report = jar.execute("demo.NeoMod", None, "neoforge", &mut NullHost);
@@ -16104,11 +16150,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x2a, 0xba, 0, 1, 0, 0, 0xb0]),
                 max_locals: 1,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let value = jar
@@ -16175,7 +16223,9 @@ mandatory = true
             fields: Vec::new(),
             methods: Vec::new(),
 
-            annotations: Vec::new(),};
+            annotations: Vec::new(),
+            raw: Vec::new(),
+        };
         assert_eq!(
             class.invoke_dynamic_target(1).unwrap(),
             Some(MethodRef {
@@ -16211,11 +16261,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x2a, 0x08, 0xb5, 0, 1, 0x2a, 0xb4, 0, 1, 0xac]),
                 max_locals: 1,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -16301,6 +16353,7 @@ mandatory = true
                     access: 8,
                     code: Some(vec![0x08, 0xb3, 0, 1, 0xb1]),
                     max_locals: 0,
+                    max_stack: 0,
 
                     annotations: Vec::new(),
                 },
@@ -16310,12 +16363,14 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0xb2, 0, 1, 0xac]),
                     max_locals: 0,
+                    max_stack: 0,
 
                     annotations: Vec::new(),
                 },
             ],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -16333,6 +16388,7 @@ mandatory = true
             access: 9,
             code: Some(code),
             max_locals: 0,
+            max_stack: 0,
 
             annotations: Vec::new(),
         };
@@ -16353,6 +16409,7 @@ mandatory = true
             ],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -16832,6 +16889,7 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x10, 42, 0xac]),
                     max_locals: 0,
+                    max_stack: 0,
 
                     annotations: Vec::new(),
                 },
@@ -16841,12 +16899,14 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x1a, 0xac]),
                     max_locals: 1,
+                    max_stack: 0,
 
                     annotations: Vec::new(),
                 },
             ],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let classes = BTreeMap::from([(target.name.clone(), target)]);
         let mut host = NullHost;
@@ -17173,11 +17233,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x2a, 0xb0]),
                 max_locals: 1,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let caller = ClassFile {
             name: "demo/Caller".into(),
@@ -17212,6 +17274,7 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x2a, 0x2b, 0xb9, 0, 1, 2, 0, 0xb0]),
                     max_locals: 2,
+                    max_stack: 0,
 
                     annotations: Vec::new(),
                 },
@@ -17221,12 +17284,14 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x2a, 0x2b, 0xb9, 0, 7, 2, 0, 0xb0]),
                     max_locals: 2,
+                    max_stack: 0,
 
                     annotations: Vec::new(),
                 },
             ],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([caller, target]);
         let marker = Value::Ref(Some(
@@ -17289,11 +17354,13 @@ mandatory = true
                 access: 1,
                 code: Some(vec![0xb1]),
                 max_locals: 2,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([target]);
         let dispatch = EventDispatch {
@@ -18313,11 +18380,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x08, 0xac]), // iconst_5; ireturn
                 max_locals: 0,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let callback = ClassFile {
             name: "demo/Mixin".into(),
@@ -18332,11 +18401,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xb1]),
                 max_locals: 1,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([target, callback]);
         let plan = MixinInjectionPlan::inject_at_head(
@@ -18373,11 +18444,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x08, 0xac]),
                 max_locals: 0,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let callback = |name: &str| ClassFile {
             name: format!("demo/{name}"),
@@ -18391,11 +18464,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xb1]),
                 max_locals: 0,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([target, callback("MixinA"), callback("MixinB")]);
         let target_ref = MethodRef {
@@ -18442,11 +18517,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xb1]),
                 max_locals: 0,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let callback = ClassFile {
             name: "demo/Mixin".into(),
@@ -18461,11 +18538,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xb1]),
                 max_locals: 1,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([target, callback]);
         let mut plan = MixinInjectionPlan::inject_at_head(
@@ -18506,11 +18585,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x03, 0xac]),
                 max_locals: 0,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let callback = ClassFile {
             name: "demo/Mixin".into(),
@@ -18524,11 +18605,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xb1]),
                 max_locals: 0,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([target, callback]);
         let mut plan = MixinInjectionPlan::inject_at_head(
@@ -18569,9 +18652,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x08, 0xac]), // iconst_5; ireturn
                 max_locals: 0,
+                max_stack: 0,
                 annotations: Vec::new(),
             }],
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let code = if override_result {
             // aload_0; iconst_3; invokevirtual setReturnValue(Object); return
@@ -18606,9 +18691,11 @@ mandatory = true
                 access: 9,
                 code: Some(code),
                 max_locals: 1,
+                max_stack: 0,
                 annotations: Vec::new(),
             }],
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([target, callback]);
         let mut plan = MixinInjectionPlan::inject_at_return(
@@ -18669,9 +18756,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xb1]),
                 max_locals: 0,
+                max_stack: 0,
                 annotations: Vec::new(),
             }],
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let callback = ClassFile {
             name: "demo/Mixin".into(),
@@ -18687,9 +18776,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xb1]),
                 max_locals: 1,
+                max_stack: 0,
                 annotations: Vec::new(),
             }],
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([target, callback]);
         let plan = MixinInjectionPlan::inject_at_return(
@@ -18800,11 +18891,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x08, 0xac]), // iconst_5; ireturn
                 max_locals: 0,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let replacement = ClassFile {
             name: "demo/Mixin".into(),
@@ -18818,11 +18911,13 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x10, 9, 0xac]), // bipush 9; ireturn
                 max_locals: 0,
+                max_stack: 0,
 
                 annotations: Vec::new(),
             }],
 
             annotations: Vec::new(),
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([target, replacement]);
         let mut plan = MixinInjectionPlan::inject_at_head(
@@ -19042,6 +19137,7 @@ mandatory = true
             access: 9,
             code: Some(code),
             max_locals: 2,
+            max_stack: 0,
             annotations,
         }
     }
@@ -19059,6 +19155,7 @@ mandatory = true
                 test_method("run", "(I)V", body, Vec::new()),
             ],
             annotations: Vec::new(),
+            raw: Vec::new(),
         }
     }
 
@@ -19088,6 +19185,7 @@ mandatory = true
                 descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
                 values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
             }],
+            raw: Vec::new(),
         }
     }
 
@@ -19186,6 +19284,7 @@ mandatory = true
                 descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
                 values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
             }],
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([target_class(), mixin]);
         let error = jar
@@ -19319,6 +19418,7 @@ mandatory = true
                 descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
                 values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
             }],
+            raw: Vec::new(),
         }
     }
 
@@ -19439,6 +19539,7 @@ mandatory = true
                 descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
                 values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
             }],
+            raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([target_class(), mixin]);
         let error = run_discovered(&jar, "run", &mut MarkerHost::default()).unwrap_err();
@@ -19495,6 +19596,7 @@ mandatory = true
                 Vec::new(),
             )],
             annotations: Vec::new(),
+            raw: Vec::new(),
         }
     }
 
@@ -19541,6 +19643,7 @@ mandatory = true
                 Vec::new(),
             )],
             annotations: Vec::new(),
+            raw: Vec::new(),
         }
     }
 
@@ -19788,6 +19891,7 @@ mandatory = true
                 descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
                 values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
             }],
+            raw: Vec::new(),
         }
     }
 
