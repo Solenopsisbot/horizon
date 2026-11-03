@@ -13,6 +13,10 @@ use horizon_mods::native::{
     EntityDeclaration, MenuDeclaration, SpawnRestriction,
 };
 
+/// Most block → menu bindings the [`JavaRegistrySnapshot::menu_bindings`] list
+/// and its diagnostics line name; a larger registry only counts the rest.
+const MAX_MENU_BINDINGS: usize = 16;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct BlockTemplate {
     pub id: String,
@@ -97,6 +101,72 @@ impl JavaRegistrySnapshot {
             .map(|index| &self.menus[index])
     }
 
+    /// The menus a block opens from, sorted by id: the server routes a block
+    /// use to one of them. Empty when no declared menu binds `block`.
+    pub(super) fn menus_for_block(&self, block: &str) -> Vec<&MenuDeclaration> {
+        let mut menus: Vec<&MenuDeclaration> = self
+            .menus
+            .iter()
+            .filter(|menu| menu.open_blocks.iter().any(|open| open.as_str() == block))
+            .collect();
+        menus.sort_by(|a, b| a.id.cmp(&b.id));
+        menus
+    }
+
+    /// The declared block → menu bindings as `(block, menu)` pairs, sorted and
+    /// without repeats, for diagnostics. Only the first
+    /// [`MAX_MENU_BINDINGS`] are named; a longer registry ends the list with
+    /// `...` so a reader can tell it was cut.
+    pub(super) fn menu_bindings(&self) -> Vec<(String, String)> {
+        let mut bindings: Vec<(String, String)> = self
+            .menus
+            .iter()
+            .flat_map(|menu| {
+                menu.open_blocks
+                    .iter()
+                    .map(|block| (block.clone(), menu.id.clone()))
+            })
+            .collect();
+        bindings.sort();
+        bindings.dedup();
+        bindings.truncate(MAX_MENU_BINDINGS);
+        bindings
+    }
+
+    /// Every block a declared menu opens from must resolve inside this
+    /// registry: a block the snapshot declares, a block a declared block
+    /// entity carries, or a vanilla one.
+    ///
+    /// The snapshot holds mod declarations only and never reads the vanilla
+    /// block table, so `minecraft:*` is accepted on its namespace alone: the
+    /// prefix says vanilla owns the id, not that this batch loaded the block.
+    fn check_menu_bindings(&self) -> Result<(), String> {
+        let carried = |block: &str| {
+            self.block_entities
+                .iter()
+                .any(|row| row.valid_blocks.iter().any(|valid| valid == block))
+        };
+        for menu in &self.menus {
+            for block in &menu.open_blocks {
+                if block.starts_with("minecraft:")
+                    || self
+                        .blocks
+                        .binary_search_by(|row| row.as_str().cmp(block))
+                        .is_ok()
+                    || carried(block)
+                {
+                    continue;
+                }
+                return Err(format!(
+                    "native menu {} opens from {block}, which is not a declared block, \
+                     a block entity's valid block, or a vanilla block",
+                    menu.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn block_entity(&self, id: &str) -> Option<&BlockEntityDeclaration> {
         self.block_entities
             .binary_search_by(|row| row.id.as_str().cmp(id))
@@ -151,6 +221,20 @@ impl JavaRegistrySnapshot {
                 .join(", ");
             out.push(format!("java registry coalesced duplicate rows: {rows}"));
         }
+        let bindings = self.menu_bindings();
+        if !bindings.is_empty() {
+            let mut rows = bindings
+                .iter()
+                .map(|(block, menu)| format!("{block} opens {menu}"))
+                .collect::<Vec<_>>();
+            // Menu ids and each menu's `open_blocks` are without repeats, so
+            // the sum counts distinct (block, menu) pairs.
+            let total: usize = self.menus.iter().map(|menu| menu.open_blocks.len()).sum();
+            if total > rows.len() {
+                rows.push("...".to_owned());
+            }
+            out.push(format!("java registry menu bindings: {}", rows.join(", ")));
+        }
         out
     }
 }
@@ -171,7 +255,9 @@ fn state() -> &'static RwLock<JavaRegistrySnapshot> {
 /// first-wins.
 ///
 /// The batch is built and validated aside, so a rejected row leaves the
-/// previously published snapshot untouched: the swap is all-or-nothing.
+/// previously published snapshot untouched: the swap is all-or-nothing. A menu
+/// opening from a block neither this batch declares nor vanilla defines
+/// rejects the batch too.
 pub(super) fn try_synchronize(
     mods: &[horizon_client::mod_content::ContentMod],
 ) -> Result<JavaRegistrySnapshot, String> {
@@ -296,6 +382,7 @@ pub(super) fn try_synchronize(
         })?,
     );
     next.coalesced = coalesced;
+    next.check_menu_bindings()?;
     *state().write().expect("java registry lock poisoned") = next.clone();
     Ok(next)
 }
@@ -442,6 +529,27 @@ mod tests {
         }
     }
 
+    /// A block row whose id is all these tests read back.
+    fn block(id: &str) -> horizon_mods::content::Block {
+        horizon_mods::content::Block {
+            id: id.into(),
+            template: "minecraft:stone".into(),
+            properties: Default::default(),
+            shapes: None,
+            default_state: Default::default(),
+            item: false,
+            components: Default::default(),
+        }
+    }
+
+    /// A menu bound to `blocks`, as the registry sink reads `open_blocks`.
+    fn bound_menu(id: &str, blocks: &[&str]) -> MenuDeclaration {
+        MenuDeclaration {
+            open_blocks: blocks.iter().map(|block| (*block).to_owned()).collect(),
+            ..menu(id)
+        }
+    }
+
     fn block_entity(id: &str) -> BlockEntityDeclaration {
         BlockEntityDeclaration {
             id: id.into(),
@@ -455,15 +563,7 @@ mod tests {
     fn auxiliary_rows_are_sorted_deduplicated_and_atomic() {
         let _guard = test_guard();
         let declarations = NativeDeclarations {
-            blocks: vec![horizon_mods::content::Block {
-                id: "ruby:stone".into(),
-                template: "minecraft:stone".into(),
-                properties: Default::default(),
-                shapes: None,
-                default_state: Default::default(),
-                item: true,
-                components: Default::default(),
-            }],
+            blocks: vec![block("ruby:stone")],
             items: vec![horizon_mods::content::Item {
                 id: "ruby:shard".into(),
                 template: "minecraft:stone".into(),
@@ -631,6 +731,115 @@ mod tests {
     }
 
     #[test]
+    fn menus_bound_to_a_block_are_listed_by_id() {
+        let _guard = test_guard();
+        let snapshot = synchronize(&[content_mod(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![block("ruby:crate_block")],
+                menus: vec![
+                    bound_menu("ruby:zeta", &["ruby:crate_block", "minecraft:barrel"]),
+                    bound_menu("ruby:crate", &["ruby:crate_block"]),
+                    menu("ruby:loose"),
+                ],
+                ..NativeDeclarations::default()
+            },
+        )]);
+        let ids = |block: &str| -> Vec<String> {
+            snapshot
+                .menus_for_block(block)
+                .iter()
+                .map(|menu| menu.id.clone())
+                .collect()
+        };
+        assert_eq!(ids("ruby:crate_block"), ["ruby:crate", "ruby:zeta"]);
+        assert_eq!(ids("minecraft:barrel"), ["ruby:zeta"]);
+        assert!(ids("ruby:unbound").is_empty());
+        assert_eq!(
+            snapshot.menu_bindings(),
+            [
+                ("minecraft:barrel".to_owned(), "ruby:zeta".to_owned()),
+                ("ruby:crate_block".to_owned(), "ruby:crate".to_owned()),
+                ("ruby:crate_block".to_owned(), "ruby:zeta".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn menu_bindings_accept_declared_and_vanilla_blocks_and_reject_unknown() {
+        let _guard = test_guard();
+        // A block the batch declares, and a vanilla one, both resolve.
+        let snapshot = try_synchronize(&[content_mod(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![block("ruby:crate_block")],
+                menus: vec![bound_menu(
+                    "ruby:crate",
+                    &["ruby:crate_block", "minecraft:barrel"],
+                )],
+                ..NativeDeclarations::default()
+            },
+        )])
+        .unwrap();
+        assert_eq!(snapshot.menus_for_block("ruby:crate_block").len(), 1);
+        assert_eq!(snapshot.menus_for_block("minecraft:barrel").len(), 1);
+        // A block a declared block entity carries resolves too.
+        let snapshot = try_synchronize(&[content_mod(
+            "ruby",
+            NativeDeclarations {
+                block_entities: vec![block_entity("ruby:crate")],
+                menus: vec![bound_menu("ruby:crate", &["ruby:crate_block"])],
+                ..NativeDeclarations::default()
+            },
+        )])
+        .unwrap();
+        assert_eq!(snapshot.menus_for_block("ruby:crate_block").len(), 1);
+        // An id nobody declares is rejected, naming the menu and the block.
+        // `from_native` fences the same thing per mod, so bypass it here the
+        // way a hand-built row would.
+        let mut unknown = content_mod("ruby", NativeDeclarations::default());
+        let mut row = menu("ruby:ghost");
+        row.open_blocks = vec!["othermod:ghost".into()];
+        unknown.content.menus.push(row);
+        assert_eq!(
+            try_synchronize(&[unknown]).unwrap_err(),
+            "native menu ruby:ghost opens from othermod:ghost, which is not a declared block, \
+             a block entity's valid block, or a vanilla block"
+        );
+    }
+
+    #[test]
+    fn menu_binding_diagnostics_are_bounded() {
+        let _guard = test_guard();
+        let count = MAX_MENU_BINDINGS + 2;
+        let blocks: Vec<_> = (0..count)
+            .map(|i| block(&format!("ruby:block_{i:02}")))
+            .collect();
+        let menus: Vec<_> = (0..count)
+            .map(|i| {
+                let block = format!("ruby:block_{i:02}");
+                bound_menu(&format!("ruby:menu_{i:02}"), &[&block])
+            })
+            .collect();
+        let snapshot = synchronize(&[content_mod(
+            "ruby",
+            NativeDeclarations {
+                blocks,
+                menus,
+                ..NativeDeclarations::default()
+            },
+        )]);
+        let bindings = snapshot.menu_bindings();
+        assert_eq!(bindings.len(), MAX_MENU_BINDINGS);
+        assert_eq!(bindings[0].0, "ruby:block_00");
+        assert_eq!(bindings[MAX_MENU_BINDINGS - 1].0, "ruby:block_15");
+        let line = snapshot.diagnostics().pop().unwrap();
+        assert!(line.starts_with("java registry menu bindings: "), "{line}");
+        assert!(line.ends_with(", ..."), "{line}");
+        assert_eq!(line.matches(" opens ").count(), MAX_MENU_BINDINGS);
+    }
+
+    #[test]
     fn conflicting_menu_and_block_entity_rows_naming_the_id_are_rejected() {
         let _guard = test_guard();
         let mut menu_changed = menu("ruby:crate");
@@ -720,6 +929,32 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_name_the_menu_bindings() {
+        let _guard = test_guard();
+        let snapshot = synchronize(&[content_mod(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![block("ruby:crate_block")],
+                menus: vec![bound_menu("ruby:crate", &["ruby:crate_block"])],
+                ..NativeDeclarations::default()
+            },
+        )]);
+        assert_eq!(
+            snapshot.diagnostics().last().map(String::as_str),
+            Some("java registry menu bindings: ruby:crate_block opens ruby:crate")
+        );
+        // A menu bound to no block adds no line.
+        let snapshot = synchronize(&[content_mod(
+            "ruby",
+            NativeDeclarations {
+                menus: vec![menu("ruby:loose")],
+                ..NativeDeclarations::default()
+            },
+        )]);
+        assert_eq!(snapshot.diagnostics().len(), 2);
+    }
+
+    #[test]
     fn rejected_batch_keeps_the_published_snapshot() {
         let _guard = test_guard();
         let good = content_mod(
@@ -742,6 +977,13 @@ mod tests {
             },
         );
         assert!(try_synchronize(&[good.clone(), conflicting]).is_err());
+        assert_eq!(*state().read().unwrap(), published);
+        // A menu opening from a block nobody declares rejects the batch too.
+        let mut unknown = content_mod("ruby-extra", NativeDeclarations::default());
+        let mut row = menu("ruby:ghost");
+        row.open_blocks = vec!["othermod:ghost".into()];
+        unknown.content.menus.push(row);
+        assert!(try_synchronize(&[good.clone(), unknown]).is_err());
         assert_eq!(*state().read().unwrap(), published);
         let mut changed_menu = menu("ruby:crate");
         changed_menu.title_key = "container.ruby.other".into();
