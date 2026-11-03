@@ -286,7 +286,7 @@ fn fabric_fixture_infers_typed_item_and_block_declarations() {
     assert_eq!(
         wand.declaration,
         Some(RegistryDeclaration::Item {
-            template: "minecraft:item".into(),
+            template: "minecraft:stick".into(),
             properties: BTreeMap::from([
                 ("max_stack_size".into(), "16".into()),
                 ("rarity".into(), "rare".into()),
@@ -311,7 +311,7 @@ fn fabric_fixture_infers_typed_item_and_block_declarations() {
     assert_eq!(
         lamp.declaration,
         Some(RegistryDeclaration::Block {
-            template: "minecraft:block".into(),
+            template: "minecraft:stone".into(),
             properties: BTreeMap::from([
                 ("explosion_resistance".into(), "6".into()),
                 ("hardness".into(), "2".into()),
@@ -385,7 +385,7 @@ fn explicit_declaration_replaces_an_inferred_one() {
     assert_eq!(
         host.registrations()[0].declaration,
         Some(RegistryDeclaration::Item {
-            template: "minecraft:item".into(),
+            template: "minecraft:stick".into(),
             properties: BTreeMap::from([("max_stack_size".into(), "16".into())]),
         })
     );
@@ -454,7 +454,7 @@ fn inference_records_a_plain_item_with_no_properties() {
     assert_eq!(
         host.registrations()[0].declaration,
         Some(RegistryDeclaration::Item {
-            template: "minecraft:item".into(),
+            template: "minecraft:stick".into(),
             properties: BTreeMap::new(),
         })
     );

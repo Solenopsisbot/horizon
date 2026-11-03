@@ -317,14 +317,15 @@ const BLOCK_CLASS: &str = "net/minecraft/world/level/block/Block";
 const ITEM_PROPERTIES_DESC: &str = "Lnet/minecraft/world/item/Item$Properties;";
 const BLOCK_PROPERTIES_DESC: &str =
     "Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;";
-/// The template an inferred item declaration names. `minecraft:item` is not a
-/// vanilla item model: it tells the content loader that only item properties
-/// were described, so the row inherits the plain item template instead of
-/// claiming a vanilla item's model or behaviour.
-const INFERRED_ITEM_TEMPLATE: &str = "minecraft:item";
-/// The template an inferred block declaration names, meaning the same thing
-/// for blocks: the plain block template, never a copy of a vanilla block.
-const INFERRED_BLOCK_TEMPLATE: &str = "minecraft:block";
+/// The template an inferred item declaration names. A content plan resolves
+/// templates against vanilla's own tables, so an item whose only declared
+/// behaviour is its property chain inherits the plain vanilla item model and
+/// components. A native model or an explicit metadata template replaces it.
+const INFERRED_ITEM_TEMPLATE: &str = "minecraft:stick";
+/// The template an inferred block declaration names: the plain vanilla block,
+/// with the declared hardness/resistance/tool flags overlaid by the content
+/// planner. Explicit metadata replaces it.
+const INFERRED_BLOCK_TEMPLATE: &str = "minecraft:stone";
 /// Property builders whose chains stay in host state. Past this, later
 /// builders are still answered but their chains are dropped, so a jar cannot
 /// grow the host without bound.
