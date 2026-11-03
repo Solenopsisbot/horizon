@@ -78,6 +78,7 @@ fn a_real_game_jar_enters_the_production_provider() {
     zip.finish().unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_horizon-jvm"))
+        .current_dir(&root)
         .arg("--real-loader")
         .arg("--entry-kind")
         .arg("server")
