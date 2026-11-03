@@ -12,7 +12,10 @@ use std::{
 
 pub mod weaver;
 
-pub use weaver::{ReturnMode, weave_class, weave_classes, weave_head, weave_plans, weave_return};
+pub use weaver::{
+    ReturnMode, WovenClasses, callback_info_returnable_class, weave_class, weave_class_with_extras,
+    weave_classes, weave_classes_with_extras, weave_head, weave_plans, weave_return,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {

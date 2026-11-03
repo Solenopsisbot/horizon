@@ -22,12 +22,44 @@
 //! invokestatic callback
 //! ```
 //!
-//! [`weave_return`] inserts the same sequence immediately before every
-//! return-family instruction (`return`, `ireturn`, `areturn`, `freturn`,
-//! `dreturn`, `lreturn`) for [`ReturnMode::Return`], or before only the last one
-//! for [`ReturnMode::Tail`] (Mixin's `TAIL`).  Only `void` targets are woven;
-//! the callback carries the target's arguments, plus the receiver when it
-//! declares it.
+//! [`weave_return`] inserts a callback immediately before every return-family
+//! instruction (`return`, `ireturn`, `areturn`, `freturn`, `dreturn`,
+//! `lreturn`) for [`ReturnMode::Return`], or before only the last one for
+//! [`ReturnMode::Tail`] (Mixin's `TAIL`).  The callback carries the target's
+//! arguments, plus the receiver when it declares it.
+//!
+//! A `void` target weaves the plain `invokestatic`.  A non-`void` target also
+//! carries its result: the callback's last argument is a
+//! `CallbackInfoReturnable`, which the insert builds around the target's boxed
+//! value - the same class [`callback_info_returnable_class`] adds to the jar:
+//!
+//! ```text
+//! invokestatic  java/lang/Integer.valueOf                (primitive returns only)
+//! astore        <fresh local>
+//! new           org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable
+//! dup
+//! aload         <fresh local>
+//! invokespecial CallbackInfoReturnable.<init>(Ljava/lang/Object;)V
+//! astore        <fresh local>
+//! <load every callback argument: the receiver, then the target's arguments>
+//! aload         <fresh local>
+//! invokestatic  callback
+//! aload         <fresh local>
+//! invokevirtual CallbackInfoReturnable.getReturnValue()Ljava/lang/Object;
+//! checkcast     <wrapper for a primitive, the return type otherwise>
+//! invokevirtual <wrapper>.<type>Value                    (primitive returns only)
+//! ```
+//!
+//! The object is built before the arguments because the callback consumes the
+//! topmost one as its last argument, and the second `aload` keeps the woven
+//! method's own reference for `getReturnValue`.
+//!
+//! The object starts with the target's own boxed result, so a callback that
+//! never calls `setReturnValue` changes nothing and the last `setReturnValue`
+//! wins.  A `cancel()` keeps the override, because the method returns
+//! `getReturnValue()` either way - which is what Mixin's own `RETURN` handler
+//! does for a cancellable non-void injection.  The insert therefore adds no
+//! branch, and the fresh local is the only verifier state it touches.
 //!
 //! Because an insert moves every byte after it, both anchors relocate everything
 //! in the method that names a bytecode offset, each by the delta that applies at
@@ -74,54 +106,57 @@
 //! back.  A `HEAD` insert is *skipped*: a backward branch to the method's first
 //! instruction lands after the callback, so the callback runs once at entry.
 //! When an insert lands on a `StackMapTable` frame position the frame is emitted
-//! twice, once before the callback and once at the instruction, because the
-//! bytes after an unconditional transfer start a basic block whether or not
-//! anything branches to them and the callback runs in the same state.
+//! before the callback, because the bytes after an unconditional transfer start
+//! a basic block whether or not anything branches to them and a `HEAD` or `void`
+//! callback runs in the same state.  Such an insert leaves stack and locals
+//! untouched, so the frame is emitted at the instruction too; a non-void
+//! `RETURN` insert writes a fresh local, so only the insert keeps the frame and
+//! the `return` behind it - which now starts no basic block - carries none.
 //!
 //! `wide`-prefixed local instructions (`wide` load/store, `iinc`, `ret`) are
 //! walked at their real length and copied verbatim, so a method whose local
 //! slots exceed 255 weaves exactly like one below the limit.
 //!
 //! `max_stack` is raised conservatively (HEAD: `original + argument slots + 1`;
-//! RETURN/TAIL: `original + argument slots`), `max_locals` is raised to the
-//! argument slots when the class declares fewer, and the `code_length` and
-//! `Code` attribute length follow the rewritten code.  Attributes the weaver
-//! does not read (`Exceptions`, type annotations, ...) are still copied
-//! byte-for-byte.
+//! RETURN/TAIL: `original + argument slots`, plus three slots for the
+//! `CallbackInfoReturnable` construction of a non-void target), `max_locals` is
+//! raised to the argument slots when the class declares fewer (and by one for
+//! the fresh local of a non-void insert), and the `code_length` and `Code`
+//! attribute length follow the rewritten code.  Attributes the weaver does not
+//! read (`Exceptions`, type annotations, ...) are still copied byte-for-byte.
 //!
 //! The callback descriptor must consume exactly the target's arguments and
 //! return `void`.  An instance target's callback may instead take the target
 //! instance as an extra first parameter, which the inserted `aload_0` supplies.
+//! A non-void `RETURN`/`TAIL` callback must end with a
+//! `CallbackInfoReturnable`, which the insert supplies.
 //!
 //! [`weave_class`] applies every matching `HEAD` plan first, then every
 //! `RETURN`/`TAIL` plan, re-parsing the class between edits and skipping plans
 //! for other classes.  [`weave_classes`] groups plans by target owner, weaves
 //! each affected class with [`weave_class`], and re-encodes every other class
-//! unchanged.
+//! unchanged.  [`weave_classes_with_extras`] additionally reports the synthetic
+//! classes a rewrite references ([`WovenClasses::added`]), which is what a jar
+//! writer has to add beside the rewritten class.
 //!
 //! # What it does not support
 //!
 //! [`weave_plans`] applies only `HEAD` plans, in plan order, and skips plans
 //! that target another class or ask for cancellation; [`weave_class`] instead
-//! rejects a cancellable or `INVOKE` plan that targets its class with a reason.
+//! rejects an anchor it cannot weave, a `void` cancellation and a per-class plan
+//! overflow with a reason.
 //!
-//! Non-void `RETURN`/`TAIL` callbacks, cancellation and `@At("INVOKE")` stay on
-//! the interpreter path.  A non-void `RETURN` callback needs a
-//! `CallbackInfoReturnable` object carrying the target's boxed result,
-//! cancellation needs a runtime-owned `CallbackInfo`, and `INVOKE` moves or
-//! guards a call site - all three need object construction or call-site
-//! rewriting a plain insert cannot express.
+//! Cancelling a `void` target and `@At("INVOKE")` stay on the interpreter path:
+//! cancellation needs a runtime-owned `CallbackInfo` object, and `INVOKE` moves
+//! or guards a call site - both need bytecode a plain insert cannot express.  A
+//! non-void `RETURN`/`TAIL` callback that does not declare the trailing
+//! `CallbackInfoReturnable` stays there too, because it cannot observe the
+//! result.
 //!
-//! A non-void `RETURN` is rejected rather than half-woven, and the reason is a
-//! hard one: Mixin's callback is static and void, so it must receive a live
-//! `CallbackInfoReturnable`.  Emitting that means `new`/`dup`/`<init>` plus a
-//! boxing conversion of the value already on the stack; reading an override
-//! back means `getReturnValue` plus `checkcast`/unboxing and a branch that
-//! either keeps the original value or replaces it.  Every one of those branches
-//! needs a `StackMapTable` frame, and this module relocates frames but cannot
-//! synthesise one.  The crate also has no JVM-side helper class to delegate to:
-//! `CallbackInfos` is interpreter state, not a class in the woven jar.  So the
-//! target is rejected with that reason and the interpreter handles it.
+//! The synthetic `CallbackInfoReturnable` is the smallest class that carries the
+//! result, so it does not extend Mixin's `CallbackInfo`: a callback that casts
+//! it to `CallbackInfo` or reads `isCancellable` is outside the bounded subset.
+//! A jar that already declares the class keeps its own copy.
 //!
 //! A class whose constant pool uses `CONSTANT_Dynamic` (condy) is rejected
 //! because the writer cannot re-encode its bootstrap arguments.  Non-ASCII
@@ -130,11 +165,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{ClassFile, Cp, MethodRef, MixinInjectionPlan};
+use crate::{
+    CALLBACK_INFO_RETURNABLE_CLASS, CALLBACK_INFO_RETURNABLE_DESC, ClassFile, Cp, MethodRef,
+    MixinInjectionPlan,
+};
 
 const ACC_STATIC: u16 = 0x0008;
 const ACC_ABSTRACT: u16 = 0x0400;
 const ACC_NATIVE: u16 = 0x0100;
+const ACC_PUBLIC: u16 = 0x0001;
+const ACC_PRIVATE: u16 = 0x0002;
+/// `ACC_SUPER`, which every class file since Java 1.0.2 sets so `invokespecial`
+/// dispatches through the superclass.
+const ACC_SUPER: u16 = 0x0020;
+/// The class-file version of the synthetic classes this module writes: Java 8,
+/// which every JVM that can load a mod's classes accepts.
+const SYNTHETIC_CLASS_MAJOR: u16 = 52;
 const MAX_CODE_LENGTH: usize = 65_535;
 /// Relocation passes before a layout has to be stable.  A pass only ever grows
 /// an instruction (`goto`/`jsr` to `goto_w`/`jsr_w`), never shrinks one, so the
@@ -665,6 +711,11 @@ fn encode_constant(out: &mut Vec<u8>, constant: &Cp) -> Result<(), String> {
             out.extend_from_slice(&name.to_be_bytes());
             out.extend_from_slice(&descriptor.to_be_bytes());
         }
+        Cp::FieldRef { class, nt } => {
+            out.push(9);
+            out.extend_from_slice(&class.to_be_bytes());
+            out.extend_from_slice(&nt.to_be_bytes());
+        }
         Cp::MethodRef { class, nt } => {
             out.push(10);
             out.extend_from_slice(&class.to_be_bytes());
@@ -677,7 +728,7 @@ fn encode_constant(out: &mut Vec<u8>, constant: &Cp) -> Result<(), String> {
         }
         other => {
             return Err(format!(
-                "the class writer can only append Utf8/Class/NameAndType/MethodRef constants, not {other:?}"
+                "the class writer can only append Utf8/Class/NameAndType/FieldRef/MethodRef constants, not {other:?}"
             ));
         }
     }
@@ -768,6 +819,246 @@ impl<'a> PoolBuilder<'a> {
         }
         self.push(Cp::MethodRef { class, nt })
     }
+}
+
+fn push_u2(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn push_u4(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+/// Append one constant to a pool under construction and return its index.
+///
+/// Like a parsed pool, index 0 is the reserved `Cp::Empty` slot, so the count a
+/// caller writes is `pool.len()` and the entries are `pool[1..]`.
+fn pool_push(pool: &mut Vec<Cp>, constant: Cp) -> u16 {
+    pool.push(constant);
+    // A synthetic class stays far below the 65535-entry constant pool limit, so
+    // the index of the entry just pushed always fits.
+    (pool.len() - 1) as u16
+}
+
+fn pool_utf8(pool: &mut Vec<Cp>, value: &str) -> u16 {
+    pool_push(pool, Cp::Utf8(value.to_owned()))
+}
+
+fn pool_class(pool: &mut Vec<Cp>, name: &str) -> u16 {
+    let name = pool_utf8(pool, name);
+    pool_push(pool, Cp::Class(name))
+}
+
+fn pool_name_type(pool: &mut Vec<Cp>, name: u16, descriptor: u16) -> u16 {
+    pool_push(pool, Cp::NameType { name, descriptor })
+}
+
+fn pool_field_ref(pool: &mut Vec<Cp>, owner: &str, name: u16, descriptor: u16) -> u16 {
+    let class = pool_class(pool, owner);
+    let nt = pool_name_type(pool, name, descriptor);
+    pool_push(pool, Cp::FieldRef { class, nt })
+}
+
+fn pool_method_ref(pool: &mut Vec<Cp>, owner: &str, name: u16, descriptor: u16) -> u16 {
+    let class = pool_class(pool, owner);
+    let nt = pool_name_type(pool, name, descriptor);
+    pool_push(pool, Cp::MethodRef { class, nt })
+}
+
+/// One method body of a synthetic class.
+struct SyntheticCode<'a> {
+    max_stack: u16,
+    max_locals: u16,
+    bytes: &'a [u8],
+}
+
+fn push_synthetic_field(out: &mut Vec<u8>, access: u16, name: u16, descriptor: u16) {
+    push_u2(out, access);
+    push_u2(out, name);
+    push_u2(out, descriptor);
+    push_u2(out, 0); // no field attributes
+}
+
+fn push_synthetic_method(
+    out: &mut Vec<u8>,
+    code_name: u16,
+    access: u16,
+    name: u16,
+    descriptor: u16,
+    body: SyntheticCode<'_>,
+) {
+    push_u2(out, access);
+    push_u2(out, name);
+    push_u2(out, descriptor);
+    push_u2(out, 1); // one attribute: Code
+    push_u2(out, code_name);
+    let mut attribute = Vec::new();
+    push_u2(&mut attribute, body.max_stack);
+    push_u2(&mut attribute, body.max_locals);
+    push_u4(&mut attribute, body.bytes.len() as u32);
+    attribute.extend_from_slice(body.bytes);
+    push_u2(&mut attribute, 0); // exception table
+    push_u2(&mut attribute, 0); // Code attributes
+    push_u4(out, attribute.len() as u32);
+    out.extend_from_slice(&attribute);
+}
+
+/// The bounded JVM-side `CallbackInfoReturnable` a woven non-void
+/// `RETURN`/`TAIL` insert constructs.
+///
+/// Mixin's own class lives in the Mixin jar, which a jar woven without Mixin on
+/// the classpath does not have, so the weaver writes the smallest class that
+/// answers what a return callback uses: `returnValue`/`cancelled` fields, the
+/// `()V` and `(Ljava/lang/Object;)V` constructors, `setReturnValue`,
+/// `getReturnValue`, `cancel` and `isCancelled`.  No member branches, so the
+/// class needs no `StackMapTable`, and it parses with [`crate::ClassFile::parse`]
+/// exactly like a compiled class.
+///
+/// The class stands on its own rather than extending Mixin's `CallbackInfo`:
+/// the woven jar may not carry that class, and a callback that casts this object
+/// to `CallbackInfo` is outside the bounded subset.
+pub fn callback_info_returnable_class() -> Result<Vec<u8>, String> {
+    const NAME: &str = CALLBACK_INFO_RETURNABLE_CLASS;
+    let mut pool: Vec<Cp> = vec![Cp::Empty];
+    let this_class = pool_class(&mut pool, NAME);
+    let super_class = pool_class(&mut pool, "java/lang/Object");
+    let code_name = pool_utf8(&mut pool, "Code");
+    // Members are named and described once, so the pool has no duplicate Utf8.
+    let name_return_value = pool_utf8(&mut pool, "returnValue");
+    let name_cancelled = pool_utf8(&mut pool, "cancelled");
+    let name_init = pool_utf8(&mut pool, "<init>");
+    let name_set_return = pool_utf8(&mut pool, "setReturnValue");
+    let name_get_return = pool_utf8(&mut pool, "getReturnValue");
+    let name_cancel = pool_utf8(&mut pool, "cancel");
+    let name_is_cancelled = pool_utf8(&mut pool, "isCancelled");
+    let desc_object = pool_utf8(&mut pool, "Ljava/lang/Object;");
+    let desc_boolean = pool_utf8(&mut pool, "Z");
+    let desc_void = pool_utf8(&mut pool, "()V");
+    let desc_value = pool_utf8(&mut pool, "(Ljava/lang/Object;)V");
+    let desc_get_return = pool_utf8(&mut pool, "()Ljava/lang/Object;");
+    let desc_is_cancelled = pool_utf8(&mut pool, "()Z");
+    let return_value = pool_field_ref(&mut pool, NAME, name_return_value, desc_object);
+    let cancelled = pool_field_ref(&mut pool, NAME, name_cancelled, desc_boolean);
+    let object_init = pool_method_ref(&mut pool, "java/lang/Object", name_init, desc_void);
+
+    // `<init>()V`: `aload_0; invokespecial Object.<init>; return`.
+    let mut init_bytes = vec![0x2a, 0xb7];
+    init_bytes.extend_from_slice(&object_init.to_be_bytes());
+    init_bytes.push(0xb1);
+    // `<init>(Object)V`: the same, then `putfield returnValue` from `aload_1`.
+    let mut init_value_bytes = vec![0x2a, 0xb7];
+    init_value_bytes.extend_from_slice(&object_init.to_be_bytes());
+    init_value_bytes.extend_from_slice(&[0x2a, 0x2b, 0xb5]);
+    init_value_bytes.extend_from_slice(&return_value.to_be_bytes());
+    init_value_bytes.push(0xb1);
+    // `setReturnValue(Object)V`: `aload_0; aload_1; putfield returnValue`.
+    let mut set_return_bytes = vec![0x2a, 0x2b, 0xb5];
+    set_return_bytes.extend_from_slice(&return_value.to_be_bytes());
+    set_return_bytes.push(0xb1);
+    // `getReturnValue()Object`: `aload_0; getfield returnValue; areturn`.
+    let mut get_return_bytes = vec![0x2a, 0xb4];
+    get_return_bytes.extend_from_slice(&return_value.to_be_bytes());
+    get_return_bytes.push(0xb0);
+    // `cancel()V`: `aload_0; iconst_1; putfield cancelled; return`.
+    let mut cancel_bytes = vec![0x2a, 0x04, 0xb5];
+    cancel_bytes.extend_from_slice(&cancelled.to_be_bytes());
+    cancel_bytes.push(0xb1);
+    // `isCancelled()Z`: `aload_0; getfield cancelled; ireturn`.
+    let mut is_cancelled_bytes = vec![0x2a, 0xb4];
+    is_cancelled_bytes.extend_from_slice(&cancelled.to_be_bytes());
+    is_cancelled_bytes.push(0xac);
+
+    let mut out = Vec::new();
+    push_u4(&mut out, 0xCAFE_BABE);
+    push_u2(&mut out, 0); // minor_version
+    push_u2(&mut out, SYNTHETIC_CLASS_MAJOR);
+    push_u2(&mut out, pool.len() as u16);
+    // Index 0 is the reserved slot, so the entries are `pool[1..]`.
+    for constant in &pool[1..] {
+        encode_constant(&mut out, constant)?;
+    }
+    push_u2(&mut out, ACC_PUBLIC | ACC_SUPER);
+    push_u2(&mut out, this_class);
+    push_u2(&mut out, super_class);
+    push_u2(&mut out, 0); // interfaces
+    push_u2(&mut out, 2); // fields
+    push_synthetic_field(&mut out, ACC_PRIVATE, name_return_value, desc_object);
+    push_synthetic_field(&mut out, ACC_PRIVATE, name_cancelled, desc_boolean);
+    push_u2(&mut out, 6); // methods
+    push_synthetic_method(
+        &mut out,
+        code_name,
+        ACC_PUBLIC,
+        name_init,
+        desc_void,
+        SyntheticCode {
+            max_stack: 1,
+            max_locals: 1,
+            bytes: &init_bytes,
+        },
+    );
+    push_synthetic_method(
+        &mut out,
+        code_name,
+        ACC_PUBLIC,
+        name_init,
+        desc_value,
+        SyntheticCode {
+            max_stack: 2,
+            max_locals: 2,
+            bytes: &init_value_bytes,
+        },
+    );
+    push_synthetic_method(
+        &mut out,
+        code_name,
+        ACC_PUBLIC,
+        name_set_return,
+        desc_value,
+        SyntheticCode {
+            max_stack: 2,
+            max_locals: 2,
+            bytes: &set_return_bytes,
+        },
+    );
+    push_synthetic_method(
+        &mut out,
+        code_name,
+        ACC_PUBLIC,
+        name_get_return,
+        desc_get_return,
+        SyntheticCode {
+            max_stack: 1,
+            max_locals: 1,
+            bytes: &get_return_bytes,
+        },
+    );
+    push_synthetic_method(
+        &mut out,
+        code_name,
+        ACC_PUBLIC,
+        name_cancel,
+        desc_void,
+        SyntheticCode {
+            max_stack: 2,
+            max_locals: 1,
+            bytes: &cancel_bytes,
+        },
+    );
+    push_synthetic_method(
+        &mut out,
+        code_name,
+        ACC_PUBLIC,
+        name_is_cancelled,
+        desc_is_cancelled,
+        SyntheticCode {
+            max_stack: 1,
+            max_locals: 1,
+            bytes: &is_cancelled_bytes,
+        },
+    );
+    push_u2(&mut out, 0); // class attributes
+    Ok(out)
 }
 
 /// The rewritten `Code` attribute of one method.
@@ -1800,6 +2091,25 @@ fn validate_insertions(
     Ok(sorted)
 }
 
+/// Where the frames of a `Code` attribute whose offset carries an insert are
+/// re-emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameSites {
+    /// At the insert and at the instruction.  A `HEAD` insert and a `void`
+    /// `RETURN` insert leave the operand stack and every local exactly as the
+    /// verifier expects at the instruction, so its frame still describes the
+    /// state after the insert and stays valid at both offsets.
+    Both,
+    /// At the insert only.  A non-void `RETURN` insert stores the target's
+    /// result in a fresh local, so the state the verifier sees at the
+    /// instruction differs by one live local: re-emitting the frame there would
+    /// claim a `Top` slot that actually holds the boxed result.  The insert
+    /// itself receives that frame, and every branch or switch that named the
+    /// instruction now lands on the insert, so the instruction starts no basic
+    /// block and needs none.
+    InsertOnly,
+}
+
 /// Rewrite one method's code around a set of same-size inserts.
 ///
 /// The layout pass places every instruction (and re-pads every switch) in the
@@ -1816,6 +2126,7 @@ fn relocate<'a>(
     max_stack: u16,
     max_locals: u16,
     entry: TargetEntry,
+    sites: FrameSites,
 ) -> Result<CodePatch<'a>, String> {
     let insertions = validate_insertions(label, scan, code.code.len(), insertions, bytes.len())?;
     let plan = stable_plan(label, scan, &insertions, entry)?;
@@ -1855,7 +2166,7 @@ fn relocate<'a>(
     let attributes = code
         .attributes
         .iter()
-        .map(|attribute| relocate_attribute(label, attribute, &plan, &insertions))
+        .map(|attribute| relocate_attribute(label, attribute, &plan, &insertions, sites))
         .collect::<Result<Vec<_>, String>>()?;
 
     Ok(CodePatch {
@@ -1872,6 +2183,7 @@ fn relocate_attribute<'a>(
     attribute: &CodeAttribute<'a>,
     plan: &CodePlan,
     insertions: &[(usize, usize)],
+    sites: FrameSites,
 ) -> Result<CodeAttribute<'a>, String> {
     Ok(match attribute {
         CodeAttribute::Raw { name_index, body } => CodeAttribute::Raw {
@@ -1906,7 +2218,7 @@ fn relocate_attribute<'a>(
         },
         CodeAttribute::StackMap { name_index, frames } => CodeAttribute::StackMap {
             name_index: *name_index,
-            frames: relocate_frames(label, frames, plan, insertions)?,
+            frames: relocate_frames(label, frames, plan, insertions, sites)?,
         },
     })
 }
@@ -1942,6 +2254,7 @@ fn relocate_frames(
     frames: &[StackMapFrame],
     plan: &CodePlan,
     insertions: &[(usize, usize)],
+    sites: FrameSites,
 ) -> Result<Vec<StackMapFrame>, String> {
     let mut out = Vec::with_capacity(frames.len() * 2);
     for frame in frames {
@@ -1949,12 +2262,19 @@ fn relocate_frames(
         // instruction that frame describes, which leaves the callback where the
         // verifier still wants a frame: the instruction after an unconditional
         // transfer (the `goto`/switch that named this position) starts a basic
-        // block even when nothing branches to the inserted bytes.  The callback
-        // runs in exactly the frame's state - it only pushes its arguments and
-        // calls `invokestatic` - so the same frame is valid at both offsets.
-        if frame.offset > 0 && inserted_at(insertions, frame.offset).is_some() {
+        // block even when nothing branches to the inserted bytes.  A `HEAD` or
+        // void `RETURN` callback runs in exactly the frame's state - it only
+        // pushes its arguments and calls `invokestatic` - so the same frame is
+        // valid at both offsets.  A non-void `RETURN` insert leaves one more live
+        // local behind, so only the insert keeps the frame.
+        if inserted_at(insertions, frame.offset).is_some()
+            && (frame.offset > 0 || sites == FrameSites::InsertOnly)
+        {
             let boundary = map_offset(label, plan, frame.offset, false)?;
             push_frame(label, &mut out, frame, boundary, plan)?;
+            if sites == FrameSites::InsertOnly {
+                continue;
+            }
         }
         let offset = map_offset(label, plan, frame.offset, true)?;
         push_frame(label, &mut out, frame, offset, plan)?;
@@ -2051,12 +2371,18 @@ fn find_target(class_name: &str, layout: &Layout<'_>, target: &MethodRef) -> Res
 /// parameter (which the inserted `aload_0` supplies).  A static target's
 /// callback must take exactly the target's arguments; an instance target's
 /// callback may take them with or without the receiver.
+///
+/// `returns_value` is true for a non-void `RETURN`/`TAIL` target, whose callback
+/// must end with the `CallbackInfoReturnable` the insert supplies.  Every other
+/// anchor passes `false`, and a callback-info argument is then rejected: those
+/// shapes need a runtime-owned `CallbackInfo` this insert cannot construct.
 fn callback_arguments(
     class_name: &str,
     is_static: bool,
     target_descriptor: &str,
     callback_descriptor: &str,
     anchor: &str,
+    returns_value: bool,
 ) -> Result<bool, String> {
     if !crate::valid_method_descriptor(callback_descriptor) {
         return Err(format!(
@@ -2064,12 +2390,29 @@ fn callback_arguments(
         ));
     }
     let callback_arguments = crate::descriptor_arguments(callback_descriptor);
-    if let Some(last) = callback_arguments.last() {
-        if crate::is_callback_info_descriptor(last) {
-            return Err(format!(
-                "callback {callback_descriptor} takes a trailing CallbackInfo; {anchor} weaving with CallbackInfo needs the interpreter path"
-            ));
+    let takes_returnable = callback_arguments
+        .last()
+        .is_some_and(|last| last == CALLBACK_INFO_RETURNABLE_DESC);
+    if !returns_value {
+        if let Some(last) = callback_arguments.last() {
+            if crate::is_callback_info_descriptor(last) {
+                return Err(format!(
+                    "callback {callback_descriptor} takes a trailing CallbackInfo; {anchor} weaving with CallbackInfo needs the interpreter path"
+                ));
+            }
         }
+    } else if !takes_returnable {
+        let detail = if callback_arguments
+            .last()
+            .is_some_and(|last| crate::is_callback_info_descriptor(last))
+        {
+            "a plain CallbackInfo cannot carry the result"
+        } else {
+            "the callback declares no such argument"
+        };
+        return Err(format!(
+            "{anchor} weaving a non-void target needs the callback's last argument to be {CALLBACK_INFO_RETURNABLE_DESC}: the insert boxes the target's result into that object and returns getReturnValue(), so no override branch and no synthesised StackMapTable frame is needed; {detail}, so {callback_descriptor} cannot observe or replace the result and stays on the interpreter path"
+        ));
     }
     if crate::return_desc(callback_descriptor) != "V" {
         return Err(format!(
@@ -2086,6 +2429,9 @@ fn callback_arguments(
         }
         for argument in &target_arguments {
             shape.push_str(argument);
+        }
+        if takes_returnable {
+            shape.push_str(CALLBACK_INFO_RETURNABLE_DESC);
         }
         shape.push_str(")V");
         shape
@@ -2214,6 +2560,95 @@ struct CallbackCall {
     local_slots: u16,
 }
 
+/// Append a local-variable instruction naming `slot`.
+///
+/// A slot above 255 needs the `wide` prefix; the class-file format caps a
+/// method's parameter slots well below that, so this only runs for a hand-built
+/// descriptor or a method that already declares 255+ locals, but emitting the
+/// wide form keeps the insert faithful to the slot it names instead of silently
+/// truncating the index.
+fn local_opcode(out: &mut Vec<u8>, opcode: u8, slot: u16) {
+    if slot > u8::MAX as u16 {
+        out.push(0xc4); // wide
+        out.push(opcode);
+        out.extend_from_slice(&slot.to_be_bytes());
+    } else {
+        out.push(opcode);
+        out.push(slot as u8);
+    }
+}
+
+/// One local load of a callback argument.
+#[derive(Debug, Clone, Copy)]
+struct LocalLoad {
+    /// The opcode: the compressed one-byte form (`aload_0`) for the receiver,
+    /// the indexed form (`iload 1`) for an argument.
+    opcode: u8,
+    /// The slot an indexed opcode names; `None` for the compressed form.
+    slot: Option<u16>,
+    /// Local slots the value spans.
+    width: u16,
+}
+
+impl LocalLoad {
+    /// `aload_0`, which supplies an instance callback's receiver.
+    fn receiver() -> Self {
+        Self {
+            opcode: 0x2a,
+            slot: None,
+            width: 1,
+        }
+    }
+
+    fn argument(opcode: u8, slot: u16, width: u16) -> Self {
+        Self {
+            opcode,
+            slot: Some(slot),
+            width,
+        }
+    }
+
+    fn emit(&self, out: &mut Vec<u8>) {
+        match self.slot {
+            Some(slot) => local_opcode(out, self.opcode, slot),
+            None => out.push(self.opcode),
+        }
+    }
+
+    /// The local slot the load reads, and the slots it spans.
+    fn span(&self) -> (u16, u16) {
+        (self.slot.unwrap_or(0), self.width)
+    }
+}
+
+/// The local loads a callback's own arguments need, in order: the optional
+/// receiver first, then the target's arguments, each with the local slot it
+/// occupies and the slots it spans.
+fn argument_loads(target: &Target<'_>, takes_receiver: bool) -> Result<Vec<LocalLoad>, String> {
+    let arguments = crate::descriptor_arguments(&target.descriptor);
+    let mut loads = Vec::with_capacity(arguments.len() + 1);
+    let mut slot: u16 = if target.is_static { 0 } else { 1 };
+    if takes_receiver {
+        loads.push(LocalLoad::receiver());
+    }
+    for argument in &arguments {
+        let (opcode, width) = load_opcode(argument)?;
+        loads.push(LocalLoad::argument(opcode, slot, width));
+        slot = slot.checked_add(width).ok_or("local slot overflow")?;
+    }
+    Ok(loads)
+}
+
+/// The local slots the target's arguments occupy, receiver included.
+fn argument_slots(target: &Target<'_>) -> Result<u16, String> {
+    let mut slots: u16 = if target.is_static { 0 } else { 1 };
+    for argument in crate::descriptor_arguments(&target.descriptor) {
+        let (_, width) = load_opcode(&argument)?;
+        slots = slots.checked_add(width).ok_or("local slot overflow")?;
+    }
+    Ok(slots)
+}
+
 /// Emit the loads for one callback and its `invokestatic`.
 ///
 /// `local_slots` is the highest local slot the loads read plus one, so the
@@ -2226,30 +2661,13 @@ fn callback_call(
     takes_receiver: bool,
     pool: &mut PoolBuilder<'_>,
 ) -> Result<CallbackCall, String> {
-    let arguments = crate::descriptor_arguments(&target.descriptor);
     let mut inserted = Vec::new();
-    let mut slot = if target.is_static { 0 } else { 1 };
     let mut slots = 0u16;
-    if takes_receiver {
-        inserted.push(0x2a); // aload_0
-        slots += 1;
-    }
-    for argument in &arguments {
-        let (opcode, width) = load_opcode(argument)?;
-        // A slot above 255 needs the `wide` prefix; the class-file format caps a
-        // method's parameter slots well below that, so this only runs for a
-        // hand-built descriptor the verifier would reject anyway, but emitting
-        // the wide form keeps the insert faithful to the slots it is told to
-        // read instead of silently truncating the index.
-        if slot > u8::MAX as u16 {
-            inserted.push(0xc4); // wide
-            inserted.push(opcode);
-            inserted.extend_from_slice(&slot.to_be_bytes());
-        } else {
-            inserted.push(opcode);
-            inserted.push(slot as u8);
-        }
-        slot = slot.checked_add(width).ok_or("local slot overflow")?;
+    let mut local_slots = if target.is_static { 0 } else { 1 };
+    for load in argument_loads(target, takes_receiver)? {
+        load.emit(&mut inserted);
+        let (slot, width) = load.span();
+        local_slots = local_slots.max(slot.checked_add(width).ok_or("local slot overflow")?);
         slots = slots.checked_add(width).ok_or("argument slot overflow")?;
     }
     let callback_index = pool.method_ref(callback)?;
@@ -2258,7 +2676,146 @@ fn callback_call(
     Ok(CallbackCall {
         bytes: inserted,
         stack_slots: slots,
-        local_slots: slot,
+        local_slots,
+    })
+}
+
+/// The wrapper class, `valueOf` descriptor and unboxing method that move one
+/// primitive return descriptor through a `CallbackInfoReturnable`.
+fn primitive_wrapper(descriptor: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    Some(match descriptor {
+        "Z" => (
+            "java/lang/Boolean",
+            "(Z)Ljava/lang/Boolean;",
+            "booleanValue",
+        ),
+        "B" => ("java/lang/Byte", "(B)Ljava/lang/Byte;", "byteValue"),
+        "C" => (
+            "java/lang/Character",
+            "(C)Ljava/lang/Character;",
+            "charValue",
+        ),
+        "S" => ("java/lang/Short", "(S)Ljava/lang/Short;", "shortValue"),
+        "I" => ("java/lang/Integer", "(I)Ljava/lang/Integer;", "intValue"),
+        "J" => ("java/lang/Long", "(J)Ljava/lang/Long;", "longValue"),
+        "F" => ("java/lang/Float", "(F)Ljava/lang/Float;", "floatValue"),
+        "D" => ("java/lang/Double", "(D)Ljava/lang/Double;", "doubleValue"),
+        _ => return None,
+    })
+}
+
+/// The `CONSTANT_Class` name an `areturn` type's `checkcast` names: the class
+/// name inside `L...;`, or the array descriptor itself.
+fn reference_class_name(descriptor: &str) -> Result<&str, String> {
+    if let Some(name) = descriptor
+        .strip_prefix('L')
+        .and_then(|rest| rest.strip_suffix(';'))
+        && !name.is_empty()
+        && !name.contains(';')
+    {
+        return Ok(name);
+    }
+    if descriptor.starts_with('[') {
+        return Ok(descriptor);
+    }
+    Err(format!(
+        "return descriptor {descriptor:?} is neither a primitive nor a reference type"
+    ))
+}
+
+/// Emit one non-void `RETURN`/`TAIL` insert.
+///
+/// The target's result is on the operand stack when the insert runs.  The insert
+/// boxes it into the fresh local `slot`, builds a `CallbackInfoReturnable`
+/// around it, calls the callback with the woven method's arguments and that
+/// object, then replaces the result with `getReturnValue()` in the target's own
+/// shape.  No branch is needed: the object starts with the target's value, so
+/// "no override" and "override" are the same read.
+///
+/// `slot` holds the boxed value and then the object itself - the value is dead
+/// once `<init>` ran - so one fresh local is enough.  It sits at the callback's
+/// own argument position, which is why the object is built before the arguments
+/// are pushed: the arguments consume the topmost object and the second `aload`
+/// keeps the woven method's own reference for `getReturnValue`.
+fn returnable_call(
+    target: &Target<'_>,
+    callback: &MethodRef,
+    takes_receiver: bool,
+    slot: u16,
+    pool: &mut PoolBuilder<'_>,
+) -> Result<CallbackCall, String> {
+    let returns = crate::return_desc(&target.descriptor);
+    let wrapper = primitive_wrapper(returns);
+    let mut bytes = Vec::new();
+    if let Some((wrapper, box_descriptor, _)) = wrapper {
+        let value_of = pool.method_ref(&MethodRef {
+            owner: wrapper.to_owned(),
+            name: "valueOf".to_owned(),
+            descriptor: box_descriptor.to_owned(),
+        })?;
+        bytes.push(0xb8); // invokestatic <wrapper>.valueOf
+        bytes.extend_from_slice(&value_of.to_be_bytes());
+    }
+    local_opcode(&mut bytes, 0x3a, slot); // astore <slot>
+    let returnable = pool.class(CALLBACK_INFO_RETURNABLE_CLASS)?;
+    bytes.push(0xbb); // new CallbackInfoReturnable
+    bytes.extend_from_slice(&returnable.to_be_bytes());
+    bytes.push(0x59); // dup
+    local_opcode(&mut bytes, 0x19, slot); // aload <slot>
+    let init = pool.method_ref(&MethodRef {
+        owner: CALLBACK_INFO_RETURNABLE_CLASS.to_owned(),
+        name: "<init>".to_owned(),
+        descriptor: "(Ljava/lang/Object;)V".to_owned(),
+    })?;
+    bytes.push(0xb7); // invokespecial CallbackInfoReturnable.<init>(Object)
+    bytes.extend_from_slice(&init.to_be_bytes());
+    local_opcode(&mut bytes, 0x3a, slot); // astore <slot>: the value is dead
+    let mut slots = 0u16;
+    let mut local_slots = slot
+        .checked_add(1)
+        .ok_or("the fresh local does not fit the class-file local-slot limit")?;
+    for load in argument_loads(target, takes_receiver)? {
+        load.emit(&mut bytes);
+        let (index, width) = load.span();
+        local_slots = local_slots.max(index.saturating_add(width));
+        slots = slots.saturating_add(width);
+    }
+    local_opcode(&mut bytes, 0x19, slot); // aload <slot>
+    let callback_index = pool.method_ref(callback)?;
+    bytes.push(0xb8); // invokestatic callback
+    bytes.extend_from_slice(&callback_index.to_be_bytes());
+    local_opcode(&mut bytes, 0x19, slot); // aload <slot>
+    let get_return = pool.method_ref(&MethodRef {
+        owner: CALLBACK_INFO_RETURNABLE_CLASS.to_owned(),
+        name: "getReturnValue".to_owned(),
+        descriptor: "()Ljava/lang/Object;".to_owned(),
+    })?;
+    bytes.push(0xb6); // invokevirtual getReturnValue
+    bytes.extend_from_slice(&get_return.to_be_bytes());
+    match wrapper {
+        Some((wrapper, _, unbox)) => {
+            let cast = pool.class(wrapper)?;
+            bytes.push(0xc0); // checkcast <wrapper>
+            bytes.extend_from_slice(&cast.to_be_bytes());
+            let unbox = pool.method_ref(&MethodRef {
+                owner: wrapper.to_owned(),
+                name: unbox.to_owned(),
+                descriptor: format!("(){returns}"),
+            })?;
+            bytes.push(0xb6); // invokevirtual <wrapper>.<unbox>
+            bytes.extend_from_slice(&unbox.to_be_bytes());
+        }
+        None => {
+            let cast = pool.class(reference_class_name(returns)?)?;
+            bytes.push(0xc0); // checkcast <return type>
+            bytes.extend_from_slice(&cast.to_be_bytes());
+        }
+    }
+    Ok(CallbackCall {
+        bytes,
+        // `new` + `dup` + the boxed value sit above the callback's arguments.
+        stack_slots: slots.saturating_add(3),
+        local_slots,
     })
 }
 
@@ -2295,6 +2852,7 @@ pub fn weave_head(
         &target.descriptor,
         &callback.descriptor,
         "HEAD",
+        false,
     )?;
 
     let mut pool = PoolBuilder::new(&class.pool);
@@ -2321,6 +2879,7 @@ pub fn weave_head(
         max_stack,
         max_locals,
         TargetEntry::Skip,
+        FrameSites::Both,
     )?;
 
     emit(
@@ -2334,18 +2893,21 @@ pub fn weave_head(
     )
 }
 
-/// Insert a void callback immediately before the target's `return`
-/// instructions.
+/// Insert a callback immediately before the target's `return` instructions.
 ///
 /// [`ReturnMode::Return`] inserts before every return-family instruction in
 /// the method; [`ReturnMode::Tail`] inserts before the last one only, matching
 /// Mixin's `RETURN` and `TAIL` anchors.
 ///
-/// Only `void` targets are woven.  A non-void target would need a
-/// `CallbackInfoReturnable` carrying the target's boxed result plus an override
-/// branch that reloads or replaces it, which needs object construction and
-/// synthesised stack-map frames this bounded insert cannot emit; that target is
-/// rejected with a reason and stays on the interpreter path.
+/// A `void` target weaves the plain `invokestatic`.  A non-void target also
+/// carries its result: the callback must end with a `CallbackInfoReturnable`,
+/// which the insert builds from the target's boxed value, and the method then
+/// returns `getReturnValue()` in its own shape, so a `setReturnValue` override
+/// wins and the target's value survives when none is set.  A `cancel()` keeps
+/// the override rather than discarding it - the method returns
+/// `getReturnValue()` either way, which is what Mixin's own cancellable
+/// `RETURN` handler does.  The object [`callback_info_returnable_class`] writes
+/// is the class such a jar needs.
 ///
 /// The callback is invoked with `invokestatic`.  A callback takes the target's
 /// arguments in order and returns `void`.  An instance target's callback may
@@ -2357,7 +2919,7 @@ pub fn weave_head(
 /// entered by the branches and switch cases that named the `return`.
 /// Every other rejection matches
 /// [`weave_head`]: condy, abstract/native methods, a mismatched callback
-/// descriptor, or `CallbackInfo`/`CallbackInfoReturnable` parameters.
+/// descriptor, or a `void` target whose callback asks for a `CallbackInfo`.
 pub fn weave_return(
     class: &ClassFile,
     target: &MethodRef,
@@ -2367,17 +2929,14 @@ pub fn weave_return(
     let target = prepare_target(class, target)?;
     let label = target.label();
     let anchor = mode.anchor();
-    if crate::return_desc(&target.descriptor) != "V" {
-        return Err(format!(
-            "{label}: {anchor} weaving a non-void target needs a CallbackInfoReturnable carrying the target's boxed result and an override branch that reloads or replaces it; the bounded weaver cannot construct the object or synthesise the StackMapTable frames such a branch needs, so only void targets are woven (the interpreter handles this one)"
-        ));
-    }
+    let returns_value = crate::return_desc(&target.descriptor) != "V";
     let takes_receiver = callback_arguments(
         &target.class_name,
         target.is_static,
         &target.descriptor,
         &callback.descriptor,
         anchor,
+        returns_value,
     )?;
 
     let code = target.code()?;
@@ -2393,7 +2952,17 @@ pub fn weave_return(
     }
 
     let mut pool = PoolBuilder::new(&class.pool);
-    let call = callback_call(&target, callback, takes_receiver, &mut pool)?;
+    // A non-void insert keeps the boxed result in a fresh local past every one
+    // the method declares, so it can never shadow an argument or a local.
+    let (call, frame_sites) = if returns_value {
+        let slot = code.max_locals.max(argument_slots(&target)?);
+        let call = returnable_call(&target, callback, takes_receiver, slot, &mut pool)?;
+        let sites = FrameSites::InsertOnly;
+        (call, sites)
+    } else {
+        let call = callback_call(&target, callback, takes_receiver, &mut pool)?;
+        (call, FrameSites::Both)
+    };
     if code.code.len() + call.bytes.len() * sites.len() > MAX_CODE_LENGTH {
         return Err(format!(
             "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
@@ -2417,6 +2986,7 @@ pub fn weave_return(
         max_stack,
         max_locals,
         TargetEntry::Enter,
+        frame_sites,
     )?;
 
     emit(
@@ -2435,10 +3005,27 @@ pub fn weave_return(
 ///
 /// Plans for other classes are skipped.  A matching plan that asks for an
 /// anchor or object this file cannot produce is an error rather than a silent
-/// skip: `INVOKE` call-site rewriting, cancellation (`CallbackInfo`), an
-/// unknown anchor, and more than `MAX_WEAVE_PLANS_PER_CLASS` plans for one
-/// class.
+/// skip: `INVOKE` call-site rewriting, cancelling a `void` target, an unknown
+/// anchor, and more than `MAX_WEAVE_PLANS_PER_CLASS` plans for one class.
+///
+/// A `RETURN`/`TAIL` plan on a non-void target references the synthetic
+/// `CallbackInfoReturnable`; [`weave_class_with_extras`] reports that class
+/// alongside the rewritten bytes so a jar writer can add it.
 pub fn weave_class(class: &ClassFile, plans: &[MixinInjectionPlan]) -> Result<Vec<u8>, String> {
+    weave_class_with_extras(class, plans).map(|(bytes, _)| bytes)
+}
+
+/// [`weave_class`], plus the synthetic classes the rewrite references.
+///
+/// `added` is keyed by internal class name and holds
+/// [`callback_info_returnable_class`] when a non-void `RETURN`/`TAIL` insert
+/// landed; it is empty otherwise.  The weaver cannot tell whether the jar
+/// already declares that class, so [`weave_classes_with_extras`] drops the
+/// duplicates.
+pub fn weave_class_with_extras(
+    class: &ClassFile,
+    plans: &[MixinInjectionPlan],
+) -> Result<(Vec<u8>, BTreeMap<String, Vec<u8>>), String> {
     let matching = plans
         .iter()
         .filter(|plan| plan.target.owner == class.name)
@@ -2451,21 +3038,25 @@ pub fn weave_class(class: &ClassFile, plans: &[MixinInjectionPlan]) -> Result<Ve
         ));
     }
     for plan in &matching {
-        if plan.cancellable {
-            return Err(format!(
-                "{}.{}: cancellable {} weaving needs a runtime-owned CallbackInfo, which the bounded weaver cannot construct",
-                plan.target.owner, plan.target.name, plan.at
-            ));
-        }
         if !matches!(plan.at.as_str(), "HEAD" | "RETURN" | "TAIL") {
             return Err(format!(
                 "{}.{}: anchor {} needs the interpreter path; the bounded weaver applies HEAD, RETURN and TAIL",
                 plan.target.owner, plan.target.name, plan.at
             ));
         }
+        // A non-void `RETURN`/`TAIL` builds the `CallbackInfoReturnable` the
+        // callback cancels with, so only the `void` targets still need the
+        // interpreter's runtime-owned `CallbackInfo`.
+        if plan.cancellable && !plan_returns_value(class, plan) {
+            return Err(format!(
+                "{}.{}: cancellable {} weaving needs a runtime-owned CallbackInfo, which the bounded weaver cannot construct",
+                plan.target.owner, plan.target.name, plan.at
+            ));
+        }
     }
 
     let mut current = class.write()?;
+    let mut needs_returnable = false;
     for plan in matching.iter().filter(|plan| plan.at == "HEAD") {
         let next = ClassFile::parse(&current)
             .map_err(|error| format!("rewritten class did not parse again: {error}"))?;
@@ -2482,9 +3073,29 @@ pub fn weave_class(class: &ClassFile, plans: &[MixinInjectionPlan]) -> Result<Ve
         };
         let next = ClassFile::parse(&current)
             .map_err(|error| format!("rewritten class did not parse again: {error}"))?;
+        needs_returnable |= plan_returns_value(&next, plan);
         current = weave_return(&next, &plan.target, &plan.callback, mode)?;
     }
-    Ok(current)
+    let mut added = BTreeMap::new();
+    if needs_returnable {
+        added.insert(
+            CALLBACK_INFO_RETURNABLE_CLASS.to_owned(),
+            callback_info_returnable_class()?,
+        );
+    }
+    Ok((current, added))
+}
+
+/// Whether one `RETURN`/`TAIL` plan targets a method with a value to carry.
+///
+/// A descriptor-less plan never resolves here; the weaver reports that
+/// ambiguity itself, so the answer is `false` and the plan keeps the `void`
+/// shape for the cancellable check.
+fn plan_returns_value(class: &ClassFile, plan: &MixinInjectionPlan) -> bool {
+    matches!(plan.at.as_str(), "RETURN" | "TAIL")
+        && class
+            .method(&plan.target.name, &plan.target.descriptor)
+            .is_some_and(|method| crate::return_desc(&method.descriptor) != "V")
 }
 
 /// Apply the `HEAD` plans that target `class`, in plan order.
@@ -2522,6 +3133,19 @@ pub fn weave_plans(class: &ClassFile, plans: &[MixinInjectionPlan]) -> Result<Ve
     Ok(current)
 }
 
+/// A woven class set: the rewritten input classes plus the synthetic classes
+/// their bytecode references.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WovenClasses {
+    /// Every input class, rewritten or re-encoded unchanged, keyed like the
+    /// input set.
+    pub classes: BTreeMap<String, Vec<u8>>,
+    /// Synthetic classes to add beside them, keyed by internal class name.
+    /// Empty unless a non-void `RETURN`/`TAIL` insert landed and the input set
+    /// does not already declare the class.
+    pub added: BTreeMap<String, Vec<u8>>,
+}
+
 /// Weave a set of parsed classes, grouped by the class each plan targets.
 ///
 /// Classes with matching plans go through [`weave_class`]; every other class is
@@ -2529,10 +3153,25 @@ pub fn weave_plans(class: &ClassFile, plans: &[MixinInjectionPlan]) -> Result<Ve
 /// replacement set keyed like `classes`.  A plan that targets a class absent
 /// from the set is an error rather than a silent skip, and the per-class plan
 /// bound is `MAX_WEAVE_PLANS_PER_CLASS`.
+///
+/// The result drops the class set, so a caller that also writes a jar wants
+/// [`weave_classes_with_extras`].
 pub fn weave_classes(
     classes: &BTreeMap<String, ClassFile>,
     plans: &[MixinInjectionPlan],
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    weave_classes_with_extras(classes, plans).map(|woven| woven.classes)
+}
+
+/// [`weave_classes`], plus the synthetic classes the rewrites reference.
+///
+/// [`WovenClasses::added`] holds `CallbackInfoReturnable` when a non-void
+/// `RETURN`/`TAIL` insert landed, unless the input already declares it - a jar
+/// that ships its own copy keeps it.
+pub fn weave_classes_with_extras(
+    classes: &BTreeMap<String, ClassFile>,
+    plans: &[MixinInjectionPlan],
+) -> Result<WovenClasses, String> {
     let mut by_owner: BTreeMap<&str, Vec<&MixinInjectionPlan>> = BTreeMap::new();
     for plan in plans {
         by_owner
@@ -2548,20 +3187,30 @@ pub fn weave_classes(
         }
     }
 
-    let mut woven = BTreeMap::new();
+    let mut woven = WovenClasses::default();
     for (key, class) in classes {
-        let bytes = match by_owner.get(class.name.as_str()) {
+        match by_owner.get(class.name.as_str()) {
             Some(class_plans) => {
                 let owned = class_plans
                     .iter()
                     .map(|plan| (*plan).clone())
                     .collect::<Vec<_>>();
-                weave_class(class, &owned)?
+                let (bytes, added) = weave_class_with_extras(class, &owned)?;
+                for (name, bytes) in added {
+                    woven.added.entry(name).or_insert(bytes);
+                }
+                woven.classes.insert(key.clone(), bytes);
             }
-            None => class.write()?,
-        };
-        woven.insert(key.clone(), bytes);
+            None => {
+                woven.classes.insert(key.clone(), class.write()?);
+            }
+        }
     }
+    let declared = classes
+        .values()
+        .map(|class| class.name.clone())
+        .collect::<BTreeSet<_>>();
+    woven.added.retain(|name, _| !declared.contains(name));
     Ok(woven)
 }
 
@@ -3114,6 +3763,64 @@ mod tests {
         assert!(error.contains("ifeq"), "{error}");
         assert!(error.contains("16-bit"), "{error}");
         assert!(error.contains("32770"), "{error}");
+    }
+
+    /// Cancellable `RETURN`/`TAIL` on a non-void target.
+    ///
+    /// Mixin's cancellable handler returns `getReturnValue()` whether or not the
+    /// callback cancelled, so `cancel()` alone keeps the target's own result and
+    /// a `setReturnValue` still wins - exactly what the branch-free insert does.
+    /// Only a `void` target still needs the interpreter's runtime-owned
+    /// `CallbackInfo`.
+    #[test]
+    fn a_cancellable_plan_weaves_a_non_void_target() {
+        let bytes = fixture(0x0009, "(I)I", 1, &[0x1a, 0xac], &[]);
+        let class = ClassFile::parse(&bytes).unwrap();
+        let target = MethodRef {
+            owner: "demo/T".into(),
+            name: "m".into(),
+            descriptor: "(I)I".into(),
+        };
+        let mut plan = MixinInjectionPlan::inject_at_return(
+            target.clone(),
+            callback(&format!("(I{CALLBACK_INFO_RETURNABLE_DESC})V")),
+        );
+        plan.cancellable = true;
+        let woven = weave_class(&class, &[plan]).unwrap();
+        let (code, _, _) = woven_code(&woven, "m", "(I)I");
+        assert_eq!(
+            code.iter().filter(|opcode| **opcode == 0xbb).count(),
+            1,
+            "one CallbackInfoReturnable for the single return"
+        );
+        assert_eq!(code.last(), Some(&0xac), "the plain return stays last");
+        assert_eq!(
+            code.iter().filter(|opcode| **opcode == 0xb6).count(),
+            2,
+            "getReturnValue plus the unboxing call"
+        );
+    }
+
+    /// The synthetic class is a normal class file the crate's own parser reads,
+    /// so a jar that carries it loads on the native path too.
+    #[test]
+    fn the_synthetic_returnable_parses_and_round_trips() {
+        let bytes = callback_info_returnable_class().unwrap();
+        let class = ClassFile::parse(&bytes).unwrap();
+        assert_eq!(class.name, CALLBACK_INFO_RETURNABLE_CLASS);
+        assert_eq!(class.write().unwrap(), bytes);
+        assert_eq!(class.methods.len(), 6);
+        assert_eq!(class.fields.len(), 2);
+        assert!(
+            class
+                .method("getReturnValue", "()Ljava/lang/Object;")
+                .is_some()
+        );
+        assert!(
+            class
+                .method("setReturnValue", "(Ljava/lang/Object;)V")
+                .is_some()
+        );
     }
 
     /// `(default, low, high, cases)` of the `tableswitch` at `at`, with the

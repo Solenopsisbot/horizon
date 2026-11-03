@@ -1,5 +1,6 @@
 use horizon_native_java::{
-    ClassFile, MethodRef, MixinInjectionPlan, NativeJar, StdHost, weave_classes,
+    ClassFile, MethodRef, MixinInjectionPlan, NativeJar, StdHost, weave_class_with_extras,
+    weave_classes_with_extras,
 };
 use std::{
     collections::BTreeMap,
@@ -78,6 +79,8 @@ struct WeaveReport {
     woven_plans: usize,
     /// Plans it rejected, or that target a class this jar does not contain.
     skipped_plans: usize,
+    /// Synthetic classes the woven bytecode references, added to the jar.
+    added_classes: usize,
     /// The jar that was written.
     out: String,
 }
@@ -99,6 +102,7 @@ impl WeaveReport {
             "woven_classes": self.woven_classes,
             "woven_plans": self.woven_plans,
             "skipped_plans": self.skipped_plans,
+            "added_classes": self.added_classes,
             "out": self.out,
         })
     }
@@ -185,19 +189,19 @@ fn read_jar(input: &Path) -> Result<(Vec<JarEntry>, BTreeMap<String, ClassFile>)
 
 /// Weave one class, dropping the plans the bounded weaver rejects.
 ///
-/// Returns the class bytes when at least one plan applied, and how many did.
-/// A plan the weaver cannot apply (`INVOKE`, cancellation, an unreadable
-/// target method) is a diagnostic, never a reason to abandon the jar.
+/// Returns the class bytes when at least one plan applied, how many did, and the
+/// synthetic classes the rewrite references.  A plan the weaver cannot apply
+/// (`INVOKE`, cancelling a `void` target, an unreadable target method) is a
+/// diagnostic, never a reason to abandon the jar.
 fn weave_one(
     classes: &BTreeMap<String, ClassFile>,
     owner: &str,
     plans: &[&MixinInjectionPlan],
-) -> (Option<Vec<u8>>, usize) {
-    let single = |class: ClassFile| BTreeMap::from([(owner.to_owned(), class)]);
+) -> (Option<Vec<u8>>, usize, BTreeMap<String, Vec<u8>>) {
     let class = classes[owner].clone();
     let owned = plans.iter().map(|plan| (*plan).clone()).collect::<Vec<_>>();
-    if let Ok(bytes) = weave_classes(&single(class.clone()), &owned) {
-        return (bytes.get(owner).cloned(), owned.len());
+    if let Ok((bytes, added)) = weave_class_with_extras(&class, &owned) {
+        return (Some(bytes), owned.len(), added);
     }
     // The class as a whole was rejected, so find the plans it accepts, in the
     // order `weave_class` applies them: HEAD first, then RETURN/TAIL.
@@ -206,19 +210,21 @@ fn weave_one(
     let mut current = class;
     let mut woven = None;
     let mut applied = 0;
+    let mut added = BTreeMap::new();
     for plan in ordered {
-        let Ok(bytes) = weave_classes(&single(current.clone()), std::slice::from_ref(plan)) else {
+        let Ok((bytes, extras)) = weave_class_with_extras(&current, std::slice::from_ref(plan))
+        else {
             continue;
         };
-        let Some(bytes) = bytes.get(owner) else { break };
-        let Ok(next) = ClassFile::parse(bytes) else {
+        let Ok(next) = ClassFile::parse(&bytes) else {
             break;
         };
         current = next;
-        woven = Some(bytes.clone());
+        woven = Some(bytes);
         applied += 1;
+        added.extend(extras);
     }
-    (woven, applied)
+    (woven, applied, added)
 }
 
 /// Write `entries` to `output`, swapping in woven bytes for the classes a plan
@@ -242,6 +248,7 @@ fn write_woven_jar(
         }
     }
     let mut woven: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut added: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut woven_plans = 0;
     let resolved = by_owner
         .values()
@@ -252,32 +259,53 @@ fn write_woven_jar(
         // The common case: the weaver applies every plan in one pass.  When it
         // rejects one, isolate per class and then per plan so the jar is
         // written with what it could apply instead of nothing at all.
-        match weave_classes(classes, &resolved) {
-            Ok(bytes) => {
+        match weave_classes_with_extras(classes, &resolved) {
+            Ok(output) => {
                 for owner in by_owner.keys() {
-                    if let Some(class_bytes) = bytes.get(*owner) {
+                    if let Some(class_bytes) = output.classes.get(*owner) {
                         woven.insert((*owner).to_owned(), class_bytes.clone());
                     }
                 }
+                added = output.added;
                 woven_plans = resolved.len();
             }
             Err(_) => {
                 for (owner, owner_plans) in &by_owner {
-                    let (class_bytes, applied) = weave_one(classes, owner, owner_plans);
+                    let (class_bytes, applied, extras) = weave_one(classes, owner, owner_plans);
                     woven_plans += applied;
                     skipped_plans += owner_plans.len() - applied;
                     if let Some(class_bytes) = class_bytes {
                         woven.insert((*owner).to_owned(), class_bytes);
                     }
+                    added.extend(extras);
                 }
             }
         }
     }
+    let extra = added
+        .into_iter()
+        .filter(|(name, _)| {
+            // A jar that declares the class keeps its own copy; only an entry
+            // whose internal name differs could collide, and such a jar is
+            // malformed enough to prefer its own bytes.
+            !entries
+                .iter()
+                .any(|entry| entry.name == format!("{name}.class"))
+        })
+        .map(|(name, data)| JarEntry {
+            name: format!("{name}.class"),
+            data,
+            class: Some(name),
+            stored: false,
+            directory: false,
+        })
+        .collect::<Vec<_>>();
+    let added_classes = extra.len();
 
     let file = File::create(output)
         .map_err(|error| format!("cannot write {}: {error}", output.display()))?;
     let mut archive = zip::ZipWriter::new(file);
-    for entry in entries {
+    for entry in entries.iter().chain(extra.iter()) {
         let fail = |error: zip::result::ZipError| {
             format!(
                 "cannot write {} into {}: {error}",
@@ -331,6 +359,7 @@ fn write_woven_jar(
         untouched_classes,
         woven_plans,
         skipped_plans,
+        added_classes,
         out: output.display().to_string(),
     })
 }
@@ -376,11 +405,12 @@ fn weave_main(input: &str, output: &str, json: bool) -> ExitCode {
     };
     if !json {
         println!(
-            "woven {} plan(s) into {} class(es); {} class(es) had no plan, {} plan(s) skipped -> {}",
+            "woven {} plan(s) into {} class(es); {} class(es) had no plan, {} plan(s) skipped, {} class(es) added -> {}",
             report.woven_plans,
             report.woven_classes,
             report.untouched_classes,
             report.skipped_plans,
+            report.added_classes,
             report.out
         );
     }
@@ -840,6 +870,7 @@ mod tests {
                 untouched_classes: 1,
                 woven_plans: 0,
                 skipped_plans: 0,
+                added_classes: 0,
                 out: output.display().to_string(),
             }
         );
