@@ -35,6 +35,13 @@ pub struct Class {
     /// Every field and method the constant pool names, with its owner: what
     /// the class actually attaches to (`docs/java-mod-compat.md`, phase 0).
     pub members: Vec<Member>,
+    /// Every field, method and class its method bodies name, in scan order:
+    /// the call sites, which the constant pool alone does not show.
+    pub body_refs: Vec<CallTarget>,
+    /// Why the body scan stopped early, if it did: `class#method at offset N:
+    /// ...`. The references read before it are kept, so one bad method does
+    /// not lose the class.
+    pub body_error: Option<String>,
     /// The class's own annotations.
     pub annotations: Vec<Annotation>,
     /// Every declared field and method, with its access flags: the shapes a
@@ -75,6 +82,104 @@ impl Member {
     pub fn key(&self) -> String {
         format!("{}#{} {}", self.owner, self.name, self.descriptor)
     }
+}
+
+/// What one instruction in a method body names: a field, a method, a class
+/// literal or a method handle. The ABI corpus ranks these by call site, which
+/// the constant pool's [`Member`] list cannot do: it holds every name once,
+/// called or not.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CallTarget {
+    pub owner: String,
+    /// Empty for a class literal.
+    pub name: String,
+    /// Empty for a class literal.
+    pub descriptor: String,
+    pub kind: CallKind,
+}
+
+impl CallTarget {
+    /// `owner#name(descriptor)`, the census's method-body key; a class
+    /// literal is its own name.
+    pub fn key(&self) -> String {
+        if self.kind == CallKind::Class {
+            self.owner.clone()
+        } else {
+            format!("{}#{}({})", self.owner, self.name, self.descriptor)
+        }
+    }
+
+    pub fn is_field(&self) -> bool {
+        matches!(
+            self.kind,
+            CallKind::GetStatic | CallKind::PutStatic | CallKind::GetField | CallKind::PutField
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CallKind {
+    Virtual,
+    Static,
+    Interface,
+    Special,
+    GetStatic,
+    PutStatic,
+    GetField,
+    PutField,
+    /// A class literal: `ldc a/Type`.
+    Class,
+    /// A method handle: `ldc` of one, a bootstrap method, or a bootstrap
+    /// argument (a lambda's body or a method reference).
+    MethodHandle,
+}
+
+impl Class {
+    /// The methods its bodies invoke, counted once per call site, keyed
+    /// `owner#name(descriptor)`.
+    pub fn calls(&self) -> BTreeMap<String, usize> {
+        counted(&self.body_refs, |target| {
+            !target.is_field() && target.kind != CallKind::Class
+        })
+    }
+
+    /// The fields its bodies read or write, counted the same way.
+    pub fn field_refs(&self) -> BTreeMap<String, usize> {
+        counted(&self.body_refs, CallTarget::is_field)
+    }
+}
+
+fn counted(targets: &[CallTarget], keep: impl Fn(&CallTarget) -> bool) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    for target in targets.iter().filter(|target| keep(target)) {
+        *out.entry(target.key()).or_default() += 1;
+    }
+    out
+}
+
+/// Every method a set of classes' bodies invokes, keyed `owner#name(descriptor)`
+/// and counted per call site, sorted by key: the ABI corpus's call ranking.
+pub fn method_references(classes: &[Class]) -> BTreeMap<String, usize> {
+    references(classes, Class::calls)
+}
+
+/// The fields those bodies read or write, counted the same way.
+pub fn field_references(classes: &[Class]) -> BTreeMap<String, usize> {
+    references(classes, Class::field_refs)
+}
+
+fn references(
+    classes: &[Class],
+    count: impl Fn(&Class) -> BTreeMap<String, usize>,
+) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    for class in classes {
+        for (key, sites) in count(class) {
+            *out.entry(key).or_default() += sites;
+        }
+    }
+    out
 }
 
 /// A field or method a class declares, with its flags.
@@ -155,14 +260,16 @@ pub struct Injection {
 /// The annotation that makes a class a Mixin.
 const MIXIN: &str = "Lorg/spongepowered/asm/mixin/Mixin;";
 
-/// Reads a class file's header, constant pool, members and annotations.
+/// Reads a class file's header, constant pool, members, annotations and the
+/// references its method bodies make. A body that cannot be walked keeps the
+/// references read before it and records why in [`Class::body_error`].
 pub fn parse(bytes: &[u8]) -> Option<Class> {
     let mut r = Reader { bytes, at: 0 };
     if r.u4()? != 0xCAFE_BABE {
         return None;
     }
     r.skip(4)?; // minor, major
-    let pool = Pool::read(&mut r)?;
+    let mut pool = Pool::read(&mut r)?;
     let access = r.u2()?;
     let name = pool.class_name(r.u2()?)?.to_owned();
     let superclass = pool.class_name(r.u2()?).unwrap_or_default().to_owned();
@@ -192,13 +299,20 @@ pub fn parse(bytes: &[u8]) -> Option<Class> {
     }
     let mut methods = Vec::new();
     let mut method_annotations = BTreeMap::new();
+    let mut bodies: Vec<(String, &[u8])> = Vec::new();
     for _ in 0..r.u2()? {
         let access = r.u2()?;
         let method = pool.str(r.u2()?)?.to_owned();
         let descriptor = pool.str(r.u2()?)?.to_owned();
-        let annotations = annotations(&attributes(&mut r, &pool)?, &pool);
+        let attributes = attributes(&mut r, &pool)?;
+        let annotations = annotations(&attributes, &pool);
         if !annotations.is_empty() {
             method_annotations.insert(method.clone(), annotations);
+        }
+        for (attribute, bytes) in &attributes {
+            if attribute == "Code" {
+                bodies.push((method.clone(), *bytes));
+            }
         }
         declared.push(Declared {
             name: method.clone(),
@@ -211,7 +325,20 @@ pub fn parse(bytes: &[u8]) -> Option<Class> {
             methods.push(method);
         }
     }
-    let annotations = annotations(&attributes(&mut r, &pool)?, &pool);
+    let attributes = attributes(&mut r, &pool)?;
+    pool.bootstrap = bootstrap_methods(&attributes);
+    let annotations = annotations(&attributes, &pool);
+    let mut body_refs = Vec::new();
+    let mut body_error = None;
+    for (method, bytes) in &bodies {
+        if body_refs.len() >= BODY_REFS_MAX {
+            break;
+        }
+        if let Err(error) = scan_method_code(bytes, &pool, &name, method, &mut body_refs) {
+            body_error = Some(error);
+            break;
+        }
+    }
     let mixin = annotations.iter().any(|a| a.ty == MIXIN) || pool.utf8.values().any(|s| s == MIXIN);
     let mixin_targets = if mixin {
         mixin_targets(&annotations)
@@ -233,6 +360,8 @@ pub fn parse(bytes: &[u8]) -> Option<Class> {
         methods,
         refs: pool.classes(),
         members: pool.members(),
+        body_refs,
+        body_error,
         mixin_targets,
         injections,
         annotations,
@@ -929,8 +1058,18 @@ struct Pool {
     doubles: HashMap<usize, f64>,
     /// NameAndType: name, descriptor.
     pairs: HashMap<usize, (usize, usize)>,
-    /// Fieldref, Methodref, InterfaceMethodref: tag, class, NameAndType.
-    refs: Vec<(u8, usize, usize)>,
+    /// Fieldref, Methodref, InterfaceMethodref by pool index: tag, class,
+    /// NameAndType.
+    refs: HashMap<usize, (u8, usize, usize)>,
+    /// MethodHandle by pool index: reference kind, member's pool index.
+    handles: HashMap<usize, (u8, usize)>,
+    /// Dynamic and InvokeDynamic by pool index: bootstrap method index,
+    /// NameAndType.
+    dynamic: HashMap<usize, (u16, usize)>,
+    /// `BootstrapMethods`, in the attribute's order: the handle's pool index
+    /// and its argument pool indexes. Read after the methods, since the
+    /// attribute sits at the end of the class file.
+    bootstrap: Vec<(usize, Vec<usize>)>,
 }
 
 impl Pool {
@@ -969,15 +1108,21 @@ impl Pool {
                 9..=11 => {
                     let class = r.u2()? as usize;
                     let pair = r.u2()? as usize;
-                    p.refs.push((tag, class, pair));
+                    p.refs.insert(i, (tag, class, pair));
                 }
                 12 => {
                     let name = r.u2()? as usize;
                     let descriptor = r.u2()? as usize;
                     p.pairs.insert(i, (name, descriptor));
                 }
-                15 => r.skip(3)?,
-                17 | 18 => r.skip(4)?,
+                15 => {
+                    let kind = r.u1()?;
+                    p.handles.insert(i, (kind, r.u2()? as usize));
+                }
+                17 | 18 => {
+                    let bootstrap = r.u2()?;
+                    p.dynamic.insert(i, (bootstrap, r.u2()? as usize));
+                }
                 _ => return None,
             }
             i += 1;
@@ -989,10 +1134,22 @@ impl Pool {
         self.utf8.get(&(i as usize)).map(String::as_str)
     }
 
+    fn utf8_at(&self, i: usize) -> Option<&str> {
+        self.utf8.get(&i).map(String::as_str)
+    }
+
     fn class_name(&self, i: u16) -> Option<&str> {
         self.class_of
             .get(&(i as usize))
             .and_then(|u| self.str(*u as u16))
+    }
+
+    /// The class a `CONSTANT_Class` pool index names.
+    fn class_at(&self, i: usize) -> Option<&str> {
+        self.class_of
+            .get(&i)
+            .and_then(|u| self.utf8.get(u))
+            .map(String::as_str)
     }
 
     fn classes(&self) -> BTreeSet<String> {
@@ -1005,9 +1162,14 @@ impl Pool {
     }
 
     fn members(&self) -> Vec<Member> {
+        // Pool order, not the map's: a class's members stay in the order its
+        // constant pool writes them.
+        let mut indexes: Vec<usize> = self.refs.keys().copied().collect();
+        indexes.sort_unstable();
         let mut out = Vec::new();
-        for &(tag, class, pair) in &self.refs {
-            let Some(owner) = self.class_name(class as u16) else {
+        for index in indexes {
+            let &(tag, class, pair) = &self.refs[&index];
+            let Some(owner) = self.class_at(class) else {
                 continue;
             };
             if owner.starts_with('[') {
@@ -1034,6 +1196,287 @@ impl Pool {
         }
         out
     }
+}
+
+/// The most references one class's bodies contribute, and the most code
+/// bytes walked in one method. Both are far past a real class and bounded so
+/// a crafted jar cannot make the census allocate at will.
+const BODY_REFS_MAX: usize = 100_000;
+const METHOD_CODE_MAX: usize = 64 * 1024; // the JVM's own limit on one method
+/// The most bootstrap arguments read from one `BootstrapMethods` entry.
+const BOOTSTRAP_ARGUMENTS_MAX: usize = 64;
+
+/// Walks one method's `Code` attribute, appending what its instructions name.
+/// An error names the class, the method and the offset in the code array. A
+/// pool index that names nothing is skipped: the census reads what it can,
+/// the JVM's verifier rejects the rest.
+fn scan_method_code(
+    bytes: &[u8],
+    pool: &Pool,
+    class: &str,
+    method: &str,
+    out: &mut Vec<CallTarget>,
+) -> Result<(), String> {
+    let mut r = Reader { bytes, at: 0 };
+    r.skip(4)
+        .ok_or_else(|| body_error(class, method, 0, "truncated Code attribute"))?; // max_stack, max_locals
+    let length = r
+        .u4()
+        .ok_or_else(|| body_error(class, method, 0, "truncated Code attribute"))?
+        as usize;
+    if length > METHOD_CODE_MAX {
+        return Err(body_error(
+            class,
+            method,
+            0,
+            &format!("code is {length} bytes, the limit is {METHOD_CODE_MAX}"),
+        ));
+    }
+    let code = r
+        .take(length)
+        .ok_or_else(|| body_error(class, method, 0, "code runs past the attribute"))?;
+    scan_instructions(code, pool, class, method, out)
+}
+
+fn scan_instructions(
+    code: &[u8],
+    pool: &Pool,
+    class: &str,
+    method: &str,
+    out: &mut Vec<CallTarget>,
+) -> Result<(), String> {
+    let mut at = 0;
+    while at < code.len() {
+        if out.len() >= BODY_REFS_MAX {
+            return Ok(());
+        }
+        let op = code[at];
+        let len = match op {
+            0x00..=0x0f
+            | 0x1a..=0x35
+            | 0x3b..=0x83
+            | 0x85..=0x98
+            | 0xac..=0xb1
+            | 0xbe
+            | 0xbf
+            | 0xc2
+            | 0xc3 => 1,
+            0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => 2,
+            0x11
+            | 0x13
+            | 0x14
+            | 0x84
+            | 0x99..=0xa8
+            | 0xb2..=0xb8
+            | 0xbb
+            | 0xbd
+            | 0xc0
+            | 0xc1
+            | 0xc6
+            | 0xc7 => 3,
+            0xc5 => 4,
+            0xb9 | 0xba | 0xc8 | 0xc9 => 5,
+            0xaa => tableswitch_len(code, at, class, method)?,
+            0xab => lookupswitch_len(code, at, class, method)?,
+            0xc4 => wide_len(code, at, class, method)?,
+            _ => {
+                return Err(body_error(
+                    class,
+                    method,
+                    at,
+                    &format!("unknown opcode {op:#04x}"),
+                ));
+            }
+        };
+        if at + len > code.len() {
+            return Err(body_error(class, method, at, "operand runs past the code"));
+        }
+        let index = || u2_be(code, at + 1) as usize;
+        match op {
+            0x12 => ldc_target(pool, code[at + 1] as usize, out),
+            0x13 => ldc_target(pool, index(), out),
+            0xb2..=0xb9 => {
+                if let Some(target) = member_target(pool, index(), call_kind(op)) {
+                    out.push(target);
+                }
+            }
+            0xba => indy_targets(pool, index(), out),
+            _ => {}
+        }
+        at += len;
+    }
+    Ok(())
+}
+
+/// The length of a `tableswitch`: padding to the instruction's 4-byte
+/// alignment, then `default` and `low`/`high` and the jump table.
+fn tableswitch_len(code: &[u8], at: usize, class: &str, method: &str) -> Result<usize, String> {
+    let body = at + 1 + switch_padding(at);
+    let past = || body_error(class, method, at, "tableswitch runs past the code");
+    let low = i4_be(code, body + 4).ok_or_else(past)?;
+    let high = i4_be(code, body + 8).ok_or_else(past)?;
+    let count = i64::from(high) - i64::from(low) + 1;
+    if count < 0 {
+        return Err(body_error(class, method, at, "tableswitch high below low"));
+    }
+    let len = 1 + switch_padding(at) + 12 + count as usize * 4;
+    if at + len > code.len() {
+        return Err(past());
+    }
+    Ok(len)
+}
+
+/// The length of a `lookupswitch`: padding, `default`, then one
+/// match/offset pair per count.
+fn lookupswitch_len(code: &[u8], at: usize, class: &str, method: &str) -> Result<usize, String> {
+    let body = at + 1 + switch_padding(at);
+    let past = || body_error(class, method, at, "lookupswitch runs past the code");
+    let pairs = i4_be(code, body + 4).ok_or_else(past)?;
+    if pairs < 0 {
+        return Err(body_error(
+            class,
+            method,
+            at,
+            "lookupswitch pairs below zero",
+        ));
+    }
+    let len = 1 + switch_padding(at) + 8 + pairs as usize * 8;
+    if at + len > code.len() {
+        return Err(past());
+    }
+    Ok(len)
+}
+
+/// The length of a `wide`: `iinc` carries two more bytes than the rest.
+fn wide_len(code: &[u8], at: usize, class: &str, method: &str) -> Result<usize, String> {
+    let Some(&op) = code.get(at + 1) else {
+        return Err(body_error(class, method, at, "wide runs past the code"));
+    };
+    match op {
+        0x15..=0x19 | 0x36..=0x3a | 0xa9 => Ok(4),
+        0x84 => Ok(6),
+        _ => Err(body_error(
+            class,
+            method,
+            at,
+            &format!("wide of opcode {op:#04x}"),
+        )),
+    }
+}
+
+/// The bytes between an instruction and its 4-byte-aligned operand.
+fn switch_padding(at: usize) -> usize {
+    (4 - (at + 1) % 4) % 4
+}
+
+fn call_kind(op: u8) -> CallKind {
+    match op {
+        0xb2 => CallKind::GetStatic,
+        0xb3 => CallKind::PutStatic,
+        0xb4 => CallKind::GetField,
+        0xb5 => CallKind::PutField,
+        0xb6 => CallKind::Virtual,
+        0xb7 => CallKind::Special,
+        0xb8 => CallKind::Static,
+        _ => CallKind::Interface,
+    }
+}
+
+/// `ldc`/`ldc_w`: a class literal or a method handle. A `Dynamic` constant
+/// (conditional dynamic, `condy`) is a known gap: its bootstrap is not read.
+fn ldc_target(pool: &Pool, index: usize, out: &mut Vec<CallTarget>) {
+    match pool.class_at(index) {
+        Some(owner) if !owner.starts_with('[') && !owner.is_empty() => out.push(CallTarget {
+            owner: owner.to_owned(),
+            name: String::new(),
+            descriptor: String::new(),
+            kind: CallKind::Class,
+        }),
+        Some(_) => {}
+        None => {
+            if let Some(target) = handle_target(pool, index) {
+                out.push(target);
+            }
+        }
+    }
+}
+
+fn member_target(pool: &Pool, index: usize, kind: CallKind) -> Option<CallTarget> {
+    let &(_, class, pair) = pool.refs.get(&index)?;
+    let owner = pool.class_at(class)?;
+    if owner.starts_with('[') {
+        return None;
+    }
+    let &(name, descriptor) = pool.pairs.get(&pair)?;
+    Some(CallTarget {
+        owner: owner.to_owned(),
+        name: pool.utf8_at(name)?.to_owned(),
+        descriptor: pool.utf8_at(descriptor)?.to_owned(),
+        kind,
+    })
+}
+
+fn handle_target(pool: &Pool, index: usize) -> Option<CallTarget> {
+    let &(_, reference) = pool.handles.get(&index)?;
+    member_target(pool, reference, CallKind::MethodHandle)
+}
+
+/// `invokedynamic`: the bootstrap method handle and the method handles among
+/// its arguments (a lambda's body, a method reference).
+fn indy_targets(pool: &Pool, index: usize, out: &mut Vec<CallTarget>) {
+    let Some(&(bootstrap, _)) = pool.dynamic.get(&index) else {
+        return;
+    };
+    let Some((handle, arguments)) = pool.bootstrap.get(bootstrap as usize) else {
+        return;
+    };
+    if let Some(target) = handle_target(pool, *handle) {
+        out.push(target);
+    }
+    for &argument in arguments {
+        if let Some(target) = handle_target(pool, argument) {
+            out.push(target);
+        }
+    }
+}
+
+fn body_error(class: &str, method: &str, offset: usize, reason: &str) -> String {
+    format!("{class}#{method} at offset {offset}: {reason}")
+}
+
+fn u2_be(code: &[u8], at: usize) -> u16 {
+    u16::from_be_bytes([code[at], code[at + 1]])
+}
+
+fn i4_be(code: &[u8], at: usize) -> Option<i32> {
+    let b = code.get(at..at.checked_add(4)?)?;
+    Some(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// The `BootstrapMethods` attribute: each bootstrap method's handle and its
+/// arguments' pool indexes, in order. A bounded prefix is kept.
+fn bootstrap_methods(attributes: &[(String, &[u8])]) -> Vec<(usize, Vec<usize>)> {
+    let mut out = Vec::new();
+    for (name, bytes) in attributes {
+        if name != "BootstrapMethods" {
+            continue;
+        }
+        let mut r = Reader { bytes, at: 0 };
+        let Some(n) = r.u2() else { return out };
+        for _ in 0..n {
+            let (Some(handle), Some(count)) = (r.u2(), r.u2()) else {
+                return out;
+            };
+            let mut arguments = Vec::new();
+            for _ in 0..(count as usize).min(BOOTSTRAP_ARGUMENTS_MAX) {
+                let Some(argument) = r.u2() else { break };
+                arguments.push(argument as usize);
+            }
+            out.push((handle as usize, arguments));
+        }
+        break; // only one BootstrapMethods attribute is legal
+    }
+    out
 }
 
 /// A class's, method's or field's attributes: name and bytes.
