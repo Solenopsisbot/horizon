@@ -191,7 +191,7 @@ pub struct Content {
     pub blocks: Vec<Block>,
     pub items: Vec<Item>,
     pub effects: Vec<MobEffect>,
-    /// Data files supplied by a native adapter (currently recipes). These
+    /// Data files supplied by a native adapter (recipes and ingredients). These
     /// are written into the same resource overlay as packaged mod files.
     pub native_files: BTreeMap<String, Vec<u8>>,
     /// The namespaces it owns: the mod id, then the manifest's `namespaces`.
@@ -360,6 +360,16 @@ impl Content {
             let file = format!("data/{namespace}/recipe/{path}.json");
             check_path(&file)?;
             native_files.insert(file, recipe.json.clone());
+        }
+        for ingredient in &declarations.ingredients {
+            add_namespace(&ingredient.id);
+            let (namespace, path) = ingredient
+                .id
+                .split_once(':')
+                .ok_or_else(|| format!("native ingredient {} has no namespace", ingredient.id))?;
+            let file = format!("data/{namespace}/ingredient/{path}.json");
+            check_path(&file)?;
+            native_files.insert(file, ingredient.json.clone());
         }
         Ok(Self {
             source: Source::Dir(PathBuf::new()),

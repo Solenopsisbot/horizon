@@ -140,6 +140,11 @@ pub enum RegistryDeclaration {
     Recipe {
         json: String,
     },
+    /// A data ingredient emitted into `data/<namespace>/ingredient/<path>.json`
+    /// by the game-owned content adapter.
+    Ingredient {
+        json: String,
+    },
     Custom {
         kind: String,
         properties: BTreeMap<String, String>,
@@ -7768,6 +7773,23 @@ fn parse_native_metadata(text: &str) -> Result<(Option<String>, Vec<RegistryEntr
                         .map_err(|e| NativeError::Metadata(e.to_string()))?,
                 }
             }
+            "ingredient" => {
+                let json = object
+                    .get("ingredient")
+                    .or_else(|| object.get("json"))
+                    .ok_or_else(|| {
+                        NativeError::Metadata("native ingredient is missing json".into())
+                    })?;
+                if !json.is_object() {
+                    return Err(NativeError::Metadata(
+                        "native ingredient json is not an object".into(),
+                    ));
+                }
+                RegistryDeclaration::Ingredient {
+                    json: serde_json::to_string(json)
+                        .map_err(|e| NativeError::Metadata(e.to_string()))?,
+                }
+            }
             "custom" => RegistryDeclaration::Custom {
                 kind: required_from(object, "custom_kind")?,
                 properties,
@@ -14571,13 +14593,14 @@ mandatory = true
                 "id":"ruby",
                 "registrations":[
                   {"registry":"minecraft:block","id":"ruby:lamp","kind":"block","template":"minecraft:stone","item":true,"properties":{"hardness":2.0}},
-                  {"registry":"minecraft:mob_effect","id":"ruby:glow","kind":"mob_effect","category":"beneficial","color":16711680}
+                  {"registry":"minecraft:mob_effect","id":"ruby:glow","kind":"mob_effect","category":"beneficial","color":16711680},
+                  {"registry":"minecraft:ingredient","id":"ruby:stone","kind":"ingredient","ingredient":{"items":["minecraft:stone"]}}
                 ]
             }"#,
         )
         .unwrap();
         assert_eq!(id.as_deref(), Some("ruby"));
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert!(matches!(
             entries[0].declaration,
             Some(RegistryDeclaration::Block { item: true, .. })
@@ -14588,6 +14611,10 @@ mandatory = true
                 color: 0xff0000,
                 ..
             })
+        ));
+        assert!(matches!(
+            entries[2].declaration,
+            Some(RegistryDeclaration::Ingredient { .. })
         ));
     }
 

@@ -29,6 +29,14 @@ pub struct RecipeDeclaration {
     pub json: Vec<u8>,
 }
 
+/// An ingredient declaration that becomes a data-pack JSON file before the
+/// resource root is loaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngredientDeclaration {
+    pub id: String,
+    pub json: Vec<u8>,
+}
+
 /// Typed registrations waiting for the pre-resource load phase.
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct NativeDeclarations {
@@ -36,6 +44,7 @@ pub struct NativeDeclarations {
     pub items: Vec<Item>,
     pub effects: Vec<MobEffect>,
     pub recipes: Vec<RecipeDeclaration>,
+    pub ingredients: Vec<IngredientDeclaration>,
     pub custom: Vec<CustomDeclaration>,
 }
 
@@ -201,6 +210,33 @@ impl NativeDeclarations {
         });
         Ok(())
     }
+
+    fn add_ingredient(&mut self, entry: &RegistryEntry, json: &str) -> Result<(), String> {
+        Self::ensure_id(&entry.id)?;
+        if self
+            .ingredients
+            .iter()
+            .any(|ingredient| ingredient.id == entry.id)
+        {
+            return Err(format!("duplicate native ingredient {}", entry.id));
+        }
+        let value: serde_json::Value = serde_json::from_str(json)
+            .map_err(|error| format!("native ingredient {} is invalid JSON: {error}", entry.id))?;
+        if !value.is_object() {
+            return Err(format!(
+                "native ingredient {} is not a JSON object",
+                entry.id
+            ));
+        }
+        let json = serde_json::to_vec(&value).map_err(|error| {
+            format!("native ingredient {} cannot be encoded: {error}", entry.id)
+        })?;
+        self.ingredients.push(IngredientDeclaration {
+            id: entry.id.clone(),
+            json,
+        });
+        Ok(())
+    }
 }
 
 impl TypedRegistrySink for NativeDeclarations {
@@ -240,6 +276,7 @@ impl TypedRegistrySink for NativeDeclarations {
                 Ok(())
             }
             RegistryDeclaration::Recipe { json } => self.add_recipe(entry, json),
+            RegistryDeclaration::Ingredient { json } => self.add_ingredient(entry, json),
             RegistryDeclaration::Custom { kind, properties } => {
                 Self::ensure_id(&entry.id)?;
                 self.custom.push(CustomDeclaration {
@@ -379,6 +416,35 @@ mod tests {
                 .and_then(|values| values.first())
                 .and_then(serde_json::Value::as_str),
             Some("#")
+        );
+    }
+
+    #[test]
+    fn ingredient_declaration_becomes_native_data_file() {
+        let ingredient = RegistryEntry::typed(
+            "minecraft:ingredient",
+            "ruby:lamp",
+            RegistryDeclaration::Ingredient {
+                json: r##"{"items":["minecraft:stone"]}"##.into(),
+            },
+        );
+        let declarations = NativeDeclarations::from_registry_entries([&ingredient]).unwrap();
+        assert_eq!(declarations.ingredients.len(), 1);
+        let content = crate::Content::from_native("ruby", declarations).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(
+            content
+                .native_files
+                .get("data/ruby/ingredient/lamp.json")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            value
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(serde_json::Value::as_str),
+            Some("minecraft:stone")
         );
     }
 

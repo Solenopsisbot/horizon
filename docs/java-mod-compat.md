@@ -469,8 +469,8 @@ wrong side of a split Fabric jar is immediately actionable.
 
 An explicitly supported jar may include `META-INF/horizon-native.json` to supply that typed adapter data:
 `{"id":"mod_id","registrations":[{"registry":"minecraft:block","id":"mod_id:block","kind":"block","template":"minecraft:stone","properties":{},"item":true},{"registry":"minecraft:recipe","id":"mod_id:block","kind":"recipe","recipe":{"type":"minecraft:crafting_shaped","pattern":["#"]}}]}`.
-The loader validates block, item, mob-effect, and recipe declarations, turns them into declaration-only
-`Content`, writes recipe declarations as `data/<namespace>/recipe/<path>.json`, and layers them through
+The loader validates block, item, mob-effect, recipe, and ingredient declarations, turns them into declaration-only
+`Content`, writes recipe and ingredient declarations as `data/<namespace>/{recipe,ingredient}/<path>.json`, and layers them through
 the same `content_root` planner as `.hmod` content. Unsupported custom kinds fail before content planning
 with the registry, id, and kind named, rather than silently entering the native registries.
 
@@ -873,6 +873,8 @@ values remain follow-up work. `hasBlockEntity` and `isRandomlyTicking` expose ex
 for bootstrap checks.
 `BlockState.getFluidState()` now returns a bounded `FluidState` value with deterministic empty, source, amount, and height queries, keeping common fluid checks linkable without inventing live fluid registries.
 `EntityType.Builder` preserves bounded size, client tracking range, update interval, and fire-immunity values through `build`; the generated `EntityType` exposes those values for bootstrap inspection without installing a live entity registry entry.
+The generated `MobCategory` enum also preserves its common name, per-chunk limit, friendliness,
+persistence, and despawn-distance queries for entity registration and spawn-placement branches.
 `ItemStack.getUseAnimation()` now returns the deterministic `UseAnim.NONE` façade value, and `getTags()`
 returns a bounded empty stream alongside the existing count, copy, damage, component, and tag queries, keeping
 common item bootstrap branches linkable.
