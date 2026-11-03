@@ -932,6 +932,24 @@ Mixin weaves into *our* classes, so we choose their shape. That is the lever: th
 satisfy the ecosystem's injections (real `@Shadow` fields, real target methods), not to mirror vanilla's
 arbitrary internals.
 
+The implementation is deliberately bounded at this stage. The census reads Mixin JSON and annotations,
+retains descriptors, selectors, slices, ordering and contract values, and emits a translation plan; it does
+not execute a config or weave bytecode. The façade generator materializes public `@Accessor`/`@Invoker`
+interfaces when their signatures are linkable, which is enough for casts and bootstrap code, but it does
+not give an accessor the real field or call semantics. The native interpreter currently accepts only
+`MixinInjectionPlan::inject_at_head` with a non-cancellable callback. A plan with `RETURN`, `INVOKE`,
+`FIELD`, a cancellable `CallbackInfo`, or an unsupported descriptor is a named diagnostic and must use the
+embedded JVM path; it is never silently treated as a no-op.
+
+The live adapter will be added in bounded slices. At startup it will reject a required or unresolved plan
+before the world opens, sort accepted callbacks by config priority then injector order, and install one
+per-target dispatch table. A target call checks that table once; the dispatch builds the mirrored arguments,
+runs callbacks in order, and applies cancellation or replacement only when that plan family has an explicit
+Rust ABI. `@Redirect`, `@WrapOperation`, and call-site `@At` therefore become separate generated hook
+records rather than a general bytecode interpreter. Each record keeps the exact owner, method descriptor,
+and callback class so an unsupported overload names the jar and method. This keeps the native path bounded
+and leaves arbitrary weaving, reflection and unmodelled cancellation to `horizon-jvm`.
+
 | Construct | Works | How |
 |---|---|---|
 | `@Inject` at HEAD / RETURN / TAIL | yes | the hook at that named point; the body runs in Java with the mirrored arguments |
@@ -947,6 +965,32 @@ The rule that keeps this honest: **a method that receives many mixins becomes mo
 Rust stops deciding and calls Java there — the same move as a named hook, but chosen by data rather than
 by taste. The census is the data: 670 points over 264 classes, with `LivingEntity` (34), `Minecraft` (25)
 and `Hud` (23) at the top ([mod-abi-census.md](mod-abi-census.md)).
+
+### Live registration commit
+
+Registration is a startup transaction, not a write-through from an arbitrary Java object. The current
+`--java-mod` path performs this sequence before `Assets::load`:
+
+1. Read the jar's Fabric or NeoForge metadata and select `client`, `server`, `main`, or `neoforge` for
+   the execution role. The jar is explicit; `mods/` is never scanned implicitly.
+2. Seed the bounded host with the jar's id, version, required loader dependencies, environment and bundled
+   resources, then execute every selected entrypoint in metadata order.
+3. Collect host registrations, listeners and payload records. Merge typed records from
+   `META-INF/horizon-native.json`; a metadata declaration may enrich an opaque callback record with the
+   same `(registry, id)`.
+4. Validate the complete set through `NativeDeclarations::from_registry_entries`. Invalid properties,
+   duplicate ids or conflicting typed declarations abort the whole batch. Opaque registrations remain in
+   diagnostics and never enter a live registry.
+5. Convert the validated batch to one `ContentMod` and pass it through the existing `content_root` and
+   asset planning path. Vanilla ids stay fixed and namespace clashes are checked before immutable tables
+   are built.
+
+The host's registry, world and capability values are callback-local mirrors. `RegistryEntry` is only made
+live by a typed declaration or an explicit game-owned adapter; `attach_registration_declaration` rejects a
+missing or already-enriched entry. This prevents a Java callback from installing an opaque `Block` or
+`Item` into Horizon's tables and gives the commit a single all-or-nothing boundary. The eventual live
+registry ABI will preserve the same sequence, adding stable handles for `Block`, `Item`, block entities and
+entities after content planning; it will not make the callback-local maps authoritative.
 
 ## "Translate any jar": five outcomes
 
@@ -1003,11 +1047,24 @@ worse than a native mod, which at least passed a human.
 
 ## Multiplayer
 
-- Single player and LAN host: the JVM lives in the host's process, exactly like native mods.
-- A bridged mod's registry entries travel the same way content mods' do; a client without them is
-  refused, as today.
-- Dedicated server: the same binary with `--dedicated`. Phase 10, but phase 3's server-side scope is
-  deliberately most of the way there.
+- `--java-mod` is currently a bounded native startup path for all three authoritative roles: the window
+  client, the integrated server, and `--dedicated`. The host advertises `CLIENT` only for the window and
+  `SERVER` for both server roles; a `clientSideOnly` jar is rejected before a server world opens. The
+  integrated server and dedicated server therefore select server entrypoints today, while a client-only
+  entrypoint never runs on the server by accident.
+- Single player and LAN host keep the Java startup state in the authoritative process. A remote window is a
+  mirror and does not execute server lifecycle callbacks. The existing lifecycle ledger gives the future
+  Java dispatcher one place to attach: world-open ready/failed, final/failed close, and authoritative
+  server-tick start/end. Each open gets a fresh epoch; reads are permitted only inside the current tick
+  callback, so a stale Java handle cannot outlive a world or tick. Paused passes emit no tick callback, and
+  the deprecated in-frame path emits no lifecycle events.
+- Typed bridged registrations are converted into the same `ContentMod` input as carried content before the
+  authoritative tables load. They are therefore available to the host and its guests through the existing
+  registry/content sync. An opaque callback registration, or a payload whose codec/handler has not crossed
+  the network ABI, remains diagnostic and cannot alter a remote client's registry.
+- Dedicated server startup is implemented; live Java event dispatch, registry sync for runtime-created
+  objects, and arbitrary mod packet handling are still later work. A client without the server's typed
+  declarations is refused during the normal content/registry compatibility check, as with other content.
 - Mods that change packets outside their own channel: reported, not emulated.
 
 ## How it is tested
