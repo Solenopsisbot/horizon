@@ -143,6 +143,39 @@ fn role_name(role: ExecutionRole) -> &'static str {
     }
 }
 
+/// The Mixin translation planning one jar declares, as a report keeps it: the
+/// plans the bounded runtime would weave, the methods they hook (sorted and
+/// bounded), the selectors it could not read, and the configs it read. Scanned
+/// once per jar, so the window, its server thread and the dedicated server
+/// report the same numbers.
+#[derive(Debug, Default, Clone)]
+pub(super) struct MixinPlanning {
+    pub(super) plans: usize,
+    pub(super) targets: Vec<String>,
+    pub(super) unresolved: usize,
+    pub(super) configs: usize,
+    pub(super) config_errors: usize,
+}
+
+impl MixinPlanning {
+    /// Planning is a property of the jar, not of a run: a jar that never
+    /// executed entrypoints (a refused one) still plans the same way, and a jar
+    /// that could not be read (`None`) plans nothing.
+    pub(super) fn of(jar: Option<&horizon_native_java::NativeJar>) -> Self {
+        let Some(jar) = jar else {
+            return Self::default();
+        };
+        let plans = jar.mixin_injection_plans();
+        Self {
+            plans: plans.len(),
+            targets: bounded_sorted(plans.iter().map(|plan| mixin_target_label(&plan.target))),
+            unresolved: jar.unresolved_invoke_plans().len(),
+            configs: jar.mixin_configs().len(),
+            config_errors: jar.mixin_config_errors().len(),
+        }
+    }
+}
+
 /// One jar's bounded compatibility decision: what the native path read, what it
 /// ran, and what actually reached the typed content tables. Lists are sorted and
 /// truncated at [`MAX_REPORT_ROWS`], so the window, its server thread and the
@@ -169,6 +202,19 @@ pub(super) struct JavaCompatibilityReport {
     pub(super) promoted: Vec<String>,
     pub(super) payload_directions: Vec<String>,
     pub(super) listeners: usize,
+    /// `@Inject` plans the bounded runtime would weave, counted as translation
+    /// planning rather than weaving: nothing is patched into a class.
+    pub(super) mixin_plans: usize,
+    /// The methods those plans hook, `owner#name(descriptor)`, sorted and
+    /// bounded like every other list here.
+    pub(super) mixin_targets: Vec<String>,
+    /// `@At("INVOKE")` plans whose call site the bounded runtime cannot read,
+    /// so they stay on the JVM fallback instead of a guessed target.
+    pub(super) mixin_unresolved: usize,
+    /// Mixin JSON configs the jar declares and this runtime could read.
+    pub(super) mixin_configs: usize,
+    /// Declared configs that could not be read, counted rather than named.
+    pub(super) mixin_config_errors: usize,
     /// True only for the diagnostics a server role logs when it refuses a jar
     /// marked `clientSideOnly`; an accepted jar is never rejected.
     pub(super) client_side_only_rejected: bool,
@@ -210,6 +256,9 @@ impl JavaCompatibilityReport {
                 .filter(|key| !promoted.contains(key)),
         );
         promoted.truncate(MAX_REPORT_ROWS);
+        // Mixin planning comes from the jar's annotations and configs, so a
+        // refused jar reports what it would have woven just like a run one.
+        let mixin = MixinPlanning::of(Some(jar));
         Self {
             jar: path.to_owned(),
             id: native_mod_id(jar, path).map(str::to_owned),
@@ -229,6 +278,11 @@ impl JavaCompatibilityReport {
                     .map(|payload| payload.direction.clone()),
             ),
             listeners: facts.listeners,
+            mixin_plans: mixin.plans,
+            mixin_targets: mixin.targets,
+            mixin_unresolved: mixin.unresolved,
+            mixin_configs: mixin.configs,
+            mixin_config_errors: mixin.config_errors,
             client_side_only_rejected: facts.rejected,
             role,
         }
@@ -267,6 +321,21 @@ impl JavaCompatibilityReport {
             "  payloads: [{}]",
             self.payload_directions.join(", ")
         ));
+        // Mixin planning, always printed so a jar with none reads as planned
+        // nothing rather than missing the line; the targets stay bounded.
+        lines.push(format!(
+            "  mixin: {} plan(s), {} target(s), {} unresolved, {} config, {} config error(s){}",
+            self.mixin_plans,
+            self.mixin_targets.len(),
+            self.mixin_unresolved,
+            self.mixin_configs,
+            self.mixin_config_errors,
+            if self.mixin_targets.is_empty() {
+                String::new()
+            } else {
+                format!(" targets=[{}]", self.mixin_targets.join(", "))
+            },
+        ));
         if self.client_side_only_rejected {
             lines.push(format!(
                 "  rejected: clientSideOnly metadata for {} execution",
@@ -275,6 +344,26 @@ impl JavaCompatibilityReport {
         }
         lines
     }
+
+    /// The one warning a jar's Mixin planning earns when part of it could not be
+    /// translated. The counts only: the bounded lists are in [`Self::summary`].
+    pub(super) fn mixin_warning(&self) -> Option<String> {
+        if self.mixin_unresolved == 0 && self.mixin_config_errors == 0 {
+            return None;
+        }
+        Some(format!(
+            "Horizon: native Java {} has {} unresolved Mixin plan(s) and {} unreadable Mixin config(s); those stay on the JVM fallback",
+            self.jar.display(),
+            self.mixin_unresolved,
+            self.mixin_config_errors,
+        ))
+    }
+}
+
+/// A woven method labeled the way the native probe labels it:
+/// `owner#name(descriptor)`.
+fn mixin_target_label(method: &horizon_native_java::MethodRef) -> String {
+    format!("{}#{}{}", method.owner, method.name, method.descriptor)
 }
 
 /// Sorted, deduplicated and truncated at [`MAX_REPORT_ROWS`].
@@ -588,6 +677,9 @@ pub(super) fn run_java_mods_with_report(
                 .map_err(|error| format!("{}: {error}", path.display()))?;
             native_content.push(ContentMod { id, content });
         }
+        if let Some(warning) = report.mixin_warning() {
+            log::warn!("{warning}");
+        }
         for line in report.summary() {
             log::info!("{line}");
         }
@@ -605,8 +697,16 @@ pub(super) fn run_java_mods_with_report(
         .iter()
         .map(|report| report.payload_directions.len())
         .sum::<usize>();
+    let mixin_plans = reports
+        .iter()
+        .map(|report| report.mixin_plans)
+        .sum::<usize>();
+    let mixin_unresolved = reports
+        .iter()
+        .map(|report| report.mixin_unresolved)
+        .sum::<usize>();
     log::info!(
-        "Horizon: Java compatibility: {} jar(s), {typed} typed registrations, {opaque} opaque, {payloads} payload directions",
+        "Horizon: Java compatibility: {} jar(s), {typed} typed registrations, {opaque} opaque, {payloads} payload directions, {mixin_plans} mixin plan(s), {mixin_unresolved} unresolved",
         reports.len(),
     );
     Ok((native_content, reports))
@@ -1334,6 +1434,7 @@ clientSideOnly = true
              promoted=[minecraft:item/demo:gem]"
                 .to_owned(),
             "  payloads: [play_to_server]".to_owned(),
+            "  mixin: 0 plan(s), 0 target(s), 0 unresolved, 0 config, 0 config error(s)".to_owned(),
         ];
         assert_eq!(report.summary(), lines);
         assert_eq!(report.summary(), lines);
@@ -1381,6 +1482,133 @@ clientSideOnly = true
         assert_eq!(
             bounded.opaque_registrations[0],
             "minecraft:item/demo:item_00"
+        );
+    }
+
+    /// A jar's Mixin planning is one bounded line: the plans, the methods they
+    /// hook, the selectors this runtime could not read, and the configs it
+    /// read. Built from execution facts, so no jar has to be compiled here.
+    #[test]
+    fn java_compatibility_summary_reports_mixin_planning() {
+        let mut jar = horizon_native_java::NativeJar::default();
+        jar.fabric_id = Some("demo".into());
+        jar.fabric_version = Some("1.0".into());
+        let report = JavaCompatibilityReport {
+            mixin_plans: 2,
+            mixin_targets: vec![
+                "demo/Target#greet(Ljava/lang/String;)Ljava/lang/String;".into(),
+                "demo/Target#tick()V".into(),
+            ],
+            mixin_unresolved: 1,
+            mixin_configs: 1,
+            mixin_config_errors: 0,
+            ..JavaCompatibilityReport::new(
+                &jar,
+                std::path::Path::new("/mods/demo.jar"),
+                ExecutionRole::Client,
+                NativeRunFacts::default(),
+            )
+        };
+        let summary = report.summary();
+        // Header, entrypoints, registrations, payloads, then Mixin planning.
+        assert_eq!(
+            summary[4],
+            "  mixin: 2 plan(s), 2 target(s), 1 unresolved, 1 config, 0 config error(s) \
+             targets=[demo/Target#greet(Ljava/lang/String;)Ljava/lang/String;, \
+             demo/Target#tick()V]"
+        );
+        assert_eq!(summary, report.summary());
+        // Nothing planned reads as nothing planned instead of a missing line.
+        let quiet = JavaCompatibilityReport {
+            mixin_plans: 0,
+            mixin_targets: Vec::new(),
+            mixin_unresolved: 0,
+            mixin_configs: 0,
+            mixin_config_errors: 0,
+            ..report.clone()
+        };
+        assert_eq!(
+            quiet.summary()[4],
+            "  mixin: 0 plan(s), 0 target(s), 0 unresolved, 0 config, 0 config error(s)"
+        );
+    }
+
+    /// The jar-derived path: `fabric.mod.json` and the root `*.mixins.json`
+    /// entries fill the fields with no entrypoint declared, and a malformed
+    /// config is counted rather than hidden.
+    #[test]
+    fn java_compatibility_report_reads_mixin_configs_from_the_jar() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-java-mixin-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("demo.jar");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(br#"{"id":"demo","version":"1.0","mixins":["demo.mixins.json"]}"#)
+            .unwrap();
+        zip.start_file("demo.mixins.json", options).unwrap();
+        zip.write_all(br#"{"required":true,"package":"demo.mixin","mixins":["DemoMixin"]}"#)
+            .unwrap();
+        // A config this bounded reader cannot parse: a diagnostic, not a stop.
+        zip.start_file("broken.mixins.json", options).unwrap();
+        zip.write_all(br#"{"mixins":5}"#).unwrap();
+        zip.finish().unwrap();
+
+        let jar = horizon_native_java::NativeJar::from_path(&path).unwrap();
+        let report = JavaCompatibilityReport::new(
+            &jar,
+            &path,
+            ExecutionRole::Client,
+            NativeRunFacts::default(),
+        );
+        // No class carries a mixin annotation, so nothing is planned; both
+        // configs were found and one could not be read.
+        assert_eq!(report.mixin_plans, 0);
+        assert!(report.mixin_targets.is_empty());
+        assert_eq!(report.mixin_unresolved, 0);
+        assert_eq!(report.mixin_configs, 1);
+        assert_eq!(report.mixin_config_errors, 1);
+        assert_eq!(
+            report.summary()[4],
+            "  mixin: 0 plan(s), 0 target(s), 0 unresolved, 1 config, 1 config error(s)"
+        );
+        assert!(
+            report
+                .mixin_warning()
+                .is_some_and(|warning| warning.contains(&path.display().to_string())),
+            "{:?}",
+            report.mixin_warning()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A jar whose Mixin planning is partly untranslatable warns once, naming
+    /// the jar and the counts; nothing planned warns not at all.
+    #[test]
+    fn java_compatibility_mixin_warning_names_the_jar_and_counts() {
+        let jar = horizon_native_java::NativeJar::default();
+        let report = JavaCompatibilityReport::new(
+            &jar,
+            std::path::Path::new("/mods/demo.jar"),
+            ExecutionRole::DedicatedServer,
+            NativeRunFacts::default(),
+        );
+        assert_eq!(report.mixin_warning(), None);
+        let untranslatable = JavaCompatibilityReport {
+            mixin_unresolved: 1,
+            mixin_config_errors: 2,
+            ..report
+        };
+        assert_eq!(
+            untranslatable.mixin_warning().as_deref(),
+            Some(
+                "Horizon: native Java /mods/demo.jar has 1 unresolved Mixin plan(s) and 2 unreadable Mixin config(s); those stay on the JVM fallback"
+            )
         );
     }
 

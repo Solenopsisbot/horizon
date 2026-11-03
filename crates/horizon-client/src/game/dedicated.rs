@@ -10,7 +10,7 @@ use super::{
     Game, Options,
     execution_role::ExecutionRole,
     lan::LanSettings,
-    mods::{JavaCompatibilityReport, JavaLoader},
+    mods::{JavaCompatibilityReport, JavaLoader, MixinPlanning},
     world_loading::WorldRequest,
 };
 use horizon_client::{
@@ -315,6 +315,7 @@ fn refusal_report(
             path.file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
         });
+    let mixin = MixinPlanning::of(jar);
     JavaCompatibilityReport {
         jar: path.to_owned(),
         id,
@@ -333,6 +334,11 @@ fn refusal_report(
         promoted: Vec::new(),
         payload_directions: Vec::new(),
         listeners: 0,
+        mixin_plans: mixin.plans,
+        mixin_targets: mixin.targets,
+        mixin_unresolved: mixin.unresolved,
+        mixin_configs: mixin.configs,
+        mixin_config_errors: mixin.config_errors,
         client_side_only_rejected: jar.is_some_and(|jar| jar.client_side_only),
         role: ExecutionRole::DedicatedServer,
     }
@@ -2014,6 +2020,11 @@ mod tests {
             promoted: Vec::new(),
             payload_directions: payload.iter().map(|way| (*way).to_owned()).collect(),
             listeners: 0,
+            mixin_plans: 0,
+            mixin_targets: Vec::new(),
+            mixin_unresolved: 0,
+            mixin_configs: 0,
+            mixin_config_errors: 0,
             client_side_only_rejected: false,
             role: ExecutionRole::DedicatedServer,
         }
@@ -2038,9 +2049,9 @@ mod tests {
             ),
         ];
         let lines = capture_log(|| log_java_reports(&reports, "INFO"));
-        // A summary is four lines: the jar, its entrypoints, its registrations
-        // and its payloads.
-        assert_eq!(lines.len(), 8, "{lines:?}");
+        // A summary is five lines: the jar, its entrypoints, its registrations,
+        // its payloads and its Mixin planning.
+        assert_eq!(lines.len(), 10, "{lines:?}");
         for line in &lines {
             assert!(line.starts_with(JAVA_PREFIX), "{line}");
         }
@@ -2065,7 +2076,7 @@ mod tests {
         );
         assert!(lines[3].contains("payloads: [server->client]"), "{lines:?}");
         assert!(
-            lines[6].contains("registrations: typed=0 opaque=[minecraft:item/demo:token]"),
+            lines[7].contains("registrations: typed=0 opaque=[minecraft:item/demo:token]"),
             "{lines:?}"
         );
     }
