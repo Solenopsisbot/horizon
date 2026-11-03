@@ -58,15 +58,28 @@ fn mixin_target_labels<'a>(targets: impl IntoIterator<Item = &'a MethodRef>) -> 
 /// Sort key for the plan report, mirroring the discovery order.
 fn mixin_plan_sort_key(
     plan: &MixinInjectionPlan,
-) -> (&str, &str, &str, &str, &str, &str, &str, bool) {
+) -> (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    bool,
+) {
     (
-        &plan.target.owner,
-        &plan.target.name,
-        &plan.target.descriptor,
-        &plan.at,
-        &plan.callback.owner,
-        &plan.callback.name,
-        &plan.callback.descriptor,
+        plan.target.owner.clone(),
+        plan.target.name.clone(),
+        plan.target.descriptor.clone(),
+        plan.at.clone(),
+        plan.callback.owner.clone(),
+        plan.callback.name.clone(),
+        plan.callback.descriptor.clone(),
+        plan.invoke_target
+            .clone()
+            .map_or_else(String::new, |target| method_label(&target)),
         plan.cancellable,
     )
 }
@@ -90,6 +103,7 @@ fn mixin_plan_entries(plans: &[MixinInjectionPlan]) -> Vec<serde_json::Value> {
                 "callback": format!("{}#{}", plan.callback.owner, plan.callback.name),
                 "callback_descriptor": plan.callback.descriptor,
                 "at": plan.at,
+                "invoke_target": plan.invoke_target.as_ref().map(method_label),
                 "cancellable": plan.cancellable,
             })
         })
@@ -99,6 +113,7 @@ fn mixin_plan_entries(plans: &[MixinInjectionPlan]) -> Vec<serde_json::Value> {
 /// The `--mixin-plans` report: planning only, no entrypoint is required.
 fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
     let plans = jar.mixin_injection_plans();
+    let unresolved = jar.unresolved_invoke_plans();
     let configs = jar
         .mixin_configs()
         .iter()
@@ -118,6 +133,7 @@ fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
         "status": "ok",
         "targets": mixin_target_labels(plans.iter().map(|plan| &plan.target)),
         "plans": mixin_plan_entries(&plans),
+        "unresolved": mixin_plan_entries(&unresolved),
         "configs": configs,
         "config_errors": jar
             .mixin_config_errors()

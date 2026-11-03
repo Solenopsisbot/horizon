@@ -532,6 +532,7 @@ def expect_mixin_probe(archive: Path) -> dict | None:
             "callback": "demo/TargetMixin#before",
             "callback_descriptor": "(I)V",
             "at": "HEAD",
+            "invoke_target": None,
             "cancellable": False,
         },
         {
@@ -541,6 +542,7 @@ def expect_mixin_probe(archive: Path) -> dict | None:
             "callback": "demo/TargetMixin#after",
             "callback_descriptor": "(I)V",
             "at": "RETURN",
+            "invoke_target": None,
             "cancellable": False,
         },
     ]
