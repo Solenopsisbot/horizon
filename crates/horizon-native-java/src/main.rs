@@ -1,11 +1,13 @@
-use horizon_native_java::{NativeJar, StdHost};
+use horizon_native_java::{MethodRef, MixinInjectionPlan, NativeJar, StdHost};
 use std::{path::PathBuf, process::ExitCode};
 
-/// Command-line shape: `--json` may appear anywhere, the remaining arguments
-/// are the jar, an optional loader kind, and an optional explicit class.
+/// Command-line shape: `--json` and `--mixin-plans` may appear anywhere, the
+/// remaining arguments are the jar, an optional loader kind, and an optional
+/// explicit class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cli {
     json: bool,
+    mixin_plans: bool,
     path: String,
     kind: Option<String>,
     class: Option<String>,
@@ -14,10 +16,13 @@ struct Cli {
 impl Cli {
     fn parse(args: impl IntoIterator<Item = String>) -> Option<Self> {
         let mut json = false;
+        let mut mixin_plans = false;
         let mut positional = Vec::new();
         for arg in args {
             if arg == "--json" {
                 json = true;
+            } else if arg == "--mixin-plans" {
+                mixin_plans = true;
             } else {
                 positional.push(arg);
             }
@@ -25,11 +30,80 @@ impl Cli {
         let mut positional = positional.into_iter();
         Some(Self {
             json,
+            mixin_plans,
             path: positional.next()?,
             kind: positional.next(),
             class: positional.next(),
         })
     }
+}
+
+/// Render a method as `owner#name(descriptor)`.
+///
+/// The descriptor keeps its own parentheses, so a concrete method reads
+/// `demo/Target#greet(Ljava/lang/String;)Ljava/lang/String;` and a
+/// descriptor-less `@Inject(method = "greet")` reads `demo/Target#greet`.
+fn method_label(method: &MethodRef) -> String {
+    format!("{}#{}{}", method.owner, method.name, method.descriptor)
+}
+
+/// Sorted, deduplicated `owner#name(descriptor)` labels for target methods.
+fn mixin_target_labels<'a>(targets: impl IntoIterator<Item = &'a MethodRef>) -> Vec<String> {
+    let mut labels = targets.into_iter().map(method_label).collect::<Vec<_>>();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+/// Sort key for the plan report, mirroring the discovery order.
+fn mixin_plan_sort_key(
+    plan: &MixinInjectionPlan,
+) -> (&str, &str, &str, &str, &str, &str, &str, bool) {
+    (
+        &plan.target.owner,
+        &plan.target.name,
+        &plan.target.descriptor,
+        &plan.at,
+        &plan.callback.owner,
+        &plan.callback.name,
+        &plan.callback.descriptor,
+        plan.cancellable,
+    )
+}
+
+/// Report rows for discovered plans, sorted and deduplicated.
+///
+/// `callback` carries the mixin class and method (`owner#name`) because a
+/// callback only makes sense together with the class that declares it;
+/// `callback_descriptor` holds the rest of its signature.
+fn mixin_plan_entries(plans: &[MixinInjectionPlan]) -> Vec<serde_json::Value> {
+    let mut plans = plans.to_vec();
+    plans.sort_by(|a, b| mixin_plan_sort_key(a).cmp(&mixin_plan_sort_key(b)));
+    plans.dedup();
+    plans
+        .iter()
+        .map(|plan| {
+            serde_json::json!({
+                "target": plan.target.owner,
+                "method": plan.target.name,
+                "descriptor": plan.target.descriptor,
+                "callback": format!("{}#{}", plan.callback.owner, plan.callback.name),
+                "callback_descriptor": plan.callback.descriptor,
+                "at": plan.at,
+                "cancellable": plan.cancellable,
+            })
+        })
+        .collect()
+}
+
+/// The `--mixin-plans` report: planning only, no entrypoint is required.
+fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
+    let plans = jar.mixin_injection_plans();
+    serde_json::json!({
+        "status": "ok",
+        "targets": mixin_target_labels(plans.iter().map(|plan| &plan.target)),
+        "plans": mixin_plan_entries(&plans),
+    })
 }
 
 fn main() -> ExitCode {
@@ -41,6 +115,7 @@ fn main() -> ExitCode {
     };
     let Cli {
         json,
+        mixin_plans,
         path,
         kind: requested_kind,
         class: explicit_class,
@@ -60,6 +135,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Planning is a separate question from execution: report what the jar's
+    // annotations would weave and stop, even when the jar declares no
+    // entrypoint at all.
+    if mixin_plans {
+        println!("{}", mixin_plans_json(&jar));
+        return ExitCode::SUCCESS;
+    }
     let entrypoints = if let Some(class) = explicit_class {
         vec![horizon_native_java::Entrypoint {
             class,
@@ -137,6 +219,10 @@ fn main() -> ExitCode {
                             .collect::<Vec<_>>(),
                         "listeners": host.listener_registrations().count(),
                         "events": host.posted_events().len(),
+                        "mixin_targets": mixin_target_labels(
+                            jar.discovered_mixin_targets().iter()
+                        ),
+                        "mixin_plans": jar.mixin_injection_plans().len(),
                     })
                 );
             } else {
@@ -174,12 +260,29 @@ mod tests {
     fn json_flag_is_position_independent() {
         let expected = Cli {
             json: true,
+            mixin_plans: false,
             path: "mod.jar".into(),
             kind: Some("client".into()),
             class: Some("demo.Main".into()),
         };
-        assert_eq!(parse(&["--json", "mod.jar", "client", "demo.Main"]), Some(expected.clone()));
+        assert_eq!(
+            parse(&["--json", "mod.jar", "client", "demo.Main"]),
+            Some(expected.clone())
+        );
         assert_eq!(parse(&["mod.jar", "--json", "client", "demo.Main"]), Some(expected));
+    }
+
+    #[test]
+    fn mixin_plan_flag_is_position_independent() {
+        let expected = Cli {
+            json: false,
+            mixin_plans: true,
+            path: "mod.jar".into(),
+            kind: None,
+            class: None,
+        };
+        assert_eq!(parse(&["--mixin-plans", "mod.jar"]), Some(expected.clone()));
+        assert_eq!(parse(&["mod.jar", "--mixin-plans"]), Some(expected));
     }
 
     #[test]
@@ -188,6 +291,7 @@ mod tests {
             parse(&["mod.jar"]),
             Some(Cli {
                 json: false,
+                mixin_plans: false,
                 path: "mod.jar".into(),
                 kind: None,
                 class: None,

@@ -388,6 +388,11 @@ def expect_probe(
             problems.append(
                 f"registrations {recorded!r}, expected {registrations!r}"
             )
+    if report.get("mixin_plans") != 0 or report.get("mixin_targets") != []:
+        problems.append(
+            f"unexpected Mixin plans {report.get('mixin_plans')!r} "
+            f"targets {report.get('mixin_targets')!r} for a plain jar"
+        )
     if problems:
         print(
             f"native {name} probe failed: {', '.join(problems)}: "
