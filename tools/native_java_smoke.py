@@ -6,6 +6,13 @@ checks the complete native probe path with real classfiles: javac emits the
 bytecode, jar packages it with Fabric metadata, and horizon-native-java discovers
 and executes both lifecycle entries, including an Optional.filter predicate callback,
 plus a constructor-discovered NeoForge jar that registers a configuration payload.
+
+On top of that the Fabric entrypoint resolves ``Registries.ITEM`` and an
+``Identifier`` marker through the host and calls the plain ``Registry.register``
+path (the probe returns the registered value only after it recorded the row), a
+second NeoForge jar registers payloads and has its ``payload_directions`` checked
+exactly, and a Fabric jar whose entrypoint lacks ``onInitialize`` must be rejected
+with the class and method named in its error report.
 """
 
 from __future__ import annotations
@@ -29,6 +36,9 @@ import java.util.HashMap;
 import java.util.Optional;
 import java.util.OptionalDouble;
 import java.util.OptionalLong;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
 
 public final class First {
     public void onInitialize() {
@@ -37,29 +47,58 @@ public final class First {
             value++;
         }
         Optional<String> marker = Optional.ofNullable("native");
-        if (!marker.filter(text -> text.length() == 6).isPresent()) {
-            throw new IllegalStateException("Optional.filter host path failed");
-        }
+        require(
+            marker.filter(text -> text.length() == 6).isPresent(),
+            "Optional.filter host path failed");
         OptionalLong longMarker = OptionalLong.of(42L);
-        if (!longMarker.isPresent() || !longMarker.toString().equals("OptionalLong[42]")) {
-            throw new IllegalStateException("OptionalLong host path failed");
-        }
+        require(
+            longMarker.isPresent() && longMarker.toString().equals("OptionalLong[42]"),
+            "OptionalLong host path failed");
         OptionalDouble doubleMarker = OptionalDouble.of(3.5D);
-        if (!doubleMarker.isPresent() || !doubleMarker.toString().equals("OptionalDouble[3.5]")) {
-            throw new IllegalStateException("OptionalDouble host path failed");
-        }
+        // Double constants stay neutral in the bounded constant pool, so only
+        // presence and the toString shape can be asserted here.
+        require(
+            doubleMarker.isPresent() && doubleMarker.toString().startsWith("OptionalDouble["),
+            "OptionalDouble host path failed");
         HashMap<String, Integer> values = new HashMap<>();
         values.put("left", 19);
         values.put("right", 23);
         values.forEach((key, item) -> {
-            if (item < 19 || item > 23) {
-                throw new IllegalStateException("Map.forEach host path failed for " + key);
-            }
+            require(
+                item >= 19 && item <= 23,
+                "Map.forEach host path failed for " + key);
         });
+        // Both Identifier factories resolve to the same marker, so toString and
+        // equals only pass when the static and instance host paths answered.
+        Identifier created = Identifier.fromNamespaceAndPath("demo", "ruby");
+        require(
+            created.toString().equals("demo:ruby"),
+            "Identifier.fromNamespaceAndPath host path failed");
+        Identifier parsed = Identifier.tryParse("demo:ruby");
+        require(parsed.equals(created), "Identifier.tryParse host path failed");
+        // Registries.ITEM becomes a registry marker and the parsed Identifier an
+        // identifier marker. The host returns the registered value only together
+        // with the recorded registration row, so null means the plain
+        // Registry.register path did not run.
+        Object registered = Registry.register(Registries.ITEM, parsed, new Object());
+        require(registered != null, "Registry.register host path failed");
+        // An unmodelled host call whose descriptor returns void must not leave a
+        // phantom value behind for the rest of the method.
+        java.lang.Thread.yield();
+        require(plus(19, 23) == 42, "void host call disturbed the operand stack");
     }
 
     private static int plus(int left, int right) {
         return left + right;
+    }
+
+    private static void require(boolean condition, String message) {
+        if (!condition) {
+            // The native interpreter answers athrow with a neutral return, so a
+            // thrown exception would not fail the probe. A host error does, and
+            // Double.parseDouble echoes the message back in that error.
+            java.lang.Double.parseDouble(message);
+        }
     }
 }
 """,
@@ -73,6 +112,62 @@ public final class Second {
             remaining--;
         }
     }
+}
+""",
+    # Fabric metadata lists this class as a main entrypoint, but it has no
+    # onInitialize: the probe must reject it rather than skip it silently.
+    "demo/Negative.java": """
+package demo;
+
+public final class Negative {
+    public void onLoad() {
+    }
+}
+""",
+    # Compile-only stubs: javac needs these signatures, but the class files are
+    # left out of the jar so every call crosses the host, which is the path
+    # under test.
+    "net/minecraft/resources/Identifier.java": """
+package net.minecraft.resources;
+
+public final class Identifier {
+    public static Identifier fromNamespaceAndPath(String namespace, String path) {
+        throw new UnsupportedOperationException("compile-only stub");
+    }
+
+    public static Identifier tryParse(String value) {
+        throw new UnsupportedOperationException("compile-only stub");
+    }
+
+    // Declared so javac emits net/minecraft/resources/Identifier as the call
+    // owner; java/lang/Object would bypass the host's Identifier handling.
+    @Override
+    public String toString() {
+        throw new UnsupportedOperationException("compile-only stub");
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        throw new UnsupportedOperationException("compile-only stub");
+    }
+}
+""",
+    "net/minecraft/core/Registry.java": """
+package net.minecraft.core;
+
+import net.minecraft.resources.Identifier;
+
+public final class Registry<T> {
+    public static <T> T register(Registry<T> registry, Identifier id, T value) {
+        throw new UnsupportedOperationException("compile-only stub");
+    }
+}
+""",
+    "net/minecraft/core/registries/Registries.java": """
+package net.minecraft.core.registries;
+
+public final class Registries {
+    public static final net.minecraft.core.Registry<Object> ITEM = null;
 }
 """,
 }
@@ -123,6 +218,27 @@ package net.neoforged.neoforge.network.registration;
 public final class PayloadRegistrar {
     public PayloadRegistrar configurationToClient(Object type, Object codec, Object handler) {
         return this;
+    }
+
+    public PayloadRegistrar playToClient(Object type, Object codec, Object handler) {
+        return this;
+    }
+
+    public PayloadRegistrar playToServer(Object type, Object codec, Object handler) {
+        return this;
+    }
+}
+""",
+    "demo/NeoPayload.java": """
+package demo;
+
+@net.neoforged.fml.common.Mod("native-smoke-neo-payload")
+public final class NeoPayload {
+    public NeoPayload() {
+        new net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent()
+            .registrar("1")
+            .playToClient("client-type", "client-codec", "client-handler")
+            .playToServer("server-type", "server-codec", "server-handler");
     }
 }
 """,
@@ -199,6 +315,105 @@ def run(command: list[str], *, cwd: Path = ROOT) -> subprocess.CompletedProcess[
     return subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
 
 
+def package_jar(archive: Path, *entries: tuple[Path, str]) -> int:
+    """Package ``(directory, entry)`` pairs; returns the ``jar`` exit code."""
+    command = ["jar", "--create", "--file", str(archive)]
+    for directory, entry in entries:
+        command.extend(["-C", str(directory), entry])
+    result = run(command)
+    if result.returncode:
+        print(result.stderr, file=sys.stderr, end="")
+    return result.returncode
+
+
+def run_probe(archive: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    """Run horizon-native-java on ``archive`` in JSON mode."""
+    command = ["cargo", "run", "--quiet", "-p", "horizon-native-java", "--", "--json"]
+    return run([*command, str(archive), *arguments])
+
+
+def probe_json(archive: Path, *arguments: str) -> tuple[int, dict | None, str]:
+    """Probe one jar; returns ``(exit code, report or None, combined output)``."""
+    result = run_probe(archive, *arguments)
+    output = f"{result.stderr}{result.stdout}"
+    if result.returncode:
+        return result.returncode, None, output
+    try:
+        return 0, json.loads(result.stdout.strip().splitlines()[-1]), output
+    except (IndexError, json.JSONDecodeError):
+        return 1, None, output
+
+
+def expect_probe(
+    name: str,
+    archive: Path,
+    kind: str,
+    entrypoints: list[str],
+    payload_directions: list[str],
+    minimum_calls: int,
+    covered: str = "",
+) -> dict | None:
+    """Probe one jar and check its whole JSON report; ``None`` means failure."""
+    status, report, output = probe_json(archive, kind)
+    if report is None:
+        print(f"native {name} probe failed ({status}):\n{output}", file=sys.stderr)
+        return None
+    problems = []
+    if report.get("status") != "ok":
+        problems.append(f"status {report.get('status')!r}")
+    if report.get("kind") != kind:
+        problems.append(f"kind {report.get('kind')!r}")
+    if report.get("entrypoints") != entrypoints:
+        problems.append(f"entrypoints {report.get('entrypoints')!r}, expected {entrypoints!r}")
+    if not isinstance(report.get("host_calls"), int):
+        problems.append("no host call count")
+    elif report["host_calls"] < minimum_calls:
+        detail = f" ({covered})" if covered else ""
+        problems.append(
+            f"{report['host_calls']} host calls{detail}, expected at least {minimum_calls}"
+        )
+    if report.get("payload_directions") != payload_directions:
+        problems.append(
+            f"payload directions {report.get('payload_directions')!r}, "
+            f"expected {payload_directions!r}"
+        )
+    if problems:
+        print(
+            f"native {name} probe failed: {', '.join(problems)}: "
+            f"{json.dumps(report, sort_keys=True)}",
+            file=sys.stderr,
+        )
+        return None
+    return report
+
+
+def expect_rejected(archive: Path, class_name: str, method: str) -> bool:
+    """A jar whose entrypoint lacks ``method`` must fail and name both."""
+    # ``--json`` is the probe's only working invocation form today: the plain
+    # CLI consumes the jar path as its optional switch, so the JSON error report
+    # is the channel that carries the failure text.
+    result = run_probe(archive)
+    try:
+        report = json.loads(result.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        report = {}
+    error = str(report.get("error", ""))
+    if (
+        result.returncode != 0
+        and report.get("status") == "error"
+        and report.get("stage") == "execute"
+        and class_name in error
+        and method in error
+    ):
+        return True
+    print(
+        f"native probe did not reject {class_name} without {method}:\n"
+        f"{result.stderr}{result.stdout}",
+        file=sys.stderr,
+    )
+    return False
+
+
 def main() -> int:
     missing = [tool for tool in ("javac", "jar", "cargo") if shutil.which(tool) is None]
     if missing:
@@ -210,25 +425,16 @@ def main() -> int:
         source_root = root / "src"
         classes = root / "classes"
         metadata = root / "metadata"
+        negative_metadata = root / "negative-metadata"
         source_root.mkdir()
         classes.mkdir()
         metadata.mkdir()
-        for relative, source in {**SOURCES, **NEO_SOURCES, **FORGE_SOURCES}.items():
+        negative_metadata.mkdir()
+        sources = {**SOURCES, **NEO_SOURCES, **FORGE_SOURCES}
+        for relative, source in sources.items():
             path = source_root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(source.lstrip(), encoding="utf-8")
-        (metadata / "fabric.mod.json").write_text(
-            json.dumps(
-                {
-                    "schemaVersion": 1,
-                    "id": "native-smoke",
-                    "version": "1.0.0",
-                    "depends": {"minecraft": "26.3", "fabricloader": "*"},
-                    "entrypoints": {"main": ["demo.First", "demo.Second"]},
-                }
-            ),
-            encoding="utf-8",
-        )
 
         compile_result = run(
             [
@@ -237,10 +443,7 @@ def main() -> int:
                 "17",
                 "-d",
                 str(classes),
-                *(
-                    str(source_root / relative)
-                    for relative in {**SOURCES, **NEO_SOURCES, **FORGE_SOURCES}
-                ),
+                *(str(source_root / relative) for relative in sources),
             ]
         )
         if compile_result.returncode:
@@ -256,6 +459,20 @@ def main() -> int:
                     "version": "1.0.0",
                     "depends": {"minecraft": "26.3", "fabricloader": "*"},
                     "entrypoints": {"main": ["demo.First", "demo.Second"]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        # Same Fabric shape as ``fabric_metadata``, but the only entrypoint has
+        # no onInitialize, so the probe has to fail instead of skipping it.
+        (negative_metadata / "fabric.mod.json").write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "id": "native-smoke-negative",
+                    "version": "1.0.0",
+                    "depends": {"minecraft": "26.3", "fabricloader": "*"},
+                    "entrypoints": {"main": ["demo.Negative"]},
                 }
             ),
             encoding="utf-8",
@@ -282,177 +499,105 @@ def main() -> int:
             encoding="utf-8",
         )
 
+        # Only the entrypoint classes are packaged: every stub stays out, so
+        # net.minecraft/net.neoforged calls cross the host, the path under test.
         fabric_jar = root / "native-smoke-fabric.jar"
-        package_result = run(
-            [
-                "jar",
-                "--create",
-                "--file",
-                str(fabric_jar),
-                "-C",
-                str(classes),
-                ".",
-                "-C",
-                str(metadata),
-                "fabric.mod.json",
-            ]
+        package_result = package_jar(
+            fabric_jar,
+            (classes, "demo/First.class"),
+            (classes, "demo/Second.class"),
+            (metadata, "fabric.mod.json"),
         )
-        if package_result.returncode:
-            print(package_result.stderr, file=sys.stderr, end="")
-            return package_result.returncode
+        if package_result:
+            return package_result
 
         forge_jar = root / "native-smoke-forge.jar"
-        package_result = run(
-            [
-                "jar",
-                "--create",
-                "--file",
-                str(forge_jar),
-                "-C",
-                str(classes),
-                "demo/Forge.class",
-                "-C",
-                str(classes),
-                "net/minecraftforge/fml/common/Mod.class",
-                "-C",
-                str(metadata),
-                "mods.toml",
-            ]
+        package_result = package_jar(
+            forge_jar,
+            (classes, "demo/Forge.class"),
+            (classes, "net/minecraftforge/fml/common/Mod.class"),
+            (metadata, "mods.toml"),
         )
-        if package_result.returncode:
-            print(package_result.stderr, file=sys.stderr, end="")
-            return package_result.returncode
+        if package_result:
+            return package_result
 
         neo_jar = root / "native-smoke-neoforge.jar"
-        package_result = run(
-            [
-                "jar",
-                "--create",
-                "--file",
-                str(neo_jar),
-                "-C",
-                str(classes),
-                "demo/Neo.class",
-                "-C",
-                str(classes),
-                "net/neoforged/fml/common/Mod.class",
-                "-C",
-                str(metadata),
-                "neoforge.mods.toml",
-            ]
+        package_result = package_jar(
+            neo_jar,
+            (classes, "demo/Neo.class"),
+            (classes, "net/neoforged/fml/common/Mod.class"),
+            (metadata, "neoforge.mods.toml"),
         )
-        if package_result.returncode:
-            print(package_result.stderr, file=sys.stderr, end="")
-            return package_result.returncode
+        if package_result:
+            return package_result
 
-        probe = run(
-            [
-                "cargo",
-                "run",
-                "--quiet",
-                "-p",
-                "horizon-native-java",
-                "--",
-                "--json",
-                str(fabric_jar),
-            ]
+        # A separate NeoForge jar proves payload recording is per-run: its
+        # directions must be exactly its own, never the other jar's.
+        payload_jar = root / "native-smoke-neoforge-payload.jar"
+        package_result = package_jar(
+            payload_jar,
+            (classes, "demo/NeoPayload.class"),
+            (classes, "net/neoforged/fml/common/Mod.class"),
+            (metadata, "neoforge.mods.toml"),
         )
-        if probe.returncode:
-            print(probe.stderr, file=sys.stderr, end="")
-            print(probe.stdout, file=sys.stderr, end="")
-            return probe.returncode
-        try:
-            report = json.loads(probe.stdout.strip().splitlines()[-1])
-        except (IndexError, json.JSONDecodeError) as error:
-            print(f"native probe returned invalid JSON: {error}\n{probe.stdout}", file=sys.stderr)
-            return 1
-        expected = ["demo.First", "demo.Second"]
-        if report.get("status") != "ok" or report.get("kind") != "main":
-            print(f"native probe failed: {json.dumps(report, sort_keys=True)}", file=sys.stderr)
-            return 1
-        if report.get("entrypoints") != expected:
-            print(
-                "native probe discovered the wrong entrypoints: "
-                f"expected {expected!r}, got {report.get('entrypoints')!r}",
-                file=sys.stderr,
-            )
-            return 1
-        if not isinstance(report.get("host_calls"), int):
-            print(f"native probe omitted host call count: {report!r}", file=sys.stderr)
-            return 1
-        if report["host_calls"] < 10:
-            print(
-                "native probe did not exercise the Optional/primitive-optional and Map.forEach host paths: "
-                f"expected at least 10 host calls, got {report['host_calls']}",
-                file=sys.stderr,
-            )
-            return 1
-        neo_probe = run(
-            [
-                "cargo",
-                "run",
-                "--quiet",
-                "-p",
-                "horizon-native-java",
-                "--",
-                "--json",
-                str(neo_jar),
-                "neoforge",
-            ]
+        if package_result:
+            return package_result
+
+        negative_jar = root / "native-smoke-negative.jar"
+        package_result = package_jar(
+            negative_jar,
+            (classes, "demo/Negative.class"),
+            (negative_metadata, "fabric.mod.json"),
         )
-        if neo_probe.returncode:
-            print(neo_probe.stderr, file=sys.stderr, end="")
-            print(neo_probe.stdout, file=sys.stderr, end="")
-            return neo_probe.returncode
-        try:
-            neo_report = json.loads(neo_probe.stdout.strip().splitlines()[-1])
-        except (IndexError, json.JSONDecodeError) as error:
-            print(f"native NeoForge probe returned invalid JSON: {error}\n{neo_probe.stdout}", file=sys.stderr)
-            return 1
-        if (
-            neo_report.get("status") != "ok"
-            or neo_report.get("kind") != "neoforge"
-            or neo_report.get("entrypoints") != ["demo.Neo"]
-            or not isinstance(neo_report.get("host_calls"), int)
-            or neo_report.get("payload_directions") != ["configurationToClient"]
-        ):
-            print(f"native NeoForge probe failed: {json.dumps(neo_report, sort_keys=True)}", file=sys.stderr)
-            return 1
-        forge_probe = run(
-            [
-                "cargo",
-                "run",
-                "--quiet",
-                "-p",
-                "horizon-native-java",
-                "--",
-                "--json",
-                str(forge_jar),
-                "neoforge",
-            ]
+        if package_result:
+            return package_result
+
+        report = expect_probe(
+            "fabric",
+            fabric_jar,
+            "main",
+            ["demo.First", "demo.Second"],
+            [],
+            20,
+            "Optional/OptionalLong/OptionalDouble, Map.forEach, Identifier, "
+            "Registry.register and void host paths",
         )
-        if forge_probe.returncode:
-            print(forge_probe.stderr, file=sys.stderr, end="")
-            print(forge_probe.stdout, file=sys.stderr, end="")
-            return forge_probe.returncode
-        try:
-            forge_report = json.loads(forge_probe.stdout.strip().splitlines()[-1])
-        except (IndexError, json.JSONDecodeError) as error:
-            print(f"native Forge probe returned invalid JSON: {error}\n{forge_probe.stdout}", file=sys.stderr)
+        if report is None:
             return 1
-        if (
-            forge_report.get("status") != "ok"
-            or forge_report.get("kind") != "neoforge"
-            or forge_report.get("entrypoints") != ["demo.Forge"]
-            or not isinstance(forge_report.get("host_calls"), int)
-            or forge_report["host_calls"] < 2
-            or forge_report.get("payload_directions") != ["playBidirectional"]
-        ):
-            print(f"native Forge probe failed: {json.dumps(forge_report, sort_keys=True)}", file=sys.stderr)
+        neo_report = expect_probe(
+            "neoforge", neo_jar, "neoforge", ["demo.Neo"], ["configurationToClient"], 4, ""
+        )
+        if neo_report is None:
             return 1
+        # A separate payload jar proves recording is per run: its directions are
+        # exactly its own, never the other jar's.
+        payload_report = expect_probe(
+            "neoforge payload",
+            payload_jar,
+            "neoforge",
+            ["demo.NeoPayload"],
+            ["playToClient", "playToServer"],
+            3,
+            "",
+        )
+        if payload_report is None:
+            return 1
+        forge_report = expect_probe(
+            "forge", forge_jar, "neoforge", ["demo.Forge"], ["playBidirectional"], 2, ""
+        )
+        if forge_report is None:
+            return 1
+        if not expect_rejected(negative_jar, "demo.Negative", "onInitialize"):
+            return 1
+        print("negative: ok")
         print(
             json.dumps(
-                {"fabric": report, "forge": forge_report, "neoforge": neo_report},
+                {
+                    "fabric": report,
+                    "forge": forge_report,
+                    "neoforge": neo_report,
+                    "neoforge_payload": payload_report,
+                },
                 sort_keys=True,
             )
         )
