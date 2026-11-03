@@ -488,7 +488,8 @@ const MOD_CONTAINER_CLASS: &str = "net/fabricmc/loader/api/ModContainer";
 const DATAGEN_INIT_SIG: &str = "(Lnet/fabricmc/fabric/api/datagen/v1/FabricDataGenerator;)V";
 const DATAGEN_OUTPUT_CTOR: &str = "(Lnet/fabricmc/loader/api/ModContainer;Ljava/nio/file/Path;Z)V";
 const DATAGEN_GENERATOR_CTOR: &str = "(Lnet/fabricmc/fabric/api/datagen/v1/FabricDataOutput;Lnet/fabricmc/loader/api/ModContainer;)V";
-const MOD_CONTAINER_HORIZON_SIG: &str = "(Ljava/lang/String;Ljava/lang/String;)Lnet/fabricmc/loader/api/ModContainer;";
+const MOD_CONTAINER_HORIZON_SIG: &str =
+    "(Ljava/lang/String;Ljava/lang/String;)Lnet/fabricmc/loader/api/ModContainer;";
 const DATAGEN_PROVIDERS: &str = "horizonProviders";
 const DATAGEN_PROVIDERS_SIG: &str = "()Ljava/util/List;";
 const MAX_DATAGEN_PROVIDERS: usize = 256;
@@ -530,18 +531,25 @@ fn run_datagen(
     nested: &NestedJars,
     metadata: Option<&(String, String)>,
 ) -> Result<(), String> {
-    let output_dir = output.map_or_else(|| std::env::temp_dir().join("horizon-datagen"), Path::to_path_buf);
+    let output_dir = output.map_or_else(
+        || std::env::temp_dir().join("horizon-datagen"),
+        Path::to_path_buf,
+    );
     let paths = std::env::join_paths(classpath).map_err(|e| e.to_string())?;
-    let mut init = InitArgsBuilder::new().version(JNIVersion::V8)
+    let mut init = InitArgsBuilder::new()
+        .version(JNIVersion::V8)
         .option(format!("-Djava.class.path={}", paths.to_string_lossy()))
-        .option(heap).option("-Djava.awt.headless=true");
+        .option(heap)
+        .option("-Djava.awt.headless=true");
     for option in datagen_jvm_options(output) {
         init = init.option(option);
     }
     let init = init.build().map_err(|e| format!("JVM options: {e}"))?;
     let jvm = JavaVM::new(init)
         .map_err(|e| format!("could not start a JVM ({e}); set JAVA_HOME to a JDK with libjvm"))?;
-    let mut guard = jvm.attach_current_thread().map_err(|e| format!("attach: {e}"))?;
+    let mut guard = jvm
+        .attach_current_thread()
+        .map_err(|e| format!("attach: {e}"))?;
     let env = &mut *guard;
     prepare_fabric_loader(env, &nested.root)?;
     seed_fabric_metadata(env, classpath)?;
@@ -567,37 +575,88 @@ fn new_datagen_generator<'local>(
     let generator = datagen_class(env, DATAGEN_GENERATOR_CLASS)?;
     let output_class = datagen_class(env, DATAGEN_OUTPUT_CLASS)?;
     let container_class = datagen_class(env, MOD_CONTAINER_CLASS)?;
-    if env.get_static_method_id(&container_class, "horizon", MOD_CONTAINER_HORIZON_SIG).is_err() {
+    if env
+        .get_static_method_id(&container_class, "horizon", MOD_CONTAINER_HORIZON_SIG)
+        .is_err()
+    {
         let _ = env.exception_clear();
-        return Err(datagen_shim_unavailable(&format!("{MOD_CONTAINER_CLASS}.horizon")));
+        return Err(datagen_shim_unavailable(&format!(
+            "{MOD_CONTAINER_CLASS}.horizon"
+        )));
     }
-    let (id, version) = metadata.map_or(("minecraft", "26.3"), |(id, version)| (id.as_str(), version.as_str()));
-    let id = env.new_string(id).map_err(|e| format!("datagen mod id: {e}"))?;
-    let version = env.new_string(version).map_err(|e| format!("datagen mod version: {e}"))?;
-    let container = env.call_static_method(&container_class, "horizon", MOD_CONTAINER_HORIZON_SIG,
-        &[JValue::Object(&JObject::from(id)), JValue::Object(&JObject::from(version))])
-        .map_err(|e| format!("datagen ModContainer: {e}"))?.l()
+    let (id, version) = metadata.map_or(("minecraft", "26.3"), |(id, version)| {
+        (id.as_str(), version.as_str())
+    });
+    let id = env
+        .new_string(id)
+        .map_err(|e| format!("datagen mod id: {e}"))?;
+    let version = env
+        .new_string(version)
+        .map_err(|e| format!("datagen mod version: {e}"))?;
+    let container = env
+        .call_static_method(
+            &container_class,
+            "horizon",
+            MOD_CONTAINER_HORIZON_SIG,
+            &[
+                JValue::Object(&JObject::from(id)),
+                JValue::Object(&JObject::from(version)),
+            ],
+        )
+        .map_err(|e| format!("datagen ModContainer: {e}"))?
+        .l()
         .map_err(|e| format!("datagen ModContainer: {e}"))?;
     let paths = datagen_class(env, "java/nio/file/Paths")?;
-    let output_text = env.new_string(output.to_string_lossy()).map_err(|e| format!("datagen output path: {e}"))?;
-    let empty = env.new_object_array(0, "java/lang/String", JObject::null()).map_err(|e| format!("datagen output path: {e}"))?;
-    let path = env.call_static_method(&paths, "get", "(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",
-        &[JValue::Object(&JObject::from(output_text)), JValue::Object(&empty)])
-        .map_err(|e| format!("datagen output path: {e}"))?.l()
+    let output_text = env
+        .new_string(output.to_string_lossy())
         .map_err(|e| format!("datagen output path: {e}"))?;
-    let output = env.new_object(&output_class, DATAGEN_OUTPUT_CTOR,
-        &[JValue::Object(&container), JValue::Object(&path), JValue::Bool(0)])
+    let empty = env
+        .new_object_array(0, "java/lang/String", JObject::null())
+        .map_err(|e| format!("datagen output path: {e}"))?;
+    let path = env
+        .call_static_method(
+            &paths,
+            "get",
+            "(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",
+            &[
+                JValue::Object(&JObject::from(output_text)),
+                JValue::Object(&empty),
+            ],
+        )
+        .map_err(|e| format!("datagen output path: {e}"))?
+        .l()
+        .map_err(|e| format!("datagen output path: {e}"))?;
+    let output = env
+        .new_object(
+            &output_class,
+            DATAGEN_OUTPUT_CTOR,
+            &[
+                JValue::Object(&container),
+                JValue::Object(&path),
+                JValue::Bool(0),
+            ],
+        )
         .map_err(|e| format!("datagen FabricDataOutput: {e}"))?;
-    env.new_object(&generator, DATAGEN_GENERATOR_CTOR, &[JValue::Object(&output), JValue::Object(&container)])
-        .map_err(|e| format!("datagen FabricDataGenerator: {e}"))
+    env.new_object(
+        &generator,
+        DATAGEN_GENERATOR_CTOR,
+        &[JValue::Object(&output), JValue::Object(&container)],
+    )
+    .map_err(|e| format!("datagen FabricDataGenerator: {e}"))
 }
 
 /// One datagen entrypoint: a class implementing `DataGeneratorEntrypoint`, which
 /// Fabric instantiates and hands the generator.
-fn invoke_datagen_entry(env: &mut JNIEnv, generator: &JObject, entry_spec: &str) -> Result<(), String> {
+fn invoke_datagen_entry(
+    env: &mut JNIEnv,
+    generator: &JObject,
+    entry_spec: &str,
+) -> Result<(), String> {
     let (entry, method) = split_entrypoint(entry_spec);
     if method.is_some() {
-        return Err(format!("datagen entrypoint {entry_spec} names a method; pass --entry <class>"));
+        return Err(format!(
+            "datagen entrypoint {entry_spec} names a method; pass --entry <class>"
+        ));
     }
     let class = match env.find_class(entry.replace('.', "/")) {
         Ok(class) => class,
@@ -607,7 +666,12 @@ fn invoke_datagen_entry(env: &mut JNIEnv, generator: &JObject, entry_spec: &str)
         Ok(object) => object,
         Err(e) => return describe(env, "new", entry, e),
     };
-    match env.call_method(&object, "onInitializeDataGenerator", DATAGEN_INIT_SIG, &[JValue::Object(generator)]) {
+    match env.call_method(
+        &object,
+        "onInitializeDataGenerator",
+        DATAGEN_INIT_SIG,
+        &[JValue::Object(generator)],
+    ) {
         Ok(_) => println!("datagen: onInitializeDataGenerator returned"),
         Err(e) => return describe(env, "onInitializeDataGenerator", entry, e),
     }
@@ -618,20 +682,36 @@ fn invoke_datagen_entry(env: &mut JNIEnv, generator: &JObject, entry_spec: &str)
 /// one row per `addProvider`, in call order. A shim without the accessor (an
 /// older façade) reports nothing instead of failing.
 fn report_datagen_providers(env: &mut JNIEnv, generator: &JObject) -> Result<Vec<String>, String> {
-    let class = env.get_object_class(generator).map_err(|e| format!("datagen providers: {e}"))?;
-    if env.get_method_id(&class, DATAGEN_PROVIDERS, DATAGEN_PROVIDERS_SIG).is_err() {
+    let class = env
+        .get_object_class(generator)
+        .map_err(|e| format!("datagen providers: {e}"))?;
+    if env
+        .get_method_id(&class, DATAGEN_PROVIDERS, DATAGEN_PROVIDERS_SIG)
+        .is_err()
+    {
         let _ = env.exception_clear();
         return Ok(Vec::new());
     }
-    let list = env.call_method(generator, DATAGEN_PROVIDERS, DATAGEN_PROVIDERS_SIG, &[])
-        .and_then(|value| value.l()).map_err(|e| format!("datagen providers: {e}"))?;
-    let count = env.call_method(&list, "size", "()I", &[])
-        .and_then(|value| value.i()).map_err(|e| format!("datagen providers: {e}"))?;
+    let list = env
+        .call_method(generator, DATAGEN_PROVIDERS, DATAGEN_PROVIDERS_SIG, &[])
+        .and_then(|value| value.l())
+        .map_err(|e| format!("datagen providers: {e}"))?;
+    let count = env
+        .call_method(&list, "size", "()I", &[])
+        .and_then(|value| value.i())
+        .map_err(|e| format!("datagen providers: {e}"))?;
     let count = usize::try_from(count).unwrap_or(0);
     let mut lines = vec![datagen_providers_line(count)];
     for index in 0..count.min(MAX_DATAGEN_PROVIDERS) {
-        let row = env.call_method(&list, "get", "(I)Ljava/lang/Object;", &[JValue::Int(index as i32)])
-            .and_then(|value| value.l()).map_err(|e| format!("datagen provider {index}: {e}"))?;
+        let row = env
+            .call_method(
+                &list,
+                "get",
+                "(I)Ljava/lang/Object;",
+                &[JValue::Int(index as i32)],
+            )
+            .and_then(|value| value.l())
+            .map_err(|e| format!("datagen provider {index}: {e}"))?;
         let row = JObjectArray::from(row);
         if env.get_array_length(&row).unwrap_or(0) >= 3 {
             let pack = provider_text(env, &row, 0)?;
@@ -641,7 +721,9 @@ fn report_datagen_providers(env: &mut JNIEnv, generator: &JObject) -> Result<Vec
         }
     }
     if count > MAX_DATAGEN_PROVIDERS {
-        lines.push(format!("datagen providers: capped at {MAX_DATAGEN_PROVIDERS} of {count}"));
+        lines.push(format!(
+            "datagen providers: capped at {MAX_DATAGEN_PROVIDERS} of {count}"
+        ));
     }
     Ok(lines)
 }
@@ -649,12 +731,14 @@ fn report_datagen_providers(env: &mut JNIEnv, generator: &JObject) -> Result<Vec
 /// One `{pack, id, kind, provider}` column as text; a null column (a shim that
 /// retained no id) reads as `null` instead of failing the report.
 fn provider_text(env: &mut JNIEnv, row: &JObjectArray, column: i32) -> Result<String, String> {
-    let value = env.get_object_array_element(row, column)
+    let value = env
+        .get_object_array_element(row, column)
         .map_err(|e| format!("datagen provider value: {e}"))?;
     if value.is_null() {
         return Ok("null".to_owned());
     }
-    let text = env.get_string((&value).into())
+    let text = env
+        .get_string((&value).into())
         .map_err(|e| format!("datagen provider value: {e}"))?;
     Ok(text.to_string_lossy().into_owned())
 }
@@ -3073,25 +3157,24 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Entrypoint, MAX_FABRIC_ADD_MODS, MAX_FABRIC_ADD_MODS_BYTES,
+        DATAGEN_GENERATOR_CLASS, Entrypoint, MAX_FABRIC_ADD_MODS, MAX_FABRIC_ADD_MODS_BYTES,
         MAX_MIXIN_CONFIG_PROPERTY_BYTES, MixinBootstrap, MixinConfigRef, MixinEnvironment,
         MixinPhaseDriver, MixinRegistrar, MixinSide, MixinStage, NO_ARG_CONSTRUCTOR, NeoforgeArg,
-        PhaseOutcome, classpath_separator, constructor_only_entry_kind, declared_entrypoint_kinds,
-        discover_entries, discover_mixin_configs, entrypoints_from_metadata, fabric_add_mods,
-        fabric_add_mods_count, fabric_add_mods_line, fabric_entries, fabric_jvm_options,
-        fabric_metadata, fabric_mixin_configs, fallback_label, format_entrypoints,
-        format_mixin_config_property, format_mixin_configs, initializer_for_kind,
-        is_datagen_kind, is_minecraft_class, link_failure, missing_entry_message,
-        mixin_bootstrap_line, mixin_config_names, mixin_config_property, mixin_configs_line,
-        mixin_jvm_options, mixin_registered_count, mixin_stages, neoforge_constructor,
-        neoforge_constructor_args, neoforge_constructor_descriptor, neoforge_ctor_fallback_line,
-        neoforge_ctor_line, neoforge_dist, neoforge_dist_fields, neoforge_metadata, nested_jar_name,
-        parse_constructors, parse_mixin_config, pre_launch_entries, quilt_entrypoint_kind,
-        quilt_mixin_configs, register_mixin_configs, report_mixin_configs, run_mixin_phase,
-        select_mixin_configs, should_retry_no_arg, skip_mc_provider_requested,
-        skipped_mixin_configs, split_entrypoint, DATAGEN_GENERATOR_CLASS, USAGE,
-        datagen_jvm_options, datagen_provider_line, datagen_providers_line,
-        datagen_shim_unavailable,
+        PhaseOutcome, USAGE, classpath_separator, constructor_only_entry_kind, datagen_jvm_options,
+        datagen_provider_line, datagen_providers_line, datagen_shim_unavailable,
+        declared_entrypoint_kinds, discover_entries, discover_mixin_configs,
+        entrypoints_from_metadata, fabric_add_mods, fabric_add_mods_count, fabric_add_mods_line,
+        fabric_entries, fabric_jvm_options, fabric_metadata, fabric_mixin_configs, fallback_label,
+        format_entrypoints, format_mixin_config_property, format_mixin_configs,
+        initializer_for_kind, is_datagen_kind, is_minecraft_class, link_failure,
+        missing_entry_message, mixin_bootstrap_line, mixin_config_names, mixin_config_property,
+        mixin_configs_line, mixin_jvm_options, mixin_registered_count, mixin_stages,
+        neoforge_constructor, neoforge_constructor_args, neoforge_constructor_descriptor,
+        neoforge_ctor_fallback_line, neoforge_ctor_line, neoforge_dist, neoforge_dist_fields,
+        neoforge_metadata, nested_jar_name, parse_constructors, parse_mixin_config,
+        pre_launch_entries, quilt_entrypoint_kind, quilt_mixin_configs, register_mixin_configs,
+        report_mixin_configs, run_mixin_phase, select_mixin_configs, should_retry_no_arg,
+        skip_mc_provider_requested, skipped_mixin_configs, split_entrypoint,
     };
     use std::{
         fs::File,
@@ -4617,7 +4700,10 @@ config="demo.mixins.json""#,
                 br#"{"entrypoints":{"init":"demo.Main","datagen":"demo.Datagen"}}"#,
             )],
         );
-        assert_eq!(discover_entries(&quilt, "datagen").unwrap(), ["demo.Datagen"]);
+        assert_eq!(
+            discover_entries(&quilt, "datagen").unwrap(),
+            ["demo.Datagen"]
+        );
         let absent = build_jar(
             "datagen-absent",
             &[(
