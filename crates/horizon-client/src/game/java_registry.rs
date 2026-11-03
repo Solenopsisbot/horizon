@@ -6,6 +6,31 @@
 //! into entity/component/attachment stores.
 use std::sync::{OnceLock, RwLock};
 
+use horizon_mods::content::{BlockProperties, BlockShapes, Rarity};
+use horizon_mods::native::{AttachmentDeclaration, DataComponentDeclaration, EntityDeclaration};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BlockTemplate {
+    pub id: String,
+    pub template: String,
+    pub properties: BlockProperties,
+    pub shapes: Option<BlockShapes>,
+    pub default_state: BTreeMap<String, String>,
+    pub item: bool,
+    pub components: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ItemTemplate {
+    pub id: String,
+    pub template: String,
+    pub max_stack_size: Option<u8>,
+    pub rarity: Option<Rarity>,
+    pub components: BTreeMap<String, serde_json::Value>,
+    pub crafting_remainder: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct JavaRegistrySnapshot {
     pub blocks: Vec<String>,
@@ -13,6 +38,48 @@ pub(super) struct JavaRegistrySnapshot {
     pub entities: Vec<String>,
     pub data_components: Vec<String>,
     pub attachments: Vec<String>,
+    pub block_templates: Vec<BlockTemplate>,
+    pub item_templates: Vec<ItemTemplate>,
+    pub entity_declarations: Vec<EntityDeclaration>,
+    pub data_component_declarations: Vec<DataComponentDeclaration>,
+    pub attachment_declarations: Vec<AttachmentDeclaration>,
+}
+
+impl JavaRegistrySnapshot {
+    pub(super) fn block_template(&self, id: &str) -> Option<&BlockTemplate> {
+        self.block_templates
+            .binary_search_by(|row| row.id.as_str().cmp(id))
+            .ok()
+            .map(|index| &self.block_templates[index])
+    }
+
+    pub(super) fn item_template(&self, id: &str) -> Option<&ItemTemplate> {
+        self.item_templates
+            .binary_search_by(|row| row.id.as_str().cmp(id))
+            .ok()
+            .map(|index| &self.item_templates[index])
+    }
+
+    pub(super) fn entity(&self, id: &str) -> Option<&EntityDeclaration> {
+        self.entity_declarations
+            .binary_search_by(|row| row.id.as_str().cmp(id))
+            .ok()
+            .map(|index| &self.entity_declarations[index])
+    }
+
+    pub(super) fn data_component(&self, id: &str) -> Option<&DataComponentDeclaration> {
+        self.data_component_declarations
+            .binary_search_by(|row| row.id.as_str().cmp(id))
+            .ok()
+            .map(|index| &self.data_component_declarations[index])
+    }
+
+    pub(super) fn attachment(&self, id: &str) -> Option<&AttachmentDeclaration> {
+        self.attachment_declarations
+            .binary_search_by(|row| row.id.as_str().cmp(id))
+            .ok()
+            .map(|index| &self.attachment_declarations[index])
+    }
 }
 
 static SNAPSHOT: OnceLock<RwLock<JavaRegistrySnapshot>> = OnceLock::new();
@@ -50,6 +117,45 @@ pub(super) fn synchronize(
             .iter()
             .flat_map(|m| m.content.attachments.iter().map(|row| row.id.clone()))
             .collect(),
+        block_templates: mods
+            .iter()
+            .flat_map(|m| {
+                m.content.blocks.iter().map(|row| BlockTemplate {
+                    id: row.id.clone(),
+                    template: row.template.clone(),
+                    properties: row.properties.clone(),
+                    shapes: row.shapes.clone(),
+                    default_state: row.default_state.clone(),
+                    item: row.item,
+                    components: row.components.clone(),
+                })
+            })
+            .collect(),
+        item_templates: mods
+            .iter()
+            .flat_map(|m| {
+                m.content.items.iter().map(|row| ItemTemplate {
+                    id: row.id.clone(),
+                    template: row.template.clone(),
+                    max_stack_size: row.max_stack_size,
+                    rarity: row.rarity,
+                    components: row.components.clone(),
+                    crafting_remainder: row.crafting_remainder.clone(),
+                })
+            })
+            .collect(),
+        entity_declarations: mods
+            .iter()
+            .flat_map(|m| m.content.entities.iter().cloned())
+            .collect(),
+        data_component_declarations: mods
+            .iter()
+            .flat_map(|m| m.content.data_components.iter().cloned())
+            .collect(),
+        attachment_declarations: mods
+            .iter()
+            .flat_map(|m| m.content.attachments.iter().cloned())
+            .collect(),
     };
     next.blocks.sort();
     next.blocks.dedup();
@@ -61,6 +167,18 @@ pub(super) fn synchronize(
     next.data_components.dedup();
     next.attachments.sort();
     next.attachments.dedup();
+    next.block_templates.sort_by(|a, b| a.id.cmp(&b.id));
+    next.block_templates.dedup_by(|a, b| a.id == b.id);
+    next.item_templates.sort_by(|a, b| a.id.cmp(&b.id));
+    next.item_templates.dedup_by(|a, b| a.id == b.id);
+    next.entity_declarations.sort_by(|a, b| a.id.cmp(&b.id));
+    next.entity_declarations.dedup_by(|a, b| a.id == b.id);
+    next.data_component_declarations
+        .sort_by(|a, b| a.id.cmp(&b.id));
+    next.data_component_declarations
+        .dedup_by(|a, b| a.id == b.id);
+    next.attachment_declarations.sort_by(|a, b| a.id.cmp(&b.id));
+    next.attachment_declarations.dedup_by(|a, b| a.id == b.id);
     *state().write().expect("java registry lock poisoned") = next.clone();
     next
 }
