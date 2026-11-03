@@ -139,6 +139,17 @@ pub struct Census {
     /// Access-transformer targets, counted across jars (discovery only).
     #[serde(default)]
     pub access_transformer_targets: BTreeMap<String, usize>,
+    /// `owner#name(descriptor)`: how many call sites invoke the method. Unlike
+    /// [`Census::members`], this is the static call count from method bodies,
+    /// not "how many classes name it once".
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub body_calls: BTreeMap<String, usize>,
+    /// `owner#name(descriptor)`: how many call sites read or write the field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub body_field_refs: BTreeMap<String, usize>,
+    /// Classes whose body scan stopped early, bounded per jar and in total.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub body_errors: usize,
 }
 
 /// The first routing decision for a descriptor-bearing ABI reference.
@@ -278,6 +289,15 @@ pub struct JarCensus {
     /// Bounded NeoForge/Forge access-transformer targets found in this jar.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_transformer_targets: Vec<String>,
+    /// `owner#name(descriptor)`: call sites in this jar's method bodies.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub body_calls: BTreeMap<String, usize>,
+    /// Field reads and writes in this jar's method bodies, counted the same way.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub body_field_refs: BTreeMap<String, usize>,
+    /// Classes whose body scan stopped early, bounded by [`MAX_BODY_ERRORS`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub body_errors: usize,
     pub static_code: bool,
     /// Why not, if not (up to eight).
     pub dynamic: Vec<String>,
@@ -687,6 +707,7 @@ impl Census {
                     }
                 }
             }
+            self.fold_body(&mut jar, class);
             jar.references += class.refs.len();
             jar.members += class.members.len();
             jar.mixins += class.mixin_targets.len();
@@ -713,6 +734,28 @@ impl Census {
         Ok(())
     }
 
+    /// Folds one class's method-body call sites into its jar and this census.
+    /// Both are incremented here; `join` recomputes the aggregate from the
+    /// jars so a second join cannot double-count.
+    fn fold_body(&mut self, jar: &mut JarCensus, class: &classes::Class) {
+        let calls = class.calls();
+        add_counts(&mut jar.body_calls, &calls);
+        add_counts(&mut self.body_calls, &calls);
+        let fields = class.field_refs();
+        add_counts(&mut jar.body_field_refs, &fields);
+        add_counts(&mut self.body_field_refs, &fields);
+        if class.body_error.is_some() {
+            jar.body_errors = (jar.body_errors + 1).min(MAX_BODY_ERRORS);
+            self.body_errors = (self.body_errors + 1).min(MAX_BODY_ERRORS);
+        }
+    }
+
+    /// The most-called methods, by call site then name: the body ranking the
+    /// constant-pool member list cannot give.
+    pub fn top_body_calls(&self, top: usize) -> Vec<(&String, usize)> {
+        ranked(&self.body_calls, top)
+    }
+
     /// Marks every point with the hooks at its method, and counts coverage.
     pub fn join(&mut self, hooks: &HookIndex) {
         self.totals.points_needing_hooks = 0;
@@ -723,8 +766,14 @@ impl Census {
         // incremented, so a second `join` cannot double-count them.
         self.totals.nested_jar_kinds.clear();
         self.totals.nested_jar_errors = 0;
+        self.body_calls.clear();
+        self.body_field_refs.clear();
+        self.body_errors = 0;
         for jar in &self.jars {
             merge_nested_totals(&mut self.totals, jar);
+            add_counts(&mut self.body_calls, &jar.body_calls);
+            add_counts(&mut self.body_field_refs, &jar.body_field_refs);
+            self.body_errors = (self.body_errors + jar.body_errors).min(MAX_BODY_ERRORS);
         }
         for point in &mut self.points {
             if !NEEDS_HOOK.contains(&point.kind.as_str()) {
@@ -833,6 +882,52 @@ impl Census {
             self.totals.mixins,
             self.totals.injections
         ));
+        if !self.body_calls.is_empty() || self.body_errors > 0 {
+            let sites: usize = self.body_calls.values().sum();
+            let mut line = format!(
+                "body calls: {sites} call sites at {} methods",
+                self.body_calls.len()
+            );
+            if self.body_errors > 0 {
+                line.push_str(&format!(", {} body errors", self.body_errors));
+            }
+            let top_calls = self.top_body_calls(top);
+            if !top_calls.is_empty() {
+                let named = top_calls
+                    .iter()
+                    .map(|(name, count)| format!("{name}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                line.push_str(&format!(" (top: {named})"));
+            }
+            out.push_str(&line);
+            out.push('\n');
+            let field_sites: usize = self.body_field_refs.values().sum();
+            if field_sites > 0 {
+                out.push_str(&format!(
+                    "body field refs: {field_sites} access sites at {} fields\n",
+                    self.body_field_refs.len()
+                ));
+            }
+            let mut owners: BTreeMap<&str, usize> = BTreeMap::new();
+            for (name, count) in &self.body_calls {
+                let owner = name
+                    .split_once('#')
+                    .map_or(name.as_str(), |(owner, _)| owner);
+                *owners.entry(owner).or_default() += count;
+            }
+            if !owners.is_empty() {
+                let mut owners: Vec<(&str, usize)> = owners.into_iter().collect();
+                owners.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                owners.truncate(top);
+                if !owners.is_empty() {
+                    out.push_str("\nbody call owners\n");
+                    for (owner, count) in owners {
+                        out.push_str(&format!("{count:7} {owner}\n"));
+                    }
+                }
+            }
+        }
         if self.totals.member_only_points > 0 {
             out.push_str(&format!(
                 "member-only Mixin points (Accessor/Invoker/Shadow): {}\n",
@@ -1004,6 +1099,17 @@ fn nested_kind_counts(jars: &[jar::NestedJar]) -> BTreeMap<String, usize> {
             .or_default() += 1;
     }
     out
+}
+
+/// Classes whose body scan gave up, kept per jar and in the aggregate: one
+/// broken class is a report row, not a reason to grow the file without limit.
+const MAX_BODY_ERRORS: usize = 64;
+
+/// Folds counted call sites into a running total.
+fn add_counts(into: &mut BTreeMap<String, usize>, from: &BTreeMap<String, usize>) {
+    for (key, sites) in from {
+        *into.entry(key.clone()).or_default() += sites;
+    }
 }
 
 /// Folds one jar's nested counts into the run's totals. `Census::join`
@@ -2665,5 +2771,153 @@ mod tests {
         assert!(json["jars"][0].get("nested_jars").is_none());
         assert!(json["totals"].get("nested_jar_errors").is_none());
         assert!(!census.summary(5).contains("nested jars"));
+    }
+
+    /// One body reference: `owner#name(descriptor)`, or a class literal.
+    fn body_target(
+        owner: &str,
+        name: &str,
+        descriptor: &str,
+        kind: classes::CallKind,
+    ) -> classes::CallTarget {
+        classes::CallTarget {
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+            descriptor: descriptor.to_owned(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn body_call_sites_fold_into_the_jar_and_the_census() {
+        let get_block_state = "net/minecraft/world/level/Level#getBlockState((Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/block/state/BlockState;)";
+        let level_field = "example/Mod#level(Lnet/minecraft/world/level/Level;)";
+        let class = classes::Class {
+            name: "example/Mod".to_owned(),
+            body_refs: vec![
+                body_target(
+                    "net/minecraft/world/level/Level",
+                    "getBlockState",
+                    "(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/block/state/BlockState;",
+                    classes::CallKind::Virtual,
+                ),
+                // Same target twice: the census counts call sites, not names.
+                body_target(
+                    "net/minecraft/world/level/Level",
+                    "getBlockState",
+                    "(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/block/state/BlockState;",
+                    classes::CallKind::Interface,
+                ),
+                body_target(
+                    "example/Mod",
+                    "level",
+                    "Lnet/minecraft/world/level/Level;",
+                    classes::CallKind::GetField,
+                ),
+                // A class literal is neither a call nor a field access.
+                body_target(
+                    "net/minecraft/world/level/Level",
+                    "",
+                    "",
+                    classes::CallKind::Class,
+                ),
+            ],
+            ..classes::Class::default()
+        };
+        let mut census = Census::default();
+        let mut jar = JarCensus::default();
+        census.fold_body(&mut jar, &class);
+
+        assert_eq!(jar.body_calls.get(get_block_state), Some(&2));
+        assert_eq!(jar.body_calls.len(), 1);
+        assert_eq!(jar.body_field_refs.get(level_field), Some(&1));
+        assert_eq!(jar.body_field_refs.len(), 1);
+        assert_eq!(census.body_calls, jar.body_calls);
+        assert_eq!(census.body_field_refs, jar.body_field_refs);
+
+        // `join` replays the jars: a second join cannot double the counts.
+        census.jars.push(jar);
+        census.join(&HookIndex::default());
+        census.join(&HookIndex::default());
+        assert_eq!(census.body_calls.get(get_block_state), Some(&2));
+        assert_eq!(census.body_field_refs.get(level_field), Some(&1));
+
+        // A jar whose classes stop early reports a bounded error count.
+        let broken = classes::Class {
+            body_error: Some("example/Mod#tick at 4: operand runs past the code".to_owned()),
+            ..classes::Class::default()
+        };
+        let mut jar = JarCensus::default();
+        for _ in 0..(MAX_BODY_ERRORS + 4) {
+            census.fold_body(&mut jar, &broken);
+        }
+        assert_eq!(jar.body_errors, MAX_BODY_ERRORS);
+        assert_eq!(census.body_errors, MAX_BODY_ERRORS);
+    }
+
+    #[test]
+    fn summary_names_the_top_body_calls_and_owners() {
+        let get_block_state = "net/minecraft/world/level/Level#getBlockState((Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/block/state/BlockState;)";
+        let local = "example/Mod#level(()Lnet/minecraft/world/level/Level;)";
+        let census = Census {
+            body_calls: BTreeMap::from([(get_block_state.to_owned(), 3), (local.to_owned(), 1)]),
+            body_field_refs: BTreeMap::from([("example/Mod#counter(I)".to_owned(), 2)]),
+            body_errors: 1,
+            ..Census::default()
+        };
+        assert_eq!(
+            census.top_body_calls(1),
+            vec![(&get_block_state.to_owned(), 3)]
+        );
+
+        let summary = census.summary(2);
+        assert!(summary.contains("body calls: 4 call sites at 2 methods, 1 body errors (top: "));
+        assert!(summary.contains(&format!("{get_block_state}=3")));
+        assert!(summary.contains("body field refs: 2 access sites at 1 fields"));
+        let owners = summary.split("body call owners").nth(1).unwrap();
+        assert!(
+            owners.find("net/minecraft/world/level/Level").unwrap()
+                < owners.find("example/Mod").unwrap()
+        );
+        // `top` bounds both the named calls and the owner rows, and the text
+        // does not depend on map order.
+        let one = census.summary(1);
+        assert!(!one.contains(&format!("{local}=")));
+        assert!(!one.contains("example/Mod\n"));
+        assert_eq!(summary, census.summary(2));
+    }
+
+    #[test]
+    fn older_census_json_without_body_sites_still_deserializes() {
+        let json = serde_json::json!({
+            "totals": {
+                "jars": 1, "classes": 1, "references": 0, "members": 0,
+                "mixins": 0, "injections": 0, "static_jars": 1,
+                "points_needing_hooks": 0, "points_covered": 0,
+                "member_only_points": 0
+            },
+            "jars": [{
+                "file": "a.jar", "mod_id": "a", "name": "A", "version": "1",
+                "loader": "fabric", "minecraft": "26.3", "classes": 1,
+                "nested": 0, "references": 0, "members": 0, "mixins": 0,
+                "injections": 0, "static_code": true, "dynamic": []
+            }],
+            "classes": {}, "members": {}, "mixin_targets": {},
+            "injections": {}, "at": {}, "points": []
+        });
+        let census: Census = serde_json::from_value(json).unwrap();
+        assert!(census.body_calls.is_empty());
+        assert!(census.body_field_refs.is_empty());
+        assert_eq!(census.body_errors, 0);
+        assert!(census.jars[0].body_calls.is_empty());
+        assert!(census.jars[0].body_field_refs.is_empty());
+        assert_eq!(census.jars[0].body_errors, 0);
+
+        let json = serde_json::to_value(&census).unwrap();
+        assert!(json.get("body_calls").is_none());
+        assert!(json.get("body_errors").is_none());
+        assert!(json["jars"][0].get("body_calls").is_none());
+        assert!(json["jars"][0].get("body_errors").is_none());
+        assert!(!census.summary(5).contains("body calls"));
     }
 }
