@@ -399,9 +399,10 @@ requires the returnable marker. `@At(value = "INVOKE", target = ...)` plans reso
 `owner.method(...)` and `owner#name` selectors; the interpreter runs their hooks before the matched call, and a
 cancellable hook suppresses that call and returns the descriptor default. Unparseable selectors stay
 report-only. `--mixin-plans` reports the same plans without running an entrypoint. This is planning and
-bounded native invocation, not bytecode weaving: no class is rewritten, and `@Redirect`,
-`@ModifyArg`/`@ModifyVariable`, `FIELD`/`NEW`/`JUMP`, slices, and ordinal selectors remain on the JVM
-fallback.
+bounded native invocation, and a first classfile writer now re-emits parsed classes byte-for-byte and weaves
+HEAD callbacks into straight-line methods with no `CallbackInfo`, branches, exception table or stack-map
+frames. `@Redirect`, `@ModifyArg`/`@ModifyVariable`, `FIELD`/`NEW`/`JUMP`, slices, ordinal selectors and every
+method outside that subset still take the interpreter or JVM path.
 
 Reproduce:
 
