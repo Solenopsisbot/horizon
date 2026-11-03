@@ -1501,3 +1501,53 @@ fn native_declaration_changes_invalidate_content_stamp() {
     assert_ne!(first_stamp, second_stamp);
     fs::remove_dir_all(base).unwrap();
 }
+
+#[test]
+fn native_menu_and_block_entity_rows_reach_the_built_root() {
+    use horizon_mods::native::{BlockEntityDeclaration, MenuDeclaration, NativeDeclarations};
+
+    let Some(base) = prepared() else {
+        return;
+    };
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let scratch = std::env::temp_dir().join(format!("horizon-native-menu-{nonce}"));
+    let m = ContentMod {
+        id: "ruby".into(),
+        content: Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                menus: vec![MenuDeclaration {
+                    id: "ruby:crate".into(),
+                    title_key: "container.ruby.crate".into(),
+                    slots: 27,
+                }],
+                block_entities: vec![BlockEntityDeclaration {
+                    id: "ruby:crate".into(),
+                    template: "minecraft:barrel".into(),
+                    ticker: true,
+                    valid_blocks: vec!["ruby:crate_block".into()],
+                }],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap(),
+    };
+    let root = resource_root(&base, std::slice::from_ref(&m), &scratch.join("cache")).unwrap();
+    let json = |file: &str| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(root.join(file)).unwrap()).unwrap()
+    };
+    let menu = json("data/ruby/horizon/menu/crate.json");
+    assert_eq!(menu["title_key"], "container.ruby.crate");
+    assert_eq!(menu["slots"], 27);
+    let block_entity = json("data/ruby/horizon/block_entity/crate.json");
+    assert_eq!(block_entity["template"], "minecraft:barrel");
+    assert_eq!(block_entity["ticker"], true);
+    assert_eq!(
+        block_entity["valid_blocks"],
+        serde_json::json!(["ruby:crate_block"])
+    );
+    fs::remove_dir_all(scratch).unwrap();
+}

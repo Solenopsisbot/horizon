@@ -9,8 +9,8 @@ use std::sync::{OnceLock, RwLock};
 
 use horizon_mods::content::{BlockProperties, BlockShapes, Rarity};
 use horizon_mods::native::{
-    AttachmentDeclaration, DataComponentDeclaration, EntityAttributes, EntityDeclaration,
-    SpawnRestriction,
+    AttachmentDeclaration, BlockEntityDeclaration, DataComponentDeclaration, EntityAttributes,
+    EntityDeclaration, MenuDeclaration, SpawnRestriction,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +46,8 @@ pub(super) struct JavaRegistrySnapshot {
     pub entity_declarations: Vec<EntityDeclaration>,
     pub data_component_declarations: Vec<DataComponentDeclaration>,
     pub attachment_declarations: Vec<AttachmentDeclaration>,
+    pub menus: Vec<MenuDeclaration>,
+    pub block_entities: Vec<BlockEntityDeclaration>,
     /// Rows folded away while coalescing duplicates, by table name. Sorted, so
     /// two batches that coalesce the same rows report the same map.
     pub coalesced: BTreeMap<String, usize>,
@@ -88,6 +90,20 @@ impl JavaRegistrySnapshot {
             .map(|index| &self.attachment_declarations[index])
     }
 
+    pub(super) fn menu(&self, id: &str) -> Option<&MenuDeclaration> {
+        self.menus
+            .binary_search_by(|row| row.id.as_str().cmp(id))
+            .ok()
+            .map(|index| &self.menus[index])
+    }
+
+    pub(super) fn block_entity(&self, id: &str) -> Option<&BlockEntityDeclaration> {
+        self.block_entities
+            .binary_search_by(|row| row.id.as_str().cmp(id))
+            .ok()
+            .map(|index| &self.block_entities[index])
+    }
+
     /// The spawn placement declared for `id`, when the adapter set one.
     pub(super) fn entity_spawn(&self, id: &str) -> Option<&SpawnRestriction> {
         self.entity(id).and_then(|row| row.spawn.as_ref())
@@ -106,20 +122,24 @@ impl JavaRegistrySnapshot {
     pub(super) fn diagnostics(&self) -> Vec<String> {
         let mut out = vec![
             format!(
-                "java registry: {} block ids, {} item ids, {} entity ids, {} data component ids, {} attachment ids",
+                "java registry: {} block ids, {} item ids, {} entity ids, {} data component ids, {} attachment ids, {} menu ids, {} block entity ids",
                 self.blocks.len(),
                 self.items.len(),
                 self.entities.len(),
                 self.data_components.len(),
                 self.attachments.len(),
+                self.menus.len(),
+                self.block_entities.len(),
             ),
             format!(
-                "java registry templates: {} blocks, {} items, {} entities, {} data components, {} attachments",
+                "java registry templates: {} blocks, {} items, {} entities, {} data components, {} attachments, {} menus, {} block entities",
                 self.block_templates.len(),
                 self.item_templates.len(),
                 self.entity_declarations.len(),
                 self.data_component_declarations.len(),
                 self.attachment_declarations.len(),
+                self.menus.len(),
+                self.block_entities.len(),
             ),
         ];
         if !self.coalesced.is_empty() {
@@ -146,8 +166,9 @@ fn state() -> &'static RwLock<JavaRegistrySnapshot> {
 /// Rows are sorted by id, so metadata order and entrypoint execution order
 /// cannot change the snapshot. Rows repeated by a later startup call coalesce
 /// when they are equal and are counted in [`JavaRegistrySnapshot::coalesced`];
-/// two entity rows for one id that disagree on template, properties, spawn or
-/// attributes are an error naming that id instead of a silent first-wins.
+/// two rows of a validated table (entities, menus, block entities) that
+/// disagree on any field are an error naming that id instead of a silent
+/// first-wins.
 ///
 /// The batch is built and validated aside, so a rejected row leaves the
 /// previously published snapshot untouched: the swap is all-or-nothing.
@@ -214,6 +235,14 @@ pub(super) fn try_synchronize(
             .iter()
             .flat_map(|m| m.content.attachments.iter().cloned())
             .collect(),
+        menus: mods
+            .iter()
+            .flat_map(|m| m.content.menus.iter().cloned())
+            .collect(),
+        block_entities: mods
+            .iter()
+            .flat_map(|m| m.content.block_entities.iter().cloned())
+            .collect(),
         coalesced: BTreeMap::new(),
     };
     next.blocks.sort();
@@ -240,7 +269,9 @@ pub(super) fn try_synchronize(
     note_coalesced(
         &mut coalesced,
         "entities",
-        coalesce_entities(&mut next.entity_declarations)?,
+        coalesce_typed(&mut next.entity_declarations, "entity", |row| {
+            row.id.as_str()
+        })?,
     );
     note_coalesced(
         &mut coalesced,
@@ -251,6 +282,18 @@ pub(super) fn try_synchronize(
         &mut coalesced,
         "attachments",
         coalesce_sorted(&mut next.attachment_declarations, |row| row.id.as_str()),
+    );
+    note_coalesced(
+        &mut coalesced,
+        "menus",
+        coalesce_typed(&mut next.menus, "menu", |row| row.id.as_str())?,
+    );
+    note_coalesced(
+        &mut coalesced,
+        "block entities",
+        coalesce_typed(&mut next.block_entities, "block entity", |row| {
+            row.id.as_str()
+        })?,
     );
     next.coalesced = coalesced;
     *state().write().expect("java registry lock poisoned") = next.clone();
@@ -287,21 +330,25 @@ fn coalesce_sorted<T>(rows: &mut Vec<T>, id: impl Fn(&T) -> &str) -> usize {
     before - rows.len()
 }
 
-/// Entity rows are validated before coalescing: only a row that agrees on
-/// template, properties, spawn and attributes may share another row's id.
-fn coalesce_entities(rows: &mut Vec<EntityDeclaration>) -> Result<usize, String> {
-    rows.sort_by(|a, b| a.id.cmp(&b.id));
+/// Typed rows are validated before coalescing: only a row that agrees on every
+/// field may share another row's id. `table` names the row kind in the error.
+fn coalesce_typed<T: PartialEq>(
+    rows: &mut Vec<T>,
+    table: &str,
+    id: impl Fn(&T) -> &str,
+) -> Result<usize, String> {
+    rows.sort_by(|a, b| id(a).cmp(id(b)));
     if let Some(pair) = rows
         .windows(2)
-        .find(|pair| pair[0].id == pair[1].id && pair[0] != pair[1])
+        .find(|pair| id(&pair[0]) == id(&pair[1]) && pair[0] != pair[1])
     {
         return Err(format!(
-            "conflicting native entity declaration {}",
-            pair[0].id
+            "conflicting native {table} declaration {}",
+            id(&pair[0])
         ));
     }
     let before = rows.len();
-    rows.dedup_by(|a, b| a.id == b.id);
+    rows.dedup_by(|a, b| id(a) == id(b));
     Ok(before - rows.len())
 }
 
@@ -316,8 +363,8 @@ mod tests {
     use super::*;
     use horizon_mods::content::Content;
     use horizon_mods::native::{
-        AttachmentDeclaration, DataComponentDeclaration, EntityAttributes, EntityDeclaration,
-        NativeDeclarations, SpawnRestriction,
+        AttachmentDeclaration, BlockEntityDeclaration, DataComponentDeclaration, EntityAttributes,
+        EntityDeclaration, MenuDeclaration, NativeDeclarations, SpawnRestriction,
     };
     use std::sync::Mutex;
 
@@ -383,6 +430,23 @@ mod tests {
             codec: "minecraft:int".into(),
             default_value: "0".into(),
             copy_on_death: true,
+        }
+    }
+
+    fn menu(id: &str) -> MenuDeclaration {
+        MenuDeclaration {
+            id: id.into(),
+            title_key: "container.ruby.crate".into(),
+            slots: 27,
+        }
+    }
+
+    fn block_entity(id: &str) -> BlockEntityDeclaration {
+        BlockEntityDeclaration {
+            id: id.into(),
+            template: "minecraft:barrel".into(),
+            ticker: true,
+            valid_blocks: vec!["ruby:crate_block".into()],
         }
     }
 
@@ -521,6 +585,8 @@ mod tests {
             entities: vec![zombie_with_auxiliary()],
             data_components: vec![data_component("ruby:power")],
             attachments: vec![attachment("ruby:power")],
+            menus: vec![menu("ruby:crate")],
+            block_entities: vec![block_entity("ruby:crate")],
             ..NativeDeclarations::default()
         };
         let snapshot = try_synchronize(&[
@@ -531,9 +597,85 @@ mod tests {
         assert_eq!(snapshot.entity_declarations.len(), 1);
         assert_eq!(snapshot.data_component_declarations.len(), 1);
         assert_eq!(snapshot.attachment_declarations.len(), 1);
+        assert_eq!(snapshot.menus.len(), 1);
+        assert_eq!(snapshot.block_entities.len(), 1);
         assert_eq!(snapshot.coalesced.get("entities"), Some(&1));
         assert_eq!(snapshot.coalesced.get("data components"), Some(&1));
         assert_eq!(snapshot.coalesced.get("attachments"), Some(&1));
+        assert_eq!(snapshot.coalesced.get("menus"), Some(&1));
+        assert_eq!(snapshot.coalesced.get("block entities"), Some(&1));
+    }
+
+    #[test]
+    fn menu_and_block_entity_rows_round_trip() {
+        let _guard = test_guard();
+        let snapshot = synchronize(&[content_mod(
+            "ruby",
+            NativeDeclarations {
+                menus: vec![menu("ruby:crate")],
+                block_entities: vec![block_entity("ruby:crate")],
+                ..NativeDeclarations::default()
+            },
+        )]);
+        let row = snapshot.menu("ruby:crate").unwrap();
+        assert_eq!(row.title_key, "container.ruby.crate");
+        assert_eq!(row.slots, 27);
+        let row = snapshot.block_entity("ruby:crate").unwrap();
+        assert_eq!(row.template, "minecraft:barrel");
+        assert!(row.ticker);
+        assert_eq!(row.valid_blocks, ["ruby:crate_block"]);
+        assert!(snapshot.menu("ruby:missing").is_none());
+        assert!(snapshot.block_entity("ruby:missing").is_none());
+        assert_eq!(*state().read().unwrap(), snapshot);
+    }
+
+    #[test]
+    fn conflicting_menu_and_block_entity_rows_naming_the_id_are_rejected() {
+        let _guard = test_guard();
+        let mut menu_changed = menu("ruby:crate");
+        menu_changed.slots = 54;
+        assert_eq!(
+            try_synchronize(&[
+                content_mod(
+                    "ruby",
+                    NativeDeclarations {
+                        menus: vec![menu("ruby:crate")],
+                        ..NativeDeclarations::default()
+                    },
+                ),
+                content_mod(
+                    "ruby-extra",
+                    NativeDeclarations {
+                        menus: vec![menu_changed],
+                        ..NativeDeclarations::default()
+                    },
+                ),
+            ])
+            .unwrap_err(),
+            "conflicting native menu declaration ruby:crate"
+        );
+        let mut block_entity_changed = block_entity("ruby:crate");
+        block_entity_changed.valid_blocks = vec!["ruby:other".into()];
+        assert_eq!(
+            try_synchronize(&[
+                content_mod(
+                    "ruby",
+                    NativeDeclarations {
+                        block_entities: vec![block_entity("ruby:crate")],
+                        ..NativeDeclarations::default()
+                    },
+                ),
+                content_mod(
+                    "ruby-extra",
+                    NativeDeclarations {
+                        block_entities: vec![block_entity_changed],
+                        ..NativeDeclarations::default()
+                    },
+                ),
+            ])
+            .unwrap_err(),
+            "conflicting native block entity declaration ruby:crate"
+        );
     }
 
     #[test]
@@ -542,8 +684,8 @@ mod tests {
         assert_eq!(
             JavaRegistrySnapshot::default().diagnostics(),
             [
-                "java registry: 0 block ids, 0 item ids, 0 entity ids, 0 data component ids, 0 attachment ids".to_string(),
-                "java registry templates: 0 blocks, 0 items, 0 entities, 0 data components, 0 attachments".to_string(),
+                "java registry: 0 block ids, 0 item ids, 0 entity ids, 0 data component ids, 0 attachment ids, 0 menu ids, 0 block entity ids".to_string(),
+                "java registry templates: 0 blocks, 0 items, 0 entities, 0 data components, 0 attachments, 0 menus, 0 block entities".to_string(),
             ]
         );
         let snapshot = synchronize(&[
@@ -552,6 +694,8 @@ mod tests {
                 NativeDeclarations {
                     entities: vec![zombie_with_auxiliary()],
                     data_components: vec![data_component("ruby:power")],
+                    menus: vec![menu("ruby:crate")],
+                    block_entities: vec![block_entity("ruby:crate")],
                     ..NativeDeclarations::default()
                 },
             ),
@@ -559,6 +703,7 @@ mod tests {
                 "ruby-extra",
                 NativeDeclarations {
                     entities: vec![zombie_with_auxiliary()],
+                    menus: vec![menu("ruby:crate")],
                     ..NativeDeclarations::default()
                 },
             ),
@@ -566,9 +711,9 @@ mod tests {
         assert_eq!(
             snapshot.diagnostics(),
             [
-                "java registry: 0 block ids, 0 item ids, 1 entity ids, 1 data component ids, 0 attachment ids".to_string(),
-                "java registry templates: 0 blocks, 0 items, 1 entities, 1 data components, 0 attachments".to_string(),
-                "java registry coalesced duplicate rows: entities=1".to_string(),
+                "java registry: 0 block ids, 0 item ids, 1 entity ids, 1 data component ids, 0 attachment ids, 1 menu ids, 1 block entity ids".to_string(),
+                "java registry templates: 0 blocks, 0 items, 1 entities, 1 data components, 0 attachments, 1 menus, 1 block entities".to_string(),
+                "java registry coalesced duplicate rows: entities=1, menus=1".to_string(),
             ]
         );
     }
@@ -580,6 +725,7 @@ mod tests {
             "ruby",
             NativeDeclarations {
                 entities: vec![zombie_with_auxiliary()],
+                menus: vec![menu("ruby:crate")],
                 ..NativeDeclarations::default()
             },
         );
@@ -591,6 +737,17 @@ mod tests {
             "ruby-extra",
             NativeDeclarations {
                 entities: vec![changed],
+                ..NativeDeclarations::default()
+            },
+        );
+        assert!(try_synchronize(&[good.clone(), conflicting]).is_err());
+        assert_eq!(*state().read().unwrap(), published);
+        let mut changed_menu = menu("ruby:crate");
+        changed_menu.title_key = "container.ruby.other".into();
+        let conflicting = content_mod(
+            "ruby-extra",
+            NativeDeclarations {
+                menus: vec![changed_menu],
                 ..NativeDeclarations::default()
             },
         );
