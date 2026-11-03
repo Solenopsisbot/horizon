@@ -3,6 +3,7 @@
 //! (`native_hooks.rs`); WebAssembly code mods don't run any more.
 use super::{Game, execution_role::ExecutionRole};
 use horizon_client::{
+    mod_content::ContentMod,
     mod_list::{self, Installed},
     text::Text,
 };
@@ -24,7 +25,7 @@ pub(super) fn content_root(
     root: &std::path::Path,
     enabled: &std::collections::BTreeSet<String>,
     dev: &[std::path::PathBuf],
-    native: &[horizon_client::mod_content::ContentMod],
+    native: &[ContentMod],
 ) -> std::path::PathBuf {
     use horizon_client::mod_content::{self, ContentMod};
     use horizon_mods::{Capability, Content, Package};
@@ -84,15 +85,253 @@ pub(super) fn content_root(
     }
 }
 
-/// Runs explicitly supplied Java entrypoints through the bounded native
-/// interpreter before resource workers start. Java jars are never discovered
-/// implicitly: a launcher or developer must pass `--java-mod PATH`.
+/// Most rows one jar's compatibility report keeps from its unbounded native
+/// records. Sorting first makes the truncation deterministic, and the startup
+/// log stays readable whatever a jar registers.
+const MAX_REPORT_ROWS: usize = 12;
+
+/// The loader metadata a jar declares. All three run through the same bounded
+/// interpreter; the kind only names which metadata the native path read, so a
+/// server operator can tell a Fabric jar from a NeoForge one in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JavaLoader {
+    Fabric,
+    NeoForge,
+    /// `META-INF/mods.toml` without `META-INF/neoforge.mods.toml`.
+    LegacyForge,
+}
+
+impl JavaLoader {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fabric => "fabric",
+            Self::NeoForge => "neoforge",
+            Self::LegacyForge => "legacy-forge",
+        }
+    }
+
+    /// Which metadata wins. Fabric comes first because its entrypoint kinds are
+    /// searched first, and a jar converted from Forge often keeps its old
+    /// `mods.toml` beside `fabric.mod.json`.
+    fn of(jar: &horizon_native_java::NativeJar) -> Option<Self> {
+        let declares = |name: &str| jar.resource_names().any(|resource| resource == name);
+        if jar.fabric_id.is_some()
+            || !jar.fabric_entrypoints.is_empty()
+            || declares("fabric.mod.json")
+        {
+            Some(Self::Fabric)
+        } else if declares("META-INF/neoforge.mods.toml") || !jar.neoforge_entrypoints.is_empty() {
+            Some(Self::NeoForge)
+        } else if declares("META-INF/mods.toml") {
+            Some(Self::LegacyForge)
+        } else if jar.neoforge_id.is_some() {
+            // A jar built from classes alone keeps no metadata file to name.
+            Some(Self::NeoForge)
+        } else {
+            None
+        }
+    }
+}
+
+/// The role names the compatibility diagnostics use. `ExecutionRole` is
+/// internal to the bin and has no display of its own.
+fn role_name(role: ExecutionRole) -> &'static str {
+    match role {
+        ExecutionRole::Client => "client",
+        ExecutionRole::IntegratedServer => "integrated-server",
+        ExecutionRole::DedicatedServer => "dedicated-server",
+    }
+}
+
+/// One jar's bounded compatibility decision: what the native path read, what it
+/// ran, and what actually reached the typed content tables. Lists are sorted and
+/// truncated at [`MAX_REPORT_ROWS`], so the window, its server thread and the
+/// dedicated server log the same lines for the same jar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct JavaCompatibilityReport {
+    pub(super) jar: PathBuf,
+    /// The mod id the native host seeded: metadata first, then the file name.
+    pub(super) id: Option<String>,
+    pub(super) version: Option<String>,
+    pub(super) loader: Option<JavaLoader>,
+    /// Every entrypoint kind the jar declares, sorted.
+    pub(super) declared_entrypoints: Vec<String>,
+    /// The kind this role selected; empty when the jar never got that far.
+    pub(super) entrypoint_kind: String,
+    pub(super) executed_entrypoints: usize,
+    pub(super) host_calls: usize,
+    /// Typed rows that reached `Content::from_native`.
+    pub(super) typed_registrations: usize,
+    /// Registrations left opaque: kept out of live registries until a typed
+    /// declaration arrives. A promoted row is not repeated here.
+    pub(super) opaque_registrations: Vec<String>,
+    /// Opaque rows a typed declaration of the same registry and id replaced.
+    pub(super) promoted: Vec<String>,
+    pub(super) payload_directions: Vec<String>,
+    pub(super) listeners: usize,
+    /// True only for the diagnostics a server role logs when it refuses a jar
+    /// marked `clientSideOnly`; an accepted jar is never rejected.
+    pub(super) client_side_only_rejected: bool,
+    pub(super) role: ExecutionRole,
+}
+
+/// What one entrypoint run recorded. Kept apart from the jar (and from the
+/// native host) so the report builder is testable without compiling Java.
+#[derive(Default)]
+struct NativeRunFacts<'a> {
+    kind: &'a str,
+    executed: usize,
+    host_calls: usize,
+    listeners: usize,
+    recorded: &'a [horizon_native_java::RegistryEntry],
+    payloads: &'a [horizon_native_java::PayloadRegistration],
+    typed: usize,
+    promoted: Vec<String>,
+    rejected: bool,
+}
+
+impl JavaCompatibilityReport {
+    fn new(
+        jar: &horizon_native_java::NativeJar,
+        path: &std::path::Path,
+        role: ExecutionRole,
+        facts: NativeRunFacts<'_>,
+    ) -> Self {
+        let mut promoted = facts.promoted;
+        promoted.sort();
+        promoted.dedup();
+        // A promoted row is no longer opaque: the typed declaration replaced it.
+        let opaque = bounded_sorted(
+            facts
+                .recorded
+                .iter()
+                .filter(|entry| entry.declaration.is_none())
+                .map(horizon_native_java::RegistryEntry::key)
+                .filter(|key| !promoted.contains(key)),
+        );
+        promoted.truncate(MAX_REPORT_ROWS);
+        Self {
+            jar: path.to_owned(),
+            id: native_mod_id(jar, path).map(str::to_owned),
+            version: native_mod_version(jar).map(str::to_owned),
+            loader: JavaLoader::of(jar),
+            declared_entrypoints: native_entrypoint_kinds(jar),
+            entrypoint_kind: facts.kind.to_owned(),
+            executed_entrypoints: facts.executed,
+            host_calls: facts.host_calls,
+            typed_registrations: facts.typed,
+            opaque_registrations: opaque,
+            promoted,
+            payload_directions: bounded_sorted(
+                facts
+                    .payloads
+                    .iter()
+                    .map(|payload| payload.direction.clone()),
+            ),
+            listeners: facts.listeners,
+            client_side_only_rejected: facts.rejected,
+            role,
+        }
+    }
+
+    /// The startup log's lines for this jar: a fixed order over fixed fields,
+    /// with every list bounded and sorted.
+    pub(super) fn summary(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "Horizon: Java compatibility {}: role={} loader={} id={} version={}",
+            self.jar.display(),
+            role_name(self.role),
+            self.loader.map_or("unknown", JavaLoader::name),
+            self.id.as_deref().unwrap_or("unknown"),
+            self.version.as_deref().unwrap_or("unknown"),
+        )];
+        lines.push(format!(
+            "  entrypoints: declared=[{}] selected={} executed={} host-calls={} listeners={}",
+            self.declared_entrypoints.join(", "),
+            if self.entrypoint_kind.is_empty() {
+                "none"
+            } else {
+                &self.entrypoint_kind
+            },
+            self.executed_entrypoints,
+            self.host_calls,
+            self.listeners,
+        ));
+        lines.push(format!(
+            "  registrations: typed={} opaque=[{}] promoted=[{}]",
+            self.typed_registrations,
+            self.opaque_registrations.join(", "),
+            self.promoted.join(", "),
+        ));
+        lines.push(format!(
+            "  payloads: [{}]",
+            self.payload_directions.join(", ")
+        ));
+        if self.client_side_only_rejected {
+            lines.push(format!(
+                "  rejected: clientSideOnly metadata for {} execution",
+                role_name(self.role)
+            ));
+        }
+        lines
+    }
+}
+
+/// Sorted, deduplicated and truncated at [`MAX_REPORT_ROWS`].
+fn bounded_sorted(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut values: Vec<String> = values.into_iter().collect();
+    values.sort();
+    values.dedup();
+    values.truncate(MAX_REPORT_ROWS);
+    values
+}
+
+/// The mod id the native host seeds: its own metadata name, else the file's.
+fn native_mod_id<'a>(
+    jar: &'a horizon_native_java::NativeJar,
+    path: &'a std::path::Path,
+) -> Option<&'a str> {
+    jar.native_id
+        .as_deref()
+        .or(jar.fabric_id.as_deref())
+        .or(jar.neoforge_id.as_deref())
+        .or_else(|| path.file_stem().and_then(|stem| stem.to_str()))
+}
+
+fn native_mod_version(jar: &horizon_native_java::NativeJar) -> Option<&str> {
+    jar.fabric_version
+        .as_deref()
+        .or(jar.neoforge_version.as_deref())
+}
+
 fn opaque_registration_keys(entries: &[horizon_native_java::RegistryEntry]) -> Vec<String> {
     entries
         .iter()
         .filter(|entry| entry.declaration.is_none())
         .map(horizon_native_java::RegistryEntry::key)
         .collect()
+}
+
+/// Opaque registrations a typed declaration of the same registry and id
+/// supersedes. The typed row is kept and the collision is reported once; the
+/// merge itself is unchanged.
+fn promoted_registrations(
+    recorded: &[horizon_native_java::RegistryEntry],
+    declared: &[horizon_native_java::RegistryEntry],
+) -> Vec<String> {
+    bounded_sorted(
+        recorded
+            .iter()
+            .filter(|entry| {
+                entry.declaration.is_none()
+                    && declared.iter().any(|declared| {
+                        declared.declaration.is_some()
+                            && declared.registry == entry.registry
+                            && declared.id == entry.id
+                    })
+            })
+            .map(horizon_native_java::RegistryEntry::key),
+    )
 }
 
 /// Merge typed declarations from the jar metadata with registrations observed
@@ -174,17 +413,8 @@ fn seeded_native_host(
         ExecutionRole::Client => "CLIENT",
         ExecutionRole::IntegratedServer | ExecutionRole::DedicatedServer => "SERVER",
     };
-    let id = jar
-        .native_id
-        .as_deref()
-        .or(jar.fabric_id.as_deref())
-        .or(jar.neoforge_id.as_deref())
-        .or_else(|| path.file_stem().and_then(|stem| stem.to_str()));
-    let version = jar
-        .fabric_version
-        .as_deref()
-        .or(jar.neoforge_version.as_deref())
-        .unwrap_or("unknown");
+    let id = native_mod_id(jar, path);
+    let version = native_mod_version(jar).unwrap_or("unknown");
     let mut host = horizon_native_java::StdHost::new().with_environment_type(environment);
     if let Some(id) = id {
         host = host.with_mod(id, version);
@@ -198,12 +428,26 @@ fn seeded_native_host(
     jar.seed_host(host)
 }
 
+/// Runs explicitly supplied Java entrypoints through the bounded native
+/// interpreter before resource workers start. Java jars are never discovered
+/// implicitly: a launcher or developer must pass `--java-mod PATH`.
 pub(super) fn run_java_mods(
     paths: &[PathBuf],
     role: ExecutionRole,
-) -> Result<Vec<horizon_client::mod_content::ContentMod>, String> {
+) -> Result<Vec<ContentMod>, String> {
+    run_java_mods_with_report(paths, role).map(|(content, _)| content)
+}
+
+/// [`run_java_mods`], keeping each jar's compatibility report so the window, its
+/// server thread and the dedicated server can log the same decisions from their
+/// own startup path.
+pub(super) fn run_java_mods_with_report(
+    paths: &[PathBuf],
+    role: ExecutionRole,
+) -> Result<(Vec<ContentMod>, Vec<JavaCompatibilityReport>), String> {
+    let mut reports = Vec::new();
     if paths.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), reports));
     }
     let kinds: &[&str] = match role {
         ExecutionRole::Client => &["client", "main", "neoforge"],
@@ -221,6 +465,20 @@ pub(super) fn run_java_mods(
                 ExecutionRole::IntegratedServer | ExecutionRole::DedicatedServer
             )
         {
+            // The refusal is a compatibility decision too: log it in the same
+            // shape as an accepted jar, then keep today's error.
+            let report = JavaCompatibilityReport::new(
+                &jar,
+                path,
+                role,
+                NativeRunFacts {
+                    rejected: true,
+                    ..NativeRunFacts::default()
+                },
+            );
+            for line in report.summary() {
+                log::warn!("{line}");
+            }
             return Err(format!(
                 "{}: clientSideOnly mod cannot run for server execution",
                 path.display()
@@ -264,13 +522,14 @@ pub(super) fn run_java_mods(
                 })?;
             calls += report.calls;
         }
+        let listeners = host.listener_registrations().count();
         log::info!(
             "Horizon: native Java {} {} entrypoint(s) completed ({} host calls, {} registrations, {} listeners)",
             path.display(),
             entrypoints.len(),
             calls,
             host.registrations().len(),
-            host.listener_registrations().count(),
+            listeners,
         );
         let opaque_keys = opaque_registration_keys(host.registrations());
         if !opaque_keys.is_empty() {
@@ -278,6 +537,14 @@ pub(super) fn run_java_mods(
                 "Horizon: native Java {} recorded opaque registrations [{}]; typed content declarations are required before they enter live registries",
                 path.display(),
                 opaque_keys.join(", ")
+            );
+        }
+        let promoted = promoted_registrations(host.registrations(), &jar.native_declarations);
+        if !promoted.is_empty() {
+            log::warn!(
+                "Horizon: native Java {} declares typed and opaque rows for [{}]; the typed row is kept",
+                path.display(),
+                promoted.join(", ")
             );
         }
         let mut entries = host
@@ -288,6 +555,22 @@ pub(super) fn run_java_mods(
             .collect::<Vec<_>>();
         merge_native_entries(&mut entries, jar.native_declarations.clone())
             .map_err(|error| format!("{}: {error}", path.display()))?;
+        let report = JavaCompatibilityReport::new(
+            &jar,
+            path,
+            role,
+            NativeRunFacts {
+                kind,
+                executed: entrypoints.len(),
+                host_calls: calls,
+                listeners,
+                recorded: host.registrations(),
+                payloads: host.payload_registrations(),
+                typed: entries.len(),
+                promoted,
+                rejected: false,
+            },
+        );
         if !entries.is_empty() {
             let declarations =
                 horizon_mods::native::NativeDeclarations::from_registry_entries(entries.iter())
@@ -303,17 +586,37 @@ pub(super) fn run_java_mods(
                 .ok_or_else(|| format!("{}: native metadata has no mod id", path.display()))?;
             let content = horizon_mods::Content::from_native(id.clone(), declarations)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
-            native_content.push(horizon_client::mod_content::ContentMod { id, content });
+            native_content.push(ContentMod { id, content });
         }
+        for line in report.summary() {
+            log::info!("{line}");
+        }
+        reports.push(report);
     }
-    Ok(native_content)
+    let typed = reports
+        .iter()
+        .map(|report| report.typed_registrations)
+        .sum::<usize>();
+    let opaque = reports
+        .iter()
+        .map(|report| report.opaque_registrations.len())
+        .sum::<usize>();
+    let payloads = reports
+        .iter()
+        .map(|report| report.payload_directions.len())
+        .sum::<usize>();
+    log::info!(
+        "Horizon: Java compatibility: {} jar(s), {typed} typed registrations, {opaque} opaque, {payloads} payload directions",
+        reports.len(),
+    );
+    Ok((native_content, reports))
 }
 
 /// The mods' mob effects join vanilla's (`brewing::effect`), once the root
 /// holding their network ids is built. The startup root's effects, none
 /// included, stay until restart: a pack reload after a Mods switch builds a
 /// root with others.
-pub(super) fn register_mob_effects(mods: &[horizon_client::mod_content::ContentMod]) {
+pub(super) fn register_mob_effects(mods: &[ContentMod]) {
     let effects = horizon_client::mod_content::mob_effects(mods);
     let ids: Vec<String> = effects.iter().map(|e| e.id.clone()).collect();
     let set = horizon_client::brewing::register_mod_effects(effect_rows(effects));
@@ -754,15 +1057,19 @@ clientSideOnly = true
         .unwrap();
         zip.finish().unwrap();
 
-        let error = run_java_mods(
-            std::slice::from_ref(&jar_path),
-            ExecutionRole::DedicatedServer,
-        )
-        .unwrap_err();
-        assert!(
-            error.contains("clientSideOnly mod cannot run for server execution"),
-            "{error}"
+        let message = format!(
+            "{}: clientSideOnly mod cannot run for server execution",
+            jar_path.display()
         );
+        // Both server roles refuse it, with the same message the dedicated
+        // server has always used.
+        for role in [
+            ExecutionRole::IntegratedServer,
+            ExecutionRole::DedicatedServer,
+        ] {
+            let error = run_java_mods(std::slice::from_ref(&jar_path), role).unwrap_err();
+            assert_eq!(error, message, "{role:?}");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -910,5 +1217,287 @@ clientSideOnly = true
         let error = run_java_mods(std::slice::from_ref(&path), ExecutionRole::Client).unwrap_err();
         assert!(error.contains(&path.display().to_string()), "{error}");
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// A jar that carries only loader metadata, to check which loader the
+    /// report names without compiling Java.
+    fn metadata_jar(root: &std::path::Path, name: &str, file: &str, text: &str) -> PathBuf {
+        std::fs::create_dir_all(root).unwrap();
+        let path = root.join(format!("{name}.jar"));
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file(file, options).unwrap();
+        zip.write_all(text.as_bytes()).unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn java_loader_kinds_name_the_metadata_a_jar_ships() {
+        let root = std::env::temp_dir().join(format!("horizon-java-loader-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (name, file, text, want) in [
+            (
+                "fabric",
+                "fabric.mod.json",
+                r#"{"id":"demo","version":"1.0","entrypoints":{"main":"demo.Mod"}}"#,
+                "fabric",
+            ),
+            (
+                "neoforge",
+                "META-INF/neoforge.mods.toml",
+                "[[mods]]\nmodId = \"demo\"\nversion = \"1.0\"\n",
+                "neoforge",
+            ),
+            (
+                "legacy-forge",
+                "META-INF/mods.toml",
+                "modLoader = \"javafml\"\n[[mods]]\nmodId = \"demo\"\nversion = \"1.0\"\n",
+                "legacy-forge",
+            ),
+        ] {
+            let path = metadata_jar(&root, name, file, text);
+            let jar = horizon_native_java::NativeJar::from_path(&path).unwrap();
+            assert_eq!(
+                JavaLoader::of(&jar).map(JavaLoader::name),
+                Some(want),
+                "{name}"
+            );
+        }
+        // A jar with no loader metadata is named as unknown rather than guessed.
+        assert_eq!(
+            JavaLoader::of(&horizon_native_java::NativeJar::default()),
+            None
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn java_compatibility_summary_is_deterministic() {
+        let mut jar = horizon_native_java::NativeJar::default();
+        jar.fabric_id = Some("demo".into());
+        jar.fabric_version = Some("1.2.3".into());
+        jar.fabric_entrypoints = BTreeMap::from([(
+            "main".to_owned(),
+            vec![horizon_native_java::Entrypoint {
+                class: "demo.Mod".into(),
+                method: None,
+                adapter: None,
+            }],
+        )]);
+        let opaque = |id: &str| horizon_native_java::RegistryEntry {
+            registry: "minecraft:item".into(),
+            id: id.into(),
+            value: horizon_native_java::Value::Ref(Some("opaque".into())),
+            declaration: None,
+        };
+        let recorded = [
+            opaque("demo:token"),
+            horizon_native_java::RegistryEntry::typed(
+                "minecraft:item",
+                "demo:gem",
+                horizon_native_java::RegistryDeclaration::Item {
+                    template: "minecraft:stick".into(),
+                    properties: BTreeMap::new(),
+                },
+            ),
+        ];
+        let payloads = [horizon_native_java::PayloadRegistration {
+            direction: "play_to_server".into(),
+            payload_type: horizon_native_java::Value::Ref(Some("payload".into())),
+            codec: horizon_native_java::Value::Ref(Some("codec".into())),
+            handler: horizon_native_java::Value::Ref(Some("handler".into())),
+        }];
+        let report = JavaCompatibilityReport::new(
+            &jar,
+            std::path::Path::new("/mods/demo.jar"),
+            ExecutionRole::DedicatedServer,
+            NativeRunFacts {
+                kind: "main",
+                executed: 1,
+                host_calls: 9,
+                listeners: 2,
+                recorded: &recorded,
+                payloads: &payloads,
+                typed: 1,
+                promoted: vec!["minecraft:item/demo:gem".into()],
+                rejected: false,
+            },
+        );
+        let lines = vec![
+            "Horizon: Java compatibility /mods/demo.jar: role=dedicated-server loader=fabric \
+             id=demo version=1.2.3"
+                .to_owned(),
+            "  entrypoints: declared=[main] selected=main executed=1 host-calls=9 listeners=2"
+                .to_owned(),
+            "  registrations: typed=1 opaque=[minecraft:item/demo:token] \
+             promoted=[minecraft:item/demo:gem]"
+                .to_owned(),
+            "  payloads: [play_to_server]".to_owned(),
+        ];
+        assert_eq!(report.summary(), lines);
+        assert_eq!(report.summary(), lines);
+
+        // Each role prints its own name, so a startup log says which one ran.
+        for (role, name) in [
+            (ExecutionRole::Client, "client"),
+            (ExecutionRole::IntegratedServer, "integrated-server"),
+            (ExecutionRole::DedicatedServer, "dedicated-server"),
+        ] {
+            assert_eq!(role_name(role), name);
+        }
+
+        // A refused jar reports the decision instead of a run.
+        let rejected = JavaCompatibilityReport::new(
+            &jar,
+            std::path::Path::new("/mods/demo.jar"),
+            ExecutionRole::IntegratedServer,
+            NativeRunFacts {
+                rejected: true,
+                ..NativeRunFacts::default()
+            },
+        );
+        assert!(rejected.client_side_only_rejected);
+        assert_eq!(
+            rejected.summary().last().map(String::as_str),
+            Some("  rejected: clientSideOnly metadata for integrated-server execution")
+        );
+
+        // Too many rows are sorted first, so the rows a jar keeps never vary.
+        let many: Vec<_> = (0..MAX_REPORT_ROWS + 4)
+            .rev()
+            .map(|index| opaque(&format!("demo:item_{index:02}")))
+            .collect();
+        let bounded = JavaCompatibilityReport::new(
+            &jar,
+            std::path::Path::new("/mods/demo.jar"),
+            ExecutionRole::Client,
+            NativeRunFacts {
+                recorded: &many,
+                ..NativeRunFacts::default()
+            },
+        );
+        assert_eq!(bounded.opaque_registrations.len(), MAX_REPORT_ROWS);
+        assert_eq!(
+            bounded.opaque_registrations[0],
+            "minecraft:item/demo:item_00"
+        );
+    }
+
+    /// One compiled initializer, shipped under two typed declarations: the
+    /// callback registers `report:gem` and `report:token` opaquely, so the
+    /// first declaration collides with a row and the second does not.
+    #[test]
+    fn java_mod_reports_separate_typed_promoted_and_opaque_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-game-java-report-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        std::fs::create_dir_all(&classes).unwrap();
+        let sources = [
+            (
+                "net/fabricmc/api/ModInitializer.java",
+                "package net.fabricmc.api; public interface ModInitializer { void onInitialize(); }",
+            ),
+            (
+                "net/minecraft/resources/Identifier.java",
+                r#"package net.minecraft.resources; public final class Identifier { private final String namespace; private final String path; private Identifier(String n, String p) { namespace = n; path = p; } public static Identifier fromNamespaceAndPath(String n, String p) { return new Identifier(n, p); } public String toString() { return namespace + ":" + path; } }"#,
+            ),
+            (
+                "net/minecraft/core/Registry.java",
+                "package net.minecraft.core; import net.minecraft.resources.Identifier; public interface Registry<T> { static <T> T register(Registry<T> registry, Identifier id, T value) { return value; } }",
+            ),
+            (
+                "net/minecraft/core/registries/Registries.java",
+                "package net.minecraft.core.registries; import net.minecraft.core.Registry; public final class Registries { public static final Registry<Object> ITEM = null; }",
+            ),
+            (
+                "report/ReportMod.java",
+                r#"package report; import net.fabricmc.api.ModInitializer; import net.minecraft.core.Registry; import net.minecraft.core.registries.Registries; import net.minecraft.resources.Identifier; public final class ReportMod implements ModInitializer { public void onInitialize() { Registry.register(Registries.ITEM, Identifier.fromNamespaceAndPath("report", "gem"), new Object()); Registry.register(Registries.ITEM, Identifier.fromNamespaceAndPath("report", "token"), new Object()); } }"#,
+            ),
+        ];
+        let mut paths = Vec::new();
+        for (name, text) in sources {
+            let path = src.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            paths.push(path);
+        }
+        let status = Command::new("javac")
+            .arg("--release")
+            .arg("17")
+            .arg("-d")
+            .arg(&classes)
+            .args(&paths)
+            .status()
+            .unwrap();
+        assert!(status.success(), "javac failed");
+        let write = |name: &str, declared: &str| -> PathBuf {
+            let path = root.join(format!("{name}.jar"));
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("fabric.mod.json", options).unwrap();
+            zip.write_all(
+                br#"{"id":"report-mod","version":"1.0","entrypoints":{"main":"report.ReportMod"}}"#,
+            )
+            .unwrap();
+            zip.start_file("report/ReportMod.class", options).unwrap();
+            zip.write_all(&std::fs::read(classes.join("report/ReportMod.class")).unwrap())
+                .unwrap();
+            zip.start_file("META-INF/horizon-native.json", options)
+                .unwrap();
+            zip.write_all(declared.as_bytes()).unwrap();
+            zip.finish().unwrap();
+            path
+        };
+        let colliding = write(
+            "report-colliding",
+            r#"{"id":"report-mod","registrations":[{"registry":"minecraft:item","id":"report:gem","kind":"item","template":"minecraft:stick"}]}"#,
+        );
+        let distinct = write(
+            "report-distinct",
+            r#"{"id":"report-mod","registrations":[{"registry":"minecraft:item","id":"report:ore","kind":"item","template":"minecraft:stick"}]}"#,
+        );
+        let (content, reports) =
+            run_java_mods_with_report(&[colliding, distinct], ExecutionRole::DedicatedServer)
+                .unwrap();
+        assert_eq!(reports.len(), 2);
+        let report = &reports[0];
+        assert_eq!(role_name(report.role), "dedicated-server");
+        assert_eq!(report.loader.map(JavaLoader::name), Some("fabric"));
+        assert_eq!(report.id.as_deref(), Some("report-mod"));
+        assert_eq!(report.version.as_deref(), Some("1.0"));
+        assert_eq!(report.declared_entrypoints, ["main"]);
+        assert_eq!(report.entrypoint_kind, "main");
+        assert_eq!(report.executed_entrypoints, 1);
+        assert!(report.host_calls > 0, "{report:?}");
+        // The typed metadata row wins over the colliding callback row; the
+        // other callback row stays opaque.
+        assert_eq!(report.typed_registrations, 1);
+        assert_eq!(report.opaque_registrations, ["minecraft:item/report:token"]);
+        assert_eq!(report.promoted, ["minecraft:item/report:gem"]);
+        let summary = report.summary();
+        assert!(
+            summary[0].contains("role=dedicated-server loader=fabric id=report-mod version=1.0"),
+            "{summary:?}"
+        );
+        assert!(
+            summary[1].contains("selected=main executed=1"),
+            "{summary:?}"
+        );
+        // No id collides in the second jar, so nothing is promoted.
+        assert!(reports[1].promoted.is_empty());
+        assert_eq!(
+            reports[1].opaque_registrations,
+            ["minecraft:item/report:gem", "minecraft:item/report:token"]
+        );
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0].content.items[0].id, "report:gem");
+        assert_eq!(content[1].content.items[0].id, "report:ore");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
