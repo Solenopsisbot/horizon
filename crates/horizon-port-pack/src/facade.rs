@@ -1171,6 +1171,12 @@ fn render(
             "    protected int horizonMaxStackSize = 64;\n    protected int horizonMaxDamage;\n    protected net.minecraft.world.item.Item horizonCraftRemainder;\n    protected boolean horizonFireResistant;"
         );
     }
+    if class.name == "net/minecraft/world/level/block/state/BlockBehaviour$Properties" {
+        let _ = writeln!(
+            out,
+            "    protected float horizonDestroyTime;\n    protected float horizonExplosionResistance;\n    protected float horizonFriction = 0.6f;\n    protected float horizonSpeedFactor = 1.0f;\n    protected float horizonJumpFactor = 1.0f;\n    protected boolean horizonNoOcclusion;\n    protected boolean horizonNoLootTable;\n    protected boolean horizonCorrectTool;\n    protected boolean horizonRandomTicks;"
+        );
+    }
     if class.name == "net/minecraft/world/phys/AABB" {
         let _ = writeln!(
             out,
@@ -2729,8 +2735,36 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     if class == "net/minecraft/world/level/block/state/BlockBehaviour$Properties"
         && ret == "net.minecraft.world.level.block.state.BlockBehaviour.Properties"
     {
-        if method == "of" {
-            return "return new Properties();".to_owned();
+        match (method, descriptor) {
+            ("of", _) => return "return new Properties();".to_owned(),
+            (
+                "strength",
+                "(F)Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;",
+            ) => {
+                return "horizonDestroyTime = Math.max(0.0f, p0); horizonExplosionResistance = Math.max(0.0f, p0); return this;".to_owned();
+            }
+            (
+                "strength",
+                "(FF)Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;",
+            ) => {
+                return "horizonDestroyTime = Math.max(0.0f, p0); horizonExplosionResistance = Math.max(0.0f, p1); return this;".to_owned();
+            }
+            ("noOcclusion", _) => return "horizonNoOcclusion = true; return this;".to_owned(),
+            ("noLootTable", _) => return "horizonNoLootTable = true; return this;".to_owned(),
+            ("requiresCorrectToolForDrops", _) => {
+                return "horizonCorrectTool = true; return this;".to_owned();
+            }
+            ("randomTicks", _) => return "horizonRandomTicks = true; return this;".to_owned(),
+            ("friction", _) => {
+                return "horizonFriction = Math.max(0.0f, p0); return this;".to_owned();
+            }
+            ("speedFactor", _) => {
+                return "horizonSpeedFactor = Math.max(0.0f, p0); return this;".to_owned();
+            }
+            ("jumpFactor", _) => {
+                return "horizonJumpFactor = Math.max(0.0f, p0); return this;".to_owned();
+            }
+            _ => {}
         }
         return "return this;".to_owned();
     }
@@ -5207,6 +5241,56 @@ mod tests {
                 "()Z",
             ),
             "return horizonMaxDamage > 0;"
+        );
+    }
+
+    #[test]
+    fn block_properties_preserve_common_registration_values() {
+        let properties = "net.minecraft.world.level.block.state.BlockBehaviour.Properties";
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/block/state/BlockBehaviour$Properties",
+                "strength",
+                properties,
+                "(F)Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;",
+            ),
+            "horizonDestroyTime = Math.max(0.0f, p0); horizonExplosionResistance = Math.max(0.0f, p0); return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/block/state/BlockBehaviour$Properties",
+                "strength",
+                properties,
+                "(FF)Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;",
+            ),
+            "horizonDestroyTime = Math.max(0.0f, p0); horizonExplosionResistance = Math.max(0.0f, p1); return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/block/state/BlockBehaviour$Properties",
+                "noOcclusion",
+                properties,
+                "()Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;",
+            ),
+            "horizonNoOcclusion = true; return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/block/state/BlockBehaviour$Properties",
+                "friction",
+                properties,
+                "(F)Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;",
+            ),
+            "horizonFriction = Math.max(0.0f, p0); return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/level/block/state/BlockBehaviour$Properties",
+                "requiresCorrectToolForDrops",
+                properties,
+                "()Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;",
+            ),
+            "horizonCorrectTool = true; return this;"
         );
     }
 
