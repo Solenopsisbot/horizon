@@ -69,13 +69,18 @@ pub enum AnnotationValue {
 
 /// A bounded native translation for one Mixin callback.
 ///
-/// The native path deliberately accepts only the common `@Inject(at = HEAD)`
-/// shape.  The callback is invoked before the target method, so the target
-/// keeps its normal return value.  A `cancellable` plan receives a
-/// runtime-owned `CallbackInfo`: `ci.cancel()` skips the remaining HEAD
-/// callbacks and the target body, and the target answers with the default value
-/// of its return descriptor.  Cancellable RETURN/TAIL plans and
-/// `CallbackInfoReturnable.setReturnValue` stay on the JVM fallback.
+/// At `HEAD` the callback runs before the target method, so the target keeps
+/// its normal return value.  A `cancellable` plan receives a runtime-owned
+/// `CallbackInfo`: `ci.cancel()` skips the remaining HEAD callbacks and the
+/// target body, and the target answers with the default value of its return
+/// descriptor.
+///
+/// At `RETURN`/`TAIL` the target runs first and each callback receives a
+/// runtime-owned `CallbackInfoReturnable`.  `getReturnValue` reads the target's
+/// own result until a callback calls `setReturnValue`, which replaces the value
+/// the woven method answers with.  The last override wins.  A callback on a
+/// non-void target must accept the `CallbackInfoReturnable`; a void target
+/// keeps the plain `CallbackInfo` shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixinInjectionPlan {
     pub target: MethodRef,
@@ -118,6 +123,13 @@ impl MixinInjectionPlan {
 pub struct MixinExecutionReport {
     /// The last callback result, kept for the single-plan entry points.
     pub callback_result: Value,
+    /// The value the woven method answers with.
+    ///
+    /// HEAD and `@Overwrite` plans report the target body's result (or the
+    /// descriptor's default when a HEAD callback cancelled it).  RETURN/TAIL
+    /// plans report the last `CallbackInfoReturnable.setReturnValue` override
+    /// when one exists, and the target's own result otherwise; see
+    /// [`Self::return_value_overridden`].
     pub target_result: Value,
     /// Every callback result in execution order.
     ///
@@ -130,8 +142,17 @@ pub struct MixinExecutionReport {
     /// A cancelled HEAD injection skips the callbacks after the one that
     /// cancelled and the target body; `target_result` is then the default value
     /// of the target's return descriptor, exactly as the woven method returns
-    /// without running its body.
+    /// without running its body.  A RETURN/TAIL `cancel()` never stops the
+    /// target (it already ran) or the callbacks after it, so this stays false
+    /// there.
     pub cancelled: bool,
+    /// Whether a RETURN/TAIL callback replaced the target's return value.
+    ///
+    /// When set, [`Self::target_result`] is the last `setReturnValue` value
+    /// rather than the target's own result.  Always false for HEAD and
+    /// `@Overwrite` plans, and for RETURN/TAIL plans whose callbacks only read
+    /// `getReturnValue`.
+    pub return_value_overridden: bool,
 }
 
 /// Runtime state for the `CallbackInfo` objects one native Mixin execution
@@ -139,13 +160,27 @@ pub struct MixinExecutionReport {
 ///
 /// Mixin creates one `CallbackInfo` per injection point and passes that same
 /// object to every callback at the point, so the deterministic marker a
-/// callback receives is the object's identity and the flag is its cancelled
-/// state.  The table belongs to one execution - the object's whole lifetime -
-/// so a marker no execution opened is a diagnostic rather than a silent no-op,
-/// and the entry count is bounded by [`MAX_CALLBACK_INFOS`].
+/// callback receives is the object's identity, the flag is its cancelled
+/// state, and a `CallbackInfoReturnable` additionally carries the target's
+/// result and the last `setReturnValue` override.  The table belongs to one
+/// execution - the object's whole lifetime - so a marker no execution opened is
+/// a diagnostic rather than a silent no-op, and the entry count is bounded by
+/// [`MAX_CALLBACK_INFOS`].
 #[derive(Debug, Default)]
 struct CallbackInfos {
-    cancelled: BTreeMap<String, bool>,
+    states: BTreeMap<String, CallbackInfoState>,
+}
+
+/// The state behind one injection point's callback-info object.
+#[derive(Debug, Default)]
+struct CallbackInfoState {
+    cancelled: bool,
+    /// The target's own result, handed to `getReturnValue` until an override
+    /// exists.  `None` for a HEAD object, which has no result yet.
+    actual: Option<Value>,
+    /// The last `setReturnValue` value.  `None` means "return the target's
+    /// value unchanged".
+    returned: Option<Value>,
 }
 
 impl CallbackInfos {
@@ -153,41 +188,132 @@ impl CallbackInfos {
         Self::default()
     }
 
-    /// Open the object for one injection point, keeping a flag an earlier
-    /// callback already set.
-    fn open(&mut self, marker: &str) -> Result<(), NativeError> {
-        if self.cancelled.contains_key(marker) {
-            return Ok(());
-        }
-        if self.cancelled.len() >= MAX_CALLBACK_INFOS {
-            return Err(NativeError::Metadata(format!(
-                "native Mixin execution reached the bound of {MAX_CALLBACK_INFOS} CallbackInfo objects"
-            )));
-        }
-        self.cancelled.insert(marker.to_owned(), false);
-        Ok(())
-    }
-
-    /// Read the flag of exactly `marker`, or report that this execution does not
-    /// own such an object.
-    fn flag(&self, marker: &str) -> Result<bool, NativeError> {
-        self.cancelled.get(marker).copied().ok_or_else(|| {
+    fn state(&self, marker: &str) -> Result<&CallbackInfoState, NativeError> {
+        self.states.get(marker).ok_or_else(|| {
             NativeError::Metadata(format!(
                 "native Mixin CallbackInfo {marker} is not owned by this execution"
             ))
         })
     }
 
-    /// Set the flag of exactly `marker`; an unknown marker is a bounded
-    /// diagnostic, never a panic.
-    fn cancel(&mut self, marker: &str) -> Result<(), NativeError> {
-        let cancelled = self.cancelled.get_mut(marker).ok_or_else(|| {
+    fn state_mut(&mut self, marker: &str) -> Result<&mut CallbackInfoState, NativeError> {
+        self.states.get_mut(marker).ok_or_else(|| {
             NativeError::Metadata(format!(
                 "native Mixin CallbackInfo {marker} is not owned by this execution"
             ))
-        })?;
-        *cancelled = true;
+        })
+    }
+
+    /// Open the object for one injection point, keeping the flag and any
+    /// override an earlier callback already set.
+    fn open(&mut self, marker: &str) -> Result<(), NativeError> {
+        if self.states.contains_key(marker) {
+            return Ok(());
+        }
+        if self.states.len() >= MAX_CALLBACK_INFOS {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin execution reached the bound of {MAX_CALLBACK_INFOS} CallbackInfo objects"
+            )));
+        }
+        self.states
+            .insert(marker.to_owned(), CallbackInfoState::default());
         Ok(())
+    }
+
+    /// Read the flag of exactly `marker`, or report that this execution does not
+    /// own such an object.
+    fn flag(&self, marker: &str) -> Result<bool, NativeError> {
+        Ok(self.state(marker)?.cancelled)
+    }
+
+    /// Set the flag of exactly `marker`; an unknown marker is a bounded
+    /// diagnostic, never a panic.
+    fn cancel(&mut self, marker: &str) -> Result<(), NativeError> {
+        self.state_mut(marker)?.cancelled = true;
+        Ok(())
+    }
+
+    /// Record the target's own result for `getReturnValue`.
+    fn set_actual(&mut self, marker: &str, value: Value) -> Result<(), NativeError> {
+        self.state_mut(marker)?.actual = Some(value);
+        Ok(())
+    }
+
+    /// Record one `setReturnValue` argument.  `Value::Void` clears the override
+    /// so the woven method answers with the target's own result again; a value
+    /// is normalized against the target descriptor when it is read back.
+    fn set_return(&mut self, marker: &str, value: Value) -> Result<(), NativeError> {
+        let returned = self.state_mut(marker)?;
+        returned.returned = (value != Value::Void).then_some(value);
+        Ok(())
+    }
+
+    /// The value `getReturnValue` answers: the last override, else the target's
+    /// own result, else `null` when this object has no result yet.
+    fn current(&self, marker: &str) -> Result<Value, NativeError> {
+        let state = self.state(marker)?;
+        Ok(state
+            .returned
+            .clone()
+            .or_else(|| state.actual.clone())
+            .unwrap_or(Value::Ref(None)))
+    }
+
+    /// The override in the target's declared shape, or `None` when no callback
+    /// replaced the value.
+    fn take_override(
+        &self,
+        marker: &str,
+        target_descriptor: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        match &self.state(marker)?.returned {
+            Some(value) => return_override(target_descriptor, value.clone()),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Normalize a callback's `setReturnValue` argument to the target's declared
+/// return descriptor.
+///
+/// The interpreter represents a boxed primitive either as `Value::Int` or as
+/// the host's `integer:`/`boolean:`/`character:` reference markers, so a
+/// primitive target accepts both.  An object target accepts only a reference;
+/// handing it a primitive is a bounded diagnostic instead of a phantom
+/// coercion.  `Value::Void` clears the override (handled by the caller).
+fn return_override(desc: &str, value: Value) -> Result<Option<Value>, NativeError> {
+    let desc = if desc.contains('(') {
+        return_desc(desc)
+    } else {
+        desc
+    };
+    match desc {
+        "V" => Err(NativeError::Metadata(
+            "native Mixin CallbackInfoReturnable cannot override a void target".into(),
+        )),
+        "Z" | "B" | "C" | "S" | "I" | "J" | "D" | "F" => {
+            let integer = if let Some(flag) =
+                expect_ref(&value).and_then(|marker| marker.strip_prefix("boolean:"))
+            {
+                Some(i32::from(flag == "true"))
+            } else {
+                boxed_character(&value).or_else(|| boxed_number(&value).map(|value| value as i32))
+            };
+            integer.map(|integer| Some(Value::Int(integer))).ok_or_else(|| {
+                NativeError::Metadata(format!(
+                    "native Mixin CallbackInfoReturnable override {} does not fit primitive return {desc}",
+                    value_marker(&value)
+                ))
+            })
+        }
+        _ => match value {
+            Value::Ref(_) => Ok(Some(value)),
+            Value::Int(_) => Err(NativeError::Metadata(format!(
+                "native Mixin CallbackInfoReturnable override {} is primitive but return {desc} is a reference",
+                value_marker(&value)
+            ))),
+            Value::Void => Ok(None),
+        },
     }
 }
 
@@ -6597,9 +6723,9 @@ impl NativeJar {
     /// lists HEAD plans before RETURN/TAIL plans.
     ///
     /// A `cancellable` HEAD plan is accepted: the native `CallbackInfo` owns the
-    /// flag and the execution stops the target body when it is set.  Cancellable
-    /// RETURN/TAIL plans are rejected, because a return-value contract needs
-    /// `CallbackInfoReturnable.setReturnValue`, which stays on the JVM fallback.
+    /// flag and the execution stops the target body when it is set.  A
+    /// RETURN/TAIL plan follows the target's shape: a non-void target needs a
+    /// trailing `CallbackInfoReturnable` and a void target must not declare one.
     fn discovered_mixin_plans(
         &self,
         target: &MethodRef,
@@ -6617,15 +6743,36 @@ impl NativeJar {
             match plan.at.as_str() {
                 "HEAD" => before.push(plan),
                 "RETURN" | "TAIL" => {
-                    if plan.cancellable {
+                    let returnable = callback_takes_returnable(&plan.callback.descriptor);
+                    if plan.cancellable && !returnable {
                         return Err(NativeError::Metadata(format!(
-                            "native Mixin callback {}#{}{} on {}#{} is cancellable at {}; native cancellation supports only @Inject(at = HEAD), so return-value callbacks stay on the JVM fallback",
+                            "native Mixin callback {}#{}{} on {}#{} is cancellable at {}; a cancellable return injection needs a trailing CallbackInfoReturnable",
                             plan.callback.owner,
                             plan.callback.name,
                             plan.callback.descriptor,
                             target.owner,
                             target.name,
                             plan.at
+                        )));
+                    }
+                    if return_desc(&target.descriptor) == "V" && returnable {
+                        return Err(NativeError::Metadata(format!(
+                            "native Mixin callback {}#{}{} takes a CallbackInfoReturnable for void target {}#{}; a void target has no return value to override",
+                            plan.callback.owner,
+                            plan.callback.name,
+                            plan.callback.descriptor,
+                            target.owner,
+                            target.name
+                        )));
+                    }
+                    if return_desc(&target.descriptor) != "V" && !returnable {
+                        return Err(NativeError::Metadata(format!(
+                            "native Mixin callback {}#{}{} on non-void target {}#{} does not take a trailing CallbackInfoReturnable; return-value callbacks without one stay on the JVM fallback",
+                            plan.callback.owner,
+                            plan.callback.name,
+                            plan.callback.descriptor,
+                            target.owner,
+                            target.name
                         )));
                     }
                     after.push(plan);
@@ -7113,6 +7260,7 @@ impl NativeJar {
             target_result,
             callback_results: vec![callback_result],
             cancelled,
+            return_value_overridden: false,
         })
     }
 
@@ -7123,9 +7271,11 @@ impl NativeJar {
     ///
     /// A `cancellable` HEAD plan stops the chain where it is: the callbacks
     /// after it do not run, the target body is skipped, and the report carries
-    /// the default value of the target's return descriptor. Cancellable
-    /// RETURN/TAIL plans, return-value callbacks, and mixed anchors stay on the
-    /// JVM fallback.
+    /// the default value of the target's return descriptor. This entry point
+    /// keeps the void-only RETURN/TAIL shape: cancellable RETURN/TAIL plans,
+    /// non-void RETURN/TAIL targets, and mixed anchors stay on the JVM
+    /// fallback.  Return overrides go through [`Self::execute_mixin_at_return`]
+    /// and [`Self::execute_discovered_mixins`].
     pub fn execute_mixin_chain<H: Host>(
         &self,
         plans: &[MixinInjectionPlan],
@@ -7146,8 +7296,7 @@ impl NativeJar {
         }
         if first.at != "HEAD" && plans.iter().any(|plan| plan.cancellable) {
             return Err(NativeError::Metadata(
-                "native Mixin chains support cancellation only at @Inject(at = HEAD); RETURN/TAIL callbacks stay on the JVM fallback"
-                    .into(),
+                "native Mixin chains support cancellation only at @Inject(at = HEAD)".into(),
             ));
         }
         if first.at != "HEAD" && first.at != "RETURN" && first.at != "TAIL" {
@@ -7248,6 +7397,7 @@ impl NativeJar {
             target_result,
             callback_results,
             cancelled,
+            return_value_overridden: false,
         })
     }
 
@@ -7341,15 +7491,19 @@ impl NativeJar {
         )
     }
 
-    /// Execute the bounded void-only form of `@Inject(at = RETURN|TAIL)`.
+    /// Execute one bounded `@Inject(at = RETURN|TAIL)` translation.
     ///
-    /// Return-value callbacks need a `CallbackInfoReturnable` object with a
-    /// replacement value.  Rather than inventing that contract, the native path
-    /// accepts only void targets and invokes a void callback after the target,
-    /// optionally supplying the runtime-owned `CallbackInfo` marker the HEAD
-    /// path uses; a `cancel()` there is a no-op, because the body already ran.
-    /// `setReturnValue` and non-void targets stay on the JVM fallback with an
-    /// explicit diagnostic.
+    /// The target runs first, exactly once.  Each callback then runs after it
+    /// with the runtime-owned `CallbackInfoReturnable` marker, which carries the
+    /// target's own result for `getReturnValue`.  `setReturnValue` replaces the
+    /// value the woven method answers with and the last override wins; a
+    /// callback that only reads leaves the target's result in place.
+    ///
+    /// A non-void target requires the callback to take the trailing
+    /// `CallbackInfoReturnable`; a void target keeps the plain `CallbackInfo`
+    /// shape, because it has no value to override.  A cancellable plan needs
+    /// the returnable too: `cancel()` after the target cannot un-run it, so it
+    /// is a bounded no-op that keeps any override already set.
     pub fn execute_mixin_at_return<H: Host>(
         &self,
         plan: &MixinInjectionPlan,
@@ -7363,10 +7517,12 @@ impl NativeJar {
                 plan.at
             )));
         }
-        if plan.cancellable {
-            return Err(NativeError::Metadata(
-                "native @Inject(at = RETURN|TAIL) does not support cancellable callbacks".into(),
-            ));
+        let returnable = callback_takes_returnable(&plan.callback.descriptor);
+        if plan.cancellable && !returnable {
+            return Err(NativeError::Metadata(format!(
+                "native @Inject(at = RETURN|TAIL) callback {}#{}{} is cancellable, so it needs a trailing CallbackInfoReturnable",
+                plan.callback.owner, plan.callback.name, plan.callback.descriptor
+            )));
         }
 
         let target_class = self.classes.get(&plan.target.owner).ok_or_else(|| {
@@ -7383,10 +7539,26 @@ impl NativeJar {
                     plan.target.owner, plan.target.name, plan.target.descriptor
                 ))
             })?;
-        if return_desc(&plan.target.descriptor) != "V" {
-            return Err(NativeError::Metadata(
-                "native @Inject(at = RETURN|TAIL) supports only void targets; return-value callbacks use the JVM fallback".into(),
-            ));
+        let target_is_void = return_desc(&plan.target.descriptor) == "V";
+        if target_is_void && returnable {
+            return Err(NativeError::Metadata(format!(
+                "native @Inject(at = RETURN|TAIL) callback {}#{}{} takes a CallbackInfoReturnable for void target {}#{}; a void target has no return value to override",
+                plan.callback.owner,
+                plan.callback.name,
+                plan.callback.descriptor,
+                plan.target.owner,
+                plan.target.name
+            )));
+        }
+        if !target_is_void && !returnable {
+            return Err(NativeError::Metadata(format!(
+                "native @Inject(at = RETURN|TAIL) callback {}#{}{} on non-void target {}#{} does not take a trailing CallbackInfoReturnable; return-value callbacks without one stay on the JVM fallback",
+                plan.callback.owner,
+                plan.callback.name,
+                plan.callback.descriptor,
+                plan.target.owner,
+                plan.target.name
+            )));
         }
         if args.len() != arg_count(&plan.target.descriptor) {
             return Err(NativeError::Metadata(format!(
@@ -7439,17 +7611,18 @@ impl NativeJar {
             }
         }
 
-        // The object is opened so a `cancel()` here is a bounded no-op instead
-        // of a diagnostic: this plan is not cancellable, and the target body has
-        // already run by the time the callback executes.
+        // The target runs first so the returnable can carry its real result.
+        // A `cancel()` from the callback is a bounded no-op: the body already
+        // ran, and the override is the only value knob left.
+        let marker = callback_info_marker(&plan.target);
         let mut callback_infos = CallbackInfos::new();
-        callback_infos.open(&callback_info_marker(&plan.target))?;
+        callback_infos.open(&marker)?;
         let target_receiver = (!target_method.is_static()).then(|| {
             receiver
                 .clone()
                 .unwrap_or_else(|| Value::Ref(Some(plan.target.owner.clone())))
         });
-        let target_result = self.invoke_with_callback_infos(
+        let actual = self.invoke_with_callback_infos(
             &plan.target.owner,
             &plan.target.name,
             &plan.target.descriptor,
@@ -7458,6 +7631,9 @@ impl NativeJar {
             host,
             &mut callback_infos,
         )?;
+        if !target_is_void {
+            callback_infos.set_actual(&marker, actual.clone())?;
+        }
         let callback_receiver = (!callback_method.is_static()).then(|| {
             receiver
                 .clone()
@@ -7472,11 +7648,13 @@ impl NativeJar {
             host,
             &mut callback_infos,
         )?;
+        let override_value = callback_infos.take_override(&marker, &plan.target.descriptor)?;
         Ok(MixinExecutionReport {
             callback_result: callback_result.clone(),
-            target_result,
+            target_result: override_value.clone().unwrap_or(actual),
             callback_results: vec![callback_result],
             cancelled: false,
+            return_value_overridden: override_value.is_some(),
         })
     }
 
@@ -7490,10 +7668,16 @@ impl NativeJar {
     /// `target_result` becomes the default value of the target's return
     /// descriptor and `cancelled` is set.
     ///
-    /// Unsupported anchors, cancellable RETURN/TAIL plans, and targets that mix
+    /// RETURN/TAIL plans run after the target and each callback receives the
+    /// runtime-owned `CallbackInfoReturnable` carrying the target's result; the
+    /// last `setReturnValue` becomes `target_result` and sets
+    /// `return_value_overridden`.  A non-void target requires that marker and a
+    /// void target refuses it, mirroring Mixin's callback shape.
+    ///
+    /// Unsupported anchors, malformed return-value shapes, and targets that mix
     /// HEAD with RETURN/TAIL are rejected with a bounded
     /// `NativeError::Metadata`; they stay on the JVM fallback rather than
-    /// approximating a return-value contract or two anchor families at once.
+    /// approximating two anchor families at once.
     pub fn execute_discovered_mixins<H: Host>(
         &self,
         target: &MethodRef,
@@ -7527,18 +7711,16 @@ impl NativeJar {
             )));
         }
         let head_count = plans.iter().filter(|plan| plan.at == "HEAD").count();
-        if head_count < plans.len() && return_desc(&target.descriptor) != "V" {
-            return Err(NativeError::Metadata(
-                "native Mixin RETURN|TAIL callbacks support only void targets; return-value callbacks use the JVM fallback".into(),
-            ));
-        }
         // Validate every callback before running any of them so a malformed
         // plan never leaves the target half-woven.
         for plan in &plans {
             self.check_mixin_callback(plan, args)?;
         }
+        let marker = callback_info_marker(target);
         let mut callback_infos = CallbackInfos::new();
+        callback_infos.open(&marker)?;
         let mut cancelled = false;
+        let mut overridden = None;
         let mut callback_results = Vec::with_capacity(plans.len());
         for plan in &plans[..head_count] {
             callback_results.push(self.invoke_mixin_callback(
@@ -7550,7 +7732,7 @@ impl NativeJar {
             )?);
             // A cancelling callback ends the HEAD chain and skips the target
             // body; the callbacks after it never run.
-            if plan.cancellable && callback_infos.flag(&callback_info_marker(target))? {
+            if plan.cancellable && callback_infos.flag(&marker)? {
                 cancelled = true;
                 break;
             }
@@ -7572,6 +7754,9 @@ impl NativeJar {
                 host,
                 &mut callback_infos,
             )?;
+            if return_desc(&target.descriptor) != "V" {
+                callback_infos.set_actual(&marker, result.clone())?;
+            }
             for plan in &plans[head_count..] {
                 callback_results.push(self.invoke_mixin_callback(
                     plan,
@@ -7580,14 +7765,18 @@ impl NativeJar {
                     host,
                     &mut callback_infos,
                 )?);
+                // Re-read after every callback: the last override wins, and a
+                // callback that clears it falls back to the target's result.
+                overridden = callback_infos.take_override(&marker, &target.descriptor)?;
             }
-            result
+            overridden.clone().unwrap_or(result)
         };
         Ok(MixinExecutionReport {
             callback_result: callback_results.last().cloned().unwrap_or(Value::Void),
             target_result,
             callback_results,
             cancelled,
+            return_value_overridden: overridden.is_some(),
         })
     }
 
@@ -7686,6 +7875,7 @@ impl NativeJar {
             target_result: replacement.clone(),
             callback_results: vec![replacement],
             cancelled: false,
+            return_value_overridden: false,
         })
     }
 
@@ -7920,13 +8110,17 @@ impl<H: Host> Runtime<'_, H> {
     /// owns.
     ///
     /// Mixin's callback info is runtime state, not a host capability: the
-    /// interpreter keeps one flag per injection point, so `cancel()` and
-    /// `isCancelled()` act on exactly the object the plan handed the callback.
-    /// Every other member falls through to the host path unchanged.
+    /// interpreter keeps one flag and one return override per injection point,
+    /// so `cancel()`, `isCancelled()`, `setReturnValue()` and `getReturnValue()`
+    /// act on exactly the object the plan handed the callback.  A `cancel()` on
+    /// a returnable never un-runs the target; it keeps whatever override the
+    /// callback set, which is a bounded no-op when it set none.  Every other
+    /// member falls through to the host path unchanged.
     fn invoke_callback_info(
         &mut self,
         r: &MethodRef,
         receiver: Option<&Value>,
+        args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
         if !is_callback_info_class(&r.owner) {
             return Ok(None);
@@ -7942,6 +8136,16 @@ impl<H: Host> Runtime<'_, H> {
                     .callback_infos
                     .flag(callback_info_receiver(receiver)?)?;
                 Ok(Some(Value::Int(i32::from(cancelled))))
+            }
+            ("setReturnValue", "(Ljava/lang/Object;)V") => {
+                let marker = callback_info_receiver(receiver)?;
+                self.callback_infos
+                    .set_return(marker, args.first().cloned().unwrap_or(Value::Ref(None)))?;
+                Ok(Some(Value::Void))
+            }
+            ("getReturnValue", "()Ljava/lang/Object;") => {
+                let marker = callback_info_receiver(receiver)?;
+                self.callback_infos.current(marker).map(Some)
             }
             _ => Ok(None),
         }
@@ -9146,7 +9350,9 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_reflect_method(&r, receiver.as_ref(), &args)?
                     {
                         value
-                    } else if let Some(value) = self.invoke_callback_info(&r, receiver.as_ref())? {
+                    } else if let Some(value) =
+                        self.invoke_callback_info(&r, receiver.as_ref(), &args)?
+                    {
                         value
                     } else if r.owner == "java/lang/Class"
                         && r.name == "forName"
@@ -9372,6 +9578,14 @@ fn descriptor_arguments(desc: &str) -> Vec<String> {
 
 fn is_callback_info_descriptor(desc: &str) -> bool {
     matches!(desc, CALLBACK_INFO_DESC | CALLBACK_INFO_RETURNABLE_DESC)
+}
+
+/// Whether the callback's trailing injected argument is a
+/// `CallbackInfoReturnable`, the object a return-value injection needs.
+fn callback_takes_returnable(callback_descriptor: &str) -> bool {
+    descriptor_arguments(callback_descriptor)
+        .last()
+        .is_some_and(|arg| arg == CALLBACK_INFO_RETURNABLE_DESC)
 }
 
 fn is_callback_info_class(owner: &str) -> bool {
@@ -17331,7 +17545,7 @@ mandatory = true
     }
 
     #[test]
-    fn return_mixin_rejects_non_void_target_and_unsupported_anchor() {
+    fn return_mixin_requires_a_returnable_for_non_void_targets() {
         let target = ClassFile {
             name: "demo/Target".into(),
             super_name: "java/lang/Object".into(),
@@ -17385,12 +17599,243 @@ mandatory = true
         let error = jar
             .execute_mixin_at_return(&plan, None, &[], &mut NullHost)
             .unwrap_err();
-        assert!(error.to_string().contains("only void targets"));
+        assert!(error.to_string().contains("CallbackInfoReturnable"));
         plan.at = "INVOKE".into();
         let error = jar
             .execute_mixin_at_return(&plan, None, &[], &mut NullHost)
             .unwrap_err();
         assert!(error.to_string().contains("RETURN|TAIL"));
+    }
+
+    /// A non-void target returns 5; the callback's `setReturnValue` gets 3.
+    fn return_override_fixture(override_result: bool) -> (NativeJar, MixinInjectionPlan) {
+        let target = ClassFile {
+            name: "demo/Target".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "number".into(),
+                descriptor: "()I".into(),
+                access: 9,
+                code: Some(vec![0x08, 0xac]), // iconst_5; ireturn
+                max_locals: 0,
+                annotations: Vec::new(),
+            }],
+            annotations: Vec::new(),
+        };
+        let code = if override_result {
+            // aload_0; iconst_3; invokevirtual setReturnValue(Object); return
+            vec![0x2a, 0x06, 0xb6, 0x00, 0x06, 0xb1]
+        } else {
+            vec![0xb1]
+        };
+        let callback = ClassFile {
+            name: "demo/Mixin".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![
+                Cp::Empty,
+                Cp::Utf8(
+                    "org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable".into(),
+                ),
+                Cp::Class(1),
+                Cp::Utf8("setReturnValue".into()),
+                Cp::Utf8("(Ljava/lang/Object;)V".into()),
+                Cp::NameType {
+                    name: 3,
+                    descriptor: 4,
+                },
+                Cp::MethodRef { class: 2, nt: 5 },
+            ],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "onNumber".into(),
+                descriptor:
+                    "(Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable;)V"
+                        .into(),
+                access: 9,
+                code: Some(code),
+                max_locals: 1,
+                annotations: Vec::new(),
+            }],
+            annotations: Vec::new(),
+        };
+        let jar = NativeJar::from_classes([target, callback]);
+        let mut plan = MixinInjectionPlan::inject_at_return(
+            MethodRef {
+                owner: "demo/Target".into(),
+                name: "number".into(),
+                descriptor: "()I".into(),
+            },
+            MethodRef {
+                owner: "demo/Mixin".into(),
+                name: "onNumber".into(),
+                descriptor:
+                    "(Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable;)V"
+                        .into(),
+            },
+        );
+        // A cancellable return injection is accepted once the callback takes
+        // the returnable: `cancel()` there only keeps the override.
+        plan.cancellable = true;
+        (jar, plan)
+    }
+
+    #[test]
+    fn executes_bounded_mixin_injection_at_return_with_an_override() {
+        let (jar, plan) = return_override_fixture(true);
+        let report = jar
+            .execute_mixin_at_return(&plan, None, &[], &mut NullHost)
+            .unwrap();
+        assert_eq!(report.target_result, Value::Int(3));
+        assert!(report.return_value_overridden);
+        assert!(!report.cancelled, "cancel() cannot un-run the target");
+        assert_eq!(report.callback_result, Value::Void);
+    }
+
+    #[test]
+    fn executes_bounded_mixin_injection_at_return_without_an_override() {
+        let (jar, mut plan) = return_override_fixture(false);
+        plan.cancellable = false;
+        let report = jar
+            .execute_mixin_at_return(&plan, None, &[], &mut NullHost)
+            .unwrap();
+        assert_eq!(report.target_result, Value::Int(5));
+        assert!(!report.return_value_overridden);
+        assert!(!report.cancelled);
+    }
+
+    #[test]
+    fn return_injection_rejects_a_returnable_on_a_void_target() {
+        let target = ClassFile {
+            name: "demo/Target".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "run".into(),
+                descriptor: "()V".into(),
+                access: 9,
+                code: Some(vec![0xb1]),
+                max_locals: 0,
+                annotations: Vec::new(),
+            }],
+            annotations: Vec::new(),
+        };
+        let callback = ClassFile {
+            name: "demo/Mixin".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "after".into(),
+                descriptor:
+                    "(Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable;)V"
+                        .into(),
+                access: 9,
+                code: Some(vec![0xb1]),
+                max_locals: 1,
+                annotations: Vec::new(),
+            }],
+            annotations: Vec::new(),
+        };
+        let jar = NativeJar::from_classes([target, callback]);
+        let plan = MixinInjectionPlan::inject_at_return(
+            MethodRef {
+                owner: "demo/Target".into(),
+                name: "run".into(),
+                descriptor: "()V".into(),
+            },
+            MethodRef {
+                owner: "demo/Mixin".into(),
+                name: "after".into(),
+                descriptor:
+                    "(Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable;)V"
+                        .into(),
+            },
+        );
+        let error = jar
+            .execute_mixin_at_return(&plan, None, &[], &mut NullHost)
+            .unwrap_err();
+        assert!(
+            matches!(&error, NativeError::Metadata(message)
+                if message.contains("void target has no return value")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn callback_info_returnable_round_trips_and_is_bounded() {
+        let mut infos = CallbackInfos::new();
+        let marker = "mixin/callback-info/demo/Target#number";
+        let text = "mixin/callback-info/demo/Target#text";
+        let unknown = "mixin/callback-info/demo/Target#unknown";
+        assert!(infos.set_return(unknown, Value::Int(1)).is_err());
+        assert!(infos.set_actual(unknown, Value::Int(1)).is_err());
+        assert!(infos.current(unknown).is_err());
+        assert!(infos.take_override(unknown, "I").is_err());
+
+        infos.open(marker).unwrap();
+        infos.set_actual(marker, Value::Int(5)).unwrap();
+        assert_eq!(infos.current(marker).unwrap(), Value::Int(5));
+        assert_eq!(infos.take_override(marker, "I").unwrap(), None);
+
+        // javac boxes the primitive, so `setReturnValue` sees a reference that
+        // is unboxed against the target's declared descriptor.
+        infos
+            .set_return(marker, Value::Ref(Some("integer:7".into())))
+            .unwrap();
+        assert_eq!(
+            infos.current(marker).unwrap(),
+            Value::Ref(Some("integer:7".into())),
+            "getReturnValue reads the override once one exists"
+        );
+        assert_eq!(
+            infos.take_override(marker, "I").unwrap(),
+            Some(Value::Int(7))
+        );
+        // `Void` clears the override and `getReturnValue` falls back to the
+        // target's own result.
+        infos.set_return(marker, Value::Void).unwrap();
+        assert_eq!(infos.current(marker).unwrap(), Value::Int(5));
+        assert_eq!(infos.take_override(marker, "I").unwrap(), None);
+
+        infos.open(text).unwrap();
+        infos
+            .set_actual(text, Value::Ref(Some("actual".into())))
+            .unwrap();
+        infos
+            .set_return(text, Value::Ref(Some("override".into())))
+            .unwrap();
+        assert_eq!(
+            infos.take_override(text, "Ljava/lang/String;").unwrap(),
+            Some(Value::Ref(Some("override".into())))
+        );
+
+        // A reference cannot satisfy a primitive target, and a primitive
+        // cannot satisfy a reference target.
+        infos
+            .set_return(marker, Value::Ref(Some("not-a-number".into())))
+            .unwrap();
+        assert!(infos.take_override(marker, "I").is_err());
+        infos
+            .open("mixin/callback-info/demo/Target#primitive")
+            .unwrap();
+        infos
+            .set_return("mixin/callback-info/demo/Target#primitive", Value::Int(1))
+            .unwrap();
+        assert!(
+            infos
+                .take_override(
+                    "mixin/callback-info/demo/Target#primitive",
+                    "Ljava/lang/String;"
+                )
+                .is_err()
+        );
     }
 
     #[test]
