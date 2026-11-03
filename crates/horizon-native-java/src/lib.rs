@@ -71,9 +71,11 @@ pub enum AnnotationValue {
 ///
 /// The native path deliberately accepts only the common `@Inject(at = HEAD)`
 /// shape.  The callback is invoked before the target method, so the target
-/// keeps its normal return value.  `cancellable` is retained in the plan to
-/// make the unsupported contract explicit: cancellation requires a real
-/// `CallbackInfo` object and is left to the JVM fallback for now.
+/// keeps its normal return value.  A `cancellable` plan receives a
+/// runtime-owned `CallbackInfo`: `ci.cancel()` skips the remaining HEAD
+/// callbacks and the target body, and the target answers with the default value
+/// of its return descriptor.  Cancellable RETURN/TAIL plans and
+/// `CallbackInfoReturnable.setReturnValue` stay on the JVM fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixinInjectionPlan {
     pub target: MethodRef,
@@ -123,6 +125,70 @@ pub struct MixinExecutionReport {
     /// discovered-injection path records each callback in plan order so a
     /// caller can verify what ran without depending on host side effects.
     pub callback_results: Vec<Value>,
+    /// Whether a `CallbackInfo.cancel()` stopped this injection.
+    ///
+    /// A cancelled HEAD injection skips the callbacks after the one that
+    /// cancelled and the target body; `target_result` is then the default value
+    /// of the target's return descriptor, exactly as the woven method returns
+    /// without running its body.
+    pub cancelled: bool,
+}
+
+/// Runtime state for the `CallbackInfo` objects one native Mixin execution
+/// hands to its callbacks.
+///
+/// Mixin creates one `CallbackInfo` per injection point and passes that same
+/// object to every callback at the point, so the deterministic marker a
+/// callback receives is the object's identity and the flag is its cancelled
+/// state.  The table belongs to one execution - the object's whole lifetime -
+/// so a marker no execution opened is a diagnostic rather than a silent no-op,
+/// and the entry count is bounded by [`MAX_CALLBACK_INFOS`].
+#[derive(Debug, Default)]
+struct CallbackInfos {
+    cancelled: BTreeMap<String, bool>,
+}
+
+impl CallbackInfos {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Open the object for one injection point, keeping a flag an earlier
+    /// callback already set.
+    fn open(&mut self, marker: &str) -> Result<(), NativeError> {
+        if self.cancelled.contains_key(marker) {
+            return Ok(());
+        }
+        if self.cancelled.len() >= MAX_CALLBACK_INFOS {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin execution reached the bound of {MAX_CALLBACK_INFOS} CallbackInfo objects"
+            )));
+        }
+        self.cancelled.insert(marker.to_owned(), false);
+        Ok(())
+    }
+
+    /// Read the flag of exactly `marker`, or report that this execution does not
+    /// own such an object.
+    fn flag(&self, marker: &str) -> Result<bool, NativeError> {
+        self.cancelled.get(marker).copied().ok_or_else(|| {
+            NativeError::Metadata(format!(
+                "native Mixin CallbackInfo {marker} is not owned by this execution"
+            ))
+        })
+    }
+
+    /// Set the flag of exactly `marker`; an unknown marker is a bounded
+    /// diagnostic, never a panic.
+    fn cancel(&mut self, marker: &str) -> Result<(), NativeError> {
+        let cancelled = self.cancelled.get_mut(marker).ok_or_else(|| {
+            NativeError::Metadata(format!(
+                "native Mixin CallbackInfo {marker} is not owned by this execution"
+            ))
+        })?;
+        *cancelled = true;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -343,6 +409,19 @@ const MAX_PROPERTY_BUILDERS: usize = 512;
 /// Settings kept per builder. Builders in the wild set a handful; past this
 /// the extras are dropped rather than growing host state.
 const MAX_BUILDER_PROPERTIES: usize = 16;
+/// Mixin's callback-info classes. `cancel()`/`isCancelled()` resolve against
+/// the runtime's own table, never a host capability, so the interpreter names
+/// them here.
+const CALLBACK_INFO_CLASS: &str = "org/spongepowered/asm/mixin/injection/callback/CallbackInfo";
+const CALLBACK_INFO_RETURNABLE_CLASS: &str =
+    "org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable";
+const CALLBACK_INFO_DESC: &str = "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;";
+const CALLBACK_INFO_RETURNABLE_DESC: &str =
+    "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable;";
+/// `CallbackInfo` objects one native Mixin execution may own.  Mixin creates
+/// one per injection point, so only a jar with an unbounded number of them
+/// reaches this bound.
+const MAX_CALLBACK_INFOS: usize = 64;
 
 /// Deterministic, game-independent mappings for the small standard-library
 /// surface commonly reached during mod bootstrap.
@@ -6516,6 +6595,11 @@ impl NativeJar {
     /// descriptor that disagrees with the request are skipped; a descriptor-
     /// less plan matches any overload.  The result keeps discovery order and
     /// lists HEAD plans before RETURN/TAIL plans.
+    ///
+    /// A `cancellable` HEAD plan is accepted: the native `CallbackInfo` owns the
+    /// flag and the execution stops the target body when it is set.  Cancellable
+    /// RETURN/TAIL plans are rejected, because a return-value contract needs
+    /// `CallbackInfoReturnable.setReturnValue`, which stays on the JVM fallback.
     fn discovered_mixin_plans(
         &self,
         target: &MethodRef,
@@ -6529,20 +6613,23 @@ impl NativeJar {
             if !plan.target.descriptor.is_empty() && plan.target.descriptor != target.descriptor {
                 continue;
             }
-            if plan.cancellable {
-                return Err(NativeError::Metadata(format!(
-                    "native Mixin callback {}#{}{} on {}#{} is cancellable; cancellation stays on the JVM fallback",
-                    plan.callback.owner,
-                    plan.callback.name,
-                    plan.callback.descriptor,
-                    target.owner,
-                    target.name
-                )));
-            }
             plan.target.descriptor = target.descriptor.clone();
             match plan.at.as_str() {
                 "HEAD" => before.push(plan),
-                "RETURN" | "TAIL" => after.push(plan),
+                "RETURN" | "TAIL" => {
+                    if plan.cancellable {
+                        return Err(NativeError::Metadata(format!(
+                            "native Mixin callback {}#{}{} on {}#{} is cancellable at {}; native cancellation supports only @Inject(at = HEAD), so return-value callbacks stay on the JVM fallback",
+                            plan.callback.owner,
+                            plan.callback.name,
+                            plan.callback.descriptor,
+                            target.owner,
+                            target.name,
+                            plan.at
+                        )));
+                    }
+                    after.push(plan);
+                }
                 other => {
                     return Err(NativeError::Metadata(format!(
                         "native Mixin callback {}#{}{} uses unsupported anchor {other}; native execution supports HEAD, RETURN and TAIL",
@@ -6792,6 +6879,7 @@ impl NativeJar {
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            callback_infos: &mut CallbackInfos::new(),
         };
         if !runtime.classes.contains_key(&class_name) {
             return Err(NativeError::MissingMethod(format!("class {class}")));
@@ -6850,6 +6938,32 @@ impl NativeJar {
         args: &[Value],
         host: &mut H,
     ) -> Result<Value, NativeError> {
+        // A standalone call owns its callback-info table: nothing outside a
+        // translated injection can cancel it.
+        self.invoke_with_callback_infos(
+            class,
+            method,
+            descriptor,
+            receiver,
+            args,
+            host,
+            &mut CallbackInfos::new(),
+        )
+    }
+
+    /// Invoke one jar method with the `CallbackInfo` objects of the execution
+    /// that owns it, so `ci.cancel()` inside a Mixin callback is visible to the
+    /// caller once the call returns.
+    fn invoke_with_callback_infos<H: Host>(
+        &self,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+        callback_infos: &mut CallbackInfos,
+    ) -> Result<Value, NativeError> {
         let class_name = class.replace('.', "/");
         let mut runtime = Runtime {
             classes: &self.classes,
@@ -6863,6 +6977,7 @@ impl NativeJar {
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            callback_infos,
         };
         runtime.invoke(&class_name, method, descriptor, receiver, args)
     }
@@ -6871,11 +6986,10 @@ impl NativeJar {
     ///
     /// The supported shape is the common callback form: a `void` callback
     /// method runs before the target method, with the target's arguments and,
-    /// when present, a trailing `CallbackInfo` marker.  The marker is a
-    /// deterministic value owned by this runtime; it does not expose a Java
-    /// object graph or cancellation state.  Cancellable injections therefore
-    /// stay on the JVM fallback until a native callback-info implementation is
-    /// available.
+    /// when present, a trailing `CallbackInfo` marker.  The marker names a
+    /// runtime-owned object: a `cancellable` plan whose callback calls
+    /// `ci.cancel()` skips the target body and reports the default value of the
+    /// target's return descriptor.
     pub fn execute_mixin_at_head<H: Host>(
         &self,
         plan: &MixinInjectionPlan,
@@ -6888,11 +7002,6 @@ impl NativeJar {
                 "native Mixin translation supports only @Inject(at = HEAD), got {}",
                 plan.at
             )));
-        }
-        if plan.cancellable {
-            return Err(NativeError::Metadata(
-                "native @Inject(at = HEAD) does not support cancellable callbacks".into(),
-            ));
         }
 
         let target_class = self.classes.get(&plan.target.owner).ok_or_else(|| {
@@ -6953,10 +7062,7 @@ impl NativeJar {
                 .is_some_and(|arg| is_callback_info_descriptor(arg))
             && callback_args[..target_args.len()] == target_args[..]
         {
-            callback_values.push(Value::Ref(Some(format!(
-                "mixin/callback-info/{}#{}",
-                plan.target.owner, plan.target.name
-            ))));
+            callback_values.push(Value::Ref(Some(callback_info_marker(&plan.target))));
         } else {
             return Err(NativeError::Metadata(format!(
                 "native Mixin callback {}#{}{} must mirror target arguments and may add one trailing CallbackInfo",
@@ -6964,44 +7070,62 @@ impl NativeJar {
             )));
         }
 
+        let marker = callback_info_marker(&plan.target);
+        let mut callback_infos = CallbackInfos::new();
+        callback_infos.open(&marker)?;
         let callback_receiver = (!callback_method.is_static()).then(|| {
             receiver
                 .clone()
                 .unwrap_or_else(|| Value::Ref(Some(plan.callback.owner.clone())))
         });
-        let callback_result = self.invoke_method_with_args(
+        let callback_result = self.invoke_with_callback_infos(
             &plan.callback.owner,
             &plan.callback.name,
             &plan.callback.descriptor,
             callback_receiver,
             &callback_values,
             host,
+            &mut callback_infos,
         )?;
-        let target_receiver = (!target_method.is_static()).then(|| {
-            receiver
-                .clone()
-                .unwrap_or_else(|| Value::Ref(Some(plan.target.owner.clone())))
-        });
-        let target_result = self.invoke_method_with_args(
-            &plan.target.owner,
-            &plan.target.name,
-            &plan.target.descriptor,
-            target_receiver,
-            args,
-            host,
-        )?;
+        let cancelled = plan.cancellable && callback_infos.flag(&marker)?;
+        let target_result = if cancelled {
+            // A cancelled HEAD injection never reaches the target body; the
+            // woven method returns the descriptor's default instead.
+            Value::default_for(&plan.target.descriptor)
+        } else {
+            let target_receiver = (!target_method.is_static()).then(|| {
+                receiver
+                    .clone()
+                    .unwrap_or_else(|| Value::Ref(Some(plan.target.owner.clone())))
+            });
+            self.invoke_with_callback_infos(
+                &plan.target.owner,
+                &plan.target.name,
+                &plan.target.descriptor,
+                target_receiver,
+                args,
+                host,
+                &mut callback_infos,
+            )?
+        };
         Ok(MixinExecutionReport {
             callback_result: callback_result.clone(),
             target_result,
             callback_results: vec![callback_result],
+            cancelled,
         })
     }
 
     /// Execute an ordered chain of compatible void-only injectors while invoking
     /// the target body exactly once. Plans must share the same target and anchor.
     /// This is the bounded dispatch table used when multiple mixins attach to one
-    /// native hook; cancellation, return-value callbacks, and mixed anchors stay
-    /// on the JVM fallback.
+    /// native hook.
+    ///
+    /// A `cancellable` HEAD plan stops the chain where it is: the callbacks
+    /// after it do not run, the target body is skipped, and the report carries
+    /// the default value of the target's return descriptor. Cancellable
+    /// RETURN/TAIL plans, return-value callbacks, and mixed anchors stay on the
+    /// JVM fallback.
     pub fn execute_mixin_chain<H: Host>(
         &self,
         plans: &[MixinInjectionPlan],
@@ -7014,10 +7138,15 @@ impl NativeJar {
         };
         if plans
             .iter()
-            .any(|plan| plan.target != first.target || plan.at != first.at || plan.cancellable)
+            .any(|plan| plan.target != first.target || plan.at != first.at)
         {
             return Err(NativeError::Metadata(
-                "native Mixin chain requires one target, one anchor, and non-cancellable callbacks"
+                "native Mixin chain requires one target and one anchor".into(),
+            ));
+        }
+        if first.at != "HEAD" && plans.iter().any(|plan| plan.cancellable) {
+            return Err(NativeError::Metadata(
+                "native Mixin chains support cancellation only at @Inject(at = HEAD); RETURN/TAIL callbacks stay on the JVM fallback"
                     .into(),
             ));
         }
@@ -7061,6 +7190,8 @@ impl NativeJar {
                 .clone()
                 .unwrap_or_else(|| Value::Ref(Some(first.target.owner.clone())))
         });
+        let mut callback_infos = CallbackInfos::new();
+        let mut cancelled = false;
         let mut callback_results = Vec::with_capacity(plans.len());
         let target_result = if first.at == "HEAD" {
             for plan in plans {
@@ -7069,24 +7200,37 @@ impl NativeJar {
                     receiver.clone(),
                     args,
                     host,
+                    &mut callback_infos,
                 )?);
+                // A cancel() in one callback stops the ones after it and the
+                // target body, exactly like a woven HEAD injection.
+                if plan.cancellable && callback_infos.flag(&callback_info_marker(&first.target))? {
+                    cancelled = true;
+                    break;
+                }
             }
-            self.invoke_method_with_args(
-                &first.target.owner,
-                &first.target.name,
-                &first.target.descriptor,
-                target_receiver,
-                args,
-                host,
-            )?
+            if cancelled {
+                Value::default_for(&first.target.descriptor)
+            } else {
+                self.invoke_with_callback_infos(
+                    &first.target.owner,
+                    &first.target.name,
+                    &first.target.descriptor,
+                    target_receiver,
+                    args,
+                    host,
+                    &mut callback_infos,
+                )?
+            }
         } else {
-            let result = self.invoke_method_with_args(
+            let result = self.invoke_with_callback_infos(
                 &first.target.owner,
                 &first.target.name,
                 &first.target.descriptor,
                 target_receiver,
                 args,
                 host,
+                &mut callback_infos,
             )?;
             for plan in plans {
                 callback_results.push(self.invoke_mixin_callback(
@@ -7094,6 +7238,7 @@ impl NativeJar {
                     receiver.clone(),
                     args,
                     host,
+                    &mut callback_infos,
                 )?);
             }
             result
@@ -7102,6 +7247,7 @@ impl NativeJar {
             callback_result: callback_results.last().cloned().unwrap_or(Value::Void),
             target_result,
             callback_results,
+            cancelled,
         })
     }
 
@@ -7158,10 +7304,7 @@ impl NativeJar {
                     .is_some_and(|arg| is_callback_info_descriptor(arg))
                 && callback_args[..target_args.len()] == target_args[..]
             {
-                callback_values.push(Value::Ref(Some(format!(
-                    "mixin/callback-info/{}#{}",
-                    plan.target.owner, plan.target.name
-                ))));
+                callback_values.push(Value::Ref(Some(callback_info_marker(&plan.target))));
             } else {
                 return Err(NativeError::Metadata(format!(
                     "native Mixin callback {}#{}{} must mirror target arguments and may add one trailing CallbackInfo",
@@ -7178,28 +7321,35 @@ impl NativeJar {
         receiver: Option<Value>,
         args: &[Value],
         host: &mut H,
+        callback_infos: &mut CallbackInfos,
     ) -> Result<Value, NativeError> {
         let (is_static, callback_values) = self.check_mixin_callback(plan, args)?;
+        // Open the object even when this callback does not declare it: every
+        // callback of one injection point sees the same Mixin instance, so a
+        // `cancel()` here is the one an earlier or later callback observes.
+        callback_infos.open(&callback_info_marker(&plan.target))?;
         let callback_receiver = (!is_static)
             .then(|| receiver.unwrap_or_else(|| Value::Ref(Some(plan.callback.owner.clone()))));
-        self.invoke_method_with_args(
+        self.invoke_with_callback_infos(
             &plan.callback.owner,
             &plan.callback.name,
             &plan.callback.descriptor,
             callback_receiver,
             &callback_values,
             host,
+            callback_infos,
         )
     }
 
     /// Execute the bounded void-only form of `@Inject(at = RETURN|TAIL)`.
     ///
-    /// Return-value callbacks need a `CallbackInfoReturnable` object and a
-    /// replacement-value contract.  Rather than inventing either, the native
-    /// path accepts only void targets and invokes a void callback after the
-    /// target, optionally supplying the same deterministic `CallbackInfo`
-    /// marker used by the HEAD path.  Non-void targets stay on the JVM
-    /// fallback with an explicit diagnostic.
+    /// Return-value callbacks need a `CallbackInfoReturnable` object with a
+    /// replacement value.  Rather than inventing that contract, the native path
+    /// accepts only void targets and invokes a void callback after the target,
+    /// optionally supplying the runtime-owned `CallbackInfo` marker the HEAD
+    /// path uses; a `cancel()` there is a no-op, because the body already ran.
+    /// `setReturnValue` and non-void targets stay on the JVM fallback with an
+    /// explicit diagnostic.
     pub fn execute_mixin_at_return<H: Host>(
         &self,
         plan: &MixinInjectionPlan,
@@ -7280,10 +7430,7 @@ impl NativeJar {
                     .is_some_and(|arg| is_callback_info_descriptor(arg))
                 && callback_args[..target_args.len()] == target_args[..]
             {
-                callback_values.push(Value::Ref(Some(format!(
-                    "mixin/callback-info/{}#{}",
-                    plan.target.owner, plan.target.name
-                ))));
+                callback_values.push(Value::Ref(Some(callback_info_marker(&plan.target))));
             } else {
                 return Err(NativeError::Metadata(format!(
                     "native Mixin callback {}#{}{} must mirror target arguments and may add one trailing CallbackInfo",
@@ -7292,36 +7439,44 @@ impl NativeJar {
             }
         }
 
+        // The object is opened so a `cancel()` here is a bounded no-op instead
+        // of a diagnostic: this plan is not cancellable, and the target body has
+        // already run by the time the callback executes.
+        let mut callback_infos = CallbackInfos::new();
+        callback_infos.open(&callback_info_marker(&plan.target))?;
         let target_receiver = (!target_method.is_static()).then(|| {
             receiver
                 .clone()
                 .unwrap_or_else(|| Value::Ref(Some(plan.target.owner.clone())))
         });
-        let target_result = self.invoke_method_with_args(
+        let target_result = self.invoke_with_callback_infos(
             &plan.target.owner,
             &plan.target.name,
             &plan.target.descriptor,
             target_receiver,
             args,
             host,
+            &mut callback_infos,
         )?;
         let callback_receiver = (!callback_method.is_static()).then(|| {
             receiver
                 .clone()
                 .unwrap_or_else(|| Value::Ref(Some(plan.callback.owner.clone())))
         });
-        let callback_result = self.invoke_method_with_args(
+        let callback_result = self.invoke_with_callback_infos(
             &plan.callback.owner,
             &plan.callback.name,
             &plan.callback.descriptor,
             callback_receiver,
             &callback_values,
             host,
+            &mut callback_infos,
         )?;
         Ok(MixinExecutionReport {
             callback_result: callback_result.clone(),
             target_result,
             callback_results: vec![callback_result],
+            cancelled: false,
         })
     }
 
@@ -7330,10 +7485,15 @@ impl NativeJar {
     ///
     /// HEAD plans run in discovery order before the target body; RETURN/TAIL
     /// plans run after it.  The target is invoked exactly once and receives the
-    /// caller's arguments unchanged.  Cancellable injections, unsupported
-    /// anchors, and targets that mix HEAD with RETURN/TAIL are rejected with a
-    /// bounded `NativeError::Metadata`; they stay on the JVM fallback rather
-    /// than approximating cancellation or two anchor families at once.
+    /// caller's arguments unchanged.  A `cancellable` HEAD callback that calls
+    /// `ci.cancel()` stops the callbacks after it and skips the target body, so
+    /// `target_result` becomes the default value of the target's return
+    /// descriptor and `cancelled` is set.
+    ///
+    /// Unsupported anchors, cancellable RETURN/TAIL plans, and targets that mix
+    /// HEAD with RETURN/TAIL are rejected with a bounded
+    /// `NativeError::Metadata`; they stay on the JVM fallback rather than
+    /// approximating a return-value contract or two anchor families at once.
     pub fn execute_discovered_mixins<H: Host>(
         &self,
         target: &MethodRef,
@@ -7377,6 +7537,8 @@ impl NativeJar {
         for plan in &plans {
             self.check_mixin_callback(plan, args)?;
         }
+        let mut callback_infos = CallbackInfos::new();
+        let mut cancelled = false;
         let mut callback_results = Vec::with_capacity(plans.len());
         for plan in &plans[..head_count] {
             callback_results.push(self.invoke_mixin_callback(
@@ -7384,33 +7546,48 @@ impl NativeJar {
                 receiver.clone(),
                 args,
                 host,
+                &mut callback_infos,
             )?);
+            // A cancelling callback ends the HEAD chain and skips the target
+            // body; the callbacks after it never run.
+            if plan.cancellable && callback_infos.flag(&callback_info_marker(target))? {
+                cancelled = true;
+                break;
+            }
         }
-        let target_receiver = (!target_method.is_static()).then(|| {
-            receiver
-                .clone()
-                .unwrap_or_else(|| Value::Ref(Some(target.owner.clone())))
-        });
-        let target_result = self.invoke_method_with_args(
-            &target.owner,
-            &target.name,
-            &target.descriptor,
-            target_receiver,
-            args,
-            host,
-        )?;
-        for plan in &plans[head_count..] {
-            callback_results.push(self.invoke_mixin_callback(
-                plan,
-                receiver.clone(),
+        let target_result = if cancelled {
+            Value::default_for(&target.descriptor)
+        } else {
+            let target_receiver = (!target_method.is_static()).then(|| {
+                receiver
+                    .clone()
+                    .unwrap_or_else(|| Value::Ref(Some(target.owner.clone())))
+            });
+            let result = self.invoke_with_callback_infos(
+                &target.owner,
+                &target.name,
+                &target.descriptor,
+                target_receiver,
                 args,
                 host,
-            )?);
-        }
+                &mut callback_infos,
+            )?;
+            for plan in &plans[head_count..] {
+                callback_results.push(self.invoke_mixin_callback(
+                    plan,
+                    receiver.clone(),
+                    args,
+                    host,
+                    &mut callback_infos,
+                )?);
+            }
+            result
+        };
         Ok(MixinExecutionReport {
             callback_result: callback_results.last().cloned().unwrap_or(Value::Void),
             target_result,
             callback_results,
+            cancelled,
         })
     }
 
@@ -7419,7 +7596,8 @@ impl NativeJar {
     /// The census emits this plan only when one native hook names the target
     /// method and the overwrite has no call-site anchor. The replacement body
     /// must have the exact target descriptor; arbitrary bytecode rewriting,
-    /// multiple competing overwrites, and cancellation remain JVM fallback.
+    /// multiple competing overwrites, and a cancellable overwrite remain JVM
+    /// fallback.
     pub fn execute_mixin_overwrite<H: Host>(
         &self,
         plan: &MixinInjectionPlan,
@@ -7507,6 +7685,7 @@ impl NativeJar {
             callback_result: replacement.clone(),
             target_result: replacement.clone(),
             callback_results: vec![replacement],
+            cancelled: false,
         })
     }
 
@@ -7705,6 +7884,10 @@ struct Runtime<'a, H> {
     next_object: usize,
     streams: BTreeMap<String, Vec<Value>>,
     next_stream: usize,
+    /// The `CallbackInfo` objects this execution owns.  `cancel()` on a marker
+    /// this table does not hold is a diagnostic, so a callback can only flag the
+    /// object a plan actually handed it.
+    callback_infos: &'a mut CallbackInfos,
 }
 impl<H: Host> Runtime<'_, H> {
     fn static_field_key(field: &MethodRef) -> String {
@@ -7731,6 +7914,37 @@ impl<H: Host> Runtime<'_, H> {
             self.invoke(class, "<clinit>", "()V", None, &[])?;
         }
         Ok(())
+    }
+
+    /// Answer the bounded `CallbackInfo` surface for the object this execution
+    /// owns.
+    ///
+    /// Mixin's callback info is runtime state, not a host capability: the
+    /// interpreter keeps one flag per injection point, so `cancel()` and
+    /// `isCancelled()` act on exactly the object the plan handed the callback.
+    /// Every other member falls through to the host path unchanged.
+    fn invoke_callback_info(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+    ) -> Result<Option<Value>, NativeError> {
+        if !is_callback_info_class(&r.owner) {
+            return Ok(None);
+        }
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("cancel", "()V") => {
+                self.callback_infos
+                    .cancel(callback_info_receiver(receiver)?)?;
+                Ok(Some(Value::Void))
+            }
+            ("isCancelled", "()Z") => {
+                let cancelled = self
+                    .callback_infos
+                    .flag(callback_info_receiver(receiver)?)?;
+                Ok(Some(Value::Int(i32::from(cancelled))))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Resolve a captured invokedynamic marker when its target is in this
@@ -8932,6 +9146,8 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_reflect_method(&r, receiver.as_ref(), &args)?
                     {
                         value
+                    } else if let Some(value) = self.invoke_callback_info(&r, receiver.as_ref())? {
+                        value
                     } else if r.owner == "java/lang/Class"
                         && r.name == "forName"
                         && r.descriptor.ends_with(")Ljava/lang/Class;")
@@ -9155,11 +9371,34 @@ fn descriptor_arguments(desc: &str) -> Vec<String> {
 }
 
 fn is_callback_info_descriptor(desc: &str) -> bool {
-    matches!(
-        desc,
-        "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;"
-            | "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable;"
-    )
+    matches!(desc, CALLBACK_INFO_DESC | CALLBACK_INFO_RETURNABLE_DESC)
+}
+
+fn is_callback_info_class(owner: &str) -> bool {
+    matches!(owner, CALLBACK_INFO_CLASS | CALLBACK_INFO_RETURNABLE_CLASS)
+}
+
+/// The marker naming the `CallbackInfo` one injection point hands to its
+/// callbacks.
+///
+/// Mixin creates one of these per injection point, so every callback on a
+/// target shares this identity: a `cancel()` in an earlier callback is visible
+/// to a later one and stops the target body.
+fn callback_info_marker(target: &MethodRef) -> String {
+    format!("mixin/callback-info/{}#{}", target.owner, target.name)
+}
+
+/// The marker a `CallbackInfo` call acts on: the receiver value the plan passed
+/// as its trailing argument.
+fn callback_info_receiver(receiver: Option<&Value>) -> Result<&str, NativeError> {
+    receiver
+        .and_then(expect_ref)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            NativeError::Metadata(
+                "native Mixin CallbackInfo call has no runtime-owned marker receiver".into(),
+            )
+        })
 }
 
 fn neutral_args(desc: &str) -> Vec<Value> {
@@ -9916,6 +10155,7 @@ mod tests {
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            callback_infos: &mut CallbackInfos::new(),
         };
         let method = MethodRef {
             owner: "java/lang/String".into(),
@@ -9949,6 +10189,7 @@ mod tests {
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            callback_infos: &mut CallbackInfos::new(),
         };
         let method = MethodRef {
             owner: "java/lang/String".into(),
@@ -14850,6 +15091,7 @@ mandatory = true
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            callback_infos: &mut CallbackInfos::new(),
         };
         let first = runtime.new_object("demo/Fields");
         let second = runtime.new_object("demo/Fields");
@@ -14983,6 +15225,7 @@ mandatory = true
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            callback_infos: &mut CallbackInfos::new(),
         };
         let new_instance = MethodRef {
             owner: "java/lang/reflect/Array".into(),
@@ -15174,6 +15417,7 @@ mandatory = true
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            callback_infos: &mut CallbackInfos::new(),
         };
         let stream = runtime
             .invoke_stream(
@@ -15466,6 +15710,7 @@ mandatory = true
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            callback_infos: &mut CallbackInfos::new(),
         };
         let lookup = MethodRef {
             owner: "java/lang/Class".into(),
@@ -15681,6 +15926,7 @@ mandatory = true
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            callback_infos: &mut CallbackInfos::new(),
         };
         let class = Value::Ref(Some("demo/ReflectiveFields".into()));
         let declared_fields = runtime
@@ -17589,6 +17835,111 @@ mandatory = true
             .unwrap_err();
         assert!(
             matches!(&error, NativeError::MissingMethod(message) if message == "demo/Missing#gone()V"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Run the discovered plan for one `demo/Target` method that takes no
+    /// arguments, so each rejection case stays one call.
+    fn run_discovered(
+        jar: &NativeJar,
+        name: &str,
+        host: &mut MarkerHost,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        jar.execute_discovered_mixins(
+            &MethodRef {
+                owner: "demo/Target".into(),
+                name: name.into(),
+                descriptor: "()V".into(),
+            },
+            None,
+            &[],
+            host,
+        )
+    }
+
+    #[test]
+    fn callback_info_cancel_requires_an_owned_marker() {
+        let mut infos = CallbackInfos::new();
+        let marker = "mixin/callback-info/demo/Target#run";
+        let error = infos.cancel(marker).unwrap_err();
+        assert!(
+            matches!(&error, NativeError::Metadata(message)
+                if message.contains("is not owned by this execution") && message.len() < 200),
+            "unexpected error: {error}"
+        );
+        assert!(
+            infos.flag(marker).is_err(),
+            "isCancelled needs the object too"
+        );
+
+        infos.open(marker).unwrap();
+        assert!(!infos.flag(marker).unwrap());
+        infos.cancel(marker).unwrap();
+        assert!(infos.flag(marker).unwrap(), "cancel() round-trips");
+        // Opening the object again keeps the flag an earlier callback set.
+        infos.open(marker).unwrap();
+        assert!(infos.flag(marker).unwrap());
+
+        // The table is bounded: one object per injection point, and a jar past
+        // the bound gets a diagnostic instead of growing the runtime.
+        let mut bounded = CallbackInfos::new();
+        for index in 0..MAX_CALLBACK_INFOS {
+            bounded
+                .open(&format!("mixin/callback-info/demo/Target#{index}"))
+                .unwrap();
+        }
+        assert!(
+            bounded
+                .open("mixin/callback-info/demo/Target#overflow")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn discovered_mixins_reject_cancellable_return_and_mixed_anchor_plans() {
+        let mixed = NativeJar::from_classes([
+            target_class(),
+            marker_mixin(
+                "demo/HeadMixin",
+                "run()V",
+                "HEAD",
+                false,
+                "before",
+                "before",
+            ),
+            marker_mixin(
+                "demo/ReturnMixin",
+                "run()V",
+                "RETURN",
+                false,
+                "after",
+                "after",
+            ),
+        ]);
+        let error = run_discovered(&mixed, "run", &mut MarkerHost::default()).unwrap_err();
+        assert!(
+            matches!(&error, NativeError::Metadata(message)
+                if message.contains("mixes HEAD with RETURN/TAIL")),
+            "unexpected error: {error}"
+        );
+
+        let cancellable_return = NativeJar::from_classes([
+            target_class(),
+            marker_mixin(
+                "demo/AfterMixin",
+                "run()V",
+                "RETURN",
+                true,
+                "after",
+                "after",
+            ),
+        ]);
+        let error =
+            run_discovered(&cancellable_return, "run", &mut MarkerHost::default()).unwrap_err();
+        assert!(
+            matches!(&error, NativeError::Metadata(message)
+                if message.contains("cancellable at RETURN")),
             "unexpected error: {error}"
         );
     }

@@ -329,7 +329,7 @@ fn executes_discovered_return_callback_after_the_target() {
 }
 
 #[test]
-fn rejects_mixed_anchor_and_cancellable_discovered_mixins() {
+fn rejects_mixed_anchor_discovered_mixins() {
     let (root, jar_path) = build_jar(
         "execution-rejected",
         fixture_sources(),
@@ -352,19 +352,19 @@ fn rejects_mixed_anchor_and_cancellable_discovered_mixins() {
         "unexpected error: {error}"
     );
 
-    let error = jar
+    // A cancellable HEAD plan is accepted; this callback never calls
+    // `CallbackInfo.cancel()`, so the target still runs once.
+    let mut host = StdHost::new();
+    let report = jar
         .execute_discovered_mixins(
             &target("cancelMe", "(I)V"),
             None,
             &[Value::Int(1)],
-            &mut StdHost::new(),
+            &mut host,
         )
-        .unwrap_err();
-    assert!(
-        matches!(&error, NativeError::Metadata(message)
-            if message.contains("cancellable") && message.len() < 200),
-        "unexpected error: {error}"
-    );
+        .unwrap();
+    assert!(!report.cancelled);
+    assert_eq!(mark_order(&host), vec!["cancel", "cancel-target"]);
 
     let _ = fs::remove_dir_all(root);
 }
