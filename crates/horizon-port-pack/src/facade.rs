@@ -113,6 +113,21 @@ pub fn generate_many(
     let uses_fabric_networking = uses_server_networking
         || uses_client_networking
         || names_fabric("net/fabricmc/fabric/api/networking/v1/PacketSender");
+    // Fabric's data-attachment registry and NeoForge's attachment type are
+    // library classes too. They are emitted only when the real API class is
+    // absent, and they retain what a mod registers (id, codec/initializer
+    // markers, flags) instead of attaching anything to a live target.
+    let uses_fabric_attachments =
+        names_fabric("net/fabricmc/fabric/api/attachment/v1/AttachmentRegistry")
+            || names_fabric("net/fabricmc/fabric/api/attachment/v1/AttachmentType")
+            || names_fabric("net/fabricmc/fabric/api/attachment/v1/AttachmentTarget");
+    let uses_neoforge_attachments = uses_neoforge
+        && target.iter().any(|class| {
+            class
+                .refs
+                .iter()
+                .any(|r| r.split('$').next() == Some(NEOFORGE_ATTACHMENT_TYPE))
+        });
     // `ClientPlayNetworking.Context#player()` names the client player type. It
     // is a client-only game class (26.3 still calls it `LocalPlayer`), so a
     // server-shaped jar leaves it unresolved and the client shim is reported
@@ -360,6 +375,22 @@ pub fn generate_many(
             wanted.insert(name.clone());
         }
     }
+    // The attachment shims name the id and the codec a registration carries.
+    // Resolve them from the game jar and the dependency jars (26.3 calls the id
+    // `Identifier`; a jar built against `ResourceLocation` still names it) and
+    // seed the game class, so the shim compiles against the real type. A role
+    // that resolves nowhere stays unresolved and the shim is reported below,
+    // never emitted with an invented type.
+    let attachment_types = if uses_fabric_attachments || uses_neoforge_attachments {
+        resolve_attachment_types(&game, &lib_names, &own, &mut wanted)
+    } else {
+        BTreeMap::new()
+    };
+    // `AttachmentTarget` names `AttachmentType`, whose id accessor is the
+    // resolved game type: without that role neither shim can compile, so the
+    // interface is also not added to a game stub.
+    let fabric_attachment_target =
+        uses_fabric_attachments && attachment_types.contains_key("identifier");
     let mut used: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
     for class in &target {
         for m in &class.members {
@@ -451,6 +482,23 @@ pub fn generate_many(
                     interface: mixin.name.clone(),
                     methods: methods.clone(),
                 });
+        }
+    }
+    // Fabric's game classes carry the attachment store through its Mixin. The
+    // façade has no weaver, so the game types a mod names implement that
+    // interface directly (the same path an accessor Mixin takes): the stub
+    // inherits its default methods and `((AttachmentTarget) entity)` links.
+    if fabric_attachment_target {
+        for target_name in FABRIC_ATTACHMENT_TARGETS {
+            if wanted.contains(*target_name) {
+                mixin_impls
+                    .entry((*target_name).to_owned())
+                    .or_default()
+                    .push(MixinImpl {
+                        interface: FABRIC_ATTACHMENT_TARGET.to_owned(),
+                        methods: Vec::new(),
+                    });
+            }
         }
     }
     // Bounded entity values that the generated bodies construct have to exist
@@ -568,12 +616,20 @@ pub fn generate_many(
         ..Report::default()
     };
     let mut files = Vec::new();
+    // `render` gates an implemented interface on `available`. The attachment
+    // interface is written as a shim below, so it is on this compilation's
+    // classpath even when the real Fabric API jar is absent; the emission
+    // guards keep reading the real `available` set.
+    let mut compiling = available.clone();
+    if fabric_attachment_target {
+        compiling.insert(FABRIC_ATTACHMENT_TARGET.to_owned());
+    }
     for root in &top {
         let source = tree(
             root,
             true,
             &game,
-            &available,
+            &compiling,
             &used,
             &nested,
             &mixin_impls,
@@ -796,7 +852,7 @@ pub fn generate_many(
         available: &available,
         types: &client,
     };
-    let fill_client = |template: &str| fill_client_types(template, &client);
+    let fill_client = |template: &str| fill_types(template, &client);
     if uses_fabric_client {
         let key_binding = "net/fabricmc/fabric/api/client/keybinding/v1/KeyBindingHelper";
         client_shims.emit(
@@ -918,6 +974,57 @@ pub fn generate_many(
             client_shims.emit(&mut files, &mut report, class, roles, || {
                 fill_client(template)
             })?;
+        }
+    }
+    // Fabric's data-attachment API: one registration per attachment id, kept in
+    // a deterministic map with its codec and initializer markers plus the
+    // persistent and copy-on-death flags. `AttachmentType#id()` answers the
+    // identifier it was registered under, and `AttachmentTarget` keeps attached
+    // values per target in the interface's bounded store. Nothing is serialized
+    // or moved to a live target here.
+    if uses_fabric_attachments {
+        // Every row names the id role: `AttachmentTarget` inherits the
+        // `AttachmentType` interface, so it needs the same resolved id type
+        // even though its own methods only name that interface.
+        let attachment_type = "net/fabricmc/fabric/api/attachment/v1/AttachmentType";
+        let registry = "net/fabricmc/fabric/api/attachment/v1/AttachmentRegistry";
+        for (class, requires, template) in [
+            (attachment_type, &["identifier"][..], FABRIC_ATTACHMENT_TYPE),
+            (
+                FABRIC_ATTACHMENT_TARGET,
+                &["identifier"][..],
+                FABRIC_ATTACHMENT_TARGET_SOURCE,
+            ),
+        ] {
+            emit_role_shim(
+                &mut files,
+                &mut report,
+                &src,
+                &available,
+                &attachment_types,
+                class,
+                requires,
+                || fill_types(template, &attachment_types),
+            )?;
+        }
+        // `buildAndRegister` answers the `AttachmentType` this slice emits: a
+        // real type with members the shim does not model would mix two shapes,
+        // so the registry lands only when the type is the façade's own.
+        if available.contains(attachment_type) {
+            report
+                .missing
+                .push(format!("{registry} (needs {attachment_type} absent)"));
+        } else {
+            emit_role_shim(
+                &mut files,
+                &mut report,
+                &src,
+                &available,
+                &attachment_types,
+                registry,
+                &["identifier", "codec"],
+                || fill_types(FABRIC_ATTACHMENT_REGISTRY, &attachment_types),
+            )?;
         }
     }
     // The loader slice is one unit: the bounded containers name each other, so
@@ -1436,6 +1543,21 @@ pub fn generate_many(
                 || fill_client(NEOFORGE_ENTITY_RENDERERS),
             )?;
         }
+    }
+    // NeoForge's attachment type: the builder keeps the codec and default
+    // markers plus the copy-on-death flag, and the registration marker retains
+    // the id it is handed. A real NeoForge jar is never shadowed.
+    if uses_neoforge_attachments {
+        emit_role_shim(
+            &mut files,
+            &mut report,
+            &src,
+            &available,
+            &attachment_types,
+            NEOFORGE_ATTACHMENT_TYPE,
+            &["identifier", "codec"],
+            || fill_types(NEOFORGE_ATTACHMENT_TYPE_SOURCE, &attachment_types),
+        )?;
     }
     if files.is_empty() {
         return Err("nothing to generate".to_owned());
@@ -2456,6 +2578,171 @@ public final class ColorProviderRegistry {
 }
 "#;
 
+/// Fabric API's data-attachment types and registry. A registration is only
+/// retained (id, codec and initializer markers, persistent and copy-on-death
+/// flags); the store itself lives on the `AttachmentTarget` interface that the
+/// game classes below implement in the façade.
+const FABRIC_ATTACHMENT_TARGET: &str = "net/fabricmc/fabric/api/attachment/v1/AttachmentTarget";
+
+/// The game classes Fabric's Mixin gives an attachment store to. A mod that
+/// casts one of these to `AttachmentTarget` links through the interface's
+/// default methods; a class this jar does not carry is simply not named.
+const FABRIC_ATTACHMENT_TARGETS: &[&str] = &[
+    "net/minecraft/world/entity/Entity",
+    "net/minecraft/world/level/block/entity/BlockEntity",
+    "net/minecraft/world/level/Level",
+    "net/minecraft/world/item/ItemStack",
+];
+
+/// The registered attachment: `id()` answers the identifier the registry
+/// retained, which is the same key the host reads back.
+const FABRIC_ATTACHMENT_TYPE: &str = r#"package net.fabricmc.fabric.api.attachment.v1;
+
+public interface AttachmentType<A> {
+    {identifier} id();
+}
+"#;
+
+/// Bounded Fabric API `AttachmentTarget`: the per-target store Fabric gives a
+/// game class through its Mixin. The façade has no weaver, so one bounded
+/// identity map holds the values for every target, and the game classes a mod
+/// names implement this interface (`FABRIC_ATTACHMENT_TARGETS`). Values are
+/// retained, never serialized, and no game thread is touched.
+const FABRIC_ATTACHMENT_TARGET_SOURCE: &str = r#"package net.fabricmc.fabric.api.attachment.v1;
+
+public interface AttachmentTarget {
+    java.util.Map<Object, java.util.Map<String, Object>> HORIZON_ATTACHMENTS = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Object, java.util.Map<String, Object>>());
+
+    static java.util.Map<String, Object> horizonAttachments(Object target) {
+        if (target == null) return new java.util.LinkedHashMap<>();
+        return HORIZON_ATTACHMENTS.computeIfAbsent(target, key -> new java.util.LinkedHashMap<>());
+    }
+
+    static String horizonKey(AttachmentType<?> type) {
+        if (type == null || type.id() == null) return "<unknown>";
+        return String.valueOf(type.id());
+    }
+
+    @SuppressWarnings("unchecked")
+    static <A> A horizonCast(Object value) { return (A) value; }
+
+    default <A> A getAttached(AttachmentType<A> type) { return horizonCast(horizonAttachments(this).get(horizonKey(type))); }
+
+    default <A> boolean hasAttached(AttachmentType<A> type) { return horizonAttachments(this).containsKey(horizonKey(type)); }
+
+    default <A> A getAttachedOrElse(AttachmentType<A> type, A defaultValue) {
+        Object value = horizonAttachments(this).get(horizonKey(type));
+        return value == null ? defaultValue : horizonCast(value);
+    }
+
+    default <A> A getAttachedOrGet(AttachmentType<A> type, java.util.function.Supplier<A> factory) {
+        Object value = horizonAttachments(this).get(horizonKey(type));
+        if (value != null) return horizonCast(value);
+        A created = factory == null ? null : factory.get();
+        if (created == null) return null;
+        setAttached(type, created);
+        return created;
+    }
+
+    default <A> A getAttachedOrCreate(AttachmentType<A> type, java.util.function.Supplier<A> factory) { return getAttachedOrGet(type, factory); }
+
+    /** Bounded: the initializer is only a marker here, so an absent value stays null. */
+    default <A> A getAttachedOrCreate(AttachmentType<A> type) { return getAttachedOrGet(type, () -> null); }
+
+    default <A> A getAttachedOrSet(AttachmentType<A> type, A defaultValue) {
+        Object value = horizonAttachments(this).get(horizonKey(type));
+        if (value != null) return horizonCast(value);
+        setAttached(type, defaultValue);
+        return defaultValue;
+    }
+
+    /** Bounded: an absent value is left absent rather than handed to the modifier as null. */
+    default <A> void modifyAttached(AttachmentType<A> type, java.util.function.UnaryOperator<A> modifier) {
+        Object value = horizonAttachments(this).get(horizonKey(type));
+        if (value == null) return;
+        setAttached(type, modifier.apply(horizonCast(value)));
+    }
+
+    default <A> A setAttached(AttachmentType<A> type, A value) {
+        Object previous = horizonAttachments(this).put(horizonKey(type), value);
+        return horizonCast(previous);
+    }
+
+    default <A> A removeAttached(AttachmentType<A> type) {
+        Object previous = horizonAttachments(this).remove(horizonKey(type));
+        return horizonCast(previous);
+    }
+}
+"#;
+
+/// Bounded Fabric API `AttachmentRegistry`: `create()` starts a builder, and
+/// `buildAndRegister` keeps one row per attachment id in a deterministic map
+/// (codec marker, initializer marker, persistent flag, copy-on-death flag)
+/// while answering the `AttachmentType` the mod stores. A second registration
+/// for the same id fails, as the real registry's check does.
+const FABRIC_ATTACHMENT_REGISTRY: &str = r#"package net.fabricmc.fabric.api.attachment.v1;
+
+public final class AttachmentRegistry {
+    private static final java.util.Map<String, Registration> HORIZON_REGISTRATIONS = new java.util.TreeMap<>();
+
+    private AttachmentRegistry() {}
+
+    public static <A> Builder<A> create() { return new Builder<>(); }
+
+    /** The flags one registration retained, keyed by the attachment id. */
+    public static final class Registration {
+        private final String id;
+        private final boolean initializer;
+        private final boolean codec;
+        private final boolean copyOnDeath;
+
+        private Registration(String id, boolean initializer, boolean codec, boolean copyOnDeath) {
+            this.id = id;
+            this.initializer = initializer;
+            this.codec = codec;
+            this.copyOnDeath = copyOnDeath;
+        }
+
+        public String id() { return id; }
+        public boolean hasInitializer() { return initializer; }
+        /** Fabric keeps an attachment exactly when it was given a codec. */
+        public boolean persistent() { return codec; }
+        public boolean hasCodec() { return codec; }
+        public boolean copyOnDeath() { return copyOnDeath; }
+    }
+
+    /** The registration retained for an attachment id, or null. */
+    public static Registration horizonRegistration(String id) { return HORIZON_REGISTRATIONS.get(id); }
+
+    /** Every registration, keyed by attachment id in id order. */
+    public static java.util.Map<String, Registration> horizonRegistrations() { return new java.util.TreeMap<>(HORIZON_REGISTRATIONS); }
+
+    public static final class Builder<A> {
+        private java.util.function.Supplier<A> initializer;
+        private {codec}<A> codec;
+        private boolean copyOnDeath;
+
+        private Builder() {}
+
+        public Builder<A> initializer(java.util.function.Supplier<A> initializer) { this.initializer = initializer; return this; }
+
+        public Builder<A> persistent({codec}<A> codec) { this.codec = codec; return this; }
+
+        public Builder<A> copyOnDeath() { this.copyOnDeath = true; return this; }
+
+        public AttachmentType<A> buildAndRegister({identifier} id) {
+            if (id == null) throw new NullPointerException("id");
+            String key = String.valueOf(id);
+            if (HORIZON_REGISTRATIONS.containsKey(key)) throw new IllegalStateException("attachment already registered: " + key);
+            HORIZON_REGISTRATIONS.put(key, new Registration(key, initializer != null, codec != null, copyOnDeath));
+            return new AttachmentType<A>() {
+                public {identifier} id() { return id; }
+            };
+        }
+    }
+}
+"#;
+
 /// Bounded loader bootstrap values. They answer the queries entrypoint code
 /// makes during startup (`getModContainer`, `getAllMods`, `getObjectShare`,
 /// `isModLoaded`) without claiming to be the Fabric loader's registry: the
@@ -2726,6 +3013,79 @@ public class EntityRenderersEvent extends Event {
 }
 "#;
 
+/// NeoForge's attachment type: a library class, emitted only when the real
+/// `net.neoforged.neoforge.attachment.AttachmentType` is absent.
+const NEOFORGE_ATTACHMENT_TYPE: &str = "net/neoforged/neoforge/attachment/AttachmentType";
+
+/// Bounded NeoForge `AttachmentType`: `builder(Supplier)` keeps the default
+/// supplier, `serialize(Codec, Supplier)` the codec and its default,
+/// `copyOnDeath()` the flag, and `build()` the value. NeoForge registers the
+/// type from a `DeferredRegister`, so the bounded marker here is
+/// `horizonRegister(Identifier)`: it retains the id it is given, and the host
+/// reads the rows back through `horizonRegistrations()`.
+const NEOFORGE_ATTACHMENT_TYPE_SOURCE: &str = r#"package net.neoforged.neoforge.attachment;
+
+public final class AttachmentType<T> {
+    private static final java.util.Map<String, AttachmentType<?>> HORIZON_REGISTRATIONS = new java.util.TreeMap<>();
+
+    private final java.util.function.Supplier<T> horizonDefault;
+    private final {codec}<T> horizonCodec;
+    private final boolean horizonCopyOnDeath;
+    private {identifier} horizonId;
+
+    private AttachmentType(java.util.function.Supplier<T> defaultValue, {codec}<T> codec, boolean copyOnDeath) {
+        this.horizonDefault = defaultValue;
+        this.horizonCodec = codec;
+        this.horizonCopyOnDeath = copyOnDeath;
+    }
+
+    public static <T> Builder<T> builder(java.util.function.Supplier<T> defaultValueSupplier) { return new Builder<>(defaultValueSupplier); }
+
+    /** The registered value type's default: null when the builder kept none. */
+    public T defaultValue() { return horizonDefault == null ? null : horizonDefault.get(); }
+
+    public boolean hasCodec() { return horizonCodec != null; }
+    public boolean persistent() { return horizonCodec != null; }
+    public boolean copyOnDeath() { return horizonCopyOnDeath; }
+
+    /** Retains the id this attachment is registered under (the bounded NeoForge registration marker). */
+    public AttachmentType<T> horizonRegister({identifier} id) {
+        if (id == null) throw new NullPointerException("id");
+        String key = String.valueOf(id);
+        if (HORIZON_REGISTRATIONS.containsKey(key)) throw new IllegalStateException("attachment already registered: " + key);
+        this.horizonId = id;
+        HORIZON_REGISTRATIONS.put(key, this);
+        return this;
+    }
+
+    /** The id retained by `horizonRegister`, or null. */
+    public {identifier} horizonId() { return horizonId; }
+
+    public static AttachmentType<?> horizonRegistered(String id) { return HORIZON_REGISTRATIONS.get(id); }
+
+    public static java.util.Map<String, AttachmentType<?>> horizonRegistrations() { return new java.util.TreeMap<>(HORIZON_REGISTRATIONS); }
+
+    public static final class Builder<T> {
+        private java.util.function.Supplier<T> horizonDefault;
+        private {codec}<T> horizonCodec;
+        private boolean horizonCopyOnDeath;
+
+        private Builder(java.util.function.Supplier<T> defaultValueSupplier) { this.horizonDefault = defaultValueSupplier; }
+
+        /** Keeps the codec marker; the supplied default overrides the builder's. */
+        public Builder<T> serialize({codec}<T> codec, java.util.function.Supplier<T> defaultSupplier) {
+            this.horizonCodec = codec;
+            if (defaultSupplier != null) this.horizonDefault = defaultSupplier;
+            return this;
+        }
+
+        public Builder<T> copyOnDeath() { this.horizonCopyOnDeath = true; return this; }
+
+        public AttachmentType<T> build() { return new AttachmentType<>(horizonDefault, horizonCodec, horizonCopyOnDeath); }
+    }
+}
+"#;
+
 /// Legacy Forge keeps the same result/cancellation surface in its own package.
 const FORGE_EVENT: &str = r#"package net.minecraftforge.eventbus.api;
 
@@ -2867,8 +3227,50 @@ fn resolve_client_types(
     out
 }
 
+/// The game and dependency types an attachment registration names. 26.3 calls
+/// its id `Identifier`; `ResourceLocation` stays second so a jar compiled
+/// against the name it replaced still resolves. `Codec` lives in the game's
+/// serialization dependency, so it is a library class here rather than a game
+/// one. `Supplier` is JDK and stays a literal in the templates.
+const ATTACHMENT_TYPE_CANDIDATES: &[(&str, &[&str])] = &[
+    (
+        "identifier",
+        &[
+            "net/minecraft/resources/Identifier",
+            "net/minecraft/resources/ResourceLocation",
+        ],
+    ),
+    ("codec", &["com/mojang/serialization/Codec"]),
+];
+
+/// Resolve the attachment roles this classpath carries. A game class is seeded
+/// into the façade so the shim compiles against the real stub; a dependency
+/// class (a library jar, or one the target jars bundle) is already on `javac`'s
+/// classpath. A role none of them carries stays unresolved, and the shim that
+/// needs it is reported (`emit_role_shim`).
+fn resolve_attachment_types(
+    game: &BTreeMap<String, Class>,
+    lib_names: &BTreeSet<String>,
+    own: &BTreeSet<&str>,
+    wanted: &mut BTreeSet<String>,
+) -> BTreeMap<&'static str, String> {
+    let mut out = BTreeMap::new();
+    for (role, candidates) in ATTACHMENT_TYPE_CANDIDATES {
+        let picked = candidates.iter().copied().find(|name| {
+            game.contains_key(*name) || lib_names.contains(*name) || own.contains(*name)
+        });
+        if let Some(name) = picked {
+            if game.contains_key(name) && !wanted.contains(name) {
+                wanted.insert(name.to_owned());
+            }
+            out.insert(*role, name.to_owned());
+        }
+    }
+    out
+}
+
 /// `{gui}` → the resolved class's Java source name.
-fn fill_client_types(template: &str, types: &BTreeMap<&'static str, String>) -> String {
+fn fill_types(template: &str, types: &BTreeMap<&'static str, String>) -> String {
     types
         .iter()
         .fold(template.to_owned(), |source, (role, name)| {
@@ -2933,6 +3335,37 @@ fn emit_networking_shim(
         .iter()
         .copied()
         .filter(|ty| !game.contains_key(*ty))
+        .collect();
+    if !missing.is_empty() {
+        report
+            .missing
+            .push(format!("{class} (needs {})", missing.join(", ")));
+        return Ok(());
+    }
+    write_shim(files, src, class, &source())
+}
+
+/// Emits one API-only shim whose signature names roles resolved from the game
+/// jar and the dependency jars (the attachment slice). A real API class is
+/// never shadowed, and a role this jar cannot resolve is reported instead of
+/// being emitted with an invented type.
+fn emit_role_shim(
+    files: &mut Vec<PathBuf>,
+    report: &mut Report,
+    src: &Path,
+    available: &BTreeSet<String>,
+    types: &BTreeMap<&'static str, String>,
+    class: &str,
+    requires: &[&str],
+    source: impl FnOnce() -> String,
+) -> Result<(), String> {
+    if available.contains(class) {
+        return Ok(());
+    }
+    let missing: Vec<&str> = requires
+        .iter()
+        .copied()
+        .filter(|role| !types.contains_key(role))
         .collect();
     if !missing.is_empty() {
         report
@@ -12241,7 +12674,7 @@ mod tests {
         let nested = game(&["net/minecraft/world/item/Item$TooltipContext"]);
         let resolved = resolve_client_types(&nested, &none, &none);
         assert_eq!(
-            fill_client_types("import {tooltip_context};", &resolved),
+            fill_types("import {tooltip_context};", &resolved),
             "import net.minecraft.world.item.Item.TooltipContext;"
         );
         // A `$` name the jar lacks leaves the role unresolved.
@@ -12399,15 +12832,15 @@ mod tests {
         write("net/fabricmc/fabric/api/event/Event.java", FABRIC_EVENT);
         write(
             "net/fabricmc/fabric/api/client/rendering/v1/HudRenderCallback.java",
-            &fill_client_types(FABRIC_HUD_RENDER_CALLBACK, &types),
+            &fill_types(FABRIC_HUD_RENDER_CALLBACK, &types),
         );
         write(
             "net/fabricmc/fabric/api/client/item/tooltip/v1/ItemTooltipCallback.java",
-            &fill_client_types(FABRIC_ITEM_TOOLTIP_CALLBACK, &types),
+            &fill_types(FABRIC_ITEM_TOOLTIP_CALLBACK, &types),
         );
         write(
             "net/fabricmc/fabric/api/client/keybinding/v1/KeyBindingHelper.java",
-            &fill_client_types(FABRIC_KEY_BINDING_HELPER, &types),
+            &fill_types(FABRIC_KEY_BINDING_HELPER, &types),
         );
         write(
             "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents.java",
@@ -12455,7 +12888,7 @@ mod tests {
         for (relative, source) in [
             (
                 "net/neoforged/neoforge/client/event/RegisterKeyMappingsEvent.java",
-                fill_client_types(NEOFORGE_REGISTER_KEY_MAPPINGS, &types),
+                fill_types(NEOFORGE_REGISTER_KEY_MAPPINGS, &types),
             ),
             (
                 "net/neoforged/neoforge/client/event/ClientTickEvent.java",
@@ -12463,7 +12896,7 @@ mod tests {
             ),
             (
                 "net/neoforged/neoforge/client/event/RenderGuiEvent.java",
-                fill_client_types(NEOFORGE_RENDER_GUI_EVENT, &types),
+                fill_types(NEOFORGE_RENDER_GUI_EVENT, &types),
             ),
         ] {
             write(relative, &source);
@@ -12723,7 +13156,7 @@ mod tests {
                 FABRIC_ITEM_GROUP_ENTRIES,
             ),
         ] {
-            write(relative, &fill_client_types(template, &types));
+            write(relative, &fill_types(template, &types));
         }
         // The smallest game types the registration signatures name.
         for (relative, source) in [
@@ -12782,6 +13215,385 @@ mod tests {
         assert!(output.status.success(), "item-group probe failed: {stderr}");
         assert!(
             stdout.contains("horizon item group facade ok"),
+            "probe output: {stdout}{stderr}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Every attachment method keeps its API descriptor, and emission stays
+    /// guarded: the real class wins, an unresolved role is reported, and a
+    /// resolved one is written at the API's path. The two roles are resolved
+    /// from the game jar and the dependency jars, never invented.
+    #[test]
+    fn attachment_facade_shapes_are_guarded_and_resolved() {
+        for (template, fragments) in [
+            (
+                FABRIC_ATTACHMENT_TYPE,
+                &["public interface AttachmentType<A> {", "{identifier} id();"][..],
+            ),
+            (
+                FABRIC_ATTACHMENT_REGISTRY,
+                &[
+                    "public static <A> Builder<A> create() { return new Builder<>(); }",
+                    "public Builder<A> initializer(java.util.function.Supplier<A> initializer) {",
+                    "public Builder<A> persistent({codec}<A> codec) {",
+                    "public Builder<A> copyOnDeath() {",
+                    "public AttachmentType<A> buildAndRegister({identifier} id) {",
+                    "public static Registration horizonRegistration(String id) {",
+                    "public static java.util.Map<String, Registration> horizonRegistrations() {",
+                ][..],
+            ),
+            (
+                FABRIC_ATTACHMENT_TARGET_SOURCE,
+                &[
+                    "default <A> A getAttached(AttachmentType<A> type)",
+                    "default <A> boolean hasAttached(AttachmentType<A> type)",
+                    "default <A> A getAttachedOrElse(AttachmentType<A> type, A defaultValue)",
+                    "default <A> A getAttachedOrCreate(AttachmentType<A> type)",
+                    "default <A> A getAttachedOrSet(AttachmentType<A> type, A defaultValue)",
+                    "default <A> A setAttached(AttachmentType<A> type, A value)",
+                    "default <A> A removeAttached(AttachmentType<A> type)",
+                    "default <A> void modifyAttached(AttachmentType<A> type, java.util.function.UnaryOperator<A> modifier)",
+                ][..],
+            ),
+            (
+                NEOFORGE_ATTACHMENT_TYPE_SOURCE,
+                &[
+                    "public static <T> Builder<T> builder(java.util.function.Supplier<T> defaultValueSupplier) {",
+                    "public Builder<T> serialize({codec}<T> codec, java.util.function.Supplier<T> defaultSupplier) {",
+                    "public Builder<T> copyOnDeath() {",
+                    "public AttachmentType<T> build() {",
+                    "public AttachmentType<T> horizonRegister({identifier} id) {",
+                ][..],
+            ),
+        ] {
+            for fragment in fragments {
+                assert!(
+                    template.contains(fragment),
+                    "missing attachment fragment: {fragment}"
+                );
+            }
+            assert!(
+                !template.contains("net.minecraft."),
+                "hard-coded game type in an attachment template"
+            );
+        }
+        for role in ["identifier", "codec"] {
+            assert!(
+                ATTACHMENT_TYPE_CANDIDATES
+                    .iter()
+                    .any(|(name, _)| *name == role),
+                "missing attachment role: {role}"
+            );
+        }
+        // The game jar wins; a class the jars do not carry stays unresolved.
+        let game: BTreeMap<String, Class> = BTreeMap::from([(
+            "net/minecraft/resources/Identifier".to_owned(),
+            Class {
+                name: "net/minecraft/resources/Identifier".to_owned(),
+                ..Class::default()
+            },
+        )]);
+        let libs = BTreeSet::from(["com/mojang/serialization/Codec".to_owned()]);
+        let mut wanted = BTreeSet::new();
+        let resolved = resolve_attachment_types(&game, &libs, &BTreeSet::new(), &mut wanted);
+        assert_eq!(resolved["identifier"], "net/minecraft/resources/Identifier");
+        assert_eq!(resolved["codec"], "com/mojang/serialization/Codec");
+        assert!(wanted.contains("net/minecraft/resources/Identifier"));
+        // A dependency class is already on the classpath, so it is not stubbed.
+        assert!(!wanted.contains("com/mojang/serialization/Codec"));
+        // The same holds for a dependency the target jars bundle themselves.
+        let bundled = BTreeSet::from(["com/mojang/serialization/Codec"]);
+        let mut wanted = BTreeSet::new();
+        let resolved = resolve_attachment_types(&game, &BTreeSet::new(), &bundled, &mut wanted);
+        assert_eq!(resolved["codec"], "com/mojang/serialization/Codec");
+        assert!(!wanted.contains("com/mojang/serialization/Codec"));
+        // The name 26.3 replaced still resolves for a jar built against it.
+        let renamed: BTreeMap<String, Class> = BTreeMap::from([(
+            "net/minecraft/resources/ResourceLocation".to_owned(),
+            Class {
+                name: "net/minecraft/resources/ResourceLocation".to_owned(),
+                ..Class::default()
+            },
+        )]);
+        let mut wanted = BTreeSet::new();
+        let resolved =
+            resolve_attachment_types(&renamed, &BTreeSet::new(), &BTreeSet::new(), &mut wanted);
+        assert_eq!(
+            resolved["identifier"],
+            "net/minecraft/resources/ResourceLocation"
+        );
+        assert!(!resolved.contains_key("codec"));
+        let mut wanted = BTreeSet::new();
+        assert!(
+            resolve_attachment_types(
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &mut wanted
+            )
+            .is_empty()
+        );
+        assert!(wanted.is_empty());
+
+        // Emission: an available class is never shadowed, a missing role is
+        // reported, and an emitted shim lands at the API's path.
+        let root = std::env::temp_dir().join(format!(
+            "horizon-facade-attachment-shim-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create shim directory");
+        let types = BTreeMap::from([(
+            "identifier",
+            "net/minecraft/resources/Identifier".to_owned(),
+        )]);
+        let mut files = Vec::new();
+        let mut report = Report::default();
+        emit_role_shim(
+            &mut files,
+            &mut report,
+            &root,
+            &BTreeSet::from([FABRIC_ATTACHMENT_TARGET.to_owned()]),
+            &types,
+            FABRIC_ATTACHMENT_TARGET,
+            &[],
+            || "shadowed".to_owned(),
+        )
+        .expect("guard the real API class");
+        assert!(files.is_empty() && report.missing.is_empty());
+        emit_role_shim(
+            &mut files,
+            &mut report,
+            &root,
+            &BTreeSet::new(),
+            &types,
+            "net/fabricmc/fabric/api/attachment/v1/AttachmentRegistry",
+            &["identifier", "codec"],
+            || "invented".to_owned(),
+        )
+        .expect("report a missing role");
+        assert!(files.is_empty());
+        assert_eq!(
+            report.missing,
+            vec!["net/fabricmc/fabric/api/attachment/v1/AttachmentRegistry (needs codec)"]
+        );
+        emit_role_shim(
+            &mut files,
+            &mut report,
+            &root,
+            &BTreeSet::new(),
+            &types,
+            "net/fabricmc/fabric/api/attachment/v1/AttachmentType",
+            &["identifier"],
+            || fill_types(FABRIC_ATTACHMENT_TYPE, &types),
+        )
+        .expect("emit the attachment type");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("net/fabricmc/fabric/api/attachment/v1/AttachmentType.java"));
+        let _ = fs::remove_dir_all(&root);
+
+        // Detection and emission markers stay in the generator path.
+        let source = include_str!("facade.rs");
+        for marker in [
+            "let uses_fabric_attachments =",
+            "let uses_neoforge_attachments = uses_neoforge",
+            "resolve_attachment_types(&game, &lib_names, &own, &mut wanted)",
+            "if available.contains(class) {",
+            "FABRIC_ATTACHMENT_TARGETS",
+            "emit_role_shim(",
+        ] {
+            assert!(source.contains(marker), "missing guard: {marker}");
+        }
+        for class in [
+            "net/fabricmc/fabric/api/attachment/v1/AttachmentRegistry",
+            "net/fabricmc/fabric/api/attachment/v1/AttachmentType",
+            FABRIC_ATTACHMENT_TARGET,
+            "net/neoforged/neoforge/attachment/AttachmentType",
+        ] {
+            assert!(
+                source.contains(&format!("\"{class}\"")),
+                "attachment shim not registered: {class}"
+            );
+        }
+        // Fabric's game targets are the classes its Mixin attaches to.
+        for target in FABRIC_ATTACHMENT_TARGETS {
+            assert!(
+                source.contains(&format!("\"{target}\"")),
+                "attachment target missing: {target}"
+            );
+        }
+    }
+
+    /// Fabric's attachment registry, type and target store are compiled and run
+    /// for real: one retained row per id with the builder's flags, the id
+    /// accessor, and the per-target store. Skipped cleanly when no JDK is
+    /// installed.
+    #[test]
+    fn fabric_attachment_registry_compiles_and_retains_flags() {
+        use std::{path::PathBuf, process::Command};
+        let types: BTreeMap<&'static str, String> = BTreeMap::from([
+            (
+                "identifier",
+                "net/minecraft/resources/Identifier".to_owned(),
+            ),
+            ("codec", "com/mojang/serialization/Codec".to_owned()),
+        ]);
+        let probe = r#"public class AttachmentProbe {
+    static final class Data {
+        final String value;
+        Data(String value) { this.value = value; }
+    }
+
+    static final class Holder implements net.fabricmc.fabric.api.attachment.v1.AttachmentTarget {}
+
+    public static void main(String[] args) {
+        net.minecraft.resources.Identifier first = new net.minecraft.resources.Identifier("probe", "first");
+        net.minecraft.resources.Identifier second = new net.minecraft.resources.Identifier("probe", "second");
+
+        net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.Builder<Data> builder =
+            net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.create();
+        net.fabricmc.fabric.api.attachment.v1.AttachmentType<Data> firstType = builder
+            .initializer(() -> new Data("default"))
+            .persistent(new com.mojang.serialization.Codec<Data>() {})
+            .copyOnDeath()
+            .buildAndRegister(first);
+        net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.Builder<Data> plain =
+            net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.create();
+        net.fabricmc.fabric.api.attachment.v1.AttachmentType<Data> secondType = plain.buildAndRegister(second);
+
+        if (firstType.id() != first) throw new AssertionError("first id accessor");
+        if (secondType.id() != second) throw new AssertionError("second id accessor");
+
+        java.util.Map<String, net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.Registration> rows =
+            net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.horizonRegistrations();
+        if (!rows.keySet().toString().equals("[probe:first, probe:second]")) throw new AssertionError("id order " + rows.keySet());
+        net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.Registration kept = rows.get("probe:first");
+        if (kept == null || !kept.id().equals("probe:first")) throw new AssertionError("kept row");
+        if (!kept.hasInitializer() || !kept.hasCodec() || !kept.persistent() || !kept.copyOnDeath()) throw new AssertionError("kept flags");
+        net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.Registration unset = rows.get("probe:second");
+        if (unset == null || unset.hasInitializer() || unset.hasCodec() || unset.persistent() || unset.copyOnDeath()) throw new AssertionError("unset flags");
+        if (net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.horizonRegistration("probe:missing") != null) throw new AssertionError("missing row");
+
+        try {
+            net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.Builder<Data> duplicate =
+                net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.create();
+            duplicate.buildAndRegister(first);
+            throw new AssertionError("duplicate id retained");
+        } catch (IllegalStateException expected) {}
+        try {
+            net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.Builder<Data> missing =
+                net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry.create();
+            missing.buildAndRegister(null);
+            throw new AssertionError("null id retained");
+        } catch (NullPointerException expected) {}
+
+        Holder holder = new Holder();
+        if (holder.hasAttached(firstType)) throw new AssertionError("fresh target");
+        Data value = new Data("v");
+        if (holder.setAttached(firstType, value) != null) throw new AssertionError("first set");
+        if (holder.getAttached(firstType) != value) throw new AssertionError("round trip");
+        if (holder.getAttachedOrElse(secondType, value) != value) throw new AssertionError("orElse");
+        if (holder.getAttachedOrCreate(secondType) != null) throw new AssertionError("bounded create");
+        Data created = holder.getAttachedOrSet(secondType, new Data("s"));
+        if (!holder.hasAttached(secondType) || holder.getAttached(secondType) != created) throw new AssertionError("orSet");
+        holder.modifyAttached(secondType, previous -> new Data(previous.value + "!"));
+        if (!holder.getAttached(secondType).value.equals("s!")) throw new AssertionError("modify " + holder.getAttached(secondType).value);
+        if (holder.removeAttached(secondType) == null || holder.hasAttached(secondType)) throw new AssertionError("remove");
+        if (!holder.getAttachedOrGet(secondType, () -> new Data("g")).value.equals("g")) throw new AssertionError("orGet");
+
+        // NeoForge keeps the same retention shape: builder markers, flags, and
+        // the registration id it was handed.
+        net.minecraft.resources.Identifier neoId = new net.minecraft.resources.Identifier("probe", "neo");
+        net.neoforged.neoforge.attachment.AttachmentType<Data> neo =
+            net.neoforged.neoforge.attachment.AttachmentType.<Data>builder(() -> new Data("neo-default"))
+                .serialize(new com.mojang.serialization.Codec<Data>() {}, () -> new Data("neo-serialized"))
+                .copyOnDeath()
+                .build()
+                .horizonRegister(neoId);
+        if (neo.horizonId() != neoId) throw new AssertionError("neo id");
+        if (!neo.hasCodec() || !neo.persistent() || !neo.copyOnDeath()) throw new AssertionError("neo flags");
+        if (!neo.defaultValue().value.equals("neo-serialized")) throw new AssertionError("neo default");
+        if (net.neoforged.neoforge.attachment.AttachmentType.horizonRegistered("probe:neo") != neo) throw new AssertionError("neo registration");
+        System.out.println("horizon attachment facade ok");
+    }
+}
+"#;
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-attachment-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let mut files = Vec::new();
+        let mut write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write java shim");
+            files.push(file);
+        };
+        for (relative, template) in [
+            ("AttachmentType.java", FABRIC_ATTACHMENT_TYPE),
+            ("AttachmentRegistry.java", FABRIC_ATTACHMENT_REGISTRY),
+            ("AttachmentTarget.java", FABRIC_ATTACHMENT_TARGET_SOURCE),
+        ] {
+            write(
+                &format!("net/fabricmc/fabric/api/attachment/v1/{relative}"),
+                &fill_types(template, &types),
+            );
+        }
+        write(
+            "net/neoforged/neoforge/attachment/AttachmentType.java",
+            &fill_types(NEOFORGE_ATTACHMENT_TYPE_SOURCE, &types),
+        );
+        // The smallest game types the attachment signatures name.
+        for (relative, source) in [
+            (
+                "net/minecraft/resources/Identifier.java",
+                "package net.minecraft.resources;\npublic class Identifier { private final String namespace; private final String path; public Identifier(String namespace, String path) { this.namespace = namespace; this.path = path; } public String toString() { return namespace + \":\" + path; } }\n",
+            ),
+            (
+                "com/mojang/serialization/Codec.java",
+                "package com.mojang.serialization;\npublic interface Codec<A> {}\n",
+            ),
+        ] {
+            write(relative, source);
+        }
+        write("AttachmentProbe.java", probe);
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(javac_status) = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(
+            javac_status.success(),
+            "javac rejected the generated attachment façade"
+        );
+        let java = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("java"))
+            .unwrap_or_else(|| PathBuf::from("java"));
+        let output = Command::new(&java)
+            .arg("-cp")
+            .arg(&classes)
+            .arg("AttachmentProbe")
+            .output()
+            .expect("run the attachment probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "attachment probe failed: {stderr}");
+        assert!(
+            stdout.contains("horizon attachment facade ok"),
             "probe output: {stdout}{stderr}"
         );
         let _ = fs::remove_dir_all(&root);
