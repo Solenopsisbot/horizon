@@ -1030,6 +1030,11 @@ fn run_server_java_mods(options: &mut Options) -> Result<()> {
         }
         content.push(mod_content);
     }
+    // The server thread owns authoritative potion/effect lookup state. Keep
+    // this bounded registry in sync immediately after Java declarations are
+    // loaded, even though the broader content/resource tables still rebuild
+    // on the next resource reload.
+    super::mods::register_mob_effects(content);
     Ok(())
 }
 

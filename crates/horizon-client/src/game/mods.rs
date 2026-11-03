@@ -313,27 +313,40 @@ pub(super) fn run_java_mods(
 /// holding their network ids is built. The startup root's effects, none
 /// included, stay until restart: a pack reload after a Mods switch builds a
 /// root with others.
-fn register_mob_effects(mods: &[horizon_client::mod_content::ContentMod]) {
-    use horizon_client::brewing::{self, Category};
-    use horizon_mods::content::EffectCategory;
+pub(super) fn register_mob_effects(mods: &[horizon_client::mod_content::ContentMod]) {
     let effects = horizon_client::mod_content::mob_effects(mods);
     let ids: Vec<String> = effects.iter().map(|e| e.id.clone()).collect();
-    let set = brewing::register_mod_effects(effects.into_iter().map(|e| {
-        let category = match e.category {
-            EffectCategory::Beneficial => Category::Beneficial,
-            EffectCategory::Harmful => Category::Harmful,
-            EffectCategory::Neutral => Category::Neutral,
-        };
-        (e.id.clone(), e.color, category)
-    }));
+    let set = horizon_client::brewing::register_mod_effects(effect_rows(effects.into_iter()));
     if !set
-        && brewing::mod_effects()
+        && horizon_client::brewing::mod_effects()
             .iter()
             .map(|e| e.id)
             .ne(ids.iter().map(String::as_str))
     {
         log::warn!("Horizon: the mods' mob effects changed; restart the game to use them");
     }
+}
+
+fn effect_rows<'a>(
+    effects: impl IntoIterator<Item = &'a horizon_mods::content::MobEffect>,
+) -> Vec<(String, u32, horizon_client::brewing::Category)> {
+    effects
+        .into_iter()
+        .map(|effect| {
+            let category = match effect.category {
+                horizon_mods::content::EffectCategory::Beneficial => {
+                    horizon_client::brewing::Category::Beneficial
+                }
+                horizon_mods::content::EffectCategory::Harmful => {
+                    horizon_client::brewing::Category::Harmful
+                }
+                horizon_mods::content::EffectCategory::Neutral => {
+                    horizon_client::brewing::Category::Neutral
+                }
+            };
+            (effect.id.clone(), effect.color, category)
+        })
+        .collect()
 }
 
 /// What the launcher writes beside a game it built with native mods: their ids under `mods`.
@@ -459,6 +472,37 @@ impl Game<'_> {
 mod tests {
     use super::*;
     use std::{collections::BTreeMap, io::Write, process::Command};
+
+    #[test]
+    fn native_effect_rows_preserve_typed_categories_for_server_registration() {
+        let effects = [
+            horizon_mods::content::MobEffect {
+                id: "zeta:shock".into(),
+                category: horizon_mods::content::EffectCategory::Harmful,
+                color: 0x112233,
+            },
+            horizon_mods::content::MobEffect {
+                id: "alpha:glow".into(),
+                category: horizon_mods::content::EffectCategory::Beneficial,
+                color: 0xAABBCC,
+            },
+        ];
+        assert_eq!(
+            effect_rows(effects.iter()),
+            vec![
+                (
+                    "zeta:shock".into(),
+                    0x112233,
+                    horizon_client::brewing::Category::Harmful,
+                ),
+                (
+                    "alpha:glow".into(),
+                    0xAABBCC,
+                    horizon_client::brewing::Category::Beneficial,
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn native_entrypoint_diagnostics_list_declared_loader_kinds() {
