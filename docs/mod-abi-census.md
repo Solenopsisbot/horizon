@@ -32,6 +32,9 @@ unsupported-mixin diagnostic: the point needs a façade-owned Java method or a n
 The aggregate `mixin_method_descriptors` map retains the exact JVM descriptors for each
 descriptor-free `target#method` key, so overloaded targets remain distinguishable to a future
 translator without changing hook matching.
+The aggregate `mixin_at_targets` map likewise retains exact descriptor-bearing `@At(target:...)`
+selectors for Redirect/ModifyArg and related call-site planning; it is report-only and does not
+weave bytecode.
 Accessor, invoker, and shadow rows are omitted because
 they require member shape rather than a call-site hook. This keeps consumers from having to
 filter and regroup the ranked `points` array.

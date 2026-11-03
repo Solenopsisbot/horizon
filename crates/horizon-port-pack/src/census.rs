@@ -110,6 +110,11 @@ pub struct Census {
     /// for a future translator.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mixin_method_descriptors: BTreeMap<String, Vec<String>>,
+    /// Exact descriptor-bearing `@At(target:...)` selectors, keyed by the
+    /// serialized `@At` value. This is report-only input for call-site
+    /// translation planning; no bytecode is woven.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mixin_at_targets: BTreeMap<String, Vec<String>>,
     /// Access-widener targets, counted across jars (discovery only).
     #[serde(default)]
     pub access_widener_targets: BTreeMap<String, usize>,
@@ -354,6 +359,10 @@ pub fn read_with(path: &Path, hooks: Option<&HookIndex>) -> Result<Census, Strin
         descriptors.sort();
         descriptors.dedup();
     }
+    for selectors in census.mixin_at_targets.values_mut() {
+        selectors.sort();
+        selectors.dedup();
+    }
     census.points = points
         .into_iter()
         .map(|((target, method, kind, at), count)| PointCount {
@@ -504,6 +513,15 @@ impl Census {
                 }
                 if !injection.at.is_empty() {
                     *self.at.entry(injection.at.clone()).or_default() += 1;
+                    let selectors = at_target_selectors(&injection.at)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    if !selectors.is_empty() {
+                        self.mixin_at_targets
+                            .entry(injection.at.clone())
+                            .or_default()
+                            .extend(selectors);
+                    }
                 }
                 // Mixin permits one annotation to name several target
                 // methods. `classes::injections` keeps that source shape as
@@ -1014,6 +1032,15 @@ fn method_descriptor(method: &str) -> Option<&str> {
     method.find('(').map(|at| &method[at..])
 }
 
+/// Extracts exact descriptor-bearing selectors from a serialized `@At` value.
+/// Other selectors remain attached to the original `at` key and are not
+/// interpreted here.
+fn at_target_selectors(at: &str) -> impl Iterator<Item = &str> {
+    at.split('|')
+        .filter_map(|part| part.strip_prefix("target:"))
+        .filter(|selector| !selector.is_empty())
+}
+
 /// Mixin's `method` element can be a scalar or an array. The class reader
 /// preserves arrays as `|`-joined text so this boundary can expand them into
 /// independently matchable native hook keys.
@@ -1236,6 +1263,10 @@ mod tests {
         assert_eq!(
             census.mixin_method_descriptors["net/minecraft/Target#destroyBlock"],
             ["()V"]
+        );
+        assert_eq!(
+            census.mixin_at_targets["HEAD|target:Lnet/minecraft/Target;destroyBlock()V"],
+            ["Lnet/minecraft/Target;destroyBlock()V"]
         );
         assert_eq!(
             census.hook_points["net/minecraft/Target#destroyBlock"][0].hooks,

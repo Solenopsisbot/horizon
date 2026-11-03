@@ -1175,6 +1175,8 @@ pub(crate) mod tests_support {
         let at_ty = utf(&mut pool, "Lorg/spongepowered/asm/mixin/injection/At;");
         let value_name = utf(&mut pool, "value");
         let head = utf(&mut pool, "HEAD");
+        let target_name = utf(&mut pool, "target");
+        let at_target = utf(&mut pool, &format!("L{target};{method}"));
         let runtime_annotations = utf(&mut pool, "RuntimeVisibleAnnotations");
         let run = utf(&mut pool, "run");
         let desc = utf(&mut pool, "()V");
@@ -1201,10 +1203,13 @@ pub(crate) mod tests_support {
         ma.extend(at_name.to_be_bytes());
         ma.extend(*b"@");
         ma.extend(at_ty.to_be_bytes());
-        ma.extend([0, 1]);
+        ma.extend([0, 2]);
         ma.extend(value_name.to_be_bytes());
         ma.extend(*b"s");
         ma.extend(head.to_be_bytes());
+        ma.extend(target_name.to_be_bytes());
+        ma.extend(*b"s");
+        ma.extend(at_target.to_be_bytes());
         out.extend([0, 1]);
         out.extend(runtime_annotations.to_be_bytes());
         out.extend((ma.len() as u32).to_be_bytes());
