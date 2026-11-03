@@ -14,7 +14,7 @@
 //! get the exact failure.
 use jni::{
     InitArgsBuilder, JNIEnv, JNIVersion, JavaVM,
-    objects::{JClass, JObject, JValue},
+    objects::{JClass, JObject, JValue, JValueOwned},
 };
 use std::{
     fs::{self, File},
@@ -305,6 +305,17 @@ fn run() -> Result<(), String> {
                     println!("{line}");
                 }
             }
+        }
+    }
+    // The loading phase ends here, before the first entrypoint: real launches
+    // finish loading and select the environment's side once the loader has
+    // registered its configs. A run with no stage never reached Mixin, so it
+    // must not load a Mixin class for the phase either.
+    if !stages.is_empty() {
+        let side = MixinSide::selected(&entry_kind);
+        let mut driver = JniMixinPhase { env: &mut *env };
+        for line in run_mixin_phase(bootstrap.as_ref(), side, &mut driver) {
+            println!("{line}");
         }
     }
     // Fabric runs loader-level `preLaunch` callbacks before the selected
@@ -1852,6 +1863,264 @@ fn mixin_bootstrap_label(env: &mut JNIEnv) -> MixinBootstrap {
     }
 }
 
+/// The `MixinEnvironment$Side` constant a run sets. `None` is Mixin's default,
+/// for a loader-lifecycle probe (`main`, `preLaunch`, `neoforge`) that has no game
+/// environment to pick a side from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MixinSide {
+    Client,
+    Server,
+}
+
+impl MixinSide {
+    fn selected(entry_kind: &str) -> Option<Self> {
+        match entry_kind {
+            "client" | "client_init" => Some(Self::Client),
+            "server" | "server_init" => Some(Self::Server),
+            _ => None,
+        }
+    }
+
+    /// The enum's static field, read with `get_static_field`.
+    fn field(self) -> &'static str {
+        match self {
+            Self::Client => "CLIENT",
+            Self::Server => "SERVER",
+        }
+    }
+
+    /// The `mixin phase:` value.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Server => "server",
+        }
+    }
+}
+
+/// One step of the hand-off between registration and the first entrypoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MixinPhaseStep {
+    /// `MixinBootstrap.onLoadingDone()V`.
+    LoadingDone,
+    /// `MixinEnvironment.getDefaultEnvironment()`, then its `setSide`.
+    Environment,
+}
+
+/// The steps a run that reached Mixin performs, in order: `onLoadingDone`, which
+/// Fabric calls once the loader registered the configs, then the side, which
+/// `setSide` only assigns while it is still `UNKNOWN`.
+const MIXIN_PHASE_STEPS: [MixinPhaseStep; 2] =
+    [MixinPhaseStep::LoadingDone, MixinPhaseStep::Environment];
+
+/// A step's result. Anything but `Ok` is reported, never fatal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PhaseOutcome {
+    Ok,
+    /// The class, method or field is not on the classpath.
+    Unavailable,
+    /// The call threw; the label is already bounded and exception-free.
+    Failed(String),
+}
+
+/// The JVM effects the plan needs, so every outcome runs in a unit test instead
+/// of a started JVM.
+trait MixinPhaseDriver {
+    /// `MixinBootstrap.onLoadingDone()V`; Mixin 0.8.7 ships no such method.
+    fn loading_done(&mut self) -> PhaseOutcome;
+
+    /// `MixinEnvironment.getDefaultEnvironment()`, then its `setSide` for a sided
+    /// run. Resolution stops at the first unavailable step.
+    fn set_side(&mut self, side: Option<MixinSide>) -> PhaseOutcome;
+}
+
+/// `mixin phase: <step>` with the outcome: `ok`, `unavailable`, or
+/// `failed (<label>)`. The environment line carries no `ok`: the side it names is
+/// the state a reader wants.
+fn mixin_phase_line(
+    step: MixinPhaseStep,
+    side: Option<MixinSide>,
+    outcome: &PhaseOutcome,
+) -> String {
+    let label = match step {
+        MixinPhaseStep::LoadingDone => "loading-done",
+        MixinPhaseStep::Environment => side.map_or("default", MixinSide::label),
+    };
+    match outcome {
+        PhaseOutcome::Ok => match step {
+            MixinPhaseStep::LoadingDone => format!("mixin phase: {label} ok"),
+            MixinPhaseStep::Environment => format!("mixin phase: {label}"),
+        },
+        PhaseOutcome::Unavailable => format!("mixin phase: {label} unavailable"),
+        PhaseOutcome::Failed(reason) => format!("mixin phase: {label} failed ({reason})"),
+    }
+}
+
+/// The lifecycle stage after registration: one line per step, in
+/// [`MIXIN_PHASE_STEPS`] order. Pure apart from [`MixinPhaseDriver`].
+fn run_mixin_phase(
+    bootstrap: Option<&MixinBootstrap>,
+    side: Option<MixinSide>,
+    driver: &mut impl MixinPhaseDriver,
+) -> Vec<String> {
+    if !bootstrap.is_some_and(|bootstrap| bootstrap.is_ok()) {
+        return Vec::new();
+    }
+    MIXIN_PHASE_STEPS
+        .iter()
+        .map(|step| {
+            let outcome = match step {
+                MixinPhaseStep::LoadingDone => driver.loading_done(),
+                MixinPhaseStep::Environment => driver.set_side(side),
+            };
+            mixin_phase_line(*step, side, &outcome)
+        })
+        .collect()
+}
+
+const MIXIN_BOOTSTRAP_CLASS: &str = "org/spongepowered/asm/launch/MixinBootstrap";
+const MIXIN_ON_LOADING_DONE: &str = "onLoadingDone";
+const MIXIN_ENVIRONMENT_CLASS: &str = "org/spongepowered/asm/mixin/MixinEnvironment";
+const MIXIN_SIDE_CLASS: &str = "org/spongepowered/asm/mixin/MixinEnvironment$Side";
+const MIXIN_SIDE_SIG: &str = "Lorg/spongepowered/asm/mixin/MixinEnvironment$Side;";
+const MIXIN_GET_DEFAULT_ENVIRONMENT: &str = "getDefaultEnvironment";
+const MIXIN_GET_DEFAULT_ENVIRONMENT_SIG: &str = "()Lorg/spongepowered/asm/mixin/MixinEnvironment;";
+const MIXIN_SET_ACTIVE_ENVIRONMENT: &str = "setActiveEnvironment";
+const MIXIN_SET_ACTIVE_ENVIRONMENT_SIG: &str = "(Lorg/spongepowered/asm/mixin/MixinEnvironment;)V";
+const MIXIN_SET_SIDE: &str = "setSide";
+const MIXIN_SET_SIDE_SIG: &str = "(Lorg/spongepowered/asm/mixin/MixinEnvironment$Side;)Lorg/spongepowered/asm/mixin/MixinEnvironment;";
+
+/// [`MixinPhaseDriver`] over JNI. Every member is reflective, so a Mixin build
+/// without one of them reports `unavailable` instead of failing.
+struct JniMixinPhase<'env, 'local> {
+    env: &'env mut JNIEnv<'local>,
+}
+
+impl<'env, 'local> JniMixinPhase<'env, 'local> {
+    /// `find_class` with the pending `NoClassDefFoundError` cleared.
+    fn find(&mut self, name: &str) -> Option<JClass<'local>> {
+        let class = self.env.find_class(name).ok();
+        if class.is_none() {
+            let _ = self.env.exception_clear();
+        }
+        class
+    }
+
+    /// [`PhaseOutcome::Failed`] for a thrown call: the same fallback label the
+    /// rest of the probe reports, with the exception cleared.
+    fn failed(&mut self, error: jni::errors::Error) -> PhaseOutcome {
+        let fallback = (error.to_string() == "Java exception was thrown")
+            .then(|| exception_fallback(self.env))
+            .flatten();
+        let _ = self.env.exception_describe();
+        let _ = self.env.exception_clear();
+        PhaseOutcome::Failed(fallback.unwrap_or_else(|| error.to_string()))
+    }
+
+    /// `class.method(sig)`: `Unavailable` when either is missing, `Failed` when
+    /// the call throws.
+    fn static_call(
+        &mut self,
+        class: &str,
+        method: &str,
+        sig: &str,
+        args: &[JValue],
+    ) -> Result<JValueOwned<'local>, PhaseOutcome> {
+        let Some(class) = self.find(class) else {
+            return Err(PhaseOutcome::Unavailable);
+        };
+        if self.env.get_static_method_id(&class, method, sig).is_err() {
+            let _ = self.env.exception_clear();
+            return Err(PhaseOutcome::Unavailable);
+        }
+        match self.env.call_static_method(&class, method, sig, args) {
+            Ok(value) => Ok(value),
+            Err(error) => Err(self.failed(error)),
+        }
+    }
+
+    /// `MixinEnvironment$Side.CLIENT` / `.SERVER`.
+    fn side_constant(&mut self, side: MixinSide) -> Result<JObject<'local>, PhaseOutcome> {
+        let Some(class) = self.find(MIXIN_SIDE_CLASS) else {
+            return Err(PhaseOutcome::Unavailable);
+        };
+        if self
+            .env
+            .get_static_field_id(&class, side.field(), MIXIN_SIDE_SIG)
+            .is_err()
+        {
+            let _ = self.env.exception_clear();
+            return Err(PhaseOutcome::Unavailable);
+        }
+        match self
+            .env
+            .get_static_field(&class, side.field(), MIXIN_SIDE_SIG)
+        {
+            Ok(value) => value.l().map_err(|error| self.failed(error)),
+            Err(error) => Err(self.failed(error)),
+        }
+    }
+}
+
+impl MixinPhaseDriver for JniMixinPhase<'_, '_> {
+    fn loading_done(&mut self) -> PhaseOutcome {
+        self.static_call(MIXIN_BOOTSTRAP_CLASS, MIXIN_ON_LOADING_DONE, "()V", &[])
+            .map_or_else(|outcome| outcome, |_| PhaseOutcome::Ok)
+    }
+
+    fn set_side(&mut self, side: Option<MixinSide>) -> PhaseOutcome {
+        // 1. `MixinEnvironment.getDefaultEnvironment()`.
+        let default = match self.static_call(
+            MIXIN_ENVIRONMENT_CLASS,
+            MIXIN_GET_DEFAULT_ENVIRONMENT,
+            MIXIN_GET_DEFAULT_ENVIRONMENT_SIG,
+            &[],
+        ) {
+            Ok(value) => match value.l() {
+                Ok(object) => object,
+                Err(error) => return self.failed(error),
+            },
+            Err(outcome) => return outcome,
+        };
+        // 2. `getDefaultEnvironment().setSide(Side.CLIENT|SERVER)`. `setSide`
+        // only assigns while the side is still `UNKNOWN`.
+        if let Some(side) = side {
+            let constant = match self.side_constant(side) {
+                Ok(constant) => constant,
+                Err(outcome) => return outcome,
+            };
+            let Ok(default_class) = self.env.get_object_class(&default) else {
+                return PhaseOutcome::Unavailable;
+            };
+            if self
+                .env
+                .get_method_id(&default_class, MIXIN_SET_SIDE, MIXIN_SET_SIDE_SIG)
+                .is_err()
+            {
+                let _ = self.env.exception_clear();
+                return PhaseOutcome::Unavailable;
+            }
+            if let Err(error) = self.env.call_method(
+                &default,
+                MIXIN_SET_SIDE,
+                MIXIN_SET_SIDE_SIG,
+                &[JValue::Object(&constant)],
+            ) {
+                return self.failed(error);
+            }
+        }
+        // 3. `MixinEnvironment.setActiveEnvironment(MixinEnvironment)` where the
+        // runtime has it. Best effort: the side above is what the game reads.
+        let _ = self.static_call(
+            MIXIN_ENVIRONMENT_CLASS,
+            MIXIN_SET_ACTIVE_ENVIRONMENT,
+            MIXIN_SET_ACTIVE_ENVIRONMENT_SIG,
+            &[JValue::Object(&default)],
+        );
+        PhaseOutcome::Ok
+    }
+}
+
 /// Fabric runs `preLaunch` before the selected environment. NeoForge has no
 /// such list, so its `@Mod` scan must not masquerade as one; an explicit
 /// `--entry` bypasses discovery and preLaunch with it.
@@ -1983,16 +2252,16 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
 mod tests {
     use super::{
         Entrypoint, MAX_MIXIN_CONFIG_PROPERTY_BYTES, MixinBootstrap, MixinConfigRef,
-        MixinEnvironment, MixinRegistrar, MixinStage, constructor_only_entry_kind,
-        declared_entrypoint_kinds, discover_entries, discover_mixin_configs,
-        entrypoints_from_metadata, fabric_entries, fabric_metadata, fabric_mixin_configs,
-        fallback_label, format_entrypoints, format_mixin_config_property, format_mixin_configs,
-        initializer_for_kind, is_minecraft_class, missing_entry_message, mixin_bootstrap_line,
-        mixin_config_names, mixin_config_property, mixin_configs_line, mixin_jvm_options,
-        mixin_registered_count, mixin_stages, neoforge_metadata, nested_jar_name,
-        parse_mixin_config, pre_launch_entries, quilt_entrypoint_kind, quilt_mixin_configs,
-        register_mixin_configs, report_mixin_configs, select_mixin_configs, skipped_mixin_configs,
-        split_entrypoint,
+        MixinEnvironment, MixinPhaseDriver, MixinRegistrar, MixinSide, MixinStage, PhaseOutcome,
+        constructor_only_entry_kind, declared_entrypoint_kinds, discover_entries,
+        discover_mixin_configs, entrypoints_from_metadata, fabric_entries, fabric_metadata,
+        fabric_mixin_configs, fallback_label, format_entrypoints, format_mixin_config_property,
+        format_mixin_configs, initializer_for_kind, is_minecraft_class, missing_entry_message,
+        mixin_bootstrap_line, mixin_config_names, mixin_config_property, mixin_configs_line,
+        mixin_jvm_options, mixin_registered_count, mixin_stages, neoforge_metadata,
+        nested_jar_name, parse_mixin_config, pre_launch_entries, quilt_entrypoint_kind,
+        quilt_mixin_configs, register_mixin_configs, report_mixin_configs, run_mixin_phase,
+        select_mixin_configs, skipped_mixin_configs, split_entrypoint,
     };
     use std::{fs::File, io::Write, path::PathBuf};
     use zip::write::SimpleFileOptions;
@@ -3043,5 +3312,130 @@ config="demo.mixins.json""#,
             vec!["alpha.First", "zeta.Second"]
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A [`MixinPhaseDriver`] that records each step and returns the outcomes it
+    /// was built with, standing in for the JNI one so the plan needs no JVM.
+    struct FakePhaseDriver {
+        loading: PhaseOutcome,
+        environment: PhaseOutcome,
+        calls: Vec<String>,
+    }
+
+    impl MixinPhaseDriver for FakePhaseDriver {
+        fn loading_done(&mut self) -> PhaseOutcome {
+            self.calls.push("loading-done".to_owned());
+            self.loading.clone()
+        }
+
+        fn set_side(&mut self, side: Option<MixinSide>) -> PhaseOutcome {
+            self.calls
+                .push(side.map_or("default", MixinSide::label).to_owned());
+            self.environment.clone()
+        }
+    }
+
+    /// The phase lines for one entry kind, with a ready bootstrap.
+    fn phase_lines(
+        entry_kind: &str,
+        loading: PhaseOutcome,
+        environment: PhaseOutcome,
+    ) -> Vec<String> {
+        let ready: MixinBootstrap = Ok(());
+        let mut driver = FakePhaseDriver {
+            loading,
+            environment,
+            calls: Vec::new(),
+        };
+        run_mixin_phase(Some(&ready), MixinSide::selected(entry_kind), &mut driver)
+    }
+
+    #[test]
+    fn plans_loading_done_then_the_selected_side_per_entry_kind() {
+        // Every kind runs the same two steps in the same order (loading first,
+        // then the environment); only the second label follows `--entry-kind`.
+        for kind in ["client", "client_init"] {
+            assert_eq!(
+                phase_lines(kind, PhaseOutcome::Ok, PhaseOutcome::Ok),
+                ["mixin phase: loading-done ok", "mixin phase: client"]
+            );
+        }
+        for kind in ["server", "server_init"] {
+            assert_eq!(
+                phase_lines(kind, PhaseOutcome::Ok, PhaseOutcome::Ok),
+                ["mixin phase: loading-done ok", "mixin phase: server"]
+            );
+        }
+        for kind in ["main", "init", "preLaunch", "neoforge"] {
+            // A loader-lifecycle probe resolves the default environment and
+            // leaves Mixin's side at `UNKNOWN`.
+            assert_eq!(MixinSide::selected(kind), None);
+            assert_eq!(
+                phase_lines(kind, PhaseOutcome::Ok, PhaseOutcome::Ok),
+                ["mixin phase: loading-done ok", "mixin phase: default"]
+            );
+        }
+        // These are the static fields `get_static_field` reads.
+        assert_eq!(
+            [MixinSide::Client.field(), MixinSide::Server.field()],
+            ["CLIENT", "SERVER"]
+        );
+    }
+
+    #[test]
+    fn reports_each_phase_outcome_without_failing_the_run() {
+        // A Mixin without `onLoadingDone` (0.8.7 ships none) reports it, and the
+        // independent side hand-off still runs.
+        assert_eq!(
+            phase_lines("server", PhaseOutcome::Unavailable, PhaseOutcome::Ok),
+            [
+                "mixin phase: loading-done unavailable",
+                "mixin phase: server"
+            ]
+        );
+        // An unavailable environment ends the plan and is not an error.
+        assert_eq!(
+            phase_lines("client", PhaseOutcome::Ok, PhaseOutcome::Unavailable),
+            [
+                "mixin phase: loading-done ok",
+                "mixin phase: client unavailable"
+            ]
+        );
+        // A throw is one bounded line per step: the fallback label, never the
+        // exception trace, and the plan does not turn into a failed probe.
+        let thrown =
+            PhaseOutcome::Failed("JVM fallback selected for missing façade member".to_owned());
+        assert_eq!(
+            phase_lines("client", thrown.clone(), PhaseOutcome::Ok),
+            [
+                "mixin phase: loading-done failed (JVM fallback selected for missing façade member)",
+                "mixin phase: client"
+            ]
+        );
+        assert_eq!(
+            phase_lines("client", PhaseOutcome::Ok, thrown),
+            [
+                "mixin phase: loading-done ok",
+                "mixin phase: client failed (JVM fallback selected for missing façade member)"
+            ]
+        );
+    }
+
+    #[test]
+    fn phase_runs_only_after_a_ready_bootstrap() {
+        let mut driver = FakePhaseDriver {
+            loading: PhaseOutcome::Ok,
+            environment: PhaseOutcome::Ok,
+            calls: Vec::new(),
+        };
+        // No configs means no Mixin stage and no bootstrap, so the phase plan
+        // must not resolve a Mixin class either.
+        assert!(run_mixin_phase(None, MixinSide::selected("main"), &mut driver).is_empty());
+        // A failed bootstrap leaves Mixin unusable: skip its lifecycle rather
+        // than reporting two more failures for it.
+        let failed: MixinBootstrap =
+            Err("JVM fallback selected for static initialization failure".to_owned());
+        assert!(run_mixin_phase(Some(&failed), Some(MixinSide::Client), &mut driver).is_empty());
+        assert!(driver.calls.is_empty());
     }
 }
