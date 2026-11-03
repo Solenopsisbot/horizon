@@ -836,6 +836,30 @@ mod tests {
 
     /// A mod container saved with more items than its menu has slots: the
     /// menu reads and writes only its count, the rest stay saved.
+    /// A normal block menu's click result is written back into the block
+    /// entity, which is what a declared Java menu now opens as.
+    #[test]
+    fn a_block_menu_writes_its_slots_back_to_the_block_entity() {
+        let mut world = World::new(horizon_world::registry::BlockStateId(0), 0);
+        let k = (0, 64, 0);
+        world
+            .block_entities
+            .insert(k, BlockEntity::Chest(vec![None; 27]));
+        let mut g = guest();
+        let slots = Slots::Block(k);
+        let mut items = slots.read(&world, &g).unwrap();
+        assert_eq!(items.len(), 27);
+        items[3] = Some(ItemStack::new("minecraft:stone", 2));
+        items[8] = Some(ItemStack::new("minecraft:dirt", 1));
+        slots.write(&mut world, &mut g, items);
+        let Some(BlockEntity::Chest(items)) = world.block_entities.get(&k) else {
+            panic!("a chest block entity");
+        };
+        assert_eq!(items[3].as_ref().map(|s| s.count), Some(2));
+        assert_eq!(items[3].as_ref().map(|s| &*s.item), Some("minecraft:stone"));
+        assert_eq!(items[8].as_ref().map(|s| s.count), Some(1));
+    }
+
     #[test]
     fn mod_menu_shows_only_its_container_slots() {
         use crate::containers::{ModBlockEntity, ModContainer};

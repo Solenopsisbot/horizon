@@ -277,6 +277,19 @@ fn note_declared_menu_open(id: &str, block: &str) {
 /// block entity is `entity`: a vanilla-template block entity's inventory up
 /// to `slots`, or nothing when the block has none. A mod's own block entity
 /// keeps its items for its own menu, which the mod fills.
+/// The vanilla chest menu a declared menu of `rows` rows opens as: its slots
+/// back the block entity, so a click persists there.
+fn declared_menu_kind(rows: u8) -> &'static str {
+    match rows {
+        1 => "minecraft:generic_9x1",
+        2 => "minecraft:generic_9x2",
+        3 => "minecraft:generic_9x3",
+        4 => "minecraft:generic_9x4",
+        5 => "minecraft:generic_9x5",
+        _ => "minecraft:generic_9x6",
+    }
+}
+
 fn declared_menu_items(entity: Option<&BlockEntity>, slots: u32) -> Vec<Option<ItemStack>> {
     let Some(entity) = entity else {
         return Vec::new();
@@ -973,11 +986,26 @@ impl Game<'_> {
         };
         if let Some(menu) = declared {
             let rows = super::java_registry::menu_rows(menu.slots);
-            let items = declared_menu_items(self.world.block_entities.get(&pos), menu.slots);
-            if self
-                .native_open_menu_on(host, conn, rows, menu.title(), items)
-                .is_some()
-            {
+            let size = usize::from(rows) * 9;
+            let mut items = declared_menu_items(self.world.block_entities.get(&pos), menu.slots);
+            // The block entity's own slots back the menu: clicks move items
+            // there and persist, instead of a look-only native menu.
+            if matches!(
+                self.world.block_entities.get(&pos),
+                Some(entity) if !matches!(entity, BlockEntity::Mod(_))
+            ) {
+                items.resize(size, None);
+                items.truncate(size);
+                let kind = declared_menu_kind(rows);
+                let title = horizon_client::lan::data::component_nbt(&menu.title().component());
+                self.guest_container_closed(host, conn);
+                self.lan_station_closed(host, conn, None);
+                let hidden = self.native_hidden_slots(pos, items.len());
+                host.hub
+                    .open_container(conn, kind, title, pos, Slots::Block(pos), items);
+                if !hidden.is_empty() {
+                    host.hub.hide_menu_slots(conn, hidden);
+                }
                 let block = &self
                     .res
                     .facts()
@@ -4074,7 +4102,7 @@ fn eye_columns(at: [f64; 3], body: Dimensions) -> [std::ops::RangeInclusive<i32>
 
 #[cfg(test)]
 mod tests {
-    use super::{declared_menu_items, eye_columns};
+    use super::{declared_menu_items, declared_menu_kind, eye_columns};
     use horizon_client::pose::Pose;
     use horizon_client::{containers::BlockEntity, items::ItemStack};
 
@@ -4114,6 +4142,16 @@ mod tests {
         assert!(declared_menu_items(Some(&BlockEntity::DaylightDetector), 27).is_empty());
         // A mod's own entity is not a vanilla-template one.
         assert!(declared_menu_items(Some(&BlockEntity::Mod(Box::default())), 27).is_empty());
+    }
+
+    /// A declared menu of `rows` rows opens as the matching vanilla chest
+    /// size, whose slots back the block entity; 7 rows clamp to six.
+    #[test]
+    fn a_declared_menu_opens_as_the_matching_chest_size() {
+        assert_eq!(declared_menu_kind(1), "minecraft:generic_9x1");
+        assert_eq!(declared_menu_kind(3), "minecraft:generic_9x3");
+        assert_eq!(declared_menu_kind(6), "minecraft:generic_9x6");
+        assert_eq!(declared_menu_kind(7), "minecraft:generic_9x6");
     }
 
     /// #3684: a player shrunk to `minecraft:scale` 0.1 who stands 0.05 from a
