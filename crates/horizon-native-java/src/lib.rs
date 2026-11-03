@@ -1340,6 +1340,31 @@ impl StdHost {
     /// of the instance form or an argument of the interface's static form) and
     /// the entry as an `identifier/<ns>:<path>` marker. Without both markers
     /// the call stays invocation-only: the host never invents ids.
+    /// A Fabric receiver registration: record the channel and its handler so
+    /// a received frame can be dispatched to the same method.
+    fn networking_register(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+        let fabric = r
+            .owner
+            .starts_with("net/fabricmc/fabric/api/networking/v1/")
+            || r.owner
+                .starts_with("net/fabricmc/fabric/api/client/networking/v1/");
+        if !fabric || r.name != "registerGlobalReceiver" || args.len() < 2 {
+            return None;
+        }
+        let direction = if r.owner.contains("client") {
+            "playToClient"
+        } else {
+            "playToServer"
+        };
+        self.payload_registrations.push(PayloadRegistration {
+            direction: direction.to_owned(),
+            payload_type: args[0].clone(),
+            codec: Value::Ref(None),
+            handler: args[1].clone(),
+        });
+        Some(Value::Int(1))
+    }
+
     /// A Fabric networking send: queue the declared channel's frame with the
     /// bytes seeded for its payload marker (empty when none are known).
     fn networking_send(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
@@ -1636,6 +1661,9 @@ impl Host for StdHost {
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
+        if let Some(value) = self.networking_register(r, args) {
+            return Ok(value);
+        }
         if let Some(value) = self.networking_send(r, args) {
             return Ok(value);
         }
@@ -2476,6 +2504,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(value) = self.networking_register(r, args) {
+            return Ok(value);
+        }
         if let Some(value) = self.networking_send(r, args) {
             return Ok(value);
         }
@@ -5614,7 +5645,15 @@ impl Host for StdHost {
                 });
                 Ok(receiver.clone())
             }
-            _ => Ok(Value::default_for(&r.descriptor)),
+            _ => {
+                // The bounded object model has no per-class `toString`; a
+                // marker's text is the fallback a handler can observe (a
+                // payload id, for instance). Specific types answer above.
+                if r.name == "toString" && r.descriptor == "()Ljava/lang/String;" {
+                    return Ok(Value::Ref(Some(value_text(receiver))));
+                }
+                Ok(Value::default_for(&r.descriptor))
+            }
         }
     }
 }
@@ -12760,6 +12799,121 @@ impl<'a> Reader<'a> {
         let b = self.bytes(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
+}
+
+/// Invoke the handler a registered payload channel names, through the native
+/// interpreter, with the received frame as its payload argument. Returns
+/// `false` when no registration matches `id` or its handler is not an
+/// in-jar lambda this bounded path can call.
+///
+/// The payload argument is a bounded marker (`payload/<id>/<hex>`), so a
+/// handler's `toString` sees the channel and the first bytes without the
+/// interpreter modelling the real payload object.
+pub fn dispatch_payload_frame(
+    jar: &NativeJar,
+    host: &mut StdHost,
+    registrations: &[PayloadRegistration],
+    id: &str,
+    bytes: &[u8],
+) -> Result<bool, NativeError> {
+    let Some(registration) = registrations.iter().find(|registration| {
+        matches!(
+            &registration.payload_type,
+            Value::Ref(Some(marker)) if host.packet_types.get(marker).is_some_and(|known| known == id)
+        )
+    }) else {
+        return Ok(false);
+    };
+    let Value::Ref(Some(marker)) = &registration.handler else {
+        return Ok(false);
+    };
+    let Some((target, captures)) = parse_dynamic_handler(marker) else {
+        return Ok(false);
+    };
+    let class = jar.classes.get(&target.owner).ok_or_else(|| {
+        NativeError::MissingMethod(format!(
+            "{}#{}{}",
+            target.owner, target.name, target.descriptor
+        ))
+    })?;
+    let method = class
+        .method(&target.name, &target.descriptor)
+        .ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                target.owner, target.name, target.descriptor
+            ))
+        })?;
+    let (receiver, mut args) = if method.is_static() {
+        (None, captures)
+    } else {
+        let (receiver, rest) = captures
+            .split_first()
+            .ok_or_else(|| NativeError::Metadata("payload handler lost its receiver".into()))?;
+        (Some(receiver.clone()), rest.to_vec())
+    };
+    let hex: String = bytes
+        .iter()
+        .take(256)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    args.push(Value::Ref(Some(format!("payload/{id}/{hex}"))));
+    args.push(Value::Ref(Some(format!("payload-context/{id}"))));
+    jar.invoke_method_with_args(
+        &target.owner,
+        &target.name,
+        &target.descriptor,
+        receiver,
+        &args,
+        host,
+    )?;
+    Ok(true)
+}
+
+/// Parse an `@indy:` handler marker into its implementation method and bound
+/// captures. Runtime arguments (the payload and context) are not included.
+fn parse_dynamic_handler(marker: &str) -> Option<(MethodRef, Vec<Value>)> {
+    let rest = marker.strip_prefix("@indy:")?;
+    let (head, captures) = rest.rsplit_once(':')?;
+    let (head, target) = head.rsplit_once(':')?;
+    let (_class_method, _index) = head.rsplit_once(':')?;
+    let (owner, name_desc) = target.split_once('#')?;
+    let (name, descriptor) = name_desc.split_once('(')?;
+    let target = MethodRef {
+        owner: owner.to_owned(),
+        name: name.to_owned(),
+        descriptor: format!("({descriptor}"),
+    };
+    let mut values = Vec::new();
+    for capture in split_dynamic_captures(captures) {
+        values.push(parse_value_marker(&capture).ok()?);
+    }
+    Some((target, values))
+}
+
+/// Split a marker's captures on unescaped commas.
+fn split_dynamic_captures(captures: &str) -> Vec<String> {
+    if captures.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in captures.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            current.push(ch);
+            escaped = true;
+        } else if ch == ',' {
+            out.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    out.push(current);
+    out
 }
 
 #[cfg(test)]
