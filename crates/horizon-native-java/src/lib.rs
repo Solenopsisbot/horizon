@@ -6174,6 +6174,121 @@ impl NativeJar {
         })
     }
 
+    /// Execute an ordered chain of compatible void-only injectors while invoking
+    /// the target body exactly once. Plans must share the same target and anchor.
+    /// This is the bounded dispatch table used when multiple mixins attach to one
+    /// native hook; cancellation, return-value callbacks, and mixed anchors stay
+    /// on the JVM fallback.
+    pub fn execute_mixin_chain<H: Host>(
+        &self,
+        plans: &[MixinInjectionPlan],
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        let Some(first) = plans.first() else {
+            return Err(NativeError::Metadata("native Mixin chain is empty".into()));
+        };
+        if plans
+            .iter()
+            .any(|plan| plan.target != first.target || plan.at != first.at || plan.cancellable)
+        {
+            return Err(NativeError::Metadata(
+                "native Mixin chain requires one target, one anchor, and non-cancellable callbacks"
+                    .into(),
+            ));
+        }
+        let mut report = match first.at.as_str() {
+            "HEAD" => self.execute_mixin_at_head(first, receiver.clone(), args, host)?,
+            "RETURN" | "TAIL" => {
+                self.execute_mixin_at_return(first, receiver.clone(), args, host)?
+            }
+            other => {
+                return Err(NativeError::Metadata(format!(
+                    "native Mixin chain does not support anchor {other}"
+                )));
+            }
+        };
+        for plan in &plans[1..] {
+            report.callback_result =
+                self.invoke_mixin_callback(plan, receiver.clone(), args, host)?;
+        }
+        Ok(report)
+    }
+
+    fn invoke_mixin_callback<H: Host>(
+        &self,
+        plan: &MixinInjectionPlan,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<Value, NativeError> {
+        let target_class = self.classes.get(&plan.target.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                plan.target.owner, plan.target.name, plan.target.descriptor
+            ))
+        })?;
+        if target_class
+            .method(&plan.target.name, &plan.target.descriptor)
+            .is_none()
+        {
+            return Err(NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                plan.target.owner, plan.target.name, plan.target.descriptor
+            )));
+        }
+        let callback_class = self.classes.get(&plan.callback.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                plan.callback.owner, plan.callback.name, plan.callback.descriptor
+            ))
+        })?;
+        let callback_method = callback_class
+            .method(&plan.callback.name, &plan.callback.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                ))
+            })?;
+        if return_desc(&plan.callback.descriptor) != "V" {
+            return Err(NativeError::Metadata(
+                "native Mixin chain callbacks must return void".into(),
+            ));
+        }
+        let target_args = descriptor_arguments(&plan.target.descriptor);
+        let callback_args = descriptor_arguments(&plan.callback.descriptor);
+        let mut callback_values = args.to_vec();
+        if callback_args != target_args {
+            if callback_args.len() == target_args.len() + 1
+                && callback_args
+                    .last()
+                    .is_some_and(|arg| is_callback_info_descriptor(arg))
+                && callback_args[..target_args.len()] == target_args[..]
+            {
+                callback_values.push(Value::Ref(Some(format!(
+                    "mixin/callback-info/{}/{}",
+                    plan.target.owner, plan.target.name
+                ))));
+            } else {
+                return Err(NativeError::Metadata(
+                    "native Mixin chain callback arguments do not mirror the target".into(),
+                ));
+            }
+        }
+        let callback_receiver = (!callback_method.is_static())
+            .then(|| receiver.unwrap_or_else(|| Value::Ref(Some(plan.callback.owner.clone()))));
+        self.invoke_method_with_args(
+            &plan.callback.owner,
+            &plan.callback.name,
+            &plan.callback.descriptor,
+            callback_receiver,
+            &callback_values,
+            host,
+        )
+    }
+
     /// Execute the bounded void-only form of `@Inject(at = RETURN|TAIL)`.
     ///
     /// Return-value callbacks need a `CallbackInfoReturnable` object and a
@@ -15487,6 +15602,71 @@ mandatory = true
             .unwrap();
         assert_eq!(report.callback_result, Value::Void);
         assert_eq!(report.target_result, Value::Int(5));
+    }
+
+    #[test]
+    fn executes_mixin_chain_callbacks_and_target_once() {
+        let target = ClassFile {
+            name: "demo/Target".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "tick".into(),
+                descriptor: "()I".into(),
+                access: 9,
+                code: Some(vec![0x08, 0xac]),
+                max_locals: 0,
+            }],
+        };
+        let callback = |name: &str| ClassFile {
+            name: format!("demo/{name}"),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "onTick".into(),
+                descriptor: "()V".into(),
+                access: 9,
+                code: Some(vec![0xb1]),
+                max_locals: 0,
+            }],
+        };
+        let jar = NativeJar::from_classes([target, callback("MixinA"), callback("MixinB")]);
+        let target_ref = MethodRef {
+            owner: "demo/Target".into(),
+            name: "tick".into(),
+            descriptor: "()I".into(),
+        };
+        let plans = [
+            MixinInjectionPlan::inject_at_head(
+                target_ref.clone(),
+                MethodRef {
+                    owner: "demo/MixinA".into(),
+                    name: "onTick".into(),
+                    descriptor: "()V".into(),
+                },
+            ),
+            MixinInjectionPlan::inject_at_head(
+                target_ref,
+                MethodRef {
+                    owner: "demo/MixinB".into(),
+                    name: "onTick".into(),
+                    descriptor: "()V".into(),
+                },
+            ),
+        ];
+        let report = jar
+            .execute_mixin_chain(&plans, None, &[], &mut NullHost)
+            .unwrap();
+        assert_eq!(report.callback_result, Value::Void);
+        assert_eq!(report.target_result, Value::Int(5));
+        let chain = jar
+            .execute_mixin_chain(&[plan.clone(), plan], None, &[], &mut NullHost)
+            .unwrap();
+        assert_eq!(chain.target_result, Value::Int(5));
     }
 
     #[test]
