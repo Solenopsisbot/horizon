@@ -957,10 +957,10 @@ The implementation is deliberately bounded at this stage. The census reads Mixin
 retains descriptors, selectors, slices, ordering and contract values, and emits a translation plan; it does
 not execute a config or weave bytecode. The façade generator materializes public `@Accessor`/`@Invoker`
 interfaces when their signatures are linkable, which is enough for casts and bootstrap code, but it does
-not give an accessor the real field or call semantics. The native interpreter currently accepts only
-`MixinInjectionPlan::inject_at_head` with a non-cancellable callback. A plan with `RETURN`, `INVOKE`,
-`FIELD`, a cancellable `CallbackInfo`, or an unsupported descriptor is a named diagnostic and must use the
-embedded JVM path; it is never silently treated as a no-op.
+not give an accessor the real field or call semantics. The native interpreter accepts bounded void-only `MixinInjectionPlan` callbacks at `HEAD`, `RETURN`, and
+`TAIL` when they are non-cancellable and have mirrored arguments. A plan with `INVOKE`, `FIELD`, a
+non-void return-value callback, a cancellable `CallbackInfo`, or an unsupported descriptor is a named
+diagnostic and must use the embedded JVM path; it is never silently treated as a no-op.
 
 The live adapter will be added in bounded slices. At startup it will reject a required or unresolved plan
 before the world opens, sort accepted callbacks by config priority then injector order, and install one
@@ -973,20 +973,19 @@ and leaves arbitrary weaving, reflection and unmodelled cancellation to `horizon
 
 | Construct | Works | How |
 |---|---|---|
-| `@Inject` at HEAD / RETURN / TAIL | yes | the hook at that named point; the body runs in Java with the mirrored arguments |
+| `@Inject` at HEAD / RETURN / TAIL (void, non-cancellable) | bounded | the callback runs at the named hook with mirrored arguments; return-value and cancellation semantics use the JVM fallback |
 | `@Inject` at INVOKE / FIELD | only on demand | a per-callsite hook, generated when the census shows more than a handful of mods want it |
 | `@ModifyVariable`, `@ModifyArg`, `@ModifyConstant` | yes | the hook exposes the variable by name |
 | `@Redirect`, `@WrapOperation` | yes | a per-callsite hook hands the callee's arguments to the mod and takes its result |
-| `@Overwrite` | only where Horizon already routes the method to a hook | otherwise refused, with the method named |
+| `@Overwrite` | bounded | a single-hook empty-`@At` plan is emitted as an executable replacement; other overwrite shapes remain report-only |
 | `@Accessor`, `@Invoker` | bounded | target stubs materialize public interfaces for linkage; common JDK/collection returns are empty or neutral values, while game generic signatures and field/call semantics still need a hook |
 | `@Shadow` | yes | fields and methods exist because the façade was generated with them |
 | Mixin into a class with no façade | no | the census lists it; adding a façade class is the fix, not a workaround |
 
-The native probe now has one executable translation boundary for the first
-common injector shape: `NativeJar::execute_mixin_at_head` runs a `void`
-`@Inject(at = HEAD)` callback before its target and mirrors the target
-arguments, with a deterministic `CallbackInfo` marker when the callback asks
-for one. Return/Tail, cancellation, and callback bytecode that changes the
+The native probe now has executable boundaries for the common void-only injector shapes: `NativeJar`
+runs `@Inject(at = HEAD)` before its target and `RETURN`/`TAIL` after it, mirroring target arguments and
+using deterministic `CallbackInfo` markers when requested. Non-void return-value callbacks, cancellation,
+and unsupported anchors remain on the JVM fallback. Return/Tail, cancellation, and callback bytecode that changes the
 target result still use the JVM fallback; the census and translation plan keep
 those cases visible until their native contracts are implemented.
 
@@ -1078,8 +1077,8 @@ worse than a native mod, which at least passed a human.
 
 - `--java-mod` is currently a bounded native startup path for all three authoritative roles: the window
   client, the integrated server, and `--dedicated`. The host advertises `CLIENT` only for the window and
-  `SERVER` for both server roles; a `clientSideOnly` jar is rejected before a server world opens. The
-  integrated server and dedicated server therefore select server entrypoints today, while a client-only
+  `SERVER` for both server roles; a `clientSideOnly` jar is skipped before constructor loading on integrated and dedicated servers. Both
+  server roles therefore select server entrypoints today, while a client-only
   entrypoint never runs on the server by accident.
 - Single player and LAN host keep the Java startup state in the authoritative process. A remote window is a
   mirror and does not execute server lifecycle callbacks. The existing lifecycle ledger gives the future
