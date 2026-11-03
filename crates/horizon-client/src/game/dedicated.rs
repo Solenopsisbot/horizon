@@ -6,7 +6,9 @@
 //! its simulation and the play-state hub that LAN hosting uses, configured
 //! from server.properties, with the operator, whitelist and ban lists and a
 //! console on standard input.
-use super::{Game, Options, lan::LanSettings, world_loading::WorldRequest};
+use super::{
+    Game, Options, execution_role::ExecutionRole, lan::LanSettings, world_loading::WorldRequest,
+};
 use horizon_client::{
     Result,
     lan::{LoginGate, NetConfig, NetLog, OnlineMode, hub::HubConfig},
@@ -225,6 +227,24 @@ fn capture_log(f: impl FnOnce()) -> Vec<String> {
     CAPTURE.set(Some(Vec::new()));
     f();
     CAPTURE.take().unwrap_or_default()
+}
+
+/// Load explicitly selected Java mods for the standalone dedicated role.
+///
+/// Keeping this boundary in the dedicated server module makes the role visible in
+/// diagnostics and prevents a future startup path from accidentally using the
+/// client or integrated-server entrypoint selection.
+fn load_java_mod_paths(paths: &[PathBuf]) -> Result<Vec<horizon_client::mod_content::ContentMod>> {
+    super::mods::run_java_mods(paths, ExecutionRole::DedicatedServer)
+        .map_err(|error| format!("dedicated Java mod startup failed: {error}").into())
+}
+
+pub(super) fn load_java_mods(options: &mut Options) -> Result<()> {
+    if options.java_mods.is_empty() {
+        return Ok(());
+    }
+    options.java_content = Arc::new(load_java_mod_paths(&options.java_mods)?);
+    Ok(())
 }
 
 /// Main.main up to the server start: arguments, server.properties (stored
@@ -1780,5 +1800,19 @@ mod tests {
             assert_log_lines(&fs::read_to_string(home.join("logs/latest.log")).unwrap());
             fs::remove_dir_all(home).unwrap();
         }
+    }
+
+    #[test]
+    fn dedicated_java_loader_names_role_in_failure() {
+        let path = std::path::PathBuf::from("/tmp/horizon-missing-dedicated-java-mod.jar");
+        let error = super::load_java_mod_paths(&[path]).unwrap_err().to_string();
+        assert!(
+            error.contains("dedicated Java mod startup failed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("horizon-missing-dedicated-java-mod.jar"),
+            "{error}"
+        );
     }
 }

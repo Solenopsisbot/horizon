@@ -17573,10 +17573,14 @@ pub fn run() -> Result<()> {
         }
         return Err(error.into());
     }
-    options.java_content = Arc::new(
-        mods::run_java_mods(&options.java_mods, options.execution_role)
-            .map_err(|error| format!("native Java mod startup failed: {error}"))?,
-    );
+    if options.execution_role == execution_role::ExecutionRole::DedicatedServer {
+        dedicated::load_java_mods(&mut options)?;
+    } else {
+        options.java_content = Arc::new(
+            mods::run_java_mods(&options.java_mods, options.execution_role)
+                .map_err(|error| format!("native Java mod startup failed: {error}"))?,
+        );
+    }
     // Someone is playing: the anonymous ping behind the launcher's "N playing now", and the
     // official server in their list (servers.dat in the game folder, the working directory). Not
     // for a server, a benchmark, a run that quits by itself, a harness's fixture or a run that
