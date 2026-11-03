@@ -98,6 +98,35 @@ pub fn generate_many(
             .iter()
             .any(|r| r == "net/fabricmc/fabric/api/networking/v1/PayloadTypeRegistry")
     });
+    // Fabric's play-stage networking classes are library classes too. They only
+    // appear in the façade when the real API jar is absent, and they retain the
+    // handlers a mod registers instead of moving a payload anywhere.
+    let names_fabric = |name: &str| {
+        target
+            .iter()
+            .any(|class| class.refs.iter().any(|r| r.split('$').next() == Some(name)))
+    };
+    let uses_server_networking =
+        names_fabric("net/fabricmc/fabric/api/networking/v1/ServerPlayNetworking");
+    let uses_client_networking =
+        names_fabric("net/fabricmc/fabric/api/client/networking/v1/ClientPlayNetworking");
+    let uses_fabric_networking = uses_server_networking
+        || uses_client_networking
+        || names_fabric("net/fabricmc/fabric/api/networking/v1/PacketSender");
+    // `ClientPlayNetworking.Context#player()` names the client player type. It
+    // is a client-only game class (26.3 still calls it `LocalPlayer`), so a
+    // server-shaped jar leaves it unresolved and the client shim is reported
+    // instead of emitted with an invented type.
+    let fabric_client_player = uses_client_networking
+        .then(|| {
+            [
+                "net/minecraft/client/player/LocalPlayer",
+                "net/minecraft/client/player/AbstractClientPlayer",
+            ]
+            .into_iter()
+            .find(|name| game.contains_key(*name) && !lib_names.contains(*name))
+        })
+        .flatten();
     // Fabric's client modules (HUD rendering, client ticks, key bindings, item
     // tooltips) are library classes as well: they are emitted below only when
     // the real API class is absent, and only when the client game types their
@@ -255,6 +284,26 @@ pub fn generate_many(
             }
         }
     }
+    // The networking shims name the payload type and the connection's player.
+    // A mod that only registers a handler never carries a reference to `Type`
+    // itself, so seed the classes the emitted signatures name; `Type` pulls its
+    // outer class in through the nested-class pass below.
+    if uses_fabric_networking {
+        for name in [
+            "net/minecraft/network/protocol/common/custom/CustomPacketPayload",
+            "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type",
+            "net/minecraft/resources/Identifier",
+            "net/minecraft/server/level/ServerPlayer",
+            "net/minecraft/client/multiplayer/ClientPacketListener",
+        ] {
+            if game.contains_key(name) && !lib_names.contains(name) && !own.contains(name) {
+                wanted.insert(name.to_owned());
+            }
+        }
+        if let Some(name) = fabric_client_player {
+            wanted.insert(name.to_owned());
+        }
+    }
     // The client and registration shims name game types in their signatures, and
     // a mod that writes `EVENT.register((context, ticks) -> {})` carries no
     // reference to them. Resolve each role against the game jar (26.3 renamed
@@ -320,6 +369,20 @@ pub fn generate_many(
                     .insert((m.name.clone(), m.descriptor.clone()));
             }
         }
+    }
+    // The networking shims key handlers by `CustomPacketPayload.Type#id()`. A
+    // mod that only hands a `Type` to `registerGlobalReceiver` never names that
+    // accessor itself, so add it to the closure explicitly (it also pulls the
+    // `Identifier` it returns into the façade).
+    if uses_fabric_networking {
+        used.entry(
+            "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type".to_owned(),
+        )
+        .or_default()
+        .insert((
+            "id".to_owned(),
+            "()Lnet/minecraft/resources/Identifier;".to_owned(),
+        ));
     }
     // Accessor and invoker mixins are Java interfaces whose methods are
     // normally materialized by Mixin on the target class. The façade has no
@@ -584,6 +647,66 @@ pub fn generate_many(
         fs::write(&payload_registry_file, FABRIC_PAYLOAD_TYPE_REGISTRY)
             .map_err(|e| format!("{}: {e}", payload_registry_file.display()))?;
         files.push(payload_registry_file);
+    }
+    // Fabric API's play-stage networking: the receiver maps are real (they key
+    // handlers by payload type id and `canSend` reads them), while `send` and
+    // `sendToServer` are bounded markers that record the type id and direction.
+    // Each class is emitted only when the real API class is absent and every
+    // game type its signatures name resolves on this jar.
+    if uses_fabric_networking {
+        let payload = "net/minecraft/network/protocol/common/custom/CustomPacketPayload";
+        let payload_type = "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type";
+        emit_networking_shim(
+            &mut files,
+            &mut report,
+            &src,
+            &available,
+            &game,
+            "net/fabricmc/fabric/api/networking/v1/PacketSender",
+            &[payload],
+            || FABRIC_PACKET_SENDER.to_owned(),
+        )?;
+        if uses_server_networking {
+            emit_networking_shim(
+                &mut files,
+                &mut report,
+                &src,
+                &available,
+                &game,
+                "net/fabricmc/fabric/api/networking/v1/ServerPlayNetworking",
+                &[
+                    payload,
+                    payload_type,
+                    "net/minecraft/server/level/ServerPlayer",
+                    "net/minecraft/resources/Identifier",
+                ],
+                || FABRIC_SERVER_PLAY_NETWORKING.to_owned(),
+            )?;
+        }
+        let client = "net/fabricmc/fabric/api/client/networking/v1/ClientPlayNetworking";
+        if uses_client_networking && !available.contains(client) {
+            match fabric_client_player {
+                Some(player) => emit_networking_shim(
+                    &mut files,
+                    &mut report,
+                    &src,
+                    &available,
+                    &game,
+                    client,
+                    &[
+                        payload,
+                        payload_type,
+                        "net/minecraft/client/multiplayer/ClientPacketListener",
+                        player,
+                        "net/minecraft/resources/Identifier",
+                    ],
+                    || FABRIC_CLIENT_PLAY_NETWORKING.replace("{player}", &java_name(player)),
+                )?,
+                None => report.missing.push(format!(
+                    "{client} (needs client type net/minecraft/client/player/LocalPlayer)"
+                )),
+            }
+        }
     }
     // Fabric API's lifecycle/player event holders and the command registration
     // callback: registration order is preserved, `invoker()` returns the
@@ -1703,6 +1826,177 @@ public final class PayloadTypeRegistry {
 }
 "#;
 
+/// Bounded Fabric API `PacketSender`: the response sender a receiver context
+/// hands back. Only the payload overload is modelled; a packet-object send is
+/// a gap until the Host can carry it.
+const FABRIC_PACKET_SENDER: &str = r#"package net.fabricmc.fabric.api.networking.v1;
+
+public interface PacketSender {
+    void sendPacket(net.minecraft.network.protocol.common.custom.CustomPacketPayload payload);
+}
+"#;
+
+/// Bounded Fabric API `ServerPlayNetworking`. Registration is real: handlers
+/// are retained per payload type id (the same key `Type#id()` yields), a second
+/// registration for a type returns false and leaves the first handler in place,
+/// and `canSend` answers from that map. `send` is a marker: it records the
+/// direction and payload type id in a static list instead of moving a packet.
+const FABRIC_SERVER_PLAY_NETWORKING: &str = r#"package net.fabricmc.fabric.api.networking.v1;
+
+public final class ServerPlayNetworking {
+    private static final java.util.Map<String, PlayPayloadHandler> horizonReceivers = new java.util.LinkedHashMap<>();
+    private static final java.util.List<String> horizonSends = new java.util.ArrayList<>();
+
+    private ServerPlayNetworking() {}
+
+    public static boolean registerGlobalReceiver(net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type, PlayPayloadHandler handler) {
+        if (type == null || handler == null) return false;
+        String id = horizonTypeId(type);
+        if (horizonReceivers.containsKey(id)) return false;
+        horizonReceivers.put(id, handler);
+        return true;
+    }
+
+    public static boolean canSend(net.minecraft.server.level.ServerPlayer player, net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type) {
+        return type != null && horizonReceivers.containsKey(horizonTypeId(type));
+    }
+
+    public static void send(net.minecraft.server.level.ServerPlayer player, net.minecraft.network.protocol.common.custom.CustomPacketPayload payload) {
+        horizonRecord("playToClient", payload);
+    }
+
+    /** The handler retained for a payload type id, or null. */
+    public static PlayPayloadHandler horizonReceiver(String id) {
+        return horizonReceivers.get(id);
+    }
+
+    /** Send markers recorded in call order as `direction typeId`. */
+    public static java.util.List<String> horizonSends() {
+        return new java.util.ArrayList<>(horizonSends);
+    }
+
+    private static String horizonTypeId(net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type) {
+        try {
+            return type.id() == null ? "<null>" : type.id().toString();
+        } catch (Throwable ignored) {
+            return "<unknown>";
+        }
+    }
+
+    private static void horizonRecord(String direction, net.minecraft.network.protocol.common.custom.CustomPacketPayload payload) {
+        String id = "<unknown>";
+        if (payload != null) {
+            try {
+                net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type = payload.type();
+                if (type != null && type.id() != null) id = type.id().toString();
+            } catch (Throwable ignored) {
+            }
+        }
+        horizonSends.add(direction + " " + id);
+    }
+
+    @FunctionalInterface
+    public interface PlayPayloadHandler {
+        void receive(net.minecraft.network.protocol.common.custom.CustomPacketPayload payload, Context context);
+    }
+
+    /** The packet-API name for the same bounded callback shape. */
+    @FunctionalInterface
+    public interface PlayChannelHandler {
+        void receive(net.minecraft.network.protocol.common.custom.CustomPacketPayload payload, Context context);
+    }
+
+    public interface Context {
+        net.minecraft.server.level.ServerPlayer player();
+        net.fabricmc.fabric.api.networking.v1.PacketSender responseSender();
+    }
+}
+"#;
+
+/// Bounded Fabric API `ClientPlayNetworking`, the client package the real API
+/// uses. It keeps the same per-type receiver map and `canSend` answer as the
+/// server holder; `send` and `sendToServer` record `playToServer` markers.
+/// `{player}` is filled with the resolved 26.3 client player class.
+const FABRIC_CLIENT_PLAY_NETWORKING: &str = r#"package net.fabricmc.fabric.api.client.networking.v1;
+
+public final class ClientPlayNetworking {
+    private static final java.util.Map<String, PlayPayloadHandler> horizonReceivers = new java.util.LinkedHashMap<>();
+    private static final java.util.List<String> horizonSends = new java.util.ArrayList<>();
+
+    private ClientPlayNetworking() {}
+
+    public static boolean registerGlobalReceiver(net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type, PlayPayloadHandler handler) {
+        if (type == null || handler == null) return false;
+        String id = horizonTypeId(type);
+        if (horizonReceivers.containsKey(id)) return false;
+        horizonReceivers.put(id, handler);
+        return true;
+    }
+
+    public static boolean canSend(net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type) {
+        return type != null && horizonReceivers.containsKey(horizonTypeId(type));
+    }
+
+    public static boolean canSend(net.minecraft.client.multiplayer.ClientPacketListener listener, net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type) {
+        return canSend(type);
+    }
+
+    public static void send(net.minecraft.network.protocol.common.custom.CustomPacketPayload payload) {
+        horizonRecord("playToServer", payload);
+    }
+
+    public static void sendToServer(net.minecraft.network.protocol.common.custom.CustomPacketPayload payload) {
+        horizonRecord("playToServer", payload);
+    }
+
+    /** The handler retained for a payload type id, or null. */
+    public static PlayPayloadHandler horizonReceiver(String id) {
+        return horizonReceivers.get(id);
+    }
+
+    /** Send markers recorded in call order as `direction typeId`. */
+    public static java.util.List<String> horizonSends() {
+        return new java.util.ArrayList<>(horizonSends);
+    }
+
+    private static String horizonTypeId(net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type) {
+        try {
+            return type.id() == null ? "<null>" : type.id().toString();
+        } catch (Throwable ignored) {
+            return "<unknown>";
+        }
+    }
+
+    private static void horizonRecord(String direction, net.minecraft.network.protocol.common.custom.CustomPacketPayload payload) {
+        String id = "<unknown>";
+        if (payload != null) {
+            try {
+                net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type = payload.type();
+                if (type != null && type.id() != null) id = type.id().toString();
+            } catch (Throwable ignored) {
+            }
+        }
+        horizonSends.add(direction + " " + id);
+    }
+
+    @FunctionalInterface
+    public interface PlayPayloadHandler {
+        void receive(net.minecraft.network.protocol.common.custom.CustomPacketPayload payload, Context context);
+    }
+
+    /** The packet-API name for the same bounded callback shape. */
+    @FunctionalInterface
+    public interface PlayChannelHandler {
+        void receive(net.minecraft.network.protocol.common.custom.CustomPacketPayload payload, Context context);
+    }
+
+    public interface Context {
+        {player} player();
+        net.fabricmc.fabric.api.networking.v1.PacketSender responseSender();
+    }
+}
+"#;
+
 /// Bounded Fabric API `Event`: listeners stay in registration order and
 /// `invoker()` returns their combined handler. The interface mirrors the two
 /// members a mod calls (`register`, `invoker`); phases are not modelled, so a
@@ -2617,6 +2911,36 @@ impl ClientShims<'_> {
         }
         write_shim(files, self.src, class, &source())
     }
+}
+
+/// Emits one Fabric networking shim: a real API class is never shadowed, and a
+/// shim whose signature names a game class this jar does not carry is reported
+/// instead of emitted with an invented type.
+fn emit_networking_shim(
+    files: &mut Vec<PathBuf>,
+    report: &mut Report,
+    src: &Path,
+    available: &BTreeSet<String>,
+    game: &BTreeMap<String, Class>,
+    class: &str,
+    requires: &[&str],
+    source: impl FnOnce() -> String,
+) -> Result<(), String> {
+    if available.contains(class) {
+        return Ok(());
+    }
+    let missing: Vec<&str> = requires
+        .iter()
+        .copied()
+        .filter(|ty| !game.contains_key(*ty))
+        .collect();
+    if !missing.is_empty() {
+        report
+            .missing
+            .push(format!("{class} (needs {})", missing.join(", ")));
+        return Ok(());
+    }
+    write_shim(files, src, class, &source())
 }
 
 /// Writes one generated shim and records it for the `javac` source list.
@@ -6540,6 +6864,210 @@ mod tests {
         assert!(output.status.success(), "payload probe failed: {stderr}");
         assert!(
             stdout.contains("horizon payload registries ok"),
+            "probe output: {stdout}{stderr}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fabric_networking_facades_match_the_api_shapes() {
+        let source = include_str!("facade.rs");
+        // The slice is selected by the API classes a target names, and the game
+        // types its signatures need are seeded because a mod that only calls
+        // `registerGlobalReceiver` may never name `Type` itself.
+        let detection = [
+            "let uses_server_networking =",
+            "        names_fabric(\"net/fabricmc/fabric/api/networking/v1/ServerPlayNetworking\");",
+        ]
+        .join("\n");
+        assert!(source.contains(&detection));
+        assert!(source.contains(
+            &["if uses_client_networking", "!available.contains(client) {"].join(" && ")
+        ));
+        assert!(source.contains(
+            "\"net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type\","
+        ));
+        assert!(source.contains(
+            "used.entry(\n            \"net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type\".to_owned(),\n        )"
+        ));
+        // A real API class is never shadowed, and a shim whose game types are
+        // absent is reported rather than invented.
+        assert!(source.contains("if available.contains(class) {\n        return Ok(());\n    }"));
+        assert!(source.contains("report\n            .missing\n            .push(format!(\"{class} (needs {})\", missing.join(\", \")));"));
+        assert!(source.contains("None => report.missing.push(format!(\n"));
+        // Server holder: exact signatures and the per-type receiver map.
+        for fragment in [
+            "public static boolean registerGlobalReceiver(net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type, PlayPayloadHandler handler)",
+            "public static boolean canSend(net.minecraft.server.level.ServerPlayer player, net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type)",
+            "public static void send(net.minecraft.server.level.ServerPlayer player, net.minecraft.network.protocol.common.custom.CustomPacketPayload payload)",
+            "horizonRecord(\"playToClient\", payload);",
+            "void receive(net.minecraft.network.protocol.common.custom.CustomPacketPayload payload, Context context);",
+            "net.minecraft.server.level.ServerPlayer player();",
+            "net.fabricmc.fabric.api.networking.v1.PacketSender responseSender();",
+            "public interface PlayChannelHandler {",
+        ] {
+            assert!(
+                FABRIC_SERVER_PLAY_NETWORKING.contains(fragment),
+                "server shim missing: {fragment}"
+            );
+        }
+        // Client holder: the real client package, both `canSend` forms the
+        // façade can answer, and `sendToServer` as the requested alias.
+        for fragment in [
+            "public static boolean registerGlobalReceiver(net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type, PlayPayloadHandler handler)",
+            "public static boolean canSend(net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type)",
+            "public static boolean canSend(net.minecraft.client.multiplayer.ClientPacketListener listener, net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type type)",
+            "public static void send(net.minecraft.network.protocol.common.custom.CustomPacketPayload payload)",
+            "public static void sendToServer(net.minecraft.network.protocol.common.custom.CustomPacketPayload payload)",
+            "horizonRecord(\"playToServer\", payload);",
+            "{player} player();",
+        ] {
+            assert!(
+                FABRIC_CLIENT_PLAY_NETWORKING.contains(fragment),
+                "client shim missing: {fragment}"
+            );
+        }
+        assert!(
+            source.contains(
+                "FABRIC_CLIENT_PLAY_NETWORKING.replace(\"{player}\", &java_name(player))"
+            )
+        );
+        assert!(
+            FABRIC_PACKET_SENDER
+                .contains("void sendPacket(net.minecraft.network.protocol.common.custom.CustomPacketPayload payload);")
+        );
+    }
+
+    /// Handler retention and the send markers are behaviour, so the two
+    /// networking holders are compiled and run against bounded game stubs.
+    #[test]
+    fn fabric_networking_retains_handlers_and_records_sends() {
+        use std::{path::PathBuf, process::Command};
+        let probe = r#"public class NetworkingProbe {
+    public static final class Payload implements net.minecraft.network.protocol.common.custom.CustomPacketPayload {
+        private final Type horizonType;
+        Payload(String id) { this.horizonType = new Type(new net.minecraft.resources.Identifier("mod", id)); }
+        public Type type() { return horizonType; }
+    }
+
+    public static void main(String[] args) {
+        net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type one =
+            new net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type(new net.minecraft.resources.Identifier("mod", "one"));
+        net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type two =
+            new net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type(new net.minecraft.resources.Identifier("mod", "two"));
+        net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type three =
+            new net.minecraft.network.protocol.common.custom.CustomPacketPayload.Type(new net.minecraft.resources.Identifier("mod", "three"));
+        final int[] calls = new int[2];
+        boolean first = net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.registerGlobalReceiver(one, (payload, context) -> calls[0]++);
+        boolean duplicate = net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.registerGlobalReceiver(one, (payload, context) -> calls[1]++);
+        boolean second = net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.registerGlobalReceiver(two, (payload, context) -> calls[1] += 10);
+        if (!first || duplicate || !second) throw new AssertionError("register flags");
+        if (!net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.canSend(null, one)) throw new AssertionError("canSend one");
+        if (!net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.canSend(null, two)) throw new AssertionError("canSend two");
+        if (net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.canSend(null, three)) throw new AssertionError("canSend three");
+        if (net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.horizonReceiver("mod:one") == null) throw new AssertionError("receiver one");
+        if (net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.horizonReceiver("mod:two") == null) throw new AssertionError("receiver two");
+        net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.horizonReceiver("mod:one").receive(new Payload("x"), null);
+        net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.horizonReceiver("mod:two").receive(new Payload("x"), null);
+        if (calls[0] != 1 || calls[1] != 10) throw new AssertionError("handler retention " + calls[0] + " " + calls[1]);
+        net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.send(null, new Payload("serverSend"));
+        java.util.List<String> serverSends = net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.horizonSends();
+        if (serverSends.size() != 1 || !"playToClient mod:serverSend".equals(serverSends.get(0))) throw new AssertionError("server send " + serverSends);
+
+        boolean clientFirst = net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.registerGlobalReceiver(one, (payload, context) -> calls[0]++);
+        if (!clientFirst) throw new AssertionError("client register");
+        if (!net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.canSend(one)) throw new AssertionError("client canSend");
+        if (!net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.canSend((net.minecraft.client.multiplayer.ClientPacketListener) null, one)) throw new AssertionError("client listener canSend");
+        if (net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.canSend(three)) throw new AssertionError("client canSend three");
+        net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.send(new Payload("clientSend"));
+        net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.sendToServer(new Payload("clientSend2"));
+        java.util.List<String> clientSends = net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.horizonSends();
+        if (clientSends.size() != 2 || !"playToServer mod:clientSend".equals(clientSends.get(0)) || !"playToServer mod:clientSend2".equals(clientSends.get(1))) throw new AssertionError("client sends " + clientSends);
+        System.out.println("horizon fabric networking ok");
+    }
+}
+"#;
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-networking-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let mut files = Vec::new();
+        let mut write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write java shim");
+            files.push(file);
+        };
+        write(
+            "net/minecraft/resources/Identifier.java",
+            "package net.minecraft.resources;\npublic class Identifier {\n    private final String horizonNamespace;\n    private final String horizonPath;\n    public Identifier(String namespace, String path) { this.horizonNamespace = namespace; this.horizonPath = path; }\n    public String toString() { return horizonNamespace + \":\" + horizonPath; }\n}\n",
+        );
+        write(
+            "net/minecraft/network/protocol/common/custom/CustomPacketPayload.java",
+            "package net.minecraft.network.protocol.common.custom;\npublic interface CustomPacketPayload {\n    Type type();\n    final class Type {\n        private final net.minecraft.resources.Identifier horizonId;\n        public Type(net.minecraft.resources.Identifier id) { this.horizonId = id; }\n        public net.minecraft.resources.Identifier id() { return horizonId; }\n        public String toString() { return horizonId.toString(); }\n    }\n}\n",
+        );
+        write(
+            "net/minecraft/server/level/ServerPlayer.java",
+            "package net.minecraft.server.level;\npublic class ServerPlayer {}\n",
+        );
+        write(
+            "net/minecraft/client/multiplayer/ClientPacketListener.java",
+            "package net.minecraft.client.multiplayer;\npublic class ClientPacketListener {}\n",
+        );
+        write(
+            "net/minecraft/client/player/LocalPlayer.java",
+            "package net.minecraft.client.player;\npublic class LocalPlayer {}\n",
+        );
+        write(
+            "net/fabricmc/fabric/api/networking/v1/PacketSender.java",
+            FABRIC_PACKET_SENDER,
+        );
+        write(
+            "net/fabricmc/fabric/api/networking/v1/ServerPlayNetworking.java",
+            FABRIC_SERVER_PLAY_NETWORKING,
+        );
+        write(
+            "net/fabricmc/fabric/api/client/networking/v1/ClientPlayNetworking.java",
+            &FABRIC_CLIENT_PLAY_NETWORKING
+                .replace("{player}", "net.minecraft.client.player.LocalPlayer"),
+        );
+        write("NetworkingProbe.java", probe);
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(javac_status) = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(
+            javac_status.success(),
+            "javac rejected the generated networking façade"
+        );
+        let java = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("java"))
+            .unwrap_or_else(|| PathBuf::from("java"));
+        let output = Command::new(&java)
+            .arg("-cp")
+            .arg(&classes)
+            .arg("NetworkingProbe")
+            .output()
+            .expect("run the networking probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "networking probe failed: {stderr}");
+        assert!(
+            stdout.contains("horizon fabric networking ok"),
             "probe output: {stdout}{stderr}"
         );
         let _ = fs::remove_dir_all(&root);
