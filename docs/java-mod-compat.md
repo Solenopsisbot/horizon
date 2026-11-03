@@ -856,6 +856,11 @@ key; generated `DataComponents` constants are distinct identity keys, absent val
 the supplied default), and copies retain the map. This covers
 the common registration and tooltip paths while the Rust mirror grows typed accessors for the modelled
 `StackData` fields in `horizon-items/item_data.rs`.
+`Item.Properties` now retains bounded `stacksTo`, `durability`, `craftRemainder`, and
+`fireResistant` values through the `Item(Properties)` constructor; the generated `Item` and
+`ItemStack` façades expose the corresponding max-stack, max-damage, damageable, crafting-remainder,
+and fire-resistance queries. This preserves common item registration branches without claiming that
+the live Rust item registry has been mutated.
 BlockState bootstrap paths retain a bounded block identity and property map: `getBlock`, `is`, `isAir`,
 `canOcclude`, `isSolidRender`, and `getLightEmission` provide stable inspection defaults, while
 `setValue` feeds `getValue`, `hasProperty`, and `getProperties` on the same façade instance. This covers
