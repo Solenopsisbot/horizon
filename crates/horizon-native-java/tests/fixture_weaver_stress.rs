@@ -585,7 +585,7 @@ fn rejected_boundaries_are_documented() {
     let class = ClassFile::parse(&bytes).unwrap();
 
     // Cancelling a void target needs a runtime-owned CallbackInfo.
-    let void_plan = MixinInjectionPlan { target: method("touch", "(I)V"), callback: callback("touch", "(I)V"), at: "RETURN".into(), cancellable: true, invoke_target: None };
+    let void_plan = MixinInjectionPlan { target: method("touch", "(I)V"), callback: callback("touch", "(I)V"), at: "RETURN".into(), cancellable: true, invoke_target: None, ordinal: None, slice: None, shift: None };
     let error = weave_class(&class, &[void_plan]).unwrap_err();
     assert_eq!(error, "demo/Target.touch: cancellable RETURN weaving needs a runtime-owned CallbackInfo, which the bounded weaver cannot construct");
 
@@ -595,10 +595,13 @@ fn rejected_boundaries_are_documented() {
     let error = weave_class(&condy, std::slice::from_ref(&head_plan)).unwrap_err();
     assert_eq!(error, "demo/Target.combo: class constant pool uses CONSTANT_Dynamic (condy), which the bounded weaver does not rewrite");
 
-    // `@At("INVOKE")` stays on the interpreter path.
+    // `@At("INVOKE")` now goes through the selected call-site entry point.
+    // `combo` declares no `Math.abs` call, so the plan is a precise reason
+    // instead of the old blanket anchor rejection.
     let invoke_plan = MixinInjectionPlan::inject_at_invoke(method("combo", "(II)I"), callback("comboHead", "(II)V"), ref_to("java/lang/Math", "abs", "(I)I"));
     let error = weave_class(&class, &[invoke_plan]).unwrap_err();
-    assert_eq!(error, "demo/Target.combo: anchor INVOKE needs the interpreter path; the bounded weaver applies HEAD, RETURN and TAIL");
+    assert!(error.contains("INVOKE weaving found no"), "{error}");
+    assert!(error.contains("interpreter"), "{error}");
 
     // TAIL on a void target stays supported: one callback before only the last
     // return, so direct `weave_return` covers the public single-anchor API.

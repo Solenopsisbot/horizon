@@ -158,16 +158,16 @@
 //!
 //! # What it does not support
 //!
-//! [`weave_plans`] applies only plain `HEAD` plans, in plan order, and skips
-//! plans that target another class or ask for cancellation; [`weave_class`]
-//! instead rejects an anchor it cannot weave and a per-class plan overflow with
-//! a reason.
+//! [`weave_plans`] applies the matching plain `HEAD` plans, in plan order (plus
+//! a selected `HEAD` ordinal), and skips plans that target another class or ask
+//! for cancellation; [`weave_class`] applies `HEAD`, `RETURN`/`TAIL` and
+//! `INVOKE` plans instead, and rejects an anchor it cannot weave and a
+//! per-class plan overflow with a reason.
 //!
-//! `@At("INVOKE")` is applied by [`weave_invoke`] (and [`weave_invoke_plan`]),
-//! not by [`weave_class`]: a call-site hook is a different edit from an
-//! around-the-body one, and keeping them apart means a plan set that names a
-//! call site cannot be mistaken for one that names the method.  The bounded
-//! shape is a `void` or value-returning `invokevirtual`/`invokestatic`/
+//! `@At("INVOKE")` is also available on its own through [`weave_invoke`] (and
+//! [`weave_invoke_plan`]); [`weave_class`] applies the same edit as one group
+//! after the around-the-body plans, re-parsing between passes so a call-site
+//! hook and a return hook on one method agree.  The bounded shape is a `void` or value-returning `invokevirtual`/`invokestatic`/
 //! `invokeinterface` for a non-cancellable callback; cancellation also needs a
 //! `void` call and exactly one matching instruction, because a value would have
 //! to be replaced by the callee descriptor's default.  `invokespecial` call
@@ -277,7 +277,8 @@ impl ReturnMode {
 
 /// Instructions an [`InvokeShift`] may move an insert by.  The bound keeps the
 /// shifted site a few instructions from the selected one instead of a scan.
-const MAX_SHIFT_BY: u8 = 8;
+/// Discovery shares it so a malformed `@At.by` stays report-only.
+pub(crate) const MAX_SHIFT_BY: u8 = 8;
 
 /// One bounded instruction selector: what a [`SliceBounds`] boundary names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5355,7 +5356,7 @@ fn selected_invoke_sites(
     let mut sites = invoke_candidates(target, code, scan, &call_site)?;
     if sites.is_empty() {
         return Err(format!(
-            "{label}: INVOKE weaving found no {}{} call site; the selector matches invokevirtual, invokestatic and invokeinterface instructions by owner, name and descriptor",
+            "{label}: INVOKE weaving found no {}{} call site; the selector matches invokevirtual, invokestatic and invokeinterface instructions by owner, name and descriptor, and a target that declares none stays on the interpreter path",
             selector.owner, selector.name
         ));
     }
@@ -5856,8 +5857,13 @@ fn weave_cancellable_invoke(
     )
 }
 
-/// Apply one `@At("INVOKE")` plan: [`weave_invoke`] with the plan's callback,
-/// target and selected call site.
+/// Apply one `@At("INVOKE")` plan: the selected call site, plus the plan's
+/// `ordinal`, `slice` and `shift`/`by` modifiers.
+///
+/// This is the plan-driven form of [`weave_invoke_selected`] and
+/// [`weave_invoke_shifted`]: a plan with no modifiers keeps every matching
+/// site, exactly like [`weave_invoke`].  A plan with no resolved call site is a
+/// reason, because the bounded weaver never guesses one.
 pub fn weave_invoke_plan(class: &ClassFile, plan: &MixinInjectionPlan) -> Result<Vec<u8>, String> {
     if plan.at != "INVOKE" {
         return Err(format!(
@@ -5871,17 +5877,43 @@ pub fn weave_invoke_plan(class: &ClassFile, plan: &MixinInjectionPlan) -> Result
             plan.target.owner, plan.target.name
         )
     })?;
-    weave_invoke(class, &plan.target, &plan.callback, site, plan.cancellable)
+    let selector = InvokeSelector {
+        owner: site.owner.clone(),
+        name: site.name.clone(),
+        descriptor: site.descriptor.clone(),
+        ordinal: plan.ordinal,
+        slice: plan.slice.clone(),
+    };
+    match plan.shift {
+        Some(shift) => weave_invoke_shifted(
+            class,
+            &plan.target,
+            &plan.callback,
+            &selector,
+            shift,
+            plan.cancellable,
+        ),
+        None => weave_invoke_selected(
+            class,
+            &plan.target,
+            &plan.callback,
+            &selector,
+            plan.cancellable,
+        ),
+    }
 }
 
 /// Apply every plan that targets `class`: `HEAD` plans first, then
-/// `RETURN`/`TAIL` plans, each group in declaration order.
+/// `RETURN`/`TAIL` plans, then `INVOKE` plans, each group in declaration order.
 ///
 /// Plans for other classes are skipped.  A matching plan that asks for an
 /// anchor or object this file cannot produce is an error rather than a silent
-/// skip: `INVOKE` call-site rewriting (use [`weave_invoke_plan`] for that
-/// anchor), cancelling a `void` target, an unknown anchor, and more than
-/// `MAX_WEAVE_PLANS_PER_CLASS` plans for one class.
+/// skip: an unknown anchor, cancelling a `void` target, an `INVOKE` plan
+/// without a resolved call site, an out-of-range `ordinal`/`by`, and more than
+/// `MAX_WEAVE_PLANS_PER_CLASS` plans for one class.  `HEAD` uses
+/// [`weave_head_selected`], `RETURN`/`TAIL` use [`weave_returns_selected`] when
+/// the plan carries an `ordinal` or a `slice`, and `INVOKE` uses
+/// [`weave_invoke_plan`], which applies the plan's ordinal, slice and shift.
 ///
 /// A `RETURN`/`TAIL` plan on a non-void target references the synthetic
 /// `CallbackInfoReturnable`; [`weave_class_with_extras`] reports that class
@@ -5894,9 +5926,9 @@ pub fn weave_class(class: &ClassFile, plans: &[MixinInjectionPlan]) -> Result<Ve
 ///
 /// `added` is keyed by internal class name and holds
 /// [`callback_info_returnable_class`] when a non-void `RETURN`/`TAIL` insert
-/// landed and [`callback_info_class`] when a cancellable `void` `HEAD` insert
-/// landed; it is empty otherwise.  The weaver cannot tell whether the jar
-/// already declares a class, so [`weave_classes_with_extras`] drops the
+/// landed and [`callback_info_class`] when a cancellable `HEAD` or `INVOKE`
+/// insert landed; it is empty otherwise.  The weaver cannot tell whether the
+/// jar already declares a class, so [`weave_classes_with_extras`] drops the
 /// duplicates.
 pub fn weave_class_with_extras(
     class: &ClassFile,
@@ -5914,17 +5946,22 @@ pub fn weave_class_with_extras(
         ));
     }
     for plan in &matching {
-        if !matches!(plan.at.as_str(), "HEAD" | "RETURN" | "TAIL") {
+        if !matches!(plan.at.as_str(), "HEAD" | "RETURN" | "TAIL" | "INVOKE") {
             return Err(format!(
-                "{}.{}: anchor {} needs the interpreter path; the bounded weaver applies HEAD, RETURN and TAIL",
+                "{}.{}: anchor {} is not one the bounded weaver applies; it supports HEAD, RETURN, TAIL and INVOKE",
                 plan.target.owner, plan.target.name, plan.at
             ));
         }
         // A non-void `RETURN`/`TAIL` builds the `CallbackInfoReturnable` the
         // callback cancels with; a `void` `HEAD` builds the `CallbackInfo`.
         // Every other cancellable shape still needs a runtime-owned object the
-        // bounded weaver does not construct.
-        if plan.cancellable && plan.at != "HEAD" && !plan_returns_value(class, plan) {
+        // bounded weaver does not construct.  A cancellable `INVOKE` is checked
+        // by the invoke path, which owns its `CallbackInfo` insert.
+        if plan.cancellable
+            && plan.at != "HEAD"
+            && plan.at != "INVOKE"
+            && !plan_returns_value(class, plan)
+        {
             return Err(format!(
                 "{}.{}: cancellable {} weaving needs a runtime-owned CallbackInfo, which the bounded weaver cannot construct",
                 plan.target.owner, plan.target.name, plan.at
@@ -5946,9 +5983,17 @@ pub fn weave_class_with_extras(
             .map_err(|error| format!("rewritten class did not parse again: {error}"))?;
         current = if plan.cancellable {
             needs_callback_info = true;
+            if let Some(ordinal) = plan.ordinal {
+                ordinal_index(
+                    &format!("{}.{}", plan.target.owner, plan.target.name),
+                    "HEAD",
+                    1,
+                    ordinal,
+                )?;
+            }
             weave_head_cancellable(&next, &plan.target, &plan.callback)?
         } else {
-            weave_head(&next, &plan.target, &plan.callback)?
+            weave_head_selected(&next, &plan.target, &plan.callback, plan.ordinal)?
         };
     }
     for plan in matching
@@ -5962,8 +6007,31 @@ pub fn weave_class_with_extras(
         };
         let next = ClassFile::parse(&current)
             .map_err(|error| format!("rewritten class did not parse again: {error}"))?;
-        needs_returnable |= plan_returns_value(&next, plan);
-        current = weave_return(&next, &plan.target, &plan.callback, mode)?;
+        let returns_value = plan_returns_value(&next, plan);
+        needs_returnable |= returns_value;
+        current = if plan.ordinal.is_some() || plan.slice.is_some() {
+            weave_returns_selected(
+                &next,
+                &plan.target,
+                &plan.callback,
+                returns_value,
+                &ReturnSelector {
+                    mode,
+                    ordinal: plan.ordinal,
+                    slice: plan.slice.clone(),
+                },
+            )?
+        } else {
+            weave_return(&next, &plan.target, &plan.callback, mode)?
+        };
+    }
+    for plan in matching.iter().filter(|plan| plan.at == "INVOKE") {
+        let next = ClassFile::parse(&current)
+            .map_err(|error| format!("rewritten class did not parse again: {error}"))?;
+        // A cancellable INVOKE constructs the same runtime-owned `CallbackInfo`
+        // a cancellable HEAD does, so the synthetic class is reported too.
+        needs_callback_info |= plan.cancellable;
+        current = weave_invoke_plan(&next, plan)?;
     }
     let mut added = BTreeMap::new();
     if needs_returnable {
@@ -6001,14 +6069,15 @@ fn plan_returns_value(class: &ClassFile, plan: &MixinInjectionPlan) -> bool {
 ///
 /// Only plans whose [`MixinInjectionPlan::at`] is `"HEAD"`, whose target owner
 /// is this class and whose target method exists are applied; plans for other
-/// classes and every other anchor are left to the interpreter.  Cancellable
-/// plans are skipped: this entry point returns only bytes, so it cannot report
-/// the synthetic `CallbackInfo` they reference - [`weave_class_with_extras`]
-/// can.
+/// classes and every other anchor are left to the interpreter.  A plan's
+/// `ordinal` follows [`weave_head_selected`], so `0`/`-1` name the single
+/// `HEAD` site and any other value is a reason.  Cancellable plans are skipped:
+/// this entry point returns only bytes, so it cannot report the synthetic
+/// `CallbackInfo` they reference - [`weave_class_with_extras`] can.
 ///
-/// [`weave_class`] is the whole-class entry point: it also applies `RETURN`
-/// and `TAIL` plans, and rejects anchors and cancellable plans it cannot weave
-/// instead of skipping them.
+/// [`weave_class`] is the whole-class entry point: it also applies `RETURN`,
+/// `TAIL` and `INVOKE` plans, and rejects anchors and cancellable plans it
+/// cannot weave instead of skipping them.
 ///
 /// Not supported here, and left to the interpreter: `RETURN`, `TAIL` and
 /// `INVOKE` anchors (the last is [`weave_invoke_plan`]); cancellation; and
@@ -6029,7 +6098,7 @@ pub fn weave_plans(class: &ClassFile, plans: &[MixinInjectionPlan]) -> Result<Ve
         }
         let next = ClassFile::parse(&current)
             .map_err(|error| format!("rewritten class did not parse again: {error}"))?;
-        current = weave_head(&next, &plan.target, &plan.callback)?;
+        current = weave_head_selected(&next, &plan.target, &plan.callback, plan.ordinal)?;
     }
     Ok(current)
 }

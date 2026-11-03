@@ -367,6 +367,9 @@ public final class Callbacks {
         at: "RETURN".into(),
         cancellable: false,
         invoke_target: None,
+        ordinal: None,
+        slice: None,
+        shift: None,
     };
     let return_report = jar
         .execute_mixin_at_return(&return_plan, None, &[Value::Int(7)], &mut return_host)

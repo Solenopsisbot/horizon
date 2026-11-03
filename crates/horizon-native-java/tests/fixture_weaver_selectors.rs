@@ -12,7 +12,8 @@
 //! rejection that javac output cannot conveniently express.
 
 use horizon_native_java::{
-    ClassFile, MethodRef, ReturnMode, callback_info_returnable_class,
+    ClassFile, MethodRef, MixinInjectionPlan, NativeJar, ReturnMode,
+    callback_info_returnable_class, weave_class,
     weaver::{
         InvokeSelector, InvokeShift, ReturnSelector, Shift, SiteSelector, SliceBounds,
         weave_head_selected, weave_invoke, weave_invoke_at, weave_invoke_selected,
@@ -20,6 +21,7 @@ use horizon_native_java::{
     },
 };
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -45,6 +47,26 @@ public class Target {
         if (x > 5) { return 1; }
         if (x > 0) { return 2; }
         return 3;
+    }
+
+    public static int twoReturns(int x) {
+        if (x > 0) { return 1; }
+        return 2;
+    }
+
+    public static void twoCalls() {
+        hit(1);
+        hit(String.valueOf(1));
+    }
+
+    public static void twoCallsSlice() {
+        hit(1);
+        hit(String.valueOf(1));
+    }
+
+    public static void twoCallsShift() {
+        hit(1);
+        hit(String.valueOf(1));
     }
 }"#;
 
@@ -89,6 +111,14 @@ class Runner {
                 target.getMethod("threeSites").invoke(instance);
             } else if (which.equals("pick")) {
                 System.out.println("result=" + target.getMethod("pick", int.class).invoke(null, x));
+            } else if (which.equals("twoReturns")) {
+                System.out.println("result=" + target.getMethod("twoReturns", int.class).invoke(null, x));
+            } else if (which.equals("twoCalls")) {
+                target.getMethod("twoCalls").invoke(null);
+            } else if (which.equals("twoCallsSlice")) {
+                target.getMethod("twoCallsSlice").invoke(null);
+            } else if (which.equals("twoCallsShift")) {
+                target.getMethod("twoCallsShift").invoke(null);
             } else {
                 throw new IllegalArgumentException(which);
             }
@@ -247,6 +277,133 @@ fn hit_on(descriptor: &str) -> SiteSelector {
 
 fn member(name: &str, descriptor: &str) -> MethodRef {
     method("demo/Target", name, descriptor)
+}
+
+/// The annotation stubs and one mixin whose `@At` selectors exercise
+/// discovery.  `javac` encodes the enum `shift` and the nested `@Slice`
+/// exactly like Mixin's own annotations, so the reader is exercised against
+/// real class-file annotation bytes.
+const DISCOVERY_SOURCES: &[(&str, &str)] = &[
+    (
+        "org/spongepowered/asm/mixin/Mixin.java",
+        r#"package org.spongepowered.asm.mixin;
+import java.lang.annotation.*;
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.TYPE)
+public @interface Mixin {
+    Class<?>[] value() default {};
+    String[] targets() default {};
+}
+"#,
+    ),
+    (
+        "org/spongepowered/asm/mixin/injection/Slice.java",
+        r#"package org.spongepowered.asm.mixin.injection;
+import java.lang.annotation.*;
+@Retention(RetentionPolicy.RUNTIME)
+@Target({})
+public @interface Slice {
+    At from() default @At("HEAD");
+    At to() default @At("TAIL");
+}
+"#,
+    ),
+    (
+        "org/spongepowered/asm/mixin/injection/At.java",
+        r#"package org.spongepowered.asm.mixin.injection;
+import java.lang.annotation.*;
+@Retention(RetentionPolicy.RUNTIME)
+@Target({})
+public @interface At {
+    String value() default "";
+    String target() default "";
+    String slice() default "";
+    int ordinal() default -1;
+    Shift shift() default Shift.NONE;
+    int by() default 1;
+    enum Shift { NONE, BEFORE, AFTER, BY }
+}
+"#,
+    ),
+    (
+        "org/spongepowered/asm/mixin/injection/Inject.java",
+        r#"package org.spongepowered.asm.mixin.injection;
+import java.lang.annotation.*;
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface Inject {
+    String[] method();
+    Slice[] slice() default {};
+    At[] at();
+    boolean cancellable() default false;
+}
+"#,
+    ),
+    (
+        "demo/SelectorMixin.java",
+        r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.Slice;
+
+@Mixin(targets = "Ldemo/MixinTarget;")
+public abstract class SelectorMixin {
+    @Inject(method = "twoReturns(I)I", at = @At(value = "RETURN", ordinal = 1))
+    private void onReturn(int x) {}
+
+    @Inject(method = "twoCalls()V", at = @At(value = "INVOKE", target = "Ldemo/MixinTarget;hit(I)V", ordinal = -1))
+    private void onInvoke() {}
+
+    @Inject(method = "twoCalls()V", at = @At(value = "INVOKE", target = "Ldemo/MixinTarget;hit(I)V"), slice = @Slice(from = @At(value = "INVOKE", target = "Ldemo/MixinTarget;hit(I)V"), to = @At("RETURN")))
+    private void onSlice() {}
+
+    @Inject(method = "twoCalls()V", at = @At(value = "INVOKE", target = "Ldemo/MixinTarget;hit(I)V", shift = At.Shift.AFTER, by = 1))
+    private void onShift() {}
+
+    @Inject(method = "twoCalls()V", at = @At(value = "RETURN", shift = At.Shift.AFTER))
+    private void badShift() {}
+
+    @Inject(method = "twoCalls()V", at = @At(value = "INVOKE", target = "Ldemo/MixinTarget;hit(I)V", shift = At.Shift.AFTER, by = 9))
+    private void badBy() {}
+
+    @Inject(method = "twoCalls()V", at = @At(value = "INVOKE", target = "Ldemo/MixinTarget;hit(I)V"), slice = @Slice(to = @At("RETURN")))
+    private void badSlice() {}
+}
+"#,
+    ),
+];
+
+/// Compile [`DISCOVERY_SOURCES`] and parse the mixin class, without needing a
+/// jar: plan discovery only reads the mixin's own annotations.
+fn compile_discovery(name: &str) -> NativeJar {
+    let root = scratch(name);
+    let src = root.join("src");
+    let classes = root.join("classes");
+    fs::create_dir_all(&classes).unwrap();
+    let mut paths = Vec::new();
+    for (relative, body) in DISCOVERY_SOURCES {
+        let path = src.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
+        paths.push(path);
+    }
+    let output = Command::new(jdk_tool("javac"))
+        .arg("--release")
+        .arg("17")
+        .arg("-nowarn")
+        .arg("-d")
+        .arg(&classes)
+        .args(&paths)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "javac failed for {name}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = fs::read(classes.join("demo/SelectorMixin.class")).unwrap();
+    NativeJar::from_classes([ClassFile::parse(&bytes).unwrap()])
 }
 
 // ---------------------------------------------------------------------------
@@ -1353,6 +1510,154 @@ fn head_selected_counts_the_single_head_site() {
         assert!(error.contains("ordinal"), "{error}");
         assert!(error.contains("1 matching"), "{error}");
     }
+}
+
+#[test]
+fn plan_driven_selectors_weave_and_run() {
+    let classes = compile("plan-selectors");
+    let bytes = read_class(&classes, "demo/Target");
+    let class = ClassFile::parse(&bytes).unwrap();
+    let on_return = callback("onReturn", &format!("(I{CALLBACK_INFO_DESC})V"));
+    let on_call = callback("onCall", "()V");
+    let hit = method("demo/Target", "hit", "");
+
+    // Two returns, and ordinal 1 names the second.
+    let mut return_plan =
+        MixinInjectionPlan::inject_at_return(member("twoReturns", "(I)I"), on_return);
+    return_plan.ordinal = Some(1);
+
+    // Two `hit` call sites, and ordinal -1 names the last.
+    let mut invoke_plan = MixinInjectionPlan::inject_at_invoke(
+        member("twoCalls", "()V"),
+        on_call.clone(),
+        hit.clone(),
+    );
+    invoke_plan.ordinal = Some(-1);
+
+    // A slice counts only the sites between its boundaries; ordinal 0 is the
+    // first `hit`.
+    let mut slice_plan = MixinInjectionPlan::inject_at_invoke(
+        member("twoCallsSlice", "()V"),
+        on_call.clone(),
+        hit.clone(),
+    );
+    slice_plan.ordinal = Some(0);
+    slice_plan.slice = Some(SliceBounds {
+        from: hit_on("(I)V"),
+        to: hit_on("(Ljava/lang/String;)V"),
+    });
+
+    // The insert moves one instruction after the first call, between it and
+    // `String.valueOf`.
+    let mut shift_plan =
+        MixinInjectionPlan::inject_at_invoke(member("twoCallsShift", "()V"), on_call, hit);
+    shift_plan.ordinal = Some(0);
+    shift_plan.shift = Some(InvokeShift {
+        direction: Shift::After,
+        by: 1,
+    });
+
+    let plans = [return_plan, invoke_plan, slice_plan, shift_plan];
+    let woven = weave_class(&class, &plans).unwrap();
+    assert_eq!(
+        ClassFile::parse(&woven).unwrap().write().unwrap(),
+        woven,
+        "the plan-woven class round-trips"
+    );
+
+    // `twoReturns(1)` takes the first return, which ordinal 1 did not select;
+    // `twoReturns(-1)` takes the second, which it did.
+    let lines = run(&classes, &woven, "twoReturns", Some("1"));
+    assert_eq!(value(&lines, "result="), "1");
+    assert_eq!(value(&lines, "calls="), "0");
+    let lines = run(&classes, &woven, "twoReturns", Some("-1"));
+    assert_eq!(value(&lines, "result="), "2");
+    assert_eq!(value(&lines, "calls="), "1");
+    assert_eq!(value(&lines, "value="), "2");
+
+    // The last call ran only after the first, so `seen` is `i`.
+    let lines = run(&classes, &woven, "twoCalls", None);
+    assert_eq!(value(&lines, "calls="), "1");
+    assert_eq!(value(&lines, "seen="), "i");
+    assert_eq!(value(&lines, "trace="), "is");
+
+    // The slice holds the first `hit`, so the callback sees no trace yet.
+    let lines = run(&classes, &woven, "twoCallsSlice", None);
+    assert_eq!(value(&lines, "calls="), "1");
+    assert_eq!(value(&lines, "seen="), "");
+    assert_eq!(value(&lines, "trace="), "is");
+
+    // The shifted insert runs after the first `hit`, before `String.valueOf`.
+    let lines = run(&classes, &woven, "twoCallsShift", None);
+    assert_eq!(value(&lines, "calls="), "1");
+    assert_eq!(value(&lines, "seen="), "i");
+    assert_eq!(value(&lines, "trace="), "is");
+}
+
+#[test]
+fn discovery_parses_bounded_selectors_and_reports_the_rest() {
+    let jar = compile_discovery("discover-selectors");
+    let plans = jar.mixin_injection_plans();
+    assert_eq!(plans.len(), 4, "unexpected plans: {plans:#?}");
+    let plan = |name: &str| {
+        plans
+            .iter()
+            .find(|plan| plan.callback.name == name)
+            .unwrap_or_else(|| panic!("no plan for {name}: {plans:#?}"))
+    };
+
+    let returned = plan("onReturn");
+    assert_eq!(returned.at, "RETURN");
+    assert_eq!(returned.ordinal, Some(1));
+    assert!(returned.slice.is_none());
+    assert!(returned.shift.is_none());
+
+    let invoked = plan("onInvoke");
+    assert_eq!(invoked.at, "INVOKE");
+    assert_eq!(invoked.ordinal, Some(-1));
+    assert_eq!(
+        invoked
+            .invoke_target
+            .as_ref()
+            .map(|site| site.owner.as_str()),
+        Some("demo/MixinTarget")
+    );
+
+    let sliced = plan("onSlice");
+    assert_eq!(sliced.ordinal, None);
+    assert_eq!(
+        sliced.slice,
+        Some(SliceBounds {
+            from: SiteSelector::Invoke {
+                owner: "demo/MixinTarget".into(),
+                name: "hit".into(),
+                descriptor: "(I)V".into(),
+            },
+            to: SiteSelector::Return,
+        })
+    );
+
+    let shifted = plan("onShift");
+    assert_eq!(
+        shifted.shift,
+        Some(InvokeShift {
+            direction: Shift::After,
+            by: 1,
+        })
+    );
+
+    // A shift on a non-INVOKE anchor, an out-of-bound `by`, and a slice with
+    // one bound are reported instead of guessed.
+    let unresolved = jar.unresolved_invoke_plans();
+    let names = unresolved
+        .iter()
+        .map(|plan| plan.callback.name.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        names,
+        BTreeSet::from(["badBy", "badShift", "badSlice"]),
+        "unresolved: {unresolved:#?}"
+    );
 }
 
 /// `Code`, `max_stack` and `max_locals` of one woven method, plus the

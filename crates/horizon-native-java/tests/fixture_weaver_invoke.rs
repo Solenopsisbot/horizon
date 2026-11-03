@@ -384,6 +384,9 @@ fn cancellable_invoke_suppresses_only_the_call() {
         at: "INVOKE".into(),
         cancellable: true,
         invoke_target: Some(site("demo/Target", "mark", "(I)V")),
+        ordinal: None,
+        slice: None,
+        shift: None,
     };
     let woven = weave_invoke_plan(&class, &plan).unwrap();
     assert_eq!(
@@ -391,6 +394,12 @@ fn cancellable_invoke_suppresses_only_the_call() {
         woven,
         "the woven class round-trips"
     );
+    // The plan-driven whole-class path applies the same INVOKE edit and reports
+    // the synthetic `CallbackInfo` a cancellable insert references.
+    let (from_class, added) =
+        horizon_native_java::weave_class_with_extras(&class, std::slice::from_ref(&plan)).unwrap();
+    assert_eq!(from_class, woven);
+    assert!(added.contains_key("org/spongepowered/asm/mixin/injection/callback/CallbackInfo"));
 
     if let Some(lines) = run(&classes, &woven, "cancel") {
         assert_eq!(value(&lines, "calls="), "1");
@@ -484,15 +493,14 @@ fn invokespecial_and_ambiguity_stay_rejected() {
     .unwrap_err();
     assert!(twice.contains("exactly one matching call site"), "{twice}");
 
-    // `weave_class` keeps INVOKE on the interpreter path; the plan entry point
-    // is the one that weaves it.
+    // `weave_class` applies INVOKE plans through the same selected call-site
+    // path as the dedicated entry point.
     let plan = MixinInjectionPlan::inject_at_invoke(
         method("demo/Target", "staticSite", "(I)V"),
         method("demo/Callback", "onStatic", "(I)V"),
         site("demo/Target", "mark", "(I)V"),
     );
-    let error = horizon_native_java::weave_class(&class, std::slice::from_ref(&plan)).unwrap_err();
-    assert!(error.contains("INVOKE"), "{error}");
-    let woven = weave_invoke_plan(&class, &plan).unwrap();
+    let woven = horizon_native_java::weave_class(&class, std::slice::from_ref(&plan)).unwrap();
     assert_ne!(woven, bytes);
+    assert_eq!(woven, weave_invoke_plan(&class, &plan).unwrap());
 }

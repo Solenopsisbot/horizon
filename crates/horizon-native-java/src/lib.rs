@@ -12,6 +12,8 @@ use std::{
 
 pub mod weaver;
 
+use weaver::{InvokeShift, Shift, SiteSelector, SliceBounds};
+
 pub use weaver::{
     ReturnMode, WovenClasses, callback_info_class, callback_info_returnable_class, weave_class,
     weave_class_with_extras, weave_classes, weave_classes_with_extras, weave_head,
@@ -124,6 +126,22 @@ pub struct MixinInjectionPlan {
     /// executable set and are reported by
     /// [`NativeJar::unresolved_invoke_plans`] instead of guessing a target.
     pub invoke_target: Option<MethodRef>,
+    /// `@At.ordinal`, when the selector names one site.
+    ///
+    /// `INVOKE` and `RETURN`/`TAIL` count their matching sites 0-based, with a
+    /// negative ordinal counted from the end (`-1` is the last). `HEAD` has one
+    /// site, so `0` and `-1` name it and any other value is outside the
+    /// bounded weaver.
+    pub ordinal: Option<i32>,
+    /// `@Slice(from = ..., to = ...)`, the half-open instruction range an
+    /// ordinal counts inside.
+    pub slice: Option<SliceBounds>,
+    /// `@At(shift = ..., by = ...)` on an `INVOKE` anchor.
+    ///
+    /// The bounded weaver moves the insert `by` instruction boundaries before
+    /// or after the selected call site; a shift on any other anchor stays out
+    /// of the executable set.
+    pub shift: Option<InvokeShift>,
 }
 
 impl MixinInjectionPlan {
@@ -134,6 +152,9 @@ impl MixinInjectionPlan {
             at: "HEAD".into(),
             cancellable: false,
             invoke_target: None,
+            ordinal: None,
+            slice: None,
+            shift: None,
         }
     }
 
@@ -144,6 +165,9 @@ impl MixinInjectionPlan {
             at: "RETURN".into(),
             cancellable: false,
             invoke_target: None,
+            ordinal: None,
+            slice: None,
+            shift: None,
         }
     }
 
@@ -154,6 +178,9 @@ impl MixinInjectionPlan {
             at: "TAIL".into(),
             cancellable: false,
             invoke_target: None,
+            ordinal: None,
+            slice: None,
+            shift: None,
         }
     }
 
@@ -169,6 +196,9 @@ impl MixinInjectionPlan {
             at: "INVOKE".into(),
             cancellable: false,
             invoke_target: Some(invoke_target),
+            ordinal: None,
+            slice: None,
+            shift: None,
         }
     }
 }
@@ -7632,21 +7662,24 @@ impl NativeJar {
     /// [`Self::execute_mixin_at_invoke`].
     ///
     /// `HEAD`, `RETURN`, `TAIL` and `INVOKE` anchors are recorded.  An
-    /// `INVOKE` plan carries its parsed `@At.target` call site; a plan whose
-    /// selector is missing or outside the accepted forms stays out of this
-    /// executable set and is reported by [`Self::unresolved_invoke_plans`].
-    /// `FIELD`, `NEW`, `JUMP`, slice and ordinal selectors remain on the JVM
-    /// fallback instead of being approximated.
+    /// `INVOKE` plan carries its parsed `@At.target` call site, and every plan
+    /// carries the bounded `ordinal`, `@Slice(from, to)` and `shift`/`by`
+    /// selectors it declared.  A plan whose selector is missing or outside the
+    /// accepted forms stays out of this executable set and is reported by
+    /// [`Self::unresolved_invoke_plans`].  `FIELD`, `NEW` and `JUMP` selectors
+    /// remain on the JVM fallback instead of being approximated.
     pub fn mixin_injection_plans(&self) -> Vec<MixinInjectionPlan> {
         self.mixin_plan_scan().0
     }
 
-    /// `@At("INVOKE")` plans whose selector this bounded runtime cannot read.
+    /// Plans whose bounded selector this runtime cannot read.
     ///
     /// These are diagnostics, not executable plans: the target and callback
-    /// stay so a loader can report the call site the mod asked for, while
-    /// [`MixinInjectionPlan::invoke_target`] stays `None` rather than inventing
-    /// one.  Sorted like [`Self::mixin_injection_plans`].
+    /// stay so a loader can report the site the mod asked for, while
+    /// [`MixinInjectionPlan::invoke_target`] and the selector fields stay
+    /// unresolved rather than inventing one.  `@At("INVOKE")` with a malformed
+    /// call site is the common case; a malformed `ordinal`, `shift`/`by` or
+    /// `@Slice` lands here too.  Sorted like [`Self::mixin_injection_plans`].
     pub fn unresolved_invoke_plans(&self) -> Vec<MixinInjectionPlan> {
         self.mixin_plan_scan().1
     }
@@ -7688,6 +7721,11 @@ impl NativeJar {
                         inject.values.get("cancellable"),
                         Some(AnnotationValue::Bool(true))
                     );
+                    let inject_slices = inject
+                        .values
+                        .get("slice")
+                        .map(annotation_slice_entries)
+                        .unwrap_or_default();
                     let method_specs = inject
                         .values
                         .get("method")
@@ -7720,7 +7758,23 @@ impl NativeJar {
                                     at: anchor.anchor.clone(),
                                     cancellable,
                                     invoke_target: None,
+                                    ordinal: anchor.ordinal,
+                                    slice: None,
+                                    shift: None,
                                 };
+                                let (slice, shift) =
+                                    match resolve_injection_modifiers(anchor, &inject_slices) {
+                                        Ok(modifiers) => modifiers,
+                                        Err(_) => {
+                                            // The plan keeps its target and
+                                            // callback but stays report-only; the
+                                            // executable set never guesses a site.
+                                            unresolved.push(plan);
+                                            continue;
+                                        }
+                                    };
+                                plan.slice = slice;
+                                plan.shift = shift;
                                 if plan.at == "INVOKE" {
                                     let Some(site) =
                                         anchor.target.as_deref().and_then(parse_invoke_selector)
@@ -13580,13 +13634,15 @@ fn annotation_strings(value: &AnnotationValue) -> Vec<String> {
 }
 
 /// One `@At` selector: its anchor name, its raw `target`/`opcode`/`ordinal`
-/// settings, and the anchors of a nested `@Slice`.
+/// settings, any `shift`/`by` pair, and the anchors of a nested `@Slice`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AtSelector {
     anchor: String,
     target: Option<String>,
     opcode: Option<u8>,
     ordinal: Option<i32>,
+    shift: Option<String>,
+    by: Option<i32>,
     slice_from: Option<String>,
     slice_to: Option<String>,
 }
@@ -13616,14 +13672,161 @@ fn annotation_at_label(annotation: &Annotation) -> String {
 
 /// The `from`/`to` labels of an `@At`'s nested `@Slice`, kept as written.
 fn annotation_slice_bounds(annotation: &Annotation) -> (Option<String>, Option<String>) {
-    let Some(AnnotationValue::Annotation(slice)) = annotation.values.get("slice") else {
-        return (None, None);
-    };
+    match annotation.values.get("slice") {
+        Some(AnnotationValue::Annotation(slice)) => annotation_slice_anchors(slice),
+        Some(AnnotationValue::Array(items)) => items
+            .first()
+            .and_then(|item| match item {
+                AnnotationValue::Annotation(slice) => Some(annotation_slice_anchors(slice)),
+                _ => None,
+            })
+            .unwrap_or((None, None)),
+        _ => (None, None),
+    }
+}
+
+/// The `from`/`to` labels of one `@Slice` annotation.
+fn annotation_slice_anchors(slice: &Annotation) -> (Option<String>, Option<String>) {
     let bound = |key: &str| match slice.values.get(key) {
         Some(AnnotationValue::Annotation(at)) => Some(annotation_at_label(at)),
         _ => None,
     };
     (bound("from"), bound("to"))
+}
+
+/// Flatten an `@Inject`/`@Redirect` `slice` value (one `@Slice` or an array)
+/// into its `from`/`to` labels.
+fn annotation_slice_entries(value: &AnnotationValue) -> Vec<(Option<String>, Option<String>)> {
+    match value {
+        AnnotationValue::Annotation(slice) => vec![annotation_slice_anchors(slice)],
+        AnnotationValue::Array(items) => items.iter().flat_map(annotation_slice_entries).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One `from`/`to` pair, requiring both ends or neither.
+fn bounded_slice_bounds(
+    from: Option<&str>,
+    to: Option<&str>,
+    context: &str,
+) -> Result<Option<(String, String)>, String> {
+    match (from, to) {
+        (None, None) => Ok(None),
+        (Some(from), Some(to)) => Ok(Some((from.to_owned(), to.to_owned()))),
+        _ => Err(format!(
+            "{context} needs both a `from` and a `to` anchor; one bound alone does not name a range"
+        )),
+    }
+}
+
+/// Resolve one `@Slice` boundary label (`HEAD`, `RETURN`, `TAIL`, or
+/// `INVOKE:<call site>`) to the bounded selector the weaver reads.
+fn parse_slice_boundary(label: &str) -> Result<SiteSelector, String> {
+    match label {
+        "HEAD" => Ok(SiteSelector::Head),
+        "RETURN" => Ok(SiteSelector::Return),
+        "TAIL" => Ok(SiteSelector::Tail),
+        _ => {
+            let spec = label.strip_prefix("INVOKE:").ok_or_else(|| {
+                format!(
+                    "@Slice anchor {label:?} is not a bounded boundary; native slices support HEAD, RETURN, TAIL and INVOKE"
+                )
+            })?;
+            let site = parse_invoke_selector(spec).ok_or_else(|| {
+                format!("@Slice INVOKE boundary {spec:?} is not one of the bounded call-site forms")
+            })?;
+            Ok(SiteSelector::Invoke {
+                owner: site.owner,
+                name: site.name,
+                descriptor: site.descriptor,
+            })
+        }
+    }
+}
+
+/// Resolve the bounded `@Slice` and `shift`/`by` modifiers of one injection
+/// selector.
+///
+/// A plan whose modifiers are outside the bounded forms stays out of the
+/// executable set, so discovery reports it instead of letting weaving guess.
+fn resolve_injection_modifiers(
+    anchor: &AtSelector,
+    inject_slices: &[(Option<String>, Option<String>)],
+) -> Result<(Option<SliceBounds>, Option<InvokeShift>), String> {
+    // A nested `@Slice` on the `@At` itself wins; otherwise an `@Inject` that
+    // declares exactly one slice applies it, which is Mixin's default-slice
+    // rule.  More than one is ambiguous without the id vocabulary.
+    let inline = bounded_slice_bounds(
+        anchor.slice_from.as_deref(),
+        anchor.slice_to.as_deref(),
+        "@At.slice",
+    )?;
+    let bounds = match inline {
+        Some(bounds) => Some(bounds),
+        None => match inject_slices {
+            [] => None,
+            [one] => bounded_slice_bounds(one.0.as_deref(), one.1.as_deref(), "@Inject.slice")?,
+            many => {
+                return Err(format!(
+                    "@Inject.slice declares {} slices; the bounded weaver models exactly one",
+                    many.len()
+                ));
+            }
+        },
+    };
+    let slice = match bounds {
+        None => None,
+        Some((from, to)) => Some(SliceBounds {
+            from: parse_slice_boundary(&from)?,
+            to: parse_slice_boundary(&to)?,
+        }),
+    };
+    let shift = match anchor.shift.as_deref() {
+        None => {
+            if anchor.by.is_some() {
+                return Err(
+                    "@At.by is set without @At.shift; the bounded weaver only moves an INVOKE insert for shift = BEFORE or AFTER"
+                        .into(),
+                );
+            }
+            None
+        }
+        Some(value) => {
+            let name = value.rsplit('.').next().unwrap_or(value);
+            if name == "NONE" {
+                // Mixin's default shift; an explicit NONE is the same no-op.
+                None
+            } else {
+                if anchor.anchor != "INVOKE" {
+                    return Err(format!(
+                        "@At.shift {value:?} is only modeled on INVOKE; anchor {} keeps its own entry point",
+                        anchor.anchor
+                    ));
+                }
+                let direction = match name {
+                    "BEFORE" => Shift::Before,
+                    "AFTER" => Shift::After,
+                    _ => {
+                        return Err(format!(
+                            "@At.shift {value:?} is not a bounded shift; native weaving supports BEFORE and AFTER"
+                        ));
+                    }
+                };
+                let by = anchor.by.unwrap_or(1);
+                let by = u8::try_from(by)
+                    .ok()
+                    .filter(|by| *by <= weaver::MAX_SHIFT_BY)
+                    .ok_or_else(|| {
+                        format!(
+                            "@At.by {by} is outside the bounded shift of 0..={} instruction(s)",
+                            weaver::MAX_SHIFT_BY
+                        )
+                    })?;
+                Some(InvokeShift { direction, by })
+            }
+        }
+    };
+    Ok((slice, shift))
 }
 
 /// Collect `@At` entries whose anchor `keep` accepts, recursing into arrays.
@@ -13653,12 +13856,22 @@ fn annotation_at_selectors_filtered(
                 Some(AnnotationValue::Int(value)) => Some(*value),
                 _ => None,
             };
+            let shift = annotation
+                .values
+                .get("shift")
+                .and_then(annotation_first_string);
+            let by = match annotation.values.get("by") {
+                Some(AnnotationValue::Int(value)) => Some(*value),
+                _ => None,
+            };
             let (slice_from, slice_to) = annotation_slice_bounds(annotation);
             vec![AtSelector {
                 anchor,
                 target,
                 opcode,
                 ordinal,
+                shift,
+                by,
                 slice_from,
                 slice_to,
             }]
@@ -13724,6 +13937,9 @@ fn mixin_plan_sort_key(
     &str,
     &str,
     &str,
+    Option<i32>,
+    bool,
+    Option<(&'static str, u8)>,
 ) {
     (
         &plan.target.owner,
@@ -13740,6 +13956,17 @@ fn mixin_plan_sort_key(
         &plan.callback.owner,
         &plan.callback.name,
         &plan.callback.descriptor,
+        plan.ordinal,
+        plan.slice.is_some(),
+        plan.shift.map(|shift| {
+            (
+                match shift.direction {
+                    Shift::Before => "BEFORE",
+                    Shift::After => "AFTER",
+                },
+                shift.by,
+            )
+        }),
     )
 }
 
