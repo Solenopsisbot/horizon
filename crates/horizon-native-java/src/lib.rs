@@ -4,7 +4,11 @@
 //! Fabric metadata, and executes a small no-argument bytecode subset. Calls
 //! outside the loaded jar cross [`Host`], so unsupported behavior is explicit.
 
-use std::{collections::BTreeMap, fs::File, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    path::Path,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -301,6 +305,34 @@ pub trait Host {
 pub struct NullHost;
 impl Host for NullHost {}
 
+/// The `Item.Properties` builder mods chain before `new Item(properties)`.
+const ITEM_PROPERTIES_CLASS: &str = "net/minecraft/world/item/Item$Properties";
+/// The `BlockBehaviour.Properties` builder mods chain before `new Block`.
+const BLOCK_PROPERTIES_CLASS: &str =
+    "net/minecraft/world/level/block/state/BlockBehaviour$Properties";
+/// The class `new Item(properties)` constructs.
+const ITEM_CLASS: &str = "net/minecraft/world/item/Item";
+/// The class `new Block(properties)` constructs.
+const BLOCK_CLASS: &str = "net/minecraft/world/level/block/Block";
+const ITEM_PROPERTIES_DESC: &str = "Lnet/minecraft/world/item/Item$Properties;";
+const BLOCK_PROPERTIES_DESC: &str =
+    "Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;";
+/// The template an inferred item declaration names. `minecraft:item` is not a
+/// vanilla item model: it tells the content loader that only item properties
+/// were described, so the row inherits the plain item template instead of
+/// claiming a vanilla item's model or behaviour.
+const INFERRED_ITEM_TEMPLATE: &str = "minecraft:item";
+/// The template an inferred block declaration names, meaning the same thing
+/// for blocks: the plain block template, never a copy of a vanilla block.
+const INFERRED_BLOCK_TEMPLATE: &str = "minecraft:block";
+/// Property builders whose chains stay in host state. Past this, later
+/// builders are still answered but their chains are dropped, so a jar cannot
+/// grow the host without bound.
+const MAX_PROPERTY_BUILDERS: usize = 512;
+/// Settings kept per builder. Builders in the wild set a handful; past this
+/// the extras are dropped rather than growing host state.
+const MAX_BUILDER_PROPERTIES: usize = 16;
+
 /// Deterministic, game-independent mappings for the small standard-library
 /// surface commonly reached during mod bootstrap.
 #[derive(Debug, Clone)]
@@ -339,6 +371,24 @@ pub struct StdHost {
     invocations: Vec<HostInvocation>,
     posted_events: Vec<Value>,
     registrations: Vec<RegistryEntry>,
+    /// Registry keys (`registry/id`) whose declaration was inferred from the
+    /// builder calls a registration's value carries. An explicit adapter may
+    /// replace these; every other declaration stays all-or-nothing.
+    inferred_declarations: BTreeSet<String>,
+    /// Registry keys the jar's own `META-INF/horizon-native.json` declares.
+    /// Those rows are recorded opaque so the metadata merge stays the one
+    /// authority for them, exactly as before inference existed.
+    declared_registrations: BTreeSet<String>,
+    /// Bounded `Item.Properties` chains, keyed by the builder's receiver
+    /// marker and by the constructed item marker once `new Item(properties)`
+    /// consumes one. `Registry.register` reads the latter to infer a typed
+    /// item declaration from bytecode alone.
+    item_property_builders: BTreeMap<String, BTreeMap<String, String>>,
+    /// Bounded `BlockBehaviour.Properties` chains, keyed the same way.
+    block_property_builders: BTreeMap<String, BTreeMap<String, String>>,
+    /// Marker counter for a property builder made by a static factory
+    /// (`BlockBehaviour.Properties.of()`), which has no `new` site to name it.
+    next_property_builder: usize,
     payload_registrations: Vec<PayloadRegistration>,
     /// Fabric lifecycle entries visible through `FabricLoader#getEntrypoints`.
     /// Entries are seeded by the loaded jar, so this query never scans a host
@@ -393,6 +443,11 @@ impl StdHost {
             invocations: Vec::new(),
             posted_events: Vec::new(),
             registrations: Vec::new(),
+            inferred_declarations: BTreeSet::new(),
+            declared_registrations: BTreeSet::new(),
+            item_property_builders: BTreeMap::new(),
+            block_property_builders: BTreeMap::new(),
+            next_property_builder: 0,
             payload_registrations: Vec::new(),
             fabric_entrypoint_containers: Vec::new(),
             packet_types: BTreeMap::new(),
@@ -617,22 +672,43 @@ impl StdHost {
         &self.registrations
     }
 
+    /// The property chain recorded for a constructed item marker, in the
+    /// builder's own vocabulary (`stacksTo`, `durability`, `rarity`, ...).
+    ///
+    /// Inference exports only the keys the content loader accepts; this is
+    /// the full record, so an adapter can still read a setting inference had
+    /// no key for.
+    pub fn item_properties(&self, marker: &str) -> Option<&BTreeMap<String, String>> {
+        self.item_property_builders.get(marker)
+    }
+
+    /// The property chain recorded for a constructed block marker
+    /// (`destroyTime`, `explosionResistance`, `friction`, ...).
+    pub fn block_properties(&self, marker: &str) -> Option<&BTreeMap<String, String>> {
+        self.block_property_builders.get(marker)
+    }
+
     /// Attach a Horizon-owned declaration to a registration recorded while a
     /// Java entrypoint executed. The lookup is explicit and all-or-nothing:
     /// opaque entries remain diagnostic until a loader adapter supplies a
     /// declaration, and an already-enriched entry cannot be replaced silently.
+    ///
+    /// An inferred declaration is not enrichment from an adapter, so an
+    /// explicit one replaces it: `META-INF/horizon-native.json` stays
+    /// authoritative over what the host read from builder calls.
     pub fn attach_registration_declaration(
         &mut self,
         registry: &str,
         id: &str,
         declaration: RegistryDeclaration,
     ) -> Result<(), String> {
+        let key = format!("{registry}/{id}");
         let entry = self
             .registrations
             .iter_mut()
             .find(|entry| entry.registry == registry && entry.id == id)
             .ok_or_else(|| format!("native registration {registry}/{id} was not recorded"))?;
-        if entry.declaration.is_some() {
+        if entry.declaration.is_some() && !self.inferred_declarations.remove(&key) {
             return Err(format!(
                 "native registration {registry}/{id} already has a declaration"
             ));
@@ -827,13 +903,128 @@ impl StdHost {
             _ => None,
         })?;
         let value = args.last().cloned().unwrap_or(Value::Void);
+        let key = format!("{registry}/{id}");
+        // An id the jar's metadata already describes stays opaque: the
+        // metadata is the explicit adapter for that row, so inference must not
+        // compete with it.
+        let declaration = if self.declared_registrations.contains(&key) {
+            None
+        } else {
+            self.inferred_declaration(registry, &value)
+        };
+        if declaration.is_some() {
+            self.inferred_declarations.insert(key);
+        }
         self.registrations.push(RegistryEntry {
             registry: registry.to_owned(),
             id,
             value: value.clone(),
-            declaration: None,
+            declaration,
         });
         Some(value)
+    }
+
+    /// Infer a typed declaration from the builder chain a registration's
+    /// value carries.
+    ///
+    /// Only items and blocks have a template vocabulary here; every other
+    /// registry stays opaque, because the host has no template for it and an
+    /// invented one would be content the mod never declared.
+    fn inferred_declaration(&self, registry: &str, value: &Value) -> Option<RegistryDeclaration> {
+        let marker = expect_ref(value)?;
+        match registry {
+            "minecraft:item" => {
+                self.item_property_builders
+                    .get(marker)
+                    .map(|builder| RegistryDeclaration::Item {
+                        template: INFERRED_ITEM_TEMPLATE.to_owned(),
+                        properties: item_declaration_properties(builder),
+                    })
+            }
+            "minecraft:block" => {
+                self.block_property_builders
+                    .get(marker)
+                    .map(|builder| RegistryDeclaration::Block {
+                        template: INFERRED_BLOCK_TEMPLATE.to_owned(),
+                        properties: block_declaration_properties(builder),
+                        // A block built this way has the item vanilla gives
+                        // every block; a mod that registers its own block item
+                        // records that separate row as a plain item.
+                        item: true,
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    /// Record the bounded property builders behind ordinary item and block
+    /// construction, and the constructor that consumes one.
+    ///
+    /// The classes stay outside the interpreter's model, exactly like the
+    /// rest of the game: the host keeps only the settings it can name, and
+    /// answers a builder-returning method with the receiver the way the real
+    /// builder does, so a chain keeps its value. Every other owner returns
+    /// `None`, leaving the standard surface untouched.
+    fn property_builder_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(marker) = expect_ref(receiver) else {
+            return Ok(None);
+        };
+        match r.owner.as_str() {
+            ITEM_PROPERTIES_CLASS | BLOCK_PROPERTIES_CLASS => {
+                let item = r.owner == ITEM_PROPERTIES_CLASS;
+                let builders = if item {
+                    &mut self.item_property_builders
+                } else {
+                    &mut self.block_property_builders
+                };
+                if r.name == "<init>" {
+                    open_inferred_builder(builders, marker);
+                    return Ok(Some(Value::Void));
+                }
+                let settings = if item {
+                    item_builder_settings(&r.name, &r.descriptor, args)
+                } else {
+                    block_builder_settings(&r.name, &r.descriptor, args)
+                };
+                for (key, value) in settings {
+                    record_inferred_property(builders, marker, key, Some(value));
+                }
+                let returns_self = if item {
+                    ITEM_PROPERTIES_DESC
+                } else {
+                    BLOCK_PROPERTIES_DESC
+                };
+                if r.descriptor.ends_with(returns_self) {
+                    return Ok(Some(receiver.clone()));
+                }
+                Ok(None)
+            }
+            ITEM_CLASS | BLOCK_CLASS if r.name == "<init>" => {
+                let Some(builder) = args.first().and_then(expect_ref) else {
+                    return Ok(None);
+                };
+                let builders = if r.owner == ITEM_CLASS {
+                    &mut self.item_property_builders
+                } else {
+                    &mut self.block_property_builders
+                };
+                let Some(properties) = builders.get(builder).cloned() else {
+                    return Ok(None);
+                };
+                // Hand the finished chain to the value the mod registers, so
+                // the registration's marker names it.
+                if builders.contains_key(marker) || builders.len() < MAX_PROPERTY_BUILDERS {
+                    builders.insert(marker.to_owned(), properties);
+                }
+                Ok(Some(Value::Void))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -886,6 +1077,16 @@ impl Host for StdHost {
             ("net/minecraftforge/fml/ModList", "get", "()Lnet/minecraftforge/fml/ModList;") => {
                 Ok(Value::Ref(Some("neoforge-mod-list".into())))
             }
+            // Item rarity is a bounded set of constants. The marker names the
+            // value so a recorded builder chain can name it back.
+            (
+                "net/minecraft/world/item/Rarity",
+                "COMMON" | "UNCOMMON" | "RARE" | "EPIC",
+                "Lnet/minecraft/world/item/Rarity;",
+            ) => Ok(Value::Ref(Some(format!(
+                "rarity/{}",
+                r.name.to_ascii_lowercase()
+            )))),
             _ => Ok(Value::default_for(&r.descriptor)),
         }
     }
@@ -1629,6 +1830,19 @@ impl Host for StdHost {
                 "getInstance",
                 "()Lnet/fabricmc/loader/api/FabricLoader;",
             ) => Ok(Value::Ref(Some("fabric-loader".into()))),
+            // A block's property builder normally comes from a static
+            // factory rather than `new`. Give it a bounded marker so the
+            // chain is observable; a copy variant keeps only the settings the
+            // mod applies afterwards, since the template's own settings live
+            // in a game registry the host cannot read.
+            (BLOCK_PROPERTIES_CLASS, "of" | "ofFullCopy" | "copy" | "ofLegacyCopy", descriptor)
+                if descriptor.ends_with(BLOCK_PROPERTIES_DESC) =>
+            {
+                let marker = format!("block/properties/{}", self.next_property_builder);
+                self.next_property_builder = self.next_property_builder.saturating_add(1);
+                open_inferred_builder(&mut self.block_property_builders, &marker);
+                Ok(Value::Ref(Some(marker)))
+            }
             _ => Ok(Value::default_for(&r.descriptor)),
         }
     }
@@ -1641,6 +1855,9 @@ impl Host for StdHost {
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
         if let Some(value) = self.registry_register(r, Some(receiver), args) {
+            return Ok(value);
+        }
+        if let Some(value) = self.property_builder_call(r, receiver, args)? {
             return Ok(value);
         }
         if is_throwable_owner(&r.owner) {
@@ -5026,6 +5243,214 @@ fn value_marker(value: &Value) -> String {
     }
 }
 
+/// Open the builder chain a `new` site or static factory just made. The entry
+/// is what makes an otherwise opaque registration inferable: an item built
+/// from default properties is still a declaration, with no properties.
+fn open_inferred_builder(builders: &mut BTreeMap<String, BTreeMap<String, String>>, marker: &str) {
+    if builders.contains_key(marker) || builders.len() < MAX_PROPERTY_BUILDERS {
+        builders.entry(marker.to_owned()).or_default();
+    }
+}
+
+/// Record one builder setting for declaration inference.
+///
+/// The chain lives under the builder's own marker, so two items built from
+/// separate builders never share settings. Once [`MAX_PROPERTY_BUILDERS`]
+/// builders are tracked the setting is dropped and the registration stays
+/// opaque instead of silently borrowing another builder's chain.
+fn record_inferred_property(
+    builders: &mut BTreeMap<String, BTreeMap<String, String>>,
+    marker: &str,
+    key: &str,
+    value: Option<String>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    if !builders.contains_key(marker) && builders.len() >= MAX_PROPERTY_BUILDERS {
+        return;
+    }
+    let properties = builders.entry(marker.to_owned()).or_default();
+    if properties.len() < MAX_BUILDER_PROPERTIES {
+        properties.insert(key.to_owned(), value);
+    }
+}
+
+/// The text a builder setting records. A float argument arrives through the
+/// interpreter's bounded number representation, which stores `fconst` and a
+/// float constant as an integer: `strength(2.0F)` is exact, a fractional
+/// `friction(0.6F)` is already `0` by the time the host sees it. The
+/// declaration mapping drops the settings that would turn that loss into a
+/// wrong block.
+fn builder_number(descriptor: &str, value: &Value) -> Option<String> {
+    let floating = descriptor
+        .strip_prefix('(')
+        .is_some_and(|args| args.starts_with('F') || args.starts_with('D'));
+    if floating {
+        boxed_float(value).map(format_java_float)
+    } else {
+        match value {
+            Value::Int(value) => Some(value.to_string()),
+            _ => None,
+        }
+    }
+}
+
+/// The settings one `Item.Properties` method records, under the builder's own
+/// marker. An unknown method records nothing; the caller still answers with
+/// the receiver, so a chain is never broken by a setting the host cannot name.
+fn item_builder_settings(
+    method: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> Vec<(&'static str, String)> {
+    let first = args.first();
+    let setting = match method {
+        "stacksTo" => (
+            "stacksTo",
+            first.and_then(|value| builder_number(descriptor, value)),
+        ),
+        "durability" => (
+            "durability",
+            first.and_then(|value| builder_number(descriptor, value)),
+        ),
+        "rarity" => (
+            "rarity",
+            first.map(|value| {
+                let marker = expect_string(value);
+                marker.strip_prefix("rarity/").unwrap_or(marker).to_owned()
+            }),
+        ),
+        "craftingRemainingItem" | "craftingRemainder" => (
+            "craftingRemainingItem",
+            first.map(|value| expect_string(value).to_owned()),
+        ),
+        "fireResistant" => (
+            "fireResistant",
+            Some(match first {
+                Some(Value::Int(flag)) if *flag == 0 => "false".to_owned(),
+                _ => "true".to_owned(),
+            }),
+        ),
+        _ => return Vec::new(),
+    };
+    setting
+        .1
+        .map(|value| vec![(setting.0, value)])
+        .unwrap_or_default()
+}
+
+/// The settings one `BlockBehaviour.Properties` method records. `strength`
+/// writes both of its settings, and the one-argument form feeds both from the
+/// same value the way vanilla does; `instabreak` is `strength(0.0F)`.
+fn block_builder_settings(
+    method: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> Vec<(&'static str, String)> {
+    let first = args.first();
+    let number = |value: Option<&Value>| value.and_then(|value| builder_number(descriptor, value));
+    let mut settings = Vec::new();
+    let mut push = |key: &'static str, value: Option<String>| {
+        if let Some(value) = value {
+            settings.push((key, value));
+        }
+    };
+    match method {
+        "strength" if descriptor.starts_with("(FF") => {
+            push("destroyTime", number(first));
+            push("explosionResistance", number(args.get(1)));
+        }
+        "strength" => {
+            let strength = number(first);
+            push("destroyTime", strength.clone());
+            push("explosionResistance", strength);
+        }
+        "instabreak" => {
+            push("destroyTime", Some("0".to_owned()));
+            push("explosionResistance", Some("0".to_owned()));
+        }
+        "friction" => push("friction", number(first)),
+        "speedFactor" => push("speedFactor", number(first)),
+        "jumpFactor" => push("jumpFactor", number(first)),
+        "randomTicks" => push("randomTicks", Some("true".to_owned())),
+        "noOcclusion" => push("noOcclusion", Some("true".to_owned())),
+        "requiresCorrectToolForDrops" => {
+            push("requiresCorrectToolForDrops", Some("true".to_owned()))
+        }
+        _ => {}
+    }
+    settings
+}
+
+/// Translate a recorded item chain into the property vocabulary the content
+/// loader accepts. A setting with no loader key (`durability`, the
+/// component-level `fireResistant`) stays in [`StdHost::item_properties`]:
+/// emitting an unknown key would make the whole declaration fail validation.
+fn item_declaration_properties(builder: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut properties = BTreeMap::new();
+    if let Some(stacks) = builder.get("stacksTo")
+        && let Ok(stacks) = stacks.parse::<u8>()
+        && (1..=99).contains(&stacks)
+    {
+        properties.insert("max_stack_size".to_owned(), stacks.to_string());
+    }
+    if let Some(rarity) = builder.get("rarity")
+        && matches!(rarity.as_str(), "common" | "uncommon" | "rare" | "epic")
+    {
+        properties.insert("rarity".to_owned(), rarity.clone());
+    }
+    if let Some(remainder) = builder
+        .get("craftingRemainingItem")
+        .and_then(|value| marker_id(value))
+    {
+        properties.insert("crafting_remainder".to_owned(), remainder);
+    }
+    properties
+}
+
+/// Translate a recorded block chain into the property vocabulary the content
+/// loader accepts. `speedFactor`, `jumpFactor`, `randomTicks` and
+/// `noOcclusion` have no loader key yet and stay in
+/// [`StdHost::block_properties`].
+fn block_declaration_properties(builder: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut properties = BTreeMap::new();
+    if let Some(destroy_time) = builder.get("destroyTime") {
+        properties.insert("hardness".to_owned(), destroy_time.clone());
+    }
+    if let Some(resistance) = builder.get("explosionResistance") {
+        properties.insert("explosion_resistance".to_owned(), resistance.clone());
+    }
+    // A truncated fraction is indistinguishable from an explicit zero, and a
+    // zero friction block is ice; leave the template's friction alone instead
+    // of guessing.
+    if let Some(friction) = builder.get("friction")
+        && friction.parse::<f64>().is_ok_and(|friction| friction > 0.0)
+    {
+        properties.insert("friction".to_owned(), friction.clone());
+    }
+    if builder.contains_key("requiresCorrectToolForDrops") {
+        properties.insert("requires_tool".to_owned(), "true".to_owned());
+    }
+    properties
+}
+
+/// The namespaced id a value marker carries, when it carries one. A
+/// constructed item keeps an opaque marker (`net/minecraft/world/item/Item#0`),
+/// so a crafting remainder that points at one is recorded but not exported:
+/// the loader requires a real id and would reject the marker text.
+fn marker_id(value: &str) -> Option<String> {
+    let value = value.strip_prefix("identifier/").unwrap_or(value);
+    let (namespace, path) = value.split_once(':')?;
+    let lowercase = |part: &str, extra: &[u8]| {
+        !part.is_empty()
+            && part.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || extra.contains(&byte)
+            })
+    };
+    (lowercase(namespace, b"_.-") && lowercase(path, b"_./-")).then(|| value.to_owned())
+}
+
 fn is_throwable_owner(owner: &str) -> bool {
     owner == "java/lang/Throwable"
         || owner.ends_with("Exception")
@@ -6234,6 +6659,9 @@ impl NativeJar {
         }
         for dependency in &self.required_mods {
             host = host.with_mod(dependency, "unknown");
+        }
+        for declaration in &self.native_declarations {
+            host.declared_registrations.insert(declaration.key());
         }
         let provider = self
             .fabric_id
@@ -7989,10 +8417,13 @@ impl<H: Host> Runtime<'_, H> {
                 0x00 => {}
                 0x01 => stack.push(Value::Ref(None)),
                 0x02..=0x08 => stack.push(Value::Int(op as i32 - 3)),
-                0x09..=0x0f => stack.push(Value::Int(if op == 0x09 || op == 0x0b || op == 0x0e {
-                    0
-                } else {
-                    1
+                // lconst_0/1, fconst_0/1/2, dconst_0/1. `fconst_2` is the
+                // only constant above one, so it is the one a value of 2 (a
+                // common property such as a block's strength) lands on.
+                0x09..=0x0f => stack.push(Value::Int(match op {
+                    0x0a | 0x0c | 0x0f => 1,
+                    0x0d => 2,
+                    _ => 0,
                 })),
                 0x10 => {
                     let b = *code.get(pc).ok_or(NativeError::Truncated)?;
@@ -14100,6 +14531,36 @@ mandatory = true
             )
             .unwrap();
         assert!(matches!(name, Value::Ref(Some(marker)) if marker.starts_with("identifier/")));
+        // The post-registration holder surface a legacy mod reads next: the
+        // same `DeferredRegister.register` row answers presence and its id.
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraftforge/registries/RegistryObject".into(),
+                    name: "isPresent".into(),
+                    descriptor: "()Z".into(),
+                },
+                &object,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/minecraftforge/registries/RegistryObject".into(),
+                    name: "getId".into(),
+                    descriptor: "()Lnet/minecraft/resources/ResourceLocation;".into(),
+                },
+                &object,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some(
+                "identifier/holder/deferred-register/registry/legacy/entry".into()
+            ))
+        );
         assert_eq!(host.registrations().len(), 1);
     }
 
