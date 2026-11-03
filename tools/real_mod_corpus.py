@@ -3,7 +3,7 @@
 
     real_mod_corpus.py --fabric-jars DIR [--fabric-jars DIR]...
                        [--neoforge-jars DIR]... [--server DIR]
-                       [--limit N] [--timeout S] [--bin-dir DIR] [--json]
+                       [--limit N] [--timeout S] [--bin-dir DIR] [--json] [--self-test]
 
 Reads every jar's loader metadata (`fabric.mod.json`, `META-INF/neoforge.mods.toml` or its older
 `META-INF/mods.toml`), then runs one short probe per jar and classifies it:
@@ -40,6 +40,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import tomllib
 import zipfile
@@ -480,6 +481,21 @@ def build_probes(timeout: float, bin_dir: Path | None) -> tuple[bool, str | None
     return True, None
 
 
+class ProbeToolchain:
+    """The probe binaries plus the one upfront build. Tests inject a stand-in, never a subprocess."""
+
+    def __init__(self, timeout: float, build_timeout: float, bin_dir: Path | None = None):
+        self.timeout = timeout
+        self.build_timeout = build_timeout
+        self.bin_dir = bin_dir
+
+    def probe(self, tool: str, mode: str, args: list[str]) -> Probe:
+        return run_probe(tool, mode, args, self.timeout, self.bin_dir)
+
+    def build(self) -> tuple[bool, str | None]:
+        return build_probes(self.build_timeout, self.bin_dir)
+
+
 def list_entrypoints(probe: Probe) -> dict[str, int]:
     """`kind<TAB>entrypoint` lines from `horizon-jvm --list-entrypoints`."""
     kinds: dict[str, int] = {}
@@ -494,12 +510,12 @@ def describe_kinds(kinds: dict[str, int]) -> str:
     return ", ".join(f"{kind} ({count})" for kind, count in sorted(kinds.items()))
 
 
-def retry_server_kind(jar: Path, kinds: dict[str, int], timeout: float,
-                      bin_dir: Path | None) -> tuple[Probe | None, str | None]:
+def retry_server_kind(jar: Path, kinds: dict[str, int],
+                      toolchain: ProbeToolchain) -> tuple[Probe | None, str | None]:
     """Run the native path for a server-only Fabric jar, the one non-client kind worth executing."""
     if "server" not in kinds or "main" in kinds:
         return None, None
-    probe = run_probe("horizon-native-java", "server", ["--json", str(jar), "server"], timeout, bin_dir)
+    probe = toolchain.probe("horizon-native-java", "server", ["--json", str(jar), "server"])
     value = probe.json()
     if probe.code == 0 and value and value.get("status") == "ok":
         entrypoints = len(value.get("entrypoints") or [])
@@ -509,11 +525,11 @@ def retry_server_kind(jar: Path, kinds: dict[str, int], timeout: float,
 
 
 def probe_fabric(jar: Path, meta: dict[str, Any], available: bool, reason: str | None,
-                 timeout: float, bin_dir: Path | None) -> tuple[str, str, list[Probe]]:
+                 toolchain: ProbeToolchain) -> tuple[str, str, list[Probe]]:
     if not available:
         return "metadata-only", f"probe unavailable: {reason}", []
     probes: list[Probe] = []
-    main = run_probe("horizon-native-java", "main", ["--json", str(jar), "main"], timeout, bin_dir)
+    main = toolchain.probe("horizon-native-java", "main", ["--json", str(jar), "main"])
     probes.append(main)
     value = main.json()
     if main.code == 0 and value and value.get("status") == "ok":
@@ -527,7 +543,7 @@ def probe_fabric(jar: Path, meta: dict[str, Any], available: bool, reason: str |
             probes,
         )
     if main.timed_out:
-        return "fallback", f"native main probe timed out after {timeout:g}s; embedded JVM fallback", probes
+        return "fallback", f"native main probe timed out after {toolchain.timeout:g}s; embedded JVM fallback", probes
     if value and value.get("status") == "error":
         stage = value.get("stage")
         error = value.get("error", "unknown error")
@@ -537,16 +553,16 @@ def probe_fabric(jar: Path, meta: dict[str, Any], available: bool, reason: str |
             return "fallback", f"native execution stopped: {error}; embedded JVM fallback", probes
     # No main entrypoint (stage `discover`), or an unparsed native failure: planning and listing are
     # still meaningful, and they say whether the jar has another kind or only mixins.
-    plans = run_probe("horizon-native-java", "mixin-plans", ["--mixin-plans", str(jar)], timeout, bin_dir)
+    plans = toolchain.probe("horizon-native-java", "mixin-plans", ["--mixin-plans", str(jar)])
     probes.append(plans)
     plan_value = plans.json() or {}
     plan_count = len(plan_value.get("plans") or [])
     config_count = len(plan_value.get("configs") or [])
-    listing = run_probe("horizon-jvm", "list-entrypoints", ["--list-entrypoints", str(jar)], timeout, bin_dir)
+    listing = toolchain.probe("horizon-jvm", "list-entrypoints", ["--list-entrypoints", str(jar)])
     probes.append(listing)
     kinds = list_entrypoints(listing)
     if kinds:
-        retry, retry_reason = retry_server_kind(jar, kinds, timeout, bin_dir)
+        retry, retry_reason = retry_server_kind(jar, kinds, toolchain)
         if retry is not None:
             probes.append(retry)
         if retry_reason:
@@ -605,7 +621,7 @@ def flag_rejected(probe: Probe) -> bool:
 
 
 def probe_neoforge(jar: Path, meta: dict[str, Any], server: Path | None, available: bool,
-                   reason: str | None, timeout: float, bin_dir: Path | None,
+                   reason: str | None, toolchain: ProbeToolchain
                    ) -> tuple[str, str, list[Probe]]:
     mod_ids = ", ".join(meta.get("mod_ids") or []) or "none"
     if server is None:
@@ -613,12 +629,10 @@ def probe_neoforge(jar: Path, meta: dict[str, Any], server: Path | None, availab
     if not available:
         return "metadata-only", f"probe unavailable: {reason}", []
     probes: list[Probe] = []
-    listing = run_probe(
+    listing = toolchain.probe(
         "horizon-jvm",
         "list-fml-mods",
         ["--list-fml-mods", "--libs", str(server / "libraries"), str(jar)],
-        timeout,
-        bin_dir,
     )
     probes.append(listing)
     if listing.code == 0:
@@ -644,7 +658,7 @@ def probe_neoforge(jar: Path, meta: dict[str, Any], server: Path | None, availab
         return "fallback", f"FML listing failed (exit {listing.code}): {tail(listing)}", probes
     # This checkout's horizon-jvm has no `--list-fml-mods` yet; the bounded @Mod scan still answers
     # whether the jar carries a class FML would construct.
-    scan = run_probe("horizon-jvm", "list-entrypoints", ["--list-entrypoints", str(jar)], timeout, bin_dir)
+    scan = toolchain.probe("horizon-jvm", "list-entrypoints", ["--list-entrypoints", str(jar)])
     probes.append(scan)
     kinds = list_entrypoints(scan)
     if kinds.get("neoforge"):
@@ -722,8 +736,8 @@ def collect_jars(roots: list[tuple[str, Path]], limit: int, size_cap: int, hash_
     return selected, skipped, duplicates, deferred
 
 
-def classify(jar: JarFile, server: Path | None, available: bool, reason: str | None,
-             timeout: float, bin_dir: Path | None) -> dict[str, Any]:
+def classify(jar: JarFile, server: Path | None, toolchain: ProbeToolchain, available: bool,
+             reason: str | None) -> dict[str, Any]:
     meta, error = read_metadata(jar.path, jar.source)
     row: dict[str, Any] = {
         "file": jar.file,
@@ -749,10 +763,10 @@ def classify(jar: JarFile, server: Path | None, available: bool, reason: str | N
     if error is not None:
         verdict, why = "unsupported", error
     elif meta["loader"] == "fabric":
-        verdict, why, probes = probe_fabric(jar.path, meta, available, reason, timeout, bin_dir)
+        verdict, why, probes = probe_fabric(jar.path, meta, available, reason, toolchain)
     elif meta["loader"] == "neoforge":
         verdict, why, probes = probe_neoforge(
-            jar.path, meta, server, available, reason, timeout, bin_dir
+            jar.path, meta, server, available, reason, toolchain
         )
     else:
         verdict, why = "unsupported", "no loader metadata"
@@ -768,7 +782,8 @@ def is_installed_server(path: Path) -> bool:
     )
 
 
-def build_report(args: argparse.Namespace) -> dict[str, Any]:
+def build_report(args: argparse.Namespace,
+                 toolchain: ProbeToolchain | None = None) -> dict[str, Any]:
     limits = {
         "jars": args.limit,
         "size_cap_bytes": args.size_cap_mib << 20,
@@ -826,10 +841,12 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         report["counts"] = {verdict: 0 for verdict in VERDICTS} | {"total": 0}
         return report
 
-    available, reason = build_probes(args.build_timeout, args.bin_dir)
+    if toolchain is None:
+        toolchain = ProbeToolchain(args.timeout, args.build_timeout, args.bin_dir)
+    available, reason = toolchain.build()
     report["probe_toolchain"]["build"] = "ok" if available else reason
     rows = [
-        classify(jar, args.server, available, reason, args.timeout, args.bin_dir)
+        classify(jar, args.server, toolchain, available, reason)
         for jar in selected
     ]
 
@@ -877,6 +894,58 @@ def print_human(report: dict[str, Any]) -> None:
         print(f"  deferred       {item['source']}/{item['file']} ({item['reason']})")
 
 
+def self_test() -> int:
+    """Probe a synthetic corpus through the real pipeline, with no JVM, cargo or real jars."""
+    def jar(path: Path, members: dict[str, str | bytes]) -> None:
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, data in members.items():
+                archive.writestr(name, data)
+
+    class Stub:
+        timeout = 1.0
+
+        def build(self) -> tuple[bool, str | None]:
+            return True, None
+
+        def probe(self, tool: str, mode: str, args: list[str]) -> Probe:
+            located = next((arg for arg in args if arg.endswith(".jar")), "")
+            meta, _ = read_metadata(Path(located), "fabric")
+            kinds = meta["entrypoint_kinds"]
+            if mode == "list-entrypoints":
+                listed = "".join(f"{kind}\tcom.example.Entry\n" for kind in kinds)
+                return Probe(tool, mode, 0, False, listed, "")
+            if mode == "mixin-plans":
+                return Probe(tool, mode, 0, False, '{"plans": [], "configs": []}', "")
+            if "main" in kinds:
+                body = {"status": "ok", "entrypoints": kinds, "host_calls": 1, "mixin_configs": 0}
+                return Probe(tool, mode, 0, False, json.dumps(body), "")
+            body = {"status": "error", "stage": "discover", "error": "no main entrypoint"}
+            return Probe(tool, mode, 0, False, json.dumps(body), "")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        jar(root / "demo-ok.jar", {"fabric.mod.json": json.dumps({
+            "schemaVersion": 1, "id": "demo", "version": "1.0",
+            "entrypoints": {"main": ["com.example.Demo"]},
+        })})
+        jar(root / "demo-client.jar", {"fabric.mod.json": json.dumps({
+            "schemaVersion": 1, "id": "demo-client", "version": "1.0",
+            "entrypoints": {"client": ["com.example.Client"]},
+        })})
+        jar(root / "plain.jar", {"demo/Thing.class": b"\xca\xfe\xba\xbe"})
+        shutil.copyfile(root / "demo-ok.jar", root / "demo-ok-copy.jar")
+        args = parse_args(["--fabric-jars", str(root)])
+        args.fabric_jars = [Path(path).resolve() for path in args.fabric_jars]
+        report = build_report(args, Stub())
+        expected = {"ok": 1, "fallback": 1, "unsupported": 1, "metadata-only": 0, "total": 3}
+        if report["counts"] != expected or len(report["duplicates"]) != 1:
+            print(f"real mod corpus self-test: FAILED ({report['counts']}, "
+                  f"{len(report['duplicates'])} duplicate(s))", file=sys.stderr)
+            return 1
+    print("real mod corpus self-test: ok")
+    return 0
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = CorpusParser(
         description=__doc__,
@@ -902,6 +971,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="stop hashing after this many MiB and defer the rest "
                              f"(default {DEFAULT_HASH_BUDGET_MIB})")
     parser.add_argument("--json", action="store_true", help="print the report as JSON only")
+    parser.add_argument("--self-test", action="store_true",
+                        help="probe a synthetic in-memory corpus (no JVM, no jars) and exit")
     args = parser.parse_args(argv)
     if args.limit < 1:
         parser.error("--limit must be at least 1")
@@ -921,6 +992,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.self_test:
+        return self_test()
     args.fabric_jars = [Path(path).resolve() for path in args.fabric_jars]
     args.neoforge_jars = [Path(path).resolve() for path in args.neoforge_jars]
     if args.server is not None:
