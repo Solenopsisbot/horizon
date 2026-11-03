@@ -4,9 +4,13 @@
 //!
 //! ```sh
 //! horizon-jvm [--entry dev.example.MyMod] [--mixin-config demo.mixins.json] \
-//!     --stubs facade.jar --loader fabric-loader.jar --libs ~/.minecraft/libraries \
-//!     mod.jar [more jars...]
+//!     [--fabric-development] --stubs facade.jar --loader fabric-loader.jar \
+//!     --libs ~/.minecraft/libraries mod.jar [more jars...]
 //! ```
+//!
+//! The supplied jars also go to Fabric Loader through its documented
+//! `fabric.addMods` developer property, so the loader itself registers their
+//! mixin configs and entrypoints instead of only this runner's own scans.
 //!
 //! The façade's methods throw `UnsupportedOperationException` naming
 //! themselves, so the first one the mod reaches is the next thing the game
@@ -159,6 +163,10 @@ fn run() -> Result<(), String> {
     args.retain(|arg| arg != "--list-entrypoints");
     let list_mixin_configs_only = args.iter().any(|arg| arg == "--list-mixin-configs");
     args.retain(|arg| arg != "--list-mixin-configs");
+    // Fabric's loader-development mode is opt-in: a plain probe keeps the
+    // production default, and the flag never reaches the jar list.
+    let fabric_development = args.iter().any(|arg| arg == "--fabric-development");
+    args.retain(|arg| arg != "--fabric-development");
     let mixin_config_args = take_all(&mut args, "--mixin-config");
     let entry = take(&mut args, "--entry");
     let entry_kind = take(&mut args, "--entry-kind").unwrap_or_else(|| "main".to_owned());
@@ -172,7 +180,7 @@ fn run() -> Result<(), String> {
         return list_mixin_configs(&args, &mixin_config_args);
     }
     if args.is_empty() {
-        return Err("usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge>] [--list-entrypoints] [--list-mixin-configs] [--mixin-config <path>]... [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...".to_owned());
+        return Err("usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge>] [--list-entrypoints] [--list-mixin-configs] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...".to_owned());
     }
     if list_entrypoints_only {
         return list_entrypoints(&args);
@@ -241,6 +249,12 @@ fn run() -> Result<(), String> {
     // Registration walks the same list the property carries, so the two
     // hand-offs can never name different configs or a different order.
     let mixin_names = mixin_config_names(mixin_property.as_deref());
+    // Fabric's own mod discovery only sees jars the loader is told about. The
+    // classpath above stays as it is; this property names the supplied jars as
+    // mods, the documented developer hand-off for classpath mods.
+    let supplied_jars: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
+    let fabric_mods = fabric_add_mods(&supplied_jars);
+    let skip_mc_provider = skip_mc_provider_requested(&fabric_environment_options());
     let paths = std::env::join_paths(&classpath).map_err(|e| e.to_string())?;
     let paths = paths.to_string_lossy().into_owned();
 
@@ -252,6 +266,11 @@ fn run() -> Result<(), String> {
     // Mixin reads its config list at launch time, so the property has to be in
     // the JVM options rather than set after `JavaVM::new`.
     for option in mixin_jvm_options(mixin_property.as_deref()) {
+        init = init.option(option);
+    }
+    // Same for Fabric's developer properties: the loader reads them while it
+    // discovers mods, which happens on the first loader class that loads.
+    for option in fabric_jvm_options(fabric_mods.as_deref(), fabric_development, skip_mc_provider) {
         init = init.option(option);
     }
     let init = init.build().map_err(|e| format!("JVM options: {e}"))?;
@@ -271,6 +290,9 @@ fn run() -> Result<(), String> {
         entry_kind,
         entry_specs.len()
     );
+    // Read the hand-off back: it proves the loader will see those jars as mods
+    // (or that the run supplied none), without guessing from the option list.
+    println!("{}", report_fabric_add_mods(env));
     if !pre_launch.is_empty() {
         println!("{} preLaunch entrypoint(s)", pre_launch.len());
     }
@@ -500,6 +522,150 @@ fn fabric_metadata(path: &Path) -> Option<(String, String)> {
         _ => "0".to_owned(),
     };
     Some((id, version))
+}
+
+/// Fabric's documented developer property for classpath mods, and the loader
+/// flags this probe may forward. The loader reads them before any entrypoint
+/// runs, so they have to be in the JVM options.
+const FABRIC_ADD_MODS: &str = "fabric.addMods";
+const FABRIC_DEVELOPMENT: &str = "fabric.development";
+const FABRIC_SKIP_MC_PROVIDER: &str = "fabric.skipMcProvider";
+
+/// Upper bounds for `-Dfabric.addMods`: the list is one JVM argument, so a
+/// hostile or accidental thousand-jar command line must not grow without bound.
+const MAX_FABRIC_ADD_MODS: usize = 256;
+const MAX_FABRIC_ADD_MODS_BYTES: usize = 32 * 1024;
+
+/// The platform path separator, what Java's `File.pathSeparator` reports and
+/// the character Fabric splits `fabric.addMods` on.
+fn classpath_separator() -> char {
+    if cfg!(windows) { ';' } else { ':' }
+}
+
+/// The value of `-Dfabric.addMods`: the supplied jars joined with
+/// [`classpath_separator`], sorted and deduplicated so the value never depends
+/// on argument order. Only paths from `jars` can appear (nothing is scanned
+/// from disk), a path carrying the separator is dropped because the property
+/// cannot express it, and the list stops at [`MAX_FABRIC_ADD_MODS`] entries or
+/// [`MAX_FABRIC_ADD_MODS_BYTES`] bytes.
+fn fabric_add_mods(jars: &[PathBuf]) -> Option<String> {
+    let separator = classpath_separator();
+    let mut paths: Vec<String> = jars
+        .iter()
+        .map(|jar| jar.to_string_lossy().into_owned())
+        .filter(|path| !path.is_empty() && !path.contains(separator))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths.truncate(MAX_FABRIC_ADD_MODS);
+    let mut value = String::new();
+    for path in paths {
+        let separator_len = usize::from(!value.is_empty());
+        if value.len() + separator_len + path.len() > MAX_FABRIC_ADD_MODS_BYTES {
+            break;
+        }
+        if separator_len == 1 {
+            value.push(separator);
+        }
+        value.push_str(&path);
+    }
+    (!value.is_empty()).then_some(value)
+}
+
+/// How many jars the property carries, for the deterministic log line. A
+/// missing or empty property has none.
+fn fabric_add_mods_count(value: Option<&str>) -> usize {
+    value.map_or(0, |value| {
+        value
+            .split(classpath_separator())
+            .filter(|path| !path.is_empty())
+            .count()
+    })
+}
+
+/// `fabric addMods: N jar(s)`, the one-line diagnostic for the hand-off.
+fn fabric_add_mods_line(count: usize) -> String {
+    format!("fabric addMods: {count} jar(s)")
+}
+
+/// The JVM options Fabric's developer properties need, in a stable order. Kept
+/// as an argument list so a test can inspect the exact properties without
+/// starting a JVM. `fabric.development` is opt-in, and `fabric.skipMcProvider`
+/// is only forwarded when the environment already set it.
+fn fabric_jvm_options(
+    add_mods: Option<&str>,
+    development: bool,
+    skip_mc_provider: bool,
+) -> Vec<String> {
+    let mut options = Vec::new();
+    if let Some(add_mods) = add_mods {
+        options.push(format!("-D{}={add_mods}", FABRIC_ADD_MODS));
+    }
+    if development {
+        options.push(format!("-D{}=true", FABRIC_DEVELOPMENT));
+    }
+    if skip_mc_provider {
+        options.push(format!("-D{}=true", FABRIC_SKIP_MC_PROVIDER));
+    }
+    options
+}
+
+/// The launcher-side JVM option strings the environment already carries. Those
+/// three variables are the only way a system property can be seeded before the
+/// JVM starts, which is what "already set in the environment" means here.
+fn fabric_environment_options() -> Vec<String> {
+    ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .collect()
+}
+
+/// Whether the environment already asks Fabric to skip its Minecraft provider.
+/// The probe never invents it: a run only forwards what a launcher put there.
+fn skip_mc_provider_requested(options: &[String]) -> bool {
+    options
+        .iter()
+        .any(|option| option.contains(FABRIC_SKIP_MC_PROVIDER))
+}
+
+/// `System.getProperty(name)`, or `None` when the JVM does not have it. Read
+/// after the JVM started, so this is diagnostics and never a failure.
+fn jvm_property(env: &mut JNIEnv, name: &str) -> Option<String> {
+    let value = system_property(env, name);
+    // A failed lookup must not leave a throwable pending for the entrypoints.
+    if value.is_none() {
+        let _ = env.exception_clear();
+    }
+    value
+}
+
+/// The raw `System.getProperty` call behind [`jvm_property`].
+fn system_property(env: &mut JNIEnv, name: &str) -> Option<String> {
+    let system = env.find_class("java/lang/System").ok()?;
+    let key = env.new_string(name).ok()?;
+    let key = JObject::from(key);
+    let value = env
+        .call_static_method(
+            &system,
+            "getProperty",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &[JValue::Object(&key)],
+        )
+        .ok()?
+        .l()
+        .ok()?;
+    if value.is_null() {
+        return None;
+    }
+    let text = env.get_string((&value).into()).ok()?;
+    Some(text.to_string_lossy().into_owned())
+}
+
+/// The `fabric addMods` diagnostic, read back from the started JVM. A property
+/// that did not survive reports 0 jars instead of failing the probe.
+fn report_fabric_add_mods(env: &mut JNIEnv) -> String {
+    let value = jvm_property(env, FABRIC_ADD_MODS);
+    fabric_add_mods_line(fabric_add_mods_count(value.as_deref()))
 }
 
 /// Give Fabric Loader the two paths it normally receives from its launcher.
@@ -2251,17 +2417,19 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Entrypoint, MAX_MIXIN_CONFIG_PROPERTY_BYTES, MixinBootstrap, MixinConfigRef,
-        MixinEnvironment, MixinPhaseDriver, MixinRegistrar, MixinSide, MixinStage, PhaseOutcome,
+        Entrypoint, MAX_FABRIC_ADD_MODS, MAX_FABRIC_ADD_MODS_BYTES,
+        MAX_MIXIN_CONFIG_PROPERTY_BYTES, MixinBootstrap, MixinConfigRef, MixinEnvironment,
+        MixinPhaseDriver, MixinRegistrar, MixinSide, MixinStage, PhaseOutcome, classpath_separator,
         constructor_only_entry_kind, declared_entrypoint_kinds, discover_entries,
-        discover_mixin_configs, entrypoints_from_metadata, fabric_entries, fabric_metadata,
+        discover_mixin_configs, entrypoints_from_metadata, fabric_add_mods, fabric_add_mods_count,
+        fabric_add_mods_line, fabric_entries, fabric_jvm_options, fabric_metadata,
         fabric_mixin_configs, fallback_label, format_entrypoints, format_mixin_config_property,
         format_mixin_configs, initializer_for_kind, is_minecraft_class, missing_entry_message,
         mixin_bootstrap_line, mixin_config_names, mixin_config_property, mixin_configs_line,
         mixin_jvm_options, mixin_registered_count, mixin_stages, neoforge_metadata,
         nested_jar_name, parse_mixin_config, pre_launch_entries, quilt_entrypoint_kind,
         quilt_mixin_configs, register_mixin_configs, report_mixin_configs, run_mixin_phase,
-        select_mixin_configs, skipped_mixin_configs, split_entrypoint,
+        select_mixin_configs, skip_mc_provider_requested, skipped_mixin_configs, split_entrypoint,
     };
     use std::{fs::File, io::Write, path::PathBuf};
     use zip::write::SimpleFileOptions;
@@ -2922,6 +3090,111 @@ config="demo.mixins.json""#,
             vec!["-Dmixin.configs=a.mixins.json,b.mixins.json"]
         );
         assert!(mixin_jvm_options(None).is_empty());
+    }
+
+    #[test]
+    fn formats_fabric_add_mods_sorted_deduped_and_bounded() {
+        let separator = classpath_separator();
+        // No supplied jar, no property: the loader stays the only source.
+        assert_eq!(fabric_add_mods(&[]), None);
+        assert_eq!(fabric_add_mods(&[PathBuf::from("")]), None);
+        assert_eq!(
+            fabric_add_mods(&[
+                PathBuf::from("mods/b.jar"),
+                PathBuf::from("mods/a.jar"),
+                PathBuf::from("mods/b.jar"),
+            ])
+            .as_deref(),
+            Some(format!("mods/a.jar{separator}mods/b.jar").as_str())
+        );
+        // A path carrying the property's separator cannot be expressed, so it
+        // is dropped rather than splitting into two mods.
+        assert_eq!(
+            fabric_add_mods(&[PathBuf::from(format!("mods/bad{separator}name.jar"))]),
+            None
+        );
+
+        // The entry cap binds first for short paths...
+        let many: Vec<PathBuf> = (0..600)
+            .map(|index| PathBuf::from(format!("/mods/mod-{index:04}.jar")))
+            .collect();
+        let bounded = fabric_add_mods(&many).unwrap();
+        assert_eq!(bounded.split(separator).count(), MAX_FABRIC_ADD_MODS);
+        assert!(bounded.len() <= MAX_FABRIC_ADD_MODS_BYTES);
+        assert!(bounded.starts_with("/mods/mod-0000.jar"));
+        // ...and the byte cap stops a list of long paths before the entry cap.
+        let long: Vec<PathBuf> = (0..600)
+            .map(|index| PathBuf::from(format!("/mods/{index:04}-{}.jar", "x".repeat(180))))
+            .collect();
+        let bounded = fabric_add_mods(&long).unwrap();
+        assert!(bounded.len() <= MAX_FABRIC_ADD_MODS_BYTES);
+        assert!(bounded.split(separator).count() < MAX_FABRIC_ADD_MODS);
+        assert!(bounded.starts_with("/mods/0000-"));
+    }
+
+    #[test]
+    fn builds_the_fabric_developer_options_before_the_jvm_starts() {
+        let separator = classpath_separator();
+        let mods = format!("mods/a.jar{separator}mods/b.jar");
+        // The supplied jars reach the loader through the documented property.
+        assert_eq!(
+            fabric_jvm_options(Some(&mods), false, false),
+            vec![format!("-Dfabric.addMods={mods}")]
+        );
+        // A probe that asks for none of this adds no Fabric option, so existing
+        // runs keep today's JVM arguments.
+        assert!(fabric_jvm_options(None, false, false).is_empty());
+        // Development mode is opt-in, and skipMcProvider only forwarded.
+        assert_eq!(
+            fabric_jvm_options(None, true, false),
+            vec!["-Dfabric.development=true"]
+        );
+        assert_eq!(
+            fabric_jvm_options(None, false, true),
+            vec!["-Dfabric.skipMcProvider=true"]
+        );
+        assert_eq!(
+            fabric_jvm_options(
+                fabric_add_mods(&[PathBuf::from("mods/a.jar")]).as_deref(),
+                true,
+                true
+            ),
+            vec![
+                "-Dfabric.addMods=mods/a.jar".to_owned(),
+                "-Dfabric.development=true".to_owned(),
+                "-Dfabric.skipMcProvider=true".to_owned(),
+            ]
+        );
+        // `fabric.skipMcProvider` is forwarded, never invented: only a JVM
+        // option the environment already carries turns it on.
+        assert!(!skip_mc_provider_requested(&[]));
+        assert!(!skip_mc_provider_requested(&[
+            "-Dfabric.development=true".to_owned()
+        ]));
+        assert!(skip_mc_provider_requested(&[
+            "-Xmx1g -Dfabric.skipMcProvider=true".to_owned()
+        ]));
+    }
+
+    #[test]
+    fn reports_fabric_add_mods_from_the_started_jvm() {
+        let separator = classpath_separator();
+        // An absent property is a run with no supplied mod jar, not a failure.
+        assert_eq!(fabric_add_mods_count(None), 0);
+        assert_eq!(fabric_add_mods_count(Some("")), 0);
+        assert_eq!(
+            fabric_add_mods_count(Some(&format!("mods/a.jar{separator}mods/b.jar"))),
+            2
+        );
+        assert_eq!(fabric_add_mods_line(0), "fabric addMods: 0 jar(s)");
+        assert_eq!(fabric_add_mods_line(2), "fabric addMods: 2 jar(s)");
+        // The line counts what the property carries, so it matches the list
+        // the option was built from.
+        let mods = fabric_add_mods(&[PathBuf::from("mods/b.jar"), PathBuf::from("mods/a.jar")]);
+        assert_eq!(
+            fabric_add_mods_line(fabric_add_mods_count(mods.as_deref())),
+            "fabric addMods: 2 jar(s)"
+        );
     }
 
     #[test]
