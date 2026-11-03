@@ -4485,7 +4485,13 @@ impl Game<'_> {
             });
         } else if storage::is_shulker_box(&name) && !self.shulker_can_open(pos) {
             // ShulkerBoxBlock.canOpen: the lid has no room; nothing opens.
-        } else if let Some(entity) = BlockEntity::for_block(&name) {
+        } else if let Some(entity) = self
+            .builtin_block_entity(&name)
+            .filter(|entity| !entity.slots().is_empty())
+        {
+            // A declared Java block entity opens here too, over the slots the
+            // template's container has; one with no slots (a bell, a marker)
+            // is not a menu, and the branches below still get their turn.
             self.world.block_entities.get_or_insert_with(key, || entity);
             self.unpack_opened_loot(key, &name);
             let centre = [

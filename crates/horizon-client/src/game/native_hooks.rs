@@ -124,6 +124,7 @@ use horizon_client::{
     text::Text,
 };
 use horizon_core::{geometry::Direction, position::BlockPos};
+use horizon_mods::native::BlockEntityDeclaration;
 use horizon_world::{
     level::{BlockId, flags},
     nbt::Compound,
@@ -1358,10 +1359,40 @@ impl Game<'_> {
 
 /// Where the game calls the hook points.
 impl Game<'_> {
-    /// `EntityBlock.newBlockEntity` of block `name`: Horizon's own, else a
-    /// native mod's.
+    /// The declared Java block entity block `name` carries
+    /// (`BlockEntityType.validBlocks`), if a content mod declares one: its
+    /// template, its `ticker` and the type id it saves as. Bounded and
+    /// deterministic ([`super::java_registry::declared_block_entity_for_block`]).
+    pub(super) fn declared_block_entity_for_block(
+        &self,
+        name: &str,
+    ) -> Option<&BlockEntityDeclaration> {
+        super::java_registry::declared_block_entity_for_block(&self.options.java_content, name)
+    }
+    /// `EntityBlock.newBlockEntity` of block `name` without the native mod
+    /// hook: a declared Java block entity's vanilla template — a mod block
+    /// with `minecraft:barrel` as its template gets the barrel's container,
+    /// so its items, hoppers and menus work — else Horizon's own.
+    ///
+    /// A vanilla block always gets its own (`minecraft:barrel` is a barrel
+    /// whatever a mod declares valid for it), and a mod block's declaration
+    /// comes before the name suffixes `for_block` guesses by, so
+    /// `ruby:storage_shelf` with a furnace template is a furnace.
+    pub(super) fn builtin_block_entity(&self, name: &str) -> Option<BlockEntity> {
+        if name.starts_with("minecraft:") {
+            return BlockEntity::for_block(name);
+        }
+        if let Some(row) = self.declared_block_entity_for_block(name)
+            && let Some(entity) = BlockEntity::for_block(&row.template)
+        {
+            return Some(entity);
+        }
+        BlockEntity::for_block(name)
+    }
+    /// `EntityBlock.newBlockEntity` of block `name`: Horizon's own (or a
+    /// declared Java block entity's template), else a native mod's.
     pub(super) fn new_block_entity(&mut self, name: &str) -> Option<BlockEntity> {
-        if let Some(entity) = BlockEntity::for_block(name) {
+        if let Some(entity) = self.builtin_block_entity(name) {
             return Some(entity);
         }
         let mut entity = None;
@@ -1407,11 +1438,12 @@ impl Game<'_> {
         }
         out
     }
-    /// Whether a native mod's block `name` has a ticking block entity.
+    /// Whether block `name`'s block entity ticks: a native mod's
+    /// (`native_block_entity_ticks`) or a declared Java row's `ticker`.
     pub(super) fn native_ticks(&self, name: &str) -> bool {
         let mut ticks = false;
         self.native_block_entity_ticks(name, &mut ticks);
-        ticks
+        ticks || super::java_registry::declared_block_entity_ticks(&self.options.java_content, name)
     }
     /// A mod block's container at `key` opens its menu: its slots grown to
     /// the menu's. False for any other block.

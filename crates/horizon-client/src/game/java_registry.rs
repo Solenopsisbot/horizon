@@ -3,11 +3,13 @@
 //! The resource root remains the source for vanilla block/item tables. These
 //! auxiliary rows are kept separately so Java declarations can be observed by
 //! the authoritative server before a future full registry reload wires them
-//! into entity/component/attachment stores.
+//! into entity/component/attachment stores. Block-entity rows are read here by
+//! the game's `EntityBlock.newBlockEntity` (`declared_block_entity`), which
+//! gives a mod block its template's real block entity.
 use std::collections::BTreeMap;
 use std::sync::{OnceLock, RwLock};
 
-use horizon_client::text::Text;
+use horizon_client::{containers::BlockEntity, text::Text};
 use horizon_mods::content::{BlockProperties, BlockShapes, Rarity};
 use horizon_mods::native::{
     AttachmentDeclaration, BlockEntityDeclaration, DataComponentDeclaration, EntityAttributes,
@@ -308,6 +310,54 @@ pub(super) fn declared_menu_for_block(
         .flat_map(|m| m.content.menus_for_block(block))
         .min_by(|a, b| a.id.cmp(&b.id))?;
     Some(MenuInfo::from_declaration(menus))
+}
+
+/// Most block-entity rows [`declared_block_entity_for_block`] reads: a content
+/// root with more is outside the bound this lookup works within, and a block
+/// carried by a row past it starts without its declared block entity.
+pub(super) const MAX_DECLARED_BLOCK_ENTITY_ROWS: usize = 1024;
+
+/// The declared block entity `block` carries (`BlockEntityType.validBlocks`):
+/// the row that names it, lowest id first when several do. Reads at most
+/// [`MAX_DECLARED_BLOCK_ENTITY_ROWS`] rows in content-mod order, so a
+/// pathological registry cannot stall a block placement, and picks by id so
+/// metadata order cannot change the answer.
+pub(super) fn declared_block_entity_for_block<'a>(
+    mods: &'a [horizon_client::mod_content::ContentMod],
+    block: &str,
+) -> Option<&'a BlockEntityDeclaration> {
+    mods.iter()
+        .flat_map(|m| m.content.block_entities.iter())
+        .take(MAX_DECLARED_BLOCK_ENTITY_ROWS)
+        .filter(|row| row.valid_blocks.iter().any(|valid| valid == block))
+        .min_by(|a, b| a.id.cmp(&b.id))
+}
+
+/// The block entity `block` starts as (`EntityBlock.newBlockEntity`): the
+/// row that carries it and a vanilla-template block entity (`minecraft:barrel`
+/// gives the barrel's container, so its items and menus work), or none when no
+/// row carries the block or its template has no block entity (a template that
+/// is only a marker, as `minecraft:stone` is).
+///
+/// The row comes back with the entity for the callers where the declared type
+/// id (`ruby:crate_entity`) matters more than the template's.
+pub(super) fn declared_block_entity<'a>(
+    mods: &'a [horizon_client::mod_content::ContentMod],
+    block: &str,
+) -> Option<(&'a BlockEntityDeclaration, BlockEntity)> {
+    let row = declared_block_entity_for_block(mods, block)?;
+    let entity = BlockEntity::for_block(&row.template)?;
+    Some((row, entity))
+}
+
+/// Whether `block`'s block entity ticks (`EntityBlock.getTicker`): a declared
+/// row's `ticker`, and only when its template has a block entity at all — a
+/// row with no entity has nothing to tick.
+pub(super) fn declared_block_entity_ticks(
+    mods: &[horizon_client::mod_content::ContentMod],
+    block: &str,
+) -> bool {
+    declared_block_entity(mods, block).is_some_and(|(row, _)| row.ticker)
 }
 
 /// Apply typed auxiliary declarations in deterministic id order.
@@ -841,6 +891,137 @@ mod tests {
         assert_eq!(menu_rows(46), 6);
         assert_eq!(menu_rows(54), 6);
         assert_eq!(menu_rows(horizon_mods::native::MAX_MENU_SLOTS), 6);
+    }
+
+    #[test]
+    fn declared_block_entity_maps_a_block_to_its_template() {
+        let _guard = test_guard();
+        let mods = [content_mod(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![block("ruby:crate_block")],
+                block_entities: vec![
+                    block_entity("ruby:crate"),
+                    BlockEntityDeclaration {
+                        id: "ruby:marker".into(),
+                        template: "minecraft:stone".into(),
+                        ticker: true,
+                        valid_blocks: vec!["ruby:marker_block".into()],
+                    },
+                ],
+                ..NativeDeclarations::default()
+            },
+        )];
+        // A block a row carries starts as the row's template: the barrel's
+        // container, which a declared menu's slots read and hoppers fill.
+        // Horizon has no block entity of its own for the mod block, so
+        // without the declaration it would start with none.
+        assert!(BlockEntity::for_block("ruby:crate_block").is_none());
+        let (row, entity) = declared_block_entity(&mods, "ruby:crate_block").unwrap();
+        assert_eq!(row.id, "ruby:crate");
+        assert_eq!(entity.slots().len(), 27);
+        assert!(matches!(entity, BlockEntity::Chest(_)));
+        // A block no row carries has none, and a template with no block
+        // entity leaves the block without one. The row is still found: it is
+        // the template that has nothing to copy.
+        assert!(declared_block_entity(&mods, "ruby:unbound").is_none());
+        assert!(declared_block_entity_for_block(&mods, "ruby:unbound").is_none());
+        assert!(declared_block_entity(&mods, "ruby:marker_block").is_none());
+        assert_eq!(
+            declared_block_entity_for_block(&mods, "ruby:marker_block")
+                .unwrap()
+                .id,
+            "ruby:marker"
+        );
+    }
+
+    #[test]
+    fn declared_block_entity_ticker_applies_only_with_an_entity() {
+        let _guard = test_guard();
+        let mods = [content_mod(
+            "ruby",
+            NativeDeclarations {
+                block_entities: vec![
+                    block_entity("ruby:ticking"),
+                    BlockEntityDeclaration {
+                        id: "ruby:still".into(),
+                        template: "minecraft:barrel".into(),
+                        ticker: false,
+                        valid_blocks: vec!["ruby:still_block".into()],
+                    },
+                    BlockEntityDeclaration {
+                        id: "ruby:hollow".into(),
+                        template: "minecraft:stone".into(),
+                        ticker: true,
+                        valid_blocks: vec!["ruby:hollow_block".into()],
+                    },
+                ],
+                ..NativeDeclarations::default()
+            },
+        )];
+        assert!(declared_block_entity_ticks(&mods, "ruby:crate_block"));
+        assert!(!declared_block_entity_ticks(&mods, "ruby:still_block"));
+        // A ticker on a template with no block entity ticks nothing.
+        assert!(!declared_block_entity_ticks(&mods, "ruby:hollow_block"));
+        assert!(!declared_block_entity_ticks(&mods, "ruby:unbound"));
+    }
+
+    #[test]
+    fn declared_block_entity_lookup_is_lowest_id_and_bounded() {
+        let _guard = test_guard();
+        // Two rows carry one block: the lower id answers, wherever it sits.
+        let mods = [content_mod(
+            "ruby",
+            NativeDeclarations {
+                block_entities: vec![
+                    BlockEntityDeclaration {
+                        id: "ruby:zeta".into(),
+                        template: "minecraft:hopper".into(),
+                        ticker: true,
+                        valid_blocks: vec!["ruby:shared".into()],
+                    },
+                    BlockEntityDeclaration {
+                        id: "ruby:alpha".into(),
+                        template: "minecraft:barrel".into(),
+                        ticker: true,
+                        valid_blocks: vec!["ruby:shared".into()],
+                    },
+                ],
+                ..NativeDeclarations::default()
+            },
+        )];
+        assert_eq!(
+            declared_block_entity_for_block(&mods, "ruby:shared")
+                .unwrap()
+                .id,
+            "ruby:alpha"
+        );
+        // Rows past the bound are not read, and the bound is exact.
+        let rows: Vec<BlockEntityDeclaration> = (0..=MAX_DECLARED_BLOCK_ENTITY_ROWS)
+            .map(|i| BlockEntityDeclaration {
+                id: format!("ruby:e{i:04}"),
+                template: "minecraft:barrel".into(),
+                ticker: false,
+                valid_blocks: vec![format!("ruby:b{i:04}")],
+            })
+            .collect();
+        let mods = [content_mod(
+            "ruby",
+            NativeDeclarations {
+                block_entities: rows,
+                ..NativeDeclarations::default()
+            },
+        )];
+        let last = MAX_DECLARED_BLOCK_ENTITY_ROWS - 1;
+        assert!(declared_block_entity_for_block(&mods, "ruby:b0000").is_some());
+        assert!(declared_block_entity_for_block(&mods, &format!("ruby:b{last:04}")).is_some());
+        assert!(
+            declared_block_entity_for_block(
+                &mods,
+                &format!("ruby:b{MAX_DECLARED_BLOCK_ENTITY_ROWS:04}")
+            )
+            .is_none()
+        );
     }
 
     #[test]
