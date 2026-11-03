@@ -85,6 +85,12 @@ pub struct Census {
     /// façade and JDK work queues a stable split without losing overloads.
     #[serde(default)]
     pub member_disposition: BTreeMap<AbiDisposition, usize>,
+    /// ABI member shape counts, including JVM constructors and static initializers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub member_shapes: BTreeMap<String, usize>,
+    /// Loader event and capability types named by the mod classes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub api_refs: BTreeMap<String, usize>,
     /// Mixin target: how many mixins weave into it.
     pub mixin_targets: BTreeMap<String, usize>,
     /// Mixin target classes declared by discovered JSON configs (report only).
@@ -110,6 +116,9 @@ pub struct Census {
     /// for a future translator.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mixin_method_descriptors: BTreeMap<String, Vec<String>>,
+    /// Mixin points grouped by constructor versus ordinary target method.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mixin_method_kinds: BTreeMap<String, usize>,
     /// Exact descriptor-bearing `@At(target:...)` selectors, keyed by the
     /// serialized `@At` value. This is report-only input for call-site
     /// translation planning; no bytecode is woven.
@@ -542,6 +551,12 @@ impl Census {
                     .member_disposition
                     .entry(member_disposition(m))
                     .or_default() += 1;
+                *self.member_shapes.entry(member_shape(m)).or_default() += 1;
+            }
+            for reference in &class.refs {
+                if let Some(kind) = api_reference_kind(reference) {
+                    *self.api_refs.entry(kind.to_owned()).or_default() += 1;
+                }
             }
             for target in &class.mixin_targets {
                 *self.mixin_targets.entry(target.clone()).or_default() += 1;
@@ -584,6 +599,10 @@ impl Census {
                 }
                 for method in injection_methods(&injection.method) {
                     for target in &class.mixin_targets {
+                        *self
+                            .mixin_method_kinds
+                            .entry(mixin_method_kind(method))
+                            .or_default() += 1;
                         *points
                             .entry((
                                 target.clone(),
@@ -797,6 +816,18 @@ impl Census {
                 out.push_str(&format!("{count:7} {name}\n"));
             }
         }
+        if !self.member_shapes.is_empty() {
+            out.push_str("\nmember ABI shapes\n");
+            for (shape, count) in &self.member_shapes {
+                out.push_str(&format!("{count:7} {shape}\n"));
+            }
+        }
+        if !self.api_refs.is_empty() {
+            out.push_str("\nloader API references\n");
+            for (kind, count) in &self.api_refs {
+                out.push_str(&format!("{count:7} {kind}\n"));
+            }
+        }
         if !self.member_disposition.is_empty() {
             out.push_str("\nmember ABI disposition\n");
             for (disposition, count) in &self.member_disposition {
@@ -826,6 +857,48 @@ impl Census {
     pub fn write(&self, path: &Path) -> Result<(), String> {
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         fs::write(path, json).map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
+fn member_shape(member: &classes::Member) -> String {
+    if member.name == "<init>" {
+        "constructor".to_owned()
+    } else if member.name == "<clinit>" {
+        "static-initializer".to_owned()
+    } else {
+        match member.kind {
+            classes::MemberKind::Field => "field",
+            classes::MemberKind::Method => "method",
+            classes::MemberKind::InterfaceMethod => "interface-method",
+        }
+        .to_owned()
+    }
+}
+
+fn mixin_method_kind(method: &str) -> &'static str {
+    if method
+        .split('|')
+        .any(|m| m == "<init>" || m.starts_with("<init> "))
+    {
+        "constructor"
+    } else {
+        "method"
+    }
+}
+
+fn api_reference_kind(reference: &str) -> Option<&'static str> {
+    if reference.starts_with("net/neoforged/neoforge/event/")
+        || reference.starts_with("net/minecraftforge/event/")
+        || reference.starts_with("net/fabricmc/fabric/api/event/")
+        || reference.starts_with("net/fabricmc/fabric/api/entity/event/")
+    {
+        Some("event")
+    } else if reference.starts_with("net/neoforged/neoforge/capabilities/")
+        || reference.starts_with("net/minecraftforge/common/capabilities/")
+    {
+        Some("capability")
+    } else {
+        None
     }
 }
 
@@ -1799,6 +1872,46 @@ mod tests {
         let summary = census.summary(20);
         assert!(summary.contains("mixin annotation metadata (presence only; no weaving)"));
         assert!(summary.contains("      2 cancellable"));
+    }
+
+    #[test]
+    fn abi_and_mixin_diagnostics_classify_compatibility_edges() {
+        let member = |name: &str, kind| classes::Member {
+            owner: "net/minecraft/Target".to_owned(),
+            name: name.to_owned(),
+            descriptor: "()V".to_owned(),
+            kind,
+        };
+        assert_eq!(
+            member_shape(&member("<init>", classes::MemberKind::Method)),
+            "constructor"
+        );
+        assert_eq!(
+            member_shape(&member("<clinit>", classes::MemberKind::Method)),
+            "static-initializer"
+        );
+        assert_eq!(
+            member_shape(&member("value", classes::MemberKind::Field)),
+            "field"
+        );
+        assert_eq!(mixin_method_kind("<init>(I)V|tick()V"), "constructor");
+        assert_eq!(mixin_method_kind("tick()V"), "method");
+        assert_eq!(
+            api_reference_kind("net/neoforged/neoforge/event/entity/EntityEvent"),
+            Some("event")
+        );
+        assert_eq!(
+            api_reference_kind("net/minecraftforge/common/capabilities/Capability"),
+            Some("capability")
+        );
+        let summary = Census {
+            member_shapes: BTreeMap::from([("constructor".to_owned(), 2)]),
+            api_refs: BTreeMap::from([("event".to_owned(), 3), ("capability".to_owned(), 1)]),
+            ..Census::default()
+        }
+        .summary(10);
+        assert!(summary.contains("member ABI shapes"));
+        assert!(summary.contains("loader API references"));
     }
 
     #[test]
