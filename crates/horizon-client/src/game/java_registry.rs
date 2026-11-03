@@ -15,10 +15,19 @@ use horizon_mods::native::{
     AttachmentDeclaration, BlockEntityDeclaration, DataComponentDeclaration, EntityAttributes,
     EntityDeclaration, MenuDeclaration, SpawnRestriction,
 };
+use horizon_mods::payloads::{PayloadCodec, PayloadDeclaration};
 
 /// Most block → menu bindings the [`JavaRegistrySnapshot::menu_bindings`] list
 /// and its diagnostics line name; a larger registry only counts the rest.
 const MAX_MENU_BINDINGS: usize = 16;
+
+/// Most channel ids a [`PayloadSummary`] names; a larger root only counts the
+/// rest.
+pub(super) const MAX_PAYLOAD_IDS: usize = 16;
+
+/// The prefix every [`JavaRegistrySnapshot::compatibility_lines`] line starts
+/// with, so a log reader can pick the summary out of a mixed stream.
+pub(super) const COMPATIBILITY_PREFIX: &str = "java compatibility: ";
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct BlockTemplate {
@@ -58,6 +67,106 @@ pub(super) struct JavaRegistrySnapshot {
     /// Rows folded away while coalescing duplicates, by table name. Sorted, so
     /// two batches that coalesce the same rows report the same map.
     pub coalesced: BTreeMap<String, usize>,
+}
+
+/// Counts over one [`JavaRegistrySnapshot`], in a fixed order: every table the
+/// command registries merge, plus the registry's menu bindings and the blocks
+/// a declared block entity carries. Output stays constant-size.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct RegistrySummary {
+    pub blocks: usize,
+    pub items: usize,
+    pub entities: usize,
+    pub data_components: usize,
+    pub attachments: usize,
+    pub menus: usize,
+    pub block_entities: usize,
+    /// Distinct `(block, menu)` pairs.
+    pub menu_bindings: usize,
+    /// Distinct blocks a declared block entity carries.
+    pub block_entity_blocks: usize,
+}
+
+/// Counts over the payload channels a run declared, sorted by id.
+/// `directions` is in [`PayloadDirection`](horizon_mods::payloads::PayloadDirection)
+/// wire order, so two summaries print the same fields in the same order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct PayloadSummary {
+    pub channels: usize,
+    pub directions: [usize; 5],
+    /// Declarations whose codec the transport models and validates.
+    pub supported_codecs: usize,
+    /// Declarations with no codec or one the transport does not model.
+    pub opaque_codecs: usize,
+    /// The channel ids, sorted, at most [`MAX_PAYLOAD_IDS`].
+    pub ids: Vec<String>,
+    pub ids_truncated: bool,
+}
+
+#[allow(dead_code)]
+impl PayloadSummary {
+    /// Summarize `declared` ([`horizon_client::lan::payloads::declared_by_id`]),
+    /// counting each channel once and naming the first [`MAX_PAYLOAD_IDS`] in
+    /// id order.
+    pub(super) fn from_declarations(declared: &BTreeMap<String, PayloadDeclaration>) -> Self {
+        let mut directions = [0; 5];
+        let mut supported_codecs = 0;
+        let mut opaque_codecs = 0;
+        for declaration in declared.values() {
+            directions[declaration.direction.wire() as usize] += 1;
+            if declaration
+                .codec
+                .as_deref()
+                .and_then(PayloadCodec::parse)
+                .is_some()
+            {
+                supported_codecs += 1;
+            } else {
+                opaque_codecs += 1;
+            }
+        }
+        let ids: Vec<String> = declared.keys().take(MAX_PAYLOAD_IDS).cloned().collect();
+        Self {
+            channels: declared.len(),
+            directions,
+            supported_codecs,
+            opaque_codecs,
+            ids,
+            ids_truncated: declared.len() > MAX_PAYLOAD_IDS,
+        }
+    }
+
+    /// The channels the last content root recorded. Empty until one records
+    /// some, so a window that never stored declarations logs zeros.
+    pub(super) fn declared() -> Self {
+        Self::from_declarations(&horizon_client::lan::payloads::declared_by_id())
+    }
+
+    /// The counts line, then the bounded ids. Always at least one line, so a
+    /// caller can log an empty run without a special case.
+    pub(super) fn lines(&self) -> Vec<String> {
+        let [
+            to_client,
+            to_server,
+            config_to_client,
+            config_to_server,
+            both,
+        ] = self.directions;
+        let mut lines = vec![format!(
+            "payload channels: {} ({to_client} playToClient, {to_server} playToServer, \
+             {config_to_client} configurationToClient, {config_to_server} configurationToServer, \
+             {both} playBidirectional), {} supported codec(s), {} opaque",
+            self.channels, self.supported_codecs, self.opaque_codecs,
+        )];
+        if !self.ids.is_empty() {
+            lines.push(format!(
+                "payload ids: {}{}",
+                self.ids.join(", "),
+                if self.ids_truncated { ", ..." } else { "" }
+            ));
+        }
+        lines
+    }
 }
 
 /// A declared menu a block opens, as a block use needs it: the definition id,
@@ -177,6 +286,82 @@ impl JavaRegistrySnapshot {
         bindings.dedup();
         bindings.truncate(MAX_MENU_BINDINGS);
         bindings
+    }
+
+    /// Counts for the command registries, menu bindings and block entities:
+    /// constant-size output whatever the batch size.
+    pub(super) fn summary(&self) -> RegistrySummary {
+        let mut pairs: Vec<(&str, &str)> = self
+            .menus
+            .iter()
+            .flat_map(|menu| {
+                menu.open_blocks
+                    .iter()
+                    .map(move |block| (block.as_str(), menu.id.as_str()))
+            })
+            .collect();
+        pairs.sort();
+        pairs.dedup();
+        let mut blocks: Vec<&str> = self
+            .block_entities
+            .iter()
+            .flat_map(|row| row.valid_blocks.iter().map(String::as_str))
+            .collect();
+        blocks.sort();
+        blocks.dedup();
+        RegistrySummary {
+            blocks: self.blocks.len(),
+            items: self.items.len(),
+            entities: self.entities.len(),
+            data_components: self.data_components.len(),
+            attachments: self.attachments.len(),
+            menus: self.menus.len(),
+            block_entities: self.block_entities.len(),
+            menu_bindings: pairs.len(),
+            block_entity_blocks: blocks.len(),
+        }
+    }
+
+    /// A deterministic multi-line compatibility summary for the log and
+    /// status: the snapshot's counts, what content mods declared, and the
+    /// payload channels the run stored. Every line starts with
+    /// [`COMPATIBILITY_PREFIX`], and the detail lists are the bounded ones the
+    /// summaries expose, so even a maximal root stays a handful of lines.
+    pub(super) fn compatibility_lines(
+        &self,
+        declared: &horizon_client::mod_content::DeclarationSummary,
+        payloads: &PayloadSummary,
+    ) -> Vec<String> {
+        let summary = self.summary();
+        let mut lines = vec![format!(
+            "{COMPATIBILITY_PREFIX}registry: {} block ids, {} item ids, {} entity ids, {} data component ids, {} attachment ids, {} menu ids, {} block entity ids, {} menu bindings, {} block entity blocks",
+            summary.blocks,
+            summary.items,
+            summary.entities,
+            summary.data_components,
+            summary.attachments,
+            summary.menus,
+            summary.block_entities,
+            summary.menu_bindings,
+            summary.block_entity_blocks,
+        )];
+        let declared_lines = declared.lines();
+        if declared_lines.is_empty() {
+            lines.push(format!("{COMPATIBILITY_PREFIX}declared: none"));
+        } else {
+            lines.extend(
+                declared_lines
+                    .into_iter()
+                    .map(|line| format!("{COMPATIBILITY_PREFIX}declared: {line}")),
+            );
+        }
+        lines.extend(
+            payloads
+                .lines()
+                .into_iter()
+                .map(|line| format!("{COMPATIBILITY_PREFIX}{line}")),
+        );
+        lines
     }
 
     /// Every block a declared menu opens from must resolve inside this
@@ -568,6 +753,7 @@ mod tests {
         AttachmentDeclaration, BlockEntityDeclaration, DataComponentDeclaration, EntityAttributes,
         EntityDeclaration, MenuDeclaration, NativeDeclarations, SpawnRestriction,
     };
+    use horizon_mods::payloads::PayloadDirection;
     use std::sync::Mutex;
 
     /// The snapshot lives in a process-wide `OnceLock`, so tests that publish a
@@ -672,6 +858,23 @@ mod tests {
             ticker: true,
             valid_blocks: vec!["ruby:crate_block".into()],
         }
+    }
+
+    /// One declared payload channel, as `lan::payloads` stores it.
+    fn payload(id: &str, direction: PayloadDirection, codec: Option<&str>) -> PayloadDeclaration {
+        PayloadDeclaration {
+            id: id.into(),
+            direction,
+            codec: codec.map(str::to_owned),
+        }
+    }
+
+    /// The declaration map `lan::payloads::declared_by_id` returns: sorted by
+    /// id, one row per channel.
+    fn payload_map(
+        rows: impl IntoIterator<Item = PayloadDeclaration>,
+    ) -> BTreeMap<String, PayloadDeclaration> {
+        rows.into_iter().map(|row| (row.id.clone(), row)).collect()
     }
 
     #[test]
@@ -1303,6 +1506,113 @@ mod tests {
             },
         )]);
         assert_eq!(snapshot.diagnostics().len(), 2);
+    }
+
+    #[test]
+    fn compatibility_lines_tie_registry_declarations_and_payloads_together() {
+        use PayloadDirection::*;
+        let _guard = test_guard();
+        let mods = [content_mod(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![block("ruby:crate_block")],
+                items: vec![horizon_mods::content::Item {
+                    id: "ruby:shard".into(),
+                    template: "minecraft:stone".into(),
+                    max_stack_size: None,
+                    rarity: None,
+                    components: Default::default(),
+                    crafting_remainder: None,
+                }],
+                entities: vec![entity("ruby:zombie", "minecraft:zombie")],
+                data_components: vec![data_component("ruby:power")],
+                attachments: vec![attachment("ruby:power")],
+                menus: vec![bound_menu("ruby:crate", &["ruby:crate_block"])],
+                block_entities: vec![block_entity("ruby:crate")],
+                ..NativeDeclarations::default()
+            },
+        )];
+        let snapshot = synchronize(&mods);
+        let declared = horizon_client::mod_content::declaration_summary(&mods);
+        let payloads = PayloadSummary::from_declarations(&payload_map([
+            payload("demo:up", PlayToServer, Some("minecraft:string")),
+            payload("demo:down", PlayToClient, None),
+        ]));
+        assert_eq!(
+            snapshot.summary(),
+            RegistrySummary {
+                blocks: 1,
+                items: 1,
+                entities: 1,
+                data_components: 1,
+                attachments: 1,
+                menus: 1,
+                block_entities: 1,
+                menu_bindings: 1,
+                block_entity_blocks: 1,
+            }
+        );
+        assert_eq!(
+            snapshot.compatibility_lines(&declared, &payloads),
+            [
+                "java compatibility: registry: 1 block ids, 1 item ids, 1 entity ids, 1 data component ids, 1 attachment ids, 1 menu ids, 1 block entity ids, 1 menu bindings, 1 block entity blocks",
+                "java compatibility: declared: 1 block, 1 item, 1 entity, 1 data component, 1 attachment, 1 menu, 1 block entity",
+                "java compatibility: declared: namespaces: ruby",
+                "java compatibility: declared: ids: ruby:crate, ruby:crate_block, ruby:power, ruby:shard, ruby:zombie",
+                "java compatibility: payload channels: 2 (1 playToClient, 1 playToServer, 0 configurationToClient, 0 configurationToServer, 0 playBidirectional), 1 supported codec(s), 1 opaque",
+                "java compatibility: payload ids: demo:down, demo:up",
+            ]
+        );
+        // Nothing declared and no channels: three fixed lines, same prefix.
+        let empty = JavaRegistrySnapshot::default()
+            .compatibility_lines(&Default::default(), &PayloadSummary::default());
+        assert_eq!(
+            empty,
+            [
+                "java compatibility: registry: 0 block ids, 0 item ids, 0 entity ids, 0 data component ids, 0 attachment ids, 0 menu ids, 0 block entity ids, 0 menu bindings, 0 block entity blocks",
+                "java compatibility: declared: none",
+                "java compatibility: payload channels: 0 (0 playToClient, 0 playToServer, 0 configurationToClient, 0 configurationToServer, 0 playBidirectional), 0 supported codec(s), 0 opaque",
+            ]
+        );
+        assert!(
+            empty
+                .iter()
+                .all(|line| line.starts_with(COMPATIBILITY_PREFIX))
+        );
+    }
+
+    #[test]
+    fn payload_summary_counts_directions_codecs_and_bounds_ids() {
+        use PayloadDirection::*;
+        let summary = PayloadSummary::from_declarations(&payload_map([
+            payload("demo:a", PlayToClient, Some("minecraft:string")),
+            payload("demo:b", PlayToServer, Some("minecraft:raw")),
+            payload("demo:c", ConfigurationToClient, Some("minecraft:unit")),
+            payload("demo:d", ConfigurationToServer, None),
+            payload("demo:e", PlayBidirectional, Some("demo:codec")),
+        ]));
+        assert_eq!(summary.channels, 5);
+        assert_eq!(summary.directions, [1, 1, 1, 1, 1]);
+        assert_eq!(summary.supported_codecs, 3);
+        assert_eq!(summary.opaque_codecs, 2);
+        assert_eq!(
+            summary.ids,
+            ["demo:a", "demo:b", "demo:c", "demo:d", "demo:e"]
+        );
+        assert!(!summary.ids_truncated);
+        // Past the bound only the count and the sorted prefix remain.
+        let rows =
+            (0..MAX_PAYLOAD_IDS + 2).map(|i| payload(&format!("demo:c{i:03}"), PlayToServer, None));
+        let summary = PayloadSummary::from_declarations(&payload_map(rows));
+        assert_eq!(summary.channels, MAX_PAYLOAD_IDS + 2);
+        assert_eq!(summary.ids.len(), MAX_PAYLOAD_IDS);
+        assert!(summary.ids_truncated);
+        assert_eq!(summary.ids.first().map(String::as_str), Some("demo:c000"));
+        let last = format!("demo:c{:03}", MAX_PAYLOAD_IDS - 1);
+        assert_eq!(summary.ids.last(), Some(&last));
+        let line = summary.lines().pop().unwrap();
+        assert!(line.starts_with("payload ids: demo:c000, "), "{line}");
+        assert!(line.ends_with(", ..."), "{line}");
     }
 
     #[test]
