@@ -3,7 +3,10 @@
 //! upgraded from 1.21.1 to 26.3, item models get their `items/` client
 //! definitions, and each blockstate gets a vanilla template guessed from its
 //! properties until the oracle's facts replace the guess.
-use crate::{jar::JarInfo, oracle::Facts};
+use crate::{
+    jar::{JarInfo, NestedJarKind},
+    oracle::Facts,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -63,6 +66,53 @@ pub struct Report {
     pub worldgen_types: crate::worldgen::Upgrade,
     /// The loader's convention biome tags the structures name, carried.
     pub convention_biome_tags: usize,
+    /// Nested (JiJ/JarJar) jars whose data and assets were carried, in entry
+    /// order.
+    pub nested_carried: Vec<NestedCarry>,
+    /// Nested jars left out, by entry, and why.
+    pub nested_skipped: BTreeMap<String, String>,
+    /// Nested files the carry kept as the earlier one: `path: entry`.
+    pub nested_conflicts: Vec<String>,
+}
+
+/// A nested (JiJ/JarJar) jar carried with the mod, and the files it gave the
+/// content mod under its own namespace.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct NestedCarry {
+    /// Entry path in the outer jar.
+    pub entry: String,
+    /// The nested mod's id, which is its namespace in the carry.
+    pub id: String,
+    /// Files carried from it.
+    pub files: usize,
+}
+
+/// Nested content is capped like a content mod: a file/byte budget shared
+/// with the outer jar, and a size per nested jar so one bundler cannot make
+/// the carry unbounded.
+const MAX_CARRY_FILES: usize = 65_536;
+const MAX_CARRY_BYTES: u64 = 512 << 20;
+const MAX_NESTED_JAR_BYTES: u64 = 32 << 20;
+/// One row per skipped jar or conflict; the report stays bounded.
+const MAX_NESTED_ROWS: usize = 64;
+const MAX_NESTED_REASON: usize = 160;
+
+#[derive(Clone, Copy)]
+struct Caps {
+    files: usize,
+    bytes: u64,
+}
+
+const CARRY_CAPS: Caps = Caps {
+    files: MAX_CARRY_FILES,
+    bytes: MAX_CARRY_BYTES,
+};
+
+/// What a carry has written so far, so nested files count toward its caps.
+#[derive(Default, Clone, Copy)]
+struct Used {
+    files: usize,
+    bytes: u64,
 }
 
 /// The pack around a mod being carried.
@@ -740,14 +790,16 @@ pub fn carry(
     let mut convention = BTreeSet::new();
     let mut block_loot = BTreeSet::new();
     let mut biome_conventions = BTreeSet::new();
+    let mut carried_bytes = 0u64;
     let set_tags = crate::worldgen::structure_set_tags(&mut zip);
     let piece_counts = crate::worldgen::piece_counts(&mut zip);
     let mut processor_data = crate::processors::ProcessorData::read(&mut zip);
     processor_data.mark_loaded(loaded);
     report.namespaces = extra_namespaces(&mut zip, id, pack.mods);
-    let owned: Vec<&str> = std::iter::once(id.as_str())
-        .chain(report.namespaces.iter().map(String::as_str))
+    let owned_names: Vec<String> = std::iter::once(id.clone())
+        .chain(report.namespaces.iter().cloned())
         .collect();
+    let owned: Vec<&str> = owned_names.iter().map(String::as_str).collect();
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
         let name = entry.name().to_owned();
@@ -774,6 +826,7 @@ pub fn carry(
         }
         let dest = if keep {
             report.copied += 1;
+            carried_bytes += bytes.len() as u64;
             inside.join(&name)
         } else {
             report.outside.push(name.clone());
@@ -943,6 +996,11 @@ pub fn carry(
         }
         write(&dest, &bytes)?;
     }
+    let used = Used {
+        files: report.copied,
+        bytes: carried_bytes,
+    };
+    nested_carry(&mut zip, info, id, &inside, CARRY_CAPS, used, &mut report)?;
     // Entries the mod adds to other structure sets in Java code, for the
     // structures it has.
     for (file, set, entries) in crate::legacy_structure_mods::ctov::code_set_entries(id) {
@@ -1192,6 +1250,202 @@ pub fn carry(
         &serde_json::to_vec_pretty(&report).unwrap_or_default(),
     )?;
     Ok(report)
+}
+
+/// Carries the data and assets of the jars nested in a mod's jar (Fabric's
+/// `META-INF/jars/`, NeoForge's `META-INF/jarjar/`) under the nested mod's
+/// own namespace. A nested jar without metadata is reported once and skipped;
+/// one with malformed metadata carries its reason from [`JarInfo::nested_jar_errors`].
+/// Entries are taken in path order, and a file an earlier carry wrote is kept.
+fn nested_carry(
+    zip: &mut zip::ZipArchive<fs::File>,
+    info: &JarInfo,
+    outer_id: &str,
+    inside: &Path,
+    caps: Caps,
+    used: Used,
+    report: &mut Report,
+) -> Result<(), String> {
+    let mut jars: Vec<&crate::jar::NestedJar> = info.nested_jars.iter().collect();
+    // The archive order is not trusted: the report and the output follow entry
+    // paths, and an identity breaks a duplicate entry.
+    jars.sort_by(|a, b| a.entry.cmp(&b.entry).then_with(|| a.id.cmp(&b.id)));
+    let errors: BTreeMap<&str, &str> = info
+        .nested_jar_errors
+        .iter()
+        .map(|(entry, reason)| (entry.as_str(), reason.as_str()))
+        .collect();
+    let mut used = used;
+    let mut namespaces = Vec::new();
+    for nested in jars {
+        if report.nested_carried.len() >= MAX_NESTED_ROWS {
+            push_skip(report, &nested.entry, "nested jar list is full");
+            break;
+        }
+        let reason = errors.get(nested.entry.as_str()).copied();
+        let Some(id) = nested.id.as_deref() else {
+            push_skip(
+                report,
+                &nested.entry,
+                reason.unwrap_or("no mod metadata").to_owned(),
+            );
+            continue;
+        };
+        if let Some(reason) = reason {
+            push_skip(report, &nested.entry, reason.to_owned());
+            continue;
+        }
+        if !matches!(nested.kind, NestedJarKind::Fabric | NestedJarKind::NeoForge) {
+            push_skip(report, &nested.entry, "unknown nesting folder");
+            continue;
+        }
+        if !nested_namespace(id) {
+            push_skip(
+                report,
+                &nested.entry,
+                format!("{id:?} is not a content namespace"),
+            );
+            continue;
+        }
+        let bytes = match read_nested(zip, &nested.entry) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                push_skip(report, &nested.entry, reason);
+                continue;
+            }
+        };
+        let files =
+            carry_nested_entries(&bytes, id, &nested.entry, inside, caps, &mut used, report)?;
+        if files == 0 {
+            // The entry may already be reported as over the carry budget.
+            if !report.nested_skipped.contains_key(&nested.entry) {
+                push_skip(report, &nested.entry, "no data or assets in its namespace");
+            }
+            continue;
+        }
+        report.nested_carried.push(NestedCarry {
+            entry: nested.entry.clone(),
+            id: id.to_owned(),
+            files,
+        });
+        if id != outer_id && !namespaces.iter().any(|ns| ns == id) {
+            namespaces.push(id.to_owned());
+        }
+    }
+    for ns in namespaces {
+        if !report.namespaces.contains(&ns) {
+            report.namespaces.push(ns);
+        }
+    }
+    report.namespaces.sort();
+    report.nested_conflicts.sort();
+    Ok(())
+}
+
+/// A nested jar's bytes, read from the outer archive (never written to disk),
+/// under the same per-jar bound as the jar census.
+fn read_nested(zip: &mut zip::ZipArchive<fs::File>, entry: &str) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    zip.by_name(entry)
+        .map_err(|_| "nested jar is missing from the archive".to_owned())?
+        .take(MAX_NESTED_JAR_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{entry}: {e}"))?;
+    if bytes.len() as u64 > MAX_NESTED_JAR_BYTES {
+        return Err(format!(
+            "nested jar exceeds the {MAX_NESTED_JAR_BYTES}-byte budget"
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Copies one nested jar's `data/<id>/` and `assets/<id>/` files into the
+/// carry, in path order, counting them toward the carry's file and byte caps.
+fn carry_nested_entries(
+    bytes: &[u8],
+    id: &str,
+    entry: &str,
+    inside: &Path,
+    caps: Caps,
+    used: &mut Used,
+    report: &mut Report,
+) -> Result<usize, String> {
+    let mut inner = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|_| "nested jar is not a readable zip".to_owned())?;
+    let mut entries: Vec<(String, usize)> = (0..inner.len())
+        .filter_map(|index| {
+            let name = inner.by_index(index).ok()?.name().to_owned();
+            split(&name)
+                .is_some_and(|(_, ns, _)| ns == id)
+                .then_some((name, index))
+        })
+        .collect();
+    // Duplicate names stay: the second one is a conflict with the first.
+    entries.sort();
+    let mut carried = 0usize;
+    for (name, index) in entries {
+        if used.files >= caps.files || used.bytes >= caps.bytes {
+            push_skip(report, entry, "nested content exceeds the carry budget");
+            break;
+        }
+        if name.split('/').any(|p| p == ".." || p.is_empty()) || name.contains(['\\', ':']) {
+            continue;
+        }
+        let room = caps.bytes - used.bytes;
+        let mut data = Vec::new();
+        inner
+            .by_index(index)
+            .map_err(|e| format!("{name}: {e}"))?
+            .take(room + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| format!("{name}: {e}"))?;
+        if data.len() as u64 > room {
+            push_skip(report, entry, "nested content exceeds the carry budget");
+            break;
+        }
+        if let Some(why) = unreadable(&name, &mut data) {
+            report.unreadable.insert(name.clone(), why);
+            continue;
+        }
+        let dest = inside.join(&name);
+        if dest.exists() {
+            if report.nested_conflicts.len() < MAX_NESTED_ROWS {
+                report
+                    .nested_conflicts
+                    .push(format!("{name}: {entry} kept the earlier file"));
+            }
+            continue;
+        }
+        write(&dest, &data)?;
+        carried += 1;
+        used.files += 1;
+        used.bytes += data.len() as u64;
+        report.copied += 1;
+    }
+    Ok(carried)
+}
+
+/// A nested mod id may become one of the manifest's namespaces.
+fn nested_namespace(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b))
+        && !NOT_CLAIMED.contains(&id)
+}
+
+fn push_skip(report: &mut Report, entry: &str, reason: impl Into<String>) {
+    if report.nested_skipped.len() < MAX_NESTED_ROWS {
+        let reason = reason.into();
+        report.nested_skipped.insert(
+            entry.to_owned(),
+            reason
+                .replace(['\r', '\n'], " ")
+                .chars()
+                .take(MAX_NESTED_REASON)
+                .collect(),
+        );
+    }
 }
 
 /// The item a recipe makes: `result.id` (1.21 and later), `result.item` or a bare id.
@@ -1941,6 +2195,150 @@ mod tests {
         assert_eq!(report.copied, 0);
         assert!(report.outside.is_empty());
         assert!(!dir.join("evil.json").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn jar_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in files {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    fn str_jar(files: &[(&str, &str)]) -> Vec<u8> {
+        let bytes: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(name, body)| (*name, body.as_bytes()))
+            .collect();
+        jar_bytes(&bytes)
+    }
+
+    /// Nested jars come along under their own namespaces, in entry order; a
+    /// jar without metadata is reported once, a malformed one with its reason,
+    /// a path an earlier file gave keeps the earlier file, and the caps hold.
+    #[test]
+    fn carries_nested_jars_in_entry_order() {
+        let dir =
+            std::env::temp_dir().join(format!("horizon-port-pack-nested-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fabric = str_jar(&[
+            ("fabric.mod.json", r#"{"id":"fab","version":"1"}"#),
+            ("data/fab/recipe/x.json", r#"{"nested":true}"#),
+            ("assets/fab/lang/en_us.json", "{}"),
+            // Another namespace is not the nested mod's to carry.
+            ("data/other/x.json", "{}"),
+        ]);
+        let neo = str_jar(&[
+            (
+                "META-INF/neoforge.mods.toml",
+                "[[mods]]\nmodId = \"neo\"\nversion = \"2\"\n",
+            ),
+            ("data/neo/loot_table/x.json", r#"{"pools":[]}"#),
+        ]);
+        let plain = str_jar(&[("data/plain/recipe/x.json", "{}")]);
+        let broken = str_jar(&[("fabric.mod.json", "{not json")]);
+        let jar = dir.join("outer-1.0.jar");
+        fs::write(
+            &jar,
+            jar_bytes(&[
+                (
+                    "META-INF/neoforge.mods.toml",
+                    b"[[mods]]\nmodId = \"outer\"\nversion = \"1.0\"\n".as_slice(),
+                ),
+                (
+                    "data/outer/loot_table/blocks/x.json",
+                    br#"{"pools":[]}"#.as_slice(),
+                ),
+                // The outer mod's own file in `fab`, which it claims by name.
+                ("data/fab/recipe/x.json", br#"{"outer":true}"#.as_slice()),
+                (
+                    "data/outer/advancement/claim.json",
+                    br#"{"claim":["fab:x"]}"#.as_slice(),
+                ),
+                // Archive order is not entry order: the report sorts.
+                ("META-INF/jars/plain.jar", plain.as_slice()),
+                ("META-INF/jars/fabric.jar", fabric.as_slice()),
+                ("META-INF/jarjar/neo.jar", neo.as_slice()),
+                ("META-INF/jars/broken.jar", broken.as_slice()),
+            ]),
+        )
+        .unwrap();
+
+        let info = crate::jar::read(&jar).unwrap();
+        let out = dir.join("work/mods/outer");
+        let pack = Pack {
+            loaded: &|_| true,
+            mods: &|_| false,
+        };
+        let report = carry(&jar, &info, &out, None, &|_| true, &pack, &BTreeMap::new()).unwrap();
+        let carried: Vec<(&str, &str, usize)> = report
+            .nested_carried
+            .iter()
+            .map(|n| (n.entry.as_str(), n.id.as_str(), n.files))
+            .collect();
+        assert_eq!(
+            carried,
+            [
+                ("META-INF/jarjar/neo.jar", "neo", 1),
+                ("META-INF/jars/fabric.jar", "fab", 1),
+            ]
+        );
+        assert_eq!(
+            report.nested_skipped.keys().collect::<Vec<_>>(),
+            ["META-INF/jars/broken.jar", "META-INF/jars/plain.jar"]
+        );
+        assert!(report.nested_skipped["META-INF/jars/broken.jar"].starts_with("fabric.mod.json:"));
+        assert_eq!(
+            report.nested_skipped["META-INF/jars/plain.jar"],
+            "no mod metadata"
+        );
+        assert_eq!(
+            report.nested_conflicts,
+            ["data/fab/recipe/x.json: META-INF/jars/fabric.jar kept the earlier file"]
+        );
+        assert_eq!(report.namespaces, ["fab", "neo"]);
+        // Two outer files, the Neo file, and the Fabric file and lang.
+        assert_eq!(report.copied, 5);
+        let carried = out.join("carry");
+        for file in [
+            "data/fab/recipe/x.json",
+            "assets/fab/lang/en_us.json",
+            "data/neo/loot_table/x.json",
+        ] {
+            assert!(carried.join(file).exists(), "{file}");
+        }
+        assert!(!carried.join("data/other").exists());
+        let package = horizon_mods::Package::read(&carried).unwrap();
+        assert_eq!(package.manifest.namespaces, ["fab", "neo"]);
+
+        // The caps: the files and bytes the carry has room for; a jar that
+        // does not fit gives nothing and one row.
+        let mut zip = zip::ZipArchive::new(fs::File::open(&jar).unwrap()).unwrap();
+        let run = |zip: &mut zip::ZipArchive<fs::File>, name: &str, caps: Caps| {
+            let mut report = Report::default();
+            nested_carry(
+                zip,
+                &info,
+                "outer",
+                &dir.join(name).join("carry"),
+                caps,
+                Used::default(),
+                &mut report,
+            )
+            .unwrap();
+            report
+        };
+        let caps = |files, bytes| Caps { files, bytes };
+        let report = run(&mut zip, "files", caps(0, 1 << 20));
+        assert!(report.nested_carried.is_empty());
+        assert!(report.nested_skipped["META-INF/jarjar/neo.jar"].contains("budget"));
+        let report = run(&mut zip, "bytes", caps(100, 0));
+        assert!(report.nested_carried.is_empty());
+        assert!(report.nested_skipped["META-INF/jarjar/neo.jar"].contains("budget"));
         fs::remove_dir_all(&dir).unwrap();
     }
 }
