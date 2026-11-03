@@ -9,6 +9,7 @@
 use super::remote_chunks::{ChunkDecoder, ChunkFormat, Next};
 use super::{Dim, Game, Mining, Screen};
 use horizon_client::first_person::{Hand, SwingAnimation};
+use horizon_client::lan::payloads::{self, PayloadLink};
 use horizon_client::{
     Result,
     blocks::Fluid,
@@ -28,11 +29,13 @@ use horizon_client::{
     world::World,
 };
 use horizon_core::{geometry::Vec3, random::RandomSource};
+use horizon_mods::payloads::{PayloadDirection, PayloadFrame};
 use horizon_protocol::{
     entity_data::{ITEM_ENTITY_ITEM, Value},
     item::{Hashed, Stack},
     packets::{
         Empty,
+        configuration::CustomPayload,
         play::{self, Clientbound as C, Serverbound as S},
     },
     registry::{Builtin, DimensionType, Dynamic, SyncedNames, ceil_log2},
@@ -316,6 +319,8 @@ pub(super) struct Remote {
     pub(super) menu: Option<(i32, String)>,
     /// The open menu's title as the server named it, with its styles.
     pub(super) menu_title: Option<horizon_client::text::Text>,
+    /// Registered mod payload channels and frames the server sent.
+    pub(super) payloads: PayloadLink,
     state_id: i32,
     use_target: Option<[i32; 3]>,
     entities: HashMap<i32, Tracked>,
@@ -714,6 +719,7 @@ impl Game<'_> {
             predictions: HashMap::new(),
             menu: None,
             menu_title: None,
+            payloads: PayloadLink::from_declared(),
             state_id: 0,
             use_target: None,
             entities: HashMap::new(),
@@ -2441,6 +2447,27 @@ impl Game<'_> {
                 let delay = self.debug_millis() - p.time;
                 self.debug_charts.ping.log(delay);
             }
+            // The server's declared mod payload channels, then their frames.
+            C::CustomPayload(p) if p.channel == payloads::REGISTER_CHANNEL => {
+                if let Some(r) = self.remote.as_mut() {
+                    match r.payloads.apply_registration(&p.data) {
+                        Ok(count) => {
+                            log::info!("Horizon: server declared {count} mod payload channel(s)")
+                        }
+                        Err(error) => {
+                            log::warn!("Horizon: bad mod payload registration: {error}")
+                        }
+                    }
+                }
+            }
+            C::CustomPayload(p) if p.channel == payloads::CHANNEL => {
+                if let Some(r) = self.remote.as_mut()
+                    && let Err(error) = r.payloads.receive(&p.data, PayloadDirection::PlayToClient)
+                {
+                    log::warn!("Horizon: bad mod payload from the server: {error}");
+                }
+            }
+            C::CustomPayload(_) => {}
             C::Login(p) => {
                 self.test_highlights.clear();
                 self.level.hardcore = p.hardcore;
@@ -7482,6 +7509,33 @@ impl Game<'_> {
     /// after it; the server corrects anything it sees differently. A menu the
     /// engine doesn't model sends the clicks unpredicted. False when a click's
     /// slot isn't one of the menu's.
+    /// Send one declared mod payload frame to the server.
+    #[allow(dead_code)] // wired for mod-triggered sends once Java hooks call it
+    pub(super) fn remote_send_payload(
+        &mut self,
+        id: &str,
+        direction: PayloadDirection,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<(), String> {
+        let Some(r) = self.remote.as_mut() else {
+            return Err("not connected to a server".to_owned());
+        };
+        let data = r.payloads.send(id, direction, bytes)?;
+        self.send(S::CustomPayload(CustomPayload {
+            channel: payloads::CHANNEL.to_owned(),
+            data,
+        }));
+        Ok(())
+    }
+
+    /// Frames the server sent, in arrival order.
+    #[allow(dead_code)] // consumed by the mod hook dispatcher once wired
+    pub(super) fn take_remote_payloads(&mut self) -> Vec<PayloadFrame> {
+        self.remote
+            .as_mut()
+            .map_or_else(Vec::new, |r| r.payloads.take_incoming())
+    }
+
     pub(super) fn remote_menu_ops(&mut self, ops: &[(Option<usize>, i32, Input)]) -> bool {
         // CrafterScreen.slotClicked: a slot toggle goes out before the click.
         if let [(Some(slot), button, input)] = ops {

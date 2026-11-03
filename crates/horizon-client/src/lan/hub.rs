@@ -10,6 +10,7 @@ use super::{
     data::SyncData,
     entity::{Entities, EntityState, Viewer},
     guest::{Guest, SentEffect, stack_to_network},
+    payloads::{self, PayloadLink},
 };
 use crate::{
     chunk::Chunk,
@@ -22,10 +23,14 @@ use horizon_core::{
     geometry::{Aabb, ShapeOp, Vec3, VoxelShape},
     random::LegacyRandom,
 };
+use horizon_mods::payloads::{PayloadDirection, PayloadFrame};
 use horizon_protocol::ids::play::clientbound as ids;
 use horizon_protocol::{
     entity_data::{Particle, ParticleData, Value, serializer},
-    packets::play::{self, Clientbound as C, Serverbound as S},
+    packets::{
+        configuration::CustomPayload,
+        play::{self, Clientbound as C, Serverbound as S},
+    },
     text::{literal, translatable},
 };
 use horizon_world::{
@@ -182,6 +187,9 @@ pub enum HostEvent {
 pub struct Hub {
     /// Clicks on and closings of native mods' menus, for the game.
     pub native_menu_events: Vec<super::menu::NativeMenuEvent>,
+    /// Registered mod payload channels, and frames received from guests.
+    pub payloads: PayloadLink,
+    pub payload_inbox: Vec<(u32, PayloadFrame)>,
     pub lan: Lan,
     pub config: HubConfig,
     pub encoder: ChunkEncoder,
@@ -440,6 +448,8 @@ impl Hub {
             entity_out: Vec::new(),
             mod_commands: (serde_json::Value::Null, None),
             native_menu_events: Vec::new(),
+            payloads: PayloadLink::from_declared(),
+            payload_inbox: Vec::new(),
             teams: Vec::new(),
         }
     }
@@ -449,6 +459,31 @@ impl Hub {
     }
     pub fn guest_mut(&mut self, conn: u32) -> Option<&mut Guest> {
         self.guests.iter_mut().find(|g| g.conn == conn)
+    }
+
+    /// Frames received from guests, in arrival order.
+    #[allow(dead_code)] // consumed by the game's mod hook dispatcher
+    pub fn take_payloads(&mut self) -> Vec<(u32, PayloadFrame)> {
+        std::mem::take(&mut self.payload_inbox)
+    }
+
+    /// Send one declared payload frame to a guest.
+    pub fn send_payload(
+        &mut self,
+        conn: u32,
+        id: &str,
+        direction: PayloadDirection,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        let data = self.payloads.send(id, direction, bytes)?;
+        let g = self
+            .guest(conn)
+            .ok_or_else(|| format!("guest {conn} is not here"))?;
+        g.send(&C::CustomPayload(CustomPayload {
+            channel: payloads::CHANNEL.to_owned(),
+            data,
+        }));
+        Ok(())
     }
 
     /// The network id of a name in a built-in or synchronized registry.
@@ -790,7 +825,12 @@ impl Hub {
             let g = &self.guests[i];
             (g.name.clone(), g.uuid, g.entity_id, g.game_mode)
         };
+        let registration = self.payloads.registration();
         let g = &self.guests[i];
+        g.send(&C::CustomPayload(CustomPayload {
+            channel: payloads::REGISTER_CHANNEL.to_owned(),
+            data: registration,
+        }));
         g.send(&C::Login(play::Login {
             player_id: entity_id,
             hardcore: self.config.hardcore,
@@ -2445,6 +2485,25 @@ impl Hub {
                         g.awaiting_teleport = None;
                         let rot = (p.yaw, p.pitch);
                         self.position_change(i, [p.x, p.y, p.z], rot, 0, ctx, events);
+                    }
+                }
+                // A mod payload frame: validated against the declared channels
+                // and left for the game to consume.
+                S::CustomPayload(p) if p.channel == payloads::CHANNEL => {
+                    match self
+                        .payloads
+                        .receive(&p.data, PayloadDirection::PlayToServer)
+                    {
+                        Ok(frame) => {
+                            let frame = frame.clone();
+                            if self.payload_inbox.len() < 256 {
+                                self.payload_inbox.push((conn, frame));
+                            }
+                        }
+                        Err(error) => log::warn!(
+                            "Horizon: {} sent an invalid mod payload: {error}",
+                            self.guests[i].name
+                        ),
                     }
                 }
                 // handlePlayerAbilities: the client flies only if it may.
