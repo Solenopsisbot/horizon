@@ -384,6 +384,72 @@ impl MobType {
         self.layers.get(key)
     }
 }
+/// The most declared mod entities one resource root may alias: the native
+/// declaration lists are capped too (`MAX_NATIVE_DECLARATIONS`).
+pub const MAX_MOB_ALIASES: usize = 1024;
+/// A declared entity id or template longer than this is rejected.
+const MAX_MOB_ALIAS_ID: usize = 256;
+/// A declared entity's size in blocks, the bound the native declarations
+/// fence `width`, `height` and `eye_height` at
+/// (`horizon_mods::native::MAX_ENTITY_SIZE`).
+const MAX_MOB_ALIAS_SIZE: f64 = 64.0;
+/// A declared entity attribute's value (`horizon_mods::native::MAX_ENTITY_ATTRIBUTE`).
+const MAX_MOB_ALIAS_ATTRIBUTE: f64 = 1.0e6;
+/// A declared mod entity (`data/<namespace>/horizon/entity/<path>.json`): a
+/// type of its own that copies a vanilla template, every number it leaves
+/// `None` staying the template's. The declaration's spawn placement,
+/// components and goals belong to the systems that own them; the mob this
+/// aliases is the template's model, sounds, brain and goals.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MobEntityAlias {
+    /// The declared id (`ruby:goblin`), never a vanilla one.
+    pub id: String,
+    /// The type it copies: `minecraft:zombie` or the bare `zombie`.
+    pub template: String,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    pub eye_height: Option<f64>,
+    pub max_health: Option<f32>,
+    pub speed: Option<f64>,
+    pub attack_damage: Option<f32>,
+    pub follow_range: Option<f64>,
+}
+impl MobEntityAlias {
+    /// The fences an alias passes whether a content file or a caller built
+    /// it: a bounded template and finite numbers inside the bounds the native
+    /// declarations use, with health above zero.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.template.is_empty() || self.template.len() > MAX_MOB_ALIAS_ID {
+            return Err("template is empty or too long".into());
+        }
+        fn bounded(name: &str, value: Option<f64>, max: f64) -> Result<(), String> {
+            match value {
+                Some(v) if !(v.is_finite() && (0.0..=max).contains(&v)) => {
+                    Err(format!("{name} {v} is not 0 to {max}"))
+                }
+                _ => Ok(()),
+            }
+        }
+        bounded("width", self.width, MAX_MOB_ALIAS_SIZE)?;
+        bounded("height", self.height, MAX_MOB_ALIAS_SIZE)?;
+        bounded("eye_height", self.eye_height, MAX_MOB_ALIAS_SIZE)?;
+        bounded("speed", self.speed, MAX_MOB_ALIAS_ATTRIBUTE)?;
+        bounded(
+            "attack_damage",
+            self.attack_damage.map(f64::from),
+            MAX_MOB_ALIAS_ATTRIBUTE,
+        )?;
+        bounded("follow_range", self.follow_range, MAX_MOB_ALIAS_ATTRIBUTE)?;
+        match self.max_health {
+            Some(h) if !(h.is_finite() && h > 0.0 && f64::from(h) <= MAX_MOB_ALIAS_ATTRIBUTE) => {
+                Err(format!(
+                    "max_health {h} is above 0 and at most {MAX_MOB_ALIAS_ATTRIBUTE}"
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
 /// Each type's default attribute values, parsed exactly (serde_json's
 /// default float parsing can miss the nearest double by one ulp).
 fn exact_attributes(bytes: &[u8]) -> HashMap<String, HashMap<String, f64>> {
@@ -407,6 +473,9 @@ fn exact_attributes(bytes: &[u8]) -> HashMap<String, HashMap<String, f64>> {
 }
 pub struct MobTypes {
     pub types: HashMap<String, MobType>,
+    /// The declared entities [`MobTypes::add_alias`] added, by id: a second
+    /// declaration of an id must agree with the first.
+    aliases: HashMap<String, MobEntityAlias>,
 }
 impl MobTypes {
     pub fn load(root: &Path) -> crate::Result<Self> {
@@ -508,8 +577,96 @@ impl MobTypes {
                 },
             );
         }
-        Ok(Self { types: out })
+        Ok(Self {
+            types: out,
+            aliases: HashMap::new(),
+        })
     }
+    /// The type an id names: its exact key, then its `minecraft:`-normalized
+    /// form (`Identifier.parse`). Unlike a declaration, nothing is invented:
+    /// `ruby:goblin` resolves only when it was declared.
+    pub fn resolve(&self, id: &str) -> Option<&MobType> {
+        resolve_type(&self.types, id)
+    }
+    /// Declare a mod entity as an alias of a vanilla template type: the
+    /// template's model, sounds, brain and goals under a new id, with the
+    /// alias's numbers over them (its drops are looked up by id, so a
+    /// declared entity has to declare its own table to have drops). At most
+    /// [`MAX_MOB_ALIASES`]; a second declaration of the same id must agree
+    /// with the first.
+    pub fn add_alias(&mut self, alias: &MobEntityAlias) -> Result<(), String> {
+        alias.validate()?;
+        let id = horizon_client_core::identifier::normalize_id(&alias.id)
+            .filter(|id| id.len() <= MAX_MOB_ALIAS_ID)
+            .ok_or_else(|| format!("entity id {:?} is malformed", alias.id))?;
+        if id.starts_with("minecraft:") {
+            return Err(format!("declared entity {id} is a vanilla id"));
+        }
+        let mut alias = alias.clone();
+        alias.id = id.clone();
+        if let Some(previous) = self.aliases.get(&id) {
+            return if *previous == alias {
+                Ok(())
+            } else {
+                Err(format!(
+                    "declared entity {id} is declared twice with other properties"
+                ))
+            };
+        }
+        if self.aliases.len() >= MAX_MOB_ALIASES {
+            return Err(format!("more than {MAX_MOB_ALIASES} declared entities"));
+        }
+        let mut kind = self
+            .template_type(&alias.template)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "declared entity {id} copies unknown template {:?}",
+                    alias.template
+                )
+            })?;
+        kind.id = id.clone();
+        if let Some(v) = alias.width {
+            kind.width = v;
+        }
+        if let Some(v) = alias.height {
+            kind.height = v;
+        }
+        if let Some(v) = alias.eye_height {
+            kind.eye_height = v;
+        }
+        if let Some(v) = alias.max_health {
+            kind.max_health = v;
+        }
+        if let Some(v) = alias.speed {
+            kind.speed = v;
+        }
+        if let Some(v) = alias.attack_damage {
+            kind.attack_damage = v;
+        }
+        if let Some(v) = alias.follow_range {
+            kind.follow_range = v;
+        }
+        self.types.insert(id.clone(), kind);
+        self.aliases.insert(id, alias);
+        Ok(())
+    }
+    /// The type a declaration copies: the exact id, then vanilla's id for the
+    /// last segment (`zombie` and `ruby:zombie` both mean `minecraft:zombie`).
+    fn template_type(&self, template: &str) -> Option<&MobType> {
+        self.types.get(template).or_else(|| {
+            let last = template.rsplit(':').next()?;
+            self.types.get(&format!("minecraft:{last}"))
+        })
+    }
+}
+/// [`MobTypes::resolve`] over a stored map of types (`Resources::mob_types`),
+/// so a `HashMap<String, Arc<MobType>>` and `MobTypes` answer alike.
+pub fn resolve_type<'a, T>(types: &'a HashMap<String, T>, id: &str) -> Option<&'a T> {
+    types.get(id).or_else(|| {
+        let normalized = horizon_client_core::identifier::normalize_id(id)?;
+        types.get(&normalized)
+    })
 }
 pub use horizon_client_core::who::Who;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3694,6 +3851,145 @@ mod held_stack_tests {
         extra.take_main_hand();
         assert!(extra.main_hand.is_none());
         assert!(extra.main_hand_stack().is_none());
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::sensor_scan_tests::kind;
+    use super::*;
+
+    /// Two vanilla types to copy, without a resource root.
+    fn types() -> MobTypes {
+        let mut pig = (*kind()).clone();
+        pig.id = "minecraft:pig".into();
+        pig.species = Species::Pig;
+        MobTypes {
+            types: HashMap::from([
+                ("minecraft:cow".to_owned(), (*kind()).clone()),
+                ("minecraft:pig".to_owned(), pig),
+            ]),
+            aliases: HashMap::new(),
+        }
+    }
+    fn alias(id: &str, template: &str) -> MobEntityAlias {
+        MobEntityAlias {
+            id: id.into(),
+            template: template.into(),
+            ..Default::default()
+        }
+    }
+
+    /// The declared type is the template's with a new id, and only the
+    /// numbers it names are replaced; the template itself stays as it was.
+    #[test]
+    fn a_declared_entity_copies_its_template_and_overlays_its_numbers() {
+        let mut types = types();
+        types
+            .add_alias(&MobEntityAlias {
+                id: "ruby:goblin".into(),
+                // A bare template means vanilla's, as an id without a
+                // namespace does everywhere else.
+                template: "pig".into(),
+                width: Some(0.7),
+                height: None,
+                eye_height: Some(1.5),
+                max_health: Some(30.0),
+                speed: Some(0.3),
+                attack_damage: Some(4.0),
+                follow_range: Some(24.0),
+            })
+            .unwrap();
+        let t = types.resolve("ruby:goblin").expect("declared");
+        assert_eq!(t.id, "ruby:goblin");
+        assert_eq!(t.species, Species::Pig);
+        assert_eq!(t.width, 0.7);
+        assert_eq!(t.height, 1.4, "a number left unset stays the template's");
+        assert_eq!(t.eye_height, 1.5);
+        assert_eq!(t.max_health, 30.0);
+        assert_eq!(t.speed, 0.3);
+        assert_eq!(t.attack_damage, 4.0);
+        assert_eq!(t.follow_range, 24.0);
+        let pig = types.resolve("minecraft:pig").unwrap();
+        assert_eq!(pig.max_health, 10.0, "the template is not changed");
+        assert_eq!(pig.speed, 0.2);
+    }
+    /// A declaration whose template the game does not have is rejected, and
+    /// its id is not half-declared.
+    #[test]
+    fn a_declared_entity_needs_a_template_the_game_has() {
+        let mut types = types();
+        let error = types
+            .add_alias(&alias("ruby:ghost", "minecraft:ghast"))
+            .unwrap_err();
+        assert!(error.contains("unknown template"), "{error}");
+        assert!(types.resolve("ruby:ghost").is_none());
+    }
+    /// Neither a malformed id nor a vanilla one can be declared, and a number
+    /// outside the bounds the native declarations use is refused.
+    #[test]
+    fn a_declaration_is_fenced_by_its_id_and_numbers() {
+        let mut types = types();
+        assert!(types.add_alias(&alias("Ruby Goblin", "cow")).is_err());
+        assert!(types.add_alias(&alias("minecraft:zombie", "cow")).is_err());
+        let bad = MobEntityAlias {
+            width: Some(-1.0),
+            ..alias("ruby:huge", "cow")
+        };
+        assert!(types.add_alias(&bad).is_err());
+        let sick = MobEntityAlias {
+            max_health: Some(0.0),
+            ..alias("ruby:sick", "cow")
+        };
+        assert!(types.add_alias(&sick).is_err());
+        assert_eq!(types.types.len(), 2);
+    }
+    /// The same declaration twice is the same type; another set of numbers
+    /// under an id already taken is an error, and the first one stands.
+    #[test]
+    fn a_second_declaration_of_an_id_must_agree() {
+        let mut types = types();
+        let declared = MobEntityAlias {
+            max_health: Some(20.0),
+            ..alias("ruby:goblin", "cow")
+        };
+        types.add_alias(&declared).unwrap();
+        types.add_alias(&declared).unwrap();
+        let changed = MobEntityAlias {
+            max_health: Some(21.0),
+            ..declared
+        };
+        let error = types.add_alias(&changed).unwrap_err();
+        assert!(error.contains("twice"), "{error}");
+        assert_eq!(types.resolve("ruby:goblin").unwrap().max_health, 20.0);
+    }
+    /// `resolve` fills in the `minecraft` namespace, and invents no id: a
+    /// declared entity answers only to its own.
+    #[test]
+    fn resolve_reads_a_bare_id_as_minecrafts_and_invents_nothing() {
+        let mut types = types();
+        types.add_alias(&alias("ruby:goblin", "cow")).unwrap();
+        assert_eq!(types.resolve("ruby:goblin").unwrap().id, "ruby:goblin");
+        assert_eq!(types.resolve("cow").unwrap().id, "minecraft:cow");
+        assert_eq!(types.resolve("minecraft:pig").unwrap().id, "minecraft:pig");
+        assert!(types.resolve("ruby:hobgoblin").is_none());
+        assert!(types.resolve("hobgoblin").is_none());
+        assert!(types.resolve("").is_none());
+    }
+    /// The aliases a root may add are capped, so a hostile pack cannot make
+    /// the table grow without end.
+    #[test]
+    fn declared_entities_are_capped() {
+        let mut types = types();
+        for i in 0..MAX_MOB_ALIASES {
+            types
+                .add_alias(&alias(&format!("ruby:mob{i}"), "cow"))
+                .unwrap();
+        }
+        let error = types
+            .add_alias(&alias("ruby:one_too_many", "cow"))
+            .unwrap_err();
+        assert!(error.contains("declared entities"), "{error}");
     }
 }
 

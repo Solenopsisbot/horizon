@@ -1998,43 +1998,42 @@ impl Game<'_> {
         {
             return Err(err("commands.summon.invalidPosition", &[]));
         }
+        // A declared mod entity (`data/<namespace>/horizon/entity/...`) is a
+        // type of its own that copies a vanilla one: its id names the mob and
+        // the template only says how it looks and behaves. Vanilla ids keep
+        // their own names, and an id nothing declares still reads as vanilla's
+        // (`tnt` -> `minecraft:tnt`).
+        let resolved = horizon_client::mobs::resolve_type(self.res.mob_types(), &kind).cloned();
+        let type_id = resolved.as_ref().map_or_else(
+            || horizon_client::command::args::normalize(&kind),
+            |t| t.id.clone(),
+        );
+        let name_key = format!("entity.{}", type_id.replace(':', "."));
         let short = kind.trim_start_matches("minecraft:").to_owned();
         if let Some(Arg::Str(nbt)) = ctx.get("nbt").cloned() {
             // With an NBT argument the entity is built from it, unfinalized.
-            if self.ui.difficulty == 0
-                && self
-                    .res
-                    .mob_types()
-                    .get(&format!("minecraft:{short}"))
-                    .is_some_and(|t| t.category == "monster")
+            if self.ui.difficulty == 0 && resolved.as_ref().is_some_and(|t| t.category == "monster")
             {
                 return Err(err("commands.summon.failed.peaceful", &[]));
             }
             let before = self.spawned_mark();
-            let name = match self.summon_with_nbt(&format!("minecraft:{short}"), pos, &nbt)? {
+            let name = match self.summon_with_nbt(&type_id, pos, &nbt)? {
                 Some(target) => self.target_name(target),
                 // Spawned as a kind no command target stands for (primed
                 // TNT, falling blocks, projectiles): its type's name.
-                None if self.spawned_mark() != before => {
-                    Text::translate(&format!("entity.minecraft.{short}"), &[])
-                }
+                None if self.spawned_mark() != before => Text::translate(&name_key, &[]),
                 None => return Err(err("commands.summon.failed", &[])),
             };
             self.feedback(Text::translate("commands.summon.success", &[name]));
             return Ok(1);
         }
         let name;
-        if let Some(t) = self
-            .res
-            .mob_types()
-            .get(&format!("minecraft:{short}"))
-            .cloned()
-        {
+        if let Some(t) = resolved {
             if self.ui.difficulty == 0 && t.category == "monster" {
                 return Err(err("commands.summon.failed.peaceful", &[]));
             }
-            self.spawn_mob_spawned(&short, pos);
-            name = Text::translate(&format!("entity.minecraft.{short}"), &[]);
+            self.spawn_mob_spawned(&t.id, pos);
+            name = Text::translate(&name_key, &[]);
         } else {
             match short.as_str() {
                 "item" => {
@@ -2089,13 +2088,11 @@ impl Game<'_> {
                 // SummonCommand.createEntity: any other type from an empty compound.
                 _ => {
                     let before = self.spawned_mark();
-                    name = match self.summon_with_nbt(&kind, pos, "{}")? {
+                    name = match self.summon_with_nbt(&type_id, pos, "{}")? {
                         Some(target) => self.target_name(target),
                         // Spawned as a kind no command target stands for
                         // (primed TNT, falling blocks, projectiles).
-                        None if self.spawned_mark() != before => {
-                            Text::translate(&format!("entity.minecraft.{short}"), &[])
-                        }
+                        None if self.spawned_mark() != before => Text::translate(&name_key, &[]),
                         None => return Err(err("commands.summon.failed", &[])),
                     };
                 }

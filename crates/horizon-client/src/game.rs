@@ -10542,7 +10542,37 @@ impl Game<'_> {
         self.streaming.sky_light = dim != Dim::Nether;
         self.streaming.nether_shading = dim == Dim::Nether;
         self.load_world_state();
+        self.register_declared_entity_types();
         Ok(())
+    }
+    /// Declared mod entities are entity types of the running game: the
+    /// argument registry `/summon` and `@e[type=]` check ids against lists
+    /// vanilla's exported registry, so the declared ids join it here, where a
+    /// world's registries are built (`build_registries`) and the server game
+    /// answers commands. Sorted and deduplicated, once per world open.
+    fn register_declared_entity_types(&mut self) {
+        let mut declared: Vec<String> = self
+            .res
+            .mob_types()
+            .keys()
+            .filter(|id| !id.starts_with("minecraft:"))
+            .cloned()
+            .collect();
+        if declared.is_empty() {
+            return;
+        }
+        declared.sort();
+        let registries = &mut self.ui.registries;
+        registries.entity_types.extend(declared.iter().cloned());
+        registries.entity_types.sort();
+        registries.entity_types.dedup();
+        // `ids` reads `by_registry` first: the exported list is the one the
+        // parsers see when `command-registries.json` is beside the resources.
+        if let Some(types) = registries.by_registry.get_mut("minecraft:entity_type") {
+            types.ids.extend(declared);
+            types.ids.sort();
+            types.ids.dedup();
+        }
     }
     /// Streaming and region storage for one dimension of a world.
     fn make_streaming(
@@ -16670,6 +16700,146 @@ fn load_resources(
     })
 }
 
+/// The most declared mod entities one resource root is read for, and the
+/// largest declaration file read: a pack cannot make the scan unbounded.
+const MAX_DECLARED_ENTITIES: usize = 1024;
+const MAX_DECLARED_ENTITY_BYTES: u64 = 1 << 20;
+/// How many rejected declarations a world open names before it stops.
+const MAX_DECLARED_ENTITY_WARNINGS: usize = 8;
+
+/// One declared mod entity (`data/<namespace>/horizon/entity/<path>.json`) as
+/// an alias of the vanilla type it copies. Only `template` and the numbers
+/// the game reads are parsed; `spawn`, components and goals belong to the
+/// systems that own them.
+fn parse_entity_alias(
+    id: &str,
+    bytes: &[u8],
+) -> std::result::Result<horizon_client::mobs::MobEntityAlias, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| format!("not JSON ({error})"))?;
+    let template = value
+        .get("template")
+        .and_then(|v| v.as_str())
+        .ok_or("no template")?;
+    // `properties` holds the adapter's strings (`"width": "0.6"`), the typed
+    // `attributes` block the same numbers as numbers; both read alike, and
+    // either block may be absent.
+    let properties = value.get("properties").and_then(|v| v.as_object());
+    let attributes = value.get("attributes").and_then(|v| v.as_object());
+    let number = |value: &serde_json::Value| match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    };
+    let property = |key: &str| properties.and_then(|p| p.get(key)).and_then(number);
+    let attribute = |key: &str, property_key: &str| {
+        attributes
+            .and_then(|a| a.get(key))
+            .and_then(number)
+            .or_else(|| property(property_key))
+    };
+    let alias = horizon_client::mobs::MobEntityAlias {
+        id: id.to_owned(),
+        template: template.to_owned(),
+        width: property("width"),
+        height: property("height"),
+        eye_height: property("eye_height"),
+        max_health: attribute("health", "max_health").map(|v| v as f32),
+        speed: attribute("speed", "speed"),
+        attack_damage: attribute("attack_damage", "attack_damage").map(|v| v as f32),
+        follow_range: attribute("follow_range", "follow_range"),
+    };
+    alias.validate()?;
+    Ok(alias)
+}
+
+/// Every declared mod entity under a resource root, as aliases of the vanilla
+/// types they copy, with the files that could not be read. Deterministic: the
+/// files are sorted by id before the first [`MAX_DECLARED_ENTITIES`] are read,
+/// each at most [`MAX_DECLARED_ENTITY_BYTES`]. A bad declaration never fails
+/// the load: it comes back in the rejected list for the caller to name.
+fn declared_entity_aliases(
+    root: &std::path::Path,
+) -> (
+    Vec<horizon_client::mobs::MobEntityAlias>,
+    Vec<(PathBuf, String)>,
+) {
+    let mut namespaces: Vec<PathBuf> = std::fs::read_dir(root.join("data"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    namespaces.sort();
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for namespace_dir in namespaces {
+        let Some(namespace) = namespace_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let entities = namespace_dir.join("horizon").join("entity");
+        let mut stack = vec![entities.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("json")
+                    && let Ok(relative) = path.strip_prefix(&entities)
+                {
+                    // `data/<namespace>/horizon/entity/<path>.json` is
+                    // `<namespace>:<path>`, folders included.
+                    files.push((
+                        format!(
+                            "{namespace}:{}",
+                            relative
+                                .with_extension("")
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                        ),
+                        path,
+                    ));
+                }
+            }
+        }
+    }
+    files.sort();
+    let mut rejected = Vec::new();
+    if files.len() > MAX_DECLARED_ENTITIES {
+        rejected.push((
+            root.join("data"),
+            format!(
+                "{} declarations over the {MAX_DECLARED_ENTITIES} a root may have are ignored",
+                files.len() - MAX_DECLARED_ENTITIES
+            ),
+        ));
+        files.truncate(MAX_DECLARED_ENTITIES);
+    }
+    let mut aliases = Vec::new();
+    for (id, path) in files {
+        let size = std::fs::metadata(&path).map_or(u64::MAX, |m| m.len());
+        if size > MAX_DECLARED_ENTITY_BYTES {
+            rejected.push((
+                path,
+                format!("{id}: file is over {} MiB", MAX_DECLARED_ENTITY_BYTES >> 20),
+            ));
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            rejected.push((path, format!("{id}: cannot be read")));
+            continue;
+        };
+        match parse_entity_alias(&id, &bytes) {
+            Ok(alias) => aliases.push(alias),
+            Err(error) => rejected.push((path, format!("{id}: {error}"))),
+        }
+    }
+    (aliases, rejected)
+}
+
 fn load_world_rest(
     root: &std::path::Path,
     resources: &Resources,
@@ -16739,11 +16909,41 @@ fn load_world_rest(
             behaviour_json,
             gameplay_projection,
         )?,
-        mob_types: MobTypes::load(root)?
-            .types
-            .into_iter()
-            .map(|(k, v)| (k, Arc::new(v)))
-            .collect(),
+        mob_types: {
+            let mut types = MobTypes::load(root)?;
+            let (aliases, rejected) = declared_entity_aliases(root);
+            let mut declared = 0;
+            let mut warnings: Vec<String> = Vec::new();
+            for (path, error) in &rejected {
+                warnings.push(format!("{}: {error}", path.display()));
+            }
+            for alias in &aliases {
+                match types.add_alias(alias) {
+                    Ok(()) => declared += 1,
+                    Err(error) => warnings.push(format!("{}: {error}", alias.id)),
+                }
+            }
+            // A declared entity the game cannot build is named, never fatal:
+            // a pack must not keep a world from opening.
+            for warning in warnings.iter().take(MAX_DECLARED_ENTITY_WARNINGS) {
+                log::warn!("Horizon: declared entity was ignored at {warning}");
+            }
+            if warnings.len() > MAX_DECLARED_ENTITY_WARNINGS {
+                log::warn!(
+                    "Horizon: {} more ignored declared entities were not named",
+                    warnings.len() - MAX_DECLARED_ENTITY_WARNINGS
+                );
+            }
+            log::info!(
+                "Horizon: {declared} declared mod entities copy a vanilla type ({} ignored)",
+                warnings.len()
+            );
+            types
+                .types
+                .into_iter()
+                .map(|(k, v)| (k, Arc::new(v)))
+                .collect()
+        },
         mob_data,
         player_type: perspective::player_type(root),
         player_arm: player_arms(root, "minecraft:player#main"),
@@ -17831,6 +18031,108 @@ mod runtime_reset_tests {
         assert!(!adv.loaded && !stats.loaded);
         assert!(adv.progress.criteria.is_empty());
         assert!(stats.values.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod declared_entity_tests {
+    use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-declared-entities-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+    fn write(root: &std::path::Path, file: &str, contents: &str) {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// A declaration's template and numbers are read from the adapter's
+    /// strings or the typed attributes block alike, and its id comes from the
+    /// path (`data/<namespace>/horizon/entity/<path>.json`), folders included.
+    #[test]
+    fn declarations_are_read_from_the_resource_root() {
+        let root = temp_root("read");
+        // The shape a native content mod writes.
+        write(
+            &root,
+            "data/ruby/horizon/entity/bird.json",
+            r#"{
+                "format": "horizon:native/1",
+                "template": "minecraft:chicken",
+                "properties": {"width": "0.6"},
+                "spawn": null,
+                "attributes": {"health": 4.0, "speed": 0.25, "attack_damage": null}
+            }"#,
+        );
+        write(
+            &root,
+            "data/alpha/horizon/entity/monster/goblin.json",
+            r#"{
+                "template": "zombie",
+                "properties": {"height": "1.95", "max_health": "30"}
+            }"#,
+        );
+        // Not an entity: the `horizon` folder holds other kinds beside it.
+        write(
+            &root,
+            "data/ruby/horizon/block/bird.json",
+            r#"{"template": "minecraft:stone"}"#,
+        );
+        let (aliases, rejected) = declared_entity_aliases(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(aliases.len(), 2);
+        // Sorted by id, so the scan is the same on every filesystem order.
+        let goblin = &aliases[0];
+        assert_eq!(goblin.id, "alpha:monster/goblin");
+        assert_eq!(goblin.template, "zombie");
+        assert_eq!(goblin.height, Some(1.95));
+        assert_eq!(goblin.max_health, Some(30.0));
+        let bird = &aliases[1];
+        assert_eq!(bird.id, "ruby:bird");
+        assert_eq!(bird.template, "minecraft:chicken");
+        assert_eq!(bird.width, Some(0.6));
+        assert_eq!(bird.max_health, Some(4.0));
+        assert_eq!(bird.speed, Some(0.25));
+        assert_eq!(bird.attack_damage, None);
+    }
+
+    /// A file the game cannot use is reported with its path, one by one, so a
+    /// world open can name it and go on: a bad pack never fails the load.
+    #[test]
+    fn a_bad_declaration_is_reported_not_fatal() {
+        let root = temp_root("reject");
+        write(&root, "data/ruby/horizon/entity/broken.json", "{");
+        write(&root, "data/ruby/horizon/entity/plain.json", "{}");
+        write(
+            &root,
+            "data/ruby/horizon/entity/huge.json",
+            r#"{"template": "cow", "properties": {"width": "-1"}}"#,
+        );
+        let (aliases, rejected) = declared_entity_aliases(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(aliases.is_empty());
+        assert_eq!(rejected.len(), 3);
+        for (path, error) in &rejected {
+            assert!(path.starts_with(&root), "{}", path.display());
+            assert!(!error.is_empty());
+        }
+    }
+
+    /// A root with no `data` (or no declarations) declares nothing.
+    #[test]
+    fn a_root_without_declarations_is_empty() {
+        let root = temp_root("empty");
+        std::fs::create_dir_all(&root).unwrap();
+        let (aliases, rejected) = declared_entity_aliases(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(aliases.is_empty() && rejected.is_empty());
     }
 }
 
