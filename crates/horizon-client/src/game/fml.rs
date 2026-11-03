@@ -533,4 +533,58 @@ mod tests {
         assert_eq!(last_line("a\n\n  b  \n").as_deref(), Some("b"));
         assert_eq!(last_line(" \n"), None);
     }
+
+    /// A fake `horizon-jvm` proves the process path without a JVM: the report
+    /// comes from the child's real output, and a non-zero exit is a reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_process_success_and_failure_become_reports() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "horizon-fml-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let libraries = root.join("libraries");
+        std::fs::create_dir_all(&libraries).unwrap();
+        let script = root.join("fake-jvm");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho mods=2\necho mod=beta\necho mod=alpha\necho 'real loader: FML probe completed'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = FmlConfig {
+            role: ExecutionRole::DedicatedServer,
+            server: root.clone(),
+            jvm: script,
+            strict: false,
+            jars: Vec::new(),
+        };
+        let report = run(&config);
+        assert!(report.succeeded(), "{report:?}");
+        assert_eq!(report.mods, Some(2));
+        assert_eq!(report.mod_ids, ["alpha", "beta"]);
+        assert_eq!(
+            report.summary().first().map(String::as_str),
+            Some("fml-preflight: role=dedicated-server jars=0 mods=2 real-loader=completed")
+        );
+
+        std::fs::write(
+            &config.jvm,
+            "#!/bin/sh\necho 'loader blew up' >&2\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&config.jvm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let failed = run(&config);
+        assert!(!failed.succeeded());
+        let failure = failed.failure.as_deref().unwrap_or_default();
+        assert!(failure.contains("exited with"), "{failure}");
+        assert!(failure.contains("loader blew up"), "{failure}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
