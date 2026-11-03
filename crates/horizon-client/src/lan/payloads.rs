@@ -10,6 +10,7 @@
 use horizon_mods::payloads::{
     PayloadDeclaration, PayloadDirection, PayloadFrame, PayloadRegistry, validate_payload,
 };
+use horizon_native_java::{NativeJar, PayloadRegistration, StdHost, dispatch_payload_frame};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -194,6 +195,57 @@ impl PayloadLink {
 /// bidirectional play form.
 pub fn accepts(declared: PayloadDirection, direction: PayloadDirection) -> bool {
     declared == direction || declared == PayloadDirection::PlayBidirectional
+}
+
+/// The jars and registrations of running Java mods, so a received frame can
+/// reach its registered handler.
+struct HandlerJar {
+    jar: NativeJar,
+    registrations: Vec<PayloadRegistration>,
+}
+
+static HANDLER_JARS: Mutex<Vec<HandlerJar>> = Mutex::new(Vec::new());
+
+/// Remember one mod jar's payload registrations; called after its bootstrap.
+pub fn store_handler_jar(jar: NativeJar, registrations: Vec<PayloadRegistration>) {
+    if registrations.is_empty() {
+        return;
+    }
+    HANDLER_JARS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(HandlerJar { jar, registrations });
+}
+
+/// Forget the jars of a previous bootstrap.
+pub fn clear_handler_jars() {
+    HANDLER_JARS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// Dispatch one received frame to the first registered handler that names its
+/// channel. Returns whether a handler ran; sends it queues are published for
+/// the next server tick.
+pub fn dispatch_received(frame: &PayloadFrame) -> Result<bool, String> {
+    let handlers = HANDLER_JARS.lock().unwrap_or_else(|e| e.into_inner());
+    for handler in handlers.iter() {
+        let mut host = StdHost::new();
+        let matched = dispatch_payload_frame(
+            &handler.jar,
+            &mut host,
+            &handler.registrations,
+            frame.id(),
+            frame.bytes(),
+        )
+        .map_err(|error| error.to_string())?;
+        if matched {
+            publish_from_host(&mut host)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Frames a Java host asked to send, waiting for the server's next tick.
@@ -565,5 +617,13 @@ mod tests {
             host.take_incoming_payloads(),
             vec![("demo:up".to_owned(), b"hello".to_vec())]
         );
+    }
+
+    #[test]
+    fn without_stored_jars_no_handler_runs() {
+        clear_handler_jars();
+        let frame =
+            PayloadFrame::new("demo:up", PayloadDirection::PlayToServer, b"x".to_vec()).unwrap();
+        assert!(!dispatch_received(&frame).unwrap());
     }
 }

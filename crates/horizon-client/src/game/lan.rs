@@ -1755,6 +1755,20 @@ impl Game<'_> {
                 } else {
                     Vec::new()
                 };
+                if pass.first {
+                    for (_, frame) in host.hub.take_payloads() {
+                        match horizon_client::lan::payloads::dispatch_received(&frame) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                log::warn!("Horizon: no Java handler for payload {}", frame.id())
+                            }
+                            Err(error) => log::warn!(
+                                "Horizon: Java payload {} handler failed: {error}",
+                                frame.id()
+                            ),
+                        }
+                    }
+                }
                 events.extend(host.hub.tick_level(&mut ctx));
                 if pass.last {
                     host.hub.end_tick();

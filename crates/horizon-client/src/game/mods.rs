@@ -624,6 +624,7 @@ pub(super) fn run_java_mods_with_report(
     };
     let mut native_content = Vec::new();
     let mut payload_declarations = Vec::new();
+    horizon_client::lan::payloads::clear_handler_jars();
     for path in paths {
         let jar = horizon_native_java::NativeJar::from_path(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
@@ -718,6 +719,10 @@ pub(super) fn run_java_mods_with_report(
                 path.display()
             );
         }
+        horizon_client::lan::payloads::store_handler_jar(
+            jar.clone(),
+            host.payload_registrations().to_vec(),
+        );
         let listeners = host.listener_registrations().count();
         log::info!(
             "Horizon: native Java {} {} entrypoint(s) completed ({} host calls, {} registrations, {} listeners)",
