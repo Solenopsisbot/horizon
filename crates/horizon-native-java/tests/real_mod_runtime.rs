@@ -262,9 +262,13 @@ public final class Callbacks {
         .iter()
         .position(|marker| *marker == second_marker)
         .unwrap();
+    let target_index = markers
+        .iter()
+        .position(|marker| *marker == target_marker)
+        .unwrap();
     assert!(
-        first_index < second_index,
-        "callbacks must run in declaration order"
+        first_index < second_index && second_index < target_index,
+        "HEAD callbacks must run in declaration order before the target"
     );
     let _ = fs::remove_dir_all(root);
 }

@@ -6198,22 +6198,77 @@ impl NativeJar {
                     .into(),
             ));
         }
-        let mut report = match first.at.as_str() {
-            "HEAD" => self.execute_mixin_at_head(first, receiver.clone(), args, host)?,
-            "RETURN" | "TAIL" => {
-                self.execute_mixin_at_return(first, receiver.clone(), args, host)?
-            }
-            other => {
-                return Err(NativeError::Metadata(format!(
-                    "native Mixin chain does not support anchor {other}"
-                )));
-            }
-        };
-        for plan in &plans[1..] {
-            report.callback_result =
-                self.invoke_mixin_callback(plan, receiver.clone(), args, host)?;
+        if first.at != "HEAD" && first.at != "RETURN" && first.at != "TAIL" {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin chain does not support anchor {}",
+                first.at
+            )));
         }
-        Ok(report)
+        let target_class = self.classes.get(&first.target.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                first.target.owner, first.target.name, first.target.descriptor
+            ))
+        })?;
+        let target_method = target_class
+            .method(&first.target.name, &first.target.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    first.target.owner, first.target.name, first.target.descriptor
+                ))
+            })?;
+        if args.len() != arg_count(&first.target.descriptor) {
+            return Err(NativeError::Metadata(format!(
+                "Mixin target {}#{}{} expected {} arguments, got {}",
+                first.target.owner,
+                first.target.name,
+                first.target.descriptor,
+                arg_count(&first.target.descriptor),
+                args.len()
+            )));
+        }
+        if first.at != "HEAD" && return_desc(&first.target.descriptor) != "V" {
+            return Err(NativeError::Metadata(
+                "native Mixin RETURN|TAIL chains support only void targets".into(),
+            ));
+        }
+        let target_receiver = (!target_method.is_static()).then(|| {
+            receiver
+                .clone()
+                .unwrap_or_else(|| Value::Ref(Some(first.target.owner.clone())))
+        });
+        let mut callback_result = Value::Void;
+        let target_result = if first.at == "HEAD" {
+            for plan in plans {
+                callback_result = self.invoke_mixin_callback(plan, receiver.clone(), args, host)?;
+            }
+            self.invoke_method_with_args(
+                &first.target.owner,
+                &first.target.name,
+                &first.target.descriptor,
+                target_receiver,
+                args,
+                host,
+            )?
+        } else {
+            let result = self.invoke_method_with_args(
+                &first.target.owner,
+                &first.target.name,
+                &first.target.descriptor,
+                target_receiver,
+                args,
+                host,
+            )?;
+            for plan in plans {
+                callback_result = self.invoke_mixin_callback(plan, receiver.clone(), args, host)?;
+            }
+            result
+        };
+        Ok(MixinExecutionReport {
+            callback_result,
+            target_result,
+        })
     }
 
     fn invoke_mixin_callback<H: Host>(
