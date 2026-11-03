@@ -81,12 +81,26 @@ pub enum AnnotationValue {
 /// the woven method answers with.  The last override wins.  A callback on a
 /// non-void target must accept the `CallbackInfoReturnable`; a void target
 /// keeps the plain `CallbackInfo` shape.
+///
+/// At `INVOKE` the callback runs before each execution of the call site named
+/// by [`Self::invoke_target`] inside the woven method, receiving the woven
+/// method's arguments plus a runtime-owned `CallbackInfo`.  A `cancellable`
+/// callback that calls `ci.cancel()` suppresses that one call: the interpreter
+/// leaves the invoked descriptor's default value on the stack instead (no
+/// value for a `void` call), and the woven method keeps running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixinInjectionPlan {
     pub target: MethodRef,
     pub callback: MethodRef,
     pub at: String,
     pub cancellable: bool,
+    /// The call site an `at == "INVOKE"` plan hooks, parsed from `@At.target`.
+    ///
+    /// `None` for every other anchor, and for an `INVOKE` plan whose selector
+    /// is missing or outside the accepted forms: those stay out of the
+    /// executable set and are reported by
+    /// [`NativeJar::unresolved_invoke_plans`] instead of guessing a target.
+    pub invoke_target: Option<MethodRef>,
 }
 
 impl MixinInjectionPlan {
@@ -96,6 +110,7 @@ impl MixinInjectionPlan {
             callback,
             at: "HEAD".into(),
             cancellable: false,
+            invoke_target: None,
         }
     }
 
@@ -105,6 +120,7 @@ impl MixinInjectionPlan {
             callback,
             at: "RETURN".into(),
             cancellable: false,
+            invoke_target: None,
         }
     }
 
@@ -114,6 +130,22 @@ impl MixinInjectionPlan {
             callback,
             at: "TAIL".into(),
             cancellable: false,
+            invoke_target: None,
+        }
+    }
+
+    /// Plan a callback at one `@At("INVOKE")` call site.
+    pub fn inject_at_invoke(
+        target: MethodRef,
+        callback: MethodRef,
+        invoke_target: MethodRef,
+    ) -> Self {
+        Self {
+            target,
+            callback,
+            at: "INVOKE".into(),
+            cancellable: false,
+            invoke_target: Some(invoke_target),
         }
     }
 }
@@ -153,6 +185,14 @@ pub struct MixinExecutionReport {
     /// `@Overwrite` plans, and for RETURN/TAIL plans whose callbacks only read
     /// `getReturnValue`.
     pub return_value_overridden: bool,
+    /// Distinct `@At("INVOKE")` bytecode sites that ran at least one callback.
+    ///
+    /// A site is counted by `(class, method, bytecode offset)`, so a call
+    /// site inside a loop counts once while two sibling calls count twice.
+    /// Zero for HEAD, RETURN/TAIL and `@Overwrite` executions.  A target that
+    /// answered a cancellable callback's `ci.cancel()` still counts the site:
+    /// the callback ran, the call did not.
+    pub matched_invoke_sites: usize,
 }
 
 /// Runtime state for the `CallbackInfo` objects one native Mixin execution
@@ -270,6 +310,93 @@ impl CallbackInfos {
             Some(value) => return_override(target_descriptor, value.clone()),
             None => Ok(None),
         }
+    }
+
+    /// Clear one injection point's object before it observes another call
+    /// site.
+    ///
+    /// `@At("INVOKE")` reuses one `CallbackInfo` per woven method across every
+    /// dispatch of its call sites.  Resetting the flag and the return override
+    /// first keeps a `cancel()` from suppressing a later, different call.
+    fn reset(&mut self, marker: &str) -> Result<(), NativeError> {
+        self.open(marker)?;
+        *self.state_mut(marker)? = CallbackInfoState::default();
+        Ok(())
+    }
+}
+
+/// One `@At("INVOKE")` callback bound to one call site.
+#[derive(Debug, Clone)]
+struct InvokeHookEntry {
+    callback: MethodRef,
+    /// The receiver the callback runs with; `None` for a static callback.
+    receiver: Option<Value>,
+    /// The woven method's arguments plus the trailing `CallbackInfo` marker,
+    /// resolved once per execution.
+    args: Vec<Value>,
+    cancellable: bool,
+}
+
+/// Bounded call-site table for one `@At("INVOKE")` execution.
+///
+/// The interpreter consults it before executing an invoke: every callback
+/// bound to that `owner#name(descriptor)` runs in plan order with the woven
+/// method's arguments.  `dispatching` keeps a callback that reaches a hooked
+/// site from recursing; `matched_sites` counts distinct bytecode sites, so a
+/// site inside a loop counts once.
+#[derive(Debug, Default)]
+struct InvokeHooks {
+    /// Site key (`owner#name(descriptor)`, or `owner#name` for a selector
+    /// without one) to entry indices, in insertion order.
+    sites: BTreeMap<String, Vec<usize>>,
+    entries: Vec<InvokeHookEntry>,
+    /// The `CallbackInfo` object every site of one woven method shares.  It is
+    /// reset before each dispatch, so a `cancel()` only suppresses the call
+    /// whose callbacks saw it.
+    marker: String,
+    matched_sites: BTreeSet<(String, String, usize)>,
+    /// Every callback result in dispatch order.
+    results: Vec<Value>,
+    /// Whether any dispatch suppressed its call site.
+    cancelled: bool,
+    /// Set while a callback runs, so the hook table never recurses into
+    /// itself.
+    dispatching: bool,
+}
+
+impl InvokeHooks {
+    fn insert(&mut self, site: &MethodRef, entry: InvokeHookEntry) -> Result<(), NativeError> {
+        if self.entries.len() >= MAX_INVOKE_HOOKS {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin execution reached the bound of {MAX_INVOKE_HOOKS} @At(INVOKE) call-site hooks"
+            )));
+        }
+        let index = self.entries.len();
+        self.sites
+            .entry(invoke_site_key(site))
+            .or_default()
+            .push(index);
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    /// Entries bound to one invoked method, in plan order.
+    ///
+    /// A selector without a descriptor matches every overload, so the exact
+    /// key and the name-only key are merged and re-sorted by insertion index.
+    fn lookup(&self, site: &MethodRef) -> Vec<InvokeHookEntry> {
+        let mut indices = Vec::new();
+        for key in [invoke_site_key(site), invoke_name_key(site)] {
+            if let Some(bound) = self.sites.get(&key) {
+                indices.extend_from_slice(bound);
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+            .iter()
+            .filter_map(|&index| self.entries.get(index).cloned())
+            .collect()
     }
 }
 
@@ -548,6 +675,10 @@ const CALLBACK_INFO_RETURNABLE_DESC: &str =
 /// one per injection point, so only a jar with an unbounded number of them
 /// reaches this bound.
 const MAX_CALLBACK_INFOS: usize = 64;
+/// `@At("INVOKE")` call-site hooks one native Mixin execution may install.
+/// Mixin weaves one callback per matched call; the bound keeps a jar from
+/// growing the interpreter's dispatch table without limit.
+const MAX_INVOKE_HOOKS: usize = 128;
 
 /// Deterministic, game-independent mappings for the small standard-library
 /// surface commonly reached during mod bootstrap.
@@ -6632,14 +6763,35 @@ impl NativeJar {
     /// Discover native Mixin injection plans from runtime-visible annotations.
     ///
     /// This is a translation plan, not weaving: it maps `@Mixin` targets and
-    /// `@Inject` callbacks onto the bounded execution anchors already handled
-    /// by [`Self::execute_mixin_chain`] and [`Self::execute_mixin_at_return`].
-    /// Only `HEAD`, `RETURN` and `TAIL` anchors are recorded; other `@At`
-    /// values stay on the JVM fallback instead of being approximated.
+    /// `@Inject` callbacks onto the bounded execution anchors handled by
+    /// [`Self::execute_mixin_chain`], [`Self::execute_mixin_at_return`] and
+    /// [`Self::execute_mixin_at_invoke`].
+    ///
+    /// `HEAD`, `RETURN`, `TAIL` and `INVOKE` anchors are recorded.  An
+    /// `INVOKE` plan carries its parsed `@At.target` call site; a plan whose
+    /// selector is missing or outside the accepted forms stays out of this
+    /// executable set and is reported by [`Self::unresolved_invoke_plans`].
+    /// `FIELD`, `NEW`, `JUMP`, slice and ordinal selectors remain on the JVM
+    /// fallback instead of being approximated.
     pub fn mixin_injection_plans(&self) -> Vec<MixinInjectionPlan> {
+        self.mixin_plan_scan().0
+    }
+
+    /// `@At("INVOKE")` plans whose selector this bounded runtime cannot read.
+    ///
+    /// These are diagnostics, not executable plans: the target and callback
+    /// stay so a loader can report the call site the mod asked for, while
+    /// [`MixinInjectionPlan::invoke_target`] stays `None` rather than inventing
+    /// one.  Sorted like [`Self::mixin_injection_plans`].
+    pub fn unresolved_invoke_plans(&self) -> Vec<MixinInjectionPlan> {
+        self.mixin_plan_scan().1
+    }
+
+    fn mixin_plan_scan(&self) -> (Vec<MixinInjectionPlan>, Vec<MixinInjectionPlan>) {
         const MIXIN: &str = "Lorg/spongepowered/asm/mixin/Mixin;";
         const INJECT: &str = "Lorg/spongepowered/asm/mixin/injection/Inject;";
         let mut plans = Vec::new();
+        let mut unresolved = Vec::new();
         for class in self.classes.values() {
             let Some(mixin) = class
                 .annotations
@@ -6680,7 +6832,7 @@ impl NativeJar {
                     let anchors = inject
                         .values
                         .get("at")
-                        .map(annotation_at_values)
+                        .map(annotation_at_selectors)
                         .unwrap_or_default();
                     for target_owner in &targets {
                         for method_spec in &method_specs {
@@ -6690,7 +6842,7 @@ impl NativeJar {
                                 continue;
                             };
                             for anchor in &anchors {
-                                plans.push(MixinInjectionPlan {
+                                let mut plan = MixinInjectionPlan {
                                     target: MethodRef {
                                         owner: target_owner.clone(),
                                         name: target_name.to_owned(),
@@ -6701,37 +6853,31 @@ impl NativeJar {
                                         name: method.name.clone(),
                                         descriptor: method.descriptor.clone(),
                                     },
-                                    at: anchor.clone(),
+                                    at: anchor.anchor.clone(),
                                     cancellable,
-                                });
+                                    invoke_target: None,
+                                };
+                                if plan.at == "INVOKE" {
+                                    let Some(site) =
+                                        anchor.target.as_deref().and_then(parse_invoke_selector)
+                                    else {
+                                        unresolved.push(plan);
+                                        continue;
+                                    };
+                                    plan.invoke_target = Some(site);
+                                }
+                                plans.push(plan);
                             }
                         }
                     }
                 }
             }
         }
-        plans.sort_by(|a, b| {
-            (
-                &a.target.owner,
-                &a.target.name,
-                &a.target.descriptor,
-                &a.at,
-                &a.callback.owner,
-                &a.callback.name,
-                &a.callback.descriptor,
-            )
-                .cmp(&(
-                    &b.target.owner,
-                    &b.target.name,
-                    &b.target.descriptor,
-                    &b.at,
-                    &b.callback.owner,
-                    &b.callback.name,
-                    &b.callback.descriptor,
-                ))
-        });
+        plans.sort_by(|a, b| mixin_plan_sort_key(a).cmp(&mixin_plan_sort_key(b)));
         plans.dedup();
-        plans
+        unresolved.sort_by(|a, b| mixin_plan_sort_key(a).cmp(&mixin_plan_sort_key(b)));
+        unresolved.dedup();
+        (plans, unresolved)
     }
 
     /// Enumerate the target methods this jar would weave, sorted and
@@ -6818,18 +6964,23 @@ impl NativeJar {
     /// Plans that name a different owner, a different method, or a concrete
     /// descriptor that disagrees with the request are skipped; a descriptor-
     /// less plan matches any overload.  The result keeps discovery order and
-    /// lists HEAD plans before RETURN/TAIL plans.
+    /// lists HEAD plans before RETURN/TAIL plans before INVOKE plans.  An
+    /// INVOKE plan with an unresolved selector is never executable, so it is
+    /// left to [`Self::unresolved_invoke_plans`].
     ///
     /// A `cancellable` HEAD plan is accepted: the native `CallbackInfo` owns the
     /// flag and the execution stops the target body when it is set.  A
     /// RETURN/TAIL plan follows the target's shape: a non-void target needs a
     /// trailing `CallbackInfoReturnable` and a void target must not declare one.
+    /// An INVOKE callback mirrors the woven method's arguments and may add one
+    /// trailing `CallbackInfo`.
     fn discovered_mixin_plans(
         &self,
         target: &MethodRef,
     ) -> Result<Vec<MixinInjectionPlan>, NativeError> {
         let mut before = Vec::new();
         let mut after = Vec::new();
+        let mut invoke = Vec::new();
         for mut plan in self.mixin_injection_plans() {
             if plan.target.owner != target.owner || plan.target.name != target.name {
                 continue;
@@ -6840,6 +6991,11 @@ impl NativeJar {
             plan.target.descriptor = target.descriptor.clone();
             match plan.at.as_str() {
                 "HEAD" => before.push(plan),
+                "INVOKE" => {
+                    if plan.invoke_target.is_some() {
+                        invoke.push(plan);
+                    }
+                }
                 "RETURN" | "TAIL" => {
                     let returnable = callback_takes_returnable(&plan.callback.descriptor);
                     if plan.cancellable && !returnable {
@@ -6877,7 +7033,7 @@ impl NativeJar {
                 }
                 other => {
                     return Err(NativeError::Metadata(format!(
-                        "native Mixin callback {}#{}{} uses unsupported anchor {other}; native execution supports HEAD, RETURN and TAIL",
+                        "native Mixin callback {}#{}{} uses unsupported anchor {other}; native execution supports HEAD, INVOKE, RETURN and TAIL",
                         plan.callback.owner, plan.callback.name, plan.callback.descriptor
                     )));
                 }
@@ -6889,7 +7045,14 @@ impl NativeJar {
                 target.owner, target.name
             )));
         }
+        if !invoke.is_empty() && (!before.is_empty() || !after.is_empty()) {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin target {}#{} mixes INVOKE with HEAD/RETURN/TAIL callbacks; native execution supports one anchor family per target",
+                target.owner, target.name
+            )));
+        }
         before.extend(after);
+        before.extend(invoke);
         Ok(before)
     }
 
@@ -7125,6 +7288,7 @@ impl NativeJar {
             streams: BTreeMap::new(),
             next_stream: 0,
             callback_infos: &mut CallbackInfos::new(),
+            invoke_hooks: None,
         };
         if !runtime.classes.contains_key(&class_name) {
             return Err(NativeError::MissingMethod(format!("class {class}")));
@@ -7209,6 +7373,31 @@ impl NativeJar {
         host: &mut H,
         callback_infos: &mut CallbackInfos,
     ) -> Result<Value, NativeError> {
+        self.invoke_with_hooks(
+            class,
+            method,
+            descriptor,
+            receiver,
+            args,
+            host,
+            callback_infos,
+            None,
+        )
+    }
+
+    /// Invoke one jar method with the runtime-owned callback table and, for an
+    /// `@At("INVOKE")` execution, the call-site hook table.
+    fn invoke_with_hooks<H: Host>(
+        &self,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+        callback_infos: &mut CallbackInfos,
+        invoke_hooks: Option<&mut InvokeHooks>,
+    ) -> Result<Value, NativeError> {
         let class_name = class.replace('.', "/");
         let mut runtime = Runtime {
             classes: &self.classes,
@@ -7223,6 +7412,7 @@ impl NativeJar {
             streams: BTreeMap::new(),
             next_stream: 0,
             callback_infos,
+            invoke_hooks,
         };
         runtime.invoke(&class_name, method, descriptor, receiver, args)
     }
@@ -7359,6 +7549,7 @@ impl NativeJar {
             callback_results: vec![callback_result],
             cancelled,
             return_value_overridden: false,
+            matched_invoke_sites: 0,
         })
     }
 
@@ -7496,6 +7687,7 @@ impl NativeJar {
             callback_results,
             cancelled,
             return_value_overridden: false,
+            matched_invoke_sites: 0,
         })
     }
 
@@ -7753,6 +7945,137 @@ impl NativeJar {
             callback_results: vec![callback_result],
             cancelled: false,
             return_value_overridden: override_value.is_some(),
+            matched_invoke_sites: 0,
+        })
+    }
+
+    /// Execute the `@At("INVOKE")` callbacks this jar binds to one target.
+    ///
+    /// Every plan must name the same woven method; each names its own call
+    /// site.  The target runs exactly once and each callback runs immediately
+    /// before the call site it hooks, with the woven method's arguments plus a
+    /// runtime-owned `CallbackInfo`.  A `cancellable` callback that calls
+    /// `ci.cancel()` suppresses that one call: the interpreter leaves the
+    /// invoked descriptor's default value on the stack in its place (no value
+    /// for a `void` call) and the woven method keeps running.
+    ///
+    /// [`MixinExecutionReport::cancelled`] reports that at least one call site
+    /// was suppressed, and [`MixinExecutionReport::matched_invoke_sites`]
+    /// counts the distinct bytecode sites that ran a callback.  A selector
+    /// without a descriptor matches every overload of that name.
+    pub fn execute_mixin_at_invoke<H: Host>(
+        &self,
+        plans: &[MixinInjectionPlan],
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        let Some(first) = plans.first() else {
+            return Err(NativeError::Metadata(
+                "native Mixin @At(INVOKE) chain is empty".into(),
+            ));
+        };
+        self.execute_invoke_plans(&first.target, plans, receiver, args, host)
+    }
+
+    /// Run one woven method with the `@At("INVOKE")` hook table its plans
+    /// describe.
+    fn execute_invoke_plans<H: Host>(
+        &self,
+        target: &MethodRef,
+        plans: &[MixinInjectionPlan],
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        let target_class = self.classes.get(&target.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                target.owner, target.name, target.descriptor
+            ))
+        })?;
+        let target_method = target_class
+            .method(&target.name, &target.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    target.owner, target.name, target.descriptor
+                ))
+            })?;
+        if args.len() != arg_count(&target.descriptor) {
+            return Err(NativeError::Metadata(format!(
+                "Mixin target {}#{}{} expected {} arguments, got {}",
+                target.owner,
+                target.name,
+                target.descriptor,
+                arg_count(&target.descriptor),
+                args.len()
+            )));
+        }
+        let mut hooks = InvokeHooks {
+            marker: callback_info_marker(target),
+            ..InvokeHooks::default()
+        };
+        for plan in plans {
+            if plan.at != "INVOKE" {
+                return Err(NativeError::Metadata(format!(
+                    "native Mixin @At(INVOKE) execution got anchor {}; the plan must name INVOKE",
+                    plan.at
+                )));
+            }
+            if plan.target != *target {
+                return Err(NativeError::Metadata(format!(
+                    "native Mixin @At(INVOKE) plans must share target {}#{}{}",
+                    target.owner, target.name, target.descriptor
+                )));
+            }
+            let Some(site) = plan.invoke_target.as_ref() else {
+                return Err(NativeError::Metadata(format!(
+                    "native Mixin callback {}#{}{} has an unresolved @At(INVOKE) selector and stays report-only",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                )));
+            };
+            // The callback contract is the HEAD one: mirror the woven
+            // method's arguments and optionally add a trailing CallbackInfo.
+            let (is_static, callback_args) = self.check_mixin_callback(plan, args)?;
+            let callback_receiver = (!is_static).then(|| {
+                receiver
+                    .clone()
+                    .unwrap_or_else(|| Value::Ref(Some(plan.callback.owner.clone())))
+            });
+            hooks.insert(
+                site,
+                InvokeHookEntry {
+                    callback: plan.callback.clone(),
+                    receiver: callback_receiver,
+                    args: callback_args,
+                    cancellable: plan.cancellable,
+                },
+            )?;
+        }
+        let target_receiver = (!target_method.is_static()).then(|| {
+            receiver
+                .clone()
+                .unwrap_or_else(|| Value::Ref(Some(target.owner.clone())))
+        });
+        let mut callback_infos = CallbackInfos::new();
+        let target_result = self.invoke_with_hooks(
+            &target.owner,
+            &target.name,
+            &target.descriptor,
+            target_receiver,
+            args,
+            host,
+            &mut callback_infos,
+            Some(&mut hooks),
+        )?;
+        Ok(MixinExecutionReport {
+            callback_result: hooks.results.last().cloned().unwrap_or(Value::Void),
+            target_result,
+            callback_results: hooks.results.clone(),
+            cancelled: hooks.cancelled,
+            return_value_overridden: false,
+            matched_invoke_sites: hooks.matched_sites.len(),
         })
     }
 
@@ -7772,10 +8095,14 @@ impl NativeJar {
     /// `return_value_overridden`.  A non-void target requires that marker and a
     /// void target refuses it, mirroring Mixin's callback shape.
     ///
+    /// INVOKE plans run the target once with a bounded call-site hook table:
+    /// each callback runs immediately before the call site its selector names,
+    /// in plan order, and a `cancellable` one suppresses that call through
+    /// `ci.cancel()`.  `matched_invoke_sites` counts the sites that ran.
+    ///
     /// Unsupported anchors, malformed return-value shapes, and targets that mix
-    /// HEAD with RETURN/TAIL are rejected with a bounded
-    /// `NativeError::Metadata`; they stay on the JVM fallback rather than
-    /// approximating two anchor families at once.
+    /// anchor families are rejected with a bounded `NativeError::Metadata`; they
+    /// stay on the JVM fallback rather than approximating two families at once.
     pub fn execute_discovered_mixins<H: Host>(
         &self,
         target: &MethodRef,
@@ -7784,6 +8111,11 @@ impl NativeJar {
         host: &mut H,
     ) -> Result<MixinExecutionReport, NativeError> {
         let plans = self.discovered_mixin_plans(target)?;
+        // One anchor family per target: an INVOKE selection runs the target
+        // once with the call-site hook table.
+        if plans.first().is_some_and(|plan| plan.at == "INVOKE") {
+            return self.execute_invoke_plans(target, &plans, receiver, args, host);
+        }
         let target_class = self.classes.get(&target.owner).ok_or_else(|| {
             NativeError::MissingMethod(format!(
                 "{}#{}{}",
@@ -7875,6 +8207,7 @@ impl NativeJar {
             callback_results,
             cancelled,
             return_value_overridden: overridden.is_some(),
+            matched_invoke_sites: 0,
         })
     }
 
@@ -7974,6 +8307,7 @@ impl NativeJar {
             callback_results: vec![replacement],
             cancelled: false,
             return_value_overridden: false,
+            matched_invoke_sites: 0,
         })
     }
 
@@ -8176,6 +8510,8 @@ struct Runtime<'a, H> {
     /// this table does not hold is a diagnostic, so a callback can only flag the
     /// object a plan actually handed it.
     callback_infos: &'a mut CallbackInfos,
+    /// The `@At("INVOKE")` call-site table this execution installed, if any.
+    invoke_hooks: Option<&'a mut InvokeHooks>,
 }
 impl<H: Host> Runtime<'_, H> {
     fn static_field_key(field: &MethodRef) -> String {
@@ -8247,6 +8583,81 @@ impl<H: Host> Runtime<'_, H> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Run the `@At("INVOKE")` callbacks bound to one call site, just before
+    /// the interpreter executes it.
+    ///
+    /// `Some(value)` means a cancellable callback suppressed the call: the
+    /// value is the invoked descriptor's default, which is what the woven
+    /// method sees in its place.  `None` lets the call run normally.  The
+    /// hook table is suspended while a callback runs, so a callback that
+    /// reaches a hooked site cannot recurse through it.
+    fn dispatch_invoke_hooks(
+        &mut self,
+        site: &MethodRef,
+        class: &str,
+        method: &str,
+        pc: usize,
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(hooks) = self.invoke_hooks.as_deref() else {
+            return Ok(None);
+        };
+        if hooks.dispatching {
+            return Ok(None);
+        }
+        let entries = hooks.lookup(site);
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let marker = hooks.marker.clone();
+        self.set_dispatching(true);
+        let outcome = self.run_invoke_callbacks(&entries, &marker);
+        self.set_dispatching(false);
+        let cancelled = outcome?;
+        if let Some(hooks) = self.invoke_hooks.as_deref_mut() {
+            hooks.cancelled |= cancelled;
+            // Count the site even when it was cancelled: the callback ran,
+            // the call did not.
+            hooks
+                .matched_sites
+                .insert((class.to_owned(), method.to_owned(), pc));
+        }
+        Ok(cancelled.then(|| Value::default_for(&site.descriptor)))
+    }
+
+    fn set_dispatching(&mut self, value: bool) {
+        if let Some(hooks) = self.invoke_hooks.as_deref_mut() {
+            hooks.dispatching = value;
+        }
+    }
+
+    fn run_invoke_callbacks(
+        &mut self,
+        entries: &[InvokeHookEntry],
+        marker: &str,
+    ) -> Result<bool, NativeError> {
+        for entry in entries {
+            // One object per dispatch: a cancel() from the previous call at
+            // another site must not suppress this one.
+            self.callback_infos.reset(marker)?;
+            let result = self.invoke(
+                &entry.callback.owner,
+                &entry.callback.name,
+                &entry.callback.descriptor,
+                entry.receiver.clone(),
+                &entry.args,
+            )?;
+            if let Some(hooks) = self.invoke_hooks.as_deref_mut() {
+                hooks.results.push(result);
+            }
+            // A cancel() at an invoke site suppresses that call and, like the
+            // HEAD chain, the callbacks after it at the same site.
+            if entry.cancellable && self.callback_infos.flag(marker)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Resolve a captured invokedynamic marker when its target is in this
@@ -9428,7 +9839,14 @@ impl<H: Host> Runtime<'_, H> {
                         Some(pop(&mut stack, class, method)?)
                     };
                     self.calls += 1;
-                    let value = if r.owner == "java/lang/String"
+                    // An `@At("INVOKE")` callback runs just before the call;
+                    // a cancelled one replaces it with the invoked
+                    // descriptor's default value.
+                    let value = if let Some(value) =
+                        self.dispatch_invoke_hooks(&r, class, method, at)?
+                    {
+                        value
+                    } else if r.owner == "java/lang/String"
                         && r.name == "format"
                         && (r.descriptor
                             == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
@@ -10528,21 +10946,192 @@ fn annotation_strings(value: &AnnotationValue) -> Vec<String> {
     }
 }
 
-/// Collect the supported anchors from an `@At` array, dropping anchors this
-/// bounded runtime cannot execute.
-fn annotation_at_values(value: &AnnotationValue) -> Vec<String> {
+/// One `@At` selector: its anchor name and, for `INVOKE`, its target string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AtSelector {
+    anchor: String,
+    target: Option<String>,
+}
+
+/// Collect the anchors this bounded runtime supports from an `@At` array,
+/// dropping the ones it cannot execute.
+fn annotation_at_selectors(value: &AnnotationValue) -> Vec<AtSelector> {
     match value {
-        AnnotationValue::Annotation(annotation) => annotation
-            .values
-            .get("value")
-            .map(annotation_strings)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|anchor| matches!(anchor.as_str(), "HEAD" | "RETURN" | "TAIL"))
-            .collect(),
-        AnnotationValue::Array(items) => items.iter().flat_map(annotation_at_values).collect(),
+        AnnotationValue::Annotation(annotation) => {
+            let anchor = annotation
+                .values
+                .get("value")
+                .map(annotation_strings)
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            if !matches!(anchor.as_str(), "HEAD" | "RETURN" | "TAIL" | "INVOKE") {
+                return Vec::new();
+            }
+            let target = annotation
+                .values
+                .get("target")
+                .map(annotation_strings)
+                .unwrap_or_default()
+                .into_iter()
+                .next();
+            vec![AtSelector { anchor, target }]
+        }
+        AnnotationValue::Array(items) => items.iter().flat_map(annotation_at_selectors).collect(),
         _ => Vec::new(),
     }
+}
+
+/// Sort key shared by discovery and the unresolved report.
+fn mixin_plan_sort_key(
+    plan: &MixinInjectionPlan,
+) -> (
+    &str,
+    &str,
+    &str,
+    &str,
+    Option<(&str, &str, &str)>,
+    &str,
+    &str,
+    &str,
+) {
+    (
+        &plan.target.owner,
+        &plan.target.name,
+        &plan.target.descriptor,
+        &plan.at,
+        plan.invoke_target.as_ref().map(|site| {
+            (
+                site.owner.as_str(),
+                site.name.as_str(),
+                site.descriptor.as_str(),
+            )
+        }),
+        &plan.callback.owner,
+        &plan.callback.name,
+        &plan.callback.descriptor,
+    )
+}
+
+/// Parse one `@At(value = "INVOKE", target = ...)` selector.
+///
+/// The accepted forms are the ones Mixin configs and mods actually write:
+///
+/// * `Lnet/minecraft/world/level/Level;getBlockState(Lnet/minecraft/core/BlockPos;)L...;`
+/// * `net/minecraft/world/level/Level.getBlockState(...)`, including the
+///   binary-owner spelling with dots (`net.minecraft.world.level.Level...`)
+/// * `Level#getBlockState` / `Level#getBlockState(...)`, with or without a
+///   descriptor
+///
+/// A selector without a descriptor matches every overload of that name.
+/// Anything else - a field, a slice, a jump, an ordinal suffix, a malformed
+/// descriptor - yields `None`, so the plan stays report-only instead of
+/// hooking a call site the jar never named.
+fn parse_invoke_selector(spec: &str) -> Option<MethodRef> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.contains(char::is_whitespace) {
+        return None;
+    }
+    let (head, descriptor) = match spec.find('(') {
+        Some(at) => {
+            let descriptor = spec.get(at..)?;
+            if !valid_method_descriptor(descriptor) {
+                return None;
+            }
+            (spec.get(..at)?, descriptor)
+        }
+        None => (spec, ""),
+    };
+    let (owner, name) = if head.contains(';') {
+        let (owner, name) = head.strip_prefix('L')?.split_once(';')?;
+        (owner, name)
+    } else if let Some((owner, name)) = head.split_once('#') {
+        (owner, name)
+    } else {
+        let at = head.rfind('.')?;
+        (head.get(..at)?, head.get(at + 1..)?)
+    };
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '<' | '>'))
+        || !owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '$'))
+    {
+        return None;
+    }
+    let owner = owner.replace('.', "/");
+    if owner.is_empty() || owner.starts_with('/') || owner.ends_with('/') {
+        return None;
+    }
+    Some(MethodRef {
+        owner,
+        name: name.to_owned(),
+        descriptor: descriptor.to_owned(),
+    })
+}
+
+/// Whether `descriptor` is one complete method descriptor.
+fn valid_method_descriptor(descriptor: &str) -> bool {
+    let Some(rest) = descriptor.strip_prefix('(') else {
+        return false;
+    };
+    let Some((arguments, returns)) = rest.split_once(')') else {
+        return false;
+    };
+    if returns.contains(')') {
+        return false;
+    }
+    // `V` is only a return type, never a field descriptor.
+    if returns != "V" && !valid_field_descriptor(returns) {
+        return false;
+    }
+    let bytes = arguments.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        while bytes.get(at) == Some(&b'[') {
+            at += 1;
+        }
+        match bytes.get(at) {
+            Some(b'L') => match arguments[at..].find(';') {
+                Some(end) => at += end + 1,
+                None => return false,
+            },
+            Some(b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D') => at += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether `token` is one complete field descriptor, arrays included.
+fn valid_field_descriptor(token: &str) -> bool {
+    let (Some(first), Some(rest)) = (token.get(..1), token.get(1..)) else {
+        return false;
+    };
+    match first {
+        "[" => valid_field_descriptor(rest),
+        "L" => rest.strip_suffix(';').is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '$'))
+        }),
+        "Z" | "B" | "C" | "S" | "I" | "J" | "F" | "D" => rest.is_empty(),
+        _ => false,
+    }
+}
+
+/// Key of one hookable call site: `owner#name(descriptor)`.
+fn invoke_site_key(site: &MethodRef) -> String {
+    format!("{}#{}{}", site.owner, site.name, site.descriptor)
+}
+
+/// Key a descriptor-less `@At.target` selector matches: `owner#name`.
+fn invoke_name_key(site: &MethodRef) -> String {
+    format!("{}#{}", site.owner, site.name)
 }
 
 /// Convert a class descriptor (`Lnet/minecraft/.../Level;`) to an internal
@@ -10618,6 +11207,7 @@ mod tests {
             streams: BTreeMap::new(),
             next_stream: 0,
             callback_infos: &mut CallbackInfos::new(),
+            invoke_hooks: None,
         };
         let method = MethodRef {
             owner: "java/lang/String".into(),
@@ -10652,6 +11242,7 @@ mod tests {
             streams: BTreeMap::new(),
             next_stream: 0,
             callback_infos: &mut CallbackInfos::new(),
+            invoke_hooks: None,
         };
         let method = MethodRef {
             owner: "java/lang/String".into(),
@@ -15640,6 +16231,7 @@ mandatory = true
             streams: BTreeMap::new(),
             next_stream: 0,
             callback_infos: &mut CallbackInfos::new(),
+            invoke_hooks: None,
         };
         let first = runtime.new_object("demo/Fields");
         let second = runtime.new_object("demo/Fields");
@@ -15774,6 +16366,7 @@ mandatory = true
             streams: BTreeMap::new(),
             next_stream: 0,
             callback_infos: &mut CallbackInfos::new(),
+            invoke_hooks: None,
         };
         let new_instance = MethodRef {
             owner: "java/lang/reflect/Array".into(),
@@ -15966,6 +16559,7 @@ mandatory = true
             streams: BTreeMap::new(),
             next_stream: 0,
             callback_infos: &mut CallbackInfos::new(),
+            invoke_hooks: None,
         };
         let stream = runtime
             .invoke_stream(
@@ -16259,6 +16853,7 @@ mandatory = true
             streams: BTreeMap::new(),
             next_stream: 0,
             callback_infos: &mut CallbackInfos::new(),
+            invoke_hooks: None,
         };
         let lookup = MethodRef {
             owner: "java/lang/Class".into(),
@@ -16475,6 +17070,7 @@ mandatory = true
             streams: BTreeMap::new(),
             next_stream: 0,
             callback_infos: &mut CallbackInfos::new(),
+            invoke_hooks: None,
         };
         let class = Value::Ref(Some("demo/ReflectiveFields".into()));
         let declared_fields = runtime
@@ -18721,6 +19317,369 @@ mandatory = true
                 if message.contains("cancellable at RETURN")),
             "unexpected error: {error}"
         );
+    }
+
+    /// A target whose whole body is `return demo/Probe.value();`, so a
+    /// cancelled invoke's replacement value is the woven method's result.
+    fn invoke_target_class() -> ClassFile {
+        ClassFile {
+            name: "demo/Target".into(),
+            super_name: "java/lang/Object".into(),
+            pool: probe_pool("value", "()I"),
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![test_method(
+                "value",
+                "()I",
+                vec![0xb8, 0x00, 0x06, 0xac], // invokestatic demo/Probe.value; ireturn
+                Vec::new(),
+            )],
+            annotations: Vec::new(),
+        }
+    }
+
+    /// Constant pool naming one `demo/Probe#name` call.
+    fn probe_pool(name: &str, descriptor: &str) -> Vec<Cp> {
+        vec![
+            Cp::Empty,
+            Cp::Utf8("demo/Probe".into()),
+            Cp::Class(1),
+            Cp::Utf8(name.into()),
+            Cp::Utf8(descriptor.into()),
+            Cp::NameType {
+                name: 3,
+                descriptor: 4,
+            },
+            Cp::MethodRef { class: 2, nt: 5 },
+        ]
+    }
+
+    /// A static callback that calls `CallbackInfo.cancel()`.
+    fn cancel_invoke_mixin() -> ClassFile {
+        ClassFile {
+            name: "demo/InvokeMixin".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![
+                Cp::Empty,
+                Cp::Utf8(CALLBACK_INFO_CLASS.into()),
+                Cp::Class(1),
+                Cp::Utf8("cancel".into()),
+                Cp::Utf8("()V".into()),
+                Cp::NameType {
+                    name: 3,
+                    descriptor: 4,
+                },
+                Cp::MethodRef { class: 2, nt: 5 },
+            ],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![test_method(
+                "onValue",
+                "(Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;)V",
+                // aload_0; invokevirtual CallbackInfo.cancel; return
+                vec![0x2a, 0xb6, 0x00, 0x06, 0xb1],
+                Vec::new(),
+            )],
+            annotations: Vec::new(),
+        }
+    }
+
+    fn invoke_plan(invoke_target: MethodRef, cancellable: bool) -> MixinInjectionPlan {
+        let mut plan = MixinInjectionPlan::inject_at_invoke(
+            MethodRef {
+                owner: "demo/Target".into(),
+                name: "value".into(),
+                descriptor: "()I".into(),
+            },
+            MethodRef {
+                owner: "demo/InvokeMixin".into(),
+                name: "onValue".into(),
+                descriptor: format!("({CALLBACK_INFO_DESC})V"),
+            },
+            invoke_target,
+        );
+        plan.cancellable = cancellable;
+        plan
+    }
+
+    /// Answers the stubbed call with 42, so a cancelled invoke that answers the
+    /// descriptor default (0) is distinguishable from the call itself.
+    struct ValueHost {
+        calls: usize,
+    }
+
+    impl Host for ValueHost {
+        fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
+            self.calls += 1;
+            Ok(if r.owner == "demo/Probe" && r.name == "value" {
+                Value::Int(42)
+            } else {
+                Value::default_for(return_desc(&r.descriptor))
+            })
+        }
+    }
+
+    #[test]
+    fn invoke_selectors_parse_all_supported_forms() {
+        let block_state = "Lnet/minecraft/world/level/block/state/BlockState;";
+        // `Lowner;name(descriptor)`.
+        let site = parse_invoke_selector(&format!(
+            "Lnet/minecraft/world/level/Level;getBlockState(Lnet/minecraft/core/BlockPos;){block_state}"
+        ))
+        .unwrap();
+        assert_eq!(
+            site,
+            MethodRef {
+                owner: "net/minecraft/world/level/Level".into(),
+                name: "getBlockState".into(),
+                descriptor: format!("(Lnet/minecraft/core/BlockPos;){block_state}"),
+            }
+        );
+
+        // Slashed owner with `.` between owner and name.
+        let site = parse_invoke_selector(&format!(
+            "net/minecraft/world/level/Level.getBlockState(Lnet/minecraft/core/BlockPos;){block_state}"
+        ))
+        .unwrap();
+        assert_eq!(site.owner, "net/minecraft/world/level/Level");
+        assert_eq!(site.name, "getBlockState");
+
+        // Binary owner spelling normalizes to the internal form.
+        let site = parse_invoke_selector(&format!(
+            "net.minecraft.world.level.Level.getBlockState(Lnet/minecraft/core/BlockPos;){block_state}"
+        ))
+        .unwrap();
+        assert_eq!(site.owner, "net/minecraft/world/level/Level");
+        assert_eq!(site.name, "getBlockState");
+
+        // `#` form with and without a descriptor.
+        assert_eq!(
+            parse_invoke_selector("Level#getBlockState"),
+            Some(MethodRef {
+                owner: "Level".into(),
+                name: "getBlockState".into(),
+                descriptor: String::new(),
+            })
+        );
+        assert_eq!(
+            parse_invoke_selector("Ldemo/Probe;mark(Ljava/lang/String;)V").unwrap(),
+            MethodRef {
+                owner: "demo/Probe".into(),
+                name: "mark".into(),
+                descriptor: "(Ljava/lang/String;)V".into(),
+            }
+        );
+        assert_eq!(
+            parse_invoke_selector("Ldemo/Probe;mark").unwrap(),
+            MethodRef {
+                owner: "demo/Probe".into(),
+                name: "mark".into(),
+                descriptor: String::new(),
+            }
+        );
+        // Constructors stay representable; a hook simply never matches a stack
+        // slot it cannot replace.
+        assert_eq!(
+            parse_invoke_selector("Ldemo/Probe;<init>()V").unwrap().name,
+            "<init>"
+        );
+    }
+
+    #[test]
+    fn invoke_selectors_reject_everything_else() {
+        for spec in [
+            "",
+            "   ",
+            "Ldemo/Probe",
+            "Ldemo/Probe;",
+            "demo/Probe;mark()V",
+            "Ldemo/Probe;mark(Ljava/lang/String;)V:2",
+            "Ldemo/Probe;mark(x)V",
+            "Ldemo/Probe;mark(Ljava/lang/String;)",
+            "Ldemo/Probe;mar k()V",
+            "Ldemo/Probe;mark()V extra",
+            "demo/Probe",
+            "Ldemo/Probe;mark([)V",
+        ] {
+            assert!(parse_invoke_selector(spec).is_none(), "accepted {spec:?}");
+        }
+    }
+
+    #[test]
+    fn invoke_plan_cancellation_pushes_the_default_return() {
+        let jar = NativeJar::from_classes([invoke_target_class(), cancel_invoke_mixin()]);
+        let site = MethodRef {
+            owner: "demo/Probe".into(),
+            name: "value".into(),
+            descriptor: "()I".into(),
+        };
+
+        // The callback calls cancel() either way, but a non-cancellable plan
+        // ignores the flag and the call runs.
+        let plan = invoke_plan(site.clone(), false);
+        let mut host = ValueHost { calls: 0 };
+        let report = jar
+            .execute_mixin_at_invoke(std::slice::from_ref(&plan), None, &[], &mut host)
+            .unwrap();
+        assert_eq!(report.target_result, Value::Int(42));
+        assert_eq!(host.calls, 1, "the call reaches the host");
+        assert!(!report.cancelled);
+        assert_eq!(report.matched_invoke_sites, 1);
+        assert_eq!(report.callback_results, vec![Value::Void]);
+
+        // Cancellable: the call is suppressed and the descriptor's default
+        // (0) takes its place, so the woven method answers 0.
+        let plan = invoke_plan(site, true);
+        let mut host = ValueHost { calls: 0 };
+        let report = jar
+            .execute_mixin_at_invoke(std::slice::from_ref(&plan), None, &[], &mut host)
+            .unwrap();
+        assert_eq!(report.target_result, Value::Int(0));
+        assert_eq!(host.calls, 0, "the cancelled call never reaches the host");
+        assert!(report.cancelled);
+        assert_eq!(report.matched_invoke_sites, 1);
+        assert_eq!(report.callback_results, vec![Value::Void]);
+    }
+
+    #[test]
+    fn invoke_selector_without_a_descriptor_matches_every_overload() {
+        let jar = NativeJar::from_classes([invoke_target_class(), cancel_invoke_mixin()]);
+        let plan = invoke_plan(
+            MethodRef {
+                owner: "demo/Probe".into(),
+                name: "value".into(),
+                descriptor: String::new(),
+            },
+            true,
+        );
+        let mut host = ValueHost { calls: 0 };
+        let report = jar
+            .execute_mixin_at_invoke(std::slice::from_ref(&plan), None, &[], &mut host)
+            .unwrap();
+        assert_eq!(report.target_result, Value::Int(0));
+        assert!(report.cancelled);
+        assert_eq!(report.matched_invoke_sites, 1);
+    }
+
+    #[test]
+    fn invoke_execution_requires_invoke_plans() {
+        let jar = NativeJar::from_classes([invoke_target_class(), cancel_invoke_mixin()]);
+        let mut plan = invoke_plan(
+            MethodRef {
+                owner: "demo/Probe".into(),
+                name: "value".into(),
+                descriptor: "()I".into(),
+            },
+            false,
+        );
+        plan.at = "HEAD".into();
+        let error = jar
+            .execute_mixin_at_invoke(
+                std::slice::from_ref(&plan),
+                None,
+                &[],
+                &mut ValueHost { calls: 0 },
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("must name INVOKE"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn inject_invoke_annotation(method: &str, target: Option<&str>) -> Annotation {
+        let mut at_values =
+            BTreeMap::from([("value".into(), AnnotationValue::String("INVOKE".into()))]);
+        if let Some(target) = target {
+            at_values.insert("target".into(), AnnotationValue::String(target.into()));
+        }
+        Annotation {
+            descriptor: "Lorg/spongepowered/asm/mixin/injection/Inject;".into(),
+            values: BTreeMap::from([
+                ("method".into(), string_array(&[method])),
+                (
+                    "at".into(),
+                    AnnotationValue::Array(vec![AnnotationValue::Annotation(Box::new(
+                        Annotation {
+                            descriptor: "Lorg/spongepowered/asm/mixin/injection/At;".into(),
+                            values: at_values,
+                        },
+                    ))]),
+                ),
+                ("cancellable".into(), AnnotationValue::Bool(false)),
+            ]),
+        }
+    }
+
+    fn invoke_mixin(class: &str, target: Option<&str>) -> ClassFile {
+        ClassFile {
+            name: class.into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![test_method(
+                "onTick",
+                "(Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;)V",
+                vec![0xb1],
+                vec![inject_invoke_annotation("run()V", target)],
+            )],
+            annotations: vec![Annotation {
+                descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
+                values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
+            }],
+        }
+    }
+
+    #[test]
+    fn discovered_invoke_plans_parse_selectors_and_reject_mixed_anchors() {
+        let jar = NativeJar::from_classes([
+            target_class(),
+            marker_mixin(
+                "demo/HeadMixin",
+                "run()V",
+                "HEAD",
+                false,
+                "before",
+                "before",
+            ),
+            invoke_mixin("demo/InvokeMixin", Some("Ldemo/Probe;target()V")),
+        ]);
+        let plans = jar.mixin_injection_plans();
+        assert!(
+            plans.iter().any(|plan| plan.at == "INVOKE"
+                && plan.invoke_target
+                    == Some(MethodRef {
+                        owner: "demo/Probe".into(),
+                        name: "target".into(),
+                        descriptor: "()V".into(),
+                    })),
+            "unexpected plans: {plans:#?}"
+        );
+        assert!(jar.unresolved_invoke_plans().is_empty());
+
+        let error = run_discovered(&jar, "run", &mut MarkerHost::default()).unwrap_err();
+        assert!(
+            matches!(&error, NativeError::Metadata(message)
+                if message.contains("mixes INVOKE with HEAD/RETURN/TAIL")),
+            "unexpected error: {error}"
+        );
+
+        // A selector this runtime cannot read stays report-only: discovery
+        // keeps it out of the executable set and the diagnostic names it.
+        let unresolved = NativeJar::from_classes([
+            target_class(),
+            invoke_mixin("demo/MissingTargetMixin", None),
+            invoke_mixin("demo/OrdinalMixin", Some("Ldemo/Probe;target()V:3")),
+        ]);
+        assert!(
+            unresolved.mixin_injection_plans().is_empty(),
+            "unresolved selectors must not become executable plans"
+        );
+        let reported = unresolved.unresolved_invoke_plans();
+        assert_eq!(reported.len(), 2, "unexpected report: {reported:#?}");
+        assert!(reported.iter().all(|plan| plan.invoke_target.is_none()));
+        assert!(reported.iter().all(|plan| plan.at == "INVOKE"));
     }
 
     #[test]
