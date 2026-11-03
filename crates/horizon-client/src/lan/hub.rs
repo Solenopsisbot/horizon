@@ -10,6 +10,7 @@ use super::{
     data::SyncData,
     entity::{Entities, EntityState, Viewer},
     guest::{Guest, SentEffect, stack_to_network},
+    java_content,
     payloads::{self, PayloadLink},
 };
 use crate::{
@@ -847,6 +848,25 @@ impl Hub {
             .to_vec()
     }
 
+    /// The declared Java content packet sent with the login burst, when the
+    /// host has declarations. Empty content sends nothing, as an empty
+    /// channel registration would.
+    fn java_content_packet(manifest: &java_content::JavaContentManifest) -> Option<C> {
+        if manifest.is_empty() {
+            return None;
+        }
+        match manifest.encode() {
+            Ok(data) => Some(C::CustomPayload(CustomPayload {
+                channel: java_content::CHANNEL.to_owned(),
+                data,
+            })),
+            Err(error) => {
+                log::warn!("Horizon: declared Java content was not sent: {error}");
+                None
+            }
+        }
+    }
+
     /// PlayerList.placeNewPlayer for a guest whose saved state is loaded.
     pub fn place_new_player(&mut self, conn: u32, ctx: &mut TickCtx) {
         let Some(i) = self.guests.iter().position(|g| g.conn == conn) else {
@@ -857,11 +877,17 @@ impl Hub {
             (g.name.clone(), g.uuid, g.entity_id, g.game_mode)
         };
         let registration = self.payloads.registration();
+        let declared_content = java_content::JavaContentManifest::from_stored();
         let g = &self.guests[i];
         g.send(&C::CustomPayload(CustomPayload {
             channel: payloads::REGISTER_CHANNEL.to_owned(),
             data: registration,
         }));
+        // The declared ids travel with the channel registration, so the guest
+        // can resolve menus, items and block entities before the first chunk.
+        if let Some(packet) = Self::java_content_packet(&declared_content) {
+            g.send(&packet);
+        }
         g.send(&C::Login(play::Login {
             player_id: entity_id,
             hardcore: self.config.hardcore,
@@ -3416,6 +3442,35 @@ fn listed_properties(
 mod tests {
     use super::*;
     use crate::fast_hash::FxHashSet;
+
+    /// The declared Java content frame goes out only when there is something
+    /// to resolve, and it decodes back to the same manifest.
+    #[test]
+    fn declared_java_content_is_sent_only_when_non_empty() {
+        assert!(Hub::java_content_packet(&java_content::JavaContentManifest::default()).is_none());
+
+        let mut manifest = java_content::JavaContentManifest::default();
+        manifest.blocks.push("ruby:block".into());
+        manifest
+            .block_entities
+            .push(crate::mod_content::BlockEntityRow {
+                block: "ruby:crate".into(),
+                id: "ruby:crate_entity".into(),
+                template: "minecraft:barrel".into(),
+                ticker: true,
+            });
+        let packet = Hub::java_content_packet(&manifest).expect("non-empty content is sent");
+        match packet {
+            C::CustomPayload(payload) => {
+                assert_eq!(payload.channel, java_content::CHANNEL);
+                assert_eq!(
+                    java_content::JavaContentManifest::decode(&payload.data).unwrap(),
+                    manifest
+                );
+            }
+            _ => panic!("expected a custom payload"),
+        }
+    }
 
     /// The counts of what is stuck in a player are sent when set, and a
     /// count back at zero is sent as the default.

@@ -20,6 +20,7 @@ pub mod discovery;
 pub mod entity;
 pub mod guest;
 pub mod hub;
+pub mod java_content;
 pub mod menu;
 pub mod payloads;
 pub mod playerdata;

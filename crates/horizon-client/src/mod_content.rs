@@ -46,6 +46,9 @@ pub fn mob_effects(mods: &[ContentMod]) -> Vec<&MobEffect> {
 /// registry grow past it.
 pub const MAX_DECLARED_IDS: usize = 4096;
 
+/// Block-entity rows [`declared_block_entity_map`] keeps.
+pub const MAX_DECLARED_BLOCK_ENTITIES: usize = 4096;
+
 /// The ids content mods declare, registry by registry: what the command
 /// registries merge after vanilla's own (`Game::build_registries`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -93,6 +96,29 @@ impl DeclaredIds {
     }
 }
 
+/// The declarations that do not join a command registry: data components and
+/// attachments. They still travel to a guest so its item sync and block
+/// entity code resolve the host's ids.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeclaredExtraIds {
+    pub data_components: Vec<String>,
+    pub attachments: Vec<String>,
+}
+
+impl DeclaredExtraIds {
+    /// No data component or attachment declared.
+    pub fn is_empty(&self) -> bool {
+        self.data_components.is_empty() && self.attachments.is_empty()
+    }
+
+    fn normalize(self) -> std::result::Result<Self, String> {
+        Ok(Self {
+            data_components: bounded_ids(self.data_components)?,
+            attachments: bounded_ids(self.attachments)?,
+        })
+    }
+}
+
 /// What `mods` declare in the command registries, from their typed tables
 /// only (no file parsed), sorted and deduplicated, at most
 /// [`MAX_DECLARED_IDS`] per registry: the same mods give the same ids
@@ -132,6 +158,36 @@ pub fn declared_ids(mods: &[ContentMod]) -> DeclaredIds {
     }
 }
 
+/// The data components and attachments `mods` declare, sorted, deduplicated
+/// and bounded like [`declared_ids`].
+pub fn declared_extra_ids(mods: &[ContentMod]) -> DeclaredExtraIds {
+    let mut data_components: BTreeSet<String> = BTreeSet::new();
+    let mut attachments: BTreeSet<String> = BTreeSet::new();
+    for m in mods {
+        data_components.extend(m.content.data_components.iter().map(|d| d.id.clone()));
+        attachments.extend(m.content.attachments.iter().map(|a| a.id.clone()));
+    }
+    let take =
+        |set: BTreeSet<String>| -> Vec<String> { set.into_iter().take(MAX_DECLARED_IDS).collect() };
+    DeclaredExtraIds {
+        data_components: take(data_components),
+        attachments: take(attachments),
+    }
+}
+
+/// Sort, deduplicate and bound one registry's ids.
+fn bounded_ids(mut ids: Vec<String>) -> std::result::Result<Vec<String>, String> {
+    ids.sort();
+    ids.dedup();
+    if ids.len() > MAX_DECLARED_IDS {
+        return Err(format!(
+            "declared ids {} exceed {MAX_DECLARED_IDS}",
+            ids.len()
+        ));
+    }
+    Ok(ids)
+}
+
 /// The last [`store_declared_ids`], for a world opening that no longer has
 /// the mods at hand.
 static DECLARED_IDS: Mutex<Option<DeclaredIds>> = Mutex::new(None);
@@ -148,6 +204,26 @@ pub fn store_declared_ids(mods: &[ContentMod]) {
 /// holds it only as long as the merge. Empty until a content root is built.
 pub fn stored_declared_ids() -> DeclaredIds {
     DECLARED_IDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
+/// The last [`store_declared_extra_ids`], for a guest whose host sent them
+/// and for a world opening that no longer has the mods at hand.
+static DECLARED_EXTRA_IDS: Mutex<Option<DeclaredExtraIds>> = Mutex::new(None);
+
+/// Remember the data components and attachments of a built content root;
+/// empty mods clear them.
+pub fn store_declared_extra_ids(mods: &[ContentMod]) {
+    let declared = declared_extra_ids(mods);
+    *DECLARED_EXTRA_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(declared);
+}
+
+/// The data components and attachments the last content root held, cloned.
+pub fn stored_declared_extra_ids() -> DeclaredExtraIds {
+    DECLARED_EXTRA_IDS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
@@ -217,6 +293,165 @@ pub fn stored_declared_block_entities() -> std::collections::BTreeMap<String, De
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_default()
+}
+
+/// A declared block entity as a remote manifest lists it: one row per block,
+/// with the vanilla template it behaves and saves as.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BlockEntityRow {
+    pub block: String,
+    pub id: String,
+    pub template: String,
+    pub ticker: bool,
+}
+
+/// The declaration set a remote host's manifest replaces: the command
+/// registries, the extra registries, and the block entities keyed by block.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeclaredJavaContent {
+    pub ids: DeclaredIds,
+    pub extra: DeclaredExtraIds,
+    pub block_entities: std::collections::BTreeMap<String, DeclaredBlockEntity>,
+}
+
+impl DeclaredJavaContent {
+    /// Nothing to resolve: the host has no declared content.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty() && self.extra.is_empty() && self.block_entities.is_empty()
+    }
+
+    /// How many declarations travel: ids, extra ids and block-entity rows.
+    pub fn count(&self) -> usize {
+        let ids: usize = [
+            &self.ids.blocks,
+            &self.ids.items,
+            &self.ids.effects,
+            &self.ids.entity_types,
+            &self.ids.menus,
+            &self.ids.block_entity_types,
+        ]
+        .iter()
+        .map(|ids| ids.len())
+        .sum();
+        ids + self.extra.data_components.len()
+            + self.extra.attachments.len()
+            + self.block_entities.len()
+    }
+}
+
+/// Rebuild the block-keyed map from wire rows. Rows that name one
+/// declaration are grouped again, so a round trip keeps `valid_blocks`; when
+/// two declarations name one block the lower id wins, as
+/// [`declared_block_entity_map`] does.
+pub fn declared_block_entity_map_from_rows(
+    rows: impl IntoIterator<Item = BlockEntityRow>,
+) -> std::result::Result<std::collections::BTreeMap<String, DeclaredBlockEntity>, String> {
+    let mut groups: BTreeMap<(String, String, bool), Vec<String>> = BTreeMap::new();
+    for row in rows {
+        groups
+            .entry((row.id, row.template, row.ticker))
+            .or_default()
+            .push(row.block);
+    }
+    let mut out: std::collections::BTreeMap<String, DeclaredBlockEntity> =
+        std::collections::BTreeMap::new();
+    for ((id, template, ticker), mut blocks) in groups {
+        blocks.sort();
+        blocks.dedup();
+        let declared = DeclaredBlockEntity {
+            id,
+            template,
+            ticker,
+            valid_blocks: blocks.clone(),
+        };
+        for block in blocks {
+            match out.get_mut(&block) {
+                Some(existing) if existing.id <= declared.id => {}
+                Some(existing) => *existing = declared.clone(),
+                None => {
+                    out.insert(block, declared.clone());
+                }
+            }
+        }
+    }
+    if out.len() > MAX_DECLARED_BLOCK_ENTITIES {
+        return Err(format!(
+            "declared block entities {} exceed {MAX_DECLARED_BLOCK_ENTITIES}",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+fn normalize_declared_ids(ids: DeclaredIds) -> std::result::Result<DeclaredIds, String> {
+    Ok(DeclaredIds {
+        blocks: bounded_ids(ids.blocks)?,
+        items: bounded_ids(ids.items)?,
+        effects: bounded_ids(ids.effects)?,
+        entity_types: bounded_ids(ids.entity_types)?,
+        menus: bounded_ids(ids.menus)?,
+        block_entity_types: bounded_ids(ids.block_entity_types)?,
+    })
+}
+
+/// Merge a remote manifest into the declarations already loaded. An empty
+/// current set takes the incoming one, an identical set is a no-op, and two
+/// different non-empty sets conflict: a guest that has its own mods never
+/// has them silently replaced. Incoming ids are normalized here, so the same
+/// set in another order is not a conflict.
+pub fn merge_declared_java_content(
+    current: &DeclaredJavaContent,
+    ids: DeclaredIds,
+    extra: DeclaredExtraIds,
+    rows: impl IntoIterator<Item = BlockEntityRow>,
+) -> std::result::Result<DeclaredJavaContent, String> {
+    let incoming = DeclaredJavaContent {
+        ids: normalize_declared_ids(ids)?,
+        extra: extra.normalize()?,
+        block_entities: declared_block_entity_map_from_rows(rows)?,
+    };
+    if incoming.is_empty() {
+        return Ok(current.clone());
+    }
+    if current.is_empty() || current == &incoming {
+        return Ok(incoming);
+    }
+    Err("declared Java content conflicts with the content already loaded".to_owned())
+}
+
+/// Store the declared Java content a remote host sent, all three sets or
+/// none: merge first, then write [`DECLARED_IDS`], [`DECLARED_EXTRA_IDS`] and
+/// [`DECLARED_BLOCK_ENTITIES`]. Returns how many declarations were applied.
+pub fn apply_declared_java_content(
+    ids: DeclaredIds,
+    extra: DeclaredExtraIds,
+    rows: impl IntoIterator<Item = BlockEntityRow>,
+) -> std::result::Result<usize, String> {
+    let current = DeclaredJavaContent {
+        ids: stored_declared_ids(),
+        extra: stored_declared_extra_ids(),
+        block_entities: stored_declared_block_entities(),
+    };
+    let merged = merge_declared_java_content(&current, ids, extra, rows)?;
+    let count = merged.count();
+    *DECLARED_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged.ids);
+    *DECLARED_EXTRA_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged.extra);
+    *DECLARED_BLOCK_ENTITIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(merged.block_entities);
+    Ok(count)
+}
+
+/// Reset all three stores to no declarations; tests that write the
+/// process-wide stores start from here.
+#[cfg(test)]
+pub(crate) fn clear_declared_java_content() {
+    *DECLARED_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(DeclaredIds::default());
+    *DECLARED_EXTRA_IDS.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(DeclaredExtraIds::default());
+    *DECLARED_BLOCK_ENTITIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Default::default());
 }
 
 /// The declaration for a block, if the last content root had one.
@@ -2026,6 +2261,7 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
 pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<PathBuf> {
     if mods.iter().all(|m| m.content.is_empty()) {
         store_declared_ids(&[]);
+        store_declared_extra_ids(&[]);
         store_declared_block_entities(&[]);
         return Ok(base.to_owned());
     }
@@ -2036,6 +2272,7 @@ pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<P
         let warnings = fs::read_to_string(out.join(WARNINGS)).unwrap_or_default();
         warnings.lines().for_each(|w| log::warn!("Horizon: {w}"));
         store_declared_ids(mods);
+        store_declared_extra_ids(mods);
         store_declared_block_entities(mods);
         return Ok(out);
     }
@@ -2044,6 +2281,7 @@ pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<P
     }
     fs::write(out.join(STAMP), stamp)?;
     store_declared_ids(mods);
+    store_declared_extra_ids(mods);
     store_declared_block_entities(mods);
     Ok(out)
 }
@@ -2241,6 +2479,117 @@ mod declared_ids_tests {
         assert_eq!(row.template, "minecraft:barrel");
         assert_eq!(row.valid_blocks, ["ruby:ore"]);
         assert!(declared_block_entity_map(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod declared_java_content_tests {
+    use super::*;
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn row(block: &str, id: &str, template: &str, ticker: bool) -> BlockEntityRow {
+        BlockEntityRow {
+            block: block.into(),
+            id: id.into(),
+            template: template.into(),
+            ticker,
+        }
+    }
+
+    #[test]
+    fn rows_group_back_into_valid_blocks_and_the_lowest_id_wins() {
+        let map = declared_block_entity_map_from_rows([
+            row("ruby:crate", "ruby:crate_entity", "minecraft:barrel", true),
+            row("ruby:box", "ruby:crate_entity", "minecraft:barrel", true),
+            row("ruby:box", "ruby:aaa_entity", "minecraft:chest", false),
+        ])
+        .unwrap();
+        // The lower declaration id wins the shared block.
+        assert_eq!(map["ruby:box"].id, "ruby:aaa_entity");
+        assert_eq!(map["ruby:box"].template, "minecraft:chest");
+        assert!(!map["ruby:box"].ticker);
+        // One declaration's rows rebuild its valid_blocks.
+        assert_eq!(map["ruby:crate"].valid_blocks, ["ruby:box", "ruby:crate"]);
+    }
+
+    #[test]
+    fn rows_are_bounded() {
+        let rows = (0..=MAX_DECLARED_BLOCK_ENTITIES).map(|i| {
+            row(
+                &format!("ruby:b{i}"),
+                &format!("ruby:e{i}"),
+                "minecraft:barrel",
+                false,
+            )
+        });
+        assert!(declared_block_entity_map_from_rows(rows).is_err());
+    }
+
+    #[test]
+    fn merge_takes_an_empty_current_is_idempotent_and_rejects_a_conflict() {
+        let current = DeclaredJavaContent {
+            ids: DeclaredIds {
+                blocks: ids(&["ruby:block"]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let same = DeclaredIds {
+            blocks: ids(&["ruby:block", "ruby:block"]),
+            ..Default::default()
+        };
+        // Nothing incoming leaves the loaded declarations alone.
+        assert_eq!(
+            merge_declared_java_content(
+                &current,
+                DeclaredIds::default(),
+                DeclaredExtraIds::default(),
+                []
+            )
+            .unwrap(),
+            current
+        );
+        // The same set in another order is a no-op, not a conflict.
+        assert_eq!(
+            merge_declared_java_content(&current, same.clone(), DeclaredExtraIds::default(), [])
+                .unwrap(),
+            current
+        );
+        // A different non-empty set cannot replace local mods.
+        let other = DeclaredIds {
+            blocks: ids(&["ruby:other"]),
+            ..Default::default()
+        };
+        assert!(
+            merge_declared_java_content(&current, other.clone(), DeclaredExtraIds::default(), [])
+                .is_err()
+        );
+        // An empty current takes the incoming set.
+        assert_eq!(
+            merge_declared_java_content(
+                &DeclaredJavaContent::default(),
+                same,
+                DeclaredExtraIds::default(),
+                []
+            )
+            .unwrap(),
+            current
+        );
+    }
+
+    #[test]
+    fn ids_are_sorted_deduplicated_and_bounded() {
+        assert_eq!(
+            bounded_ids(ids(&["ruby:b", "ruby:a", "ruby:b"])).unwrap(),
+            ["ruby:a", "ruby:b"]
+        );
+        let too_many: Vec<String> = (0..=MAX_DECLARED_IDS)
+            .map(|i| format!("ruby:{i}"))
+            .collect();
+        assert!(bounded_ids(too_many).is_err());
     }
 }
 

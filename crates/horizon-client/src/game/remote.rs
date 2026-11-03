@@ -9,7 +9,10 @@
 use super::remote_chunks::{ChunkDecoder, ChunkFormat, Next};
 use super::{Dim, Game, Mining, Screen};
 use horizon_client::first_person::{Hand, SwingAnimation};
-use horizon_client::lan::payloads::{self, PayloadLink};
+use horizon_client::lan::{
+    java_content,
+    payloads::{self, PayloadLink},
+};
 use horizon_client::{
     Result,
     blocks::Fluid,
@@ -2446,6 +2449,18 @@ impl Game<'_> {
             C::PongResponse(p) => {
                 let delay = self.debug_millis() - p.time;
                 self.debug_charts.ping.log(delay);
+            }
+            // The host's declared Java content, right after the channel
+            // registration, so declared ids resolve before the first chunk.
+            C::CustomPayload(p) if p.channel == java_content::CHANNEL => {
+                if self.remote.is_some() {
+                    match receive_java_content(&p.data) {
+                        Ok(count) => {
+                            log::info!("Horizon: server declared {count} Java content id(s)")
+                        }
+                        Err(error) => java_content::warn_once(&error),
+                    }
+                }
             }
             // The server's declared mod payload channels, then their frames.
             C::CustomPayload(p) if p.channel == payloads::REGISTER_CHANNEL => {
@@ -8705,6 +8720,13 @@ fn snapshot_value(s: &play::AttributeSnapshot) -> f64 {
     value
 }
 
+/// The client's handler for the host's login manifest: decode it, then store
+/// it for the menu, item and block-entity paths. A malformed or conflicting
+/// manifest changes nothing.
+fn receive_java_content(data: &[u8]) -> std::result::Result<usize, String> {
+    java_content::apply(data)
+}
+
 /// `Util.getMillis` for the level load tracker's timeouts.
 fn client_millis() -> u64 {
     static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -8805,6 +8827,15 @@ mod declared_block_entity_tests {
 #[cfg(test)]
 mod tests {
     use super::synced_local_use;
+
+    /// A malformed login manifest is rejected before it can touch the shared
+    /// declaration stores; apply/merge/conflict live in `lan::java_content`.
+    #[test]
+    fn a_malformed_java_content_manifest_changes_nothing() {
+        assert!(super::receive_java_content(&[]).is_err());
+        assert!(super::receive_java_content(&[0, 1, 0]).is_err());
+        assert!(super::receive_java_content(&[0, 2]).is_err());
+    }
 
     #[test]
     fn the_server_stopping_the_use_lowers_the_shield() {
