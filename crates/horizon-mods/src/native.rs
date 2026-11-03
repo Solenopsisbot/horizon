@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(declarations.custom, []);
         assert_eq!(declarations.entities[0].template, "minecraft:chicken");
         assert_eq!(declarations.entities[0].properties["tracking_range"], "64");
-        assert_eq!(declarations.data_components[0].network_synced, true);
+        assert!(declarations.data_components[0].network_synced);
         assert_eq!(declarations.attachments[0].default_value, "0");
         assert!(declarations.attachments[0].copy_on_death);
     }
