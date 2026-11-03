@@ -445,9 +445,11 @@ The compiled smoke regression exercises this path without a Minecraft installati
 python3 tools/native_java_smoke.py
 ```
 
-The script uses `javac` to compile two ordinary Java classes and a tiny NeoForge `@Mod` annotation,
-packages real Fabric and NeoForge metadata, and checks that the native runner discovers and executes both
-Fabric `main` entrypoints plus the NeoForge constructor. The first Fabric entrypoint also runs an
+The script uses `javac` to compile two ordinary Java classes plus tiny Forge and NeoForge `@Mod`
+fixtures, packages real Fabric metadata alongside `mods.toml` and `neoforge.mods.toml`, and checks that
+the native runner discovers and executes both Fabric `main` entrypoints plus the Forge-family
+constructors. The Forge fixture crosses the bounded `DeferredRegister` and `SimpleChannel` aliases;
+the NeoForge fixture records a configuration payload registration. The first Fabric entrypoint also runs an
 `Optional.filter` predicate, `OptionalLong`/`OptionalDouble` value paths, and a mutable `Map.forEach`
 `BiConsumer` through the bounded host, so the smoke test proves primitive-value and callback boundaries
 in addition to classfile and metadata discovery. It therefore catches classfile, metadata, annotation,
@@ -979,6 +981,14 @@ and leaves arbitrary weaving, reflection and unmodelled cancellation to `horizon
 | `@Accessor`, `@Invoker` | bounded | target stubs materialize public interfaces for linkage; common JDK/collection returns are empty or neutral values, while game generic signatures and field/call semantics still need a hook |
 | `@Shadow` | yes | fields and methods exist because the façade was generated with them |
 | Mixin into a class with no façade | no | the census lists it; adding a façade class is the fix, not a workaround |
+
+The native probe now has one executable translation boundary for the first
+common injector shape: `NativeJar::execute_mixin_at_head` runs a `void`
+`@Inject(at = HEAD)` callback before its target and mirrors the target
+arguments, with a deterministic `CallbackInfo` marker when the callback asks
+for one. Return/Tail, cancellation, and callback bytecode that changes the
+target result still use the JVM fallback; the census and translation plan keep
+those cases visible until their native contracts are implemented.
 
 The rule that keeps this honest: **a method that receives many mixins becomes mod-owned at that point.**
 Rust stops deciding and calls Java there — the same move as a named hook, but chosen by data rather than

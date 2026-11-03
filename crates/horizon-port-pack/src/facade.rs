@@ -1365,25 +1365,25 @@ fn render(
     if class.name == "net/minecraft/world/entity/Entity" {
         let _ = writeln!(
             out,
-            "    protected double horizonX;\n    protected double horizonY;\n    protected double horizonZ;\n    protected double horizonDeltaX;\n    protected double horizonDeltaY;\n    protected double horizonDeltaZ;\n    protected float horizonXRot;\n    protected float horizonYRot;\n    protected net.minecraft.world.level.Level horizonLevel = new net.minecraft.world.level.Level();\n    protected net.minecraft.world.entity.EntityType horizonType = new net.minecraft.world.entity.EntityType();\n    protected java.util.UUID horizonUuid = new java.util.UUID(0L, 0L);\n    protected int horizonEntityId;\n    protected net.minecraft.world.phys.AABB horizonBoundingBox = new net.minecraft.world.phys.AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);\n    protected boolean horizonOnGround;\n    protected boolean horizonRemoved;\n    protected boolean horizonOnFire;\n    protected boolean horizonInWater;\n    protected boolean horizonInLava;\n    protected boolean horizonCrouching;\n    protected boolean horizonSprinting;"
+            "    protected double horizonX;\n    protected double horizonY;\n    protected double horizonZ;\n    protected double horizonDeltaX;\n    protected double horizonDeltaY;\n    protected double horizonDeltaZ;\n    protected float horizonXRot;\n    protected float horizonYRot;\n    protected float horizonBbWidth = 0.6f;\n    protected float horizonBbHeight = 1.8f;\n    protected float horizonEyeHeight = 1.62f;\n    protected net.minecraft.world.level.Level horizonLevel = new net.minecraft.world.level.Level();\n    protected net.minecraft.world.entity.EntityType horizonType = new net.minecraft.world.entity.EntityType();\n    protected java.util.UUID horizonUuid = new java.util.UUID(0L, 0L);\n    protected int horizonEntityId;\n    protected net.minecraft.world.phys.AABB horizonBoundingBox = new net.minecraft.world.phys.AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);\n    protected boolean horizonOnGround;\n    protected boolean horizonRemoved;\n    protected boolean horizonOnFire;\n    protected boolean horizonInWater;\n    protected boolean horizonInLava;\n    protected boolean horizonCrouching;\n    protected boolean horizonSprinting;"
         );
     }
     if class.name == "net/minecraft/world/entity/EntityType$Builder" {
         let _ = writeln!(
             out,
-            "    protected float horizonWidth = 0.6f;\n    protected float horizonHeight = 1.8f;\n    protected int horizonTrackingRange = 5;\n    protected int horizonUpdateInterval = 3;\n    protected boolean horizonFireImmune;"
+            "    protected float horizonWidth = 0.6f;\n    protected float horizonHeight = 1.8f;\n    protected int horizonTrackingRange = 5;\n    protected int horizonUpdateInterval = 3;\n    protected boolean horizonFireImmune;\n    protected net.minecraft.world.entity.MobCategory horizonCategory = net.minecraft.world.entity.MobCategory.MISC;"
         );
     }
     if class.name == "net/minecraft/world/entity/EntityType" {
         let _ = writeln!(
             out,
-            "    protected float horizonWidth = 0.6f;\n    protected float horizonHeight = 1.8f;\n    protected int horizonTrackingRange = 5;\n    protected int horizonUpdateInterval = 3;\n    protected boolean horizonFireImmune;\n    public EntityType() {{}}\n    public EntityType(float width, float height, int trackingRange, int updateInterval, boolean fireImmune) {{ this.horizonWidth = width; this.horizonHeight = height; this.horizonTrackingRange = trackingRange; this.horizonUpdateInterval = updateInterval; this.horizonFireImmune = fireImmune; }}"
+            "    protected float horizonWidth = 0.6f;\n    protected float horizonHeight = 1.8f;\n    protected int horizonTrackingRange = 5;\n    protected int horizonUpdateInterval = 3;\n    protected boolean horizonFireImmune;\n    protected net.minecraft.world.entity.MobCategory horizonCategory = net.minecraft.world.entity.MobCategory.MISC;\n    public EntityType() {{}}\n    public EntityType(float width, float height, int trackingRange, int updateInterval, boolean fireImmune) {{ this(width, height, trackingRange, updateInterval, fireImmune, net.minecraft.world.entity.MobCategory.MISC); }}\n    public EntityType(float width, float height, int trackingRange, int updateInterval, boolean fireImmune, net.minecraft.world.entity.MobCategory category) {{ this.horizonWidth = width; this.horizonHeight = height; this.horizonTrackingRange = trackingRange; this.horizonUpdateInterval = updateInterval; this.horizonFireImmune = fireImmune; this.horizonCategory = category == null ? net.minecraft.world.entity.MobCategory.MISC : category; }}"
         );
     }
     if class.name == "net/minecraft/world/entity/Mob" {
         let _ = writeln!(
             out,
-            "    protected boolean horizonNoAi;\n    protected boolean horizonAggressive;\n    protected net.minecraft.world.entity.LivingEntity horizonTarget;"
+            "    protected boolean horizonNoAi;\n    protected boolean horizonAggressive;\n    protected boolean horizonBaby;\n    protected boolean horizonPersistenceRequired;\n    protected net.minecraft.world.entity.LivingEntity horizonTarget;"
         );
     }
     if class.name == "net/minecraft/world/entity/LivingEntity" {
@@ -2817,7 +2817,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             return "int id = 0; for (Object value : horizonEntries.values()) { if (java.util.Objects.equals(value, p0)) return id; id++; } return -1;".to_owned();
         }
         if method == "byId" {
-            return format!("int id = p0; if (id < 0 || id >= horizonEntries.size()) return null; return ({ret}) horizonEntries.values().toArray()[id];");
+            return format!(
+                "int id = p0; if (id < 0 || id >= horizonEntries.size()) return null; return ({ret}) horizonEntries.values().toArray()[id];"
+            );
         }
         if method == "size" && ret == "int" {
             return "return horizonEntries.size();".to_owned();
@@ -3425,13 +3427,16 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             return "horizonFireImmune = true; return this;".to_owned();
         }
         if method == "of" && ret == "net.minecraft.world.entity.EntityType.Builder" {
+            if descriptor.contains("Lnet/minecraft/world/entity/MobCategory;") {
+                return "EntityType.Builder builder = new EntityType.Builder(); builder.horizonCategory = p1; return builder;".to_owned();
+            }
             return "return new EntityType.Builder();".to_owned();
         }
         if ret == "net.minecraft.world.entity.EntityType.Builder" {
             return "return this;".to_owned();
         }
         if method == "build" && ret == "net.minecraft.world.entity.EntityType" {
-            return "return new net.minecraft.world.entity.EntityType(horizonWidth, horizonHeight, horizonTrackingRange, horizonUpdateInterval, horizonFireImmune);".to_owned();
+            return "return new net.minecraft.world.entity.EntityType(horizonWidth, horizonHeight, horizonTrackingRange, horizonUpdateInterval, horizonFireImmune, horizonCategory);".to_owned();
         }
     }
     if class == "net/minecraft/world/entity/EntityType" {
@@ -3448,7 +3453,7 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         && method == "getCategory"
         && ret == "net.minecraft.world.entity.MobCategory"
     {
-        return "return net.minecraft.world.entity.MobCategory.MONSTER;".to_owned();
+        return "return horizonCategory;".to_owned();
     }
     if class == "net/minecraft/world/entity/MobCategory" {
         match (method, ret) {
@@ -3656,6 +3661,33 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     }
     if class == "net/minecraft/world/entity/Entity" {
         match (method, ret, descriptor) {
+            ("getBbWidth", "float", "()F") => return "return horizonBbWidth;".to_owned(),
+            ("getBbHeight", "float", "()F") => return "return horizonBbHeight;".to_owned(),
+            ("getEyeHeight", "float", "()F") => return "return horizonEyeHeight;".to_owned(),
+            ("getEyeY", "double", "()D") => {
+                return "return horizonY + horizonEyeHeight;".to_owned();
+            }
+            (
+                "getEyePosition",
+                "net.minecraft.world.phys.Vec3",
+                "()Lnet/minecraft/world/phys/Vec3;",
+            )
+            | (
+                "getEyePosition",
+                "net.minecraft.world.phys.Vec3",
+                "(F)Lnet/minecraft/world/phys/Vec3;",
+            ) => {
+                return "return new net.minecraft.world.phys.Vec3(horizonX, horizonY + horizonEyeHeight, horizonZ);".to_owned();
+            }
+            ("getBlockX", "int", "()I") => {
+                return "return (int) Math.floor(horizonX);".to_owned();
+            }
+            ("getBlockY", "int", "()I") => {
+                return "return (int) Math.floor(horizonY);".to_owned();
+            }
+            ("getBlockZ", "int", "()I") => {
+                return "return (int) Math.floor(horizonZ);".to_owned();
+            }
             ("getX", "double", "()D") => return "return horizonX;".to_owned(),
             ("getY", "double", "()D") => return "return horizonY;".to_owned(),
             ("getZ", "double", "()D") => return "return horizonZ;".to_owned(),
@@ -3696,24 +3728,6 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             }
             ("blockPosition", "net.minecraft.core.BlockPos", "()Lnet/minecraft/core/BlockPos;") => {
                 return "return new net.minecraft.core.BlockPos((int) Math.floor(horizonX), (int) Math.floor(horizonY), (int) Math.floor(horizonZ));".to_owned();
-            }
-            (
-                "getEyePosition",
-                "net.minecraft.world.phys.Vec3",
-                "(F)Lnet/minecraft/world/phys/Vec3;",
-            ) => {
-                return "return new net.minecraft.world.phys.Vec3(horizonX, horizonY + 1.62, horizonZ);"
-                    .to_owned();
-            }
-            ("getEyeY", "double", "()D") => return "return horizonY + 1.62;".to_owned(),
-            ("getBlockX", "int", "()I") => {
-                return "return (int) Math.floor(horizonX);".to_owned();
-            }
-            ("getBlockY", "int", "()I") => {
-                return "return (int) Math.floor(horizonY);".to_owned();
-            }
-            ("getBlockZ", "int", "()I") => {
-                return "return (int) Math.floor(horizonZ);".to_owned();
             }
             ("isPassenger", "boolean", "()Z") => return "return false;".to_owned(),
             (
@@ -3784,6 +3798,18 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("setAggressive", "void", "(Z)V") => {
                 return "horizonAggressive = p0;".to_owned();
             }
+            ("isBaby", "boolean", "()Z") => return "return horizonBaby;".to_owned(),
+            ("setBaby", "void", "(Z)V") => return "horizonBaby = p0;".to_owned(),
+            ("isPersistenceRequired", "boolean", "()Z") => {
+                return "return horizonPersistenceRequired;".to_owned();
+            }
+            ("setPersistenceRequired", "void", "()V") => {
+                return "horizonPersistenceRequired = true;".to_owned();
+            }
+            ("requiresCustomPersistence", "boolean", "()Z") => {
+                return "return horizonPersistenceRequired;".to_owned();
+            }
+            ("canBeLeashed", "boolean", "()Z") => return "return true;".to_owned(),
             (
                 "getTarget",
                 "net.minecraft.world.entity.LivingEntity",
@@ -4574,6 +4600,32 @@ mod tests {
     }
 
     #[test]
+    fn legacy_forge_event_and_capability_aliases_are_emitted() {
+        let source = include_str!("facade.rs");
+        assert!(source.contains("let uses_legacy_forge = target.iter().any"));
+        assert!(source.contains("net/minecraftforge/eventbus/api/SubscribeEvent.java"));
+        assert!(source.contains("public static final IEventBus EVENT_BUS"));
+        assert!(source.contains("net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext.java"));
+        assert!(source.contains("net/minecraftforge/common/capabilities/ICapabilityProvider.java"));
+        assert_eq!(
+            runtime_body(
+                "net/minecraftforge/eventbus/api/IEventBus",
+                "register",
+                "net.minecraftforge.eventbus.api.IEventBus"
+            ),
+            "return this;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraftforge/eventbus/api/IEventBus",
+                "post",
+                "boolean"
+            ),
+            "return false;"
+        );
+    }
+
+    #[test]
     fn neoforge_item_handler_contract_is_bounded_and_stateful() {
         // The source shim is intentionally kept beside the façade generator,
         // so assert the ABI policy here: one bounded slot, simulation support,
@@ -4649,32 +4701,6 @@ mod tests {
                 "(Ljava/util/function/Function;)Ljava/lang/Object;",
             ),
             "return horizonReadIndex < horizonValues.size() ? horizonValues.get(horizonReadIndex++) : null;"
-        );
-    }
-
-    #[test]
-    fn legacy_forge_event_and_capability_aliases_are_emitted() {
-        let source = include_str!("facade.rs");
-        assert!(source.contains("let uses_legacy_forge = target.iter().any"));
-        assert!(source.contains("net/minecraftforge/eventbus/api/SubscribeEvent.java"));
-        assert!(source.contains("public static final IEventBus EVENT_BUS"));
-        assert!(source.contains("net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext.java"));
-        assert!(source.contains("net/minecraftforge/common/capabilities/ICapabilityProvider.java"));
-        assert_eq!(
-            runtime_body(
-                "net/minecraftforge/eventbus/api/IEventBus",
-                "register",
-                "net.minecraftforge.eventbus.api.IEventBus"
-            ),
-            "return this;"
-        );
-        assert_eq!(
-            runtime_body(
-                "net/minecraftforge/eventbus/api/IEventBus",
-                "post",
-                "boolean"
-            ),
-            "return false;"
         );
     }
 
@@ -5224,7 +5250,7 @@ mod tests {
                 "getCategory",
                 "net.minecraft.world.entity.MobCategory"
             ),
-            "return net.minecraft.world.entity.MobCategory.MONSTER;"
+            "return horizonCategory;"
         );
         assert_eq!(
             runtime_body(
@@ -5503,7 +5529,7 @@ mod tests {
                 "build",
                 "net.minecraft.world.entity.EntityType"
             ),
-            "return new net.minecraft.world.entity.EntityType(horizonWidth, horizonHeight, horizonTrackingRange, horizonUpdateInterval, horizonFireImmune);"
+            "return new net.minecraft.world.entity.EntityType(horizonWidth, horizonHeight, horizonTrackingRange, horizonUpdateInterval, horizonFireImmune, horizonCategory);"
         );
         assert_eq!(
             runtime_body(
@@ -7326,7 +7352,7 @@ mod tests {
                 "net.minecraft.world.phys.Vec3",
                 "(F)Lnet/minecraft/world/phys/Vec3;",
             ),
-            "return new net.minecraft.world.phys.Vec3(horizonX, horizonY + 1.62, horizonZ);"
+            "return new net.minecraft.world.phys.Vec3(horizonX, horizonY + horizonEyeHeight, horizonZ);"
         );
         assert_eq!(
             runtime_body_with_descriptor(
@@ -7335,7 +7361,7 @@ mod tests {
                 "double",
                 "()D",
             ),
-            "return horizonY + 1.62;"
+            "return horizonY + horizonEyeHeight;"
         );
         assert_eq!(
             runtime_body_with_descriptor(
@@ -7344,7 +7370,7 @@ mod tests {
                 "float",
                 "()F",
             ),
-            "return 1.62f;"
+            "return horizonEyeHeight;"
         );
         assert_eq!(
             runtime_body_with_descriptor(
@@ -7353,7 +7379,7 @@ mod tests {
                 "float",
                 "()F",
             ),
-            "return 1.8f;"
+            "return horizonBbHeight;"
         );
         assert_eq!(
             runtime_body_with_descriptor(
@@ -7362,7 +7388,7 @@ mod tests {
                 "float",
                 "()F",
             ),
-            "return 0.6f;"
+            "return horizonBbWidth;"
         );
         assert_eq!(
             runtime_body_with_descriptor(
@@ -7564,6 +7590,99 @@ mod tests {
                 "()Lnet/minecraft/world/entity/LivingEntity;",
             ),
             "return horizonTarget;"
+        );
+    }
+
+    #[test]
+    fn entity_and_mob_facades_preserve_dimensions_and_lifecycle_flags() {
+        let entity = Class {
+            name: "net/minecraft/world/entity/Entity".to_owned(),
+            declared: vec![
+                Declared {
+                    name: "getBbWidth".to_owned(),
+                    descriptor: "()F".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
+                    name: "getEyePosition".to_owned(),
+                    descriptor: "()Lnet/minecraft/world/phys/Vec3;".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
+                    name: "getBlockX".to_owned(),
+                    descriptor: "()I".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+            ],
+            ..Class::default()
+        };
+        let mut report = Report::default();
+        let source = render(
+            &entity,
+            Some(&BTreeSet::from([
+                ("getBbWidth".to_owned(), "()F".to_owned()),
+                (
+                    "getEyePosition".to_owned(),
+                    "()Lnet/minecraft/world/phys/Vec3;".to_owned(),
+                ),
+                ("getBlockX".to_owned(), "()I".to_owned()),
+            ])),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut report,
+            false,
+            &[],
+        );
+        assert!(source.contains("horizonBbWidth"));
+        assert!(source.contains("horizonEyeHeight"));
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getEyePosition",
+                "net.minecraft.world.phys.Vec3",
+                "()Lnet/minecraft/world/phys/Vec3;",
+            ),
+            "return new net.minecraft.world.phys.Vec3(horizonX, horizonY + horizonEyeHeight, horizonZ);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getBlockX",
+                "int",
+                "()I",
+            ),
+            "return (int) Math.floor(horizonX);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Mob",
+                "isBaby",
+                "boolean",
+                "()Z",
+            ),
+            "return horizonBaby;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Mob",
+                "setPersistenceRequired",
+                "void",
+                "()V",
+            ),
+            "horizonPersistenceRequired = true;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/EntityType$Builder",
+                "of",
+                "net.minecraft.world.entity.EntityType.Builder",
+                "(Ljava/util/function/BiFunction;Lnet/minecraft/world/entity/MobCategory;)Lnet/minecraft/world/entity/EntityType$Builder;",
+            ),
+            "EntityType.Builder builder = new EntityType.Builder(); builder.horizonCategory = p1; return builder;"
         );
     }
 
@@ -8415,11 +8534,15 @@ mod tests {
             "return horizonEntries.size();"
         );
         assert_eq!(
-            runtime_body("net/minecraft/core/Registry", "entrySet", "java.util.Set"),
+            runtime_body("net/minecraft/core/Registry", "entrySet", "java.util.Set",),
             "return horizonEntries.entrySet();"
         );
         assert_eq!(
-            runtime_body("net/minecraft/core/Registry", "stream", "java.util.stream.Stream"),
+            runtime_body(
+                "net/minecraft/core/Registry",
+                "stream",
+                "java.util.stream.Stream",
+            ),
             "return horizonEntries.values().stream();"
         );
     }
