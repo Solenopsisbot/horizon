@@ -613,7 +613,7 @@ For native client paths that mirror bootstrap-visible `NumberFormat.getIntegerIn
 values) without emulating arbitrary locale or formatter patterns.
 `StdHost` also exposes deterministic Fabric loader values for mod-presence checks, metadata ids, names,
 versions, empty `getProvides` and `getDependencies` collections (including
-`ModMetadata.getType` as the deterministic `release` marker, and `Version.getRaw`/`getFriendlyString`), environment type (`CLIENT` by default, or
+`ModMetadata.getType` as the deterministic `release` marker, bounded authors/contributors/license collections, and `Version.getRaw`/`getFriendlyString`), environment type (`CLIENT` by default, or
 `SERVER` via `with_environment_type`, including `EnvType.isClient`, `name`, and `ordinal`), and the
 game/config/mods paths, Fabric `ModContainer.getRootPaths` (a bounded mod-root marker), and a configurable
 `isDevelopmentEnvironment` marker (off by default), plus a deterministic `getAllMods` list backed by the seeded containers; callers seed the loaded-mod map with
