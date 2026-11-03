@@ -10,7 +10,7 @@ use super::{
     Game, Options,
     execution_role::ExecutionRole,
     lan::LanSettings,
-    mods::{JavaCompatibilityReport, JavaLoader, MixinPlanning},
+    mods::{JavaCompatibilityReport, JavaLoader, MixinPlanning, fml},
     world_loading::WorldRequest,
 };
 use horizon_client::{
@@ -393,6 +393,10 @@ fn load_java_mod_paths(
 }
 
 pub(super) fn load_java_mods(options: &mut Options) -> Result<()> {
+    // The real-loader preflight is independent of the native path and runs
+    // even with no explicit jar: the operator asked whether the install's FML
+    // loads. It is skipped unless both environment paths are set.
+    fml_preflight(options)?;
     if options.java_mods.is_empty() {
         return Ok(());
     }
@@ -401,6 +405,28 @@ pub(super) fn load_java_mods(options: &mut Options) -> Result<()> {
     *JAVA_REPORTS.lock().unwrap() = reports;
     options.java_content = Arc::new(content);
     Ok(())
+}
+
+/// `HORIZON_NEOFORGE_SERVER` and `HORIZON_JVM_BIN` together ask for the opt-in
+/// FML preflight (`fml.rs`). Its report is logged once with this role's Java
+/// compatibility prefix; only `HORIZON_NEOFORGE_STRICT=1` stops startup on a
+/// failure, and a missing binary or server stays a log line.
+fn fml_preflight(options: &Options) -> Result<()> {
+    let Some(outcome) = fml::preflight(ExecutionRole::DedicatedServer, &options.java_mods) else {
+        return Ok(());
+    };
+    let level = if outcome.report.succeeded() {
+        "INFO"
+    } else {
+        "WARN"
+    };
+    for line in outcome.report.summary() {
+        log(level, &format!("{JAVA_PREFIX}{line}"));
+    }
+    match outcome.strict_error() {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
 }
 
 /// Main.main up to the server start: arguments, server.properties (stored

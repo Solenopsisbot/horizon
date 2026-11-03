@@ -1000,6 +1000,12 @@ fn serve(
 /// it in the top-level startup path.  Declarations are retained on the server
 /// options so a later resource reload can synchronize their content tables.
 fn run_server_java_mods(options: &mut Options) -> Result<()> {
+    // The opt-in real NeoForge loader preflight is independent of the native
+    // interpreter path and runs with no explicit jar, because the operator
+    // asked whether the install's FML loads. It never runs for clients and
+    // only `HORIZON_NEOFORGE_STRICT=1` stops startup on a failure.
+    super::mods::fml_preflight(ExecutionRole::IntegratedServer, &options.java_mods)
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
     if options.java_mods.is_empty() {
         return Ok(());
     }

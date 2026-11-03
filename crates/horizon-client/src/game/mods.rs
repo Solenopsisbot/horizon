@@ -1,6 +1,7 @@
 //! Mods in the game (`docs/mods.md`): content mods' blocks, items, data and
 //! assets (`content_root`), and the Mods page's rows. Code mods are native
-//! (`native_hooks.rs`); WebAssembly code mods don't run any more.
+//! (`native_hooks.rs`); WebAssembly code mods don't run any more. The opt-in
+//! real NeoForge loader preflight is `fml.rs`.
 use super::{Game, execution_role::ExecutionRole};
 use horizon_client::{
     mod_content::{self, ContentMod, DeclarationSummary},
@@ -8,6 +9,11 @@ use horizon_client::{
     text::Text,
 };
 use std::path::PathBuf;
+
+// The opt-in real-loader preflight lives in `game/fml.rs`; it is registered
+// here because it reports beside this module's Java compatibility lines.
+#[path = "fml.rs"]
+pub(super) mod fml;
 
 #[derive(Default)]
 pub(super) struct ModsState {
@@ -595,6 +601,34 @@ fn aggregate_line(reports: &[JavaCompatibilityReport], summary: &DeclarationSumm
     )
 }
 
+/// The opt-in real-loader preflight (`fml.rs`), logged once under the Java
+/// compatibility prefix and run before the native path below. It is skipped
+/// unless `HORIZON_NEOFORGE_SERVER` and `HORIZON_JVM_BIN` are set, and its
+/// failure only stops startup under `HORIZON_NEOFORGE_STRICT=1`.
+// Wired by the integrated server's startup (game/integrated.rs, top of
+// `run_server_java_mods`): `super::mods::fml_preflight(role, &options.java_mods)?;`
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn fml_preflight(
+    role: ExecutionRole,
+    jars: &[PathBuf],
+) -> Result<Option<fml::FmlReport>, String> {
+    let Some(outcome) = fml::preflight(role, jars) else {
+        return Ok(None);
+    };
+    let level = if outcome.report.succeeded() {
+        log::Level::Info
+    } else {
+        log::Level::Warn
+    };
+    for line in outcome.report.summary() {
+        log::log!(level, "Horizon: Java compatibility: {line}");
+    }
+    match outcome.strict_error() {
+        Some(error) => Err(error),
+        None => Ok(Some(outcome.report)),
+    }
+}
+
 /// Runs explicitly supplied Java entrypoints through the bounded native
 /// interpreter before resource workers start. Java jars are never discovered
 /// implicitly: a launcher or developer must pass `--java-mod PATH`.
@@ -1004,6 +1038,17 @@ mod tests {
                     horizon_client::brewing::Category::Beneficial,
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn fml_preflight_never_runs_for_a_client() {
+        // A client is refused before either environment path is read, so this
+        // answer cannot depend on the machine the test runs on.
+        assert!(
+            fml_preflight(ExecutionRole::Client, &[])
+                .expect("a client is never a preflight failure")
+                .is_none()
         );
     }
 
