@@ -851,7 +851,11 @@ impl NativeDeclarations {
     /// A data-component or attachment codec is a resource location. Rejecting
     /// control characters here means a diagnostic can never carry terminal
     /// escapes copied from an adapter string into the launcher's log.
-    fn ensure_codec(kind: &str, id: &str, codec: &str) -> Result<(), String> {
+    ///
+    /// Also the reader's fence: a packaged declaration file under
+    /// `data/<id>/horizon/` goes through it, so a content root validates the
+    /// same codec ids the sink accepted.
+    pub(crate) fn ensure_codec(kind: &str, id: &str, codec: &str) -> Result<(), String> {
         Self::ensure_id(codec)?;
         if id.chars().chain(codec.chars()).any(char::is_control) {
             return Err(format!(

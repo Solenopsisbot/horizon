@@ -1,6 +1,11 @@
 //! A content mod's `assets/` and `data/` (API 0.2, docs/modpacks.md): the
-//! files it adds to the game's resource tree, and the blocks, items and mob
-//! effects it declares in `data/<id>/horizon/{block,item,mob_effect}/`.
+//! files it adds to the game's resource tree, and the declarations it makes in
+//! `data/<id>/horizon/`: blocks, items and mob effects in `block/`, `item/`
+//! and `mob_effect/`, and the typed rows [`Content::from_native`] writes —
+//! entities, data components, attachments, menus and block entities — in
+//! `entity/`, `data_component/`, `attachment/`, `menu/` and `block_entity/`.
+//! Reading a content root validates those files with the same parsers the
+//! native path used to write them, so a root round-trips.
 //!
 //! Content is data, not code: nothing here runs in the sandbox. What a mod
 //! may add is fenced instead. Its own namespaces (its id and the ones its
@@ -11,6 +16,10 @@
 //! add entities, data components, attachments, menus and block entities under
 //! the same fences.
 use crate::manifest::{Capability, MANIFEST, Manifest};
+use crate::native::{
+    AttachmentDeclaration, BlockEntityDeclaration, DataComponentDeclaration, EntityDeclaration,
+    MAX_NATIVE_TEXT, MenuDeclaration, NativeDeclarations,
+};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,8 +33,9 @@ pub const MAX_FILE: u64 = 16 << 20;
 pub const MAX_TOTAL: u64 = 512 << 20;
 
 /// Version of the typed JSON Horizon writes under `data/<namespace>/horizon/`
-/// for entity, data-component and attachment rows. A reader checks it before
-/// it trusts a row's shape.
+/// (entity, data-component, attachment, menu and block-entity rows). A reader
+/// checks it before it trusts a row; a file without the marker is read as 1,
+/// so rows written before it existed still load.
 pub const NATIVE_FORMAT: u32 = 1;
 
 /// Checks a content path: `assets/` or `data/`, then `/`-separated parts of
@@ -197,6 +207,78 @@ pub struct MobEffect {
     pub category: EffectCategory,
     /// RGB, `0x000000` to `0xFFFFFF`.
     pub color: u32,
+}
+
+// The typed declaration files [`Content::from_native`] writes under
+// `data/<id>/horizon/`. Each carries [`NATIVE_FORMAT`]; the marker is optional
+// so a row written before it existed reads as format 1.
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntityFile {
+    #[serde(default)]
+    format: Option<u32>,
+    template: String,
+    #[serde(default)]
+    properties: BTreeMap<String, String>,
+    /// The typed view of `properties`. A reader rebuilds it from `properties`
+    /// and refuses a file where the two disagree.
+    #[serde(default)]
+    spawn: Option<serde_json::Value>,
+    #[serde(default)]
+    attributes: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DataComponentFile {
+    #[serde(default)]
+    format: Option<u32>,
+    codec: String,
+    /// A data component is persistent unless it says otherwise, as in
+    /// `native::NativeDeclarations`.
+    #[serde(default = "yes")]
+    persistent: bool,
+    #[serde(default)]
+    network_synced: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttachmentFile {
+    #[serde(default)]
+    format: Option<u32>,
+    codec: String,
+    #[serde(default = "null_text")]
+    default: String,
+    #[serde(default)]
+    copy_on_death: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MenuFile {
+    #[serde(default)]
+    format: Option<u32>,
+    title_key: String,
+    slots: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlockEntityFile {
+    #[serde(default)]
+    format: Option<u32>,
+    template: String,
+    #[serde(default)]
+    ticker: bool,
+    valid_blocks: Vec<String>,
+}
+
+/// An attachment's default when a file leaves it out, as the native sink
+/// defaults it.
+fn null_text() -> String {
+    "null".to_owned()
 }
 
 #[derive(Debug, Clone)]
@@ -708,6 +790,12 @@ impl Content {
         self.reader()?.read(name)
     }
 
+    /// One content file as typed JSON, naming it in a parse error.
+    fn read_typed<T: serde::de::DeserializeOwned>(&self, name: &str) -> Result<T, String> {
+        let bytes = self.file(name)?;
+        serde_json::from_slice(&bytes).map_err(|e| format!("{name}: {e}"))
+    }
+
     /// A reader of its content files. A packaged mod's archive is opened
     /// once for all of them (opening it reads its whole index).
     pub fn reader(&self) -> Result<FileReader<'_>, String> {
@@ -728,6 +816,11 @@ impl Content {
         let mut blocks = Vec::new();
         let mut items = Vec::new();
         let mut effects = Vec::new();
+        let mut entity_files = Vec::new();
+        let mut component_files = Vec::new();
+        let mut attachment_files = Vec::new();
+        let mut menu_files = Vec::new();
+        let mut block_entity_files = Vec::new();
         for name in &self.files {
             let mut parts = name.splitn(3, '/');
             let (top, namespace, rest) = (
@@ -748,7 +841,7 @@ impl Content {
             }
             if !own && top == "data" && rest.starts_with("horizon/") {
                 return Err(format!(
-                    "{name}: blocks, items and mob effects are declared in data/{id}/horizon/"
+                    "{name}: declarations live in data/{id}/horizon/ (block, item, mob_effect, entity, data_component, attachment, menu, block_entity)"
                 ));
             }
             let Some(decl) = (own && top == "data")
@@ -770,9 +863,19 @@ impl Content {
                 items.push((item, name.clone()));
             } else if let Some(effect) = parse("mob_effect") {
                 effects.push((effect, name.clone()));
+            } else if let Some(entity) = parse("entity") {
+                entity_files.push((entity, name.clone()));
+            } else if let Some(component) = parse("data_component") {
+                component_files.push((component, name.clone()));
+            } else if let Some(attachment) = parse("attachment") {
+                attachment_files.push((attachment, name.clone()));
+            } else if let Some(menu) = parse("menu") {
+                menu_files.push((menu, name.clone()));
+            } else if let Some(block_entity) = parse("block_entity") {
+                block_entity_files.push((block_entity, name.clone()));
             } else {
                 return Err(format!(
-                    "{name}: data/{id}/horizon/ holds block/, item/ and mob_effect/*.json only"
+                    "{name}: data/{id}/horizon/ holds block/, item/, mob_effect/, entity/, data_component/, attachment/, menu/ and block_entity/*.json only"
                 ));
             }
         }
@@ -832,6 +935,97 @@ impl Content {
             }
             self.effects.push(MobEffect { id: effect, ..file });
         }
+        let mut entities = BTreeMap::new();
+        for (id, name) in entity_files {
+            let file: EntityFile = self.read_typed(&name)?;
+            check_format(&name, file.format)?;
+            let entity = entity_row(id, file).map_err(|e| format!("{name}: {e}"))?;
+            push_row(&mut entities, entity.id.clone(), &name, entity)?;
+        }
+        let mut data_components = BTreeMap::new();
+        for (id, name) in component_files {
+            let file: DataComponentFile = self.read_typed(&name)?;
+            check_format(&name, file.format)?;
+            NativeDeclarations::ensure_codec("data component", &id, &file.codec)
+                .map_err(|e| format!("{name}: {e}"))?;
+            push_row(
+                &mut data_components,
+                id.clone(),
+                &name,
+                DataComponentDeclaration {
+                    id,
+                    codec: file.codec,
+                    persistent: file.persistent,
+                    network_synced: file.network_synced,
+                },
+            )?;
+        }
+        let mut attachments = BTreeMap::new();
+        for (id, name) in attachment_files {
+            let file: AttachmentFile = self.read_typed(&name)?;
+            check_format(&name, file.format)?;
+            NativeDeclarations::ensure_codec("attachment", &id, &file.codec)
+                .map_err(|e| format!("{name}: {e}"))?;
+            if file.default.len() > MAX_NATIVE_TEXT {
+                return Err(format!(
+                    "{name}: default is at most {MAX_NATIVE_TEXT} bytes"
+                ));
+            }
+            if file.default.chars().any(char::is_control) {
+                return Err(format!("{name}: default has control characters"));
+            }
+            push_row(
+                &mut attachments,
+                id.clone(),
+                &name,
+                AttachmentDeclaration {
+                    id,
+                    codec: file.codec,
+                    default_value: file.default,
+                    copy_on_death: file.copy_on_death,
+                },
+            )?;
+        }
+        let mut menus = BTreeMap::new();
+        for (id, name) in menu_files {
+            let file: MenuFile = self.read_typed(&name)?;
+            check_format(&name, file.format)?;
+            let menu = MenuDeclaration {
+                id,
+                title_key: file.title_key,
+                slots: file.slots,
+            };
+            menu.validate().map_err(|e| format!("{name}: {e}"))?;
+            push_row(&mut menus, menu.id.clone(), &name, menu)?;
+        }
+        let mut block_entities = BTreeMap::new();
+        for (id, name) in block_entity_files {
+            let file: BlockEntityFile = self.read_typed(&name)?;
+            check_format(&name, file.format)?;
+            let mut block_entity = BlockEntityDeclaration {
+                id,
+                template: file.template,
+                ticker: file.ticker,
+                valid_blocks: file.valid_blocks,
+            };
+            // The native sink sorts the block list; keep the row canonical.
+            block_entity.valid_blocks.sort();
+            block_entity
+                .validate()
+                .map_err(|e| format!("{name}: {e}"))?;
+            push_row(
+                &mut block_entities,
+                block_entity.id.clone(),
+                &name,
+                block_entity,
+            )?;
+        }
+        // Sorted by id, so file order cannot change the declaration tables.
+        self.entities = entities.into_values().map(|(_, row)| row).collect();
+        self.data_components = data_components.into_values().map(|(_, row)| row).collect();
+        self.attachments = attachments.into_values().map(|(_, row)| row).collect();
+        self.menus = menus.into_values().map(|(_, row)| row).collect();
+        self.block_entities = block_entities.into_values().map(|(_, row)| row).collect();
         // After every item, so a remainder may be declared in a later file.
         for (name, rest) in remainders {
             if rest == "minecraft:air" {
@@ -847,6 +1041,67 @@ impl Content {
         }
         Ok(())
     }
+}
+
+/// A declaration file's [`NATIVE_FORMAT`] marker. Absent counts as 1: a file
+/// written before the marker existed is still the same shape.
+fn check_format(name: &str, format: Option<u32>) -> Result<(), String> {
+    match format {
+        None | Some(NATIVE_FORMAT) => Ok(()),
+        Some(other) => Err(format!(
+            "{name}: format {other} is not the supported {NATIVE_FORMAT}"
+        )),
+    }
+}
+
+/// One entity declaration file, rebuilt through the parser a loader adapter's
+/// row goes through. `spawn` and `attributes` are the writer's typed view of
+/// `properties`; a file where they disagree is refused rather than read as a
+/// half-declared entity.
+fn entity_row(id: String, file: EntityFile) -> Result<EntityDeclaration, String> {
+    if !vanilla_id(&file.template) {
+        return Err(format!(
+            "template {:?} is not a vanilla entity (minecraft:...)",
+            file.template
+        ));
+    }
+    let mut properties = file.properties;
+    if let Some(template) = properties.remove("template")
+        && template != file.template
+    {
+        return Err(format!(
+            "properties.template {template:?} disagrees with template {:?}",
+            file.template
+        ));
+    }
+    let entity = EntityDeclaration::from_registry_properties(id, file.template, &properties)?;
+    let spawn = serde_json::to_value(&entity.spawn).map_err(|e| e.to_string())?;
+    let attributes = serde_json::to_value(&entity.attributes).map_err(|e| e.to_string())?;
+    if file.spawn.as_ref().is_some_and(|value| value != &spawn) {
+        return Err("spawn disagrees with properties".into());
+    }
+    if file
+        .attributes
+        .as_ref()
+        .is_some_and(|value| value != &attributes)
+    {
+        return Err("attributes disagree with properties".into());
+    }
+    Ok(entity)
+}
+
+/// One declaration row, stored under its id so the table comes out sorted and
+/// a second file claiming the same id is refused, naming both files.
+fn push_row<T>(
+    rows: &mut BTreeMap<String, (String, T)>,
+    id: String,
+    file: &str,
+    row: T,
+) -> Result<(), String> {
+    if let Some((first, _)) = rows.insert(id.clone(), (file.to_owned(), row)) {
+        return Err(format!("{file}: {id} is also declared in {first}"));
+    }
+    Ok(())
 }
 
 /// Vanilla component types only, removals as `{}`, and none of `fields`,
@@ -1269,7 +1524,7 @@ capabilities = ["registries"]
             ],
         );
         assert!(e.contains("also a block's item"), "{e}");
-        refused("other-kind", &[("data/ruby/horizon/entity/a.json", b"{}")]);
+        refused("unknown-kind", &[("data/ruby/horizon/fluid/a.json", b"{}")]);
         refused(
             "stack",
             &[(
@@ -1385,7 +1640,7 @@ capabilities = ["registries"]
         // Declarations stay in the id's namespace.
         let decl: &[(&str, &[u8])] = &[("data/kaisyn/horizon/block/a.json", BLOCK)];
         let e = hmod("listed-decl", &manifest, decl).unwrap_err();
-        assert!(e.contains("declared in data/ruby/horizon/"), "{e}");
+        assert!(e.contains("live in data/ruby/horizon/"), "{e}");
         // A namespace it does not list is still outside.
         let other: &[(&str, &[u8])] = &[("data/other/structure/a.nbt", b"nbt")];
         assert!(hmod("listed-other", &manifest, other).is_err());
@@ -1628,6 +1883,166 @@ capabilities = ["registries"]
         )
         .unwrap_err();
         assert!(error.contains("outside a mod namespace"), "{error}");
+    }
+
+    #[test]
+    fn native_declaration_files_round_trip_through_a_package() {
+        let entity = native_row(
+            "entity",
+            "ruby:bird",
+            &[
+                ("template", "minecraft:chicken"),
+                ("width", "0.6"),
+                ("max_health", "4"),
+                ("spawn_category", "on_ground"),
+                ("spawn_heightmap", "motion_blocking"),
+            ],
+        );
+        let component = native_row(
+            "data_component",
+            "ruby:mana",
+            &[("codec", "minecraft:int"), ("network_synced", "true")],
+        );
+        let attachment = native_row(
+            "attachment",
+            "ruby:soul",
+            &[
+                ("codec", "ruby:mana"),
+                ("default", "0"),
+                ("copy_on_death", "true"),
+            ],
+        );
+        let menu = native_row(
+            "menu",
+            "ruby:crate",
+            &[("title_key", "container.ruby.crate"), ("slots", "27")],
+        );
+        let block_entity = native_row(
+            "block_entity",
+            "ruby:crate",
+            &[
+                ("template", "minecraft:barrel"),
+                ("ticker", "true"),
+                ("valid_blocks", "ruby:crate_block,minecraft:barrel"),
+            ],
+        );
+        let written = Content::from_native(
+            "ruby",
+            NativeDeclarations::from_registry_entries([
+                &entity,
+                &component,
+                &attachment,
+                &menu,
+                &block_entity,
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written.native_files.len(), 5);
+        // A packaged content root is the shipped form of those files.
+        let files: Vec<(&str, &[u8])> = written
+            .native_files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let read = hmod("native-root", MANIFEST_TEXT, &files).unwrap();
+        assert_eq!(read.files.len(), 5);
+        assert_eq!(read.entities, written.entities);
+        assert_eq!(read.data_components, written.data_components);
+        assert_eq!(read.attachments, written.attachments);
+        assert_eq!(read.menus, written.menus);
+        assert_eq!(read.block_entities, written.block_entities);
+        assert_eq!(read.namespaces, written.namespaces);
+    }
+
+    #[test]
+    fn native_declaration_files_are_validated_and_name_their_file() {
+        let refused = |case: &str, file: &str, body: &str| -> String {
+            let files: &[(&str, &[u8])] = &[(file, body.as_bytes())];
+            let e = hmod(case, MANIFEST_TEXT, files).expect_err("the row should be refused");
+            assert!(e.contains(file), "{case}: {e}");
+            e
+        };
+        let e = refused(
+            "native-unknown-kind",
+            "data/ruby/horizon/fluid/oil.json",
+            "{}",
+        );
+        assert!(e.contains("block_entity/"), "{e}");
+
+        let e = refused(
+            "native-format",
+            "data/ruby/horizon/menu/a.json",
+            r#"{"format": 2, "title_key": "container.ruby", "slots": 0}"#,
+        );
+        assert!(e.contains("format 2"), "{e}");
+
+        let e = refused(
+            "native-property",
+            "data/ruby/horizon/entity/a.json",
+            r#"{"format": 1, "template": "minecraft:chicken",
+                "properties": {"hardness": "1"}}"#,
+        );
+        assert!(e.contains("unknown native entity property"), "{e}");
+
+        let e = refused(
+            "native-template",
+            "data/ruby/horizon/entity/a.json",
+            r#"{"template": "ruby:bird", "properties": {}}"#,
+        );
+        assert!(e.contains("not a vanilla entity"), "{e}");
+
+        let e = refused(
+            "native-spawn",
+            "data/ruby/horizon/entity/a.json",
+            r#"{"template": "minecraft:chicken", "properties": {},
+                "spawn": {"category": "ON_GROUND", "heightmap": "MOTION_BLOCKING"}}"#,
+        );
+        assert!(e.contains("spawn disagrees with properties"), "{e}");
+
+        let e = refused(
+            "native-slot",
+            "data/ruby/horizon/menu/a.json",
+            r#"{"title_key": "container.ruby", "slots": 257}"#,
+        );
+        assert!(e.contains("slots is 0 to"), "{e}");
+
+        let e = refused(
+            "native-codec",
+            "data/ruby/horizon/data_component/a.json",
+            r#"{"codec": "int"}"#,
+        );
+        assert!(e.contains("has no namespace"), "{e}");
+
+        // A row written before the marker existed is format 1.
+        let files: &[(&str, &[u8])] = &[(
+            "data/ruby/horizon/menu/a.json",
+            br#"{"title_key": "container.ruby", "slots": 9}"#,
+        )];
+        let content = hmod("native-legacy", MANIFEST_TEXT, files).unwrap();
+        assert_eq!(content.menus[0].slots, 9);
+    }
+
+    #[test]
+    fn duplicate_ids_are_refused_with_their_file() {
+        let files: &[(&str, &[u8])] = &[
+            ("data/ruby/horizon/block/a.json", BLOCK),
+            ("data/ruby/horizon/item/a.json", ITEM),
+        ];
+        let e = hmod("native-duplicate", MANIFEST_TEXT, files).unwrap_err();
+        assert!(e.contains("also a block's item"), "{e}");
+        assert!(e.contains("data/ruby/horizon/item/a.json"), "{e}");
+    }
+
+    #[test]
+    fn native_declaration_files_stay_in_the_owning_namespace() {
+        let manifest = format!("{MANIFEST_TEXT}namespaces = [\"kaisyn\"]\n");
+        let files: &[(&str, &[u8])] = &[(
+            "data/kaisyn/horizon/entity/a.json",
+            br#"{"template": "minecraft:chicken"}"#,
+        )];
+        let e = hmod("native-foreign", &manifest, files).unwrap_err();
+        assert!(e.contains("data/ruby/horizon/"), "{e}");
     }
 
     #[test]
