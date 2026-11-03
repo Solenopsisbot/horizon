@@ -23,6 +23,15 @@ pub enum Value {
     /// timers and arithmetic keep all 64 bits. A boxed `Long` uses the same
     /// variant: the bounded runtime is untyped, so [`boxed_long`] accepts it.
     Long(i64),
+    /// An exact IEEE-754 `float` or `double`, including a boxed `Float`/`Double`.
+    ///
+    /// One variant covers both widths: the bytecode says which one a value is,
+    /// so the interpreter rounds to `f32` at the `f*` opcodes and at an `F`
+    /// descriptor, and keeps the full `f64` bits everywhere else. A `float` is
+    /// therefore stored already rounded to `f32` precision. The derived
+    /// `PartialEq` is IEEE equality, so a `NaN` value never equals itself;
+    /// `Double.equals` is modelled separately through the bit comparison.
+    Float(f64),
     Ref(Option<String>),
     Void,
 }
@@ -44,9 +53,7 @@ impl Value {
             "V" => Self::Void,
             "Z" | "B" | "C" | "S" | "I" => Self::Int(0),
             "J" => Self::Long(0),
-            // Floating-point values are still neutralised in the bounded
-            // integer representation.
-            "D" => Self::Int(0),
+            "F" | "D" => Self::Float(0.0),
             _ => Self::Ref(None),
         }
     }
@@ -431,12 +438,14 @@ fn return_override(desc: &str, value: Value) -> Result<Option<Value>, NativeErro
             "native Mixin CallbackInfoReturnable cannot override a void target".into(),
         )),
         "Z" | "B" | "C" | "S" | "I" | "J" | "D" | "F" => {
-            // A `long` target keeps its exact 64 bits; every other primitive
-            // keeps the bounded integer coercion.
-            if let Value::Long(long) = &value {
-                if desc == "J" {
-                    return Ok(Some(Value::Long(*long)));
-                }
+            // A `long` target keeps its exact 64 bits, and an `F`/`D` target
+            // keeps its floating-point value (rounded to `f32` for `F`); every
+            // other primitive keeps the bounded integer coercion.
+            match (&value, desc) {
+                (Value::Long(long), "J") => return Ok(Some(Value::Long(*long))),
+                (Value::Float(float), "F") => return Ok(Some(Value::Float(float32(*float)))),
+                (Value::Float(float), "D") => return Ok(Some(Value::Float(*float))),
+                _ => {}
             }
             let integer = if let Some(flag) =
                 expect_ref(&value).and_then(|marker| marker.strip_prefix("boolean:"))
@@ -445,19 +454,26 @@ fn return_override(desc: &str, value: Value) -> Result<Option<Value>, NativeErro
             } else {
                 boxed_character(&value).or_else(|| boxed_number(&value).map(|value| value as i32))
             };
-            integer.map(|integer| Some(Value::Int(integer))).ok_or_else(|| {
+            let integer = integer.ok_or_else(|| {
                 NativeError::Metadata(format!(
                     "native Mixin CallbackInfoReturnable override {} does not fit primitive return {desc}",
                     value_marker(&value)
                 ))
-            })
+            })?;
+            Ok(Some(match desc {
+                "F" => Value::Float(float32(f64::from(integer))),
+                "D" => Value::Float(f64::from(integer)),
+                _ => Value::Int(integer),
+            }))
         }
         _ => match value {
             Value::Ref(_) => Ok(Some(value)),
-            Value::Int(_) | Value::Long(_) => Err(NativeError::Metadata(format!(
-                "native Mixin CallbackInfoReturnable override {} is primitive but return {desc} is a reference",
-                value_marker(&value)
-            ))),
+            Value::Int(_) | Value::Long(_) | Value::Float(_) => {
+                Err(NativeError::Metadata(format!(
+                    "native Mixin CallbackInfoReturnable override {} is primitive but return {desc} is a reference",
+                    value_marker(&value)
+                )))
+            }
             Value::Void => Ok(None),
         },
     }
@@ -1420,6 +1436,22 @@ impl Host for StdHost {
             // every comparison to "less than max".
             ("java/lang/Long", "MAX_VALUE", "J") => Ok(Value::Long(i64::MAX)),
             ("java/lang/Long", "MIN_VALUE", "J") => Ok(Value::Long(i64::MIN)),
+            // `MIN_VALUE` is the smallest positive *subnormal* in Java, not the
+            // smallest normal, so it is `from_bits(1)` and not `MIN_POSITIVE`.
+            ("java/lang/Float", "MAX_VALUE", "F") => Ok(Value::Float(f64::from(f32::MAX))),
+            ("java/lang/Float", "MIN_VALUE", "F") => Ok(Value::Float(f64::from(f32::from_bits(1)))),
+            ("java/lang/Float", "MIN_NORMAL", "F") => {
+                Ok(Value::Float(f64::from(f32::MIN_POSITIVE)))
+            }
+            ("java/lang/Float", "NaN", "F") => Ok(Value::Float(f64::from(f32::NAN))),
+            ("java/lang/Float", "POSITIVE_INFINITY", "F") => Ok(Value::Float(f64::INFINITY)),
+            ("java/lang/Float", "NEGATIVE_INFINITY", "F") => Ok(Value::Float(f64::NEG_INFINITY)),
+            ("java/lang/Double", "MAX_VALUE", "D") => Ok(Value::Float(f64::MAX)),
+            ("java/lang/Double", "MIN_VALUE", "D") => Ok(Value::Float(f64::from_bits(1))),
+            ("java/lang/Double", "MIN_NORMAL", "D") => Ok(Value::Float(f64::MIN_POSITIVE)),
+            ("java/lang/Double", "NaN", "D") => Ok(Value::Float(f64::NAN)),
+            ("java/lang/Double", "POSITIVE_INFINITY", "D") => Ok(Value::Float(f64::INFINITY)),
+            ("java/lang/Double", "NEGATIVE_INFINITY", "D") => Ok(Value::Float(f64::NEG_INFINITY)),
             ("java/util/Locale", "US", "Ljava/util/Locale;") => {
                 Ok(Value::Ref(Some("locale/US".into())))
             }
@@ -1709,14 +1741,38 @@ impl Host for StdHost {
             ("java/lang/Double", "valueOf", "(Ljava/lang/String;)Ljava/lang/Double;") => {
                 Ok(double_value(parse_java_float(Self::argument(r, args, 0)?)?))
             }
-            ("java/lang/Double", "isNaN", "(D)Z") | ("java/lang/Double", "isInfinite", "(D)Z") => {
+            ("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;") => {
+                Ok(double_value(expect_float(r, Self::argument(r, args, 0)?)?))
+            }
+            ("java/lang/Double", "compare", "(DD)I") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(Value::Int(compare_double(left, right)))
+            }
+            ("java/lang/Double", "sum", "(DD)D") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(double_value(left + right))
+            }
+            ("java/lang/Double", "max", "(DD)D") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(double_value(java_float_max(left, right)))
+            }
+            ("java/lang/Double", "min", "(DD)D") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(double_value(java_float_min(left, right)))
+            }
+            ("java/lang/Double", "isNaN", "(D)Z")
+            | ("java/lang/Double", "isInfinite", "(D)Z")
+            | ("java/lang/Double", "isFinite", "(D)Z") => {
                 let value = expect_float(r, Self::argument(r, args, 0)?)?;
-                let result = if r.name == "isNaN" {
-                    value.is_nan()
-                } else {
-                    value.is_infinite()
-                };
-                Ok(Value::Int(result as i32))
+                Ok(Value::Int(match r.name.as_str() {
+                    "isNaN" => value.is_nan(),
+                    "isInfinite" => value.is_infinite(),
+                    _ => value.is_finite(),
+                } as i32))
             }
             ("java/lang/Float", "parseFloat", "(Ljava/lang/String;)F") => {
                 Ok(float_value(parse_java_float(Self::argument(r, args, 0)?)?))
@@ -1724,14 +1780,38 @@ impl Host for StdHost {
             ("java/lang/Float", "valueOf", "(Ljava/lang/String;)Ljava/lang/Float;") => {
                 Ok(float_value(parse_java_float(Self::argument(r, args, 0)?)?))
             }
-            ("java/lang/Float", "isNaN", "(F)Z") | ("java/lang/Float", "isInfinite", "(F)Z") => {
+            ("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;") => {
+                Ok(float_value(expect_float(r, Self::argument(r, args, 0)?)?))
+            }
+            ("java/lang/Float", "compare", "(FF)I") => {
+                let left = float32(expect_float(r, Self::argument(r, args, 0)?)?);
+                let right = float32(expect_float(r, Self::argument(r, args, 1)?)?);
+                Ok(Value::Int(compare_double(left, right)))
+            }
+            ("java/lang/Float", "sum", "(FF)F") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)? as f32;
+                let right = expect_float(r, Self::argument(r, args, 1)?)? as f32;
+                Ok(float_value(f64::from(left + right)))
+            }
+            ("java/lang/Float", "max", "(FF)F") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(float_value(java_float_max(left, right)))
+            }
+            ("java/lang/Float", "min", "(FF)F") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(float_value(java_float_min(left, right)))
+            }
+            ("java/lang/Float", "isNaN", "(F)Z")
+            | ("java/lang/Float", "isInfinite", "(F)Z")
+            | ("java/lang/Float", "isFinite", "(F)Z") => {
                 let value = expect_float(r, Self::argument(r, args, 0)?)?;
-                let result = if r.name == "isNaN" {
-                    value.is_nan()
-                } else {
-                    value.is_infinite()
-                };
-                Ok(Value::Int(result as i32))
+                Ok(Value::Int(match r.name.as_str() {
+                    "isNaN" => value.is_nan(),
+                    "isInfinite" => value.is_infinite(),
+                    _ => value.is_finite(),
+                } as i32))
             }
             ("java/lang/Long", "compare", "(JJ)I") => {
                 let left = expect_long(r, Self::argument(r, args, 0)?)?;
@@ -2079,10 +2159,13 @@ impl Host for StdHost {
                     .to_string(),
             ))),
             ("java/lang/Double", "toString", "(D)Ljava/lang/String;")
-            | ("java/lang/Float", "toString", "(F)Ljava/lang/String;")
-            | ("java/lang/String", "valueOf", "(D)Ljava/lang/String;")
-            | ("java/lang/String", "valueOf", "(F)Ljava/lang/String;") => Ok(Value::Ref(Some(
+            | ("java/lang/String", "valueOf", "(D)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 format_java_float(expect_float(r, Self::argument(r, args, 0)?)?),
+            ))),
+            // `Float.toString`/`String.valueOf(float)` print the `f32` digits.
+            ("java/lang/Float", "toString", "(F)Ljava/lang/String;")
+            | ("java/lang/String", "valueOf", "(F)Ljava/lang/String;") => Ok(Value::Ref(Some(
+                format_java_float32(expect_float(r, Self::argument(r, args, 0)?)?),
             ))),
             ("java/nio/file/Paths", "get", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
                 Ok(path_value(expect_string(Self::argument(r, args, 0)?)))
@@ -3990,36 +4073,95 @@ impl Host for StdHost {
             ("java/lang/Double", "doubleValue", "()D")
             | ("java/lang/Float", "doubleValue", "()D") => {
                 Ok(double_value(boxed_float(receiver).ok_or_else(|| {
-                    NativeError::Metadata("malformed java/lang/Double marker".into())
+                    NativeError::Metadata("malformed floating-point marker".into())
                 })?))
             }
             ("java/lang/Double", "floatValue", "()F")
             | ("java/lang/Float", "floatValue", "()F") => {
                 Ok(float_value(boxed_float(receiver).ok_or_else(|| {
-                    NativeError::Metadata("malformed java/lang/Float marker".into())
+                    NativeError::Metadata("malformed floating-point marker".into())
                 })?))
             }
-            ("java/lang/Double", "toString", "()Ljava/lang/String;")
-            | ("java/lang/Float", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
-                format_java_float(boxed_float(receiver).ok_or_else(|| {
+            ("java/lang/Double", "intValue", "()I") | ("java/lang/Float", "intValue", "()I") => {
+                Ok(Value::Int(number_int_value(receiver).ok_or_else(|| {
                     NativeError::Metadata("malformed floating-point marker".into())
+                })?))
+            }
+            ("java/lang/Double", "longValue", "()J") | ("java/lang/Float", "longValue", "()J") => {
+                Ok(Value::Long(number_long_value(receiver).ok_or_else(
+                    || NativeError::Metadata("malformed floating-point marker".into()),
+                )?))
+            }
+            ("java/lang/Double", "shortValue", "()S")
+            | ("java/lang/Float", "shortValue", "()S") => {
+                Ok(Value::Int(number_short_value(receiver).ok_or_else(
+                    || NativeError::Metadata("malformed floating-point marker".into()),
+                )?))
+            }
+            ("java/lang/Double", "byteValue", "()B") | ("java/lang/Float", "byteValue", "()B") => {
+                Ok(Value::Int(number_byte_value(receiver).ok_or_else(
+                    || NativeError::Metadata("malformed floating-point marker".into()),
+                )?))
+            }
+            // `Float.toString` prints the `f32` digits, so a stored `0.1F`
+            // answers `0.1` rather than the widened `f64` spelling.
+            ("java/lang/Double", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
+                format_java_float(boxed_float(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Double marker".into())
                 })?),
             ))),
-            ("java/lang/Double", "isNaN", "()Z") | ("java/lang/Float", "isNaN", "()Z") => {
+            ("java/lang/Float", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
+                format_java_float32(boxed_float(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Float marker".into())
+                })?),
+            ))),
+            ("java/lang/Double", "isNaN", "()Z")
+            | ("java/lang/Float", "isNaN", "()Z")
+            | ("java/lang/Double", "isInfinite", "()Z")
+            | ("java/lang/Float", "isInfinite", "()Z")
+            | ("java/lang/Double", "isFinite", "()Z")
+            | ("java/lang/Float", "isFinite", "()Z") => {
+                let value = boxed_float(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed floating-point marker".into())
+                })?;
+                Ok(Value::Int(match r.name.as_str() {
+                    "isNaN" => value.is_nan(),
+                    "isInfinite" => value.is_infinite(),
+                    _ => value.is_finite(),
+                } as i32))
+            }
+            ("java/lang/Double", "compareTo", "(Ljava/lang/Double;)I")
+            | ("java/lang/Float", "compareTo", "(Ljava/lang/Float;)I") => {
+                let left = boxed_float(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed floating-point marker".into())
+                })?;
+                let right = expect_float(r, Self::argument(r, args, 0)?)?;
+                Ok(Value::Int(compare_double(left, right)))
+            }
+            ("java/lang/Double", "equals", "(Ljava/lang/Object;)Z")
+            | ("java/lang/Float", "equals", "(Ljava/lang/Object;)Z") => {
+                let bits = |value: f64| match r.owner.as_str() {
+                    "java/lang/Float" => u64::from(java_float_bits(value)),
+                    _ => java_double_bits(value),
+                };
+                let other = boxed_float(Self::argument(r, args, 0)?);
                 Ok(Value::Int(
                     boxed_float(receiver)
-                        .ok_or_else(|| {
-                            NativeError::Metadata("malformed floating-point marker".into())
-                        })?
-                        .is_nan() as i32,
+                        .is_some_and(|value| other.is_some_and(|other| bits(value) == bits(other)))
+                        as i32,
                 ))
             }
-            ("java/lang/Double", "isInfinite", "()Z")
-            | ("java/lang/Float", "isInfinite", "()Z") => Ok(Value::Int(
-                boxed_float(receiver)
-                    .ok_or_else(|| NativeError::Metadata("malformed floating-point marker".into()))?
-                    .is_infinite() as i32,
-            )),
+            ("java/lang/Double", "hashCode", "()I") => {
+                let bits = java_double_bits(boxed_float(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Double marker".into())
+                })?);
+                Ok(Value::Int((bits ^ (bits >> 32)) as i32))
+            }
+            ("java/lang/Float", "hashCode", "()I") => Ok(Value::Int(java_float_bits(
+                boxed_float(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Float marker".into())
+                })?,
+            ) as i32)),
             ("java/lang/Boolean", "booleanValue", "()Z") => {
                 Ok(Value::Int(boxed_boolean(receiver).ok_or_else(|| {
                     NativeError::Metadata("malformed java/lang/Boolean marker".into())
@@ -5474,6 +5616,7 @@ fn builder_append_text(r: &MethodRef, args: &[Value]) -> Result<String, NativeEr
             Value::Ref(None) => "null".into(),
             Value::Int(value) => value.to_string(),
             Value::Long(value) => value.to_string(),
+            Value::Float(value) => format_java_float(*value),
             Value::Void => "void".into(),
         },
         "(I)Ljava/lang/StringBuilder;" | "(I)Ljava/lang/StringBuffer;" => {
@@ -5481,6 +5624,12 @@ fn builder_append_text(r: &MethodRef, args: &[Value]) -> Result<String, NativeEr
         }
         "(J)Ljava/lang/StringBuilder;" | "(J)Ljava/lang/StringBuffer;" => {
             expect_long(r, value)?.to_string()
+        }
+        "(F)Ljava/lang/StringBuilder;" | "(F)Ljava/lang/StringBuffer;" => {
+            format_java_float32(expect_float(r, value)?)
+        }
+        "(D)Ljava/lang/StringBuilder;" | "(D)Ljava/lang/StringBuffer;" => {
+            format_java_float(expect_float(r, value)?)
         }
         "(Z)Ljava/lang/StringBuilder;" | "(Z)Ljava/lang/StringBuffer;" => {
             match expect_int(r, value)? {
@@ -5687,6 +5836,7 @@ fn value_marker(value: &Value) -> String {
     match value {
         Value::Int(value) => format!("i{value}"),
         Value::Long(value) => format!("l{value}"),
+        Value::Float(value) => format!("f{}", format_java_float(*value)),
         Value::Ref(Some(value)) => format!("r{}", value.replace('\\', "\\\\").replace(',', "\\,")),
         Value::Ref(None) => "null".to_owned(),
         Value::Void => "void".to_owned(),
@@ -5726,24 +5876,25 @@ fn record_inferred_property(
     }
 }
 
-/// The text a builder setting records. A float argument arrives through the
-/// interpreter's bounded number representation, which stores `fconst` and a
-/// float constant as an integer: `strength(2.0F)` is exact, a fractional
-/// `friction(0.6F)` is already `0` by the time the host sees it. The
-/// declaration mapping drops the settings that would turn that loss into a
-/// wrong block.
+/// The text a builder setting records.
+///
+/// A floating-point argument keeps its real value now that the model stores
+/// `Value::Float`: `strength(2.0F)` records `2` and `friction(0.6F)` records
+/// `0.6`. The text is plain decimal (no forced `.0`) because it lands in the
+/// declaration's JSON-like properties; an `F` argument prints its `f32`
+/// shortest form so a stored `0.6F` is not `0.6000000238418579`.
 fn builder_number(descriptor: &str, value: &Value) -> Option<String> {
-    let floating = descriptor
+    match descriptor
         .strip_prefix('(')
-        .is_some_and(|args| args.starts_with('F') || args.starts_with('D'));
-    if floating {
-        boxed_float(value).map(format_java_float)
-    } else {
-        match value {
+        .and_then(|args| args.chars().next())
+    {
+        Some('F') => boxed_float(value).map(|value| (value as f32).to_string()),
+        Some('D') => boxed_float(value).map(|value| value.to_string()),
+        _ => match value {
             Value::Int(value) => Some(value.to_string()),
             Value::Long(value) => Some(value.to_string()),
             _ => None,
-        }
+        },
     }
 }
 
@@ -5872,9 +6023,9 @@ fn block_declaration_properties(builder: &BTreeMap<String, String>) -> BTreeMap<
     if let Some(resistance) = builder.get("explosionResistance") {
         properties.insert("explosion_resistance".to_owned(), resistance.clone());
     }
-    // A truncated fraction is indistinguishable from an explicit zero, and a
-    // zero friction block is ice; leave the template's friction alone instead
-    // of guessing.
+    // A zero friction is ice, so the template's friction is left alone; a
+    // fractional friction now arrives exactly (`friction(0.6F)` records `0.6`)
+    // and is kept.
     if let Some(friction) = builder.get("friction")
         && friction.parse::<f64>().is_ok_and(|friction| friction > 0.0)
     {
@@ -5952,6 +6103,7 @@ fn capability_text(value: &Value) -> String {
     match value {
         Value::Int(value) => value.to_string(),
         Value::Long(value) => value.to_string(),
+        Value::Float(value) => format_java_float(*value),
         Value::Ref(Some(value)) => value.replace("\\,", ",").replace("\\\\", "\\"),
         Value::Ref(None) => "".to_owned(),
         Value::Void => "void".to_owned(),
@@ -6044,6 +6196,7 @@ fn value_text(value: &Value) -> String {
         Value::Ref(None) => "null".into(),
         Value::Int(value) => value.to_string(),
         Value::Long(value) => value.to_string(),
+        Value::Float(value) => format_java_float(*value),
         Value::Void => "void".into(),
     }
 }
@@ -6129,7 +6282,7 @@ fn format_java_string_call<H: Host>(
                 let value = boxed_float(value).ok_or_else(|| {
                     NativeError::Metadata("String.format %f requires a floating-point value".into())
                 })?;
-                output.push_str(&format_java_float(value));
+                output.push_str(&format_java_decimal(value));
             }
             'b' => {
                 let value = values.get(next).ok_or_else(|| {
@@ -6203,6 +6356,7 @@ fn boxed_number(value: &Value) -> Option<f64> {
     match value {
         Value::Int(value) => Some(f64::from(*value)),
         Value::Long(value) => Some(*value as f64),
+        Value::Float(value) => Some(*value),
         Value::Ref(Some(value)) => value
             .strip_prefix("integer:")
             .or_else(|| value.strip_prefix("byte:"))
@@ -6341,16 +6495,31 @@ fn parse_java_float(value: &Value) -> Result<f64, NativeError> {
 }
 
 fn double_value(value: f64) -> Value {
-    Value::Ref(Some(format!("double:{value}")))
+    Value::Float(value)
+}
+
+/// Round to `f32` precision without changing the stored width.
+///
+/// A Java `float` is an `f32`, so every `f*` opcode, `F` descriptor and
+/// `Float` host entry rounds here before handing the value back.
+fn float32(value: f64) -> f64 {
+    f64::from(value as f32)
 }
 
 fn float_value(value: f64) -> Value {
-    Value::Ref(Some(format!("float:{}", value as f32)))
+    Value::Float(float32(value))
 }
 
+/// Read a value as a Java `float`/`double`.
+///
+/// The bounded model also accepts an `int`/`long` (an arithmetic result that
+/// never crossed a floating-point opcode) and the older `float:`/`double:`
+/// markers, so a host value from before this variant keeps working.
 fn boxed_float(value: &Value) -> Option<f64> {
     match value {
         Value::Int(value) => Some(f64::from(*value)),
+        Value::Long(value) => Some(*value as f64),
+        Value::Float(value) => Some(*value),
         Value::Ref(Some(value)) => value
             .strip_prefix("double:")
             .or_else(|| value.strip_prefix("float:"))
@@ -6385,16 +6554,92 @@ fn format_integer_us(value: i32) -> String {
     }
 }
 
-fn format_java_float(value: f64) -> String {
+/// `String.format("%f")` without a precision is six fractional digits, as
+/// `java.util.Formatter` defaults to.
+fn format_java_decimal(value: f64) -> String {
     if value.is_nan() {
         "NaN".into()
-    } else if value == f64::INFINITY {
-        "Infinity".into()
-    } else if value == f64::NEG_INFINITY {
-        "-Infinity".into()
+    } else if value.is_infinite() {
+        if value.is_sign_negative() {
+            "-Infinity".into()
+        } else {
+            "Infinity".into()
+        }
     } else {
-        value.to_string()
+        format!("{value:.6}")
     }
+}
+
+/// Render a `double` the way `Double.toString` does, from the shortest
+/// round-tripping digits (the same digits Java prints).
+fn format_java_float(value: f64) -> String {
+    java_float_text(format!("{value:e}"))
+}
+
+/// The `float` twin: the digits must round-trip through `f32`, so a `0.1F`
+/// prints `0.1` rather than the `f64` value of the stored `f32`.
+fn format_java_float32(value: f64) -> String {
+    java_float_text(format!("{:e}", value as f32))
+}
+
+/// Format a Rust `{:e}` string (`3.5e0`, `1.25e-4`) as Java's `toString`.
+///
+/// Java keeps the plain decimal form for `1e-3 <= |m| < 1e7` and uses
+/// scientific notation with one leading digit outside it, always keeping at
+/// least one fractional digit (`1.0`, `100.0`, `1.0E20`).
+fn java_float_text(scientific: String) -> String {
+    // Rust spells the non-finite values without an exponent.
+    match scientific.as_str() {
+        "NaN" => return "NaN".to_owned(),
+        "inf" => return "Infinity".to_owned(),
+        "-inf" => return "-Infinity".to_owned(),
+        _ => {}
+    }
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("`{:e}` always writes an exponent");
+    let exponent: i32 = exponent.parse().expect("`{:e}` writes a decimal exponent");
+    let negative = mantissa.starts_with('-');
+    let digits = mantissa
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    let mut output = String::new();
+    if negative {
+        output.push('-');
+    }
+    // The digits are `d[0].d[1..]`, so the decimal point sits after
+    // `exponent + 1` digits.
+    let point = exponent + 1;
+    if (-3..=6).contains(&exponent) {
+        if point <= 0 {
+            output.push_str("0.");
+            output.push_str(&"0".repeat((-point) as usize));
+            output.push_str(&digits);
+        } else {
+            let point = point as usize;
+            if point < digits.len() {
+                output.push_str(&digits[..point]);
+                output.push('.');
+                output.push_str(&digits[point..]);
+            } else {
+                output.push_str(&digits);
+                output.push_str(&"0".repeat(point - digits.len()));
+                output.push_str(".0");
+            }
+        }
+    } else {
+        output.push_str(&digits[..1]);
+        output.push('.');
+        if digits.len() > 1 {
+            output.push_str(&digits[1..]);
+        } else {
+            output.push('0');
+        }
+        output.push('E');
+        output.push_str(&exponent.to_string());
+    }
+    output
 }
 
 fn collection_value(kind: &str, values: &[Value]) -> Value {
@@ -6506,6 +6751,7 @@ fn collection_text(value: &Value) -> Result<String, NativeError> {
             Ok(Value::Ref(None)) => "null".into(),
             Ok(Value::Int(value)) => value.to_string(),
             Ok(Value::Long(value)) => value.to_string(),
+            Ok(Value::Float(value)) => format_java_float(value),
             Ok(Value::Void) => "void".into(),
             Err(_) => value.clone(),
         })
@@ -6716,8 +6962,8 @@ enum Cp {
     Integer(i32),
     Float(f32),
     Long(i64),
-    /// A `CONSTANT_Double`: two pool slots, neutralised by the value model.
-    Double,
+    /// A `CONSTANT_Double`: two pool slots, exact `f64` bits.
+    Double(f64),
     Class(u16),
     String(u16),
     FieldRef {
@@ -8666,6 +8912,11 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
             .map(Value::Long)
             .map_err(|_| NativeError::Metadata(format!("invalid long capture {marker}")));
     }
+    if let Some(value) = marker.strip_prefix('f') {
+        return value.parse::<f64>().map(Value::Float).map_err(|_| {
+            NativeError::Metadata(format!("invalid floating-point capture {marker}"))
+        });
+    }
     if let Some(value) = marker.strip_prefix('r') {
         return Ok(Value::Ref(Some(value.to_owned())));
     }
@@ -9602,14 +9853,14 @@ impl<H: Host> Runtime<'_, H> {
                 0x02..=0x08 => stack.push(Value::Int(op as i32 - 3)),
                 0x09 => stack.push(Value::Long(0)),
                 0x0a => stack.push(Value::Long(1)),
-                // fconst_0/1/2, dconst_0/1. `fconst_2` is the only constant
-                // above one, so it is the one a value of 2 (a common property
-                // such as a block's strength) lands on. Floating-point values
-                // stay neutralised in the bounded integer representation.
-                0x0b..=0x0f => stack.push(Value::Int(match op {
-                    0x0c | 0x0f => 1,
-                    0x0d => 2,
-                    _ => 0,
+                // fconst_0/1/2 and dconst_0/1. The `float` constants are stored
+                // already rounded to `f32`, which 0, 1 and 2 are exactly.
+                0x0b..=0x0f => stack.push(Value::Float(match op {
+                    0x0b => 0.0,
+                    0x0c => 1.0,
+                    0x0d => 2.0,
+                    0x0e => 0.0,
+                    _ => 1.0,
                 })),
                 0x10 => {
                     let b = *code.get(pc).ok_or(NativeError::Truncated)?;
@@ -9672,6 +9923,33 @@ impl<H: Host> Runtime<'_, H> {
                     })?;
                     stack.push(Value::Long(value));
                 }
+                // fadd/dadd, fsub/dsub, fmul/dmul, fdiv/ddiv, frem/drem. The
+                // `f*` half rounds to `f32` after the operation, exactly as a
+                // JVM `fadd` does, while the `d*` half keeps the `f64` result.
+                0x62 | 0x66 | 0x6a | 0x6e | 0x72 => {
+                    let rhs = pop_float(&mut stack, class, method)? as f32;
+                    let lhs = pop_float(&mut stack, class, method)? as f32;
+                    let value = match op {
+                        0x62 => lhs + rhs,
+                        0x66 => lhs - rhs,
+                        0x6a => lhs * rhs,
+                        0x6e => lhs / rhs,
+                        _ => lhs % rhs,
+                    };
+                    stack.push(Value::Float(f64::from(value)));
+                }
+                0x63 | 0x67 | 0x6b | 0x6f | 0x73 => {
+                    let rhs = pop_float(&mut stack, class, method)?;
+                    let lhs = pop_float(&mut stack, class, method)?;
+                    let value = match op {
+                        0x63 => lhs + rhs,
+                        0x67 => lhs - rhs,
+                        0x6b => lhs * rhs,
+                        0x6f => lhs / rhs,
+                        _ => lhs % rhs,
+                    };
+                    stack.push(Value::Float(value));
+                }
                 0x74 => {
                     let value = pop_int(&mut stack, class, method)?;
                     stack.push(Value::Int(value.wrapping_neg()));
@@ -9679,6 +9957,15 @@ impl<H: Host> Runtime<'_, H> {
                 0x75 => {
                     let value = pop_long(&mut stack, class, method)?;
                     stack.push(Value::Long(value.wrapping_neg()));
+                }
+                // fneg/dneg only flip the sign bit, so the width is preserved.
+                0x76 => {
+                    let value = pop_float(&mut stack, class, method)? as f32;
+                    stack.push(Value::Float(f64::from(-value)));
+                }
+                0x77 => {
+                    let value = pop_float(&mut stack, class, method)?;
+                    stack.push(Value::Float(-value));
                 }
                 0x78 | 0x7a | 0x7c => {
                     let rhs = pop_int(&mut stack, class, method)?;
@@ -9745,12 +10032,20 @@ impl<H: Host> Runtime<'_, H> {
                         });
                     }
                 }
-                // i2l widens exactly; l2i keeps the low 32 bits. The float
-                // conversions stay neutralised except l2f/l2d, which have the
-                // existing `float:`/`double:` markers to land on.
+                // Conversions between the primitive widths. The floating-point
+                // ones round to `f32` in the `*2f` direction and saturate like
+                // a JVM cast (`NaN` to 0) in the `f2i`/`d2l` direction.
                 0x85 => {
                     let value = pop_int(&mut stack, class, method)?;
                     stack.push(Value::Long(i64::from(value)));
+                }
+                0x86 => {
+                    let value = pop_int(&mut stack, class, method)?;
+                    stack.push(Value::Float(f64::from(value as f32)));
+                }
+                0x87 => {
+                    let value = pop_int(&mut stack, class, method)?;
+                    stack.push(Value::Float(f64::from(value)));
                 }
                 0x88 => {
                     let value = pop_long(&mut stack, class, method)?;
@@ -9758,24 +10053,35 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 0x89 => {
                     let value = pop_long(&mut stack, class, method)?;
-                    stack.push(float_value(value as f64));
+                    stack.push(Value::Float(f64::from(value as f32)));
                 }
                 0x8a => {
                     let value = pop_long(&mut stack, class, method)?;
-                    stack.push(double_value(value as f64));
+                    stack.push(Value::Float(value as f64));
                 }
-                0x8c | 0x8f => {
-                    let value = pop(&mut stack, class, method)?;
-                    let value = boxed_number(&value).ok_or_else(|| NativeError::TypeMismatch {
-                        class: class.to_owned(),
-                        method: method.to_owned(),
-                        expected: "floating-point value",
-                    })?;
+                0x8b => {
+                    let value = pop_float(&mut stack, class, method)? as f32;
+                    stack.push(Value::Int(value as i32));
+                }
+                0x8c => {
+                    let value = pop_float(&mut stack, class, method)? as f32;
                     stack.push(Value::Long(value as i64));
                 }
-                0x86 | 0x87 | 0x8b | 0x8d | 0x8e | 0x90 => {
-                    let value = pop_int(&mut stack, class, method)?;
-                    stack.push(Value::Int(value));
+                0x8d => {
+                    let value = pop_float(&mut stack, class, method)? as f32;
+                    stack.push(Value::Float(f64::from(value)));
+                }
+                0x8e => {
+                    let value = pop_float(&mut stack, class, method)?;
+                    stack.push(Value::Int(value as i32));
+                }
+                0x8f => {
+                    let value = pop_float(&mut stack, class, method)?;
+                    stack.push(Value::Long(value as i64));
+                }
+                0x90 => {
+                    let value = pop_float(&mut stack, class, method)?;
+                    stack.push(Value::Float(f64::from(value as f32)));
                 }
                 0x91..=0x93 => {
                     let value = pop_int(&mut stack, class, method)?;
@@ -9791,11 +10097,17 @@ impl<H: Host> Runtime<'_, H> {
                     let lhs = pop_long(&mut stack, class, method)?;
                     stack.push(Value::Int(lhs.cmp(&rhs) as i32));
                 }
-                // fcmpl/fcmpg/dcmpl/dcmpg keep the neutralised integer model.
-                0x95..=0x98 => {
-                    let rhs = pop_int(&mut stack, class, method)?;
-                    let lhs = pop_int(&mut stack, class, method)?;
-                    stack.push(Value::Int(lhs.cmp(&rhs) as i32));
+                // fcmpl/fcmpg/dcmpl/dcmpg: NaN answers `-1` for the `l` forms
+                // and `+1` for the `g` forms, as the JVM specifies.
+                0x95 | 0x96 => {
+                    let rhs = pop_float(&mut stack, class, method)?;
+                    let lhs = pop_float(&mut stack, class, method)?;
+                    stack.push(Value::Int(compare_float(lhs, rhs, op == 0x95)));
+                }
+                0x97 | 0x98 => {
+                    let rhs = pop_float(&mut stack, class, method)?;
+                    let lhs = pop_float(&mut stack, class, method)?;
+                    stack.push(Value::Int(compare_float(lhs, rhs, op == 0x97)));
                 }
                 0x1a..=0x1d => stack.push(locals[(op - 0x1a) as usize].clone()),
                 0x1e..=0x21 => stack.push(locals[(op - 0x1e) as usize].clone()),
@@ -9819,11 +10131,11 @@ impl<H: Host> Runtime<'_, H> {
                     let _ = pop(&mut stack, class, method)?;
                 }
                 0x58 => {
-                    // `pop2` removes one category-2 value (a `long`) or two
-                    // category-1 values, so a discarded long does not
-                    // underflow the stack.
+                    // `pop2` removes one category-2 value (a `long`/`double`)
+                    // or two category-1 values, so a discarded wide value does
+                    // not underflow the stack.
                     let value = pop(&mut stack, class, method)?;
-                    if !matches!(value, Value::Long(_)) {
+                    if !is_category_2(&value) {
                         let _ = pop(&mut stack, class, method)?;
                     }
                 }
@@ -9842,7 +10154,7 @@ impl<H: Host> Runtime<'_, H> {
                 0x5b => {
                     let value1 = pop(&mut stack, class, method)?;
                     let value2 = pop(&mut stack, class, method)?;
-                    if matches!(value2, Value::Long(_)) {
+                    if is_category_2(&value2) {
                         stack.extend([value1.clone(), value2, value1]);
                     } else {
                         let value3 = pop(&mut stack, class, method)?;
@@ -9851,7 +10163,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 0x5c => {
                     let value1 = pop(&mut stack, class, method)?;
-                    if matches!(value1, Value::Long(_)) {
+                    if is_category_2(&value1) {
                         stack.extend([value1.clone(), value1]);
                     } else {
                         let value2 = pop(&mut stack, class, method)?;
@@ -9860,7 +10172,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 0x5d => {
                     let value1 = pop(&mut stack, class, method)?;
-                    if matches!(value1, Value::Long(_)) {
+                    if is_category_2(&value1) {
                         let value2 = pop(&mut stack, class, method)?;
                         stack.extend([value1.clone(), value2, value1]);
                     } else {
@@ -9871,9 +10183,9 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 0x5e => {
                     let value1 = pop(&mut stack, class, method)?;
-                    if matches!(value1, Value::Long(_)) {
+                    if is_category_2(&value1) {
                         let value2 = pop(&mut stack, class, method)?;
-                        if matches!(value2, Value::Long(_)) {
+                        if is_category_2(&value2) {
                             stack.extend([value1.clone(), value2, value1]);
                         } else {
                             let value3 = pop(&mut stack, class, method)?;
@@ -10003,12 +10315,13 @@ impl<H: Host> Runtime<'_, H> {
                         return Err(NativeError::InvalidClass("invalid newarray type"));
                     }
                     let marker = self.new_array(class, method);
-                    // T_LONG (11) elements default to an exact long zero so a
-                    // read-before-write still behaves like a `long`.
-                    let empty = if atype == 11 {
-                        Value::Long(0)
-                    } else {
-                        Value::Int(0)
+                    // The element type's zero: an exact long zero for `long[]`,
+                    // an `f32`/`f64` zero for `float[]`/`double[]`, and the
+                    // neutral int otherwise.
+                    let empty = match atype {
+                        11 => Value::Long(0),
+                        6 | 7 => Value::Float(0.0),
+                        _ => Value::Int(0),
                     };
                     self.arrays.insert(marker.clone(), vec![empty; length]);
                     stack.push(Value::Ref(Some(marker)));
@@ -10264,7 +10577,17 @@ impl<H: Host> Runtime<'_, H> {
                         message: thrown_message(&thrown, self.host),
                     });
                 }
-                0xac..=0xb0 => return pop(&mut stack, class, method),
+                // `freturn`/`dreturn` round to the declared width so a host
+                // value that arrived as a `double` still answers as a `float`.
+                0xae => {
+                    let value = pop(&mut stack, class, method)?;
+                    return Ok(boxed_float(&value).map_or(value, float_value));
+                }
+                0xaf => {
+                    let value = pop(&mut stack, class, method)?;
+                    return Ok(boxed_float(&value).map_or(value, double_value));
+                }
+                0xac | 0xad | 0xb0 => return pop(&mut stack, class, method),
                 0xb1 => return Ok(Value::Void),
                 opcode => {
                     return Err(NativeError::UnsupportedOpcode {
@@ -10313,6 +10636,121 @@ fn pop_long(stack: &mut Vec<Value>, class: &str, method: &str) -> Result<i64, Na
         method: method.to_owned(),
         expected: "long",
     })
+}
+
+/// Pop a `float`/`double`, which is [`Value::Float`] or an `int`/`long` the
+/// value model never crossed a floating-point opcode with.
+fn pop_float(stack: &mut Vec<Value>, class: &str, method: &str) -> Result<f64, NativeError> {
+    let value = pop(stack, class, method)?;
+    boxed_float(&value).ok_or_else(|| NativeError::TypeMismatch {
+        class: class.to_owned(),
+        method: method.to_owned(),
+        expected: "floating-point value",
+    })
+}
+
+/// Whether the value occupies a category-2 slot for the stack opcodes.
+///
+/// A `long`/`double` is one entry in this interpreter's stack too, so `pop2`
+/// and the `dup2` family treat one as a whole category-2 value. A `float` is
+/// category 1 on a real JVM, but it shares [`Value::Float`] with `double`, so
+/// it follows the same rule here; `pop2` after a discarded `float` is not
+/// something javac emits.
+fn is_category_2(value: &Value) -> bool {
+    matches!(value, Value::Long(_) | Value::Float(_))
+}
+
+/// Collapse a floating-point comparison to the JVM's `-1`/`0`/`1`, where a
+/// `NaN` operand answers `-1` for `cmpl` and `+1` for `cmpg`.
+fn compare_float(lhs: f64, rhs: f64, nan_is_less: bool) -> i32 {
+    if lhs.is_nan() || rhs.is_nan() {
+        if nan_is_less { -1 } else { 1 }
+    } else if lhs < rhs {
+        -1
+    } else if lhs > rhs {
+        1
+    } else {
+        0
+    }
+}
+
+/// `Double.compare`/`Float.compare`: total order with `NaN` above every value
+/// and `-0.0` below `0.0`, unlike a raw `cmp`.
+fn compare_double(left: f64, right: f64) -> i32 {
+    if left < right {
+        return -1;
+    }
+    if left > right {
+        return 1;
+    }
+    if left == right {
+        return if left.to_bits() == right.to_bits() {
+            0
+        } else if left.is_sign_negative() {
+            -1
+        } else {
+            1
+        };
+    }
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => 0,
+        (true, false) => 1,
+        _ => -1,
+    }
+}
+
+/// `Float.floatToIntBits`: every NaN collapses to the canonical quiet NaN.
+fn java_float_bits(value: f64) -> u32 {
+    if value.is_nan() {
+        0x7fc0_0000
+    } else {
+        (value as f32).to_bits()
+    }
+}
+
+/// `Double.doubleToLongBits`: every NaN collapses to the canonical quiet NaN,
+/// which is what `Double.equals`/`hashCode` compare.
+fn java_double_bits(value: f64) -> u64 {
+    if value.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else {
+        value.to_bits()
+    }
+}
+
+/// `Math.max` for a floating-point pair: `NaN` wins, and `+0.0` beats `-0.0`
+/// (Rust's `f64::max` returns the receiver for the signed-zero tie).
+fn java_float_max(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() {
+        f64::NAN
+    } else if left == 0.0 && right == 0.0 {
+        if left.is_sign_positive() || right.is_sign_positive() {
+            0.0
+        } else {
+            -0.0
+        }
+    } else if left >= right {
+        left
+    } else {
+        right
+    }
+}
+
+/// The `Math.min` twin of [`java_float_max`].
+fn java_float_min(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() {
+        f64::NAN
+    } else if left == 0.0 && right == 0.0 {
+        if left.is_sign_negative() || right.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        }
+    } else if left <= right {
+        left
+    } else {
+        right
+    }
 }
 
 fn branch_target(
@@ -10494,21 +10932,20 @@ fn constant_value(pool: &[Cp], index: u16) -> Result<Value, NativeError> {
             x => Err(NativeError::InvalidConstant(index, format!("{x:?}"))),
         },
         Some(Cp::Integer(v)) => Ok(Value::Int(*v)),
-        Some(Cp::Float(v)) => Ok(Value::Int(*v as i32)),
+        Some(Cp::Float(v)) => Ok(Value::Float(f64::from(*v))),
         Some(Cp::Long(v)) => Ok(Value::Long(*v)),
-        Some(Cp::Double) => Ok(Value::Int(0)),
         x => Err(NativeError::InvalidConstant(index, format!("{x:?}"))),
     }
 }
 
 /// `ldc2_w`: the two-slot `long`/`double` constant load.
 ///
-/// A `long` keeps all 64 bits. A `double` still lands on the neutral integer
-/// placeholder the bounded value model uses for floating-point constants.
+/// A `long` keeps all 64 bits and a `double` keeps all its `f64` bits, so the
+/// constant pool never has to be re-read for a widened value.
 fn constant_wide_value(pool: &[Cp], index: u16) -> Result<Value, NativeError> {
     match pool.get(index as usize) {
         Some(Cp::Long(v)) => Ok(Value::Long(*v)),
-        Some(Cp::Double) => Ok(Value::Int(0)),
+        Some(Cp::Double(v)) => Ok(Value::Float(*v)),
         x => Err(NativeError::InvalidConstant(index, format!("{x:?}"))),
     }
 }
@@ -11040,11 +11477,11 @@ fn read_pool(r: &mut Reader<'_>) -> Result<Vec<Cp>, NativeError> {
                 Cp::Long(value)
             }
             6 => {
-                // Doubles use the same two-slot pool shape, but the bounded
-                // value model keeps them neutralised instead of widening a
-                // long, so `ldc2_w` never confuses one for a `long`.
-                r.skip(8)?;
-                Cp::Double
+                // Doubles use the same two-slot pool shape as longs; keep the
+                // exact `f64` bits so `ldc2_w` never confuses one for a long.
+                let high = r.u4()? as u64;
+                let low = r.u4()? as u64;
+                Cp::Double(f64::from_bits((high << 32) | low))
             }
             15 => {
                 let _ = r.u1()?;
@@ -13224,6 +13661,474 @@ mandatory = true
     }
 
     #[test]
+    fn float_opcodes_keep_exact_float_and_double_values() {
+        let method = |name: &str, descriptor: &str, locals: u16, code: Vec<u8>| Method {
+            name: name.into(),
+            descriptor: descriptor.into(),
+            access: 9,
+            code: Some(code),
+            max_locals: locals,
+            max_stack: 4,
+            annotations: Vec::new(),
+        };
+        let class = ClassFile {
+            name: "demo/FloatMath".into(),
+            super_name: "java/lang/Object".into(),
+            // 1: float 1.25, 2: double 0.1, 3: double 0.2, 4: double NaN,
+            // 5: long 2^32+1
+            pool: vec![
+                Cp::Empty,
+                Cp::Float(1.25),
+                Cp::Double(0.1),
+                Cp::Double(0.2),
+                Cp::Double(f64::NAN),
+                Cp::Long(4_294_967_297),
+            ],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![
+                // fconst_0/1/2 and the `fadd` result rounding to `f32`.
+                method("fconstZero", "()F", 0, vec![0x0b, 0xae]),
+                method("fconstOne", "()F", 0, vec![0x0c, 0xae]),
+                method("fconstTwo", "()F", 0, vec![0x0d, 0xae]),
+                method("fconstAdd", "()F", 0, vec![0x0c, 0x0d, 0x62, 0xae]),
+                // dconst_0/1 with `dsub`.
+                method("dconstSub", "()D", 0, vec![0x0e, 0x0f, 0x67, 0xaf]),
+                // `ldc` reads the float pool value, `ldc2_w` the double.
+                method("floatConstant", "()F", 0, vec![0x12, 0x01, 0xae]),
+                method("doubleConstant", "()D", 0, vec![0x14, 0x00, 0x02, 0xaf]),
+                method(
+                    "doubleAdd",
+                    "()D",
+                    0,
+                    // ldc2_w 0.1; ldc2_w 0.2; dadd
+                    vec![0x14, 0x00, 0x02, 0x14, 0x00, 0x03, 0x63, 0xaf],
+                ),
+                method(
+                    "doubleDiv",
+                    "()D",
+                    0,
+                    vec![0x14, 0x00, 0x02, 0x14, 0x00, 0x03, 0x6f, 0xaf],
+                ),
+                method(
+                    "doubleRem",
+                    "()D",
+                    0,
+                    vec![0x14, 0x00, 0x03, 0x14, 0x00, 0x02, 0x72, 0xaf],
+                ),
+                method("doubleNeg", "()D", 0, vec![0x14, 0x00, 0x02, 0x77, 0xaf]),
+                method("floatNeg", "()F", 0, vec![0x12, 0x01, 0x76, 0xae]),
+                // dcmpl/dcmpg/fcmpl/fcmpg, including the NaN answers.
+                method(
+                    "doubleCompareLess",
+                    "()I",
+                    0,
+                    vec![0x14, 0x00, 0x02, 0x14, 0x00, 0x03, 0x97, 0xac],
+                ),
+                method(
+                    "doubleCompareGreater",
+                    "()I",
+                    0,
+                    vec![0x14, 0x00, 0x03, 0x14, 0x00, 0x02, 0x98, 0xac],
+                ),
+                method(
+                    "nanCompareLess",
+                    "()I",
+                    0,
+                    vec![0x14, 0x00, 0x02, 0x14, 0x00, 0x04, 0x97, 0xac],
+                ),
+                method(
+                    "nanCompareGreater",
+                    "()I",
+                    0,
+                    vec![0x14, 0x00, 0x02, 0x14, 0x00, 0x04, 0x98, 0xac],
+                ),
+                method(
+                    "floatCompareLess",
+                    "()I",
+                    0,
+                    vec![0x0c, 0x12, 0x01, 0x95, 0xac],
+                ),
+                method(
+                    "floatCompareGreater",
+                    "()I",
+                    0,
+                    vec![0x12, 0x01, 0x0c, 0x96, 0xac],
+                ),
+                // Every numeric conversion the JVM defines for the widths.
+                method("intToFloat", "()F", 0, vec![0x10, 0x03, 0x86, 0xae]),
+                method("intToDouble", "()D", 0, vec![0x10, 0x03, 0x87, 0xaf]),
+                method("longToFloat", "()F", 0, vec![0x14, 0x00, 0x05, 0x89, 0xae]),
+                method("longToDouble", "()D", 0, vec![0x14, 0x00, 0x05, 0x8a, 0xaf]),
+                method("floatToInt", "()I", 0, vec![0x12, 0x01, 0x8b, 0xac]),
+                method("floatToLong", "()J", 0, vec![0x12, 0x01, 0x8c, 0xad]),
+                method("floatToDouble", "()D", 0, vec![0x12, 0x01, 0x8d, 0xaf]),
+                method("doubleToInt", "()I", 0, vec![0x14, 0x00, 0x02, 0x8e, 0xac]),
+                method("doubleToLong", "()J", 0, vec![0x14, 0x00, 0x02, 0x8f, 0xad]),
+                method(
+                    "doubleToFloat",
+                    "()F",
+                    0,
+                    vec![0x14, 0x00, 0x02, 0x90, 0xae],
+                ),
+                // A `float`/`double` local round trip (each wide local is two
+                // slots, and `dload_2`/`dstore_2` address the second).
+                method("doubleLocal", "(D)D", 4, vec![0x26, 0x49, 0x28, 0xaf]),
+                method("floatLocal", "(F)F", 2, vec![0x22, 0x44, 0x23, 0xae]),
+                // `new double[2]`/`new float[1]` with `daload`/`dastore`.
+                method(
+                    "doubleArray",
+                    "(D)D",
+                    3,
+                    vec![0x05, 0xbc, 0x07, 0x59, 0x03, 0x26, 0x52, 0x03, 0x31, 0xaf],
+                ),
+                method(
+                    "floatArray",
+                    "(F)F",
+                    2,
+                    vec![0x04, 0xbc, 0x06, 0x59, 0x03, 0x22, 0x51, 0x03, 0x30, 0xae],
+                ),
+                // A read-before-write element is the element type's zero.
+                method(
+                    "doubleArrayDefault",
+                    "()D",
+                    1,
+                    vec![0x04, 0xbc, 0x07, 0x03, 0x31, 0xaf],
+                ),
+                // `pop2`/`dup2` treat the wide value as one category-2 slot.
+                method("discardDouble", "()D", 0, vec![0x0f, 0x58, 0x0e, 0xaf]),
+                method("duplicateDouble", "()D", 0, vec![0x0f, 0x5c, 0x63, 0xaf]),
+            ],
+            annotations: Vec::new(),
+            raw: Vec::new(),
+        };
+        let jar = NativeJar::from_classes([class]);
+        let mut host = NullHost;
+        let mut call = |name: &str, descriptor: &str, args: &[Value]| {
+            jar.invoke_method_with_args("demo.FloatMath", name, descriptor, None, args, &mut host)
+                .unwrap()
+        };
+
+        assert_eq!(call("fconstZero", "()F", &[]), Value::Float(0.0));
+        assert_eq!(call("fconstOne", "()F", &[]), Value::Float(1.0));
+        assert_eq!(call("fconstTwo", "()F", &[]), Value::Float(2.0));
+        assert_eq!(call("fconstAdd", "()F", &[]), Value::Float(3.0));
+        assert_eq!(call("dconstSub", "()D", &[]), Value::Float(-1.0));
+        assert_eq!(call("floatConstant", "()F", &[]), Value::Float(1.25));
+        assert_eq!(call("doubleConstant", "()D", &[]), Value::Float(0.1));
+        assert_eq!(call("doubleAdd", "()D", &[]), Value::Float(0.1 + 0.2));
+        assert_eq!(call("doubleDiv", "()D", &[]), Value::Float(0.5));
+        assert_eq!(call("doubleRem", "()D", &[]), Value::Float(0.2 % 0.1));
+        assert_eq!(call("doubleNeg", "()D", &[]), Value::Float(-0.1));
+        assert_eq!(
+            call("floatNeg", "()F", &[]),
+            Value::Float(f64::from(-1.25f32))
+        );
+        assert_eq!(call("doubleCompareLess", "()I", &[]), Value::Int(-1));
+        assert_eq!(call("doubleCompareGreater", "()I", &[]), Value::Int(1));
+        assert_eq!(call("nanCompareLess", "()I", &[]), Value::Int(-1));
+        assert_eq!(call("nanCompareGreater", "()I", &[]), Value::Int(1));
+        assert_eq!(call("floatCompareLess", "()I", &[]), Value::Int(-1));
+        assert_eq!(call("floatCompareGreater", "()I", &[]), Value::Int(1));
+
+        assert_eq!(call("intToFloat", "()F", &[]), Value::Float(3.0));
+        assert_eq!(call("intToDouble", "()D", &[]), Value::Float(3.0));
+        assert_eq!(
+            call("longToFloat", "()F", &[]),
+            Value::Float(f64::from(4_294_967_297i64 as f32))
+        );
+        assert_eq!(
+            call("longToDouble", "()D", &[]),
+            Value::Float(4_294_967_297_f64)
+        );
+        assert_eq!(call("floatToInt", "()I", &[]), Value::Int(1));
+        assert_eq!(call("floatToLong", "()J", &[]), Value::Long(1));
+        assert_eq!(
+            call("floatToDouble", "()D", &[]),
+            Value::Float(f64::from(1.25f32))
+        );
+        assert_eq!(call("doubleToInt", "()I", &[]), Value::Int(0));
+        assert_eq!(call("doubleToLong", "()J", &[]), Value::Long(0));
+        assert_eq!(
+            call("doubleToFloat", "()F", &[]),
+            Value::Float(f64::from(0.1f32))
+        );
+
+        assert_eq!(
+            call("doubleLocal", "(D)D", &[Value::Float(0.1 + 0.2)]),
+            Value::Float(0.1 + 0.2)
+        );
+        assert_eq!(
+            call("floatLocal", "(F)F", &[Value::Float(1.25)]),
+            Value::Float(1.25)
+        );
+        assert_eq!(
+            call("doubleArray", "(D)D", &[Value::Float(0.1 + 0.2)]),
+            Value::Float(0.1 + 0.2)
+        );
+        assert_eq!(
+            call("floatArray", "(F)F", &[Value::Float(1.25)]),
+            Value::Float(1.25)
+        );
+        assert_eq!(call("doubleArrayDefault", "()D", &[]), Value::Float(0.0));
+        assert_eq!(call("discardDouble", "()D", &[]), Value::Float(0.0));
+        assert_eq!(call("duplicateDouble", "()D", &[]), Value::Float(2.0));
+
+        assert_eq!(Value::default_for("F"), Value::Float(0.0));
+        assert_eq!(Value::default_for("()F"), Value::Float(0.0));
+        assert_eq!(Value::default_for("D"), Value::Float(0.0));
+        assert_eq!(Value::default_for("()D"), Value::Float(0.0));
+    }
+
+    #[test]
+    fn standard_host_boxes_parses_and_prints_exact_floats() {
+        let mut host = StdHost::new();
+        let method = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+
+        // `Double.valueOf(D)` is the boxing site javac emits for `Double d = v`.
+        let boxed = host
+            .invoke(
+                &method("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;"),
+                &[Value::Float(0.1 + 0.2)],
+            )
+            .unwrap();
+        assert_eq!(boxed, Value::Float(0.1 + 0.2));
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Double", "doubleValue", "()D"),
+                &boxed,
+                &[],
+            )
+            .unwrap(),
+            Value::Float(0.1 + 0.2)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Double", "intValue", "()I"),
+                &Value::Float(-3.75),
+                &[],
+            )
+            .unwrap(),
+            Value::Int(-3)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Double", "longValue", "()J"),
+                &Value::Float(4_294_967_297.9),
+                &[],
+            )
+            .unwrap(),
+            Value::Long(4_294_967_297)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Double", "toString", "()Ljava/lang/String;"),
+                &Value::Float(0.1 + 0.2),
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("0.30000000000000004".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Double", "compareTo", "(Ljava/lang/Double;)I"),
+                &Value::Float(f64::NAN),
+                &[Value::Float(1.0)],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Double", "equals", "(Ljava/lang/Object;)Z"),
+                &Value::Float(f64::NAN),
+                &[Value::Float(f64::NAN)],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Double", "equals", "(Ljava/lang/Object;)Z"),
+                &Value::Float(0.0),
+                &[Value::Float(-0.0)],
+            )
+            .unwrap(),
+            Value::Int(0)
+        );
+
+        // `Float.valueOf(F)` rounds the argument to `f32`, and the boxed
+        // `Float.toString` prints the `f32` digits rather than the widened ones.
+        let boxed_float = host
+            .invoke(
+                &method("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;"),
+                &[Value::Float(0.1)],
+            )
+            .unwrap();
+        assert_eq!(boxed_float, Value::Float(f64::from(0.1f32)));
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Float", "toString", "()Ljava/lang/String;"),
+                &boxed_float,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("0.1".into()))
+        );
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/Float", "parseFloat", "(Ljava/lang/String;)F"),
+                &[Value::Ref(Some("1.25".into()))],
+            )
+            .unwrap(),
+            Value::Float(1.25)
+        );
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/Double", "parseDouble", "(Ljava/lang/String;)D"),
+                &[Value::Ref(Some("-Infinity".into()))],
+            )
+            .unwrap(),
+            Value::Float(f64::NEG_INFINITY)
+        );
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/Double", "isFinite", "(D)Z"),
+                &[Value::Float(f64::INFINITY)],
+            )
+            .unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/Float", "compare", "(FF)I"),
+                &[Value::Float(f64::from(f32::NAN)), Value::Float(1.0)],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/Double", "max", "(DD)D"),
+                &[Value::Float(2.5), Value::Float(-1.5)],
+            )
+            .unwrap(),
+            Value::Float(2.5)
+        );
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/Double", "min", "(DD)D"),
+                &[Value::Float(2.5), Value::Float(-1.5)],
+            )
+            .unwrap(),
+            Value::Float(-1.5)
+        );
+
+        // The static bounds keep their exact bits.
+        assert_eq!(
+            host.get_static(&method("java/lang/Double", "MAX_VALUE", "D"))
+                .unwrap(),
+            Value::Float(f64::MAX)
+        );
+        assert_eq!(
+            host.get_static(&method("java/lang/Float", "MAX_VALUE", "F"))
+                .unwrap(),
+            Value::Float(f64::from(f32::MAX))
+        );
+        // `MIN_VALUE` is the smallest subnormal, `MIN_NORMAL` the smallest
+        // normal, as in Java.
+        assert_eq!(
+            host.get_static(&method("java/lang/Double", "MIN_VALUE", "D"))
+                .unwrap(),
+            Value::Float(f64::from_bits(1))
+        );
+        assert_eq!(
+            host.get_static(&method("java/lang/Double", "MIN_NORMAL", "D"))
+                .unwrap(),
+            Value::Float(f64::MIN_POSITIVE)
+        );
+        assert_eq!(
+            host.get_static(&method("java/lang/Float", "MIN_VALUE", "F"))
+                .unwrap(),
+            Value::Float(f64::from(f32::from_bits(1)))
+        );
+
+        // `String.valueOf`, `StringBuilder.append` and `String.format("%f")`.
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/String", "valueOf", "(D)Ljava/lang/String;"),
+                &[Value::Float(0.1 + 0.2)],
+            )
+            .unwrap(),
+            Value::Ref(Some("0.30000000000000004".into()))
+        );
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/String", "valueOf", "(F)Ljava/lang/String;"),
+                &[Value::Float(0.1)],
+            )
+            .unwrap(),
+            Value::Ref(Some("0.1".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/lang/StringBuilder".into(),
+                    name: "append".into(),
+                    descriptor: "(D)Ljava/lang/StringBuilder;".into(),
+                },
+                &Value::Ref(Some("string-builder/fixture".into())),
+                &[Value::Float(0.1 + 0.2)],
+            )
+            .unwrap(),
+            Value::Ref(Some("string-builder/fixture0.30000000000000004".into()))
+        );
+        assert_eq!(format_java_decimal(1.5), "1.500000");
+        assert_eq!(format_java_decimal(f64::NAN), "NaN");
+        assert_eq!(format_java_decimal(f64::NEG_INFINITY), "-Infinity");
+    }
+
+    #[test]
+    fn float_value_markers_round_trip_for_callback_captures() {
+        let value = Value::Float(-0.30000000000000004);
+        assert_eq!(value_marker(&value), "f-0.30000000000000004");
+        assert_eq!(parse_value_marker(&value_marker(&value)).unwrap(), value);
+
+        // Non-finite captures keep the Java spelling and parse back exactly.
+        for special in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0] {
+            let value = Value::Float(special);
+            let marker = value_marker(&value);
+            let parsed = parse_value_marker(&marker).unwrap();
+            match (parsed, special) {
+                (Value::Float(parsed), special) => {
+                    assert_eq!(parsed.to_bits(), special.to_bits(), "marker {marker}")
+                }
+                other => panic!("expected a float capture, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn java_float_text_matches_double_to_string() {
+        assert_eq!(format_java_float(3.5), "3.5");
+        assert_eq!(format_java_float(1.0), "1.0");
+        assert_eq!(format_java_float(100.0), "100.0");
+        assert_eq!(format_java_float(0.001), "0.001");
+        assert_eq!(format_java_float(1e-4), "1.0E-4");
+        assert_eq!(format_java_float(1e7), "1.0E7");
+        assert_eq!(format_java_float(1234567.0), "1234567.0");
+        assert_eq!(format_java_float(-0.0), "-0.0");
+        assert_eq!(format_java_float(f64::MAX), "1.7976931348623157E308");
+        // `f32` shortest digits, not the widened `f64` spelling.
+        assert_eq!(format_java_float32(0.1), "0.1");
+        assert_eq!(format_java_float32(f64::from(f32::MAX)), "3.4028235E38");
+    }
+
+    #[test]
     fn standard_host_maps_character_queries_and_boxing() {
         let mut host = StdHost::new();
         let letter = MethodRef {
@@ -13435,7 +14340,7 @@ mandatory = true
     }
 
     #[test]
-    fn standard_host_maps_bounded_floating_point_wrappers() {
+    fn standard_host_maps_floating_point_wrappers() {
         let mut host = StdHost::new();
         let parse_double = MethodRef {
             owner: "java/lang/Double".into(),
@@ -13445,7 +14350,7 @@ mandatory = true
         let double = host
             .invoke(&parse_double, &[Value::Ref(Some("Infinity".into()))])
             .unwrap();
-        assert_eq!(double, Value::Ref(Some("double:inf".into())));
+        assert_eq!(double, Value::Float(f64::INFINITY));
         assert_eq!(
             host.invoke(
                 &MethodRef {
@@ -13480,7 +14385,7 @@ mandatory = true
                 &[Value::Ref(Some("1.25".into()))],
             )
             .unwrap();
-        assert_eq!(float, Value::Ref(Some("float:1.25".into())));
+        assert_eq!(float, Value::Float(1.25));
         assert_eq!(
             host.invoke_instance(
                 &MethodRef {
@@ -13524,7 +14429,7 @@ mandatory = true
                 .unwrap(),
             Value::Int(1)
         );
-        let floating = Value::Ref(Some("double:3.75".into()));
+        let floating = Value::Float(3.75);
         assert_eq!(
             host.invoke_instance(&number("intValue", "()I"), &floating, &[])
                 .unwrap(),
@@ -14238,9 +15143,7 @@ mandatory = true
             descriptor: "(D)Ljava/util/OptionalDouble;".into(),
         };
         let empty_double = host.invoke(&double_empty, &[]).unwrap();
-        let double = host
-            .invoke(&double_of, &[Value::Ref(Some("double:3.5".into()))])
-            .unwrap();
+        let double = host.invoke(&double_of, &[Value::Float(3.5)]).unwrap();
         assert_eq!(empty_double, Value::Ref(None));
         assert_eq!(double, Value::Ref(Some("optional-double/3.5".into())));
         let double_get = MethodRef {
@@ -14255,16 +15158,12 @@ mandatory = true
         };
         assert_eq!(
             host.invoke_instance(&double_get, &double, &[]).unwrap(),
-            Value::Ref(Some("double:3.5".into()))
+            Value::Float(3.5)
         );
         assert_eq!(
-            host.invoke_instance(
-                &double_or_else,
-                &empty_double,
-                &[Value::Ref(Some("double:2.25".into()))]
-            )
-            .unwrap(),
-            Value::Ref(Some("double:2.25".into()))
+            host.invoke_instance(&double_or_else, &empty_double, &[Value::Float(2.25)])
+                .unwrap(),
+            Value::Float(2.25)
         );
         let to_string = MethodRef {
             owner: "java/util/OptionalDouble".into(),
