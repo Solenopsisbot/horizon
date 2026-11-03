@@ -32,6 +32,10 @@ pub const MAX_SPAWN_HEIGHT: i32 = 2_048;
 /// (`GENERIC_9x6` with the inventory) is 90; a declared menu is capped well
 /// above the biggest station slot count so a row stays plainly bounded.
 pub const MAX_MENU_SLOTS: u32 = 256;
+/// The blocks that open one declared menu (`open_blocks`). A station is opened
+/// by a handful of blocks; 64 keeps the row bounded and matches
+/// [`MAX_BLOCK_ENTITY_BLOCKS`].
+pub const MAX_MENU_OPEN_BLOCKS: usize = 64;
 /// `BlockEntityType.validBlocks` for one declared type. Vanilla's longest
 /// list (the signs') stays far below this.
 pub const MAX_BLOCK_ENTITY_BLOCKS: usize = 64;
@@ -265,8 +269,8 @@ pub struct AttachmentDeclaration {
 
 /// A typed menu registration (`MenuType`): the id a server opens with
 /// `ClientboundOpenScreenPacket`, the translation key its title resolves
-/// through, and how many slots it holds. The live menu still belongs to the
-/// game; this row only names it.
+/// through, how many slots it holds, and the blocks that open it. The live
+/// menu still belongs to the game; this row only names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuDeclaration {
     pub id: String,
@@ -274,23 +278,32 @@ pub struct MenuDeclaration {
     pub title_key: String,
     /// Slots the menu holds, 0 to [`MAX_MENU_SLOTS`].
     pub slots: u32,
+    /// The blocks that open it, sorted and without repeats: a resource
+    /// location each, vanilla (`minecraft:barrel`) allowed. Empty leaves the
+    /// menu bound to no block.
+    pub open_blocks: Vec<String>,
 }
 
 impl MenuDeclaration {
     /// Parses one native menu row from the free-form keys a loader adapter
     /// records. `title_key` and `slots` are both required: a `MenuType`
-    /// without a title or a slot count has nothing to open. Every other key
-    /// is rejected so a typo cannot silently drop a constructor option.
+    /// without a title or a slot count has nothing to open. `open_blocks` is
+    /// optional (comma-separated block ids, at most
+    /// [`MAX_MENU_OPEN_BLOCKS`] of them, sorted and without repeats). Every
+    /// other key is rejected so a typo cannot silently drop a constructor
+    /// option.
     pub fn from_registry_properties(
         id: impl Into<String>,
         properties: &BTreeMap<String, String>,
     ) -> Result<Self, String> {
         let mut title_key = None;
         let mut slots = None;
+        let mut open_blocks = None;
         for (key, value) in properties {
             match key.as_str() {
                 "title_key" => title_key = Some(value.clone()),
                 "slots" => slots = Some(parse_u32(key, value)?),
+                "open_blocks" => open_blocks = Some(parse_open_blocks(value)?),
                 other => return Err(format!("unknown native menu property {other:?}")),
             }
         }
@@ -298,6 +311,7 @@ impl MenuDeclaration {
             id: id.into(),
             title_key: title_key.ok_or_else(|| "native menu has no title_key".to_owned())?,
             slots: slots.ok_or_else(|| "native menu has no slots".to_owned())?,
+            open_blocks: open_blocks.unwrap_or_default(),
         };
         menu.validate()?;
         Ok(menu)
@@ -305,7 +319,8 @@ impl MenuDeclaration {
 
     /// The fences a menu row passes whether the registry sink parsed it or it
     /// was built by hand: a namespaced id, a translation key (`a-z0-9_.-`,
-    /// bounded, no control characters) and 0 to [`MAX_MENU_SLOTS`] slots.
+    /// bounded, no control characters), 0 to [`MAX_MENU_SLOTS`] slots and up
+    /// to [`MAX_MENU_OPEN_BLOCKS`] distinct block ids.
     pub fn validate(&self) -> Result<(), String> {
         NativeDeclarations::ensure_id(&self.id)?;
         if self.title_key.is_empty()
@@ -325,6 +340,20 @@ impl MenuDeclaration {
                 "native menu {} slots is 0 to {MAX_MENU_SLOTS}",
                 self.id
             ));
+        }
+        if self.open_blocks.len() > MAX_MENU_OPEN_BLOCKS {
+            return Err(format!(
+                "native menu {} has at most {MAX_MENU_OPEN_BLOCKS} open blocks",
+                self.id
+            ));
+        }
+        let mut sorted = self.open_blocks.clone();
+        sorted.sort();
+        if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(format!("native menu {} open_blocks repeats an id", self.id));
+        }
+        for block in &self.open_blocks {
+            NativeDeclarations::ensure_id(block)?;
         }
         Ok(())
     }
@@ -1194,25 +1223,40 @@ fn parse_u32(key: &str, value: &str) -> Result<u32, String> {
 /// [`MAX_BLOCK_ENTITY_BLOCKS`] ids, each a resource location, sorted and
 /// without repeats.
 fn parse_valid_blocks(value: &str) -> Result<Vec<String>, String> {
-    let mut blocks = Vec::new();
+    parse_id_list(
+        "native block entity valid_blocks",
+        value,
+        MAX_BLOCK_ENTITY_BLOCKS,
+    )
+}
+
+/// A menu's `open_blocks` as a comma-separated list: at most
+/// [`MAX_MENU_OPEN_BLOCKS`] ids, each a resource location, sorted and without
+/// repeats, so metadata order cannot change the declaration.
+fn parse_open_blocks(value: &str) -> Result<Vec<String>, String> {
+    parse_id_list("native menu open_blocks", value, MAX_MENU_OPEN_BLOCKS)
+}
+
+/// A bounded comma-separated id list property: each entry is a resource
+/// location, the result is sorted and no id appears twice.
+fn parse_id_list(label: &str, value: &str, max: usize) -> Result<Vec<String>, String> {
+    let mut ids = Vec::new();
     for part in value.split(',') {
         let part = part.trim();
         if part.is_empty() {
-            return Err("native block entity valid_blocks has an empty id".to_owned());
+            return Err(format!("{label} has an empty id"));
         }
         NativeDeclarations::ensure_id(part)?;
-        blocks.push(part.to_owned());
-        if blocks.len() > MAX_BLOCK_ENTITY_BLOCKS {
-            return Err(format!(
-                "native block entity valid_blocks has more than {MAX_BLOCK_ENTITY_BLOCKS} ids"
-            ));
+        ids.push(part.to_owned());
+        if ids.len() > max {
+            return Err(format!("{label} has more than {max} ids"));
         }
     }
-    blocks.sort();
-    if blocks.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err("native block entity valid_blocks repeats an id".to_owned());
+    ids.sort();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(format!("{label} repeats an id"));
     }
-    Ok(blocks)
+    Ok(ids)
 }
 
 #[cfg(test)]
@@ -1888,7 +1932,12 @@ mod tests {
         let menu = custom(
             "menu",
             "ruby:crate",
-            &[("title_key", "container.ruby.crate"), ("slots", "27")],
+            &[
+                ("title_key", "container.ruby.crate"),
+                ("slots", "27"),
+                // Out of order and spaced: the row keeps a sorted set.
+                ("open_blocks", "ruby:crate_block, minecraft:barrel"),
+            ],
         );
         // Out of order and spaced: the row keeps a sorted set either way.
         let block_entity = custom(
@@ -1910,6 +1959,7 @@ mod tests {
                 id: "ruby:crate".into(),
                 title_key: "container.ruby.crate".into(),
                 slots: 27,
+                open_blocks: vec!["minecraft:barrel".into(), "ruby:crate_block".into()],
             }
         );
         assert_eq!(
@@ -1940,11 +1990,26 @@ mod tests {
                 &[("template", template), ("valid_blocks", blocks)],
             )
         };
+        let menu_with_open = |id: &str, blocks: &str| {
+            custom(
+                "menu",
+                id,
+                &[
+                    ("title_key", "container.ruby"),
+                    ("slots", "9"),
+                    ("open_blocks", blocks),
+                ],
+            )
+        };
         let mut declarations = NativeDeclarations::default();
         declarations
             .register_entries([&menu("ruby:crate", "container.ruby", "9")])
             .unwrap();
         let too_many = (0..=MAX_BLOCK_ENTITY_BLOCKS)
+            .map(|index| format!("ruby:b{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let too_many_blocks = (0..=MAX_MENU_OPEN_BLOCKS)
             .map(|index| format!("ruby:b{index}"))
             .collect::<Vec<_>>()
             .join(",");
@@ -1962,6 +2027,18 @@ mod tests {
                     &[("title_key", "ruby"), ("slots", "9"), ("tabs", "2")],
                 ),
                 "unknown native menu property",
+            ),
+            (
+                menu_with_open("ruby:repeat_blocks", "ruby:a,ruby:a"),
+                "open_blocks repeats an id",
+            ),
+            (
+                menu_with_open("ruby:bare_block", "crate"),
+                "has no namespace",
+            ),
+            (
+                menu_with_open("ruby:many_blocks", &too_many_blocks),
+                "more than",
             ),
             (
                 block_entity("ruby:template", "ruby:barrel", "ruby:crate"),
@@ -2002,5 +2079,68 @@ mod tests {
             .register_entries([&menu("ruby:crate", "container.ruby", "9")])
             .unwrap_err();
         assert!(error.contains("duplicate native menu"), "{error}");
+    }
+
+    #[test]
+    fn menu_open_blocks_parse_sorted_and_fenced() {
+        let menu = MenuDeclaration::from_registry_properties(
+            "ruby:crate",
+            &BTreeMap::from([
+                ("title_key".to_owned(), "container.ruby.crate".to_owned()),
+                ("slots".to_owned(), "27".to_owned()),
+                (
+                    "open_blocks".to_owned(),
+                    "ruby:crate_block, minecraft:barrel".to_owned(),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(menu.open_blocks, ["minecraft:barrel", "ruby:crate_block"]);
+        // Leaving the key out leaves the menu bound to no block.
+        let unbound = MenuDeclaration::from_registry_properties(
+            "ruby:loose",
+            &BTreeMap::from([
+                ("title_key".to_owned(), "container.ruby.loose".to_owned()),
+                ("slots".to_owned(), "0".to_owned()),
+            ]),
+        )
+        .unwrap();
+        assert!(unbound.open_blocks.is_empty());
+
+        let parse = |value: &str| {
+            MenuDeclaration::from_registry_properties(
+                "ruby:crate",
+                &BTreeMap::from([
+                    ("title_key".to_owned(), "container.ruby.crate".to_owned()),
+                    ("slots".to_owned(), "27".to_owned()),
+                    ("open_blocks".to_owned(), value.to_owned()),
+                ]),
+            )
+        };
+        for (value, why) in [
+            ("", "empty id"),
+            ("crate", "has no namespace"),
+            ("ruby:a,ruby:a", "repeats an id"),
+        ] {
+            let error = parse(value).unwrap_err();
+            assert!(error.contains(why), "{value:?}: {error}");
+        }
+        let too_many = (0..=MAX_MENU_OPEN_BLOCKS)
+            .map(|index| format!("ruby:b{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let error = parse(&too_many).unwrap_err();
+        assert!(error.contains("more than"), "{error}");
+
+        // A hand-built row passes the same fences.
+        let mut hand_built = menu.clone();
+        hand_built.open_blocks = vec!["ruby:a".into(), "ruby:a".into()];
+        assert!(hand_built.validate().is_err());
+        hand_built.open_blocks = vec!["crate".into()];
+        assert!(hand_built.validate().is_err());
+        hand_built.open_blocks = (0..=MAX_MENU_OPEN_BLOCKS)
+            .map(|index| format!("ruby:b{index}"))
+            .collect();
+        assert!(hand_built.validate().is_err());
     }
 }

@@ -263,6 +263,10 @@ struct MenuFile {
     format: Option<u32>,
     title_key: String,
     slots: u32,
+    /// The blocks that open it. Absent is an unbound menu, so a row written
+    /// before the binding existed still reads.
+    #[serde(default)]
+    open_blocks: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -430,6 +434,18 @@ impl Content {
             && self.native_files.is_empty()
     }
 
+    /// The menus a block opens, sorted by id: the game routes a block use to
+    /// one of them. Empty when no declared menu binds `block`.
+    pub fn menus_for_block(&self, block: &str) -> Vec<&MenuDeclaration> {
+        let mut menus: Vec<&MenuDeclaration> = self
+            .menus
+            .iter()
+            .filter(|menu| menu.open_blocks.iter().any(|open| open.as_str() == block))
+            .collect();
+        menus.sort_by(|a, b| a.id.cmp(&b.id));
+        menus
+    }
+
     /// Builds the declaration-only content half of a native Java mod.
     ///
     /// The resulting content has no source files, but it participates in the
@@ -439,8 +455,9 @@ impl Content {
     /// so they take no format marker. The typed rows carry a [`NATIVE_FORMAT`]
     /// marker: entities add their typed [`crate::native::SpawnRestriction`] and
     /// [`crate::native::EntityAttributes`] blocks, data components and
-    /// attachments their codec flags, menus their title key and slot count,
-    /// and block entities their vanilla template, ticker and valid blocks.
+    /// attachments their codec flags, menus their title key, slot count and the
+    /// blocks that open them, and block entities their vanilla template, ticker
+    /// and valid blocks.
     /// Custom registry kinds stay outside this vocabulary until Horizon has a
     /// typed adapter for them.
     pub fn from_native(
@@ -573,6 +590,28 @@ impl Content {
         }
         for block_entity in &declarations.block_entities {
             block_entity.validate()?;
+        }
+        // A menu names the blocks that open it, so the game can route a block
+        // use to a menu. Every id is one this content can open from: a block
+        // it declares, a vanilla block, or a block a declared block entity
+        // carries.
+        let carried_blocks: BTreeSet<&str> = declarations
+            .block_entities
+            .iter()
+            .flat_map(|block_entity| block_entity.valid_blocks.iter().map(String::as_str))
+            .collect();
+        for menu in &declarations.menus {
+            for block in &menu.open_blocks {
+                if !block_ids.contains(block)
+                    && !vanilla_id(block)
+                    && !carried_blocks.contains(block.as_str())
+                {
+                    return Err(format!(
+                        "native menu {} opens from {block}, which is not a declared block or a block entity's valid block",
+                        menu.id
+                    ));
+                }
+            }
         }
         if !declarations.custom.is_empty() {
             let mut details = declarations
@@ -809,6 +848,7 @@ impl Content {
                 "format": NATIVE_FORMAT,
                 "title_key": menu.title_key,
                 "slots": menu.slots,
+                "open_blocks": menu.open_blocks,
             });
             add_native_file(
                 file,
@@ -1060,10 +1100,14 @@ impl Content {
         for (id, name) in menu_files {
             let file: MenuFile = self.read_typed(&name)?;
             check_format(&name, file.format)?;
+            // The native sink sorts the block list; keep the row canonical.
+            let mut open_blocks = file.open_blocks;
+            open_blocks.sort();
             let menu = MenuDeclaration {
                 id,
                 title_key: file.title_key,
                 slots: file.slots,
+                open_blocks,
             };
             menu.validate().map_err(|e| format!("{name}: {e}"))?;
             push_row(&mut menus, menu.id.clone(), &name, menu)?;
@@ -1397,6 +1441,30 @@ capabilities = ["registries"]
     /// One native JSON file from a planned content.
     fn native_json(content: &Content, file: &str) -> serde_json::Value {
         serde_json::from_slice(content.native_files.get(file).unwrap()).unwrap()
+    }
+    /// A hand-built menu row, bound to `open_blocks`.
+    fn menu(id: &str, open_blocks: &[&str]) -> MenuDeclaration {
+        MenuDeclaration {
+            id: id.into(),
+            title_key: "container.ruby.crate".into(),
+            slots: 27,
+            open_blocks: open_blocks
+                .iter()
+                .map(|block| (*block).to_owned())
+                .collect(),
+        }
+    }
+    /// A declared block, so a menu has one to open from.
+    fn declared_block(id: &str) -> Block {
+        Block {
+            id: id.into(),
+            template: "minecraft:barrel".into(),
+            properties: BlockProperties::default(),
+            shapes: None,
+            default_state: BTreeMap::new(),
+            item: true,
+            components: BTreeMap::new(),
+        }
     }
     fn hmod(name: &str, manifest: &str, files: &[(&str, &[u8])]) -> Result<Content, String> {
         let dir = scratch(name);
@@ -1914,7 +1982,11 @@ capabilities = ["registries"]
         let menu = native_row(
             "menu",
             "ruby:crate",
-            &[("title_key", "container.ruby.crate"), ("slots", "27")],
+            &[
+                ("title_key", "container.ruby.crate"),
+                ("slots", "27"),
+                ("open_blocks", "ruby:crate_block,minecraft:barrel"),
+            ],
         );
         let block_entity = native_row(
             "block_entity",
@@ -1945,6 +2017,20 @@ capabilities = ["registries"]
         assert_eq!(menu["format"], NATIVE_FORMAT);
         assert_eq!(menu["title_key"], "container.ruby.crate");
         assert_eq!(menu["slots"], 27);
+        assert_eq!(
+            menu["open_blocks"],
+            serde_json::json!(["minecraft:barrel", "ruby:crate_block"])
+        );
+        // The accessor the game reads the binding through.
+        assert_eq!(
+            content
+                .menus_for_block("ruby:crate_block")
+                .iter()
+                .map(|menu| menu.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ruby:crate"]
+        );
+        assert!(content.menus_for_block("ruby:unbound").is_empty());
 
         let block_entity = native_json(&content, "data/ruby/horizon/block_entity/crate.json");
         assert_eq!(block_entity["format"], NATIVE_FORMAT);
@@ -1962,6 +2048,7 @@ capabilities = ["registries"]
             id: "ruby:crate".into(),
             title_key: "container.ruby".into(),
             slots: 9,
+            open_blocks: Vec::new(),
         };
         let error = Content::from_native(
             "ruby",
@@ -2006,6 +2093,85 @@ capabilities = ["registries"]
     }
 
     #[test]
+    fn native_menu_open_blocks_bind_declared_vanilla_and_block_entity_blocks() {
+        // A block of the mod's own and a vanilla block both bind.
+        let content = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![declared_block("ruby:crate_block")],
+                menus: vec![menu(
+                    "ruby:crate",
+                    &["minecraft:barrel", "ruby:crate_block"],
+                )],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            content.menus[0].open_blocks,
+            ["minecraft:barrel", "ruby:crate_block"]
+        );
+
+        // A block only a declared block entity carries binds too.
+        let content = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                menus: vec![menu("ruby:crate", &["ruby:elsewhere"])],
+                block_entities: vec![BlockEntityDeclaration {
+                    id: "ruby:crate_entity".into(),
+                    template: "minecraft:barrel".into(),
+                    ticker: false,
+                    valid_blocks: vec!["ruby:elsewhere".into()],
+                }],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(content.menus[0].open_blocks, ["ruby:elsewhere"]);
+
+        // Nothing declares it: the whole batch is refused, naming both.
+        let error = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![declared_block("ruby:crate_block")],
+                menus: vec![menu("ruby:crate", &["ruby:missing"])],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("native menu ruby:crate"), "{error}");
+        assert!(error.contains("ruby:missing"), "{error}");
+    }
+
+    #[test]
+    fn menus_for_block_lists_bound_menus_sorted_by_id() {
+        // Declared out of id order; one menu binds no block at all.
+        let content = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![declared_block("ruby:crate_block")],
+                menus: vec![
+                    menu("ruby:zeta", &["ruby:crate_block"]),
+                    menu("ruby:alpha", &["ruby:crate_block", "minecraft:barrel"]),
+                    menu("ruby:loose", &[]),
+                ],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap();
+        let ids = |block: &str| {
+            content
+                .menus_for_block(block)
+                .iter()
+                .map(|menu| menu.id.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids("ruby:crate_block"), ["ruby:alpha", "ruby:zeta"]);
+        assert_eq!(ids("minecraft:barrel"), ["ruby:alpha"]);
+        assert!(ids("ruby:unbound").is_empty());
+    }
+
+    #[test]
     fn native_declaration_files_round_trip_through_a_package() {
         let entity = native_row(
             "entity",
@@ -2035,7 +2201,11 @@ capabilities = ["registries"]
         let menu = native_row(
             "menu",
             "ruby:crate",
-            &[("title_key", "container.ruby.crate"), ("slots", "27")],
+            &[
+                ("title_key", "container.ruby.crate"),
+                ("slots", "27"),
+                ("open_blocks", "ruby:crate_block,minecraft:barrel"),
+            ],
         );
         let block_entity = native_row(
             "block_entity",
@@ -2306,6 +2476,14 @@ capabilities = ["registries"]
             r#"{"title_key": "container.ruby", "slots": 257}"#,
         );
         assert!(e.contains("slots is 0 to"), "{e}");
+
+        let e = refused(
+            "native-open-blocks",
+            "data/ruby/horizon/menu/a.json",
+            r#"{"title_key": "container.ruby", "slots": 9,
+                "open_blocks": ["ruby:a", "ruby:a"]}"#,
+        );
+        assert!(e.contains("open_blocks repeats an id"), "{e}");
 
         let e = refused(
             "native-codec",
