@@ -5811,6 +5811,135 @@ impl NativeJar {
         runtime.invoke(&class_name, method, descriptor, receiver, args)
     }
 
+    /// Execute one bounded native Mixin translation at a method head.
+    ///
+    /// The supported shape is the common callback form: a `void` callback
+    /// method runs before the target method, with the target's arguments and,
+    /// when present, a trailing `CallbackInfo` marker.  The marker is a
+    /// deterministic value owned by this runtime; it does not expose a Java
+    /// object graph or cancellation state.  Cancellable injections therefore
+    /// stay on the JVM fallback until a native callback-info implementation is
+    /// available.
+    pub fn execute_mixin_at_head<H: Host>(
+        &self,
+        plan: &MixinInjectionPlan,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        if plan.at != "HEAD" {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin translation supports only @Inject(at = HEAD), got {}",
+                plan.at
+            )));
+        }
+        if plan.cancellable {
+            return Err(NativeError::Metadata(
+                "native @Inject(at = HEAD) does not support cancellable callbacks".into(),
+            ));
+        }
+
+        let target_class = self.classes.get(&plan.target.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                plan.target.owner, plan.target.name, plan.target.descriptor
+            ))
+        })?;
+        let target_method = target_class
+            .method(&plan.target.name, &plan.target.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    plan.target.owner, plan.target.name, plan.target.descriptor
+                ))
+            })?;
+        if args.len() != arg_count(&plan.target.descriptor) {
+            return Err(NativeError::Metadata(format!(
+                "Mixin target {}#{}{} expected {} arguments, got {}",
+                plan.target.owner,
+                plan.target.name,
+                plan.target.descriptor,
+                arg_count(&plan.target.descriptor),
+                args.len()
+            )));
+        }
+
+        let callback_class = self.classes.get(&plan.callback.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                plan.callback.owner, plan.callback.name, plan.callback.descriptor
+            ))
+        })?;
+        let callback_method = callback_class
+            .method(&plan.callback.name, &plan.callback.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                ))
+            })?;
+        if return_desc(&plan.callback.descriptor) != "V" {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin callback {}#{}{} must return void",
+                plan.callback.owner, plan.callback.name, plan.callback.descriptor
+            )));
+        }
+
+        let target_args = descriptor_arguments(&plan.target.descriptor);
+        let callback_args = descriptor_arguments(&plan.callback.descriptor);
+        let mut callback_values = args.to_vec();
+        if callback_args == target_args {
+            // Exact argument mirroring is useful for injectors that target a
+            // static helper or a façade callback with no CallbackInfo value.
+        } else if callback_args.len() == target_args.len() + 1
+            && callback_args
+                .last()
+                .is_some_and(|arg| is_callback_info_descriptor(arg))
+            && callback_args[..target_args.len()] == target_args[..]
+        {
+            callback_values.push(Value::Ref(Some(format!(
+                "mixin/callback-info/{}#{}",
+                plan.target.owner, plan.target.name
+            ))));
+        } else {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin callback {}#{}{} must mirror target arguments and may add one trailing CallbackInfo",
+                plan.callback.owner, plan.callback.name, plan.callback.descriptor
+            )));
+        }
+
+        let callback_receiver = (!callback_method.is_static()).then(|| {
+            receiver
+                .clone()
+                .unwrap_or_else(|| Value::Ref(Some(plan.callback.owner.clone())))
+        });
+        let callback_result = self.invoke_method_with_args(
+            &plan.callback.owner,
+            &plan.callback.name,
+            &plan.callback.descriptor,
+            callback_receiver,
+            &callback_values,
+            host,
+        )?;
+        let target_receiver = (!target_method.is_static()).then(|| {
+            receiver
+                .clone()
+                .unwrap_or_else(|| Value::Ref(Some(plan.target.owner.clone())))
+        });
+        let target_result = self.invoke_method_with_args(
+            &plan.target.owner,
+            &plan.target.name,
+            &plan.target.descriptor,
+            target_receiver,
+            args,
+            host,
+        )?;
+        Ok(MixinExecutionReport {
+            callback_result,
+            target_result,
+        })
+    }
+
     /// Execute one listener work item produced by [`StdHost::dispatch_event`].
     ///
     /// The callback marker carries the resolved method handle and captured
@@ -7417,6 +7546,42 @@ fn arg_count(desc: &str) -> usize {
         n += 1;
     }
     n
+}
+
+fn descriptor_arguments(desc: &str) -> Vec<String> {
+    let Some(end) = desc.find(')') else {
+        return Vec::new();
+    };
+    let bytes = desc.as_bytes();
+    let mut at = 1;
+    let mut arguments = Vec::new();
+    while at < end {
+        let start = at;
+        while at < end && bytes[at] == b'[' {
+            at += 1;
+        }
+        if at >= end {
+            break;
+        }
+        if bytes[at] == b'L' {
+            while at < end && bytes[at] != b';' {
+                at += 1;
+            }
+            at = (at + 1).min(end);
+        } else {
+            at += 1;
+        }
+        arguments.push(desc[start..at].to_owned());
+    }
+    arguments
+}
+
+fn is_callback_info_descriptor(desc: &str) -> bool {
+    matches!(
+        desc,
+        "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;"
+            | "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable;"
+    )
 }
 
 fn neutral_args(desc: &str) -> Vec<Value> {
@@ -14743,5 +14908,191 @@ mandatory = true
             host.invoke_instance(&to_string, &error, &[]).unwrap(),
             Value::Ref(Some("IllegalStateException: bad state".into()))
         );
+    }
+
+    #[test]
+    fn executes_bounded_mixin_injection_at_head_before_target() {
+        let target = ClassFile {
+            name: "demo/Target".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "tick".into(),
+                descriptor: "()I".into(),
+                access: 9,
+                code: Some(vec![0x08, 0xac]), // iconst_5; ireturn
+                max_locals: 0,
+            }],
+        };
+        let callback = ClassFile {
+            name: "demo/Mixin".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "onTick".into(),
+                descriptor: "(Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;)V"
+                    .into(),
+                access: 9,
+                code: Some(vec![0xb1]),
+                max_locals: 1,
+            }],
+        };
+        let jar = NativeJar::from_classes([target, callback]);
+        let plan = MixinInjectionPlan::inject_at_head(
+            MethodRef {
+                owner: "demo/Target".into(),
+                name: "tick".into(),
+                descriptor: "()I".into(),
+            },
+            MethodRef {
+                owner: "demo/Mixin".into(),
+                name: "onTick".into(),
+                descriptor: "(Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;)V"
+                    .into(),
+            },
+        );
+        let report = jar
+            .execute_mixin_at_head(&plan, None, &[], &mut NullHost)
+            .unwrap();
+        assert_eq!(report.callback_result, Value::Void);
+        assert_eq!(report.target_result, Value::Int(5));
+    }
+
+    #[test]
+    fn standard_host_maps_fabric_entrypoint_containers() {
+        let mut host = StdHost::new()
+            .with_mod("demo", "1.2.3")
+            .with_fabric_entrypoint("main", "demo.Main", "demo")
+            .with_fabric_entrypoint("client", "demo.Client", "demo");
+        let loader = Value::Ref(Some("fabric-loader".into()));
+        let entries = MethodRef {
+            owner: "net/fabricmc/loader/api/FabricLoader".into(),
+            name: "getEntrypoints".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/util/List;".into(),
+        };
+        let main = host
+            .invoke_instance(&entries, &loader, &[Value::Ref(Some("main".into()))])
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/List".into(),
+                    name: "size".into(),
+                    descriptor: "()I".into(),
+                },
+                &main,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        let container = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "java/util/List".into(),
+                    name: "get".into(),
+                    descriptor: "(I)Ljava/lang/Object;".into(),
+                },
+                &main,
+                &[Value::Int(0)],
+            )
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/fabricmc/loader/api/EntrypointContainer".into(),
+                    name: "getEntrypointClass".into(),
+                    descriptor: "()Ljava/lang/Class;".into(),
+                },
+                &container,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("demo.Main".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "net/fabricmc/loader/api/EntrypointContainer".into(),
+                    name: "getProvider".into(),
+                    descriptor: "()Lnet/fabricmc/loader/api/ModContainer;".into(),
+                },
+                &container,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("mod-container/demo/1.2.3".into()))
+        );
+        let client = host
+            .invoke_instance(&entries, &loader, &[Value::Ref(Some("client".into()))])
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/List".into(),
+                    name: "size".into(),
+                    descriptor: "()I".into(),
+                },
+                &client,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert!(host.fabric_entrypoint_containers().iter().any(|entry| {
+            entry.kind == "client" && entry.class == "demo.Client" && entry.provider == "demo"
+        }));
+    }
+
+    #[test]
+    fn native_jar_seeds_fabric_entrypoint_containers() {
+        let jar = NativeJar {
+            fabric_id: Some("demo".into()),
+            fabric_version: Some("1.2.3".into()),
+            fabric_entrypoints: BTreeMap::from([(
+                "main".into(),
+                vec![Entrypoint {
+                    class: "demo.Main".into(),
+                    method: None,
+                    adapter: None,
+                }],
+            )]),
+            ..NativeJar::default()
+        };
+        let host = jar.seed_host(StdHost::new());
+        assert_eq!(
+            host.fabric_entrypoint_containers(),
+            &[FabricEntrypointContainer {
+                kind: "main".into(),
+                class: "demo.Main".into(),
+                provider: "demo".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_mixin_translation_contracts() {
+        let jar = NativeJar::default();
+        let mut plan = MixinInjectionPlan::inject_at_head(
+            MethodRef {
+                owner: "demo/Target".into(),
+                name: "tick".into(),
+                descriptor: "()V".into(),
+            },
+            MethodRef {
+                owner: "demo/Mixin".into(),
+                name: "onTick".into(),
+                descriptor: "()V".into(),
+            },
+        );
+        plan.at = "RETURN".into();
+        let error = jar
+            .execute_mixin_at_head(&plan, None, &[], &mut NullHost)
+            .unwrap_err();
+        assert!(error.to_string().contains("only @Inject(at = HEAD)"));
     }
 }

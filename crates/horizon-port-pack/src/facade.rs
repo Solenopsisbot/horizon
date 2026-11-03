@@ -1951,6 +1951,15 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     {
         return "return p0;".to_owned();
     }
+    if class == "net/minecraftforge/eventbus/api/IEventBus"
+        && ret == "net.minecraftforge.eventbus.api.IEventBus"
+    {
+        return "return this;".to_owned();
+    }
+    if class == "net/minecraftforge/eventbus/api/IEventBus" && method == "post" && ret == "boolean"
+    {
+        return "return false;".to_owned();
+    }
     if matches!(
         class,
         "net/neoforged/neoforge/capabilities/CapabilityManager"
@@ -4602,6 +4611,32 @@ mod tests {
                 "(Ljava/util/function/Function;)Ljava/lang/Object;",
             ),
             "return horizonReadIndex < horizonValues.size() ? horizonValues.get(horizonReadIndex++) : null;"
+        );
+    }
+
+    #[test]
+    fn legacy_forge_event_and_capability_aliases_are_emitted() {
+        let source = include_str!("facade.rs");
+        assert!(source.contains("let uses_legacy_forge = target.iter().any"));
+        assert!(source.contains("net/minecraftforge/eventbus/api/SubscribeEvent.java"));
+        assert!(source.contains("public static final IEventBus EVENT_BUS"));
+        assert!(source.contains("net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext.java"));
+        assert!(source.contains("net/minecraftforge/common/capabilities/ICapabilityProvider.java"));
+        assert_eq!(
+            runtime_body(
+                "net/minecraftforge/eventbus/api/IEventBus",
+                "register",
+                "net.minecraftforge.eventbus.api.IEventBus"
+            ),
+            "return this;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraftforge/eventbus/api/IEventBus",
+                "post",
+                "boolean"
+            ),
+            "return false;"
         );
     }
 

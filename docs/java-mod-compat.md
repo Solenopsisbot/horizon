@@ -519,6 +519,11 @@ event marker is cancelled; both loader families retain registration order.
 Legacy Forge event-bus owners (`net.minecraftforge.eventbus.api.IEventBus` and its `Event` descriptor) use the
 same bounded listener, cancellation, fluent-registration, and `post` behavior. This alias is deliberately
 limited to the event-bus surface; unrelated Forge APIs remain unsupported.
+Forge-only façade generation now also emits the stable `MinecraftForge.EVENT_BUS`,
+`FMLJavaModLoadingContext`/`ModContainer` accessors, `@SubscribeEvent` metadata, and
+`ICapabilityProvider` signatures. These are linkable bootstrap contracts; listener dispatch and live
+capability transfer still cross the native host boundary and remain bounded diagnostics until the
+server-thread bridge is attached.
 `PayloadRegistrar` now retains the registrar returned by one `RegisterPayloadHandlersEvent` and counts its
 play and configuration registrations in each direction, so payload bootstrap can inspect a stable
 registration object before the native channel boundary is attached.
