@@ -299,6 +299,8 @@ pub struct StdHost {
     /// become a live native capability until a game adapter supplies it.
     lazy_optionals: BTreeMap<String, Option<Value>>,
     capability_values: BTreeMap<String, Value>,
+    /// Seeded slot contents for bounded Forge/NeoForge IItemHandler markers.
+    item_handlers: BTreeMap<String, Vec<Value>>,
     capability_requests: Vec<CapabilityRequest>,
     /// Messages and causes captured by bounded Throwable constructors. The
     /// interpreter keeps objects as markers, so this small side table is
@@ -343,6 +345,7 @@ impl StdHost {
             iterators: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
+            item_handlers: BTreeMap::new(),
             capability_requests: Vec::new(),
             throwable_messages: BTreeMap::new(),
             throwable_causes: BTreeMap::new(),
@@ -628,6 +631,22 @@ impl StdHost {
             side: side.map(Into::into),
         };
         self.capability_values.insert(request.key(), value);
+    }
+
+    /// Seed a bounded item-handler marker with slot contents. Each slot is a
+    /// Java `ItemStack` marker; an absent slot is represented by `Ref(None)`.
+    /// This is explicit adapter state and never reads a live inventory.
+    pub fn seed_item_handler(
+        &mut self,
+        marker: impl Into<String>,
+        slots: impl IntoIterator<Item = Value>,
+    ) {
+        self.item_handlers.insert(marker.into(), slots.into_iter().collect());
+    }
+
+    /// Inspect explicitly seeded item-handler slots after a native callback.
+    pub fn item_handler_slots(&self, marker: &str) -> Option<&[Value]> {
+        self.item_handlers.get(marker).map(Vec::as_slice)
     }
 
     /// Capability lookups observed by the native runtime in invocation order.
@@ -1859,6 +1878,71 @@ impl Host for StdHost {
                     r.name, r.descriptor
                 ))),
             };
+        }
+        if is_item_handler_owner(&r.owner) {
+            let marker = expect_ref(receiver).ok_or_else(|| {
+                NativeError::Metadata("malformed item-handler marker".into())
+            })?;
+            let slots = self.item_handlers.get_mut(marker).ok_or_else(|| {
+                NativeError::Metadata(format!("unseeded item-handler marker {marker}"))
+            })?;
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getSlots", "()I") => return Ok(Value::Int(slots.len() as i32)),
+                ("getSlotLimit", "(I)I") => {
+                    let index = expect_int(r, Self::argument(r, args, 0)?)?;
+                    if index < 0 || index as usize >= slots.len() {
+                        return Err(NativeError::Metadata(format!(
+                            "item-handler slot {index} is outside {} slots",
+                            slots.len()
+                        )));
+                    }
+                    return Ok(Value::Int(64));
+                }
+                ("getStackInSlot", "(I)Lnet/minecraft/world/item/ItemStack;") => {
+                    let index = expect_int(r, Self::argument(r, args, 0)?)?;
+                    return Ok(slots
+                        .get(index as usize)
+                        .cloned()
+                        .unwrap_or(Value::Ref(None)));
+                }
+                ("isItemValid", "(ILnet/minecraft/world/item/ItemStack;)Z") => {
+                    let index = expect_int(r, Self::argument(r, args, 0)?)?;
+                    return Ok(Value::Int((index >= 0 && (index as usize) < slots.len()) as i32));
+                }
+                ("insertItem", "(ILnet/minecraft/world/item/ItemStack;Z)Lnet/minecraft/world/item/ItemStack;") => {
+                    let index = expect_int(r, Self::argument(r, args, 0)?)?;
+                    let stack = Self::argument(r, args, 1)?.clone();
+                    let simulate = expect_int(r, Self::argument(r, args, 2)?)? != 0;
+                    let Some(slot) = slots.get_mut(index as usize) else {
+                        return Ok(stack);
+                    };
+                    if simulate {
+                        return Ok(Value::Ref(None));
+                    }
+                    let previous = std::mem::replace(slot, stack);
+                    return Ok(match previous {
+                        Value::Ref(None) => Value::Ref(None),
+                        value => value,
+                    });
+                }
+                ("extractItem", "(IIZ)Lnet/minecraft/world/item/ItemStack;") => {
+                    let index = expect_int(r, Self::argument(r, args, 0)?)?;
+                    let amount = expect_int(r, Self::argument(r, args, 1)?)?;
+                    let simulate = expect_int(r, Self::argument(r, args, 2)?)? != 0;
+                    if amount <= 0 {
+                        return Ok(Value::Ref(None));
+                    }
+                    let Some(slot) = slots.get_mut(index as usize) else {
+                        return Ok(Value::Ref(None));
+                    };
+                    let value = slot.clone();
+                    if !simulate {
+                        *slot = Value::Ref(None);
+                    }
+                    return Ok(value);
+                }
+                _ => {}
+            }
         }
         if is_capability_owner(&r.owner) && r.name == "isRegistered" && r.descriptor == "()Z" {
             return Ok(Value::Int(1));
@@ -4816,6 +4900,14 @@ fn capability_text(value: &Value) -> String {
 // Forge and NeoForge kept the same bounded capability contracts while moving
 // the classes between packages. Treat the owner names as aliases, preserving
 // the marker semantics without fabricating a live capability implementation.
+fn is_item_handler_owner(owner: &str) -> bool {
+    matches!(
+        owner,
+        "net/neoforged/neoforge/items/IItemHandler"
+            | "net/minecraftforge/items/IItemHandler"
+    )
+}
+
 fn is_capability_manager_owner(owner: &str) -> bool {
     matches!(
         owner,
@@ -14478,6 +14570,72 @@ mandatory = true
                 codec: Value::Ref(Some("encoder".into())),
                 handler: Value::Ref(Some("handler".into())),
             }]
+        );
+    }
+
+    #[test]
+    fn standard_host_bridges_seeded_item_handler_slots() {
+        let mut host = StdHost::new();
+        let marker = "handler/items";
+        host.seed_item_handler(
+            marker,
+            [Value::Ref(Some("stack/iron".into())), Value::Ref(None)],
+        );
+        let receiver = Value::Ref(Some(marker.into()));
+        let method = |name: &str, descriptor: &str| MethodRef {
+            owner: "net/neoforged/neoforge/items/IItemHandler".into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&method("getSlots", "()I"), &receiver, &[])
+                .unwrap(),
+            Value::Int(2)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("getStackInSlot", "(I)Lnet/minecraft/world/item/ItemStack;"),
+                &receiver,
+                &[Value::Int(0)],
+            )
+            .unwrap(),
+            Value::Ref(Some("stack/iron".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method(
+                    "insertItem",
+                    "(ILnet/minecraft/world/item/ItemStack;Z)Lnet/minecraft/world/item/ItemStack;",
+                ),
+                &receiver,
+                &[
+                    Value::Int(1),
+                    Value::Ref(Some("stack/gold".into())),
+                    Value::Int(0),
+                ],
+            )
+            .unwrap(),
+            Value::Ref(None)
+        );
+        assert_eq!(
+            host.item_handler_slots(marker).unwrap(),
+            &[
+                Value::Ref(Some("stack/iron".into())),
+                Value::Ref(Some("stack/gold".into())),
+            ]
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("extractItem", "(IIZ)Lnet/minecraft/world/item/ItemStack;"),
+                &receiver,
+                &[Value::Int(1), Value::Int(1), Value::Int(0)],
+            )
+            .unwrap(),
+            Value::Ref(Some("stack/gold".into()))
+        );
+        assert_eq!(
+            host.item_handler_slots(marker).unwrap()[1],
+            Value::Ref(None)
         );
     }
 
