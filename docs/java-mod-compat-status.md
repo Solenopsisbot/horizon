@@ -2,14 +2,14 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 4 November 2026, commit `39b5cdee6`.
+Last checked: 4 November 2026, commit `39b5cdee6` (verified against NeoForge 26.3.0.101).
 
 ## Supported now
 
 - [x] Read Fabric `fabric.mod.json`, NeoForge `neoforge.mods.toml`, and legacy Forge `mods.toml` for bounded identity, dependencies, client-only markers, and entrypoint discovery.
 - [x] Discover and run multiple Fabric entrypoints in deterministic order, including object/array containers and the `main`, `client`, `server`, and `preLaunch` kinds. The JVM fallback rejects unknown entrypoint adapters before starting a JVM.
 - [x] Discover NeoForge and legacy Forge `@Mod` classes through the native probe path, including multiple classes in one jar.
-- [x] Run the real NeoForge/FML loader through `horizon-jvm`: `--real-loader --entry-kind neoforge` resolves the installed server's `unix_args` classpath/versions, runs FancyModLoader in a child JVM (discovery, Minecraft bootstrap, `IEventBus` mod construction, common init) and reports completion. The fixture verifies both the direct probe and this runner path against an installed NeoForge 26.1.2 server.
+- [x] Run the real NeoForge/FML loader through `horizon-jvm`: `--real-loader --entry-kind neoforge` resolves the installed server's `unix_args` classpath/versions, runs FancyModLoader in a child JVM (discovery, Minecraft bootstrap, `IEventBus` mod construction, common init) and reports completion. The fixture verifies both the direct probe and this runner path against installed NeoForge 26.3.0.101 and 26.1.2 servers.
 - [x] Probe the real NeoForge/FML loader: `tools/neoforge_loader_probe.py` drives FancyModLoader 11 against an installed NeoForge server, discovers a real `@Mod` jar, bootstraps Minecraft, constructs the mod with its `IEventBus`, and runs common initialization. This proves the FML lifecycle outside Horizon; wiring it into `horizon-jvm` and 26.3 remains.
 - [x] Run the real Fabric loader lifecycle: `--real-loader` installs a bounded launcher and game provider, calls `FabricLoaderImpl.load()`/`freeze()`, and invokes the loader's own entrypoint containers (`main`/`client`/`server`). `tools/fabric_loader_probe.py` builds a real `ModInitializer` jar and proves the loader discovers and runs it (4 mods, 1 entrypoint). Remapping and a production Minecraft game provider remain external.
 - [x] Run unsupported entrypoints through the embedded JVM runner as a fallback; `--list-entrypoints` reports discovery without starting a JVM, and NeoForge toml/jarJar/mixin markers are surfaced as diagnostics.
@@ -89,7 +89,7 @@ Last checked: 4 November 2026, commit `39b5cdee6`.
 ## Remaining work
 
 - [ ] Build an ABI corpus from representative Fabric, Forge, and NeoForge jars and rank missing calls by execution frequency.
-- [ ] Extend the FML path to a 26.3 install and a production Minecraft game provider; the Fabric path still uses a bounded test provider.
+- [ ] Fold the FML child-JVM path into game/dedicated-server startup and add a production Minecraft game provider; the Fabric path still uses a bounded test provider.
 - [ ] Emit a native hook or rewritten classfile for each supported Mixin plan, and add a JVM fallback for unsupported transforms (the translation pipeline currently stops at native invocation).
 - [ ] Add broader real-mod integration fixtures for registries, networking, capabilities, entities, menus, resource loading, and client/server separation; current fixtures cover client/server role rejection, typed inference, a Fabric API bootstrap, and typed content merging.
 - [ ] Connect translated callbacks to the generated typed native API and complete live registry synchronization across Horizon's server-thread and dedicated-server boundaries; integrated-server startup now runs bounded Java entrypoints with role diagnostics and rejects conflicting registry batches.
