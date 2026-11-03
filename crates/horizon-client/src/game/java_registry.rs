@@ -248,6 +248,31 @@ mod tests {
         assert_eq!(snapshot.entities, ["ruby:zombie"]);
         assert_eq!(snapshot.data_components, ["ruby:power"]);
         assert_eq!(snapshot.attachments, ["ruby:power"]);
+        assert_eq!(
+            snapshot.block_template("ruby:stone").unwrap().template,
+            "minecraft:stone"
+        );
+        assert_eq!(
+            snapshot.item_template("ruby:shard").unwrap().id,
+            "ruby:shard"
+        );
+        assert_eq!(
+            snapshot.entity("ruby:zombie").unwrap().template,
+            "minecraft:zombie"
+        );
+        assert_eq!(
+            snapshot.data_component("ruby:power").unwrap().codec,
+            "minecraft:int"
+        );
+        assert_eq!(
+            snapshot.attachment("ruby:power").unwrap().default_value,
+            "0"
+        );
+        assert!(snapshot.block_template("ruby:missing").is_none());
+        assert!(snapshot.item_template("ruby:missing").is_none());
+        assert!(snapshot.entity("ruby:missing").is_none());
+        assert!(snapshot.data_component("ruby:missing").is_none());
+        assert!(snapshot.attachment("ruby:missing").is_none());
         assert_eq!(*state().read().unwrap(), snapshot);
     }
 }
