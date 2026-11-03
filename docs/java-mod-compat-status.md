@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `019ebcd36`.
+Last checked: 3 November 2026, commit `1d8b64b59`.
 
 ## Supported now
 
@@ -48,7 +48,7 @@ Last checked: 3 November 2026, commit `019ebcd36`.
 
 - `horizon-native-java`: 100 unit tests passing, including bounded jar-resource stream reads and cursor operations, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection and bounded field metadata, TagKey values, bounded primitive optionals, custom payload type identity, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries, and bounded Map.Entry equality/hashing.
 - `horizon-mods`: 29 unit tests passing, plus the runtime-built typed declaration adapter fixture.
-- `horizon-port-pack`: 167 unit tests passing, including Mixin `@At`/slice boundary metadata and values, config edge values, Mixin Extras injector normalization, loader ABI classification, Mojang codec/datafixer ABI coverage, native declaration-kind reporting, deduplicated Mixin hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, sealed InteractionResult façade values, BlockHitResult state coverage, FriendlyByteBuf façade values, and descriptor normalization coverage.
+- `horizon-port-pack`: 167 unit tests passing, including Mixin `@At`/slice boundary metadata and values (including descriptor-bearing `@At(target:...)` selectors), config edge values, Mixin Extras injector normalization, loader ABI classification, Mojang codec/datafixer ABI coverage, native declaration-kind reporting, deduplicated Mixin hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, sealed InteractionResult façade values, BlockHitResult state coverage, FriendlyByteBuf façade values, and descriptor normalization coverage.
 - `horizon-jvm`: 9 unit tests passing, including explicit fallback labels, static-initialization fallback diagnostics, and NeoForge constructor-only entry selection.
 - `horizon-client` game mod tests: 12 passing, including bundled-resource loading, typed content, client/server role selection, and client-only NeoForge rejection.
 - Workspace check, full client clippy, compatibility-crate clippy, formatting, and `tools/native_java_smoke.py` passing with compiled OptionalLong/OptionalDouble paths.
