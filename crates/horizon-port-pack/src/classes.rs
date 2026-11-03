@@ -288,6 +288,339 @@ pub fn read_jar(path: &Path) -> Result<Vec<Class>, String> {
     Ok(classes)
 }
 
+/// A Fabric access widener, parsed but not yet applied: the classes and
+/// members a mod says the game's own code may reach. The census reports the
+/// files and their namespaces (`census::access_widener_targets`);
+/// `apply_access_widener` turns them into the flags on parsed classes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessWidener {
+    /// The naming the entries use (`named`, `intermediary`). Since 26.1 the
+    /// game is named, so only `named` matches without a remap; remapping is
+    /// the caller's business, nothing here rewrites a name.
+    pub namespace: String,
+    /// In file order, duplicates kept: applying the same entry twice is not
+    /// an error, it changes nothing the second time.
+    pub entries: Vec<AccessWidenerEntry>,
+}
+
+/// One `accessible`/`extendable` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessWidenerEntry {
+    pub kind: AccessWidenerKind,
+    pub access: AccessWidenerAccess,
+    /// An internal name: `net/minecraft/world/level/block/Block`.
+    pub owner: String,
+    /// The member's name, empty for a class entry.
+    pub name: String,
+    /// `None` widens every member of that name (all overloads); a class entry
+    /// never carries one.
+    pub descriptor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AccessWidenerKind {
+    Class,
+    Method,
+    Field,
+}
+
+impl AccessWidenerKind {
+    /// How an error names the entry.
+    fn label(self) -> &'static str {
+        match self {
+            AccessWidenerKind::Class => "class",
+            AccessWidenerKind::Method => "method",
+            AccessWidenerKind::Field => "field",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AccessWidenerAccess {
+    /// Callers outside the declaring class may use it.
+    Accessible,
+    /// Subclasses outside the declaring class may extend it.
+    Extendable,
+}
+
+/// JVM access flags an access widener rewrites.
+const ACC_PUBLIC: u16 = 0x0001;
+const ACC_PRIVATE: u16 = 0x0002;
+const ACC_PROTECTED: u16 = 0x0004;
+const ACC_FINAL: u16 = 0x0010;
+
+/// The most text read, and the most entries taken from it. A 1 MiB file holds
+/// at most ~55k entries of even the shortest line (`accessible class a`), so
+/// the entry bound is the one that can fire: 16k is still far past any real
+/// widener and keeps the second guard reachable, and testable.
+const ACCESS_WIDENER_TEXT_MAX: usize = 1024 * 1024;
+const ACCESS_WIDENER_ENTRIES_MAX: usize = 16 * 1024;
+
+/// Reads a Fabric access widener's v1 or v2 text: a header naming the
+/// namespace, then one `accessible`/`extendable` line per class or member.
+/// `#` starts a comment and blank lines are skipped; v2's `transitive-` and
+/// `mixin.` forms are not applied and are rejected with the line that uses
+/// them, as is any version but v1 and v2.
+pub fn parse_access_widener(text: &str) -> Result<AccessWidener, String> {
+    if text.len() > ACCESS_WIDENER_TEXT_MAX {
+        return Err(format!(
+            "access widener is {} bytes, the limit is {ACCESS_WIDENER_TEXT_MAX}",
+            text.len()
+        ));
+    }
+    let mut widener = AccessWidener {
+        namespace: String::new(),
+        entries: Vec::new(),
+    };
+    let mut header = false;
+    for (index, raw) in text.lines().enumerate() {
+        let number = index + 1;
+        let line = raw.split_once('#').map_or(raw, |(before, _)| before).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !header {
+            widener.namespace = access_widener_header(line, number)?;
+            header = true;
+            continue;
+        }
+        if widener.entries.len() >= ACCESS_WIDENER_ENTRIES_MAX {
+            return Err(format!(
+                "line {number}: more than {ACCESS_WIDENER_ENTRIES_MAX} entries"
+            ));
+        }
+        widener.entries.push(access_widener_entry(line, number)?);
+    }
+    if !header {
+        return Err("missing the `accessWidener v1 <namespace>` header".to_owned());
+    }
+    Ok(widener)
+}
+
+/// The namespace of the header line, which must be the first thing in the
+/// file that is not a comment.
+fn access_widener_header(line: &str, number: usize) -> Result<String, String> {
+    let mut fields = line.split_whitespace();
+    if fields.next() != Some("accessWidener") {
+        return Err(format!(
+            "line {number}: expected `accessWidener v1 <namespace>`"
+        ));
+    }
+    let Some(version) = fields.next() else {
+        return Err(format!("line {number}: the header names no version"));
+    };
+    if version != "v1" && version != "v2" {
+        return Err(format!(
+            "line {number}: unsupported access widener version `{version}` (only v1 and v2)"
+        ));
+    }
+    let Some(namespace) = fields.next() else {
+        return Err(format!("line {number}: the header names no namespace"));
+    };
+    if namespace.len() > 32
+        || !namespace
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    {
+        return Err(format!(
+            "line {number}: `{namespace}` is not an access widener namespace"
+        ));
+    }
+    if fields.next().is_some() {
+        return Err(format!("line {number}: text after the header"));
+    }
+    Ok(namespace.to_owned())
+}
+
+fn access_widener_entry(line: &str, number: usize) -> Result<AccessWidenerEntry, String> {
+    let mut fields = line.split_whitespace();
+    let Some(word) = fields.next() else {
+        return Err(format!("line {number}: empty entry"));
+    };
+    let access = match word {
+        "accessible" => AccessWidenerAccess::Accessible,
+        "extendable" => AccessWidenerAccess::Extendable,
+        _ if word.starts_with("transitive-") => {
+            return Err(format!(
+                "line {number}: `{word}`: transitive wideners are not applied"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "line {number}: `{word}` is not `accessible` or `extendable`"
+            ));
+        }
+    };
+    let Some(word) = fields.next() else {
+        return Err(format!("line {number}: the entry names no kind"));
+    };
+    let kind = match word {
+        "class" => AccessWidenerKind::Class,
+        "method" => AccessWidenerKind::Method,
+        "field" => AccessWidenerKind::Field,
+        _ if word.starts_with("mixin.") => {
+            return Err(format!(
+                "line {number}: `{word}`: mixin targets are not applied"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "line {number}: `{word}` is not `class`, `method` or `field`"
+            ));
+        }
+    };
+    let Some(owner) = fields.next() else {
+        return Err(format!("line {number}: the entry names no class"));
+    };
+    if !is_internal_name(owner) {
+        return Err(format!(
+            "line {number}: `{owner}` is not an internal class name"
+        ));
+    }
+    let mut entry = AccessWidenerEntry {
+        kind,
+        access,
+        owner: owner.to_owned(),
+        name: String::new(),
+        descriptor: None,
+    };
+    if kind == AccessWidenerKind::Class {
+        if fields.next().is_some() {
+            return Err(format!("line {number}: a class entry names no member"));
+        }
+        return Ok(entry);
+    }
+    let Some(name) = fields.next() else {
+        return Err(format!(
+            "line {number}: a {} entry names no member",
+            kind.label()
+        ));
+    };
+    if name.len() > 256
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '<' | '>'))
+    {
+        return Err(format!("line {number}: `{name}` is not a member name"));
+    }
+    entry.name = name.to_owned();
+    if let Some(descriptor) = fields.next() {
+        if !is_descriptor(descriptor) {
+            return Err(format!("line {number}: `{descriptor}` is not a descriptor"));
+        }
+        entry.descriptor = Some(descriptor.to_owned());
+    }
+    if fields.next().is_some() {
+        return Err(format!(
+            "line {number}: text after the {} entry",
+            kind.label()
+        ));
+    }
+    Ok(entry)
+}
+
+/// A bounded JVM internal name, `/`-separated, as the class file writes it.
+fn is_internal_name(text: &str) -> bool {
+    text.len() <= 512
+        && !text.starts_with('/')
+        && !text.ends_with('/')
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '/'))
+}
+
+/// A bounded JVM descriptor: `()V`, `(I)I`, `Lnet/minecraft/item/Item;`.
+fn is_descriptor(text: &str) -> bool {
+    text.len() <= 1024
+        && text.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '(' | ')' | '[' | ';' | '/' | '_' | '$')
+        })
+}
+
+/// Applies a widener to parsed classes, returning the number of declarations
+/// whose flags changed: a class entry counts as one, each widened member as
+/// one. Matching is by the names the classes carry, so the namespace is
+/// recorded and not acted on.
+///
+/// A target no class or member matches is an error naming it: a widener that
+/// silently widened nothing must not read as applied. The caller therefore
+/// passes every class the widener targets, the jar's own and the game's where
+/// they have been read.
+pub fn apply_access_widener(
+    classes: &mut [Class],
+    widener: &AccessWidener,
+) -> Result<usize, String> {
+    let mut changed = 0;
+    for entry in &widener.entries {
+        let Some(class) = classes.iter_mut().find(|class| class.name == entry.owner) else {
+            return Err(format!("{}: no class of that name was read", entry.owner));
+        };
+        if entry.kind == AccessWidenerKind::Class {
+            if widen(&mut class.access, entry.access) {
+                changed += 1;
+            }
+            continue;
+        }
+        let mut matched = 0;
+        for declared in &mut class.declared {
+            if declared.name != entry.name || !kind_matches(declared, entry.kind) {
+                continue;
+            }
+            if entry
+                .descriptor
+                .as_ref()
+                .is_some_and(|descriptor| declared.descriptor != *descriptor)
+            {
+                continue;
+            }
+            matched += 1;
+            if widen(&mut declared.access, entry.access) {
+                changed += 1;
+            }
+        }
+        if matched == 0 {
+            return Err(match &entry.descriptor {
+                Some(descriptor) => format!(
+                    "{}#{} {descriptor}: no such {} declared",
+                    entry.owner,
+                    entry.name,
+                    entry.kind.label()
+                ),
+                None => format!(
+                    "{}#{}: no such {} declared",
+                    entry.owner,
+                    entry.name,
+                    entry.kind.label()
+                ),
+            });
+        }
+    }
+    Ok(changed)
+}
+
+/// A `method` entry names methods (constructors included); a `field` entry
+/// names fields.
+fn kind_matches(declared: &Declared, kind: AccessWidenerKind) -> bool {
+    match kind {
+        AccessWidenerKind::Field => declared.kind == MemberKind::Field,
+        AccessWidenerKind::Method => declared.kind != MemberKind::Field,
+        AccessWidenerKind::Class => false,
+    }
+}
+
+/// Widens one declaration's flags: `accessible` drops the narrower access,
+/// `extendable` does the same and lets subclasses in too. Returns whether
+/// anything changed, so a second application counts nothing.
+fn widen(access: &mut u16, widening: AccessWidenerAccess) -> bool {
+    let before = *access;
+    *access &= !(ACC_PRIVATE | ACC_PROTECTED);
+    *access |= ACC_PUBLIC;
+    if widening == AccessWidenerAccess::Extendable {
+        *access &= !ACC_FINAL;
+    }
+    *access != before
+}
+
 /// The constant pool, with the entries a class file's members and
 /// annotations need.
 #[derive(Default)]
@@ -1747,5 +2080,279 @@ mod tests {
         ];
         let code = census(files.iter().map(Vec::as_slice));
         assert!(!code.behaviour(), "{code:?}");
+    }
+
+    /// A `Class` with the access flags and declarations the widener tests
+    /// need; the class file reader is exercised by the tests above.
+    fn widened(name: &str, access: u16, declared: Vec<Declared>) -> Class {
+        Class {
+            name: name.to_owned(),
+            access,
+            declared,
+            ..Class::default()
+        }
+    }
+
+    fn member(kind: MemberKind, name: &str, descriptor: &str, access: u16) -> Declared {
+        Declared {
+            name: name.to_owned(),
+            descriptor: descriptor.to_owned(),
+            access,
+            kind,
+        }
+    }
+
+    fn apply(classes: &mut [Class], text: &str) -> Result<usize, String> {
+        let widener = parse_access_widener(text)?;
+        apply_access_widener(classes, &widener)
+    }
+
+    #[test]
+    fn parses_access_widener_lines_comments_and_blanks() {
+        let text = "\
+# a mod's widener
+accessWidener v1 named
+
+accessible class net/minecraft/world/level/block/Block  # the whole class
+accessible method net/minecraft/world/level/block/Block getStateForPlacement (Lnet/minecraft/world/item/ItemStack;)Lnet/minecraft/world/level/block/state/BlockState;
+extendable field a/B f I
+accessible field a/B g
+";
+        let widener = parse_access_widener(text).expect("the fixture is a v1 widener");
+        assert_eq!(widener.namespace, "named");
+        assert_eq!(widener.entries.len(), 4);
+        assert_eq!(
+            widener.entries[0],
+            AccessWidenerEntry {
+                kind: AccessWidenerKind::Class,
+                access: AccessWidenerAccess::Accessible,
+                owner: "net/minecraft/world/level/block/Block".to_owned(),
+                name: String::new(),
+                descriptor: None,
+            }
+        );
+        assert_eq!(widener.entries[1].kind, AccessWidenerKind::Method);
+        assert_eq!(
+            widener.entries[1].descriptor.as_deref(),
+            Some(
+                "(Lnet/minecraft/world/item/ItemStack;)Lnet/minecraft/world/level/block/state/BlockState;"
+            )
+        );
+        assert_eq!(widener.entries[2].access, AccessWidenerAccess::Extendable);
+        assert_eq!(widener.entries[2].descriptor.as_deref(), Some("I"));
+        assert_eq!(widener.entries[3].kind, AccessWidenerKind::Field);
+        assert_eq!(widener.entries[3].descriptor, None);
+    }
+
+    #[test]
+    fn accepts_v2_headers_and_rejects_unknown_versions() {
+        let widener =
+            parse_access_widener("accessWidener v2 intermediary\naccessible class a/B\n").unwrap();
+        assert_eq!(widener.namespace, "intermediary");
+        assert_eq!(widener.entries.len(), 1);
+        let error = |text: &str| parse_access_widener(text).unwrap_err();
+        assert!(error("accessWidener v3 named\n").contains("v3"));
+        assert!(error("AccessWidener v1 named\n").contains("line 1"));
+        assert!(error("accessWidener v1\n").contains("namespace"));
+        assert!(error("accessWidener v1 named extra\n").contains("after the header"));
+        assert!(error("accessWidener v1 a/b\n").contains("not an access widener namespace"));
+        assert!(error("accessible class a/B\n").contains("accessWidener v1"));
+        assert!(error("").contains("missing the `accessWidener v1"));
+        // A header with no entry is an empty widener, not an error.
+        let empty = parse_access_widener("accessWidener v1 named\n").unwrap();
+        assert!(empty.entries.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_access_widener_entries() {
+        let error = |text: &str| parse_access_widener(text).unwrap_err();
+        let header = "accessWidener v1 named\n";
+        assert!(error(&format!("{header}mutable class a/B\n")).contains("line 2"));
+        assert!(
+            error(&format!("{header}transitive-accessible class a/B\n")).contains("transitive")
+        );
+        assert!(error(&format!("{header}accessible mixin.class a/B\n")).contains("mixin"));
+        assert!(error(&format!("{header}accessible class a/B extra\n")).contains("no member"));
+        assert!(error(&format!("{header}accessible class ../B\n")).contains("internal class name"));
+        assert!(error(&format!("{header}accessible method a/B\n")).contains("no member"));
+        assert!(error(&format!("{header}accessible field a/B f I extra\n")).contains("text after"));
+        assert!(error(&format!("{header}accessible field a/B f !\n")).contains("descriptor"));
+        assert!(error(&format!("{header}accessible\n")).contains("no kind"));
+        // An entry with no descriptor widens every overload: valid.
+        let widener =
+            parse_access_widener(&format!("{header}accessible method a/B run\n")).unwrap();
+        assert_eq!(widener.entries[0].descriptor, None);
+    }
+
+    #[test]
+    fn rejects_oversized_access_wideners() {
+        let big = format!(
+            "accessWidener v1 named\n#{}",
+            "x".repeat(ACCESS_WIDENER_TEXT_MAX)
+        );
+        assert!(parse_access_widener(&big).unwrap_err().contains("limit"));
+        let mut many = String::from("accessWidener v1 named\n");
+        for _ in 0..=ACCESS_WIDENER_ENTRIES_MAX {
+            many.push_str("accessible class a\n");
+        }
+        let message = parse_access_widener(&many).unwrap_err();
+        assert!(message.contains("more than 16384 entries"), "{message}");
+    }
+
+    #[test]
+    fn widens_class_and_member_access_flags() {
+        let mut classes = [widened(
+            "m/Tile",
+            0x0002 | 0x0010, // private final
+            vec![
+                member(MemberKind::Field, "f", "I", 0x0002 | 0x0010),
+                member(MemberKind::Method, "run", "()V", 0x0004),
+            ],
+        )];
+        let changed = apply(
+            &mut classes,
+            "\
+accessWidener v1 named
+extendable class m/Tile
+accessible field m/Tile f I
+extendable method m/Tile run ()V
+",
+        )
+        .expect("every target is there");
+        assert_eq!(changed, 3);
+        assert_eq!(classes[0].access, ACC_PUBLIC); // extendable drops final
+        // `accessible` keeps `final`: only `extendable` clears it.
+        assert_eq!(classes[0].declared[0].access, ACC_PUBLIC | ACC_FINAL);
+        assert_eq!(classes[0].declared[1].access, ACC_PUBLIC);
+    }
+
+    #[test]
+    fn widens_members_with_and_without_descriptors() {
+        let mut classes = [widened(
+            "m/Tile",
+            ACC_PUBLIC,
+            vec![
+                member(MemberKind::Method, "get", "()V", 0x0002 | 0x0010),
+                member(MemberKind::Method, "get", "(I)V", 0x0002 | 0x0010),
+                member(MemberKind::Field, "get", "I", 0x0002),
+            ],
+        )];
+        // A descriptor picks one overload and leaves the other alone.
+        let changed = apply(
+            &mut classes,
+            "accessWidener v1 named\nextendable method m/Tile get (I)V\n",
+        )
+        .unwrap();
+        assert_eq!(changed, 1);
+        assert_eq!(classes[0].declared[0].access, 0x0002 | 0x0010);
+        assert_eq!(classes[0].declared[1].access, ACC_PUBLIC);
+        // The same name as a field is not a method target.
+        assert_eq!(classes[0].declared[2].access, 0x0002);
+        // No descriptor widens every overload of the name.
+        let changed = apply(
+            &mut classes,
+            "accessWidener v1 named\naccessible method m/Tile get\n",
+        )
+        .unwrap();
+        assert_eq!(changed, 1, "only the still-private overload changed");
+        // `accessible` keeps `final`; the descriptor-picked overload was
+        // widened with `extendable`, so its `final` is already gone.
+        assert_eq!(classes[0].declared[0].access, ACC_PUBLIC | ACC_FINAL);
+        assert_eq!(classes[0].declared[1].access, ACC_PUBLIC);
+        assert_eq!(classes[0].declared[2].access, 0x0002);
+    }
+
+    #[test]
+    fn widener_keeps_constructors() {
+        let mut classes = [widened(
+            "m/Tile",
+            ACC_PUBLIC,
+            vec![
+                member(MemberKind::Method, "<init>", "(I)V", 0x0002),
+                member(MemberKind::Method, "<clinit>", "()V", 0x0008),
+                member(MemberKind::Method, "run", "()V", 0x0002),
+            ],
+        )];
+        let before: Vec<String> = classes[0]
+            .declared
+            .iter()
+            .map(|declared| format!("{} {}", declared.name, declared.descriptor))
+            .collect();
+        let changed = apply(
+            &mut classes,
+            "\
+accessWidener v1 named
+accessible method m/Tile <init> (I)V
+accessible method m/Tile <clinit>
+",
+        )
+        .unwrap();
+        assert_eq!(changed, 2);
+        let after: Vec<String> = classes[0]
+            .declared
+            .iter()
+            .map(|declared| format!("{} {}", declared.name, declared.descriptor))
+            .collect();
+        assert_eq!(before, after, "constructors stay declared, in order");
+        assert_eq!(classes[0].declared[0].access, ACC_PUBLIC);
+        assert_eq!(classes[0].declared[1].access, ACC_PUBLIC | 0x0008);
+        assert_eq!(classes[0].declared[2].access, 0x0002);
+    }
+
+    #[test]
+    fn widener_reports_missing_targets() {
+        let mut classes = [widened(
+            "m/Tile",
+            ACC_PUBLIC,
+            vec![member(MemberKind::Field, "f", "I", 0x0002)],
+        )];
+        let message = apply(
+            &mut classes,
+            "accessWidener v1 named\naccessible class m/Gone\n",
+        )
+        .unwrap_err();
+        assert!(message.contains("m/Gone"), "{message}");
+        let message = apply(
+            &mut classes,
+            "accessWidener v1 named\naccessible field m/Tile g I\n",
+        )
+        .unwrap_err();
+        assert!(message.contains("m/Tile#g I"), "{message}");
+        // Nothing was widened by the failed entries.
+        assert_eq!(classes[0].declared[0].access, 0x0002);
+    }
+
+    #[test]
+    fn widener_is_idempotent_and_keeps_file_order() {
+        let text = "\
+accessWidener v1 named
+accessible class b/B
+extendable class a/A
+accessible class c/C
+";
+        let widener = parse_access_widener(text).unwrap();
+        assert_eq!(
+            widener
+                .entries
+                .iter()
+                .map(|entry| entry.owner.as_str())
+                .collect::<Vec<_>>(),
+            ["b/B", "a/A", "c/C"]
+        );
+        let mut classes = [
+            widened("a/A", 0x0010, vec![]),
+            widened("b/B", 0x0002, vec![]),
+            widened("c/C", 0x0004, vec![]),
+        ];
+        assert_eq!(apply_access_widener(&mut classes, &widener), Ok(3));
+        assert_eq!(apply_access_widener(&mut classes, &widener), Ok(0));
+        assert_eq!(
+            classes
+                .iter()
+                .map(|class| class.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a/A", "b/B", "c/C"],
+            "classes keep the order they were read in"
+        );
     }
 }
