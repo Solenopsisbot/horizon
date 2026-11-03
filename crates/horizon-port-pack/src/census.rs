@@ -317,7 +317,7 @@ pub struct MixinTranslationPlan {
     /// Normalized operation family (`callback`, `redirect`, `modify-argument`,
     /// `modify-variable`, `replace-method`, or `unknown`).
     pub mode: String,
-    /// `candidate` means a native hook matched; `report-only` means it did not.
+    /// `executable` means a bounded native operation can be emitted; `candidate` means a native hook matched but still needs codegen; `report-only` means it did not.
     pub status: String,
     pub count: usize,
     #[serde(
@@ -703,7 +703,19 @@ impl Census {
             }
             .to_owned();
             let matched = !point.hooks.is_empty();
-            let (status, reason) = if matched {
+            // A single-hook @Overwrite has no callback ordering, cancellation,
+            // or call-site selector to translate. Emit it as a direct method
+            // replacement operation; the runtime can bind the mod body to the
+            // named native hook without interpreting bytecode at the target.
+            let executable_overwrite = point.kind == "overwrite"
+                && point.at.is_empty()
+                && point.hooks.len() == 1;
+            let (status, reason) = if executable_overwrite {
+                (
+                    "executable".to_owned(),
+                    "single native hook supports bounded direct method replacement".to_owned(),
+                )
+            } else if matched {
                 (
                     "candidate".to_owned(),
                     "native hook matched; callback codegen, ordering, and cancellation remain unimplemented"
@@ -1754,6 +1766,37 @@ mod tests {
                 count: 2,
                 hooks: vec!["destroy_block".to_owned()],
             }]
+        );
+    }
+
+    #[test]
+    fn single_hook_overwrite_becomes_executable_replacement_plan() {
+        let dir = std::env::temp_dir().join("horizon-census-overwrite-hooks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hooks.json");
+        std::fs::write(
+            &file,
+            r#"{"hooks":[{"name":"server_tick","vanilla":"net/minecraft/server/ServerLevel#tick"}]}"#,
+        )
+        .unwrap();
+        let hooks = HookIndex::read(&file).unwrap();
+        let mut census = Census {
+            points: vec![PointCount {
+                target: "net/minecraft/server/ServerLevel".to_owned(),
+                method: "tick".to_owned(),
+                kind: "overwrite".to_owned(),
+                at: String::new(),
+                count: 1,
+                hooks: Vec::new(),
+            }],
+            ..Census::default()
+        };
+        census.join(&hooks);
+        assert_eq!(census.mixin_translation_plans[0].mode, "replace-method");
+        assert_eq!(census.mixin_translation_plans[0].status, "executable");
+        assert_eq!(
+            census.mixin_translation_plans[0].reason,
+            "single native hook supports bounded direct method replacement"
         );
     }
 
