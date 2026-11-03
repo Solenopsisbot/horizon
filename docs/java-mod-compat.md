@@ -212,6 +212,11 @@ Exact JVM descriptors for overloaded Mixin target methods are retained in the ag
 `mixin_method_descriptors` map even though native hook lookup uses descriptor-free names.
 Exact descriptor-bearing `@At(target:...)` selectors are retained in `mixin_at_targets` for
 Redirect, ModifyArg, and related call-site planning; this census data remains report-only.
+The aggregate `mixin_translation_plans` list now normalizes each call-site injector into a
+candidate operation family (`callback`, `redirect`, `modify-argument`, `modify-variable`, or
+`replace-method`) and records whether a native hook matched, along with the explicit reason when it
+did not. These are deterministic inputs for a future native code generator; they do not execute
+callbacks or apply Mixin ordering, cancellation, or bytecode transforms.
 Mixin Extras `WrapMethod` and legacy `ModifyConst` names normalize into stable report buckets, nested slice `from`/`to` boundaries are preserved, and scalar config edge values remain report-only metadata. Values are not interpreted, configs are not executed, and no bytecode is woven; malformed or oversized files are skipped.
 JDK classpath discovery is reported with the same bounded rule. References to `ServiceLoader` and calls
 to `ServiceLoader.load`/`loadInstalled` or `ClassLoader.getResource*`/`loadClass` mark a jar as dynamic,

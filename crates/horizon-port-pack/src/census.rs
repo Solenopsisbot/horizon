@@ -115,6 +115,11 @@ pub struct Census {
     /// translation planning; no bytecode is woven.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mixin_at_targets: BTreeMap<String, Vec<String>>,
+    /// Deterministic native-hook translation candidates. These plans preserve
+    /// the injector mode and anchor for a later code generator; a `candidate`
+    /// status means only that the target method has a matching native hook.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixin_translation_plans: Vec<MixinTranslationPlan>,
     /// Access-widener targets, counted across jars (discovery only).
     #[serde(default)]
     pub access_widener_targets: BTreeMap<String, usize>,
@@ -291,6 +296,28 @@ pub struct HookPoint {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub hooks: Vec<String>,
+}
+
+/// Report-only input for the native Mixin hook generator.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MixinTranslationPlan {
+    pub target: String,
+    pub method: String,
+    pub kind: String,
+    pub at: String,
+    /// Normalized operation family (`callback`, `redirect`, `modify-argument`,
+    /// `modify-variable`, `replace-method`, or `unknown`).
+    pub mode: String,
+    /// `candidate` means a native hook matched; `report-only` means it did not.
+    pub status: String,
+    pub count: usize,
+    #[serde(
+        rename = "native_hooks",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub hooks: Vec<String>,
+    pub reason: String,
 }
 
 /// The hooks' vanilla methods, from `native-hooks.json`'s `vanilla` fields.
@@ -616,6 +643,7 @@ impl Census {
             }
         }
         self.rebuild_hook_points();
+        self.rebuild_translation_plans();
     }
 
     fn rebuild_hook_points(&mut self) {
@@ -632,6 +660,53 @@ impl Census {
                         hooks: point.hooks.clone(),
                     });
             }
+        }
+    }
+
+    fn rebuild_translation_plans(&mut self) {
+        self.mixin_translation_plans.clear();
+        for point in &self.points {
+            if !NEEDS_HOOK.contains(&point.kind.as_str()) {
+                continue;
+            }
+            let mode = match point.kind.as_str() {
+                "inject" => "callback",
+                "redirect" => "redirect",
+                "modify-arg" | "modify-args" => "modify-argument",
+                "modify-variable" => "modify-variable",
+                "modify-constant" | "modify-expression-value" | "modify-return-value" => {
+                    "modify-variable"
+                }
+                "modify-receiver" => "modify-receiver",
+                "wrap-operation" | "wrap-with-condition" => "redirect",
+                "overwrite" => "replace-method",
+                _ => "unknown",
+            }
+            .to_owned();
+            let matched = !point.hooks.is_empty();
+            let (status, reason) = if matched {
+                (
+                    "candidate".to_owned(),
+                    "native hook matched; callback codegen, ordering, and cancellation remain unimplemented"
+                        .to_owned(),
+                )
+            } else {
+                (
+                    "report-only".to_owned(),
+                    "no native hook matches the target method".to_owned(),
+                )
+            };
+            self.mixin_translation_plans.push(MixinTranslationPlan {
+                target: point.target.clone(),
+                method: point.method.clone(),
+                kind: point.kind.clone(),
+                at: point.at.clone(),
+                mode,
+                status,
+                count: point.count,
+                hooks: point.hooks.clone(),
+                reason,
+            });
         }
     }
 
@@ -1327,6 +1402,14 @@ mod tests {
             census.hook_points["net/minecraft/Target#destroyBlock"][0].hooks,
             ["destroy_block"]
         );
+        assert_eq!(census.mixin_translation_plans.len(), 1);
+        assert_eq!(census.mixin_translation_plans[0].mode, "callback");
+        assert_eq!(census.mixin_translation_plans[0].status, "candidate");
+        assert!(
+            census.mixin_translation_plans[0]
+                .reason
+                .contains("callback codegen")
+        );
         assert_eq!(census.totals.points_covered, 1);
     }
 
@@ -1588,6 +1671,8 @@ mod tests {
         assert_eq!(census.totals.points_needing_hooks, 2);
         assert_eq!(census.totals.points_covered, 2);
         assert_eq!(census.points[0].hooks, ["destroy_block"]);
+        assert_eq!(census.mixin_translation_plans[0].mode, "callback");
+        assert_eq!(census.mixin_translation_plans[0].status, "candidate");
         assert_eq!(
             census.hook_points["net/minecraft/server/level/ServerPlayerGameMode#destroyBlock"],
             [HookPoint {
@@ -1618,6 +1703,24 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(old.hooks, ["server_tick"]);
+    }
+
+    #[test]
+    fn translation_plans_serialize_native_hook_contract_name() {
+        let plan = MixinTranslationPlan {
+            target: "net/minecraft/Target".to_owned(),
+            method: "tick".to_owned(),
+            kind: "redirect".to_owned(),
+            at: "INVOKE".to_owned(),
+            mode: "redirect".to_owned(),
+            status: "candidate".to_owned(),
+            count: 1,
+            hooks: vec!["server_tick".to_owned()],
+            reason: "native hook matched".to_owned(),
+        };
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["native_hooks"], serde_json::json!(["server_tick"]));
+        assert!(json.get("hooks").is_none());
     }
 
     #[test]
@@ -1656,6 +1759,12 @@ mod tests {
         assert_eq!(census.totals.points_needing_hooks, 4);
         assert_eq!(census.totals.points_covered, 0);
         assert_eq!(census.totals.points_report_only, 4);
+        assert_eq!(census.mixin_translation_plans[0].mode, "callback");
+        assert_eq!(census.mixin_translation_plans[0].status, "report-only");
+        assert_eq!(
+            census.mixin_translation_plans[0].reason,
+            "no native hook matches the target method"
+        );
         let summary = census.summary(20);
         assert!(summary.contains("mixin injection points: 0 hook-covered, 4 report-only"));
     }

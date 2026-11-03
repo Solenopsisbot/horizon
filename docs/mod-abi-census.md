@@ -35,6 +35,9 @@ translator without changing hook matching.
 The aggregate `mixin_at_targets` map likewise retains exact descriptor-bearing `@At(target:...)`
 selectors for Redirect/ModifyArg and related call-site planning; it is report-only and does not
 weave bytecode.
+The aggregate `mixin_translation_plans` list adds a deterministic operation family, native-hook
+match status, and an explicit reason for each call-site point. `candidate` means only that a native
+hook matched; callback code generation and Mixin ordering/cancellation remain future work.
 Accessor, invoker, and shadow rows are omitted because
 they require member shape rather than a call-site hook. This keeps consumers from having to
 filter and regroup the ranked `points` array.
