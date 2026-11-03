@@ -1735,9 +1735,15 @@ impl Game<'_> {
             .remote
             .as_ref()
             .and_then(|r| r.builtin.get("minecraft:block_entity_type")?.name(kind))
+            .map(str::to_owned)
         else {
             return;
         };
+        // A declared block entity is sent as its vanilla template, but a
+        // server (or an older one) may name the declared id: resolve it the
+        // same way save and chunk encoding do.
+        let name = block_entity_name_for_sync(&name);
+        let name = name.as_str();
         // A decorated pot is no block entity here: its tag is kept with the chunk.
         if name == "minecraft:decorated_pot" {
             if let Tag::Compound(fields) = tag
@@ -1859,7 +1865,7 @@ impl Game<'_> {
     /// Keep the renderable block entities (chests, furnaces) in step with blocks.
     pub(super) fn sync_block_entity(&mut self, pos: (i32, i32, i32), state: BlockStateId) {
         let name = self.res.facts().get(state).name.clone();
-        match BlockEntity::for_block(&name) {
+        match block_entity_for_block(&name) {
             Some(entity) => {
                 let same = self
                     .world
@@ -7825,7 +7831,7 @@ impl Game<'_> {
             // so they go under a key no block has.
             let holds = |k: &(i32, i32, i32)| {
                 let name = &self.res.facts().get(self.world.block(k.0, k.1, k.2)).name;
-                BlockEntity::for_block(name).is_some_and(|e| {
+                block_entity_for_block(name).is_some_and(|e| {
                     e.id() == entity.id() && e.slots().len() == entity.slots().len()
                 })
             };
@@ -8652,6 +8658,94 @@ fn client_millis() -> u64 {
         .get_or_init(std::time::Instant::now)
         .elapsed()
         .as_millis() as u64
+}
+
+/// The block entity a block gets on the client: a declared Java block uses
+/// its vanilla template, so sync packets, menus and chunk data agree with the
+/// server and with save/worldgen.
+fn block_entity_for_block(name: &str) -> Option<BlockEntity> {
+    block_entity_for_block_with(
+        &horizon_client::mod_content::stored_declared_block_entities(),
+        name,
+    )
+}
+
+fn block_entity_for_block_with(
+    declared: &std::collections::BTreeMap<String, horizon_client::mod_content::DeclaredBlockEntity>,
+    name: &str,
+) -> Option<BlockEntity> {
+    let template = declared.get(name).map(|row| row.template.as_str());
+    BlockEntity::for_block(template.unwrap_or(name))
+}
+
+/// A block-entity update names its type; a declared id resolves to the
+/// template's type before it is compared or decoded.
+fn block_entity_name_for_sync(name: &str) -> String {
+    block_entity_name_for_sync_with(
+        &horizon_client::mod_content::stored_declared_block_entities(),
+        name,
+    )
+}
+
+fn block_entity_name_for_sync_with(
+    declared: &std::collections::BTreeMap<String, horizon_client::mod_content::DeclaredBlockEntity>,
+    name: &str,
+) -> String {
+    declared
+        .values()
+        .find(|row| row.id == name)
+        .map_or_else(|| name.to_owned(), |row| row.template.clone())
+}
+
+#[cfg(test)]
+mod declared_block_entity_tests {
+    use super::*;
+    use horizon_client::mod_content::DeclaredBlockEntity;
+
+    fn declared() -> std::collections::BTreeMap<String, DeclaredBlockEntity> {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "ruby:crate".to_owned(),
+            DeclaredBlockEntity {
+                id: "ruby:crate_entity".into(),
+                template: "minecraft:barrel".into(),
+                ticker: false,
+                valid_blocks: vec!["ruby:crate".into()],
+            },
+        );
+        map
+    }
+
+    #[test]
+    fn sync_and_menu_paths_resolve_declared_blocks_to_their_template() {
+        let map = declared();
+        let chest = block_entity_for_block_with(&map, "ruby:crate").expect("template entity");
+        assert_eq!(chest.id(), "minecraft:chest");
+        assert_eq!(chest.slots().len(), 27);
+        assert!(block_entity_for_block_with(&map, "ruby:stone").is_none());
+        assert_eq!(
+            block_entity_for_block_with(&map, "minecraft:barrel").map(|e| e.id().to_owned()),
+            Some("minecraft:chest".to_owned())
+        );
+        // The menu's `holds` check compares the declared block against the
+        // menu's template entity, slots included.
+        let holds = |name: &str| {
+            block_entity_for_block_with(&map, name)
+                .is_some_and(|e| e.id() == chest.id() && e.slots().len() == chest.slots().len())
+        };
+        assert!(holds("ruby:crate"));
+        assert!(!holds("ruby:stone"));
+        // A block-entity update naming the declared id resolves to the
+        // template before decoding; vanilla ids are unchanged.
+        assert_eq!(
+            block_entity_name_for_sync_with(&map, "ruby:crate_entity"),
+            "minecraft:barrel"
+        );
+        assert_eq!(
+            block_entity_name_for_sync_with(&map, "minecraft:barrel"),
+            "minecraft:barrel"
+        );
+    }
 }
 
 #[cfg(test)]
