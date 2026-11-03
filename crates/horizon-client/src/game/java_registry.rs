@@ -10,7 +10,7 @@ use horizon_mods::content::{BlockProperties, BlockShapes, Rarity};
 use horizon_mods::native::{AttachmentDeclaration, DataComponentDeclaration, EntityDeclaration};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct BlockTemplate {
     pub id: String,
     pub template: String,
@@ -21,7 +21,7 @@ pub(super) struct BlockTemplate {
     pub components: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct ItemTemplate {
     pub id: String,
     pub template: String,
@@ -31,7 +31,7 @@ pub(super) struct ItemTemplate {
     pub crafting_remainder: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct JavaRegistrySnapshot {
     pub blocks: Vec<String>,
     pub items: Vec<String>,
