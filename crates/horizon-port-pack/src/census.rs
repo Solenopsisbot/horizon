@@ -276,6 +276,14 @@ pub struct PointCount {
     pub kind: String,
     pub at: String,
     pub count: usize,
+    /// `@Slice` boundary text as the class reader preserved it (`present`, or
+    /// `from:...|to:...`). Report-only: no bytecode range is selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice: Option<String>,
+    /// `@Inject(cancellable = true)` presence. Report-only: the census never
+    /// cancels an injection.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cancellable: bool,
     /// The hooks that name this method, if any.
     ///
     /// The explicit `native_hooks` JSON name distinguishes Horizon's native
@@ -314,8 +322,15 @@ pub struct MixinTranslationPlan {
     pub method: String,
     pub kind: String,
     pub at: String,
+    /// Bounded selector detail split out of `at` (`target:`, `desc:`,
+    /// `args:`, `local:`, `share:`, `ordinal:`, `shift:`, `by:`), in their
+    /// existing order. Nothing is interpreted; a selector too long for the
+    /// bound stays in `at` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_target: Option<String>,
     /// Normalized operation family (`callback`, `redirect`, `modify-argument`,
-    /// `modify-variable`, `replace-method`, or `unknown`).
+    /// `modify-variable`, `modify-expression`, `modify-receiver`,
+    /// `wrap-operation`, `replace-method`, or `unknown`).
     pub mode: String,
     /// `executable` means a bounded native operation can be emitted; `candidate` means a native hook matched but still needs codegen; `report-only` means it did not.
     pub status: String,
@@ -396,7 +411,7 @@ pub fn read(path: &Path) -> Result<Census, String> {
 /// Reads and, given the hook catalog, joins every point against it.
 pub fn read_with(path: &Path, hooks: Option<&HookIndex>) -> Result<Census, String> {
     let mut census = Census::default();
-    let mut points: BTreeMap<(String, String, String, String), usize> = BTreeMap::new();
+    let mut points: BTreeMap<(String, String, String, String), PointDetail> = BTreeMap::new();
     for jar in jars(path)? {
         census.add(&jar, &mut points)?;
     }
@@ -410,12 +425,14 @@ pub fn read_with(path: &Path, hooks: Option<&HookIndex>) -> Result<Census, Strin
     }
     census.points = points
         .into_iter()
-        .map(|((target, method, kind, at), count)| PointCount {
+        .map(|((target, method, kind, at), detail)| PointCount {
             target,
             method,
             kind,
             at,
-            count,
+            count: detail.count,
+            slice: detail.slice,
+            cancellable: detail.cancellable,
             hooks: Vec::new(),
         })
         .collect();
@@ -425,6 +442,29 @@ pub fn read_with(path: &Path, hooks: Option<&HookIndex>) -> Result<Census, Strin
     census.join(hooks.unwrap_or(&empty_hooks));
     census.rebuild_hook_points();
     Ok(census)
+}
+
+/// One aggregated call-site point while jars are read: its count plus the
+/// bounded report metadata the translation plan quotes in its reason.
+#[derive(Debug, Default, Clone)]
+struct PointDetail {
+    count: usize,
+    slice: Option<String>,
+    cancellable: bool,
+}
+
+/// Keeps the lexicographically smallest `@Slice` text for a point, so the
+/// aggregate does not depend on the order jars and classes are read in.
+fn merge_slice(current: Option<String>, next: Option<&str>) -> Option<String> {
+    match (current, next) {
+        (Some(current), Some(next)) => Some(if next < current.as_str() {
+            next.to_owned()
+        } else {
+            current
+        }),
+        (current, None) => current,
+        (None, next) => next.map(str::to_owned),
+    }
 }
 
 fn jars(path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -453,7 +493,7 @@ impl Census {
     fn add(
         &mut self,
         path: &Path,
-        points: &mut BTreeMap<(String, String, String, String), usize>,
+        points: &mut BTreeMap<(String, String, String, String), PointDetail>,
     ) -> Result<(), String> {
         // A broken manifest is one jar's problem, not the run's: the classes
         // are still worth counting.
@@ -603,14 +643,23 @@ impl Census {
                             .mixin_method_kinds
                             .entry(mixin_method_kind(method).to_string())
                             .or_default() += 1;
-                        *points
+                        let detail = points
                             .entry((
                                 target.clone(),
                                 method.to_owned(),
                                 injection.kind.clone(),
                                 injection.at.clone(),
                             ))
-                            .or_default() += 1;
+                            .or_default();
+                        detail.count += 1;
+                        detail.cancellable |= injection
+                            .metadata_values
+                            .get("cancellable")
+                            .is_some_and(|value| value == "true");
+                        detail.slice = merge_slice(
+                            detail.slice.take(),
+                            injection.metadata_values.get("slice").map(String::as_str),
+                        );
                     }
                 }
             }
@@ -688,20 +737,7 @@ impl Census {
             if !NEEDS_HOOK.contains(&point.kind.as_str()) {
                 continue;
             }
-            let mode = match point.kind.as_str() {
-                "inject" => "callback",
-                "redirect" => "redirect",
-                "modify-arg" | "modify-args" => "modify-argument",
-                "modify-variable" => "modify-variable",
-                "modify-constant" | "modify-expression-value" | "modify-return-value" => {
-                    "modify-variable"
-                }
-                "modify-receiver" => "modify-receiver",
-                "wrap-operation" | "wrap-with-condition" => "redirect",
-                "overwrite" => "replace-method",
-                _ => "unknown",
-            }
-            .to_owned();
+            let mode = translation_mode(&point.kind).to_owned();
             let matched = !point.hooks.is_empty();
             // A single-hook @Overwrite has no callback ordering, cancellation,
             // or call-site selector to translate. Emit it as a direct method
@@ -709,7 +745,7 @@ impl Census {
             // named native hook without interpreting bytecode at the target.
             let executable_overwrite =
                 point.kind == "overwrite" && point.at.is_empty() && point.hooks.len() == 1;
-            let (status, reason) = if executable_overwrite {
+            let (status, mut reason) = if executable_overwrite {
                 (
                     "executable".to_owned(),
                     "single native hook supports bounded direct method replacement".to_owned(),
@@ -726,11 +762,22 @@ impl Census {
                     "no native hook matches the target method".to_owned(),
                 )
             };
+            // Report the injection contract the plan cannot honour yet. The
+            // status stays the hook-match verdict; neither note enables
+            // weaving or cancellation.
+            if let Some(slice) = point.slice.as_deref().and_then(slice_detail) {
+                reason.push_str("; ");
+                reason.push_str(&slice);
+            }
+            if point.cancellable {
+                reason.push_str("; cancellable");
+            }
             self.mixin_translation_plans.push(MixinTranslationPlan {
                 target: point.target.clone(),
                 method: point.method.clone(),
                 kind: point.kind.clone(),
                 at: point.at.clone(),
+                at_target: at_selector(&point.at),
                 mode,
                 status,
                 count: point.count,
@@ -738,6 +785,8 @@ impl Census {
                 reason,
             });
         }
+        self.mixin_translation_plans.sort();
+        self.mixin_translation_plans.dedup();
     }
 
     /// The ranked surface, `top` rows of each, as the tool prints it.
@@ -1255,6 +1304,87 @@ fn at_target_selectors(at: &str) -> impl Iterator<Item = &str> {
         .filter(|selector| !selector.is_empty())
 }
 
+/// The `@At` parts that select a call site rather than name an anchor. `@Local`
+/// and `@Share` are Mixin Extras selectors, so they stay here instead of
+/// becoming injector modes.
+const AT_SELECTOR_PREFIXES: [&str; 8] = [
+    "target:", "desc:", "args:", "local:", "share:", "ordinal:", "shift:", "by:",
+];
+
+/// Bounded selector detail from a serialized `@At` value. The anchor stays in
+/// `at`; this keeps the parts after it in their existing order, so a future
+/// generator need not split the string again. Nothing is interpreted, and a
+/// selector longer than the bound is left in `at` only.
+fn at_selector(at: &str) -> Option<String> {
+    const MAX_AT_SELECTOR: usize = 256;
+    let mut out = String::new();
+    for part in at.split('|') {
+        if !AT_SELECTOR_PREFIXES
+            .iter()
+            .any(|prefix| part.starts_with(prefix))
+        {
+            continue;
+        }
+        let separator = usize::from(!out.is_empty());
+        if out.chars().count() + separator + part.chars().count() > MAX_AT_SELECTOR {
+            break;
+        }
+        if separator == 1 {
+            out.push('|');
+        }
+        out.push_str(part);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// `@Slice` boundaries as plan text: `slice present`, or `slice from:HEAD
+/// to:TAIL` when the class reader kept the boundary text. Empty boundaries
+/// (`from:|to:` from a nested `@At`) collapse to presence.
+fn slice_detail(slice: &str) -> Option<String> {
+    if slice.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in slice.split('|').map(str::trim) {
+        if part.is_empty() || part.ends_with(':') {
+            continue;
+        }
+        parts.push(part);
+        if parts.len() >= 4 {
+            break;
+        }
+    }
+    Some(if parts.is_empty() {
+        "slice present".to_owned()
+    } else {
+        format!("slice {}", parts.join(" "))
+    })
+}
+
+/// The normalized operation family for a Mixin injector kind. Mixin Extras
+/// keeps its own families rather than folding into `@Redirect`: a wrap still
+/// calls the original while a redirect replaces it, which is a different
+/// contract for a future generator.
+fn translation_mode(kind: &str) -> &'static str {
+    match kind {
+        "inject" => "callback",
+        "redirect" => "redirect",
+        "modify-arg" | "modify-args" => "modify-argument",
+        "modify-variable" => "modify-variable",
+        "modify-constant" => "modify-variable",
+        "modify-expression-value" => "modify-expression",
+        "modify-return-value" => "modify-variable",
+        "modify-receiver" => "modify-receiver",
+        "wrap-operation" | "wrap-with-condition" => "wrap-operation",
+        "overwrite" => "replace-method",
+        _ => "unknown",
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Mixin's `method` element can be a scalar or an array. The class reader
 /// preserves arrays as `|`-joined text so this boundary can expand them into
 /// independently matchable native hook keys.
@@ -1701,6 +1831,8 @@ mod tests {
                 kind: "inject".to_owned(),
                 at: "HEAD".to_owned(),
                 count: 1,
+                slice: None,
+                cancellable: false,
                 hooks: Vec::new(),
             }],
             ..Census::default()
@@ -1747,6 +1879,8 @@ mod tests {
                 kind: "inject".to_owned(),
                 at: "HEAD".to_owned(),
                 count: 2,
+                slice: None,
+                cancellable: false,
                 hooks: Vec::new(),
             }],
             ..Census::default()
@@ -1786,6 +1920,8 @@ mod tests {
                 kind: "overwrite".to_owned(),
                 at: String::new(),
                 count: 1,
+                slice: None,
+                cancellable: false,
                 hooks: Vec::new(),
             }],
             ..Census::default()
@@ -1827,6 +1963,7 @@ mod tests {
             method: "tick".to_owned(),
             kind: "redirect".to_owned(),
             at: "INVOKE".to_owned(),
+            at_target: None,
             mode: "redirect".to_owned(),
             status: "candidate".to_owned(),
             count: 1,
@@ -1847,6 +1984,8 @@ mod tests {
                 kind: "accessor".to_owned(),
                 at: String::new(),
                 count: 3,
+                slice: None,
+                cancellable: false,
                 hooks: Vec::new(),
             }],
             ..Census::default()
@@ -1866,6 +2005,8 @@ mod tests {
                 kind: "inject".to_owned(),
                 at: "INVOKE".to_owned(),
                 count: 4,
+                slice: None,
+                cancellable: false,
                 hooks: Vec::new(),
             }],
             ..Census::default()
@@ -2018,5 +2159,236 @@ mod tests {
             member_disposition(&member("com/example/Library")),
             AbiDisposition::External
         );
+    }
+
+    /// A call-site point for plan tests.
+    fn point(kind: &str, at: &str) -> PointCount {
+        PointCount {
+            target: "net/minecraft/Target".to_owned(),
+            method: "tick".to_owned(),
+            kind: kind.to_owned(),
+            at: at.to_owned(),
+            count: 1,
+            slice: None,
+            cancellable: false,
+            hooks: Vec::new(),
+        }
+    }
+
+    /// Joins the points against an empty hook catalog, as `read_with` does.
+    fn plans(points: Vec<PointCount>) -> Census {
+        let mut census = Census {
+            points,
+            ..Census::default()
+        };
+        census.join(&HookIndex::default());
+        census
+    }
+
+    #[test]
+    fn mixin_extras_injectors_keep_their_own_operation_family() {
+        let census = plans(vec![
+            point("wrap-operation", "INVOKE"),
+            point("wrap-with-condition", "FIELD"),
+            point("modify-expression-value", "INVOKE"),
+            point("modify-receiver", "INVOKE"),
+        ]);
+        let modes: BTreeMap<&str, &str> = census
+            .mixin_translation_plans
+            .iter()
+            .map(|plan| (plan.kind.as_str(), plan.mode.as_str()))
+            .collect();
+        assert_eq!(modes["wrap-operation"], "wrap-operation");
+        assert_eq!(modes["wrap-with-condition"], "wrap-operation");
+        assert_eq!(modes["modify-expression-value"], "modify-expression");
+        assert_eq!(modes["modify-receiver"], "modify-receiver");
+        assert!(
+            census
+                .mixin_translation_plans
+                .iter()
+                .all(|plan| plan.status == "report-only")
+        );
+    }
+
+    #[test]
+    fn legacy_injectors_keep_their_operation_family() {
+        for (kind, mode) in [
+            ("inject", "callback"),
+            ("redirect", "redirect"),
+            ("modify-arg", "modify-argument"),
+            ("modify-args", "modify-argument"),
+            ("modify-constant", "modify-variable"),
+            ("modify-variable", "modify-variable"),
+            ("modify-return-value", "modify-variable"),
+            ("overwrite", "replace-method"),
+        ] {
+            assert_eq!(translation_mode(kind), mode, "{kind}");
+        }
+    }
+
+    #[test]
+    fn at_anchors_and_selectors_stay_in_the_plan_text() {
+        let cases = [
+            ("INVOKE_ASSIGN", None),
+            ("FIELD", None),
+            ("NEW", None),
+            ("STORE", None),
+            ("LOAD", None),
+            ("JUMP", None),
+            ("CONSTANT", None),
+            ("RETURN|ordinal:2", Some("ordinal:2")),
+            (
+                "INVOKE|target:Lnet/minecraft/Target;method(I)V|desc:(I)V",
+                Some("target:Lnet/minecraft/Target;method(I)V|desc:(I)V"),
+            ),
+            (
+                "LOAD|target:Lnet/minecraft/Target;value:I|local:@Local(ordinal=0)|share:@Share",
+                Some("target:Lnet/minecraft/Target;value:I|local:@Local(ordinal=0)|share:@Share"),
+            ),
+        ];
+        let points = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (at, _))| {
+                let mut point = point("inject", at);
+                point.method = format!("tick{i}");
+                point
+            })
+            .collect();
+        let census = plans(points);
+        for (i, (at, selector)) in cases.iter().enumerate() {
+            let plan = census
+                .mixin_translation_plans
+                .iter()
+                .find(|plan| plan.method == format!("tick{i}"))
+                .unwrap();
+            assert_eq!(plan.at, *at);
+            assert_eq!(plan.at_target.as_deref(), *selector, "{at}");
+            // `@Local` and `@Share` are selectors: the injector kind, not the
+            // selector, picks the mode.
+            assert_eq!(plan.mode, "callback");
+        }
+    }
+
+    #[test]
+    fn plan_selector_text_is_bounded() {
+        assert_eq!(at_selector("HEAD"), None);
+        assert_eq!(
+            at_selector("RETURN|ordinal:0"),
+            Some("ordinal:0".to_owned())
+        );
+        let long = format!("INVOKE|target:{}", "a".repeat(400));
+        assert_eq!(at_selector(&long), None);
+        assert_eq!(slice_detail(""), None);
+        assert_eq!(slice_detail("present").as_deref(), Some("slice present"));
+        assert_eq!(slice_detail("from:|to:").as_deref(), Some("slice present"));
+        assert_eq!(
+            slice_detail("from:HEAD|to:TAIL").as_deref(),
+            Some("slice from:HEAD to:TAIL")
+        );
+        assert_eq!(merge_slice(None, None), None);
+        assert_eq!(
+            merge_slice(Some("present".to_owned()), Some("from:HEAD|to:TAIL")),
+            Some("from:HEAD|to:TAIL".to_owned())
+        );
+        assert_eq!(
+            merge_slice(Some("from:HEAD|to:TAIL".to_owned()), Some("present")),
+            Some("from:HEAD|to:TAIL".to_owned())
+        );
+    }
+
+    #[test]
+    fn slice_boundaries_and_cancellable_annotate_the_plan_reason() {
+        let mut sliced = point("inject", "INVOKE");
+        sliced.slice = Some("present".to_owned());
+        sliced.cancellable = true;
+        let mut bounded = point("inject", "RETURN");
+        bounded.slice = Some("from:HEAD|to:TAIL".to_owned());
+        let census = plans(vec![sliced, bounded]);
+        assert_eq!(
+            census.mixin_translation_plans[0].reason,
+            "no native hook matches the target method; slice present; cancellable"
+        );
+        assert_eq!(
+            census.mixin_translation_plans[1].reason,
+            "no native hook matches the target method; slice from:HEAD to:TAIL"
+        );
+        assert_eq!(census.mixin_translation_plans[0].status, "report-only");
+    }
+
+    #[test]
+    fn translation_plans_are_sorted_and_deduplicated() {
+        let at_target = |target: &str, kind: &str, at: &str| PointCount {
+            target: target.to_owned(),
+            ..point(kind, at)
+        };
+        let duplicate = at_target("net/minecraft/B", "inject", "HEAD");
+        let census = plans(vec![
+            duplicate.clone(),
+            at_target("net/minecraft/A", "redirect", "INVOKE"),
+            duplicate,
+            at_target("net/minecraft/A", "inject", "TAIL"),
+        ]);
+        let rows: Vec<(&str, &str, &str)> = census
+            .mixin_translation_plans
+            .iter()
+            .map(|plan| (plan.target.as_str(), plan.kind.as_str(), plan.at.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("net/minecraft/A", "inject", "TAIL"),
+                ("net/minecraft/A", "redirect", "INVOKE"),
+                ("net/minecraft/B", "inject", "HEAD"),
+            ]
+        );
+    }
+
+    #[test]
+    fn head_return_and_tail_plans_are_unchanged() {
+        for at in ["HEAD", "RETURN", "TAIL"] {
+            let census = plans(vec![point("inject", at)]);
+            let plan = &census.mixin_translation_plans[0];
+            assert_eq!(plan.at, at);
+            assert_eq!(plan.at_target, None);
+            assert_eq!(plan.mode, "callback");
+            assert_eq!(plan.status, "report-only");
+            assert_eq!(plan.reason, "no native hook matches the target method");
+        }
+    }
+
+    #[test]
+    fn older_plan_and_point_rows_still_deserialize() {
+        let plan: MixinTranslationPlan = serde_json::from_value(serde_json::json!({
+            "target": "net/minecraft/Target",
+            "method": "tick",
+            "kind": "inject",
+            "at": "HEAD",
+            "mode": "callback",
+            "status": "report-only",
+            "count": 1,
+            "reason": "no native hook matches the target method"
+        }))
+        .unwrap();
+        assert_eq!(plan.at_target, None);
+        assert!(
+            serde_json::to_value(&plan)
+                .unwrap()
+                .get("at_target")
+                .is_none()
+        );
+        let point: PointCount = serde_json::from_value(serde_json::json!({
+            "target": "net/minecraft/Target",
+            "method": "tick",
+            "kind": "inject",
+            "at": "HEAD",
+            "count": 1
+        }))
+        .unwrap();
+        assert_eq!(point.slice, None);
+        assert!(!point.cancellable);
+        let json = serde_json::to_value(&point).unwrap();
+        assert!(json.get("slice").is_none());
+        assert!(json.get("cancellable").is_none());
     }
 }
