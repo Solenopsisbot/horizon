@@ -861,6 +861,10 @@ the common registration and tooltip paths while the Rust mirror grows typed acce
 `ItemStack` façades expose the corresponding max-stack, max-damage, damageable, crafting-remainder,
 and fire-resistance queries. This preserves common item registration branches without claiming that
 the live Rust item registry has been mutated.
+`BlockBehaviour.Properties` now retains bounded `strength` (including separate destroy and explosion
+resistance values), `noOcclusion`, `noLootTable`, `requiresCorrectToolForDrops`, `randomTicks`,
+`friction`, `speedFactor`, and `jumpFactor` values through its fluent builder methods. This keeps
+common block registration decisions observable while live block behaviour remains native-owned.
 BlockState bootstrap paths retain a bounded block identity and property map: `getBlock`, `is`, `isAir`,
 `canOcclude`, `isSolidRender`, and `getLightEmission` provide stable inspection defaults, while
 `setValue` feeds `getValue`, `hasProperty`, and `getProperties` on the same façade instance. This covers
