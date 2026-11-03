@@ -1,10 +1,10 @@
-//! A bounded class-file writer and `HEAD`-injection weaver.
+//! A bounded class-file writer and straight-line injection weaver.
 //!
 //! The interpreter in [`crate`] never needed to write a class: it reads a
 //! `ClassFile` and executes a bytecode subset.  This module adds the other
-//! direction, for the one shape a native Mixin translation can prepare before
-//! an embedded JVM sees it: a straight-line method that gets a `HEAD` callback
-//! inserted at offset 0.
+//! direction, for the shapes a native Mixin translation can prepare before an
+//! embedded JVM sees them: a straight-line method that gets a `HEAD` callback
+//! at offset 0, or one that gets a callback immediately before each `return`.
 //!
 //! [`ClassFile::write`] re-encodes a parsed class from the bytes it was parsed from.
 //! Every byte range the parser does not need to understand (the constant pool
@@ -22,10 +22,19 @@
 //! invokestatic callback
 //! ```
 //!
-//! It updates `max_stack` conservatively to `original + argument slots + 1`,
+//! [`weave_return`] inserts the same sequence immediately before every
+//! return-family instruction (`return`, `ireturn`, `areturn`, `freturn`,
+//! `dreturn`, `lreturn`) for [`ReturnMode::Return`], or before only the last one
+//! for [`ReturnMode::Tail`] (Mixin's `TAIL`).  Only `void` targets are woven;
+//! the callback carries the target's arguments, plus the receiver when it
+//! declares it.
+//!
+//! Both anchors update `max_stack` conservatively (HEAD:
+//! `original + argument slots + 1`; RETURN/TAIL: `original + argument slots`),
 //! the `code_length`, and the `Code` attribute length.  Every other attribute,
 //! including a `Code` attribute's own `LineNumberTable`, is copied byte-for-byte
-//! (their `start_pc` values are not shifted; they are debug data only).
+//! (their `start_pc` values are not shifted; they are debug data only, and a
+//! straight-line method has no branch target that depends on an offset).
 //!
 //! The target method must be straight-line: no `if*`, `goto`, `tableswitch`,
 //! `lookupswitch`, `jsr`/`ret`, no exception table, no `StackMapTable`, no
@@ -35,17 +44,29 @@
 //! the target instance as an extra first parameter, which the inserted
 //! `aload_0` supplies.
 //!
+//! [`weave_class`] applies every matching `HEAD` plan first, then every
+//! `RETURN`/`TAIL` plan, re-parsing the class between edits and skipping plans
+//! for other classes.  [`weave_classes`] groups plans by target owner, weaves
+//! each affected class with [`weave_class`], and re-encodes every other class
+//! unchanged.
+//!
 //! # What it does not support
 //!
 //! [`weave_plans`] applies only `HEAD` plans, in plan order, and skips plans
-//! that target another class or ask for cancellation.  `RETURN`/`TAIL`/
-//! `INVOKE` plans, branches (so no frame or local-variable rewriting),
-//! exception handlers and `CallbackInfo`/`CallbackInfoReturnable` parameters
-//! stay on the interpreter path: HEAD-with-`CallbackInfo` needs the interpreter
-//! to own the cancellation object, which a bytecode insert cannot create.
+//! that target another class or ask for cancellation; [`weave_class`] instead
+//! rejects a cancellable or `INVOKE` plan that targets its class with a reason.
+//!
+//! Branches (so no frame or local-variable rewriting), exception handlers,
+//! non-void returns, cancellation and `@At("INVOKE")` stay on the interpreter
+//! path.  A non-void `RETURN` callback needs a `CallbackInfoReturnable` object
+//! carrying the target's boxed result, cancellation needs a runtime-owned
+//! `CallbackInfo`, and `INVOKE` moves or guards a call site - all three need
+//! object construction or call-site rewriting a plain insert cannot express.
 //! Non-ASCII constant pool strings, local slots above 255 (`wide`) and code
 //! that would exceed the class-file `code_length` limit are rejected with a
 //! reason rather than written.
+
+use std::collections::BTreeMap;
 
 use crate::{ClassFile, Cp, MethodRef, MixinInjectionPlan};
 
@@ -53,6 +74,27 @@ const ACC_STATIC: u16 = 0x0008;
 const ACC_ABSTRACT: u16 = 0x0400;
 const ACC_NATIVE: u16 = 0x0100;
 const MAX_CODE_LENGTH: usize = 65_535;
+/// Plans [`weave_class`] applies to one class.  A jar with more matching plans
+/// than this is outside the bounded weaver instead of growing the edit loop.
+const MAX_WEAVE_PLANS_PER_CLASS: usize = 32;
+
+/// Which return instruction a [`weave_return`] insert lands before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnMode {
+    /// Before every return-family instruction (`RETURN`).
+    Return,
+    /// Before the last return-family instruction only (`TAIL`).
+    Tail,
+}
+
+impl ReturnMode {
+    fn anchor(self) -> &'static str {
+        match self {
+            Self::Return => "RETURN",
+            Self::Tail => "TAIL",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct Bytes<'a> {
@@ -587,46 +629,62 @@ fn opcode_name(opcode: u8) -> &'static str {
     }
 }
 
-/// Reject every opcode whose control flow a plain insert at offset 0 cannot
-/// preserve.
+/// Whether an opcode changes control flow, so a plain byte insert cannot keep
+/// its targets or frames valid.
+fn is_control_flow(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        0x99..=0xa8 | 0xa9..=0xab | 0xc4 | 0xc6..=0xc9
+    )
+}
+
+/// The byte size of one fixed-length instruction, or `None` for an unknown or
+/// variable-length opcode.
+fn instruction_size(opcode: u8) -> Option<usize> {
+    Some(match opcode {
+        0x00..=0x0f => 1,
+        0x10 => 2,
+        0x11 => 3,
+        0x12 => 2,
+        0x13 | 0x14 => 3,
+        0x15..=0x19 => 2,
+        0x1a..=0x35 => 1,
+        0x36..=0x3a => 2,
+        0x3b..=0x83 => 1,
+        0x84 => 3,
+        0x85..=0x98 => 1,
+        0x99..=0xa8 => 3,
+        0xa9 => 2,
+        0xaa | 0xab | 0xc4 => return None,
+        0xac..=0xb1 => 1,
+        0xb2..=0xb8 => 3,
+        0xb9 | 0xba => 5,
+        0xbb => 3,
+        0xbc => 2,
+        0xbd => 3,
+        0xbe | 0xbf => 1,
+        0xc0 | 0xc1 => 3,
+        0xc2 | 0xc3 => 1,
+        0xc5 => 4,
+        0xc6..=0xc9 => 3,
+        _ => return None,
+    })
+}
+
+/// Reject every opcode whose control flow a plain insert cannot preserve.
 fn scan_straight_line(label: &str, code: &[u8]) -> Result<(), String> {
     let mut at = 0usize;
     while at < code.len() {
         let opcode = code[at];
-        let size = match opcode {
-            0x00..=0x0f => 1,
-            0x10 => 2,
-            0x11 => 3,
-            0x12 => 2,
-            0x13 | 0x14 => 3,
-            0x15..=0x19 => 2,
-            0x1a..=0x35 => 1,
-            0x36..=0x3a => 2,
-            0x3b..=0x83 => 1,
-            0x84 => 3,
-            0x85..=0x98 => 1,
-            0x99..=0xa8 | 0xa9..=0xab | 0xc4 | 0xc6..=0xc9 => {
-                return Err(format!(
-                    "{label} contains {} at offset {at}; HEAD weaving needs a straight-line method (no branches, switches, jsr/ret or wide)",
-                    opcode_name(opcode)
-                ));
-            }
-            0xac..=0xb1 => 1,
-            0xb2..=0xb8 => 3,
-            0xb9 | 0xba => 5,
-            0xbb => 3,
-            0xbc => 2,
-            0xbd => 3,
-            0xbe | 0xbf => 1,
-            0xc0 | 0xc1 => 3,
-            0xc2 | 0xc3 => 1,
-            0xc5 => 4,
-            other => {
-                return Err(format!(
-                    "{label} uses unknown or reserved opcode 0x{other:02x} at offset {at}"
-                ));
-            }
-        };
+        if is_control_flow(opcode) {
+            return Err(format!(
+                "{label} contains {} at offset {at}; the bounded weaver needs a straight-line method (no branches, switches, jsr/ret or wide)",
+                opcode_name(opcode)
+            ));
+        }
+        let size = instruction_size(opcode).ok_or_else(|| {
+            format!("{label} uses unknown or reserved opcode 0x{opcode:02x} at offset {at}")
+        })?;
         at = at
             .checked_add(size)
             .ok_or_else(|| "code offset overflow".to_owned())?;
@@ -638,6 +696,22 @@ fn scan_straight_line(label: &str, code: &[u8]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Offsets of every return-family instruction in a straight-line method.
+fn return_offsets(code: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut at = 0usize;
+    while at < code.len() {
+        let Some(size) = instruction_size(code[at]) else {
+            break;
+        };
+        if matches!(code[at], 0xac..=0xb1) {
+            offsets.push(at);
+        }
+        at += size;
+    }
+    offsets
 }
 
 /// Reject a `StackMapTable`, which would describe the code before the insert.
@@ -704,6 +778,7 @@ fn callback_arguments(
     is_static: bool,
     target_descriptor: &str,
     callback_descriptor: &str,
+    anchor: &str,
 ) -> Result<bool, String> {
     if !crate::valid_method_descriptor(callback_descriptor) {
         return Err(format!(
@@ -714,13 +789,13 @@ fn callback_arguments(
     if let Some(last) = callback_arguments.last() {
         if crate::is_callback_info_descriptor(last) {
             return Err(format!(
-                "callback {callback_descriptor} takes a trailing CallbackInfo; HEAD weaving with CallbackInfo needs the interpreter path"
+                "callback {callback_descriptor} takes a trailing CallbackInfo; {anchor} weaving with CallbackInfo needs the interpreter path"
             ));
         }
     }
     if crate::return_desc(callback_descriptor) != "V" {
         return Err(format!(
-            "callback {callback_descriptor} must return void for HEAD weaving"
+            "callback {callback_descriptor} must return void for {anchor} weaving"
         ));
     }
     let target_arguments = crate::descriptor_arguments(target_descriptor);
@@ -755,27 +830,36 @@ fn callback_arguments(
     ))
 }
 
-/// Insert a `HEAD` callback at offset 0 of `target`.
-///
-/// `class` must be the class that declares `target` (`target.owner` must equal
-/// [`ClassFile::name`]).  The returned bytes are the rewritten class; the input
-/// is untouched.
-///
-/// The callback is invoked with `invokestatic`, so it must be static.  A
-/// callback takes the target's arguments in order and returns `void`.  An
-/// instance target's callback may take the target instance first, which is
-/// what the inserted `aload_0` supplies; a callback that does not declare it
-/// gets the arguments only, and no receiver is pushed.
-///
-/// Errors name the reason a method is outside the subset instead of guessing:
-/// branches, switches, `jsr`/`ret`, `wide`, an exception table, a
-/// `StackMapTable`, condy, abstract/native methods, a local slot above 255, a
-/// mismatched callback descriptor, or `CallbackInfo` parameters.
-pub fn weave_head(
-    class: &ClassFile,
-    target: &MethodRef,
-    callback: &MethodRef,
-) -> Result<Vec<u8>, String> {
+/// A target method prepared for weaving: its parsed layout, the index of the
+/// `Code` attribute every anchor rewrites, and the descriptor facts the
+/// callback checks need.
+struct Target<'a> {
+    layout: Layout<'a>,
+    class_name: String,
+    method_index: usize,
+    attribute_index: usize,
+    name: String,
+    descriptor: String,
+    is_static: bool,
+}
+
+impl<'a> Target<'a> {
+    fn label(&self) -> String {
+        format!("{}.{}{}", self.class_name, self.name, self.descriptor)
+    }
+
+    fn code(&self) -> Result<&CodeLayout<'a>, String> {
+        self.layout.methods[self.method_index]
+            .attributes
+            .get(self.attribute_index)
+            .and_then(|attribute| attribute.code.as_ref())
+            .ok_or_else(|| format!("{}: method has no Code attribute", self.label()))
+    }
+}
+
+/// Shared validation for every anchor: owner match, condy, the target method,
+/// its `Code` attribute, and the straight-line subset.
+fn prepare_target<'a>(class: &'a ClassFile, target: &MethodRef) -> Result<Target<'a>, String> {
     if target.owner != class.name {
         return Err(format!(
             "target owner {} does not match class {}",
@@ -837,16 +921,35 @@ pub fn weave_head(
     scan_straight_line(&label, code.code)?;
 
     let is_static = method.access & ACC_STATIC != 0;
-    let takes_receiver =
-        callback_arguments(&class.name, is_static, &descriptor, &callback.descriptor)?;
+    Ok(Target {
+        layout,
+        class_name: class.name.clone(),
+        method_index,
+        attribute_index,
+        name,
+        descriptor,
+        is_static,
+    })
+}
 
-    let arguments = crate::descriptor_arguments(&descriptor);
+/// Emit the loads for one callback and its `invokestatic`.
+///
+/// Returns the instruction bytes and the number of operand-stack slots they
+/// push at their peak, so the caller can raise `max_stack` conservatively.
+fn callback_call(
+    target: &Target<'_>,
+    callback: &MethodRef,
+    takes_receiver: bool,
+    pool: &mut PoolBuilder<'_>,
+) -> Result<(Vec<u8>, u16), String> {
+    let label = target.label();
+    let arguments = crate::descriptor_arguments(&target.descriptor);
     let mut inserted = Vec::new();
-    let mut slot = if is_static { 0 } else { 1 };
-    let mut argument_slots = 0u32;
+    let mut slot = if target.is_static { 0 } else { 1 };
+    let mut slots = 0u16;
     if takes_receiver {
         inserted.push(0x2a); // aload_0
-        argument_slots += 1;
+        slots += 1;
     }
     for argument in &arguments {
         let (opcode, width) = load_opcode(argument)?;
@@ -858,19 +961,54 @@ pub fn weave_head(
         inserted.push(opcode);
         inserted.push(slot as u8);
         slot = slot.checked_add(width).ok_or("local slot overflow")?;
-        argument_slots += u32::from(width);
+        slots = slots.checked_add(width).ok_or("argument slot overflow")?;
     }
-    if slot > code.max_locals {
+    let max_locals = target.code()?.max_locals;
+    if slot > max_locals {
         return Err(format!(
-            "{label} declares max_locals {} but its arguments occupy {slot} slots",
-            code.max_locals
+            "{label} declares max_locals {max_locals} but its arguments occupy {slot} slots"
         ));
     }
-
-    let mut pool = PoolBuilder::new(&class.pool);
     let callback_index = pool.method_ref(callback)?;
     inserted.push(0xb8); // invokestatic
     inserted.extend_from_slice(&callback_index.to_be_bytes());
+    Ok((inserted, slots))
+}
+
+/// Insert a `HEAD` callback at offset 0 of `target`.
+///
+/// `class` must be the class that declares `target` (`target.owner` must equal
+/// [`ClassFile::name`]).  The returned bytes are the rewritten class; the input
+/// is untouched.
+///
+/// The callback is invoked with `invokestatic`, so it must be static.  A
+/// callback takes the target's arguments in order and returns `void`.  An
+/// instance target's callback may take the target instance first, which is
+/// what the inserted `aload_0` supplies; a callback that does not declare it
+/// gets the arguments only, and no receiver is pushed.
+///
+/// Errors name the reason a method is outside the subset instead of guessing:
+/// branches, switches, `jsr`/`ret`, `wide`, an exception table, a
+/// `StackMapTable`, condy, abstract/native methods, a local slot above 255, a
+/// mismatched callback descriptor, or `CallbackInfo` parameters.
+pub fn weave_head(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+) -> Result<Vec<u8>, String> {
+    let target = prepare_target(class, target)?;
+    let label = target.label();
+    let takes_receiver = callback_arguments(
+        &target.class_name,
+        target.is_static,
+        &target.descriptor,
+        &callback.descriptor,
+        "HEAD",
+    )?;
+
+    let mut pool = PoolBuilder::new(&class.pool);
+    let (inserted, argument_slots) = callback_call(&target, callback, takes_receiver, &mut pool)?;
+    let code = target.code()?;
 
     let mut woven = inserted;
     woven.extend_from_slice(code.code);
@@ -879,20 +1017,164 @@ pub fn weave_head(
             "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
         ));
     }
-    let max_stack = u32::from(code.max_stack) + argument_slots + 1;
-    let max_stack =
-        u16::try_from(max_stack).map_err(|_| format!("{label}: woven max_stack overflows u16"))?;
+    let max_stack = u32::from(code.max_stack)
+        .checked_add(u32::from(argument_slots))
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(|| format!("{label}: woven max_stack overflows u16"))?;
 
     emit(
-        &layout,
+        &target.layout,
         Some(Patch {
-            method: method_index,
-            attribute: attribute_index,
+            method: target.method_index,
+            attribute: target.attribute_index,
             code: woven,
             max_stack,
         }),
         &pool.added,
     )
+}
+
+/// Insert a void callback immediately before the target's `return`
+/// instructions.
+///
+/// [`ReturnMode::Return`] inserts before every return-family instruction in
+/// the method; [`ReturnMode::Tail`] inserts before the last one only, matching
+/// Mixin's `RETURN` and `TAIL` anchors in a method without branches.
+///
+/// Only `void` targets are woven.  A non-void target would need a
+/// `CallbackInfoReturnable` carrying the target's boxed result, which needs
+/// object construction this bounded insert cannot emit; that target is
+/// rejected with a reason and stays on the interpreter path.
+///
+/// The callback is invoked with `invokestatic`.  A callback takes the target's
+/// arguments in order and returns `void`.  An instance target's callback may
+/// take the target instance first, which the inserted `aload_0` supplies.
+/// Every other rejection matches [`weave_head`]: branches, switches,
+/// `jsr`/`ret`, `wide`, an exception table, a `StackMapTable`, condy,
+/// abstract/native methods, a local slot above 255, a mismatched callback
+/// descriptor, or `CallbackInfo`/`CallbackInfoReturnable` parameters.
+pub fn weave_return(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    mode: ReturnMode,
+) -> Result<Vec<u8>, String> {
+    let target = prepare_target(class, target)?;
+    let label = target.label();
+    let anchor = mode.anchor();
+    if crate::return_desc(&target.descriptor) != "V" {
+        return Err(format!(
+            "{label}: {anchor} weaving a non-void target needs a CallbackInfoReturnable object, which the bounded weaver cannot construct; only void targets are woven (the interpreter handles this one)"
+        ));
+    }
+    let takes_receiver = callback_arguments(
+        &target.class_name,
+        target.is_static,
+        &target.descriptor,
+        &callback.descriptor,
+        anchor,
+    )?;
+
+    let code = target.code()?;
+    let returns = return_offsets(code.code);
+    let sites: Vec<usize> = match mode {
+        ReturnMode::Return => returns,
+        ReturnMode::Tail => returns.last().copied().into_iter().collect(),
+    };
+    if sites.is_empty() {
+        return Err(format!(
+            "{label}: {anchor} weaving found no return instruction in a straight-line method"
+        ));
+    }
+
+    let mut pool = PoolBuilder::new(&class.pool);
+    let (call, argument_slots) = callback_call(&target, callback, takes_receiver, &mut pool)?;
+    let mut woven = Vec::with_capacity(code.code.len() + call.len() * sites.len());
+    let mut at = 0usize;
+    for site in &sites {
+        woven.extend_from_slice(&code.code[at..*site]);
+        woven.extend_from_slice(&call);
+        at = *site;
+    }
+    woven.extend_from_slice(&code.code[at..]);
+    if woven.len() > MAX_CODE_LENGTH {
+        return Err(format!(
+            "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
+        ));
+    }
+    let max_stack = u32::from(code.max_stack)
+        .checked_add(u32::from(argument_slots))
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(|| format!("{label}: woven max_stack overflows u16"))?;
+
+    emit(
+        &target.layout,
+        Some(Patch {
+            method: target.method_index,
+            attribute: target.attribute_index,
+            code: woven,
+            max_stack,
+        }),
+        &pool.added,
+    )
+}
+
+/// Apply every plan that targets `class`: `HEAD` plans first, then
+/// `RETURN`/`TAIL` plans, each group in declaration order.
+///
+/// Plans for other classes are skipped.  A matching plan that asks for an
+/// anchor or object this file cannot produce is an error rather than a silent
+/// skip: `INVOKE` call-site rewriting, cancellation (`CallbackInfo`), an
+/// unknown anchor, and more than `MAX_WEAVE_PLANS_PER_CLASS` plans for one
+/// class.
+pub fn weave_class(class: &ClassFile, plans: &[MixinInjectionPlan]) -> Result<Vec<u8>, String> {
+    let matching = plans
+        .iter()
+        .filter(|plan| plan.target.owner == class.name)
+        .collect::<Vec<_>>();
+    if matching.len() > MAX_WEAVE_PLANS_PER_CLASS {
+        return Err(format!(
+            "class {} has {} matching weave plans; the bounded weaver applies at most {MAX_WEAVE_PLANS_PER_CLASS}",
+            class.name,
+            matching.len()
+        ));
+    }
+    for plan in &matching {
+        if plan.cancellable {
+            return Err(format!(
+                "{}.{}: cancellable {} weaving needs a runtime-owned CallbackInfo, which the bounded weaver cannot construct",
+                plan.target.owner, plan.target.name, plan.at
+            ));
+        }
+        if !matches!(plan.at.as_str(), "HEAD" | "RETURN" | "TAIL") {
+            return Err(format!(
+                "{}.{}: anchor {} needs the interpreter path; the bounded weaver applies HEAD, RETURN and TAIL",
+                plan.target.owner, plan.target.name, plan.at
+            ));
+        }
+    }
+
+    let mut current = class.write()?;
+    for plan in matching.iter().filter(|plan| plan.at == "HEAD") {
+        let next = ClassFile::parse(&current)
+            .map_err(|error| format!("rewritten class did not parse again: {error}"))?;
+        current = weave_head(&next, &plan.target, &plan.callback)?;
+    }
+    for plan in matching
+        .iter()
+        .filter(|plan| plan.at == "RETURN" || plan.at == "TAIL")
+    {
+        let mode = if plan.at == "TAIL" {
+            ReturnMode::Tail
+        } else {
+            ReturnMode::Return
+        };
+        let next = ClassFile::parse(&current)
+            .map_err(|error| format!("rewritten class did not parse again: {error}"))?;
+        current = weave_return(&next, &plan.target, &plan.callback, mode)?;
+    }
+    Ok(current)
 }
 
 /// Apply the `HEAD` plans that target `class`, in plan order.
@@ -902,6 +1184,10 @@ pub fn weave_head(
 /// classes and every other anchor are left to the interpreter.  Cancellable
 /// plans are skipped because their callback takes a `CallbackInfo`, which this
 /// bytecode insert cannot construct.
+///
+/// [`weave_class`] is the whole-class entry point: it also applies `RETURN`
+/// and `TAIL` plans, and rejects anchors and cancellable plans it cannot weave
+/// instead of skipping them.
 ///
 /// Not supported here, and left on the interpreter path: `RETURN`, `TAIL` and
 /// `INVOKE` anchors; targets with branches or stack-map frames (so no
@@ -924,6 +1210,49 @@ pub fn weave_plans(class: &ClassFile, plans: &[MixinInjectionPlan]) -> Result<Ve
         current = weave_head(&next, &plan.target, &plan.callback)?;
     }
     Ok(current)
+}
+
+/// Weave a set of parsed classes, grouped by the class each plan targets.
+///
+/// Classes with matching plans go through [`weave_class`]; every other class is
+/// re-encoded unchanged by [`ClassFile::write`], so the result is a complete
+/// replacement set keyed like `classes`.  A plan that targets a class absent
+/// from the set is an error rather than a silent skip, and the per-class plan
+/// bound is `MAX_WEAVE_PLANS_PER_CLASS`.
+pub fn weave_classes(
+    classes: &BTreeMap<String, ClassFile>,
+    plans: &[MixinInjectionPlan],
+) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut by_owner: BTreeMap<&str, Vec<&MixinInjectionPlan>> = BTreeMap::new();
+    for plan in plans {
+        by_owner
+            .entry(plan.target.owner.as_str())
+            .or_default()
+            .push(plan);
+    }
+    for owner in by_owner.keys() {
+        if !classes.values().any(|class| class.name == *owner) {
+            return Err(format!(
+                "weave plan targets class {owner}, which is not in the class set"
+            ));
+        }
+    }
+
+    let mut woven = BTreeMap::new();
+    for (key, class) in classes {
+        let bytes = match by_owner.get(class.name.as_str()) {
+            Some(class_plans) => {
+                let owned = class_plans
+                    .iter()
+                    .map(|plan| (*plan).clone())
+                    .collect::<Vec<_>>();
+                weave_class(class, &owned)?
+            }
+            None => class.write()?,
+        };
+        woven.insert(key.clone(), bytes);
+    }
+    Ok(woven)
 }
 
 #[cfg(test)]

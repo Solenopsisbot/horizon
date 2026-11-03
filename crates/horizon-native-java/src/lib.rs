@@ -12,7 +12,7 @@ use std::{
 
 pub mod weaver;
 
-pub use weaver::{weave_head, weave_plans};
+pub use weaver::{ReturnMode, weave_class, weave_classes, weave_head, weave_plans, weave_return};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -6471,8 +6471,8 @@ pub struct ClassFile {
     pub fields: Vec<Field>,
     pub annotations: Vec<Annotation>,
     /// The class file these values were parsed from, kept so
-    /// [`Self::write`] and [`weaver::weave_head`] can reproduce and rewrite
-    /// the byte ranges the parser does not model.
+    /// [`Self::write`], [`weaver::weave_head`] and [`weaver::weave_return`]
+    /// can reproduce and rewrite the byte ranges the parser does not model.
     raw: Vec<u8>,
 }
 
