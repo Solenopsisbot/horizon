@@ -28,15 +28,27 @@ pub const LOADERS: [&str; 4] = ["neoforge", "fabric", "forge", "quilt"];
 /// change what content can be carried, but it tells the player that Java compatibility will
 /// need the embedded JVM path once that runtime is enabled.
 fn compatibility_note(check: &Check) -> Option<String> {
-    let error = check.native.as_ref()?.error.as_deref()?;
+    let native = check.native.as_ref()?;
+    let error = native.error.as_deref()?;
     let mut detail = error.replace(['\n', '\r'], " ");
     const MAX_DETAIL: usize = 240;
     if detail.chars().count() > MAX_DETAIL {
         detail = detail.chars().take(MAX_DETAIL - 1).collect();
         detail.push('…');
     }
+    let entry = native
+        .entrypoint
+        .as_deref()
+        .map(|name| format!(" for {}", name))
+        .unwrap_or_default();
+    let kind = native
+        .kind
+        .as_deref()
+        .map(|kind| format!(" ({kind})"))
+        .unwrap_or_default();
     Some(format!(
-        "Java compatibility probe stopped; embedded JVM fallback may be needed: {detail}"
+        "Java compatibility probe stopped{kind}{entry} after {} host calls; embedded JVM fallback may be needed: {detail}",
+        native.calls
     ))
 }
 
@@ -386,7 +398,7 @@ mod tests {
         let Support::Partial(reason) = support_of(&check) else {
             panic!("probe failures should be visible in the browser verdict")
         };
-        assert!(reason.starts_with("Content ports cleanly. Java compatibility probe stopped;"));
+        assert!(reason.starts_with("Content ports cleanly. Java compatibility probe stopped (main) for demo.Main after 0 host calls;"));
         assert!(reason.ends_with('…'));
         assert!(reason.chars().count() < 400);
     }
