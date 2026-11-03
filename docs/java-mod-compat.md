@@ -386,6 +386,16 @@ optionals, and one-dimensional arrays; the real field or call semantics remain a
 entrypoint now exercises this path through its `MinecraftAccessor` cast. Static Fabric attachment constants
 with no transformed target use explicit shims.
 
+The native probe also reads Mixin annotations from real classfiles. Class and method
+`RuntimeVisibleAnnotations` survive parsing, so `@Mixin` targets (both `targets` and `value`) and `@Inject`
+methods with `method` (name or `name(descriptor)`), nested `@At` anchors (`HEAD`, `RETURN`, `TAIL`) and
+`cancellable` become deterministic `MixinInjectionPlan`s. `NativeJar::execute_discovered_mixins` runs the
+HEAD callbacks in declaration order, invokes the target once, then runs RETURN/TAIL callbacks, and rejects
+cancellable, mixed-anchor, or non-void-callback plans before executing any of them. `--mixin-plans` reports
+the same plans without running an entrypoint. This is planning and bounded native invocation, not bytecode
+weaving: no class is rewritten, and `@Redirect`, `@ModifyArg`/`@ModifyVariable`, slices, and cancellation
+remain on the JVM fallback.
+
 Reproduce:
 
 ```sh
@@ -533,10 +543,12 @@ Legacy Forge's `NetworkRegistry.newSimpleChannel` and `SimpleChannel.registerMes
 payload marker: the message class, encoder, and handler are retained as a bidirectional registration. The
 legacy message id and decoder remain opaque, and channel ownership plus byte encoding and sends are still
 unsupported at this boundary.
-The generated `FriendlyByteBuf` façade keeps a bounded FIFO of payload values for common bootstrap calls:
-`writeUtf`/`readUtf`, `writeVarInt`/`readVarInt`, `writeInt`/`readInt`, `writeBoolean`/`readBoolean`,
-and `writeResourceLocation`/`readResourceLocation`, `writeEnum`/`readEnum`, and bounded `writeNullable`/`readNullable` round trips. It preserves registration-time value
-semantics without claiming ownership of the live Netty channel or packet bytes.
+The generated `FriendlyByteBuf` façade now owns a bounded big-endian byte buffer (1 MiB cap) with a read
+cursor, so common bootstrap calls genuinely round-trip: primitives, varints, UTF-8 strings, identifiers,
+UUIDs, block/chunk positions, byte arrays, nullable/optional values, and enum ordinals, plus
+`readableBytes`, `readerIndex`/`writerIndex`, `skipBytes`, `clear`, and `discardReadBytes`. NBT values remain
+an opaque bounded marker, and the façade still does not claim ownership of the live Netty channel or a
+packet's bytes.
 When a target references NeoForge, the generator emits these public ABI shims directly, so the path does not
 depend on shipping NeoForge's jar. A synthetic `@Mod` that creates a `DeferredRegister`, attaches it to the
 event bus, and registers an object now completes through both `horizon-jvm` and the native probe.
@@ -552,7 +564,9 @@ bounded in-jar instance fields, class initialization (`<clinit>`) and jar-owned 
 `invokeinterface`, and calls through the explicit `Host` trait are covered; wide constants, `checkcast`,
 `invokedynamic` sites now parse `BootstrapMethods`/`MethodHandle` metadata, preserve captured values, and
 resolve supported in-jar callback targets; unresolved targets remain host-visible callback markers
-(bootstrap execution remains bounded), and exception paths have neutral bounded fallbacks. An unsupported opcode
+(bootstrap execution remains bounded). An uncaught `athrow` now fails native execution with a bounded
+diagnostic naming the exception class and message instead of continuing; catch/finally handlers and stack
+traces remain outside the interpreter. An unsupported opcode
 still returns a diagnostic naming the class, method, program counter, and opcode. The probe now reaches
 Lithium (8 host calls), Spark (9), FabricProxy-Lite's server entrypoint (6), Chunky (5), ServerReplay (53),
 Logfare (120), and the workspace's NeoForge 1.21.11 ABI probe constructor (165) now complete without a JVM.
@@ -593,8 +607,9 @@ String `replace` (character and `CharSequence` forms), `repeat`, `indexOf`, `las
 are also deterministic, covering namespace/path normalization used by loader metadata and registration code. Repetition
 counts are bounded to keep native probes finite.
 Throwable and common Exception/Error subclasses retain constructor message and cause markers, with bounded
-`getMessage`, `getCause`, `initCause`, and `toString` accessors for loader diagnostics; stack traces and arbitrary
-throw/catch control flow remain outside this surface. The embedded JVM runner labels
+`getMessage`, `getCause`, `initCause`, and `toString` accessors for loader diagnostics; an uncaught
+`athrow` becomes an `UncaughtException` diagnostic, while stack traces and arbitrary throw/catch control
+flow remain outside this surface. The embedded JVM runner labels
 `UnsupportedOperationException`, dynamic classpath failures, and missing façade members such as
 `NoSuchMethodError`/`NoSuchFieldError`/`AbstractMethodError`/`IncompatibleClassChangeError` as explicit
 fallback diagnostics instead of opaque entrypoint errors.
