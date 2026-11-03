@@ -191,6 +191,12 @@ pub struct Content {
     pub blocks: Vec<Block>,
     pub items: Vec<Item>,
     pub effects: Vec<MobEffect>,
+    /// Typed entity registrations emitted by a native Java adapter.
+    pub entities: Vec<crate::native::EntityDeclaration>,
+    /// Typed data-component registrations emitted by a native Java adapter.
+    pub data_components: Vec<crate::native::DataComponentDeclaration>,
+    /// Typed attachment registrations emitted by a native Java adapter.
+    pub attachments: Vec<crate::native::AttachmentDeclaration>,
     /// Data files supplied by a native adapter (recipes and ingredients). These
     /// are written into the same resource overlay as packaged mod files.
     pub native_files: BTreeMap<String, Vec<u8>>,
@@ -281,6 +287,9 @@ impl Content {
             blocks: Vec::new(),
             items: Vec::new(),
             effects: Vec::new(),
+            entities: Vec::new(),
+            data_components: Vec::new(),
+            attachments: Vec::new(),
             native_files: BTreeMap::new(),
             namespaces: manifest.owned_namespaces().map(str::to_owned).collect(),
         };
@@ -301,6 +310,9 @@ impl Content {
             && self.blocks.is_empty()
             && self.items.is_empty()
             && self.effects.is_empty()
+            && self.entities.is_empty()
+            && self.data_components.is_empty()
+            && self.attachments.is_empty()
             && self.native_files.is_empty()
     }
 
@@ -350,6 +362,15 @@ impl Content {
         for effect in &declarations.effects {
             add_namespace(&effect.id);
         }
+        for entity in &declarations.entities {
+            add_namespace(&entity.id);
+        }
+        for component in &declarations.data_components {
+            add_namespace(&component.id);
+        }
+        for attachment in &declarations.attachments {
+            add_namespace(&attachment.id);
+        }
         let mut native_files = BTreeMap::new();
         for recipe in &declarations.recipes {
             add_namespace(&recipe.id);
@@ -371,12 +392,76 @@ impl Content {
             check_path(&file)?;
             native_files.insert(file, ingredient.json.clone());
         }
+        for entity in &declarations.entities {
+            let (namespace, path) = entity
+                .id
+                .split_once(':')
+                .ok_or_else(|| format!("native entity {} has no namespace", entity.id))?;
+            let file = format!("data/{namespace}/horizon/entity/{path}.json");
+            check_path(&file)?;
+            let json = serde_json::json!({
+                "template": entity.template,
+                "properties": entity.properties,
+            });
+            native_files.insert(
+                file,
+                serde_json::to_vec(&json).map_err(|error| {
+                    format!("native entity {} cannot be encoded: {error}", entity.id)
+                })?,
+            );
+        }
+        for component in &declarations.data_components {
+            let (namespace, path) = component.id.split_once(':').ok_or_else(|| {
+                format!("native data component {} has no namespace", component.id)
+            })?;
+            let file = format!("data/{namespace}/horizon/data_component/{path}.json");
+            check_path(&file)?;
+            let json = serde_json::json!({
+                "codec": component.codec,
+                "persistent": component.persistent,
+                "network_synced": component.network_synced,
+            });
+            native_files.insert(
+                file,
+                serde_json::to_vec(&json).map_err(|error| {
+                    format!(
+                        "native data component {} cannot be encoded: {error}",
+                        component.id
+                    )
+                })?,
+            );
+        }
+        for attachment in &declarations.attachments {
+            let (namespace, path) = attachment
+                .id
+                .split_once(':')
+                .ok_or_else(|| format!("native attachment {} has no namespace", attachment.id))?;
+            let file = format!("data/{namespace}/horizon/attachment/{path}.json");
+            check_path(&file)?;
+            let json = serde_json::json!({
+                "codec": attachment.codec,
+                "default": attachment.default_value,
+                "copy_on_death": attachment.copy_on_death,
+            });
+            native_files.insert(
+                file,
+                serde_json::to_vec(&json).map_err(|error| {
+                    format!(
+                        "native attachment {} cannot be encoded: {error}",
+                        attachment.id
+                    )
+                })?,
+            );
+        }
         Ok(Self {
             source: Source::Dir(PathBuf::new()),
             files: Vec::new(),
             blocks: declarations.blocks,
             items: declarations.items,
             effects: declarations.effects,
+            entities: declarations.entities,
+            data_components: declarations.data_components,
+            attachments: declarations.attachments,
             native_files,
             namespaces,
         })

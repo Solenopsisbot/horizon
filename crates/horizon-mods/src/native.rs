@@ -37,12 +37,45 @@ pub struct IngredientDeclaration {
     pub json: Vec<u8>,
 }
 
+/// A bounded entity registration carried by a loader adapter. The native
+/// world owns the actual entity implementation; this record preserves the
+/// vanilla template and scalar builder options until the live registry is
+/// assembled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntityDeclaration {
+    pub id: String,
+    pub template: String,
+    pub properties: BTreeMap<String, String>,
+}
+
+/// A typed data-component registration. Arbitrary Java codecs remain on the
+/// JVM fallback; native adapters provide a stable codec id and bounded flags.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataComponentDeclaration {
+    pub id: String,
+    pub codec: String,
+    pub persistent: bool,
+    pub network_synced: bool,
+}
+
+/// A typed attachment registration shared by Forge and NeoForge adapters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentDeclaration {
+    pub id: String,
+    pub codec: String,
+    pub default_value: String,
+    pub copy_on_death: bool,
+}
+
 /// Typed registrations waiting for the pre-resource load phase.
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct NativeDeclarations {
     pub blocks: Vec<Block>,
     pub items: Vec<Item>,
     pub effects: Vec<MobEffect>,
+    pub entities: Vec<EntityDeclaration>,
+    pub data_components: Vec<DataComponentDeclaration>,
+    pub attachments: Vec<AttachmentDeclaration>,
     pub recipes: Vec<RecipeDeclaration>,
     pub ingredients: Vec<IngredientDeclaration>,
     pub custom: Vec<CustomDeclaration>,
@@ -237,6 +270,150 @@ impl NativeDeclarations {
         });
         Ok(())
     }
+
+    fn add_entity(
+        &mut self,
+        entry: &RegistryEntry,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        Self::ensure_id(&entry.id)?;
+        let template = properties
+            .get("template")
+            .ok_or_else(|| format!("native entity {} has no template", entry.id))?;
+        Self::ensure_id(template)?;
+        if !template.starts_with("minecraft:") {
+            return Err(format!(
+                "native entity {} template must be a vanilla id",
+                entry.id
+            ));
+        }
+        if self.entities.iter().any(|entity| entity.id == entry.id) {
+            return Err(format!("duplicate native entity {}", entry.id));
+        }
+        let mut retained = properties.clone();
+        retained.remove("template");
+        for key in retained.keys() {
+            if !matches!(
+                key.as_str(),
+                "width"
+                    | "height"
+                    | "tracking_range"
+                    | "update_interval"
+                    | "fire_immune"
+                    | "summonable"
+                    | "spawnable"
+            ) {
+                return Err(format!("unknown native entity property {key:?}"));
+            }
+        }
+        for key in ["width", "height"] {
+            if let Some(value) = retained.get(key) {
+                parse_f32(key, value)?;
+            }
+        }
+        for key in ["tracking_range", "update_interval"] {
+            if let Some(value) = retained.get(key) {
+                value.parse::<u16>().map_err(|_| {
+                    format!("native entity property {key} is not an unsigned short: {value:?}")
+                })?;
+            }
+        }
+        for key in ["fire_immune", "summonable", "spawnable"] {
+            if let Some(value) = retained.get(key) {
+                parse_bool(key, value)?;
+            }
+        }
+        self.entities.push(EntityDeclaration {
+            id: entry.id.clone(),
+            template: template.clone(),
+            properties: retained,
+        });
+        Ok(())
+    }
+
+    fn add_data_component(
+        &mut self,
+        entry: &RegistryEntry,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        Self::ensure_id(&entry.id)?;
+        let codec = properties
+            .get("codec")
+            .ok_or_else(|| format!("native data component {} has no codec", entry.id))?;
+        Self::ensure_id(codec)?;
+        if self
+            .data_components
+            .iter()
+            .any(|component| component.id == entry.id)
+        {
+            return Err(format!("duplicate native data component {}", entry.id));
+        }
+        let persistent = properties
+            .get("persistent")
+            .map_or(Ok(true), |value| parse_bool("persistent", value))?;
+        let network_synced = properties
+            .get("network_synced")
+            .or_else(|| properties.get("network-synced"))
+            .map_or(Ok(false), |value| parse_bool("network_synced", value))?;
+        for key in properties.keys() {
+            if !matches!(
+                key.as_str(),
+                "codec" | "persistent" | "network_synced" | "network-synced"
+            ) {
+                return Err(format!("unknown native data component property {key:?}"));
+            }
+        }
+        self.data_components.push(DataComponentDeclaration {
+            id: entry.id.clone(),
+            codec: codec.clone(),
+            persistent,
+            network_synced,
+        });
+        Ok(())
+    }
+
+    fn add_attachment(
+        &mut self,
+        entry: &RegistryEntry,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        Self::ensure_id(&entry.id)?;
+        let codec = properties
+            .get("codec")
+            .ok_or_else(|| format!("native attachment {} has no codec", entry.id))?;
+        Self::ensure_id(codec)?;
+        if self
+            .attachments
+            .iter()
+            .any(|attachment| attachment.id == entry.id)
+        {
+            return Err(format!("duplicate native attachment {}", entry.id));
+        }
+        let default_value = properties
+            .get("default")
+            .or_else(|| properties.get("default_value"))
+            .cloned()
+            .unwrap_or_else(|| "null".to_owned());
+        let copy_on_death = properties
+            .get("copy_on_death")
+            .or_else(|| properties.get("copy-on-death"))
+            .map_or(Ok(false), |value| parse_bool("copy_on_death", value))?;
+        for key in properties.keys() {
+            if !matches!(
+                key.as_str(),
+                "codec" | "default" | "default_value" | "copy_on_death" | "copy-on-death"
+            ) {
+                return Err(format!("unknown native attachment property {key:?}"));
+            }
+        }
+        self.attachments.push(AttachmentDeclaration {
+            id: entry.id.clone(),
+            codec: codec.clone(),
+            default_value,
+            copy_on_death,
+        });
+        Ok(())
+    }
 }
 
 impl TypedRegistrySink for NativeDeclarations {
@@ -278,6 +455,18 @@ impl TypedRegistrySink for NativeDeclarations {
             RegistryDeclaration::Recipe { json } => self.add_recipe(entry, json),
             RegistryDeclaration::Ingredient { json } => self.add_ingredient(entry, json),
             RegistryDeclaration::Custom { kind, properties } => {
+                match kind.to_ascii_lowercase().as_str() {
+                    "entity" | "entity_type" | "entity-type" => {
+                        return self.add_entity(entry, properties);
+                    }
+                    "data_component" | "data-component" | "component" => {
+                        return self.add_data_component(entry, properties);
+                    }
+                    "attachment" | "attachments" => {
+                        return self.add_attachment(entry, properties);
+                    }
+                    _ => {}
+                }
                 Self::ensure_id(&entry.id)?;
                 self.custom.push(CustomDeclaration {
                     registry: entry.registry.clone(),
@@ -536,6 +725,107 @@ mod tests {
                 .map(|item| item.id.as_str())
                 .collect::<Vec<_>>(),
             ["ruby:existing"]
+        );
+    }
+
+    #[test]
+    fn custom_loader_kinds_become_typed_entity_component_and_attachment_rows() {
+        let rows = [
+            RegistryEntry::typed(
+                "minecraft:entity_type",
+                "ruby:bird",
+                RegistryDeclaration::Custom {
+                    kind: "entity".into(),
+                    properties: BTreeMap::from([
+                        ("template".into(), "minecraft:chicken".into()),
+                        ("width".into(), "0.6".into()),
+                        ("height".into(), "0.8".into()),
+                        ("tracking_range".into(), "64".into()),
+                    ]),
+                },
+            ),
+            RegistryEntry::typed(
+                "minecraft:data_component_type",
+                "ruby:mana",
+                RegistryDeclaration::Custom {
+                    kind: "data_component".into(),
+                    properties: BTreeMap::from([
+                        ("codec".into(), "ruby:mana".into()),
+                        ("persistent".into(), "true".into()),
+                        ("network_synced".into(), "true".into()),
+                    ]),
+                },
+            ),
+            RegistryEntry::typed(
+                "neoforge:attachment",
+                "ruby:mana",
+                RegistryDeclaration::Custom {
+                    kind: "attachment".into(),
+                    properties: BTreeMap::from([
+                        ("codec".into(), "ruby:mana".into()),
+                        ("default".into(), "0".into()),
+                        ("copy_on_death".into(), "true".into()),
+                    ]),
+                },
+            ),
+        ];
+        let declarations = NativeDeclarations::from_registry_entries(rows.iter()).unwrap();
+        assert_eq!(declarations.custom, []);
+        assert_eq!(declarations.entities[0].template, "minecraft:chicken");
+        assert_eq!(declarations.entities[0].properties["tracking_range"], "64");
+        assert_eq!(declarations.data_components[0].network_synced, true);
+        assert_eq!(declarations.attachments[0].default_value, "0");
+        assert!(declarations.attachments[0].copy_on_death);
+    }
+
+    #[test]
+    fn typed_live_rows_export_planner_files() {
+        let entity = RegistryEntry::typed(
+            "minecraft:entity_type",
+            "ruby:bird",
+            RegistryDeclaration::Custom {
+                kind: "entity".into(),
+                properties: BTreeMap::from([("template".into(), "minecraft:chicken".into())]),
+            },
+        );
+        let component = RegistryEntry::typed(
+            "minecraft:data_component_type",
+            "ruby:mana",
+            RegistryDeclaration::Custom {
+                kind: "data_component".into(),
+                properties: BTreeMap::from([("codec".into(), "ruby:mana".into())]),
+            },
+        );
+        let attachment = RegistryEntry::typed(
+            "neoforge:attachment",
+            "ruby:mana",
+            RegistryDeclaration::Custom {
+                kind: "attachment".into(),
+                properties: BTreeMap::from([("codec".into(), "ruby:mana".into())]),
+            },
+        );
+        let content = crate::Content::from_native(
+            "ruby",
+            NativeDeclarations::from_registry_entries([&entity, &component, &attachment]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(content.entities.len(), 1);
+        assert_eq!(content.data_components.len(), 1);
+        assert_eq!(content.attachments.len(), 1);
+        assert!(
+            content
+                .native_files
+                .contains_key("data/ruby/horizon/entity/bird.json")
+        );
+        assert!(
+            content
+                .native_files
+                .contains_key("data/ruby/horizon/data_component/mana.json")
+        );
+        assert!(
+            content
+                .native_files
+                .contains_key("data/ruby/horizon/attachment/mana.json")
         );
     }
 }

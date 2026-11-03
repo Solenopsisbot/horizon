@@ -4374,6 +4374,73 @@ mod tests {
     }
 
     #[test]
+    fn friendly_byte_buf_supports_typed_primitives_and_cursor() {
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "writeLong",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(J)Lnet/minecraft/network/FriendlyByteBuf;",
+            ),
+            "horizonValues.add(p0); return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "readDouble",
+                "double",
+                "()D",
+            ),
+            "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Number ? ((Number) horizonValues.get(horizonReadIndex - 1)).doubleValue() : 0.0d;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "writeByteArray",
+                "net.minecraft.network.FriendlyByteBuf",
+                "([B)Lnet/minecraft/network/FriendlyByteBuf;",
+            ),
+            "horizonValues.add(p0 == null ? new byte[0] : p0.clone()); return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "readByteArray",
+                "byte[]",
+                "(I)[B",
+            ),
+            "if (horizonReadIndex >= horizonValues.size() || !(horizonValues.get(horizonReadIndex++) instanceof byte[])) return new byte[0]; byte[] value = ((byte[]) horizonValues.get(horizonReadIndex - 1)).clone(); return value.length <= p0 ? value : java.util.Arrays.copyOf(value, p0);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "readUUID",
+                "java.util.UUID",
+                "()Ljava/util/UUID;",
+            ),
+            "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof java.util.UUID ? (java.util.UUID) horizonValues.get(horizonReadIndex - 1) : new java.util.UUID(0L, 0L);"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "readerIndex",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
+            ),
+            "horizonReadIndex = Math.max(0, Math.min(p0, horizonValues.size())); return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/FriendlyByteBuf",
+                "readOptional",
+                "java.util.Optional",
+                "(Ljava/util/function/Function;)Ljava/util/Optional;",
+            ),
+            "if (horizonReadIndex >= horizonValues.size()) return java.util.Optional.empty(); Object value = horizonValues.get(horizonReadIndex++); return value instanceof java.util.Optional ? (java.util.Optional) value : java.util.Optional.ofNullable(value);"
+        );
+    }
+
+    #[test]
     fn stream_codec_factories_are_bootstrap_values() {
         assert_eq!(
             runtime_body(
