@@ -186,20 +186,25 @@
 //!
 //! # Selector modifiers
 //!
-//! [`weave_invoke_at`], [`weave_invoke_selected`] and [`weave_invoke_shifted`]
-//! model Mixin's `ordinal`, `slice`, `shift` and `by` on an `@At("INVOKE")`
-//! anchor; [`weave_returns_selected`] and [`weave_head_selected`] model the
-//! ordinal on `RETURN`/`TAIL`/`HEAD`.  [`InvokeSelector`] names a call by owner,
-//! name and descriptor (an empty descriptor matches every overload), keeps the
-//! matches inside an optional [`SliceBounds`], and then the `ordinal`-th one -
-//! 0-based, negative from the end (`-1` is the last).  A slice boundary is
-//! another [`SiteSelector`]: `HEAD`, the first `RETURN`, the last `TAIL`, or one
-//! call instruction.  A boundary that names more than one instruction, a slice
-//! that ends before it starts, and an ordinal outside the matches are reasons,
-//! not guesses.  [`InvokeShift`] moves the insert `by` instruction boundaries
-//! (bounded to `0..=8`) before or after the selected site; an insert that would
-//! land inside an exception range is a reason, and a cancellable insert cannot
-//! be shifted because its cancellation branch has to sit on the call.
+//! [`weave_invoke_at`], [`weave_invoke_selected`], [`weave_invoke_shifted`] and
+//! [`weave_invoke_shifted_by`] model Mixin's `ordinal`, `slice`, `shift` and
+//! `by` on an `@At("INVOKE")` anchor; [`weave_returns_selected`],
+//! [`weave_returns_shifted`], [`weave_head_selected`] and [`weave_head_shifted`]
+//! model the same modifiers on `RETURN`/`TAIL`/`HEAD`.  [`InvokeSelector`] names
+//! a call by owner, name and descriptor (an empty descriptor matches every
+//! overload), keeps the matches inside an optional [`SliceBounds`], and then
+//! the `ordinal`-th one - 0-based, negative from the end (`-1` is the last).  A
+//! slice boundary is another [`SiteSelector`]: `HEAD`, the first `RETURN` or
+//! `TAIL`, a `RETURN`/`TAIL` by ordinal (`ReturnOrdinal`/`TailOrdinal`), or one
+//! call instruction - the plain form requires exactly one match, while
+//! `InvokeOrdinal` names the `ordinal`-th matching call.  A boundary that names
+//! more than one instruction, a slice that ends before it starts, and an
+//! ordinal outside the matches are reasons, not guesses.
+//! [`InvokeShift`] moves the insert `by` instruction boundaries (bounded to
+//! `0..=8`) before or after the selected site; [`Shift::By`] moves it a signed
+//! `-8..=8` boundaries from it.  An insert that would land past the method or
+//! inside an exception range is a reason, and a cancellable insert cannot be
+//! shifted because its cancellation branch has to sit on the call.
 //! [`weave_returns_selected`] takes `non_void` to say the callback observes the
 //! result through `CallbackInfoReturnable`, which the target's descriptor has to
 //! confirm; the plain callback shape it otherwise emits is stack-neutral, so a
@@ -280,6 +285,9 @@ impl ReturnMode {
 /// Discovery shares it so a malformed `@At.by` stays report-only.
 pub(crate) const MAX_SHIFT_BY: u8 = 8;
 
+/// The signed [`ShiftBy`] bound on either side of the selected site.
+const MAX_SIGNED_SHIFT: i32 = MAX_SHIFT_BY as i32;
+
 /// One bounded instruction selector: what a [`SliceBounds`] boundary names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SiteSelector {
@@ -290,15 +298,42 @@ pub enum SiteSelector {
         name: String,
         descriptor: String,
     },
+    /// The `ordinal`-th matching call instruction, 0-based and negative from
+    /// the end (`-1` is the last).  The ordinal is resolved against every
+    /// matching call before the slice is applied, so a boundary can name a
+    /// site the slice itself does not otherwise count.
+    InvokeOrdinal {
+        owner: String,
+        name: String,
+        descriptor: String,
+        ordinal: i32,
+    },
     /// The method's first instruction.
     Head,
     /// The method's first return-family instruction.
     Return,
+    /// The `ordinal`-th return-family instruction, 0-based and negative from
+    /// the end (`-1` is the last), which is the ordinal [`Self::Return`] and
+    /// [`Self::Tail`] leave implicit.
+    ReturnOrdinal { ordinal: i32 },
     /// The method's last return-family instruction.
     Tail,
+    /// The `ordinal`-th return-family instruction counted the [`Self::Return`]
+    /// way; `-1` is the last, which is exactly what plain `TAIL` names.
+    TailOrdinal { ordinal: i32 },
 }
 
 impl SiteSelector {
+    /// The anchor name an ordinal error names.
+    fn anchor(&self) -> &'static str {
+        match self {
+            Self::Invoke { .. } | Self::InvokeOrdinal { .. } => "INVOKE",
+            Self::Head => "HEAD",
+            Self::Return | Self::ReturnOrdinal { .. } => "RETURN",
+            Self::Tail | Self::TailOrdinal { .. } => "TAIL",
+        }
+    }
+
     fn describe(&self) -> String {
         match self {
             Self::Invoke {
@@ -306,9 +341,17 @@ impl SiteSelector {
                 name,
                 descriptor,
             } => format!("INVOKE {owner}.{name}{descriptor}"),
+            Self::InvokeOrdinal {
+                owner,
+                name,
+                descriptor,
+                ordinal,
+            } => format!("INVOKE {owner}.{name}{descriptor} ordinal {ordinal}"),
             Self::Head => "HEAD".to_owned(),
             Self::Return => "RETURN".to_owned(),
+            Self::ReturnOrdinal { ordinal } => format!("RETURN ordinal {ordinal}"),
             Self::Tail => "TAIL".to_owned(),
+            Self::TailOrdinal { ordinal } => format!("TAIL ordinal {ordinal}"),
         }
     }
 }
@@ -363,6 +406,90 @@ impl InvokeShift {
             ));
         }
         Ok(self.by as usize)
+    }
+}
+
+/// A signed `@At.Shift.BY` distance: positive moves the insert towards the end
+/// of the method, negative towards its start, and `0` names the selected site
+/// itself.  [`MAX_SHIFT_BY`] bounds the magnitude on either side.
+///
+/// Mixin spells the shift `BY` and takes its amount from `@At.by`, which is a
+/// signed `int`; [`Shift::By`] builds this value.  [`InvokeShift`] keeps the
+/// `Before`/`After` direction and an unsigned amount, so its existing callers
+/// are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShiftBy {
+    pub by: i32,
+}
+
+impl ShiftBy {
+    fn distance(self, label: &str) -> Result<i32, String> {
+        if self.by < -MAX_SIGNED_SHIFT || self.by > MAX_SIGNED_SHIFT {
+            return Err(format!(
+                "{label}: shift BY by {} is outside the bounded shift of -{MAX_SIGNED_SHIFT}..={MAX_SIGNED_SHIFT} instruction(s)",
+                self.by
+            ));
+        }
+        Ok(self.by)
+    }
+}
+
+impl Shift {
+    /// Mixin's `@At.Shift.BY`: move the insert `by` instruction boundaries,
+    /// positive towards the end of the method and negative towards its start.
+    ///
+    /// The variant keeps Mixin's spelling while the bounded [`Shift`] enum
+    /// stays the two directions every exhaustive `match` over it names; the
+    /// signed entry points ([`weave_invoke_shifted_by`],
+    /// [`weave_returns_shifted`], [`weave_head_shifted`]) take the [`ShiftBy`]
+    /// this builds.
+    #[allow(non_snake_case)]
+    pub const fn By(by: i32) -> ShiftBy {
+        ShiftBy { by }
+    }
+}
+
+/// The shift an `INVOKE` insert applies, before the signed distance is known.
+#[derive(Debug, Clone, Copy)]
+enum AnyShift {
+    Before(u8),
+    After(u8),
+    By(i32),
+}
+
+impl AnyShift {
+    /// The signed instruction distance the layout walks from the selected
+    /// site.  `Before by 0` and `After by 0` keep their historical meaning: the
+    /// site itself and the instruction after it.
+    fn delta(self, label: &str) -> Result<i32, String> {
+        match self {
+            Self::Before(by) => {
+                InvokeShift {
+                    direction: Shift::Before,
+                    by,
+                }
+                .distance(label)?;
+                Ok(-i32::from(by))
+            }
+            Self::After(by) => {
+                InvokeShift {
+                    direction: Shift::After,
+                    by,
+                }
+                .distance(label)?;
+                Ok(i32::from(by) + 1)
+            }
+            Self::By(by) => ShiftBy { by }.distance(label),
+        }
+    }
+}
+
+impl From<InvokeShift> for AnyShift {
+    fn from(shift: InvokeShift) -> Self {
+        match shift.direction {
+            Shift::Before => Self::Before(shift.by),
+            Shift::After => Self::After(shift.by),
+        }
     }
 }
 
@@ -4712,7 +4839,60 @@ fn ordinal_out_of_range(label: &str, anchor: &str, count: usize, ordinal: i32) -
     )
 }
 
-/// Every instruction offset one slice boundary names.
+/// Every call instruction offset one `owner.name(descriptor)` selector names.
+fn invoke_selector_offsets(
+    target: &Target<'_>,
+    code: &CodeLayout<'_>,
+    scan: &CodeScan,
+    owner: &str,
+    name: &str,
+    descriptor: &str,
+) -> Result<Vec<usize>, String> {
+    let mut offsets = Vec::new();
+    for instruction in &scan.instructions {
+        let opcode = code_u1(code.code, instruction.at)?;
+        if !matches!(opcode, 0xb6..=0xb9) {
+            continue;
+        }
+        let index = code_u2(code.code, instruction.at + 1)?;
+        let Some((call_owner, call_name, call_descriptor)) = invoke_method_ref(target.pool, index)
+        else {
+            continue;
+        };
+        if call_owner == owner
+            && call_name == name
+            && (descriptor.is_empty() || call_descriptor == descriptor)
+        {
+            offsets.push(instruction.at);
+        }
+    }
+    Ok(offsets)
+}
+
+/// Resolve one return selector's ordinal against the method's return list.
+fn return_selector_offset(
+    label: &str,
+    scan: &CodeScan,
+    selector: &SiteSelector,
+) -> Result<usize, String> {
+    let Some(first) = scan.returns.first() else {
+        return Err(format!(
+            "{label}: the {} slice boundary needs a return instruction, but the method has none",
+            selector.describe()
+        ));
+    };
+    match selector {
+        SiteSelector::Return => Ok(*first),
+        SiteSelector::Tail => Ok(*scan.returns.last().unwrap_or(first)),
+        SiteSelector::ReturnOrdinal { ordinal } | SiteSelector::TailOrdinal { ordinal } => {
+            let index = ordinal_index(label, selector.anchor(), scan.returns.len(), *ordinal)?;
+            Ok(scan.returns[index])
+        }
+        _ => unreachable!("return_selector_offset is only called with a return selector"),
+    }
+}
+
+/// Every instruction offset one slice boundary names, with its ordinal applied.
 fn selector_offsets(
     label: &str,
     target: &Target<'_>,
@@ -4729,42 +4909,18 @@ fn selector_offsets(
             }
             vec![0]
         }
-        SiteSelector::Return | SiteSelector::Tail => {
-            let at = match selector {
-                SiteSelector::Return => scan.returns.first(),
-                _ => scan.returns.last(),
-            };
-            vec![at.copied().ok_or_else(|| {
-                format!(
-                    "{label}: the {} slice boundary needs a return instruction, but the method has none",
-                    selector.describe()
-                )
-            })?]
+        SiteSelector::Return
+        | SiteSelector::Tail
+        | SiteSelector::ReturnOrdinal { .. }
+        | SiteSelector::TailOrdinal { .. } => {
+            vec![return_selector_offset(label, scan, selector)?]
         }
         SiteSelector::Invoke {
             owner,
             name,
             descriptor,
         } => {
-            let mut offsets = Vec::new();
-            for instruction in &scan.instructions {
-                let opcode = code_u1(code.code, instruction.at)?;
-                if !matches!(opcode, 0xb6..=0xb9) {
-                    continue;
-                }
-                let index = code_u2(code.code, instruction.at + 1)?;
-                let Some((call_owner, call_name, call_descriptor)) =
-                    invoke_method_ref(target.pool, index)
-                else {
-                    continue;
-                };
-                if call_owner == owner
-                    && call_name == name
-                    && (descriptor.is_empty() || call_descriptor == descriptor)
-                {
-                    offsets.push(instruction.at);
-                }
-            }
+            let offsets = invoke_selector_offsets(target, code, scan, owner, name, descriptor)?;
             if offsets.is_empty() {
                 return Err(format!(
                     "{label}: the {} slice boundary matches no instruction",
@@ -4772,6 +4928,22 @@ fn selector_offsets(
                 ));
             }
             offsets
+        }
+        SiteSelector::InvokeOrdinal {
+            owner,
+            name,
+            descriptor,
+            ordinal,
+        } => {
+            let offsets = invoke_selector_offsets(target, code, scan, owner, name, descriptor)?;
+            if offsets.is_empty() {
+                return Err(format!(
+                    "{label}: the {} slice boundary matches no instruction",
+                    selector.describe()
+                ));
+            }
+            let index = ordinal_index(label, selector.anchor(), offsets.len(), *ordinal)?;
+            vec![offsets[index]]
         }
     })
 }
@@ -4839,6 +5011,17 @@ pub fn weave_head(
     target: &MethodRef,
     callback: &MethodRef,
 ) -> Result<Vec<u8>, String> {
+    weave_head_shape(class, target, callback, None)
+}
+
+/// The shared body of [`weave_head`], [`weave_head_selected`] and
+/// [`weave_head_shifted`].
+fn weave_head_shape(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    shift: Option<ShiftBy>,
+) -> Result<Vec<u8>, String> {
     let target = prepare_target(class, target)?;
     let label = target.label();
     let takes_receiver = callback_arguments(
@@ -4854,6 +5037,22 @@ pub fn weave_head(
     let call = callback_call(&target, callback, takes_receiver, &mut pool)?;
     let code = target.code()?;
     let scan = scan_code(&label, code.code)?;
+    let insert_at = match shift {
+        Some(shift) => {
+            let delta = shift.distance(&label)?;
+            if delta == 0 {
+                0
+            } else {
+                shifted_offset(&label, code, &scan, 0, delta)?
+            }
+        }
+        None => 0,
+    };
+    let entry = if insert_at == 0 {
+        TargetEntry::Skip
+    } else {
+        TargetEntry::Enter
+    };
     if code.code.len() + call.bytes.len() > MAX_CODE_LENGTH {
         return Err(format!(
             "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
@@ -4870,11 +5069,11 @@ pub fn weave_head(
         &target,
         code,
         &scan,
-        &[(0, call.bytes.len())],
+        &[(insert_at, call.bytes.len())],
         &call.bytes,
         max_stack,
         max_locals,
-        TargetEntry::Skip,
+        entry,
         FrameSites::Both,
         &[],
         &mut pool,
@@ -4914,6 +5113,31 @@ pub fn weave_head_selected(
     weave_head(class, target, callback)
 }
 
+/// Insert the `HEAD` callback a signed [`Shift::By`] distance from offset 0.
+///
+/// Positive `by` moves the insert into the method body, negative is a reason
+/// (offset 0 has no earlier instruction), and `0` is byte-for-byte
+/// [`weave_head`].  `ordinal` is validated exactly as [`weave_head_selected`]
+/// does.  The insert is *entered* once it moves off offset 0, so a branch to
+/// the shifted instruction runs the callback first.
+pub fn weave_head_shifted(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    ordinal: Option<i32>,
+    shift: ShiftBy,
+) -> Result<Vec<u8>, String> {
+    if let Some(ordinal) = ordinal {
+        ordinal_index(
+            &format!("{}.{}", target.owner, target.name),
+            "HEAD",
+            1,
+            ordinal,
+        )?;
+    }
+    weave_head_shape(class, target, callback, Some(shift))
+}
+
 /// Insert a callback immediately before the target's `return` instructions.
 ///
 /// [`ReturnMode::Return`] inserts before every return-family instruction in
@@ -4948,7 +5172,7 @@ pub fn weave_return(
     callback: &MethodRef,
     mode: ReturnMode,
 ) -> Result<Vec<u8>, String> {
-    weave_return_shape(class, target, callback, mode, None, None)
+    weave_return_shape(class, target, callback, mode, None, None, None)
 }
 
 /// Insert a callback before the one return site a [`ReturnSelector`] names.
@@ -4981,10 +5205,43 @@ pub fn weave_returns_selected(
         selector.mode,
         Some(selector),
         Some(non_void),
+        None,
     )
 }
 
-/// The shared body of [`weave_return`] and [`weave_returns_selected`].
+/// Insert the callback a signed [`Shift::By`] distance from every return site
+/// the [`ReturnSelector`] names: positive moves towards the end of the method,
+/// negative towards its start, and `0` keeps the selectors' own return offsets
+/// byte for byte.
+///
+/// The selector (slice and ordinal) picks the returns first, exactly as
+/// [`weave_returns_selected`] does; the shift then moves each chosen insert.
+/// A shift past either end of the method, or one that would land strictly
+/// inside an exception range, is a reason.  A result-observing insert
+/// (`non_void`) shifted off its return expects the result on the operand stack
+/// where it lands, which only a point inside the return's own straight-line
+/// arm can promise; the caller owns that shape.
+pub fn weave_returns_shifted(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    non_void: bool,
+    selector: &ReturnSelector,
+    shift: ShiftBy,
+) -> Result<Vec<u8>, String> {
+    weave_return_shape(
+        class,
+        target,
+        callback,
+        selector.mode,
+        Some(selector),
+        Some(non_void),
+        Some(shift),
+    )
+}
+
+/// The shared body of [`weave_return`], [`weave_returns_selected`] and
+/// [`weave_returns_shifted`].
 fn weave_return_shape(
     class: &ClassFile,
     target: &MethodRef,
@@ -4992,6 +5249,7 @@ fn weave_return_shape(
     mode: ReturnMode,
     selector: Option<&ReturnSelector>,
     observed_non_void: Option<bool>,
+    shift: Option<ShiftBy>,
 ) -> Result<Vec<u8>, String> {
     let target = prepare_target(class, target)?;
     let label = target.label();
@@ -5046,6 +5304,15 @@ fn weave_return_shape(
         return Err(format!(
             "{label}: {anchor} weaving found no return instruction"
         ));
+    }
+    if let Some(shift) = shift {
+        let delta = shift.distance(&label)?;
+        if delta != 0 {
+            sites = sites
+                .iter()
+                .map(|at| shifted_offset(&label, code, &scan, *at, delta))
+                .collect::<Result<Vec<_>, String>>()?;
+        }
     }
 
     let mut pool = PoolBuilder::new(&class.pool);
@@ -5388,58 +5655,56 @@ fn selected_invoke_sites(
 
 /// The insertion offset a shift puts the callback at.
 ///
-/// `by == 0` names the instruction next to the selected site: the site itself
-/// for [`Shift::Before`], the instruction after the call for [`Shift::After`].
-/// The offset is an instruction boundary by construction, because it is read
-/// off the scan.  A shift that runs past either end of the method, and one that
-/// would put the insert strictly inside an exception range (where the target's
-/// own handler would catch the callback), are reasons.
+/// `delta` is a signed instruction distance: `0` names the instruction at
+/// `at`, positive moves towards the end of the method and negative towards its
+/// start.  A [`Shift::Before`]/[`Shift::After`] shift converts to this distance
+/// before it gets here; [`ShiftBy`] supplies it directly.  The offset is an
+/// instruction boundary by construction, because it is read off the scan.  A
+/// shift that runs past either end of the method, and one that would put the
+/// insert strictly inside an exception range (where the target's own handler
+/// would catch the callback), are reasons.
 fn shifted_offset(
     label: &str,
     code: &CodeLayout<'_>,
     scan: &CodeScan,
-    site: &InvokeSite,
-    direction: Shift,
-    by: usize,
+    at: usize,
+    delta: i32,
 ) -> Result<usize, String> {
     let index = scan
         .instructions
         .iter()
-        .position(|instruction| instruction.at == site.at)
+        .position(|instruction| instruction.at == at)
+        .ok_or_else(|| format!("{label}: the site at {at} is not an instruction boundary"))?;
+    let target = (index as i64)
+        .checked_add(i64::from(delta))
         .ok_or_else(|| {
             format!(
-                "{label}: the call site at {} is not an instruction boundary",
-                site.at
+                "{label}: shifting the insert at {at} by {delta} instruction(s) overflows the instruction index"
             )
         })?;
-    let target = match direction {
-        Shift::Before => index.checked_sub(by).ok_or_else(|| {
+    if target < 0 {
+        return Err(format!(
+            "{label}: shifting the insert at {at} by {delta} instruction(s) runs past the method's first instruction"
+        ));
+    }
+    let target = usize::try_from(target)
+        .ok()
+        .filter(|index| *index < scan.instructions.len())
+        .ok_or_else(|| {
             format!(
-                "{label}: shift Before by {by} from the call at {} runs past the method's first instruction",
-                site.at
+                "{label}: shifting the insert at {at} by {delta} instruction(s) runs past the method's last instruction"
             )
-        })?,
-        Shift::After => index
-            .checked_add(by)
-            .and_then(|index| index.checked_add(1))
-            .filter(|index| *index < scan.instructions.len())
-            .ok_or_else(|| {
-                format!(
-                    "{label}: shift After by {by} from the call at {} runs past the method's last instruction",
-                    site.at
-                )
-            })?,
-    };
-    let at = scan.instructions[target].at;
+        })?;
+    let shifted = scan.instructions[target].at;
     for handler in &code.exception_table {
-        if usize::from(handler.start_pc) < at && at < usize::from(handler.end_pc) {
+        if usize::from(handler.start_pc) < shifted && shifted < usize::from(handler.end_pc) {
             return Err(format!(
-                "{label}: shifting the insert off the call at {} to {at} would put it inside the exception range [{}, {}), so the target's own handler would catch it",
-                site.at, handler.start_pc, handler.end_pc
+                "{label}: shifting the insert at {at} to {shifted} would put it inside the exception range [{}, {}), so the target's own handler would catch it",
+                handler.start_pc, handler.end_pc
             ));
         }
     }
-    Ok(at)
+    Ok(shifted)
 }
 
 /// The `pop`/`pop2` opcode that removes one call argument of this descriptor.
@@ -5658,7 +5923,43 @@ pub fn weave_invoke_shifted(
     shift: InvokeShift,
     cancellable: bool,
 ) -> Result<Vec<u8>, String> {
-    weave_invoke_shape(class, target, callback, selector, Some(shift), cancellable)
+    weave_invoke_shape(
+        class,
+        target,
+        callback,
+        selector,
+        Some(shift.into()),
+        cancellable,
+    )
+}
+
+/// Insert a callback a signed [`Shift::By`] distance from the selected call
+/// site: positive moves towards the end of the method, negative towards its
+/// start, and `0` names the call itself.
+///
+/// This is Mixin's `@At(shift = Shift.BY, by = n)`.  The magnitude bound is
+/// `-8..=8`, the offset is always an instruction boundary, and an insert that
+/// would land strictly inside an exception range is rejected because the
+/// target's own handler would catch it.  The callback is inserted with
+/// [`TargetEntry::Enter`], so a branch that named the shifted instruction runs
+/// it first.  A cancellable insert cannot be shifted: its cancellation branch
+/// has to sit on the call to skip it.
+pub fn weave_invoke_shifted_by(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    selector: &InvokeSelector,
+    shift: ShiftBy,
+    cancellable: bool,
+) -> Result<Vec<u8>, String> {
+    weave_invoke_shape(
+        class,
+        target,
+        callback,
+        selector,
+        Some(AnyShift::By(shift.by)),
+        cancellable,
+    )
 }
 
 /// The shared body of every `INVOKE` entry point.
@@ -5667,7 +5968,7 @@ fn weave_invoke_shape(
     target: &MethodRef,
     callback: &MethodRef,
     selector: &InvokeSelector,
-    shift: Option<InvokeShift>,
+    shift: Option<AnyShift>,
     cancellable: bool,
 ) -> Result<Vec<u8>, String> {
     let target = prepare_target(class, target)?;
@@ -5704,10 +6005,16 @@ fn weave_invoke_shape(
 
     let offsets = match shift {
         Some(shift) => {
-            let by = shift.distance(&label)?;
+            let delta = shift.delta(&label)?;
             sites
                 .iter()
-                .map(|site| shifted_offset(&label, code, &scan, site, shift.direction, by))
+                .map(|site| {
+                    if delta == 0 {
+                        Ok(site.at)
+                    } else {
+                        shifted_offset(&label, code, &scan, site.at, delta)
+                    }
+                })
                 .collect::<Result<Vec<_>, String>>()?
         }
         None => sites.iter().map(|site| site.at).collect(),

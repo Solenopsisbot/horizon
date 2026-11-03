@@ -15,9 +15,10 @@ use horizon_native_java::{
     ClassFile, MethodRef, MixinInjectionPlan, NativeJar, ReturnMode,
     callback_info_returnable_class, weave_class,
     weaver::{
-        InvokeSelector, InvokeShift, ReturnSelector, Shift, SiteSelector, SliceBounds,
-        weave_head_selected, weave_invoke, weave_invoke_at, weave_invoke_selected,
-        weave_invoke_shifted, weave_returns_selected,
+        InvokeSelector, InvokeShift, ReturnSelector, Shift, SiteSelector, SliceBounds, weave_head,
+        weave_head_selected, weave_head_shifted, weave_invoke, weave_invoke_at,
+        weave_invoke_selected, weave_invoke_shifted, weave_invoke_shifted_by,
+        weave_returns_selected, weave_returns_shifted,
     },
 };
 use std::{
@@ -273,6 +274,21 @@ fn hit_on(descriptor: &str) -> SiteSelector {
         name: "hit".into(),
         descriptor: descriptor.into(),
     }
+}
+
+/// The `demo/Target.hit` boundary that names the `ordinal`-th matching call.
+fn hit_at(ordinal: i32) -> SiteSelector {
+    SiteSelector::InvokeOrdinal {
+        owner: "demo/Target".into(),
+        name: "hit".into(),
+        descriptor: String::new(),
+        ordinal,
+    }
+}
+
+/// The `ordinal`-th return-family boundary.
+fn return_at(ordinal: i32) -> SiteSelector {
+    SiteSelector::ReturnOrdinal { ordinal }
 }
 
 fn member(name: &str, descriptor: &str) -> MethodRef {
@@ -654,6 +670,37 @@ fn assert_insert_at(original: &[u8], woven: &[u8], at: usize) -> Vec<u8> {
         "the original tail is shifted by the {insert}-byte insert at {at}"
     );
     woven[at..at + insert].to_vec()
+}
+
+/// Assert an insert of `length` bytes starts at `at` and the original
+/// instruction follows it.  A branch that named an instruction past `at`
+/// legitimately has its operand relocated, so unlike [`assert_insert_at`] this
+/// does not require the prefix to be byte-identical.  Returns the inserted
+/// bytes.
+fn assert_insert_before(original: &[u8], woven: &[u8], at: usize, length: usize) -> Vec<u8> {
+    assert_eq!(
+        woven.len(),
+        original.len() + length,
+        "one {length}-byte insert"
+    );
+    assert_eq!(
+        woven[at + length],
+        original[at],
+        "the original instruction at {at} follows the insert"
+    );
+    let boundaries = scan(woven);
+    assert!(
+        boundaries.iter().any(|(offset, _, _)| *offset == at),
+        "the insert starts at the instruction boundary {at}"
+    );
+    assert!(
+        boundaries
+            .iter()
+            .any(|(offset, _, _)| *offset == at + length),
+        "the original instruction stays a boundary at {}",
+        at + length
+    );
+    woven[at..at + length].to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -1230,6 +1277,150 @@ fn a_shifted_insert_cannot_split_an_exception_range() {
     .unwrap_err();
     assert!(error.contains("exception range"), "{error}");
     assert!(error.contains("[0, 6)"), "{error}");
+
+    // Shift.BY names the same signed distance: +1 is the instruction after the
+    // call, which is inside the guarded range.
+    let error = weave_invoke_shifted_by(&class, &target, &on_call, &selector, Shift::By(1), false)
+        .unwrap_err();
+    assert!(error.contains("exception range"), "{error}");
+    assert!(error.contains("[0, 6)"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Shift.BY: a signed instruction distance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn shift_by_moves_either_way_and_runs() {
+    let classes = compile("shift-by");
+    let bytes = read_class(&classes, "demo/Target");
+    let class = ClassFile::parse(&bytes).unwrap();
+    let target = member("threeSites", "()V");
+    let on_call = callback("onCall", "()V");
+    let original = class
+        .method("threeSites", "()V")
+        .unwrap()
+        .code
+        .clone()
+        .unwrap();
+    let instructions = scan(&original);
+    let sites = instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, opcode))| matches!(opcode, 0xb6..=0xb9))
+        .map(|(index, (at, _, _))| (index, *at))
+        .collect::<Vec<_>>();
+    assert_eq!(sites.len(), 3, "the fixture has three call sites");
+    let first = sites[0].0;
+
+    // `BY 0` is the call itself, byte for byte the unshifted weave.
+    let unshifted =
+        weave_invoke_selected(&class, &target, &on_call, &every_hit(Some(0), None), false).unwrap();
+    let zero = weave_invoke_shifted_by(
+        &class,
+        &target,
+        &on_call,
+        &every_hit(Some(0), None),
+        Shift::By(0),
+        false,
+    )
+    .unwrap();
+    assert_eq!(zero, unshifted, "Shift.BY 0 names the selected call");
+
+    // Negative moves toward the start: -1 is the `iconst_1` that pushes the
+    // call's argument, so the callback runs before the first `hit`.
+    let negative = weave_invoke_shifted_by(
+        &class,
+        &target,
+        &on_call,
+        &every_hit(Some(0), None),
+        Shift::By(-1),
+        false,
+    )
+    .unwrap();
+    let (code, _, _) = woven_code(&negative, "threeSites", "()V");
+    assert_insert_at(&original, &code, instructions[first - 1].0);
+    let lines = run(&classes, &negative, "sites", None);
+    assert_eq!(value(&lines, "calls="), "1");
+    assert_eq!(
+        value(&lines, "seen="),
+        "",
+        "the callback ran before the first hit"
+    );
+    assert_eq!(value(&lines, "trace="), "isv");
+
+    // Positive moves toward the end: +1 is the instruction after the call, so
+    // the first `hit` already ran, and +2 the one after that.
+    for (by, index) in [(1i32, first + 1), (2, first + 2)] {
+        let shifted = weave_invoke_shifted_by(
+            &class,
+            &target,
+            &on_call,
+            &every_hit(Some(0), None),
+            Shift::By(by),
+            false,
+        )
+        .unwrap();
+        let (code, _, _) = woven_code(&shifted, "threeSites", "()V");
+        assert_insert_at(&original, &code, instructions[index].0);
+    }
+    let positive = weave_invoke_shifted_by(
+        &class,
+        &target,
+        &on_call,
+        &every_hit(Some(0), None),
+        Shift::By(1),
+        false,
+    )
+    .unwrap();
+    let lines = run(&classes, &positive, "sites", None);
+    assert_eq!(value(&lines, "calls="), "1");
+    assert_eq!(
+        value(&lines, "seen="),
+        "i",
+        "the first hit ran before the callback"
+    );
+    assert_eq!(value(&lines, "trace="), "isv");
+
+    // The signed bound and both ends of the method are reasons.
+    for by in [9, -9, i32::MAX, i32::MIN] {
+        let error = weave_invoke_shifted_by(
+            &class,
+            &target,
+            &on_call,
+            &every_hit(Some(0), None),
+            Shift::By(by),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("bounded shift of -8..=8"), "{error}");
+    }
+    let error = weave_invoke_shifted_by(
+        &class,
+        &target,
+        &on_call,
+        &every_hit(Some(-1), None),
+        Shift::By(2),
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("runs past the method's last instruction"),
+        "{error}"
+    );
+    let error = weave_invoke_shifted_by(
+        &class,
+        &target,
+        &on_call,
+        &every_hit(Some(0), None),
+        Shift::By(-3),
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("runs past the method's first instruction"),
+        "{error}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1361,6 +1552,142 @@ fn returns_ordinal_selects_one_return_and_observes_its_value() {
         "0",
         "the last return is outside the slice"
     );
+}
+
+#[test]
+fn slice_boundaries_accept_ordinals() {
+    let classes = compile("boundary-ordinals");
+    let bytes = read_class(&classes, "demo/Target");
+    let class = ClassFile::parse(&bytes).unwrap();
+    let on_return = callback("onReturn", &format!("(I{CALLBACK_INFO_DESC})V"));
+    let on_call = callback("onCall", "()V");
+
+    // `pick` has three returns; `[RETURN 1, TAIL)` holds only the second, so
+    // `pick(1)` (which returns 2) is the only path that calls back.
+    let second = SliceBounds {
+        from: return_at(1),
+        to: SiteSelector::Tail,
+    };
+    let woven = weave_returns_selected(
+        &class,
+        &member("pick", "(I)I"),
+        &on_return,
+        true,
+        &ReturnSelector {
+            mode: ReturnMode::Return,
+            ordinal: None,
+            slice: Some(second),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        ClassFile::parse(&woven).unwrap().write().unwrap(),
+        woven,
+        "the woven class round-trips"
+    );
+    let lines = run(&classes, &woven, "pick", Some("1"));
+    assert_eq!(value(&lines, "result="), "2");
+    assert_eq!(value(&lines, "calls="), "1");
+    assert_eq!(value(&lines, "value="), "2");
+    for argument in ["10", "-1"] {
+        let lines = run(&classes, &woven, "pick", Some(argument));
+        assert_eq!(
+            value(&lines, "calls="),
+            "0",
+            "pick({argument}) returns through a different arm"
+        );
+    }
+
+    // The same boundary counted from the end: -2 is the second of three.
+    let second_from_end = SliceBounds {
+        from: return_at(-2),
+        to: SiteSelector::Tail,
+    };
+    let same = weave_returns_selected(
+        &class,
+        &member("pick", "(I)I"),
+        &on_return,
+        true,
+        &ReturnSelector {
+            mode: ReturnMode::Return,
+            ordinal: None,
+            slice: Some(second_from_end),
+        },
+    )
+    .unwrap();
+    assert_eq!(same, woven, "RETURN -2 is the ordinal-1 boundary");
+
+    // `threeSites` has three matching calls.  A boundary ordinal is resolved
+    // against all of them before the slice is applied: `[HEAD, INVOKE 1)` holds
+    // the first call, and `[INVOKE 1, INVOKE -1)` the middle one.
+    let target = member("threeSites", "()V");
+    let first_slice = SliceBounds {
+        from: SiteSelector::Head,
+        to: hit_at(1),
+    };
+    let first = weave_invoke_selected(
+        &class,
+        &target,
+        &on_call,
+        &every_hit(None, Some(first_slice)),
+        false,
+    )
+    .unwrap();
+    let lines = run(&classes, &first, "sites", None);
+    assert_eq!(value(&lines, "calls="), "1");
+    assert_eq!(value(&lines, "seen="), "", "the first hit is selected");
+
+    let middle_slice = SliceBounds {
+        from: hit_at(1),
+        to: hit_at(-1),
+    };
+    let middle = weave_invoke_selected(
+        &class,
+        &target,
+        &on_call,
+        &every_hit(None, Some(middle_slice)),
+        false,
+    )
+    .unwrap();
+    let lines = run(&classes, &middle, "sites", None);
+    assert_eq!(value(&lines, "calls="), "1");
+    assert_eq!(value(&lines, "seen="), "i", "the middle hit is selected");
+
+    // A boundary ordinal outside its matches names the count instead of
+    // guessing an edge.
+    let bad_return = SliceBounds {
+        from: SiteSelector::Head,
+        to: return_at(3),
+    };
+    let error = weave_returns_selected(
+        &class,
+        &member("pick", "(I)I"),
+        &on_return,
+        true,
+        &ReturnSelector {
+            mode: ReturnMode::Return,
+            ordinal: None,
+            slice: Some(bad_return),
+        },
+    )
+    .unwrap_err();
+    assert!(error.contains("ordinal 3"), "{error}");
+    assert!(error.contains("3 matching"), "{error}");
+
+    let bad_invoke = SliceBounds {
+        from: SiteSelector::Head,
+        to: hit_at(-4),
+    };
+    let error = weave_invoke_selected(
+        &class,
+        &target,
+        &on_call,
+        &every_hit(None, Some(bad_invoke)),
+        false,
+    )
+    .unwrap_err();
+    assert!(error.contains("ordinal -4"), "{error}");
+    assert!(error.contains("3 matching"), "{error}");
 }
 
 #[test]
@@ -1510,6 +1837,96 @@ fn head_selected_counts_the_single_head_site() {
         assert!(error.contains("ordinal"), "{error}");
         assert!(error.contains("1 matching"), "{error}");
     }
+}
+
+#[test]
+fn head_and_return_shifts_land_on_instruction_boundaries() {
+    let classes = compile("head-return-shift");
+    let bytes = read_class(&classes, "demo/Target");
+    let class = ClassFile::parse(&bytes).unwrap();
+    let on_call = callback("onCall", "()V");
+    let target = member("threeSites", "()V");
+    let original = class
+        .method("threeSites", "()V")
+        .unwrap()
+        .code
+        .clone()
+        .unwrap();
+    let instructions = scan(&original);
+
+    // `BY 0` is the plain HEAD weave; `BY 1` is the instruction after the
+    // receiver load, and the callback still runs exactly once.
+    let plain = weave_head(&class, &target, &on_call).unwrap();
+    let zero = weave_head_shifted(&class, &target, &on_call, None, Shift::By(0)).unwrap();
+    assert_eq!(zero, plain, "Shift.BY 0 is the HEAD insert");
+    let head = weave_head_shifted(&class, &target, &on_call, None, Shift::By(1)).unwrap();
+    let (code, _, _) = woven_code(&head, "threeSites", "()V");
+    assert_insert_at(&original, &code, instructions[1].0);
+    let lines = run(&classes, &head, "sites", None);
+    assert_eq!(value(&lines, "calls="), "1");
+    assert_eq!(value(&lines, "seen="), "");
+    assert_eq!(value(&lines, "trace="), "isv");
+
+    let error = weave_head_shifted(&class, &target, &on_call, None, Shift::By(-1)).unwrap_err();
+    assert!(
+        error.contains("runs past the method's first instruction"),
+        "{error}"
+    );
+
+    // The same signed distance on a RETURN insert: -1 is the instruction that
+    // pushed the first return value, so `pick(10)` still answers 1 with the
+    // callback run first.
+    let pick = member("pick", "(I)I");
+    let pick_original = class.method("pick", "(I)I").unwrap().code.clone().unwrap();
+    let pick_instructions = scan(&pick_original);
+    let returns = pick_instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, opcode))| matches!(opcode, 0xac..=0xb1))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(returns.len(), 3, "the fixture has three returns");
+    let on_plain = callback("onPlain", "(I)V");
+    let shifted = weave_returns_shifted(
+        &class,
+        &pick,
+        &on_plain,
+        false,
+        &ReturnSelector {
+            mode: ReturnMode::Return,
+            ordinal: Some(0),
+            slice: None,
+        },
+        Shift::By(-1),
+    )
+    .unwrap();
+    let (code, _, _) = woven_code(&shifted, "pick", "(I)I");
+    let return_offset = pick_instructions[returns[0] - 1].0;
+    let insert = assert_insert_before(&pick_original, &code, return_offset, 5);
+    assert_eq!(insert[0], 0x15, "iload loads the method's argument");
+    assert_eq!(insert[2], 0xb8, "then invokestatic onPlain");
+    let lines = run(&classes, &shifted, "pick", Some("10"));
+    assert_eq!(value(&lines, "result="), "1");
+    assert_eq!(value(&lines, "calls="), "1");
+    assert_eq!(value(&lines, "seen="), "plain");
+
+    let error = weave_returns_shifted(
+        &class,
+        &pick,
+        &on_plain,
+        false,
+        &ReturnSelector {
+            mode: ReturnMode::Return,
+            ordinal: Some(-1),
+            slice: None,
+        },
+        Shift::By(1),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("runs past the method's last instruction"),
+        "{error}"
+    );
 }
 
 #[test]
