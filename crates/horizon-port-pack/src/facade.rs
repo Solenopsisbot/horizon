@@ -254,12 +254,26 @@ pub fn generate_many(
             .iter()
             .any(|r| fabric_holders.contains(&r.as_str()))
     });
-    let uses_fabric_loader = target.iter().any(|class| {
-        class
-            .refs
-            .iter()
-            .any(|r| r.starts_with("net/fabricmc/loader/api/"))
+    // Fabric's data-generation API (`fabric-datagen`) is a library slice too. A
+    // datagen entrypoint only implements `DataGeneratorEntrypoint` and hands the
+    // generator a pack, so the classes the slice emits select it by name; nothing
+    // here runs or writes a generated file.
+    let uses_fabric_datagen = target.iter().any(|class| {
+        class.refs.iter().any(|r| {
+            FABRIC_DATAGEN_SHIMS
+                .iter()
+                .any(|(name, ..)| *name == r.split('$').next().unwrap_or(r))
+        })
     });
+    // The datagen output names the loader's `ModContainer`; a datagen target
+    // therefore always pulls the loader slice in with it.
+    let uses_fabric_loader = uses_fabric_datagen
+        || target.iter().any(|class| {
+            class
+                .refs
+                .iter()
+                .any(|r| r.starts_with("net/fabricmc/loader/api/"))
+        });
     // Fabric's item-group registration and its client renderer registries are
     // library classes as well. Each is emitted only when the real API class is
     // absent (see `ClientShims::emit`), and only when the game types its
@@ -316,6 +330,12 @@ pub fn generate_many(
     // contract); they are still excluded from the generated façade by `own`.
     let mut available = lib_names.clone();
     available.extend(own.iter().map(|name| (*name).to_owned()));
+    // Fabric's loader bootstrap values are one unit (`FABRIC_LOADER_SHIMS`): a
+    // shim that names `ModContainer` may count on them when this compilation
+    // writes all of them, and must report the type otherwise.
+    let loader_slice_absent = FABRIC_LOADER_SHIMS
+        .iter()
+        .all(|(class, _)| !available.contains(*class));
     let mut wanted: BTreeSet<String> = BTreeSet::new();
     for class in &target {
         for r in &class.refs {
@@ -484,6 +504,13 @@ pub fn generate_many(
     // compile against the real stubs; an unresolved role is reported below.
     let menu_types = if uses_fabric_menus || uses_neoforge_menus {
         resolve_menu_types(&game, &lib_names, &own, &mut wanted)
+    } else {
+        BTreeMap::new()
+    };
+    // Fabric's datagen shims name the loader's `ModContainer` and the game's id.
+    // A role that resolves nowhere is reported instead of being invented.
+    let datagen_types = if uses_fabric_datagen {
+        resolve_datagen_types(&game, &lib_names, &own, loader_slice_absent, &mut wanted)
     } else {
         BTreeMap::new()
     };
@@ -1235,6 +1262,36 @@ pub fn generate_many(
     {
         for (class, source) in FABRIC_LOADER_SHIMS {
             write_shim(&mut files, &src, class, source)?;
+        }
+    }
+    // Fabric's data-generation API: the `fabric-datagen` entrypoint, the
+    // generator it is handed, the output a provider receives and the pack that
+    // retains providers. Datagen is a build-time step, so `addProvider` only
+    // records one `{pack, id, kind, provider}` row in call order; nothing is
+    // generated and no real API class is shadowed.
+    if uses_fabric_datagen {
+        let missing: Vec<&str> = ["mod_container", "identifier"]
+            .into_iter()
+            .filter(|role| !datagen_types.contains_key(role))
+            .collect();
+        if !missing.is_empty() {
+            report.missing.push(format!(
+                "net/fabricmc/fabric/api/datagen/v1 (needs {})",
+                missing.join(", ")
+            ));
+        } else {
+            for (class, source, requires) in FABRIC_DATAGEN_SHIMS {
+                emit_role_shim(
+                    &mut files,
+                    &mut report,
+                    &src,
+                    &available,
+                    &datagen_types,
+                    class,
+                    requires,
+                    || fill_types(source, &datagen_types),
+                )?;
+            }
         }
     }
     if uses_neoforge || uses_legacy_forge {
@@ -3502,6 +3559,224 @@ const FABRIC_LOADER_SHIMS: &[(&str, &str)] = &[
     ("net/fabricmc/loader/api/metadata/Version", FABRIC_VERSION),
 ];
 
+/// Fabric's `fabric-datagen` entrypoint: Fabric calls this instead of
+/// `onInitialize`, so the class only needs the one callback a datagen mod
+/// implements.
+const FABRIC_DATAGEN_ENTRYPOINT: &str = r#"package net.fabricmc.fabric.api.datagen.v1;
+
+@FunctionalInterface
+public interface DataGeneratorEntrypoint {
+    void onInitializeDataGenerator(FabricDataGenerator fabricDataGenerator);
+}
+"#;
+
+/// The bounded output a data provider receives: the mod container it generates
+/// for and the folder its files would land in. Nothing is written here, so the
+/// folder is only carried for the host's generator.
+const FABRIC_DATA_OUTPUT: &str = r#"package net.fabricmc.fabric.api.datagen.v1;
+
+import {mod_container};
+
+public final class FabricDataOutput {
+    private final {mod_container} horizonModContainer;
+    private final java.nio.file.Path horizonOutputFolder;
+    private final boolean horizonStrictValidation;
+
+    public FabricDataOutput({mod_container} modContainer, java.nio.file.Path outputFolder, boolean strictValidation) {
+        this.horizonModContainer = modContainer;
+        this.horizonOutputFolder = outputFolder;
+        this.horizonStrictValidation = strictValidation;
+    }
+
+    public {mod_container} getModContainer() { return horizonModContainer; }
+    public java.nio.file.Path getOutputFolder() { return horizonOutputFolder; }
+    public String getModId() { return horizonModContainer.getMetadata().getId(); }
+    public boolean isStrictValidationEnabled() { return horizonStrictValidation; }
+}
+"#;
+
+/// The bounded provider shape: an id and a kind the pack retains, and a `run`
+/// the host owns. Every member is a default, so a provider whose own `run` has
+/// the game's `run(CachedOutput)` descriptor does not collide with this
+/// interface's no-op `run()`.
+const FABRIC_DATA_PROVIDER: &str = r#"package net.fabricmc.fabric.api.datagen.v1.provider;
+
+import net.fabricmc.fabric.api.datagen.v1.FabricDataOutput;
+
+public interface DataProvider {
+    /** The id this provider is retained under; the mod's own override wins. */
+    default String getName() { return getClass().getSimpleName(); }
+
+    /** The provider family, so the host can order one kind before another. */
+    default String getKind() { return "provider"; }
+
+    /** Generation is the host's work; adding a provider only retains it. */
+    default void run() {}
+
+    @FunctionalInterface
+    interface Factory {
+        DataProvider create(FabricDataOutput output);
+    }
+}
+"#;
+
+/// A recipe provider marker: it keeps the output field and the constructor a
+/// ported provider calls, and answers its kind so the pack's ledger names it.
+const FABRIC_RECIPE_PROVIDER: &str = r#"package net.fabricmc.fabric.api.datagen.v1.provider;
+
+import net.fabricmc.fabric.api.datagen.v1.FabricDataOutput;
+
+public abstract class FabricRecipeProvider implements DataProvider {
+    protected final FabricDataOutput output;
+
+    public FabricRecipeProvider(FabricDataOutput output, java.util.concurrent.CompletableFuture<?> registriesFuture) {
+        this.output = output;
+    }
+
+    @Override
+    public String getKind() { return "recipe"; }
+}
+"#;
+
+/// The language provider marker. The key/value table a ported provider fills is
+/// the host's, so the constructor only keeps the output and the mod id.
+const FABRIC_LANGUAGE_PROVIDER: &str = r#"package net.fabricmc.fabric.api.datagen.v1.provider;
+
+import net.fabricmc.fabric.api.datagen.v1.FabricDataOutput;
+
+public abstract class FabricLanguageProvider implements DataProvider {
+    protected final FabricDataOutput output;
+    protected final String modId;
+
+    public FabricLanguageProvider(FabricDataOutput output, String modId) {
+        this.output = output;
+        this.modId = modId;
+    }
+
+    @Override
+    public String getKind() { return "language"; }
+}
+"#;
+
+/// The model provider marker: same retained output, and no baker behind it.
+const FABRIC_MODEL_PROVIDER: &str = r#"package net.fabricmc.fabric.api.datagen.v1.provider;
+
+import net.fabricmc.fabric.api.datagen.v1.FabricDataOutput;
+
+public abstract class FabricModelProvider implements DataProvider {
+    protected final FabricDataOutput output;
+
+    public FabricModelProvider(FabricDataOutput output) {
+        this.output = output;
+    }
+
+    @Override
+    public String getKind() { return "model"; }
+}
+"#;
+
+/// The generator a datagen entrypoint is handed. `createPack` keeps the name the
+/// pack is retained under (the mod id, or `resourcepacks/<id>` for a built-in
+/// pack), and `Pack#addProvider` appends `{pack, id, kind, provider}` to one
+/// ordered ledger the host reads back with `horizonProviders()`. Providers are
+/// never run: datagen is a build-time step.
+const FABRIC_DATA_GENERATOR: &str = r#"package net.fabricmc.fabric.api.datagen.v1;
+
+import {identifier};
+import {mod_container};
+import net.fabricmc.fabric.api.datagen.v1.provider.DataProvider;
+
+public final class FabricDataGenerator {
+    private final FabricDataOutput horizonOutput;
+    private final {mod_container} horizonModContainer;
+    private final java.util.List<Object[]> horizonProviders = new java.util.ArrayList<>();
+
+    public FabricDataGenerator(FabricDataOutput output, {mod_container} modContainer) {
+        this.horizonOutput = output;
+        this.horizonModContainer = modContainer;
+    }
+
+    public FabricDataOutput getOutput() { return horizonOutput; }
+    public {mod_container} getModContainer() { return horizonModContainer; }
+    public String getModId() { return horizonModContainer.getMetadata().getId(); }
+    public boolean isStrictValidationEnabled() { return horizonOutput.isStrictValidationEnabled(); }
+
+    public Pack createPack() {
+        return new Pack(horizonModContainer.getMetadata().getName());
+    }
+
+    public Pack createBuiltinResourcePack({identifier} id) {
+        return new Pack("resourcepacks/" + id);
+    }
+
+    /** One `{pack, id, kind, provider}` row per `addProvider`, in call order. */
+    public java.util.List<Object[]> horizonProviders() {
+        return java.util.Collections.unmodifiableList(new java.util.ArrayList<>(horizonProviders));
+    }
+
+    public final class Pack {
+        private final String horizonPack;
+
+        private Pack(String pack) { this.horizonPack = pack; }
+
+        public Pack addProvider(DataProvider provider) {
+            if (provider != null) {
+                horizonProviders.add(new Object[] { horizonPack, provider.getName(), provider.getKind(), provider });
+            }
+            return this;
+        }
+
+        public Pack addProvider(DataProvider.Factory factory) {
+            return factory == null ? this : addProvider(factory.create(horizonOutput));
+        }
+
+        public String getPackId() { return horizonPack; }
+    }
+}
+"#;
+
+/// The datagen slice, emitted as one unit (the generator names the pack and the
+/// provider, the markers name the provider and the output). Each row carries the
+/// roles its source names; the generator is the one that needs both, so a jar
+/// without a resolvable id reports it rather than half a slice.
+const FABRIC_DATAGEN_SHIMS: &[(&str, &str, &[&str])] = &[
+    (
+        "net/fabricmc/fabric/api/datagen/v1/DataGeneratorEntrypoint",
+        FABRIC_DATAGEN_ENTRYPOINT,
+        &[],
+    ),
+    (
+        "net/fabricmc/fabric/api/datagen/v1/FabricDataOutput",
+        FABRIC_DATA_OUTPUT,
+        &["mod_container"],
+    ),
+    (
+        "net/fabricmc/fabric/api/datagen/v1/provider/DataProvider",
+        FABRIC_DATA_PROVIDER,
+        &[],
+    ),
+    (
+        "net/fabricmc/fabric/api/datagen/v1/provider/FabricRecipeProvider",
+        FABRIC_RECIPE_PROVIDER,
+        &[],
+    ),
+    (
+        "net/fabricmc/fabric/api/datagen/v1/provider/FabricLanguageProvider",
+        FABRIC_LANGUAGE_PROVIDER,
+        &[],
+    ),
+    (
+        "net/fabricmc/fabric/api/datagen/v1/provider/FabricModelProvider",
+        FABRIC_MODEL_PROVIDER,
+        &[],
+    ),
+    (
+        "net/fabricmc/fabric/api/datagen/v1/FabricDataGenerator",
+        FABRIC_DATA_GENERATOR,
+        &["mod_container", "identifier"],
+    ),
+];
+
 /// Bounded NeoForge event base. Result and cancellation are recorded so
 /// bootstrap code can read them back; the host's bus owns ordering and the
 /// listener dispatch itself, so nothing here posts or invokes gameplay.
@@ -4124,6 +4399,51 @@ fn resolve_menu_types(
     for (role, candidates) in MENU_TYPE_CANDIDATES {
         let picked = candidates.iter().copied().find(|name| {
             game.contains_key(*name) || lib_names.contains(*name) || own.contains(*name)
+        });
+        if let Some(name) = picked {
+            if game.contains_key(name) && !wanted.contains(name) {
+                wanted.insert(name.to_owned());
+            }
+            out.insert(*role, name.to_owned());
+        }
+    }
+    out
+}
+
+/// The types a Fabric datagen registration names: the loader's `ModContainer`
+/// (a dependency class, or the façade's own loader slice when that unit is
+/// emitted) and the game's id. 26.3 calls the id `Identifier`; the name it
+/// replaced stays second, so a jar built against it still binds.
+const DATAGEN_TYPE_CANDIDATES: &[(&str, &[&str])] = &[
+    ("mod_container", &["net/fabricmc/loader/api/ModContainer"]),
+    (
+        "identifier",
+        &[
+            "net/minecraft/resources/Identifier",
+            "net/minecraft/resources/ResourceLocation",
+        ],
+    ),
+];
+
+/// Resolve the datagen roles this classpath carries. `loader_shim` says the
+/// loader unit lands in this same compilation, which is where `ModContainer`
+/// comes from for a jar-only slice. A game class is seeded into the façade so
+/// the shim compiles against the real stub; a role that resolves nowhere stays
+/// unresolved and the slice is reported instead of being emitted.
+fn resolve_datagen_types(
+    game: &BTreeMap<String, Class>,
+    lib_names: &BTreeSet<String>,
+    own: &BTreeSet<&str>,
+    loader_shim: bool,
+    wanted: &mut BTreeSet<String>,
+) -> BTreeMap<&'static str, String> {
+    let mut out = BTreeMap::new();
+    for (role, candidates) in DATAGEN_TYPE_CANDIDATES {
+        let picked = candidates.iter().copied().find(|name| {
+            game.contains_key(*name)
+                || lib_names.contains(*name)
+                || own.contains(*name)
+                || (loader_shim && *name == "net/fabricmc/loader/api/ModContainer")
         });
         if let Some(name) = picked {
             if game.contains_key(name) && !wanted.contains(name) {
@@ -15555,6 +15875,252 @@ public class ModelProbe {
         assert!(output.status.success(), "model probe failed: {stderr}");
         assert!(
             stdout.contains("horizon model facade ok"),
+            "probe output: {stdout}{stderr}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The Fabric datagen slice's exact shapes, its resolved roles and its two
+    /// guards: a real API class is never shadowed, and a role this classpath
+    /// cannot resolve reports the slice instead of inventing a type.
+    #[test]
+    fn datagen_facade_shapes_are_guarded_and_resolved() {
+        for fragment in [
+            "void onInitializeDataGenerator(FabricDataGenerator fabricDataGenerator);",
+            "public {mod_container} getModContainer() { return horizonModContainer; }",
+            "public String getModId() { return horizonModContainer.getMetadata().getId(); }",
+            "public Pack createPack() {",
+            "public Pack addProvider(DataProvider provider) {",
+            "public Pack addProvider(DataProvider.Factory factory) {",
+            "new Object[] { horizonPack, provider.getName(), provider.getKind(), provider }",
+            "DataProvider create(FabricDataOutput output);",
+            "public FabricRecipeProvider(FabricDataOutput output, java.util.concurrent.CompletableFuture<?> registriesFuture) {",
+            "public FabricLanguageProvider(FabricDataOutput output, String modId) {",
+            "public FabricModelProvider(FabricDataOutput output) {",
+        ] {
+            let found = [
+                FABRIC_DATAGEN_ENTRYPOINT,
+                FABRIC_DATA_OUTPUT,
+                FABRIC_DATA_PROVIDER,
+                FABRIC_RECIPE_PROVIDER,
+                FABRIC_LANGUAGE_PROVIDER,
+                FABRIC_MODEL_PROVIDER,
+                FABRIC_DATA_GENERATOR,
+            ]
+            .iter()
+            .any(|template| template.contains(fragment));
+            assert!(found, "missing datagen fragment: {fragment}");
+        }
+        for template in [
+            FABRIC_DATA_OUTPUT,
+            FABRIC_DATA_PROVIDER,
+            FABRIC_RECIPE_PROVIDER,
+            FABRIC_LANGUAGE_PROVIDER,
+            FABRIC_MODEL_PROVIDER,
+            FABRIC_DATA_GENERATOR,
+        ] {
+            assert!(
+                !template.contains("net.minecraft."),
+                "hard-coded game type in a datagen template"
+            );
+        }
+        // The loader unit lands in the same run for a jar-only slice, and the
+        // game jar supplies the id (26.3's name first, the one it replaced
+        // second). A classpath that carries neither reports the slice.
+        let game = |names: &[&str]| -> BTreeMap<String, Class> {
+            names
+                .iter()
+                .map(|name| ((*name).to_owned(), Class::default()))
+                .collect()
+        };
+        let none = BTreeSet::new();
+        let no_own: BTreeSet<&str> = BTreeSet::new();
+        let mut wanted = BTreeSet::new();
+        let types = resolve_datagen_types(
+            &game(&["net/minecraft/resources/Identifier"]),
+            &none,
+            &no_own,
+            true,
+            &mut wanted,
+        );
+        assert_eq!(
+            types["mod_container"],
+            "net/fabricmc/loader/api/ModContainer"
+        );
+        assert_eq!(types["identifier"], "net/minecraft/resources/Identifier");
+        assert!(wanted.contains("net/minecraft/resources/Identifier"));
+        let libs = BTreeSet::from(["net/fabricmc/loader/api/ModContainer".to_owned()]);
+        let legacy = resolve_datagen_types(
+            &game(&["net/minecraft/resources/ResourceLocation"]),
+            &libs,
+            &no_own,
+            false,
+            &mut BTreeSet::new(),
+        );
+        assert_eq!(
+            legacy["identifier"],
+            "net/minecraft/resources/ResourceLocation"
+        );
+        assert!(
+            resolve_datagen_types(&game(&[]), &none, &no_own, false, &mut BTreeSet::new())
+                .is_empty()
+        );
+        for marker in [
+            "let uses_fabric_datagen = target",
+            "if uses_fabric_datagen {",
+            "for (class, source, requires) in FABRIC_DATAGEN_SHIMS {",
+        ] {
+            assert!(
+                include_str!("facade.rs").contains(marker),
+                "missing datagen guard: {marker}"
+            );
+        }
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-datagen-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create datagen shim directory");
+        let generator = "net/fabricmc/fabric/api/datagen/v1/FabricDataGenerator";
+        let mut files = Vec::new();
+        let mut report = Report::default();
+        let written = emit_role_shim(
+            &mut files,
+            &mut report,
+            &root,
+            &none,
+            &BTreeMap::new(),
+            generator,
+            &["mod_container", "identifier"],
+            || FABRIC_DATA_GENERATOR.to_owned(),
+        )
+        .expect("emit a datagen shim without its roles");
+        assert!(!written && files.is_empty());
+        assert_eq!(
+            report.missing,
+            vec![format!("{generator} (needs mod_container, identifier)")]
+        );
+        let real = BTreeSet::from([generator.to_owned()]);
+        let mut report = Report::default();
+        let written = emit_role_shim(
+            &mut files,
+            &mut report,
+            &root,
+            &real,
+            &BTreeMap::new(),
+            generator,
+            &[],
+            || FABRIC_DATA_GENERATOR.to_owned(),
+        )
+        .expect("emit over a real datagen API class");
+        assert!(!written && files.is_empty() && report.missing.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The datagen generator is compiled and run for real: the pack keeps each
+    /// provider's id and kind in call order and hands the same output back.
+    /// Skipped cleanly when no JDK is installed.
+    #[test]
+    fn datagen_facade_compiles_and_retains_providers() {
+        let types = DATAGEN_TYPE_CANDIDATES
+            .iter()
+            .map(|(role, names)| (*role, names[0].to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        let probe = r#"import java.nio.file.Paths;
+import java.util.List;
+import net.fabricmc.loader.api.ModContainer;
+import net.fabricmc.fabric.api.datagen.v1.*;
+import net.fabricmc.fabric.api.datagen.v1.provider.*;
+public class DatagenProbe {
+    static class Recipes extends FabricRecipeProvider {
+        Recipes(FabricDataOutput output) { super(output, null); }
+    }
+    static class Lang extends FabricLanguageProvider {
+        Lang(FabricDataOutput output, String modId) { super(output, modId); }
+        @Override public String getName() { return "en_us"; }
+    }
+    public static void main(String[] args) {
+        ModContainer mod = ModContainer.horizon("demo");
+        FabricDataOutput output = new FabricDataOutput(mod, Paths.get("/work/out"), false);
+        FabricDataGenerator generator = new FabricDataGenerator(output, mod);
+        DataGeneratorEntrypoint entry = g -> {
+            FabricDataGenerator.Pack pack = g.createPack();
+            pack.addProvider(new Recipes(g.getOutput()));
+            pack.addProvider(o -> new Lang(o, "demo"));
+        };
+        entry.onInitializeDataGenerator(generator);
+        List<Object[]> rows = generator.horizonProviders();
+        if (rows.size() != 2) throw new AssertionError("rows " + rows.size());
+        if (!"demo".equals(rows.get(0)[0]) || !"Recipes".equals(rows.get(0)[1]) || !"recipe".equals(rows.get(0)[2])) throw new AssertionError("recipe row");
+        if (!"en_us".equals(rows.get(1)[1]) || !"language".equals(rows.get(1)[2])) throw new AssertionError("language row");
+        if (!(rows.get(0)[3] instanceof Recipes) || !(rows.get(1)[3] instanceof Lang)) throw new AssertionError("provider kept");
+        FabricDataGenerator.Pack pack = generator.createPack();
+        pack.addProvider((DataProvider) null);
+        pack.addProvider((DataProvider.Factory) null);
+        if (generator.horizonProviders().size() != 2) throw new AssertionError("nulls retained");
+        if (generator.getOutput() != output) throw new AssertionError("output");
+        if (!"demo".equals(generator.getModId()) || !"demo".equals(output.getModId())) throw new AssertionError("mod id");
+        if (output.getOutputFolder() == null) throw new AssertionError("folder");
+        if (!"resourcepacks/demo:pack".equals(generator.createBuiltinResourcePack(new net.minecraft.resources.Identifier("demo", "pack")).getPackId())) throw new AssertionError("builtin pack");
+        System.out.println("horizon datagen facade ok");
+    }
+}
+"#;
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-datagen-run-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let mut files = Vec::new();
+        let mut write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write java shim");
+            files.push(file);
+        };
+        for (class, source, _) in FABRIC_DATAGEN_SHIMS {
+            write(&format!("{class}.java"), &fill_types(source, &types));
+        }
+        write(
+            "net/fabricmc/loader/api/ModContainer.java",
+            "package net.fabricmc.loader.api; public class ModContainer { private final String id; public ModContainer(String id) { this.id = id; } public static ModContainer horizon(String id) { return new ModContainer(id); } public Metadata getMetadata() { return new Metadata(id); } public static class Metadata { private final String id; Metadata(String id) { this.id = id; } public String getId() { return id; } public String getName() { return id; } } }",
+        );
+        write(
+            "net/minecraft/resources/Identifier.java",
+            "package net.minecraft.resources; public class Identifier { private final String namespace; private final String path; public Identifier(String namespace, String path) { this.namespace = namespace; this.path = path; } public String toString() { return namespace + \":\" + path; } }",
+        );
+        write("DatagenProbe.java", probe);
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let tool = |name: &str| {
+            jdk_bin
+                .as_ref()
+                .map(|bin| bin.join(name))
+                .unwrap_or_else(|| PathBuf::from(name))
+        };
+        let Ok(javac_status) = Command::new(tool("javac"))
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(
+            javac_status.success(),
+            "javac rejected the generated datagen façade"
+        );
+        let output = Command::new(tool("java"))
+            .arg("-cp")
+            .arg(&classes)
+            .arg("DatagenProbe")
+            .output()
+            .expect("run the datagen probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "datagen probe failed: {stderr}");
+        assert!(
+            stdout.contains("horizon datagen facade ok"),
             "probe output: {stdout}{stderr}"
         );
         let _ = fs::remove_dir_all(&root);
