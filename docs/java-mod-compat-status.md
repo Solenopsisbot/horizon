@@ -10,7 +10,7 @@ Last checked: 3 November 2026, commit `1d8b64b59`.
 - [x] Discover and run multiple Fabric entrypoints in deterministic order.
 - [x] Discover NeoForge and legacy Forge `@Mod` classes through the native probe path.
 - [x] Run unsupported entrypoints through the embedded JVM runner as a fallback.
-- [x] Expose bounded Fabric loader values: loaded-mod checks, metadata, versions, environment type, development marker, root paths, and seeded containers.
+- [x] Expose bounded Fabric loader values: loaded-mod checks, metadata (including authors/license collections and icon-path optionals), versions, environment type, development marker, root paths, and seeded containers.
 - [x] Expose bounded NeoForge and legacy Forge loader values: mod lists, containers, event-bus access, mod ids, and role-aware client/server selection.
 - [x] Register and inspect bounded NeoForge and Forge deferred registrations, holders, registry objects, keys, ids, entry collections, generated `Registry.getHolder`/`getOrThrow` lookups, explicit typed-registration handoff, typed recipe data-file declarations, and `ItemStack.getUseAnimation`/tag-stream façade coverage, and custom payload type identity.
 - [x] Record Fabric events, NeoForge events, and legacy Forge event-bus listeners with ordering, cancellation markers, unregister support, and Forge `register(Object)` handlers.

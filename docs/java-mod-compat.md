@@ -405,7 +405,9 @@ The selected Fabric kind now dispatches to its matching lifecycle method (`onIni
 `onInitializeClient`, or `onInitializeServer`), and the embedded runner seeds fresh loader game/config
 directories. It also seeds lightweight `ModContainer`/`ModMetadata` proxies from the supplied
 `fabric.mod.json` files, so entrypoints that query `FabricLoader.getModContainer` see the jars being
-probed without requiring Fabric's full game provider. Hollow Dawn's `CoreClient` now reaches and returns
+probed without requiring Fabric's full game provider. The metadata proxy exposes bounded empty author and
+license collections and an empty icon-path optional, matching the no-host-files policy while allowing
+common display/bootstrap queries to complete. Hollow Dawn's `CoreClient` now reaches and returns
 from `onInitializeClient`; Lithium's `onInitialize` now completes through the same path. Entrypoint
 classes exposing the Mixin config-plugin `onLoad(String)` callback receive their package before the
 lifecycle call, which lets FabricProxy-Lite initialize its config. NeoForge

@@ -3929,9 +3929,35 @@ impl Host for StdHost {
                 "getEnvironmentType",
                 "()Lnet/fabricmc/api/EnvType;",
             ) => Ok(Value::Ref(Some(self.environment_type.clone()))),
+            (
+                "net/fabricmc/loader/api/FabricLoader",
+                "getMappingResolver",
+                "()Lnet/fabricmc/loader/api/MappingResolver;",
+            ) => Ok(Value::Ref(Some("fabric-mapping-resolver".into()))),
             ("net/fabricmc/loader/api/FabricLoader", "isDevelopmentEnvironment", "()Z") => {
                 Ok(Value::Int(self.development_environment as i32))
             }
+            (
+                "net/fabricmc/loader/api/MappingResolver",
+                "mapClassName" | "unmapClassName",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            ) => Ok(Value::Ref(Some(
+                expect_string(Self::argument(r, args, 1)?).to_owned(),
+            ))),
+            (
+                "net/fabricmc/loader/api/MappingResolver",
+                "mapFieldName" | "mapMethodName",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            ) => Ok(Value::Ref(Some(
+                expect_string(Self::argument(r, args, 2)?).to_owned(),
+            ))),
+            (
+                "net/fabricmc/loader/api/MappingResolver",
+                "mapDescriptor",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            ) => Ok(Value::Ref(Some(
+                expect_string(Self::argument(r, args, 1)?).to_owned(),
+            ))),
             (
                 "net/fabricmc/loader/api/ModContainer",
                 "getMetadata",
@@ -3982,6 +4008,16 @@ impl Host for StdHost {
                 "getProvides",
                 "()Ljava/util/Collection;",
             ) => Ok(collection_empty("list")),
+            (
+                "net/fabricmc/loader/api/metadata/ModMetadata",
+                "getAuthors" | "getLicense",
+                "()Ljava/util/Collection;",
+            ) => Ok(collection_empty("list")),
+            (
+                "net/fabricmc/loader/api/metadata/ModMetadata",
+                "getIconPath",
+                "(I)Ljava/util/Optional;",
+            ) => Ok(Value::Ref(None)),
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getDependencies",
@@ -11801,6 +11837,45 @@ mandatory = true
             .unwrap(),
             Value::Int(0)
         );
+        for method_name in ["getAuthors", "getLicense"] {
+            let values = host
+                .invoke_instance(
+                    &MethodRef {
+                        owner: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
+                        name: method_name.into(),
+                        descriptor: "()Ljava/util/Collection;".into(),
+                    },
+                    &Value::Ref(Some("metadata/demo/1.2.3".into())),
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                host.invoke_instance(
+                    &MethodRef {
+                        owner: "java/util/Collection".into(),
+                        name: "size".into(),
+                        descriptor: "()I".into(),
+                    },
+                    &values,
+                    &[],
+                )
+                .unwrap(),
+                Value::Int(0),
+                "{method_name} should be a bounded empty collection"
+            );
+        }
+        let icon = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
+                    name: "getIconPath".into(),
+                    descriptor: "(I)Ljava/util/Optional;".into(),
+                },
+                &Value::Ref(Some("metadata/demo/1.2.3".into())),
+                &[Value::Int(64)],
+            )
+            .unwrap();
+        assert_eq!(icon, Value::Ref(None));
         let dependencies = MethodRef {
             owner: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
             name: "getDependencies".into(),
