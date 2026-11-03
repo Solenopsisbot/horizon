@@ -470,7 +470,7 @@ scanned from `mods/` implicitly. Registrations remain diagnostic until a typed d
 the content rows described below.
 `NativeJar` reads the first `[[mods]]` record in either `META-INF/neoforge.mods.toml` or legacy
 `META-INF/mods.toml` as the loader id and version, and carries required `[[dependencies.<id>]]` records into
-the same startup seed used for Fabric metadata. A Forge or NeoForge `clientSideOnly = true` marker is retained and server roles reject the jar before constructor loading. Forge and NeoForge `@Mod` annotations are both discoverable
+the same startup seed used for Fabric metadata. A Forge or NeoForge `clientSideOnly = true` marker is retained; integrated and dedicated server roles skip the jar before constructor loading. Forge and NeoForge `@Mod` annotations are both discoverable
 as `neoforge` probe entrypoints.
 Fabric entrypoint objects retain their optional `adapter` name; the native launcher reports that adapter
 explicitly and stops rather than invoking the target with the wrong lifecycle contract; the selected
@@ -1087,9 +1087,9 @@ worse than a native mod, which at least passed a human.
   server-tick start/end. Each open gets a fresh epoch; reads are permitted only inside the current tick
   callback, so a stale Java handle cannot outlive a world or tick. Paused passes emit no tick callback, and
   the deprecated in-frame path emits no lifecycle events.
-- Typed bridged registrations are converted into the same `ContentMod` input as carried content before the
-  authoritative tables load. They are therefore available to the host and its guests through the existing
-  registry/content sync. An opaque callback registration, or a payload whose codec/handler has not crossed
+- Typed bridged registrations are converted into the same bounded `ContentMod` planning input as carried
+  content. Integrated startup currently appends those declarations to server options after shared resources
+  load; authoritative live-table synchronization to hosts and guests remains future work. An opaque callback registration, or a payload whose codec/handler has not crossed
   the network ABI, remains diagnostic and cannot alter a remote client's registry.
 - Dedicated server startup is implemented; live Java event dispatch, registry sync for runtime-created
   objects, and arbitrary mod packet handling are still later work. A client without the server's typed
