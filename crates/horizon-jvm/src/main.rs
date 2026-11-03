@@ -340,6 +340,12 @@ fn run() -> Result<(), String> {
             println!("{line}");
         }
     }
+    // The `String` a NeoForge entrypoint constructor receives is the jar's
+    // `modId`; read it once from the metadata the run already reports.
+    let neoforge_mod_id = constructor_only_entry_kind(&entry_kind)
+        .then(|| neoforge_metadata(Path::new(&args[0])).ok())
+        .flatten()
+        .and_then(|metadata| metadata.mod_ids.into_iter().next());
     // Fabric runs loader-level `preLaunch` callbacks before the selected
     // environment's entrypoints; NeoForge has none and stays constructor-only.
     let mut work: Vec<(&str, &str)> = pre_launch
@@ -367,10 +373,14 @@ fn run() -> Result<(), String> {
             Err(e) => return describe(env, "find_class", entry, e),
         };
         if constructor_only_entry_kind(entry_kind) && !has_explicit_initializer {
-            let object = match env.new_object(&class, "()V", &[]) {
-                Ok(object) => object,
-                Err(e) => return describe(env, "new", entry, e),
-            };
+            let object = invoke_neoforge_constructor(
+                env,
+                &class,
+                &classpath,
+                entry,
+                neoforge_mod_id.as_deref(),
+                neoforge_dist(entry_kind),
+            )?;
             call_mixin_on_load(env, &class, &object, entry)?;
             println!("{entry} constructor returned");
             continue;
@@ -437,6 +447,405 @@ fn split_entrypoint(spec: &str) -> (&str, Option<&str>) {
 
 fn constructor_only_entry_kind(kind: &str) -> bool {
     kind == "neoforge"
+}
+
+/// The parameter types a NeoForge entrypoint constructor may take. NeoForge
+/// injects exactly these, so a constructor taking anything else cannot run here.
+const NEOFORGE_DIST_TYPE: &str = "Lnet/neoforged/api/distmarker/Dist;";
+const NEOFORGE_MOD_ID_TYPE: &str = "Ljava/lang/String;";
+/// Loader objects the probe can name but not build: passed as `null`, which
+/// makes a mod's first call on one the exact failure this probe exists to find.
+const NEOFORGE_NULL_TYPES: [&str; 4] = [
+    "Lnet/neoforged/bus/api/IEventBus;",
+    "Lnet/neoforged/fml/ModContainer;",
+    "Lnet/neoforged/fml/javafmlmod/FMLModContainer;",
+    "Lnet/neoforged/fml/ModList;",
+];
+const NEOFORGE_DIST_CLASS: &str = "net/neoforged/api/distmarker/Dist";
+const NO_ARG_CONSTRUCTOR: &str = "()V";
+
+/// One NeoForge entrypoint constructor parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NeoforgeArg {
+    /// The `Dist` constant for `--entry-kind`: `CLIENT`, or the dedicated side.
+    Dist,
+    /// The jar's `modId`.
+    ModId,
+    /// A loader object the runner cannot build yet, passed as `null`.
+    Null,
+}
+
+/// The `Dist` constant an entrypoint constructor receives. `--entry-kind`
+/// selects the side the same way it does for Mixin; the loader-lifecycle kinds
+/// (`neoforge`, `main`) run as the client this probe models.
+fn neoforge_dist(entry_kind: &str) -> MixinSide {
+    MixinSide::selected(entry_kind).unwrap_or(MixinSide::Client)
+}
+
+/// What one constructor parameter receives, or `None` when the runner cannot
+/// supply it (which disqualifies that constructor).
+fn neoforge_arg(param: &str) -> Option<NeoforgeArg> {
+    if param == NEOFORGE_DIST_TYPE {
+        Some(NeoforgeArg::Dist)
+    } else if param == NEOFORGE_MOD_ID_TYPE {
+        Some(NeoforgeArg::ModId)
+    } else if NEOFORGE_NULL_TYPES.contains(&param) {
+        Some(NeoforgeArg::Null)
+    } else {
+        None
+    }
+}
+
+/// The arguments `descriptor` takes, or `None` when a parameter is not one the
+/// runner can supply.
+fn neoforge_constructor_args(descriptor: &str) -> Option<Vec<NeoforgeArg>> {
+    descriptor_params(descriptor)?
+        .iter()
+        .map(|param| neoforge_arg(param))
+        .collect()
+}
+
+/// The widest constructor whose parameters are all injectable, ties broken by
+/// descriptor text so class-file order never decides; `None` leaves the no-arg
+/// one.
+fn neoforge_constructor_descriptor(constructors: &[String]) -> Option<&str> {
+    constructors
+        .iter()
+        .filter_map(|descriptor| {
+            let args = neoforge_constructor_args(descriptor)?;
+            Some((args.len(), descriptor.as_str()))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
+        .map(|(_, descriptor)| descriptor)
+}
+
+/// The entrypoint constructor for `class`: the widest supported one, else
+/// `()V`. An unreadable class file (not on the classpath, malformed, above
+/// [`MAX_CLASS_FILE_BYTES`]) also lands on `()V`, so this never fails a run
+/// that has a no-arg constructor.
+fn neoforge_constructor(classpath: &[PathBuf], class: &str) -> String {
+    class_file_bytes(classpath, class)
+        .and_then(|bytes| parse_constructors(&bytes))
+        .and_then(|constructors| neoforge_constructor_descriptor(&constructors).map(str::to_owned))
+        .unwrap_or_else(|| NO_ARG_CONSTRUCTOR.to_owned())
+}
+
+/// `neoforge ctor: <descriptor>`, naming the constructor that ran.
+fn neoforge_ctor_line(descriptor: &str) -> String {
+    format!("neoforge ctor: {descriptor}")
+}
+
+/// The single line a link failure reports before the no-arg retry.
+fn neoforge_ctor_fallback_line(descriptor: &str) -> String {
+    format!("neoforge ctor: {descriptor} unavailable, retrying {NO_ARG_CONSTRUCTOR}")
+}
+
+/// Link failures that mean the JVM could not link the constructor the class
+/// file named, which is what a façade without the loader classes reports.
+fn link_failure(class: &str) -> bool {
+    matches!(
+        class,
+        "java.lang.NoSuchMethodError" | "java.lang.AbstractMethodError"
+    )
+}
+
+/// Whether a failed constructor attempt retries `()V`: only a link failure of a
+/// non-no-arg descriptor does, so a run with a no-arg constructor never fails.
+fn should_retry_no_arg(descriptor: &str, failure: Option<&str>) -> bool {
+    descriptor != NO_ARG_CONSTRUCTOR && failure.is_some_and(link_failure)
+}
+
+/// Upper bound on one class file the scan reads: no unbounded allocation.
+const MAX_CLASS_FILE_BYTES: u64 = 4 << 20;
+
+/// The JVM's own array-dimension limit, so the splitter cannot loop on garbage.
+const MAX_ARRAY_DIMENSIONS: usize = 255;
+
+/// The class file bytes for a binary class name, in classpath order like the
+/// JVM. Only the first match is read, and only up to [`MAX_CLASS_FILE_BYTES`];
+/// anything else is `None`, which leaves the no-arg constructor.
+fn class_file_bytes(classpath: &[PathBuf], class: &str) -> Option<Vec<u8>> {
+    let entry = format!("{}.class", class.replace('.', "/"));
+    for path in classpath {
+        if path.is_dir() {
+            let file = path.join(&entry);
+            let Ok(metadata) = fs::metadata(&file) else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.len() > MAX_CLASS_FILE_BYTES {
+                continue;
+            }
+            if let Ok(bytes) = fs::read(&file) {
+                return Some(bytes);
+            }
+            continue;
+        }
+        let Ok(file) = File::open(path) else {
+            continue;
+        };
+        let Ok(mut archive) = zip::ZipArchive::new(file) else {
+            continue;
+        };
+        let Ok(mut member) = archive.by_name(&entry) else {
+            continue;
+        };
+        if member.size() > MAX_CLASS_FILE_BYTES {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if std::io::Read::read_to_end(&mut member, &mut bytes).is_ok() {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+/// A bounded class-file cursor: every read checks the remaining bytes, so a
+/// truncated or hostile file fails instead of panicking.
+struct ClassReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> ClassReader<'a> {
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(len)?;
+        let bytes = self.bytes.get(self.at..end)?;
+        self.at = end;
+        Some(bytes)
+    }
+
+    fn u1(&mut self) -> Option<u8> {
+        Some(*self.take(1)?.first()?)
+    }
+
+    fn u2(&mut self) -> Option<u16> {
+        let bytes = self.take(2)?;
+        Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn u4(&mut self) -> Option<u32> {
+        let bytes = self.take(4)?;
+        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn skip(&mut self, len: usize) -> Option<()> {
+        self.take(len).map(|_| ())
+    }
+}
+
+/// The `<init>` descriptors a class file declares, in declaration order.
+/// Total by construction: a malformed or truncated file is `None`, and every
+/// index is checked against the constant pool.
+fn parse_constructors(bytes: &[u8]) -> Option<Vec<String>> {
+    let mut reader = ClassReader { bytes, at: 0 };
+    if reader.u4()? != 0xCAFE_BABE {
+        return None;
+    }
+    reader.skip(4)?; // minor_version, major_version
+    let pool = constant_pool(&mut reader)?;
+    reader.skip(6)?; // access_flags, this_class, super_class
+    let interfaces = reader.u2()? as usize;
+    reader.skip(interfaces.checked_mul(2)?)?;
+    let fields = reader.u2()? as usize;
+    for _ in 0..fields {
+        skip_member(&mut reader)?;
+    }
+    let methods = reader.u2()? as usize;
+    let mut constructors = Vec::new();
+    for _ in 0..methods {
+        let (name, descriptor) = member_header(&mut reader)?;
+        if pool.get(name as usize).copied().flatten() == Some("<init>") {
+            let descriptor = pool.get(descriptor as usize).copied().flatten()?;
+            constructors.push(descriptor.to_owned());
+        }
+        skip_attributes(&mut reader)?;
+    }
+    skip_attributes(&mut reader)?; // the class's own attributes
+    Some(constructors)
+}
+
+/// The `Utf8` entries of a constant pool, indexed by constant-pool index.
+/// Other entries are skipped by their fixed tag length; long and double take
+/// two slots, as in the class-file format.
+fn constant_pool<'a>(reader: &mut ClassReader<'a>) -> Option<Vec<Option<&'a str>>> {
+    let count = reader.u2()? as usize;
+    if count == 0 {
+        return None;
+    }
+    let mut pool: Vec<Option<&'a str>> = vec![None; count];
+    let mut index = 1;
+    while index < count {
+        match reader.u1()? {
+            1 => {
+                let len = reader.u2()? as usize;
+                pool[index] = Some(std::str::from_utf8(reader.take(len)?).ok()?);
+            }
+            3 | 4 => reader.skip(4)?,
+            // Long and double occupy two constant-pool slots.
+            5 | 6 => {
+                reader.skip(8)?;
+                index += 1;
+            }
+            7 | 8 | 16 | 19 | 20 => reader.skip(2)?,
+            9 | 10 | 11 | 12 | 17 | 18 => reader.skip(4)?,
+            15 => reader.skip(3)?,
+            _ => return None,
+        }
+        index += 1;
+    }
+    Some(pool)
+}
+
+/// A field or method's `(name_index, descriptor_index)` pair.
+fn member_header(reader: &mut ClassReader) -> Option<(u16, u16)> {
+    reader.skip(2)?; // access_flags
+    let name = reader.u2()?;
+    let descriptor = reader.u2()?;
+    Some((name, descriptor))
+}
+
+/// One field, which the constructor scan does not need.
+fn skip_member(reader: &mut ClassReader) -> Option<()> {
+    reader.skip(6)?; // access_flags, name_index, descriptor_index
+    skip_attributes(reader)
+}
+
+/// `attribute_count` followed by each `(name_index, length)` and its bytes.
+fn skip_attributes(reader: &mut ClassReader) -> Option<()> {
+    let count = reader.u2()? as usize;
+    for _ in 0..count {
+        reader.skip(2)?;
+        let len = usize::try_from(reader.u4()?).ok()?;
+        reader.skip(len)?;
+    }
+    Some(())
+}
+
+/// Splits a method descriptor into its parameter type descriptors. `None` for
+/// anything that is not a well-formed `(...)R` descriptor.
+fn descriptor_params(descriptor: &str) -> Option<Vec<&str>> {
+    let (params, _) = descriptor.strip_prefix('(')?.split_once(')')?;
+    let mut out = Vec::new();
+    let mut rest = params;
+    while !rest.is_empty() {
+        let (param, remainder) = split_type(rest)?;
+        out.push(param);
+        rest = remainder;
+    }
+    Some(out)
+}
+
+/// One type descriptor at the start of `text`, with the rest of `text`.
+fn split_type(text: &str) -> Option<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    while bytes.get(start) == Some(&b'[') {
+        start += 1;
+        if start > MAX_ARRAY_DIMENSIONS {
+            return None;
+        }
+    }
+    let element = text.get(start..)?;
+    let len = match element.as_bytes().first()? {
+        b'L' => element.find(';')? + 1,
+        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' => 1,
+        _ => return None,
+    };
+    let end = start.checked_add(len)?;
+    Some((text.get(..end)?, text.get(end..)?))
+}
+
+/// The `Dist` field names a constructor receives. NeoForge names the dedicated
+/// side `DEDICATED_SERVER`; the bare `SERVER` spelling is tried second so a
+/// build using either name works.
+fn neoforge_dist_fields(side: MixinSide) -> &'static [&'static str] {
+    match side {
+        MixinSide::Client => &["CLIENT"],
+        MixinSide::Server => &["DEDICATED_SERVER", "SERVER"],
+    }
+}
+
+/// The `Dist` constant for `side`, or `null` when the façade carries neither the
+/// class nor the field: the constructor still runs instead of the probe failing.
+fn dist_constant<'local>(env: &mut JNIEnv<'local>, side: MixinSide) -> JObject<'local> {
+    let Ok(class) = env.find_class(NEOFORGE_DIST_CLASS) else {
+        let _ = env.exception_clear();
+        return JObject::null();
+    };
+    for field in neoforge_dist_fields(side) {
+        if let Ok(value) = env.get_static_field(&class, *field, NEOFORGE_DIST_TYPE) {
+            if let Ok(value) = value.l() {
+                return value;
+            }
+        }
+        // A field this build does not have must not leave a throwable behind
+        // for the constructor call.
+        let _ = env.exception_clear();
+    }
+    JObject::null()
+}
+
+/// The objects one NeoForge constructor call passes, in parameter order.
+fn neoforge_ctor_objects<'local>(
+    env: &mut JNIEnv<'local>,
+    args: &[NeoforgeArg],
+    side: MixinSide,
+    mod_id: Option<&str>,
+) -> Vec<JObject<'local>> {
+    let mut objects = Vec::with_capacity(args.len());
+    for arg in args {
+        objects.push(match arg {
+            NeoforgeArg::Dist => dist_constant(env, side),
+            NeoforgeArg::ModId => match mod_id {
+                Some(id) => match env.new_string(id) {
+                    Ok(id) => JObject::from(id),
+                    Err(_) => {
+                        let _ = env.exception_clear();
+                        JObject::null()
+                    }
+                },
+                None => JObject::null(),
+            },
+            NeoforgeArg::Null => JObject::null(),
+        });
+    }
+    objects
+}
+
+/// Run a NeoForge entrypoint's constructor, retried as the no-arg one when the
+/// JVM cannot link it. The line naming a constructor is printed only once the
+/// call was accepted, so a fallback reads as one failure line then the retry.
+fn invoke_neoforge_constructor<'local>(
+    env: &mut JNIEnv<'local>,
+    class: &JClass<'local>,
+    classpath: &[PathBuf],
+    entry: &str,
+    mod_id: Option<&str>,
+    side: MixinSide,
+) -> Result<JObject<'local>, String> {
+    let descriptor = neoforge_constructor(classpath, entry);
+    let args = neoforge_constructor_args(&descriptor).unwrap_or_default();
+    let objects = neoforge_ctor_objects(env, &args, side, mod_id);
+    let values: Vec<JValue> = objects.iter().map(JValue::Object).collect();
+    match env.new_object(class, descriptor.as_str(), &values) {
+        Ok(object) => {
+            println!("{}", neoforge_ctor_line(&descriptor));
+            Ok(object)
+        }
+        Err(error) => {
+            let failure = pending_throwable_class(env);
+            if !should_retry_no_arg(&descriptor, failure.as_deref()) {
+                return Err(describe_error(env, "new", entry, error));
+            }
+            let _ = env.exception_clear();
+            println!("{}", neoforge_ctor_fallback_line(&descriptor));
+            match env.new_object(class, NO_ARG_CONSTRUCTOR, &[]) {
+                Ok(object) => Ok(object),
+                Err(error) => Err(describe_error(env, "new", entry, error)),
+            }
+        }
+    }
 }
 
 fn call_mixin_on_load(
@@ -770,22 +1179,25 @@ fn describe(
     entry: &str,
     error: jni::errors::Error,
 ) -> Result<(), String> {
+    Err(describe_error(env, stage, entry, error))
+}
+
+/// The message [`describe`] reports, for a caller that keeps running.
+fn describe_error(env: &mut JNIEnv, stage: &str, entry: &str, error: jni::errors::Error) -> String {
     let fallback = (error.to_string() == "Java exception was thrown")
         .then(|| exception_fallback(env))
         .flatten();
     let _ = env.exception_describe();
     let _ = env.exception_clear();
     if let Some(message) = fallback {
-        return Err(format!("{stage} {entry}: {message}"));
+        return format!("{stage} {entry}: {message}");
     }
-    Err(format!("{stage} {entry}: {error}"))
+    format!("{stage} {entry}: {error}")
 }
 
-/// Turn the exceptions that mean "the native façade cannot handle this" into
-/// an explicit JVM fallback diagnostic. Dynamic classpath/resource lookups
-/// stay on HotSpot, so a mod can tell this is a deliberate fallback rather
-/// than an opaque entrypoint failure.
-fn exception_fallback(env: &mut JNIEnv) -> Option<String> {
+/// The class name of the throwable the JVM left pending, without clearing it.
+/// The caller decides whether it is a link failure or gets described.
+fn pending_throwable_class(env: &mut JNIEnv) -> Option<String> {
     let throwable = env.exception_occurred().ok()?;
     let class = env.get_object_class(&throwable).ok()?;
     let name = env
@@ -793,11 +1205,17 @@ fn exception_fallback(env: &mut JNIEnv) -> Option<String> {
         .ok()?
         .l()
         .ok()?;
-    let name = env
-        .get_string((&name).into())
-        .ok()?
-        .to_string_lossy()
-        .into_owned();
+    let name = env.get_string((&name).into()).ok()?;
+    Some(name.to_string_lossy().into_owned())
+}
+
+/// Turn the exceptions that mean "the native façade cannot handle this" into
+/// an explicit JVM fallback diagnostic. Dynamic classpath/resource lookups
+/// stay on HotSpot, so a mod can tell this is a deliberate fallback rather
+/// than an opaque entrypoint failure.
+fn exception_fallback(env: &mut JNIEnv) -> Option<String> {
+    let name = pending_throwable_class(env)?;
+    let throwable = env.exception_occurred().ok()?;
     let message = env
         .call_method(&throwable, "getMessage", "()Ljava/lang/String;", &[])
         .ok()
@@ -2419,17 +2837,21 @@ mod tests {
     use super::{
         Entrypoint, MAX_FABRIC_ADD_MODS, MAX_FABRIC_ADD_MODS_BYTES,
         MAX_MIXIN_CONFIG_PROPERTY_BYTES, MixinBootstrap, MixinConfigRef, MixinEnvironment,
-        MixinPhaseDriver, MixinRegistrar, MixinSide, MixinStage, PhaseOutcome, classpath_separator,
-        constructor_only_entry_kind, declared_entrypoint_kinds, discover_entries,
-        discover_mixin_configs, entrypoints_from_metadata, fabric_add_mods, fabric_add_mods_count,
-        fabric_add_mods_line, fabric_entries, fabric_jvm_options, fabric_metadata,
-        fabric_mixin_configs, fallback_label, format_entrypoints, format_mixin_config_property,
-        format_mixin_configs, initializer_for_kind, is_minecraft_class, missing_entry_message,
-        mixin_bootstrap_line, mixin_config_names, mixin_config_property, mixin_configs_line,
-        mixin_jvm_options, mixin_registered_count, mixin_stages, neoforge_metadata,
-        nested_jar_name, parse_mixin_config, pre_launch_entries, quilt_entrypoint_kind,
+        MixinPhaseDriver, MixinRegistrar, MixinSide, MixinStage, NO_ARG_CONSTRUCTOR, NeoforgeArg,
+        PhaseOutcome, classpath_separator, constructor_only_entry_kind, declared_entrypoint_kinds,
+        discover_entries, discover_mixin_configs, entrypoints_from_metadata, fabric_add_mods,
+        fabric_add_mods_count, fabric_add_mods_line, fabric_entries, fabric_jvm_options,
+        fabric_metadata, fabric_mixin_configs, fallback_label, format_entrypoints,
+        format_mixin_config_property, format_mixin_configs, initializer_for_kind,
+        is_minecraft_class, link_failure, missing_entry_message, mixin_bootstrap_line,
+        mixin_config_names, mixin_config_property, mixin_configs_line, mixin_jvm_options,
+        mixin_registered_count, mixin_stages, neoforge_constructor, neoforge_constructor_args,
+        neoforge_constructor_descriptor, neoforge_ctor_fallback_line, neoforge_ctor_line,
+        neoforge_dist, neoforge_dist_fields, neoforge_metadata, nested_jar_name,
+        parse_constructors, parse_mixin_config, pre_launch_entries, quilt_entrypoint_kind,
         quilt_mixin_configs, register_mixin_configs, report_mixin_configs, run_mixin_phase,
-        select_mixin_configs, skip_mc_provider_requested, skipped_mixin_configs, split_entrypoint,
+        select_mixin_configs, should_retry_no_arg, skip_mc_provider_requested,
+        skipped_mixin_configs, split_entrypoint,
     };
     use std::{fs::File, io::Write, path::PathBuf};
     use zip::write::SimpleFileOptions;
@@ -2452,6 +2874,50 @@ mod tests {
         }
         jar.finish().unwrap();
         path
+    }
+
+    /// A minimal class file carrying `methods` as `(name, descriptor)` pairs,
+    /// so the bounded reader runs without a JVM.
+    fn class_file(methods: &[(&str, &str)]) -> Vec<u8> {
+        // Constant pool: 1 is an unused attribute name, then each method's own
+        // name and descriptor. Only `Utf8` entries are needed.
+        let mut names: Vec<&str> = vec!["code"];
+        for (name, descriptor) in methods {
+            names.push(name);
+            names.push(descriptor);
+        }
+        let mut out = Vec::new();
+        push_u4(&mut out, 0xCAFE_BABE);
+        push_u2(&mut out, 0); // minor_version
+        push_u2(&mut out, 65); // major_version
+        push_u2(&mut out, names.len() as u16 + 1); // constant_pool_count
+        for name in &names {
+            out.push(1); // CONSTANT_Utf8
+            push_u2(&mut out, name.len() as u16);
+            out.extend_from_slice(name.as_bytes());
+        }
+        push_u2(&mut out, 0x0001); // access_flags
+        push_u2(&mut out, 0); // this_class
+        push_u2(&mut out, 0); // super_class
+        push_u2(&mut out, 0); // interfaces
+        push_u2(&mut out, 0); // fields
+        push_u2(&mut out, methods.len() as u16);
+        for index in 0..methods.len() {
+            push_u2(&mut out, 0x0001); // access_flags
+            push_u2(&mut out, 2 + index as u16 * 2); // name_index
+            push_u2(&mut out, 3 + index as u16 * 2); // descriptor_index
+            push_u2(&mut out, 0); // attributes
+        }
+        push_u2(&mut out, 0); // class attributes
+        out
+    }
+
+    fn push_u2(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn push_u4(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_be_bytes());
     }
 
     #[test]
@@ -3364,6 +3830,154 @@ config="demo.mixins.json""#,
         assert!(constructor_only_entry_kind("neoforge"));
         assert!(!constructor_only_entry_kind("main"));
         assert!(!constructor_only_entry_kind("client"));
+    }
+
+    #[test]
+    fn reads_constructor_descriptors_from_a_class_file() {
+        let bytes = class_file(&[
+            ("<init>", "()V"),
+            ("<init>", "(Lnet/neoforged/api/distmarker/Dist;)V"),
+            ("run", "()V"),
+        ]);
+        assert_eq!(
+            parse_constructors(&bytes).unwrap(),
+            ["()V", "(Lnet/neoforged/api/distmarker/Dist;)V"]
+        );
+    }
+
+    #[test]
+    fn rejects_a_truncated_or_foreign_class_file() {
+        assert!(parse_constructors(b"CAFEBABE").is_none());
+        assert!(parse_constructors(&[]).is_none());
+        let bytes = class_file(&[("<init>", "()V")]);
+        assert!(parse_constructors(&bytes[..bytes.len() - 1]).is_none());
+        let mut foreign = bytes.clone();
+        foreign[0] = 0;
+        assert!(parse_constructors(&foreign).is_none());
+    }
+
+    #[test]
+    fn prefers_the_widest_injectable_constructor() {
+        let constructors: Vec<String> = [
+            "()V",
+            "(Lnet/neoforged/api/distmarker/Dist;)V",
+            "(Lnet/neoforged/bus/api/IEventBus;Lnet/neoforged/api/distmarker/Dist;Ljava/lang/String;)V",
+            "(Lcom/example/Config;)V",
+        ]
+        .iter()
+        .map(|descriptor| (*descriptor).to_owned())
+        .collect();
+        assert_eq!(
+            neoforge_constructor_descriptor(&constructors),
+            Some(
+                "(Lnet/neoforged/bus/api/IEventBus;Lnet/neoforged/api/distmarker/Dist;Ljava/lang/String;)V"
+            )
+        );
+        // Equal widths are decided by descriptor text, not class-file order.
+        let tied = [
+            "(Ljava/lang/String;)V".to_owned(),
+            "(Lnet/neoforged/fml/ModList;)V".to_owned(),
+        ];
+        assert_eq!(
+            neoforge_constructor_descriptor(&tied),
+            Some("(Ljava/lang/String;)V")
+        );
+        assert_eq!(neoforge_constructor_descriptor(&[]), None);
+        assert_eq!(neoforge_constructor_descriptor(&["(I)V".to_owned()]), None);
+    }
+
+    #[test]
+    fn classifies_neoforge_constructor_arguments() {
+        assert_eq!(
+            neoforge_constructor_args(
+                "(Lnet/neoforged/bus/api/IEventBus;Lnet/neoforged/fml/ModContainer;Lnet/neoforged/fml/javafmlmod/FMLModContainer;Lnet/neoforged/fml/ModList;Lnet/neoforged/api/distmarker/Dist;Ljava/lang/String;)V"
+            ),
+            Some(vec![
+                NeoforgeArg::Null,
+                NeoforgeArg::Null,
+                NeoforgeArg::Null,
+                NeoforgeArg::Null,
+                NeoforgeArg::Dist,
+                NeoforgeArg::ModId,
+            ])
+        );
+        assert_eq!(neoforge_constructor_args("()V"), Some(Vec::new()));
+        // A parameter the runner cannot supply disqualifies the constructor.
+        assert_eq!(neoforge_constructor_args("(Lcom/example/Config;)V"), None);
+        assert_eq!(neoforge_constructor_args("(I)V"), None);
+        assert_eq!(
+            neoforge_constructor_args("([Lnet/neoforged/fml/ModList;)V"),
+            None
+        );
+        assert_eq!(neoforge_constructor_args("not a descriptor"), None);
+    }
+
+    #[test]
+    fn retries_the_no_arg_constructor_only_on_a_link_failure() {
+        assert!(link_failure("java.lang.NoSuchMethodError"));
+        assert!(link_failure("java.lang.AbstractMethodError"));
+        assert!(!link_failure("java.lang.NullPointerException"));
+        let selected = "(Lnet/neoforged/api/distmarker/Dist;)V";
+        assert!(should_retry_no_arg(
+            selected,
+            Some("java.lang.NoSuchMethodError")
+        ));
+        assert!(!should_retry_no_arg(
+            selected,
+            Some("java.lang.NullPointerException")
+        ));
+        assert!(!should_retry_no_arg(selected, None));
+        // The no-arg constructor is its own fallback: never retry it.
+        assert!(!should_retry_no_arg(
+            NO_ARG_CONSTRUCTOR,
+            Some("java.lang.NoSuchMethodError")
+        ));
+    }
+
+    #[test]
+    fn formats_neoforge_constructor_log_lines() {
+        assert_eq!(neoforge_ctor_line(NO_ARG_CONSTRUCTOR), "neoforge ctor: ()V");
+        assert_eq!(
+            neoforge_ctor_line("(Ljava/lang/String;)V"),
+            "neoforge ctor: (Ljava/lang/String;)V"
+        );
+        assert_eq!(
+            neoforge_ctor_fallback_line("(Ljava/lang/String;)V"),
+            "neoforge ctor: (Ljava/lang/String;)V unavailable, retrying ()V"
+        );
+    }
+
+    #[test]
+    fn selects_the_dist_constant_from_the_entry_kind() {
+        assert_eq!(neoforge_dist("client"), MixinSide::Client);
+        assert_eq!(neoforge_dist("server"), MixinSide::Server);
+        assert_eq!(neoforge_dist("neoforge"), MixinSide::Client);
+        assert_eq!(neoforge_dist("main"), MixinSide::Client);
+        assert_eq!(neoforge_dist_fields(MixinSide::Client), ["CLIENT"]);
+        // NeoForge spells the dedicated side `DEDICATED_SERVER`; `SERVER` is
+        // the fallback for a build that spells it the other way.
+        assert_eq!(
+            neoforge_dist_fields(MixinSide::Server),
+            ["DEDICATED_SERVER", "SERVER"]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_no_arg_constructor_without_a_readable_class_file() {
+        assert_eq!(neoforge_constructor(&[], "dev.example.ExampleMod"), "()V");
+        let bytes = class_file(&[
+            ("<init>", "()V"),
+            ("<init>", "(Lnet/neoforged/api/distmarker/Dist;)V"),
+        ]);
+        let path = build_jar(
+            "neoforge-ctor",
+            &[("dev/example/ExampleMod.class", bytes.as_slice())],
+        );
+        assert_eq!(
+            neoforge_constructor(std::slice::from_ref(&path), "dev.example.ExampleMod"),
+            "(Lnet/neoforged/api/distmarker/Dist;)V"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
