@@ -779,6 +779,13 @@ pub struct StdHost {
     /// (`BlockBehaviour.Properties.of()`), which has no `new` site to name it.
     next_property_builder: usize,
     payload_registrations: Vec<PayloadRegistration>,
+    /// Frames a mod asked the game to send: (channel, direction, bytes).
+    outgoing_payloads: Vec<(String, String, Vec<u8>)>,
+    /// Frames the game handed to a mod: (channel, bytes).
+    incoming_payloads: Vec<(String, Vec<u8>)>,
+    /// Bytes a payload constructor supplied for one payload marker, for a
+    /// later `ServerPlayNetworking.send`.
+    payload_bytes: BTreeMap<String, Vec<u8>>,
     /// Fabric lifecycle entries visible through `FabricLoader#getEntrypoints`.
     /// Entries are seeded by the loaded jar, so this query never scans a host
     /// classpath or invents providers.
@@ -838,6 +845,9 @@ impl StdHost {
             block_property_builders: BTreeMap::new(),
             next_property_builder: 0,
             payload_registrations: Vec::new(),
+            outgoing_payloads: Vec::new(),
+            incoming_payloads: Vec::new(),
+            payload_bytes: BTreeMap::new(),
             fabric_entrypoint_containers: Vec::new(),
             packet_types: BTreeMap::new(),
             holders: BTreeMap::new(),
@@ -1131,6 +1141,47 @@ impl StdHost {
             .collect()
     }
 
+    /// Queue a declared payload frame a mod wants sent, and the direction it
+    /// travels; the game's bridge validates it against the channel registry.
+    pub fn queue_outgoing_payload(
+        &mut self,
+        id: impl Into<String>,
+        direction: impl Into<String>,
+        bytes: Vec<u8>,
+    ) {
+        self.outgoing_payloads
+            .push((id.into(), direction.into(), bytes));
+    }
+
+    /// Frames a mod asked the game to send, drained in order.
+    pub fn take_outgoing_payloads(&mut self) -> Vec<(String, String, Vec<u8>)> {
+        std::mem::take(&mut self.outgoing_payloads)
+    }
+
+    /// Hand one received payload frame to the mod host; the game calls this
+    /// with what the transport accepted.
+    pub fn deliver_payload(&mut self, id: impl Into<String>, bytes: Vec<u8>) {
+        self.incoming_payloads.push((id.into(), bytes));
+    }
+
+    /// Frames the game delivered, drained in order.
+    pub fn take_incoming_payloads(&mut self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut self.incoming_payloads)
+    }
+
+    /// Seed the bytes a payload marker sends, for hosts that built the
+    /// payload outside the interpreter.
+    pub fn with_payload_bytes(mut self, marker: impl Into<String>, bytes: Vec<u8>) -> Self {
+        self.payload_bytes.insert(marker.into(), bytes);
+        self
+    }
+
+    /// Seed a payload type marker's channel id without constructing the type.
+    pub fn with_packet_type(mut self, marker: impl Into<String>, id: impl Into<String>) -> Self {
+        self.packet_types.insert(marker.into(), id.into());
+        self
+    }
+
     /// Add one bounded Fabric entrypoint container to the loader view.
     /// Duplicate `(kind, class, provider)` rows are ignored to keep discovery
     /// deterministic when a launcher seeds the same jar more than once.
@@ -1289,6 +1340,31 @@ impl StdHost {
     /// of the instance form or an argument of the interface's static form) and
     /// the entry as an `identifier/<ns>:<path>` marker. Without both markers
     /// the call stays invocation-only: the host never invents ids.
+    /// A Fabric networking send: queue the declared channel's frame with the
+    /// bytes seeded for its payload marker (empty when none are known).
+    fn networking_send(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+        let fabric = r
+            .owner
+            .starts_with("net/fabricmc/fabric/api/networking/v1/")
+            || r.owner
+                .starts_with("net/fabricmc/fabric/api/client/networking/v1/");
+        if !fabric || !matches!(r.name.as_str(), "send" | "sendToServer" | "sendPacket") {
+            return None;
+        }
+        let payload = args.last()?;
+        let marker = expect_ref(payload)?;
+        let id = self.packet_types.get(marker)?.clone();
+        let direction = if r.owner.contains("client") {
+            "playToServer"
+        } else {
+            "playToClient"
+        };
+        let bytes = self.payload_bytes.remove(marker).unwrap_or_default();
+        self.outgoing_payloads
+            .push((id, direction.to_owned(), bytes));
+        Some(Value::Void)
+    }
+
     fn registry_register(
         &mut self,
         r: &MethodRef,
@@ -1560,6 +1636,9 @@ impl Host for StdHost {
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
+        if let Some(value) = self.networking_send(r, args) {
+            return Ok(value);
+        }
         if let Some(value) = self.registry_register(r, None, args) {
             return Ok(value);
         }
@@ -2397,6 +2476,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(value) = self.networking_send(r, args) {
+            return Ok(value);
+        }
         if let Some(value) = self.registry_register(r, Some(receiver), args) {
             return Ok(value);
         }

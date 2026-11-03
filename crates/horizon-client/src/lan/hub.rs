@@ -467,6 +467,37 @@ impl Hub {
         std::mem::take(&mut self.payload_inbox)
     }
 
+    /// Send one frame to every guest that accepts it; frames Java mods queued
+    /// at bootstrap go out on the next tick after a player joins.
+    pub fn broadcast_payload(&mut self, frame: &PayloadFrame) {
+        let direction = frame.direction();
+        if !matches!(
+            direction,
+            PayloadDirection::PlayToClient | PayloadDirection::PlayBidirectional
+        ) {
+            return;
+        }
+        let data = match self
+            .payloads
+            .send(frame.id(), direction, frame.bytes().to_vec())
+        {
+            Ok(data) => data,
+            Err(error) => {
+                log::warn!("Horizon: mod payload {} was not sent: {error}", frame.id());
+                return;
+            }
+        };
+        let packet = C::CustomPayload(CustomPayload {
+            channel: payloads::CHANNEL.to_owned(),
+            data,
+        });
+        for g in &self.guests {
+            if self.here(g) {
+                g.send(&packet);
+            }
+        }
+    }
+
     /// Send one declared payload frame to a guest.
     pub fn send_payload(
         &mut self,
@@ -1361,6 +1392,9 @@ impl Hub {
             for conn in silent {
                 self.kick(conn, translatable("disconnect.timeout", &[]));
             }
+        }
+        for frame in payloads::take_java_outgoing() {
+            self.broadcast_payload(&frame);
         }
         events
     }

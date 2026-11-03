@@ -196,6 +196,69 @@ pub fn accepts(declared: PayloadDirection, direction: PayloadDirection) -> bool 
     declared == direction || declared == PayloadDirection::PlayBidirectional
 }
 
+/// Frames a Java host asked to send, waiting for the server's next tick.
+static JAVA_OUTGOING: Mutex<Vec<PayloadFrame>> = Mutex::new(Vec::new());
+
+/// Translate a Java host's queued sends into validated frames. A channel must
+/// be declared, the direction must match, and a supported codec must accept
+/// the bytes; the whole batch stops at the first bad frame.
+pub fn publish_from_host_with(
+    registry: &PayloadRegistry,
+    host: &mut horizon_native_java::StdHost,
+) -> Result<Vec<PayloadFrame>, String> {
+    let mut frames = Vec::new();
+    for (id, direction, bytes) in host.take_outgoing_payloads() {
+        let direction = PayloadDirection::parse(&direction)?;
+        let declaration = registry
+            .get(&id)
+            .ok_or_else(|| format!("payload channel {id} is not declared"))?;
+        if !accepts(declaration.direction, direction) {
+            return Err(format!(
+                "payload {id} is declared {} not {}",
+                declaration.direction.name(),
+                direction.name()
+            ));
+        }
+        validate_payload(declaration, &bytes)?;
+        frames.push(PayloadFrame::new(&id, direction, bytes)?);
+    }
+    Ok(frames)
+}
+
+/// [`publish_from_host_with`] against the last stored declarations, queueing
+/// the frames for the server's next tick. Returns how many were published.
+pub fn publish_from_host(host: &mut horizon_native_java::StdHost) -> Result<usize, String> {
+    let frames = publish_from_host_with(&declared(), host)?;
+    let count = frames.len();
+    if !frames.is_empty() {
+        let mut queue = JAVA_OUTGOING.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.len() + frames.len() > MAX_OUTGOING {
+            return Err("Java payload send queue is full".to_owned());
+        }
+        queue.extend(frames);
+    }
+    Ok(count)
+}
+
+/// Frames Java mods asked to send, drained in order.
+pub fn take_java_outgoing() -> Vec<PayloadFrame> {
+    std::mem::take(&mut JAVA_OUTGOING.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Hand received frames to a Java host for its bootstrap/bootstrap-time view.
+/// Returns how many were delivered.
+pub fn deliver_to_host(
+    host: &mut horizon_native_java::StdHost,
+    frames: impl IntoIterator<Item = PayloadFrame>,
+) -> usize {
+    let mut count = 0;
+    for frame in frames {
+        host.deliver_payload(frame.id(), frame.bytes().to_vec());
+        count += 1;
+    }
+    count
+}
+
 /// The declarations of the last content root, for links built later.
 static DECLARED: Mutex<Option<PayloadRegistry>> = Mutex::new(None);
 
@@ -437,5 +500,70 @@ mod tests {
             .unwrap();
         assert_eq!(client.take_incoming().len(), 1);
         assert!(server.take_incoming().len() == 1);
+    }
+
+    #[test]
+    fn java_host_frames_publish_through_the_channel_registry() {
+        let registry = registry([
+            declaration(
+                "demo:up",
+                PayloadDirection::PlayToServer,
+                Some("minecraft:string"),
+            ),
+            declaration("demo:down", PayloadDirection::PlayToClient, None),
+        ]);
+        let mut host = horizon_native_java::StdHost::new();
+        host.queue_outgoing_payload("demo:up", "playToServer", b"hi".to_vec());
+        host.queue_outgoing_payload("demo:down", "playToClient", b"ok".to_vec());
+        let frames = publish_from_host_with(&registry, &mut host).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].id(), "demo:up");
+        assert_eq!(frames[0].bytes(), b"hi");
+        assert!(host.take_outgoing_payloads().is_empty());
+        // Undeclared, wrong direction and bad codec all stop the batch.
+        let mut bad = horizon_native_java::StdHost::new();
+        bad.queue_outgoing_payload("demo:missing", "playToServer", Vec::new());
+        assert!(publish_from_host_with(&registry, &mut bad).is_err());
+        let mut wrong = horizon_native_java::StdHost::new();
+        wrong.queue_outgoing_payload("demo:up", "playToClient", Vec::new());
+        assert!(publish_from_host_with(&registry, &mut wrong).is_err());
+        let mut codec = horizon_native_java::StdHost::new();
+        codec.queue_outgoing_payload("demo:up", "playToServer", vec![0xff]);
+        assert!(publish_from_host_with(&registry, &mut codec).is_err());
+    }
+
+    #[test]
+    fn a_networking_send_queues_the_payload_marker_and_bytes() {
+        use horizon_native_java::{Host, MethodRef, Value};
+        let mut host = horizon_native_java::StdHost::new()
+            .with_packet_type("payload#1", "demo:up")
+            .with_payload_bytes("payload#1", b"wire".to_vec());
+        let send = MethodRef {
+            owner: "net/fabricmc/fabric/api/networking/v1/ServerPlayNetworking".into(),
+            name: "send".into(),
+            descriptor: "(Ljava/lang/Object;Lnet/minecraft/network/protocol/common/custom/CustomPacketPayload;)V".into(),
+        };
+        Host::invoke(&mut host, &send, &[Value::Ref(Some("payload#1".into()))]).unwrap();
+        let queued = host.take_outgoing_payloads();
+        assert_eq!(
+            queued,
+            vec![(
+                "demo:up".to_owned(),
+                "playToClient".to_owned(),
+                b"wire".to_vec()
+            )]
+        );
+    }
+
+    #[test]
+    fn received_frames_reach_the_java_host() {
+        let mut host = horizon_native_java::StdHost::new();
+        let frame = PayloadFrame::new("demo:up", PayloadDirection::PlayToServer, b"hello".to_vec())
+            .unwrap();
+        assert_eq!(deliver_to_host(&mut host, [frame]), 1);
+        assert_eq!(
+            host.take_incoming_payloads(),
+            vec![("demo:up".to_owned(), b"hello".to_vec())]
+        );
     }
 }

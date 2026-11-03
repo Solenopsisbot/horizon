@@ -705,6 +705,19 @@ pub(super) fn run_java_mods_with_report(
                 ),
             }
         }
+        // Publish this host's channels first, then any frames its bootstrap
+        // queued; a bad frame is a warning, not a startup failure.
+        if let Err(error) =
+            horizon_client::lan::payloads::store_declared(payload_declarations.clone())
+        {
+            log::warn!("Horizon: Java payload channels were not registered: {error}");
+        }
+        if let Err(error) = horizon_client::lan::payloads::publish_from_host(&mut host) {
+            log::warn!(
+                "Horizon: native Java {} payload send was skipped: {error}",
+                path.display()
+            );
+        }
         let listeners = host.listener_registrations().count();
         log::info!(
             "Horizon: native Java {} {} entrypoint(s) completed ({} host calls, {} registrations, {} listeners)",
