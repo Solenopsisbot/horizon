@@ -7,7 +7,7 @@
 //!
 //! Installing copies the carried-over folder mod into `horizon-mods/<mod id>/` beside
 //! `options.txt` and turns it on in `horizon-mods.txt`, where the game's Options > Mods reads it.
-use super::{FileRef, Kind, Project, Source, Support, Version, installed::Entry, pick};
+use super::{installed::Entry, pick, FileRef, Kind, Project, Source, Support, Version};
 use horizon_port_pack::check::{self, Check, Verdict};
 use std::fs;
 use std::path::{Path, PathBuf};
