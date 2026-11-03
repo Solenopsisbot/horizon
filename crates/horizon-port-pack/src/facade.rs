@@ -128,6 +128,30 @@ pub fn generate_many(
                 .iter()
                 .any(|r| r.split('$').next() == Some(NEOFORGE_ATTACHMENT_TYPE))
         });
+    // Menu and screen-handler registration is a library slice on both loaders.
+    // The classes a jar references select it, so a target that never registers
+    // a menu pays nothing; the emission guards below keep a real API jar from
+    // being shadowed.
+    let names_any = |names: &[&str]| {
+        target.iter().any(|class| {
+            class
+                .refs
+                .iter()
+                .any(|r| names.contains(&r.split('$').next().unwrap_or(r)))
+        })
+    };
+    let uses_fabric_menus = names_any(&[
+        FABRIC_MENU_TYPE,
+        FABRIC_MENU_FACTORY,
+        FABRIC_SCREEN_HANDLER_TYPE,
+        FABRIC_SCREEN_HANDLER_FACTORY,
+    ]);
+    let uses_neoforge_menus = uses_neoforge
+        && names_any(&[
+            NEOFORGE_CONTAINER_FACTORY,
+            NEOFORGE_EXTENDED_CONTAINER_FACTORY,
+            NEOFORGE_MENU_TYPE_EXTENSION,
+        ]);
     // `ClientPlayNetworking.Context#player()` names the client player type. It
     // is a client-only game class (26.3 still calls it `LocalPlayer`), so a
     // server-shaped jar leaves it unresolved and the client shim is reported
@@ -391,6 +415,15 @@ pub fn generate_many(
     // interface is also not added to a game stub.
     let fabric_attachment_target =
         uses_fabric_attachments && attachment_types.contains_key("identifier");
+    // The menu shims name the menu, its type, the player inventory, the codec
+    // and (for a NeoForge extension) the buffer and id. Resolve them from the
+    // game jar and the dependency jars and seed the game classes, so the shims
+    // compile against the real stubs; an unresolved role is reported below.
+    let menu_types = if uses_fabric_menus || uses_neoforge_menus {
+        resolve_menu_types(&game, &lib_names, &own, &mut wanted)
+    } else {
+        BTreeMap::new()
+    };
     let mut used: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
     for class in &target {
         for m in &class.members {
@@ -500,6 +533,21 @@ pub fn generate_many(
                     });
             }
         }
+    }
+    // NeoForge's menu extension is a Mixin interface on `MenuType` too: the
+    // generated stub implements it directly (the same path), so a mod's
+    // `((IMenuTypeExtension) type).naturalId()` links. Only when that interface
+    // is the façade's own, never over a real NeoForge jar.
+    let menu_type_extension =
+        uses_neoforge_menus && !available.contains(NEOFORGE_MENU_TYPE_EXTENSION);
+    if menu_type_extension && let Some(menu_type) = menu_types.get("menu_type") {
+        mixin_impls
+            .entry(menu_type.clone())
+            .or_default()
+            .push(MixinImpl {
+                interface: NEOFORGE_MENU_TYPE_EXTENSION.to_owned(),
+                methods: Vec::new(),
+            });
     }
     // Bounded entity values that the generated bodies construct have to exist
     // in the same façade, or javac rejects the compilation unit before a mod
@@ -623,6 +671,9 @@ pub fn generate_many(
     let mut compiling = available.clone();
     if fabric_attachment_target {
         compiling.insert(FABRIC_ATTACHMENT_TARGET.to_owned());
+    }
+    if menu_type_extension {
+        compiling.insert(NEOFORGE_MENU_TYPE_EXTENSION.to_owned());
     }
     for root in &top {
         let source = tree(
@@ -1558,6 +1609,102 @@ pub fn generate_many(
             &["identifier", "codec"],
             || fill_types(NEOFORGE_ATTACHMENT_TYPE_SOURCE, &attachment_types),
         )?;
+    }
+    // Fabric's menu type and factory. The class name and package are roles here
+    // because 26.3 renamed the pair, and a jar still built against the 1.20.x
+    // names must bind too: a pair lands only for the name the target names.
+    if uses_fabric_menus {
+        for (class, requires, template) in [
+            (
+                FABRIC_MENU_TYPE,
+                &["menu", "menu_type", "inventory", "codec"][..],
+                FABRIC_MENU_TYPE_SOURCE,
+            ),
+            (
+                FABRIC_SCREEN_HANDLER_TYPE,
+                &["menu", "menu_type", "inventory", "codec"][..],
+                FABRIC_MENU_TYPE_SOURCE,
+            ),
+            (
+                FABRIC_MENU_FACTORY,
+                &[
+                    "menu_provider",
+                    "server_player",
+                    "component",
+                    "screen",
+                    "inventory",
+                ][..],
+                FABRIC_MENU_FACTORY_SOURCE,
+            ),
+            (
+                FABRIC_SCREEN_HANDLER_FACTORY,
+                &[
+                    "menu_provider",
+                    "server_player",
+                    "component",
+                    "screen",
+                    "inventory",
+                ][..],
+                FABRIC_MENU_FACTORY_SOURCE,
+            ),
+        ] {
+            if !names_any(&[class]) {
+                continue;
+            }
+            let (package, simple) = class.rsplit_once('/').unwrap_or(("", class));
+            let mut types = menu_types.clone();
+            types.insert("package", package.to_owned());
+            types.insert("name", simple.to_owned());
+            emit_role_shim(
+                &mut files,
+                &mut report,
+                &src,
+                &available,
+                &types,
+                class,
+                requires,
+                || fill_types(template, &types),
+            )?;
+        }
+    }
+    // NeoForge's menu factories and its `MenuType` extension. The extension
+    // names the factory, so the factory lands whenever the slice does; each is
+    // still guarded on the real API class being absent.
+    if uses_neoforge_menus {
+        emit_role_shim(
+            &mut files,
+            &mut report,
+            &src,
+            &available,
+            &menu_types,
+            NEOFORGE_CONTAINER_FACTORY,
+            &["menu", "inventory", "byte_buf"],
+            || fill_types(NEOFORGE_CONTAINER_FACTORY_SOURCE, &menu_types),
+        )?;
+        if names_any(&[NEOFORGE_EXTENDED_CONTAINER_FACTORY]) {
+            emit_role_shim(
+                &mut files,
+                &mut report,
+                &src,
+                &available,
+                &menu_types,
+                NEOFORGE_EXTENDED_CONTAINER_FACTORY,
+                &["menu"],
+                || fill_types(NEOFORGE_EXTENDED_CONTAINER_FACTORY_SOURCE, &menu_types),
+            )?;
+        }
+        if names_any(&[NEOFORGE_MENU_TYPE_EXTENSION]) {
+            emit_role_shim(
+                &mut files,
+                &mut report,
+                &src,
+                &available,
+                &menu_types,
+                NEOFORGE_MENU_TYPE_EXTENSION,
+                &["menu", "menu_type", "identifier"],
+                || fill_types(NEOFORGE_MENU_TYPE_EXTENSION_SOURCE, &menu_types),
+            )?;
+        }
     }
     if files.is_empty() {
         return Err("nothing to generate".to_owned());
@@ -2743,6 +2890,135 @@ public final class AttachmentRegistry {
 }
 "#;
 
+// Fabric's and NeoForge's menu and screen-handler façades. A menu type is only
+// retained (the factory and codec it was registered with, the id it answers
+// for), the factory keeps the screen-opening data and display name a server
+// writes, and no live menu or screen is opened here.
+/// Fabric's extended menu type, under the 26.3 `menu/v1` name.
+const FABRIC_MENU_TYPE: &str = "net/fabricmc/fabric/api/menu/v1/ExtendedMenuType";
+const FABRIC_MENU_FACTORY: &str = "net/fabricmc/fabric/api/menu/v1/ExtendedMenuProvider";
+/// The names 26.3 replaced, kept for a jar built against them: a pair lands
+/// only for the name the target jar actually references.
+const FABRIC_SCREEN_HANDLER_TYPE: &str =
+    "net/fabricmc/fabric/api/screenhandler/v1/ExtendedScreenHandlerType";
+const FABRIC_SCREEN_HANDLER_FACTORY: &str =
+    "net/fabricmc/fabric/api/screenhandler/v1/ExtendedScreenHandlerFactory";
+
+/// NeoForge's menu factories and the `MenuType` extension that keeps one
+/// factory per menu id (`naturalId`).
+const NEOFORGE_CONTAINER_FACTORY: &str = "net/neoforged/neoforge/network/IContainerFactory";
+const NEOFORGE_EXTENDED_CONTAINER_FACTORY: &str =
+    "net/neoforged/neoforge/network/IExtendedContainerFactory";
+const NEOFORGE_MENU_TYPE_EXTENSION: &str =
+    "net/neoforged/neoforge/common/extensions/IMenuTypeExtension";
+
+/// Fabric's extended menu type: the constructor keeps the factory and the
+/// codec marker it was handed, `create` routes to that factory, and the type it
+/// wraps is the instance itself, so the `MenuType` a mod stores is the one it
+/// registered. `{package}` and `{name}` carry the 26.3 and 1.20.x names.
+const FABRIC_MENU_TYPE_SOURCE: &str = r#"package {package};
+
+public class {name}<T extends {menu}, D> extends {menu_type} {
+    private final ExtendedFactory<T, D> factory;
+    private final {codec} codec;
+
+    public {name}(ExtendedFactory<T, D> factory, {codec} codec) {
+        // The façade's `MenuType` stub keeps the real class's two-argument
+        // constructor; the feature flags it would carry are not modelled.
+        super(null, null);
+        this.factory = java.util.Objects.requireNonNull(factory, "menu factory cannot be null");
+        this.codec = java.util.Objects.requireNonNull(codec, "codec cannot be null");
+    }
+
+    public T create(int windowId, {inventory} inventory, D data) { return factory.create(windowId, inventory, data); }
+
+    /** The codec this registration retained: a marker, never bound to a buffer here. */
+    public {codec} getCodec() { return codec; }
+
+    public {codec} getStreamCodec() { return codec; }
+
+    /** The game type this extended type is; the instance itself. */
+    public {menu_type} getMenuType() { return this; }
+
+    public interface ExtendedFactory<T extends {menu}, D> {
+        T create(int windowId, {inventory} inventory, D data);
+    }
+}
+"#;
+
+/// Fabric's extended menu provider: the opening data its menu was handed plus
+/// the display name a vanilla menu provider answers. The screen itself is the
+/// mod's own, so the bounded accessor only names the client type.
+const FABRIC_MENU_FACTORY_SOURCE: &str = r#"package {package};
+
+public interface {name}<D> extends {menu_provider} {
+    /** The data the server writes when it opens this menu. */
+    D getScreenOpeningData({server_player} player);
+
+    {component} getDisplayName();
+
+    /** Bounded: the screen belongs to the mod, so none is built here. */
+    default {screen} createScreen(int windowId, {inventory} inventory, {component} title) { return null; }
+}
+"#;
+
+/// NeoForge's menu factory: one abstract method, so a mod's lambda or
+/// anonymous class binds to the same descriptor the game calls.
+const NEOFORGE_CONTAINER_FACTORY_SOURCE: &str = r#"package net.neoforged.neoforge.network;
+
+public interface IContainerFactory<T extends {menu}> {
+    T create(int windowId, {inventory} inventory, {byte_buf} data);
+
+    /** The form the game calls when a menu was opened with no extra data. */
+    default T create(int windowId, {inventory} inventory) { return create(windowId, inventory, null); }
+}
+"#;
+
+/// The extended menu factory is the same single abstract method as
+/// [`NEOFORGE_CONTAINER_FACTORY_SOURCE`]: the name is what a mod implements
+/// when it writes the opening data itself, and adding a method would leave a
+/// lambda without one to bind.
+const NEOFORGE_EXTENDED_CONTAINER_FACTORY_SOURCE: &str = r#"package net.neoforged.neoforge.network;
+
+public interface IExtendedContainerFactory<T extends {menu}> extends IContainerFactory<T> {
+}
+"#;
+
+/// NeoForge's `MenuType` extension: `create` retains one factory per menu id
+/// and answers the id a type was created under, while the game type keeps its
+/// own constructor. The default `naturalId` is the marker the generated
+/// `MenuType` stub answers through this interface.
+const NEOFORGE_MENU_TYPE_EXTENSION_SOURCE: &str = r#"package net.neoforged.neoforge.common.extensions;
+
+public interface IMenuTypeExtension {
+    java.util.Map<String, net.neoforged.neoforge.network.IContainerFactory<?>> HORIZON_FACTORIES = new java.util.TreeMap<>();
+    java.util.Map<Object, {identifier}> HORIZON_IDS = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Object, {identifier}>());
+
+    static <T extends {menu}> {menu_type} create(net.neoforged.neoforge.network.IContainerFactory<T> factory) {
+        return create(null, factory);
+    }
+
+    static <T extends {menu}> {menu_type} create({identifier} id, net.neoforged.neoforge.network.IContainerFactory<T> factory) {
+        if (factory == null) throw new NullPointerException("factory");
+        {menu_type} type = new {menu_type}(null, null) { };
+        if (id != null) {
+            HORIZON_FACTORIES.put(String.valueOf(id), factory);
+            HORIZON_IDS.put(type, id);
+        }
+        return type;
+    }
+
+    /** The factory a menu id was created with, or null. */
+    static net.neoforged.neoforge.network.IContainerFactory<?> horizonFactory(String id) { return HORIZON_FACTORIES.get(id); }
+
+    /** Every retained factory, keyed by menu id in id order. */
+    static java.util.Map<String, net.neoforged.neoforge.network.IContainerFactory<?>> horizonFactories() { return new java.util.TreeMap<>(HORIZON_FACTORIES); }
+
+    /** Marker: the id this type was created under, or null when it named none. */
+    default {identifier} naturalId() { return HORIZON_IDS.get(this); }
+}
+"#;
+
 /// Bounded loader bootstrap values. They answer the queries entrypoint code
 /// makes during startup (`getModContainer`, `getAllMods`, `getObjectShare`,
 /// `isModLoaded`) without claiming to be the Fabric loader's registry: the
@@ -3256,6 +3532,90 @@ fn resolve_attachment_types(
 ) -> BTreeMap<&'static str, String> {
     let mut out = BTreeMap::new();
     for (role, candidates) in ATTACHMENT_TYPE_CANDIDATES {
+        let picked = candidates.iter().copied().find(|name| {
+            game.contains_key(*name) || lib_names.contains(*name) || own.contains(*name)
+        });
+        if let Some(name) = picked {
+            if game.contains_key(name) && !wanted.contains(name) {
+                wanted.insert(name.to_owned());
+            }
+            out.insert(*role, name.to_owned());
+        }
+    }
+    out
+}
+
+/// The game and dependency types a menu registration names. 26.3 renamed the
+/// id to `Identifier`, the buffer to `RegistryFriendlyByteBuf` and the codec to
+/// `StreamCodec`; the names they replaced stay second so a jar compiled against
+/// them still binds. `screen` is the client GUI a factory's menu opens, so a
+/// server-shaped jar leaves it unresolved and the factory is reported.
+const MENU_TYPE_CANDIDATES: &[(&str, &[&str])] = &[
+    (
+        "menu",
+        &["net/minecraft/world/inventory/AbstractContainerMenu"],
+    ),
+    ("menu_type", &["net/minecraft/world/inventory/MenuType"]),
+    ("menu_provider", &["net/minecraft/world/MenuProvider"]),
+    (
+        "inventory",
+        &["net/minecraft/world/entity/player/Inventory"],
+    ),
+    (
+        "byte_buf",
+        &[
+            "net/minecraft/network/RegistryFriendlyByteBuf",
+            "net/minecraft/network/FriendlyByteBuf",
+        ],
+    ),
+    (
+        "codec",
+        &[
+            "net/minecraft/network/codec/StreamCodec",
+            "net/minecraft/network/codec/PacketCodec",
+            "com/mojang/serialization/Codec",
+        ],
+    ),
+    (
+        "identifier",
+        &[
+            "net/minecraft/resources/Identifier",
+            "net/minecraft/resources/ResourceLocation",
+        ],
+    ),
+    (
+        "component",
+        &[
+            "net/minecraft/network/chat/Component",
+            "net/minecraft/text/Text",
+        ],
+    ),
+    (
+        "server_player",
+        &["net/minecraft/server/level/ServerPlayer"],
+    ),
+    (
+        "screen",
+        &[
+            "net/minecraft/client/gui/screens/Screen",
+            "net/minecraft/client/gui/screen/Screen",
+        ],
+    ),
+];
+
+/// Resolve the menu roles this classpath carries: the game jar first, then the
+/// dependency jars, then the target's own classes. A game class is seeded into
+/// the façade so the shim compiles against the real stub, while a dependency
+/// class is already on `javac`'s classpath. A role none of them carries stays
+/// unresolved and the shim that needs it is reported (`emit_role_shim`).
+fn resolve_menu_types(
+    game: &BTreeMap<String, Class>,
+    lib_names: &BTreeSet<String>,
+    own: &BTreeSet<&str>,
+    wanted: &mut BTreeSet<String>,
+) -> BTreeMap<&'static str, String> {
+    let mut out = BTreeMap::new();
+    for (role, candidates) in MENU_TYPE_CANDIDATES {
         let picked = candidates.iter().copied().find(|name| {
             game.contains_key(*name) || lib_names.contains(*name) || own.contains(*name)
         });
@@ -13594,6 +13954,500 @@ mod tests {
         assert!(output.status.success(), "attachment probe failed: {stderr}");
         assert!(
             stdout.contains("horizon attachment facade ok"),
+            "probe output: {stdout}{stderr}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Fabric's and NeoForge's menu façades: every template names a role instead
+    /// of a game type, resolution takes the game jar before a library before the
+    /// target's own classes, a real API class is never shadowed, a missing role
+    /// is reported, and the generated `MenuType` stub implements the façade's
+    /// own `IMenuTypeExtension` only when that shim is ours.
+    #[test]
+    fn menu_facade_shapes_are_guarded_and_resolved() {
+        for (template, fragments) in [
+            (
+                FABRIC_MENU_TYPE_SOURCE,
+                &[
+                    "public class {name}<T extends {menu}, D> extends {menu_type}",
+                    "public {name}(ExtendedFactory<T, D> factory, {codec} codec)",
+                    "super(null, null)",
+                    "public T create(int windowId, {inventory} inventory, D data)",
+                    "public {codec} getCodec()",
+                    "public {codec} getStreamCodec()",
+                    "public {menu_type} getMenuType() { return this; }",
+                    "public interface ExtendedFactory<T extends {menu}, D>",
+                ][..],
+            ),
+            (
+                FABRIC_MENU_FACTORY_SOURCE,
+                &[
+                    "public interface {name}<D> extends {menu_provider}",
+                    "D getScreenOpeningData({server_player} player)",
+                    "{component} getDisplayName();",
+                    "default {screen} createScreen(int windowId, {inventory} inventory, {component} title)",
+                ][..],
+            ),
+            (
+                NEOFORGE_CONTAINER_FACTORY_SOURCE,
+                &[
+                    "public interface IContainerFactory<T extends {menu}>",
+                    "T create(int windowId, {inventory} inventory, {byte_buf} data)",
+                    "default T create(int windowId, {inventory} inventory)",
+                ][..],
+            ),
+            (
+                NEOFORGE_EXTENDED_CONTAINER_FACTORY_SOURCE,
+                &[
+                    "public interface IExtendedContainerFactory<T extends {menu}> extends IContainerFactory<T>",
+                ][..],
+            ),
+            (
+                NEOFORGE_MENU_TYPE_EXTENSION_SOURCE,
+                &[
+                    "static <T extends {menu}> {menu_type} create(net.neoforged.neoforge.network.IContainerFactory<T> factory)",
+                    "static <T extends {menu}> {menu_type} create({identifier} id,",
+                    "new {menu_type}(null, null) { }",
+                    "HORIZON_FACTORIES.put(String.valueOf(id), factory);",
+                    "HORIZON_IDS.put(type, id);",
+                    "default {identifier} naturalId() { return HORIZON_IDS.get(this); }",
+                ][..],
+            ),
+        ] {
+            for fragment in fragments {
+                assert!(
+                    template.contains(fragment),
+                    "missing menu fragment: {fragment}"
+                );
+            }
+            assert!(
+                !template.contains("net.minecraft."),
+                "hard-coded game type in a menu template"
+            );
+        }
+        for role in [
+            "menu",
+            "menu_type",
+            "menu_provider",
+            "inventory",
+            "byte_buf",
+            "codec",
+            "identifier",
+            "component",
+            "server_player",
+            "screen",
+        ] {
+            assert!(
+                MENU_TYPE_CANDIDATES.iter().any(|(name, _)| *name == role),
+                "missing menu role: {role}"
+            );
+        }
+        let game = |names: &[&str]| -> BTreeMap<String, Class> {
+            names
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_owned(),
+                        Class {
+                            name: (*name).to_owned(),
+                            ..Class::default()
+                        },
+                    )
+                })
+                .collect()
+        };
+        let none: BTreeSet<String> = BTreeSet::new();
+        let no_own: BTreeSet<&str> = BTreeSet::new();
+        // 26.3's renamed types win over the names they replaced, and the game
+        // classes a role resolves to are seeded as the stubs the shims compile
+        // against.
+        let jar = game(&[
+            "net/minecraft/world/inventory/AbstractContainerMenu",
+            "net/minecraft/world/inventory/MenuType",
+            "net/minecraft/network/RegistryFriendlyByteBuf",
+            "net/minecraft/network/FriendlyByteBuf",
+            "net/minecraft/network/codec/StreamCodec",
+            "net/minecraft/resources/Identifier",
+        ]);
+        let mut wanted = BTreeSet::new();
+        let resolved = resolve_menu_types(&jar, &none, &no_own, &mut wanted);
+        assert_eq!(
+            resolved["menu"],
+            "net/minecraft/world/inventory/AbstractContainerMenu"
+        );
+        assert_eq!(
+            resolved["menu_type"],
+            "net/minecraft/world/inventory/MenuType"
+        );
+        assert_eq!(
+            resolved["byte_buf"],
+            "net/minecraft/network/RegistryFriendlyByteBuf"
+        );
+        assert_eq!(resolved["codec"], "net/minecraft/network/codec/StreamCodec");
+        assert!(wanted.contains("net/minecraft/world/inventory/MenuType"));
+        assert!(!wanted.contains("com/mojang/serialization/Codec"));
+        // A dependency class resolves the codec role and is not stubbed.
+        let libs = BTreeSet::from(["com/mojang/serialization/Codec".to_owned()]);
+        let mut wanted = BTreeSet::new();
+        let resolved = resolve_menu_types(&game(&[]), &libs, &no_own, &mut wanted);
+        assert_eq!(resolved["codec"], "com/mojang/serialization/Codec");
+        assert!(wanted.is_empty());
+        // The name 26.3 replaced still resolves for a jar built against it.
+        let legacy = game(&["net/minecraft/resources/ResourceLocation"]);
+        let mut wanted = BTreeSet::new();
+        assert_eq!(
+            resolve_menu_types(&legacy, &none, &no_own, &mut wanted)["identifier"],
+            "net/minecraft/resources/ResourceLocation"
+        );
+        // A role the target jars carry themselves resolves but is not a stub.
+        let own = BTreeSet::from(["net/minecraft/world/entity/player/Inventory"]);
+        let mut wanted = BTreeSet::new();
+        assert_eq!(
+            resolve_menu_types(&game(&[]), &none, &own, &mut wanted)["inventory"],
+            "net/minecraft/world/entity/player/Inventory"
+        );
+        assert!(wanted.is_empty());
+        // Nothing on this classpath resolves a role, so nothing is invented.
+        let mut wanted = BTreeSet::new();
+        assert!(resolve_menu_types(&game(&[]), &none, &no_own, &mut wanted).is_empty());
+        assert!(wanted.is_empty());
+
+        // Emission: an available class is never shadowed, a missing role is
+        // reported, and an emitted shim lands at the API's path with every role
+        // filled in.
+        let root = std::env::temp_dir().join(format!("horizon-facade-menu-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create shim directory");
+        let types = BTreeMap::from([
+            (
+                "menu",
+                "net/minecraft/world/inventory/AbstractContainerMenu".to_owned(),
+            ),
+            (
+                "menu_type",
+                "net/minecraft/world/inventory/MenuType".to_owned(),
+            ),
+            (
+                "inventory",
+                "net/minecraft/world/entity/player/Inventory".to_owned(),
+            ),
+            (
+                "codec",
+                "net/minecraft/network/codec/StreamCodec".to_owned(),
+            ),
+        ]);
+        let mut files = Vec::new();
+        let mut report = Report::default();
+        emit_role_shim(
+            &mut files,
+            &mut report,
+            &root,
+            &BTreeSet::from([FABRIC_MENU_TYPE.to_owned()]),
+            &types,
+            FABRIC_MENU_TYPE,
+            &[],
+            || "shadowed".to_owned(),
+        )
+        .expect("guard the real API class");
+        assert!(files.is_empty() && report.missing.is_empty());
+        emit_role_shim(
+            &mut files,
+            &mut report,
+            &root,
+            &BTreeSet::new(),
+            &types,
+            FABRIC_SCREEN_HANDLER_TYPE,
+            &["menu", "menu_type", "inventory", "codec", "screen"],
+            || "invented".to_owned(),
+        )
+        .expect("report a missing role");
+        assert!(files.is_empty());
+        assert_eq!(
+            report.missing,
+            vec![format!("{FABRIC_SCREEN_HANDLER_TYPE} (needs screen)")]
+        );
+        let mut named = types.clone();
+        named.insert("package", "net/fabricmc/fabric/api/menu/v1".to_owned());
+        named.insert("name", "ExtendedMenuType".to_owned());
+        emit_role_shim(
+            &mut files,
+            &mut report,
+            &root,
+            &BTreeSet::new(),
+            &types,
+            FABRIC_MENU_TYPE,
+            &["menu", "menu_type", "inventory", "codec"],
+            || fill_types(FABRIC_MENU_TYPE_SOURCE, &named),
+        )
+        .expect("emit the extended menu type");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("net/fabricmc/fabric/api/menu/v1/ExtendedMenuType.java"));
+        let written = fs::read_to_string(&files[0]).expect("read the emitted shim");
+        assert!(written.contains("public class ExtendedMenuType<T extends"));
+        assert!(written.contains("package net.fabricmc.fabric.api.menu.v1;"));
+        for role in named.keys() {
+            assert!(
+                !written.contains(&format!("{{{role}}}")),
+                "unfilled menu role: {role}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        // Detection and emission markers stay in the generator path, and only
+        // the façade's own extension is implemented by the generated stub.
+        let source = include_str!("facade.rs");
+        for marker in [
+            "let uses_fabric_menus = names_any",
+            "let uses_neoforge_menus = uses_neoforge",
+            "resolve_menu_types(&game, &lib_names, &own, &mut wanted)",
+            "let menu_type_extension =",
+            "if menu_type_extension && let Some(menu_type) = menu_types.get(\"menu_type\")",
+            "if !names_any(&[class]) {",
+        ] {
+            assert!(source.contains(marker), "missing guard: {marker}");
+        }
+        for class in [
+            FABRIC_MENU_TYPE,
+            FABRIC_MENU_FACTORY,
+            FABRIC_SCREEN_HANDLER_TYPE,
+            FABRIC_SCREEN_HANDLER_FACTORY,
+            NEOFORGE_CONTAINER_FACTORY,
+            NEOFORGE_EXTENDED_CONTAINER_FACTORY,
+            NEOFORGE_MENU_TYPE_EXTENSION,
+        ] {
+            assert!(
+                source.contains(&format!("\"{class}\"")),
+                "menu shim not registered: {class}"
+            );
+        }
+    }
+
+    /// Fabric's extended menu type, its factory and NeoForge's `MenuType`
+    /// extension are compiled and run for real: the type keeps the factory and
+    /// codec marker it was registered with, the factory keeps its opening data,
+    /// and the extension retains one factory per menu id. Skipped cleanly when
+    /// no JDK is installed.
+    #[test]
+    fn fabric_extended_menu_type_compiles_and_retains_registrations() {
+        use std::{path::PathBuf, process::Command};
+        let types: BTreeMap<&'static str, String> = BTreeMap::from([
+            (
+                "menu",
+                "net/minecraft/world/inventory/AbstractContainerMenu".to_owned(),
+            ),
+            (
+                "menu_type",
+                "net/minecraft/world/inventory/MenuType".to_owned(),
+            ),
+            (
+                "menu_provider",
+                "net/minecraft/world/MenuProvider".to_owned(),
+            ),
+            (
+                "inventory",
+                "net/minecraft/world/entity/player/Inventory".to_owned(),
+            ),
+            (
+                "byte_buf",
+                "net/minecraft/network/RegistryFriendlyByteBuf".to_owned(),
+            ),
+            (
+                "codec",
+                "net/minecraft/network/codec/StreamCodec".to_owned(),
+            ),
+            (
+                "identifier",
+                "net/minecraft/resources/Identifier".to_owned(),
+            ),
+            (
+                "component",
+                "net/minecraft/network/chat/Component".to_owned(),
+            ),
+            (
+                "server_player",
+                "net/minecraft/server/level/ServerPlayer".to_owned(),
+            ),
+            (
+                "screen",
+                "net/minecraft/client/gui/screens/Screen".to_owned(),
+            ),
+        ]);
+        let probe = r#"public class MenuProbe {
+    static final class Crate extends net.minecraft.world.inventory.AbstractContainerMenu {
+        final int windowId;
+        Crate(int windowId, Object data) { super(windowId); this.windowId = windowId; }
+    }
+
+    static final class Data { final String value; Data(String value) { this.value = value; } }
+
+    static final class Provider implements net.fabricmc.fabric.api.screenhandler.v1.ExtendedScreenHandlerFactory<Data> {
+        public net.minecraft.network.chat.Component getDisplayName() { return () -> "crate"; }
+        public Data getScreenOpeningData(net.minecraft.server.level.ServerPlayer player) { return new Data("opened"); }
+    }
+
+    public static void main(String[] args) {
+        net.minecraft.network.codec.StreamCodec<net.minecraft.network.RegistryFriendlyByteBuf, Data> codec =
+            new net.minecraft.network.codec.StreamCodec<net.minecraft.network.RegistryFriendlyByteBuf, Data>() {};
+        net.fabricmc.fabric.api.screenhandler.v1.ExtendedScreenHandlerType.ExtendedFactory<Crate, Data> factory =
+            (windowId, inventory, data) -> new Crate(windowId, data);
+        net.fabricmc.fabric.api.screenhandler.v1.ExtendedScreenHandlerType<Crate, Data> type =
+            new net.fabricmc.fabric.api.screenhandler.v1.ExtendedScreenHandlerType<>(factory, codec);
+        if (type.getMenuType() != type) throw new AssertionError("wrapped menu type");
+        if (type.getCodec() != codec || type.getStreamCodec() != codec) throw new AssertionError("codec marker");
+        Crate menu = type.create(7, new net.minecraft.world.entity.player.Inventory(), new Data("d"));
+        if (menu == null || menu.windowId != 7) throw new AssertionError("factory route");
+
+        Provider provider = new Provider();
+        if (!provider.getScreenOpeningData(null).value.equals("opened")) throw new AssertionError("opening data");
+        if (!provider.getDisplayName().getString().equals("crate")) throw new AssertionError("display name");
+        if (provider.createScreen(1, new net.minecraft.world.entity.player.Inventory(), provider.getDisplayName()) != null) throw new AssertionError("bounded screen");
+
+        net.minecraft.resources.Identifier id = new net.minecraft.resources.Identifier("probe", "crate");
+        net.minecraft.world.inventory.MenuType neo =
+            net.neoforged.neoforge.common.extensions.IMenuTypeExtension.create(id, (windowId, inventory, data) -> new Crate(windowId, data));
+        if (neo == null) throw new AssertionError("neo type");
+        if (((net.neoforged.neoforge.common.extensions.IMenuTypeExtension) neo).naturalId() != id) throw new AssertionError("natural id");
+        if (net.neoforged.neoforge.common.extensions.IMenuTypeExtension.horizonFactory("probe:crate") == null) throw new AssertionError("retained factory");
+        if (net.neoforged.neoforge.common.extensions.IMenuTypeExtension.horizonFactories().size() != 1) throw new AssertionError("factory count");
+        System.out.println("horizon menu facade ok");
+    }
+}
+"#;
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-menu-shim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let mut files = Vec::new();
+        let mut write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write java shim");
+            files.push(file);
+        };
+        // The 1.20.x Fabric names, so the renamed template's `{name}` role is
+        // exercised as well as the class lookup.
+        let named = |class: &str| {
+            let (package, simple) = class.rsplit_once('/').expect("package and name");
+            let mut named = types.clone();
+            named.insert("package", package.to_owned());
+            named.insert("name", simple.to_owned());
+            named
+        };
+        write(
+            "net/fabricmc/fabric/api/screenhandler/v1/ExtendedScreenHandlerType.java",
+            &fill_types(
+                FABRIC_MENU_TYPE_SOURCE,
+                &named("net/fabricmc/fabric/api/screenhandler/v1/ExtendedScreenHandlerType"),
+            ),
+        );
+        write(
+            "net/fabricmc/fabric/api/screenhandler/v1/ExtendedScreenHandlerFactory.java",
+            &fill_types(
+                FABRIC_MENU_FACTORY_SOURCE,
+                &named("net/fabricmc/fabric/api/screenhandler/v1/ExtendedScreenHandlerFactory"),
+            ),
+        );
+        for (relative, template) in [
+            ("IContainerFactory.java", NEOFORGE_CONTAINER_FACTORY_SOURCE),
+            (
+                "IExtendedContainerFactory.java",
+                NEOFORGE_EXTENDED_CONTAINER_FACTORY_SOURCE,
+            ),
+        ] {
+            write(
+                &format!("net/neoforged/neoforge/network/{relative}"),
+                &fill_types(template, &types),
+            );
+        }
+        write(
+            "net/neoforged/neoforge/common/extensions/IMenuTypeExtension.java",
+            &fill_types(NEOFORGE_MENU_TYPE_EXTENSION_SOURCE, &types),
+        );
+        // The smallest game types the menu signatures name, plus the `MenuType`
+        // stub the generator emits: it implements the extension, so
+        // `naturalId()` lands on the anonymous type `create` builds.
+        for (relative, source) in [
+            (
+                "net/minecraft/world/inventory/AbstractContainerMenu.java",
+                "package net.minecraft.world.inventory;\npublic class AbstractContainerMenu { public final int containerId; public AbstractContainerMenu(int containerId) { this.containerId = containerId; } }\n",
+            ),
+            (
+                "net/minecraft/world/inventory/MenuType.java",
+                "package net.minecraft.world.inventory;\npublic class MenuType<T extends AbstractContainerMenu> implements net.neoforged.neoforge.common.extensions.IMenuTypeExtension {\n    public MenuType() {}\n    protected MenuType(Object supplier, Object requiredFeatures) {}\n    public T create(int windowId, net.minecraft.world.entity.player.Inventory inventory) { return null; }\n}\n",
+            ),
+            (
+                "net/minecraft/world/entity/player/Inventory.java",
+                "package net.minecraft.world.entity.player;\npublic class Inventory {}\n",
+            ),
+            (
+                "net/minecraft/world/MenuProvider.java",
+                "package net.minecraft.world;\npublic interface MenuProvider { net.minecraft.network.chat.Component getDisplayName(); }\n",
+            ),
+            (
+                "net/minecraft/network/chat/Component.java",
+                "package net.minecraft.network.chat;\npublic interface Component { String getString(); }\n",
+            ),
+            (
+                "net/minecraft/network/RegistryFriendlyByteBuf.java",
+                "package net.minecraft.network;\npublic class RegistryFriendlyByteBuf {}\n",
+            ),
+            (
+                "net/minecraft/network/codec/StreamCodec.java",
+                "package net.minecraft.network.codec;\npublic interface StreamCodec<B, V> {}\n",
+            ),
+            (
+                "net/minecraft/server/level/ServerPlayer.java",
+                "package net.minecraft.server.level;\npublic class ServerPlayer {}\n",
+            ),
+            (
+                "net/minecraft/client/gui/screens/Screen.java",
+                "package net.minecraft.client.gui.screens;\npublic class Screen {}\n",
+            ),
+            (
+                "net/minecraft/resources/Identifier.java",
+                "package net.minecraft.resources;\npublic class Identifier { private final String namespace; private final String path; public Identifier(String namespace, String path) { this.namespace = namespace; this.path = path; } public String toString() { return namespace + \":\" + path; } }\n",
+            ),
+        ] {
+            write(relative, source);
+        }
+        write("MenuProbe.java", probe);
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(javac_status) = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(
+            javac_status.success(),
+            "javac rejected the generated menu façade"
+        );
+        let java = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("java"))
+            .unwrap_or_else(|| PathBuf::from("java"));
+        let output = Command::new(&java)
+            .arg("-cp")
+            .arg(&classes)
+            .arg("MenuProbe")
+            .output()
+            .expect("run the menu probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "menu probe failed: {stderr}");
+        assert!(
+            stdout.contains("horizon menu facade ok"),
             "probe output: {stdout}{stderr}"
         );
         let _ = fs::remove_dir_all(&root);
