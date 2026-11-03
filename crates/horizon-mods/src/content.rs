@@ -1,11 +1,12 @@
 //! A content mod's `assets/` and `data/` (API 0.2, docs/modpacks.md): the
 //! files it adds to the game's resource tree, and the declarations it makes in
-//! `data/<id>/horizon/`: blocks, items and mob effects in `block/`, `item/`
-//! and `mob_effect/`, and the typed rows [`Content::from_native`] writes —
-//! entities, data components, attachments, menus and block entities — in
-//! `entity/`, `data_component/`, `attachment/`, `menu/` and `block_entity/`.
-//! Reading a content root validates those files with the same parsers the
-//! native path used to write them, so a root round-trips.
+//! `data/<id>/horizon/` — blocks, items and mob effects in `block/`, `item/`
+//! and `mob_effect/`, and the typed rows in `entity/`, `data_component/`,
+//! `attachment/`, `menu/` and `block_entity/`. [`Content::from_native`] writes
+//! all of them, so a native content root keeps its whole declaration set when
+//! it is exported to a folder or a `.hmod`. Reading a content root validates
+//! those files with the same parsers the native path writes them with, so a
+//! root round-trips.
 //!
 //! Content is data, not code: nothing here runs in the sandbox. What a mod
 //! may add is fenced instead. Its own namespaces (its id and the ones its
@@ -13,8 +14,8 @@
 //! tags (`c`, which NeoForge and Fabric mods share). Paths are plain, files
 //! and totals are capped, vanilla ids cannot be redefined, and no two mods
 //! share a namespace ([`clash`]). Native declarations ([`Content::from_native`])
-//! add entities, data components, attachments, menus and block entities under
-//! the same fences.
+//! add blocks, items, mob effects, entities, data components, attachments,
+//! menus and block entities under the same fences.
 use crate::manifest::{Capability, MANIFEST, Manifest};
 use crate::native::{
     AttachmentDeclaration, BlockEntityDeclaration, DataComponentDeclaration, EntityDeclaration,
@@ -432,9 +433,11 @@ impl Content {
     /// Builds the declaration-only content half of a native Java mod.
     ///
     /// The resulting content has no source files, but it participates in the
-    /// same resource-root planning as a packaged `.hmod`. Every emitted row
-    /// carries a [`NATIVE_FORMAT`] marker: entities add their typed
-    /// [`crate::native::SpawnRestriction`] and
+    /// same resource-root planning as a packaged `.hmod`. Blocks, items and
+    /// mob effects are written in the very shapes the packaged path reads
+    /// (`block/`, `item/` and `mob_effect/` files); those reject unknown keys,
+    /// so they take no format marker. The typed rows carry a [`NATIVE_FORMAT`]
+    /// marker: entities add their typed [`crate::native::SpawnRestriction`] and
     /// [`crate::native::EntityAttributes`] blocks, data components and
     /// attachments their codec flags, menus their title key and slot count,
     /// and block entities their vanilla template, ticker and valid blocks.
@@ -661,6 +664,73 @@ impl Content {
                 .ok_or_else(|| format!("native ingredient {} has no namespace", ingredient.id))?;
             let file = format!("data/{namespace}/ingredient/{path}.json");
             add_native_file(file, ingredient.json.clone())?;
+        }
+        // Blocks, items and mob effects are written in the shapes the packaged
+        // path parses (`BlockFile`, `ItemFile`, `MobEffect`), so the same root
+        // reads back. Those shapes reject unknown keys and so carry no marker.
+        for block in &declarations.blocks {
+            let (namespace, path) = block
+                .id
+                .split_once(':')
+                .ok_or_else(|| format!("native block {} has no namespace", block.id))?;
+            let file = format!("data/{namespace}/horizon/block/{path}.json");
+            check_path(&file)?;
+            let json = serde_json::json!({
+                "template": block.template,
+                "properties": properties_json(&block.properties),
+                "shapes": block.shapes.as_ref().map(|shapes| serde_json::json!({
+                    "property": shapes.property,
+                    "values": shapes.values,
+                })),
+                "default_state": block.default_state,
+                "item": block.item,
+                "components": block.components,
+            });
+            add_native_file(
+                file,
+                serde_json::to_vec(&json).map_err(|error| {
+                    format!("native block {} cannot be encoded: {error}", block.id)
+                })?,
+            )?;
+        }
+        for item in &declarations.items {
+            let (namespace, path) = item
+                .id
+                .split_once(':')
+                .ok_or_else(|| format!("native item {} has no namespace", item.id))?;
+            let file = format!("data/{namespace}/horizon/item/{path}.json");
+            check_path(&file)?;
+            let json = serde_json::json!({
+                "template": item.template,
+                "max_stack_size": item.max_stack_size,
+                "rarity": item.rarity.map(rarity_name),
+                "components": item.components,
+                "crafting_remainder": item.crafting_remainder,
+            });
+            add_native_file(
+                file,
+                serde_json::to_vec(&json).map_err(|error| {
+                    format!("native item {} cannot be encoded: {error}", item.id)
+                })?,
+            )?;
+        }
+        for effect in &declarations.effects {
+            let (namespace, path) = effect
+                .id
+                .split_once(':')
+                .ok_or_else(|| format!("native mob effect {} has no namespace", effect.id))?;
+            let file = format!("data/{namespace}/horizon/mob_effect/{path}.json");
+            check_path(&file)?;
+            let json = serde_json::json!({
+                "category": category_name(effect.category),
+                "color": effect.color,
+            });
+            add_native_file(
+                file,
+                serde_json::to_vec(&json).map_err(|error| {
+                    format!("native mob effect {} cannot be encoded: {error}", effect.id)
+                })?,
+            )?;
         }
         for entity in &declarations.entities {
             let (namespace, path) = entity
@@ -1131,6 +1201,56 @@ fn check_components(
         }
     }
     Ok(())
+}
+
+/// A block's `properties` object as the reader parses it: only the values the
+/// declaration changes, since an unset field keeps the template's.
+fn properties_json(properties: &BlockProperties) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    let mut put = |key: &str, value: Option<serde_json::Value>| {
+        if let Some(value) = value {
+            out.insert(key.to_owned(), value);
+        }
+    };
+    put("hardness", properties.hardness.map(serde_json::Value::from));
+    put(
+        "explosion_resistance",
+        properties.explosion_resistance.map(serde_json::Value::from),
+    );
+    put("light", properties.light.map(serde_json::Value::from));
+    put(
+        "requires_tool",
+        properties.requires_tool.map(serde_json::Value::from),
+    );
+    put("friction", properties.friction.map(serde_json::Value::from));
+    put(
+        "map_color",
+        properties.map_color.map(serde_json::Value::from),
+    );
+    put(
+        "sounds",
+        properties.sounds.as_deref().map(serde_json::Value::from),
+    );
+    serde_json::Value::Object(out)
+}
+
+/// [`Rarity`]'s file name, which [`ItemFile`] reads back.
+fn rarity_name(rarity: Rarity) -> &'static str {
+    match rarity {
+        Rarity::Common => "common",
+        Rarity::Uncommon => "uncommon",
+        Rarity::Rare => "rare",
+        Rarity::Epic => "epic",
+    }
+}
+
+/// [`EffectCategory`]'s file name, which [`MobEffect`] reads back.
+fn category_name(category: EffectCategory) -> &'static str {
+    match category {
+        EffectCategory::Beneficial => "beneficial",
+        EffectCategory::Harmful => "harmful",
+        EffectCategory::Neutral => "neutral",
+    }
 }
 
 fn check_block(file: &BlockFile) -> Result<(), String> {
@@ -1953,6 +2073,186 @@ capabilities = ["registries"]
         assert_eq!(read.menus, written.menus);
         assert_eq!(read.block_entities, written.block_entities);
         assert_eq!(read.namespaces, written.namespaces);
+    }
+
+    #[test]
+    fn native_block_item_and_effect_rows_round_trip_through_a_package() {
+        let block = Block {
+            id: "ruby:ruby_block".into(),
+            template: "minecraft:iron_block".into(),
+            properties: BlockProperties {
+                hardness: Some(4.0),
+                light: Some(3),
+                sounds: Some("minecraft:amethyst_block".into()),
+                ..BlockProperties::default()
+            },
+            shapes: Some(BlockShapes {
+                property: "axis".into(),
+                values: BTreeMap::from([("x".to_owned(), vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]])]),
+            }),
+            default_state: BTreeMap::from([("axis".to_owned(), "x".to_owned())]),
+            item: true,
+            components: BTreeMap::from([(
+                "minecraft:max_stack_size".to_owned(),
+                serde_json::json!(16),
+            )]),
+        };
+        let bowl = Item {
+            id: "ruby:bowl".into(),
+            template: "minecraft:bowl".into(),
+            max_stack_size: None,
+            rarity: None,
+            components: BTreeMap::new(),
+            crafting_remainder: None,
+        };
+        let stew = Item {
+            id: "ruby:stew".into(),
+            template: "minecraft:mushroom_stew".into(),
+            max_stack_size: Some(1),
+            rarity: Some(Rarity::Rare),
+            components: BTreeMap::from([("!minecraft:lore".to_owned(), serde_json::json!({}))]),
+            crafting_remainder: Some("ruby:bowl".into()),
+        };
+        let effect = MobEffect {
+            id: "ruby:glow".into(),
+            category: EffectCategory::Beneficial,
+            color: 0xFF_0000,
+        };
+        let written = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![block.clone()],
+                // Declared out of order: the reader sorts each table by id.
+                items: vec![stew.clone(), bowl.clone()],
+                effects: vec![effect.clone()],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(written.native_files.len(), 4);
+        let files: Vec<(&str, &[u8])> = written
+            .native_files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let read = hmod("native-typed-root", MANIFEST_TEXT, &files).unwrap();
+        assert_eq!(read.files.len(), 4);
+        assert_eq!(read.blocks, [block]);
+        assert_eq!(read.items, [bowl, stew]);
+        assert_eq!(read.effects, [effect]);
+        assert_eq!(read.namespaces, written.namespaces);
+        // The files are the packaged shapes, without a format marker.
+        let block = native_json(&written, "data/ruby/horizon/block/ruby_block.json");
+        assert!(block.get("format").is_none());
+        assert_eq!(block["item"], true);
+        assert_eq!(block["properties"]["light"], 3);
+        assert_eq!(block["default_state"]["axis"], "x");
+        assert_eq!(block["shapes"]["property"], "axis");
+        let effect = native_json(&written, "data/ruby/horizon/mob_effect/glow.json");
+        assert!(effect.get("format").is_none());
+        assert_eq!(effect["category"], "beneficial");
+        assert_eq!(effect["color"], 0xFF_0000);
+    }
+
+    #[test]
+    fn native_block_item_and_item_still_clash_by_id() {
+        let block = Block {
+            id: "ruby:lamp".into(),
+            template: "minecraft:sea_lantern".into(),
+            properties: BlockProperties::default(),
+            shapes: None,
+            default_state: BTreeMap::new(),
+            item: true,
+            components: BTreeMap::new(),
+        };
+        let item = Item {
+            id: "ruby:lamp".into(),
+            template: "minecraft:stick".into(),
+            max_stack_size: None,
+            rarity: None,
+            components: BTreeMap::new(),
+            crafting_remainder: None,
+        };
+        let error = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![block.clone()],
+                items: vec![item.clone()],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "native item ruby:lamp conflicts with a block item");
+        // A block without an item leaves the id to the item, and the two rows
+        // sit in different folders, so they do not collide on disk.
+        let content = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![Block {
+                    item: false,
+                    ..block
+                }],
+                items: vec![item],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap();
+        assert!(!content.blocks[0].item);
+        assert!(
+            content
+                .native_files
+                .contains_key("data/ruby/horizon/block/lamp.json")
+        );
+        assert!(
+            content
+                .native_files
+                .contains_key("data/ruby/horizon/item/lamp.json")
+        );
+    }
+
+    #[test]
+    fn native_typed_rows_count_toward_the_content_limits() {
+        let effects: Vec<MobEffect> = (0..=MAX_FILES)
+            .map(|i| MobEffect {
+                id: format!("ruby:effect_{i}"),
+                category: EffectCategory::Neutral,
+                color: 0,
+            })
+            .collect();
+        let error = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                effects,
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.contains(&format!("more than {MAX_FILES} native content files")),
+            "{error}"
+        );
+        // A single row is capped at MAX_FILE like any other content file.
+        let block = Block {
+            id: "ruby:huge".into(),
+            template: "minecraft:stone".into(),
+            properties: BlockProperties::default(),
+            shapes: None,
+            default_state: BTreeMap::new(),
+            item: true,
+            components: BTreeMap::from([(
+                "minecraft:lore".to_owned(),
+                serde_json::json!(["x".repeat(MAX_FILE as usize)]),
+            )]),
+        };
+        let error = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![block],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("is over 16 MiB"), "{error}");
     }
 
     #[test]
