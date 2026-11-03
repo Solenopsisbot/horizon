@@ -1,7 +1,9 @@
 //! A compiled mod registers a payload receiver and the native dispatcher calls
 //! it with the received frame's bounded marker.
 
-use horizon_native_java::{NativeJar, StdHost, Value, dispatch_payload_frame};
+use horizon_native_java::{
+    NativeJar, StdHost, Value, dispatch_payload_frame, dispatch_payload_frame_with,
+};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 use zip::write::SimpleFileOptions;
 
@@ -137,5 +139,24 @@ fn a_received_frame_calls_the_registered_handler() {
     // The handler observed the channel and the frame's first bytes.
     assert!(text.contains("demo:frame"), "{text}");
     assert!(text.contains("6869"), "{text}");
+
+    // A decoded value (a supported codec's string) reaches the same handler.
+    let dispatched = dispatch_payload_frame_with(
+        &jar,
+        &mut host,
+        &registrations,
+        "demo:frame",
+        Value::Ref(Some("decoded-text".into())),
+        Value::Ref(Some("payload-context/demo:frame".into())),
+    )
+    .unwrap();
+    assert!(dispatched);
+    let seen = host
+        .invocations()
+        .iter()
+        .rev()
+        .find(|call| call.method.owner == "demo/Probe" && call.method.name == "seen")
+        .expect("Probe.seen was called again");
+    assert_eq!(seen.args[0], Value::Ref(Some("decoded-text".into())));
     let _ = fs::remove_dir_all(root);
 }

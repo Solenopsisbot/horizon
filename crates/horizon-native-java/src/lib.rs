@@ -12816,6 +12816,31 @@ pub fn dispatch_payload_frame(
     id: &str,
     bytes: &[u8],
 ) -> Result<bool, NativeError> {
+    let hex: String = bytes
+        .iter()
+        .take(256)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    dispatch_payload_frame_with(
+        jar,
+        host,
+        registrations,
+        id,
+        Value::Ref(Some(format!("payload/{id}/{hex}"))),
+        Value::Ref(Some(format!("payload-context/{id}"))),
+    )
+}
+
+/// [`dispatch_payload_frame`] with an already-decoded payload value: a codec
+/// the transport models can hand the handler the real string or bytes.
+pub fn dispatch_payload_frame_with(
+    jar: &NativeJar,
+    host: &mut StdHost,
+    registrations: &[PayloadRegistration],
+    id: &str,
+    payload: Value,
+    context: Value,
+) -> Result<bool, NativeError> {
     let Some(registration) = registrations.iter().find(|registration| {
         matches!(
             &registration.payload_type,
@@ -12852,13 +12877,8 @@ pub fn dispatch_payload_frame(
             .ok_or_else(|| NativeError::Metadata("payload handler lost its receiver".into()))?;
         (Some(receiver.clone()), rest.to_vec())
     };
-    let hex: String = bytes
-        .iter()
-        .take(256)
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    args.push(Value::Ref(Some(format!("payload/{id}/{hex}"))));
-    args.push(Value::Ref(Some(format!("payload-context/{id}"))));
+    args.push(payload);
+    args.push(context);
     jar.invoke_method_with_args(
         &target.owner,
         &target.name,

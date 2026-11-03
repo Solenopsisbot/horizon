@@ -8,9 +8,12 @@
 //! client can drive the same state machine.
 
 use horizon_mods::payloads::{
-    PayloadDeclaration, PayloadDirection, PayloadFrame, PayloadRegistry, validate_payload,
+    PayloadCodec, PayloadDeclaration, PayloadDirection, PayloadFrame, PayloadRegistry,
+    validate_payload,
 };
-use horizon_native_java::{NativeJar, PayloadRegistration, StdHost, dispatch_payload_frame};
+use horizon_native_java::{
+    NativeJar, PayloadRegistration, StdHost, Value, dispatch_payload_frame_with,
+};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -229,15 +232,19 @@ pub fn clear_handler_jars() {
 /// channel. Returns whether a handler ran; sends it queues are published for
 /// the next server tick.
 pub fn dispatch_received(frame: &PayloadFrame) -> Result<bool, String> {
+    let declarations = declared();
+    let declaration = declarations.get(frame.id());
+    let (payload, context) = payload_values(declaration, frame);
     let handlers = HANDLER_JARS.lock().unwrap_or_else(|e| e.into_inner());
     for handler in handlers.iter() {
         let mut host = StdHost::new();
-        let matched = dispatch_payload_frame(
+        let matched = dispatch_payload_frame_with(
             &handler.jar,
             &mut host,
             &handler.registrations,
             frame.id(),
-            frame.bytes(),
+            payload.clone(),
+            context.clone(),
         )
         .map_err(|error| error.to_string())?;
         if matched {
@@ -246,6 +253,39 @@ pub fn dispatch_received(frame: &PayloadFrame) -> Result<bool, String> {
         }
     }
     Ok(false)
+}
+
+/// The payload and context a handler receives. A supported codec gives it the
+/// decoded string or an empty marker; anything else stays the bounded
+/// `payload/<id>/<hex>` marker.
+fn payload_values(
+    declaration: Option<&PayloadDeclaration>,
+    frame: &PayloadFrame,
+) -> (Value, Value) {
+    let id = frame.id();
+    let context = Value::Ref(Some(format!("payload-context/{id}")));
+    let codec = declaration
+        .and_then(|declaration| declaration.codec.as_deref())
+        .and_then(PayloadCodec::parse);
+    let payload = match codec {
+        Some(PayloadCodec::Utf8) => match std::str::from_utf8(frame.bytes()) {
+            Ok(text) => Value::Ref(Some(text.to_owned())),
+            Err(_) => payload_marker(frame),
+        },
+        Some(PayloadCodec::Empty) => Value::Ref(Some(format!("payload-empty/{id}"))),
+        Some(PayloadCodec::Raw) | None => payload_marker(frame),
+    };
+    (payload, context)
+}
+
+fn payload_marker(frame: &PayloadFrame) -> Value {
+    let hex: String = frame
+        .bytes()
+        .iter()
+        .take(256)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Value::Ref(Some(format!("payload/{}/{}", frame.id(), hex)))
 }
 
 /// Frames a Java host asked to send, waiting for the server's next tick.
@@ -625,5 +665,46 @@ mod tests {
         let frame =
             PayloadFrame::new("demo:up", PayloadDirection::PlayToServer, b"x".to_vec()).unwrap();
         assert!(!dispatch_received(&frame).unwrap());
+    }
+
+    #[test]
+    fn supported_codecs_decode_the_payload_value() {
+        let string = PayloadDeclaration {
+            id: "demo:text".into(),
+            direction: PayloadDirection::PlayToServer,
+            codec: Some("minecraft:string".into()),
+        };
+        let frame = PayloadFrame::new(
+            "demo:text",
+            PayloadDirection::PlayToServer,
+            b"hello".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            payload_values(Some(&string), &frame).0,
+            Value::Ref(Some("hello".into()))
+        );
+        let empty = PayloadDeclaration {
+            id: "demo:empty".into(),
+            direction: PayloadDirection::PlayToServer,
+            codec: Some("minecraft:unit".into()),
+        };
+        let frame =
+            PayloadFrame::new("demo:empty", PayloadDirection::PlayToServer, Vec::new()).unwrap();
+        assert_eq!(
+            payload_values(Some(&empty), &frame).0,
+            Value::Ref(Some("payload-empty/demo:empty".into()))
+        );
+        let raw = PayloadDeclaration {
+            id: "demo:raw".into(),
+            direction: PayloadDirection::PlayToServer,
+            codec: Some("minecraft:byte_array".into()),
+        };
+        let frame =
+            PayloadFrame::new("demo:raw", PayloadDirection::PlayToServer, vec![0xff]).unwrap();
+        assert_eq!(
+            payload_values(Some(&raw), &frame).0,
+            Value::Ref(Some("payload/demo:raw/ff".into()))
+        );
     }
 }
