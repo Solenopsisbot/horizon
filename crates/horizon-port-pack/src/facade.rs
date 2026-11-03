@@ -98,6 +98,29 @@ pub fn generate_many(
             .iter()
             .any(|r| r == "net/fabricmc/fabric/api/networking/v1/PayloadTypeRegistry")
     });
+    // Fabric API's event holders, command callback and the loader's bootstrap
+    // queries are library classes too. They are only filled in below when the
+    // target's jars do not carry the real class, so a real API jar is never
+    // shadowed. The loader slice is emitted as a unit (see `FABRIC_LOADER_SHIMS`).
+    let fabric_holders = [
+        "net/fabricmc/fabric/api/event/Event",
+        "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents",
+        "net/fabricmc/fabric/api/event/lifecycle/v1/ClientLifecycleEvents",
+        "net/fabricmc/fabric/api/event/player/ServerPlayerEvents",
+        "net/fabricmc/fabric/api/command/v2/CommandRegistrationCallback",
+    ];
+    let uses_fabric_events = target.iter().any(|class| {
+        class
+            .refs
+            .iter()
+            .any(|r| fabric_holders.contains(&r.as_str()))
+    });
+    let uses_fabric_loader = target.iter().any(|class| {
+        class
+            .refs
+            .iter()
+            .any(|r| r.starts_with("net/fabricmc/loader/api/"))
+    });
     let own: BTreeSet<&str> = target.iter().map(|c| c.name.as_str()).collect();
     // Shapes from dependency jars are real classes on javac/the probe
     // classpaths. Keep their names available when deciding whether a game
@@ -130,6 +153,26 @@ pub fn generate_many(
                 {
                     wanted.insert(ty);
                 }
+            }
+        }
+    }
+    // The Fabric event shims name game types in their callback signatures, and
+    // a mod that only writes `register(server -> {})` carries no reference to
+    // them. Seed the façade with the types the emitted holders need; a
+    // client-only type stays absent on a server-shaped jar and the holder that
+    // names it is skipped below.
+    if uses_fabric_events {
+        for name in [
+            "net/minecraft/server/MinecraftServer",
+            "net/minecraft/client/Minecraft",
+            "net/minecraft/server/level/ServerPlayer",
+            "net/minecraft/commands/Commands",
+            "net/minecraft/commands/Commands$CommandSelection",
+            "net/minecraft/commands/CommandSourceStack",
+            "net/minecraft/commands/CommandBuildContext",
+        ] {
+            if game.contains_key(name) && !lib_names.contains(name) && !own.contains(name) {
+                wanted.insert(name.to_owned());
             }
         }
     }
@@ -407,6 +450,96 @@ pub fn generate_many(
             .map_err(|e| format!("{}: {e}", payload_registry_file.display()))?;
         files.push(payload_registry_file);
     }
+    // Fabric API's lifecycle/player event holders and the command registration
+    // callback: registration order is preserved, `invoker()` returns the
+    // combined handler, and no gameplay runs. A holder is only emitted when its
+    // callback signatures can actually resolve against this façade.
+    if uses_fabric_events {
+        let event_base = "net/fabricmc/fabric/api/event/Event";
+        // `Event.horizon` is this slice's factory: when a real `Event` interface
+        // is on the classpath it has no such member, so the holders that build
+        // on it are skipped rather than shadowing half of the API.
+        let base_absent = !available.contains(event_base);
+        if base_absent {
+            write_shim(&mut files, &src, event_base, FABRIC_EVENT)?;
+        }
+        let compilable =
+            |ty: &str| wanted.contains(ty) || lib_names.contains(ty) || own.contains(ty);
+        for (class, doc, events, requires) in [
+            (
+                "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents",
+                "Bounded server lifecycle events: ordered listeners, invoked by the host.",
+                FABRIC_SERVER_LIFECYCLE,
+                &["net/minecraft/server/MinecraftServer"][..],
+            ),
+            (
+                "net/fabricmc/fabric/api/event/lifecycle/v1/ClientLifecycleEvents",
+                "Bounded client lifecycle events: ordered listeners, invoked by the host.",
+                FABRIC_CLIENT_LIFECYCLE,
+                &["net/minecraft/client/Minecraft"][..],
+            ),
+            (
+                "net/fabricmc/fabric/api/event/player/ServerPlayerEvents",
+                "Bounded server player events: ordered listeners, invoked by the host.",
+                FABRIC_SERVER_PLAYER_EVENTS,
+                &["net/minecraft/server/level/ServerPlayer"][..],
+            ),
+        ] {
+            if available.contains(class) {
+                continue;
+            }
+            if !base_absent {
+                report
+                    .missing
+                    .push(format!("{class} (needs {event_base} absent)"));
+                continue;
+            }
+            let missing: Vec<&str> = requires
+                .iter()
+                .copied()
+                .filter(|ty| !compilable(ty))
+                .collect();
+            if !missing.is_empty() {
+                report
+                    .missing
+                    .push(format!("{class} (needs {})", missing.join(", ")));
+                continue;
+            }
+            let (package, simple) = class.rsplit_once('/').unwrap_or(("", class));
+            let source = fabric_event_source(package, simple, doc, events);
+            write_shim(&mut files, &src, class, &source)?;
+        }
+        // Brigadier is a library class: a generated empty stub would lose its
+        // type parameters, so the command callback only lands when the real
+        // dispatcher is on the classpath.
+        let command = "net/fabricmc/fabric/api/command/v2/CommandRegistrationCallback";
+        if base_absent
+            && !available.contains(command)
+            && lib_names.contains("com/mojang/brigadier/CommandDispatcher")
+            && compilable("net/minecraft/commands/CommandSourceStack")
+            && compilable("net/minecraft/commands/CommandBuildContext")
+            && wanted.contains("net/minecraft/commands/Commands$CommandSelection")
+        {
+            write_shim(
+                &mut files,
+                &src,
+                command,
+                FABRIC_COMMAND_REGISTRATION_CALLBACK,
+            )?;
+        }
+    }
+    // The loader slice is one unit: the bounded containers name each other, so
+    // a partial real jar would mix two shapes. Emit nothing when any of it is
+    // already on the classpath.
+    if uses_fabric_loader
+        && FABRIC_LOADER_SHIMS
+            .iter()
+            .all(|(class, _)| !available.contains(*class))
+    {
+        for (class, source) in FABRIC_LOADER_SHIMS {
+            write_shim(&mut files, &src, class, source)?;
+        }
+    }
     if uses_neoforge || uses_legacy_forge {
         let shims = [
             (
@@ -421,12 +554,10 @@ pub fn generate_many(
                     "public @interface Mod { String value(); }\n",
                 ),
             ),
+            ("net/neoforged/bus/api/Event.java", NEOFORGE_EVENT),
             (
-                "net/neoforged/bus/api/Event.java",
-                concat!(
-                    "package net.neoforged.bus.api;\n",
-                    "public class Event {}\n"
-                ),
+                "net/neoforged/bus/api/SubscribeEvent.java",
+                NEOFORGE_SUBSCRIBE_EVENT,
             ),
             (
                 "net/neoforged/bus/api/IEventBus.java",
@@ -458,10 +589,7 @@ pub fn generate_many(
             // surface used during mod bootstrap; dispatch is recorded by the
             // native host and unsupported listener invocation remains a
             // diagnostic boundary.
-            (
-                "net/minecraftforge/eventbus/api/Event.java",
-                "package net.minecraftforge.eventbus.api; public class Event { public boolean isCancelable() { return false; } public boolean isCanceled() { return false; } public void setCanceled(boolean value) {} }\n",
-            ),
+            ("net/minecraftforge/eventbus/api/Event.java", FORGE_EVENT),
             (
                 "net/minecraftforge/eventbus/api/EventPriority.java",
                 "package net.minecraftforge.eventbus.api; public enum EventPriority { HIGHEST, HIGH, NORMAL, LOW, LOWEST }\n",
@@ -1259,6 +1387,346 @@ public final class PayloadTypeRegistry {
     }
 }
 "#;
+
+/// Bounded Fabric API `Event`: listeners stay in registration order and
+/// `invoker()` returns their combined handler. The interface mirrors the two
+/// members a mod calls (`register`, `invoker`); phases are not modelled, so a
+/// holder that needs them stays a bounded gap. Nothing here runs gameplay.
+const FABRIC_EVENT: &str = r#"package net.fabricmc.fabric.api.event;
+
+public interface Event<T> {
+    void register(T listener);
+    T invoker();
+
+    static <T> Event<T> horizon(java.util.function.Function<java.util.List<T>, T> dispatch) {
+        return new HorizonEvent<>(dispatch);
+    }
+}
+
+final class HorizonEvent<T> implements Event<T> {
+    private final java.util.List<T> horizonListeners = new java.util.ArrayList<>();
+    private final java.util.function.Function<java.util.List<T>, T> horizonDispatch;
+
+    HorizonEvent(java.util.function.Function<java.util.List<T>, T> dispatch) { this.horizonDispatch = dispatch; }
+    @Override public void register(T listener) { if (listener != null) horizonListeners.add(listener); }
+    @Override public T invoker() {
+        // Snapshot: a handler that registers another handler cannot change a
+        // dispatch already in flight, and the order is registration order.
+        return horizonDispatch.apply(java.util.Collections.unmodifiableList(new java.util.ArrayList<>(horizonListeners)));
+    }
+    @Override public String toString() { return "Event[" + horizonListeners.size() + " listeners]"; }
+}
+"#;
+
+/// One bounded Fabric API event as
+/// `(field, callback, method, parameters, call arguments)`: the holder's field,
+/// the nested callback interface and the invoker body that walks the listeners
+/// in registration order. Parameter types are fully qualified so the emitted
+/// holder needs no imports the caller's classpath may not carry.
+type FabricEvent = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+const SERVER_PARAMS: &str = "net.minecraft.server.MinecraftServer p0";
+const CLIENT_PARAMS: &str = "net.minecraft.client.Minecraft p0";
+const PLAYER_PARAMS: &str = "net.minecraft.server.level.ServerPlayer p0, net.minecraft.server.level.ServerPlayer p1, boolean p2";
+
+const FABRIC_SERVER_LIFECYCLE: &[FabricEvent] = &[
+    (
+        "SERVER_STARTING",
+        "ServerStarting",
+        "onServerStarting",
+        SERVER_PARAMS,
+        "p0",
+    ),
+    (
+        "SERVER_STARTED",
+        "ServerStarted",
+        "onServerStarted",
+        SERVER_PARAMS,
+        "p0",
+    ),
+    (
+        "SERVER_STOPPING",
+        "ServerStopping",
+        "onServerStopping",
+        SERVER_PARAMS,
+        "p0",
+    ),
+];
+
+const FABRIC_CLIENT_LIFECYCLE: &[FabricEvent] = &[
+    (
+        "CLIENT_STARTED",
+        "ClientStarted",
+        "onClientStarted",
+        CLIENT_PARAMS,
+        "p0",
+    ),
+    (
+        "CLIENT_STOPPING",
+        "ClientStopping",
+        "onClientStopping",
+        CLIENT_PARAMS,
+        "p0",
+    ),
+];
+
+const FABRIC_SERVER_PLAYER_EVENTS: &[FabricEvent] = &[
+    (
+        "AFTER_RESPAWN",
+        "AfterRespawn",
+        "afterRespawn",
+        PLAYER_PARAMS,
+        "p0, p1, p2",
+    ),
+    (
+        "COPY_FROM",
+        "CopyFrom",
+        "copyFrom",
+        PLAYER_PARAMS,
+        "p0, p1, p2",
+    ),
+];
+
+fn fabric_event_source(package: &str, class: &str, doc: &str, events: &[FabricEvent]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "package {package};");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "import net.fabricmc.fabric.api.event.Event;");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "/** {doc} */");
+    let _ = writeln!(out, "public final class {class} {{");
+    let _ = writeln!(out, "    private {class}() {{}}");
+    for (field, callback, method, params, args) in events {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "    public static final Event<{callback}> {field} = Event.horizon(horizonListeners ->"
+        );
+        let _ = writeln!(out, "        ({params}) -> {{");
+        let _ = writeln!(
+            out,
+            "            for ({callback} horizonListener : horizonListeners) horizonListener.{method}({args});"
+        );
+        let _ = writeln!(out, "        }});");
+    }
+    for (_, callback, method, params, _) in events {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "    @FunctionalInterface");
+        let _ = writeln!(out, "    public interface {callback} {{");
+        let _ = writeln!(out, "        void {method}({params});");
+        let _ = writeln!(out, "    }}");
+    }
+    let _ = writeln!(out, "}}");
+    out
+}
+
+/// Fabric API's command registration event. `EVENT` is a functional
+/// `CommandRegistrationCallback`, exactly as in the real API, so
+/// `EVENT.register((dispatcher, registryAccess, environment) -> ...)` compiles.
+const FABRIC_COMMAND_REGISTRATION_CALLBACK: &str = r#"package net.fabricmc.fabric.api.command.v2;
+
+import com.mojang.brigadier.CommandDispatcher;
+import net.fabricmc.fabric.api.event.Event;
+import net.minecraft.commands.CommandBuildContext;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.Commands;
+
+@FunctionalInterface
+public interface CommandRegistrationCallback {
+    void register(CommandDispatcher<CommandSourceStack> dispatcher, CommandBuildContext registryAccess, Commands.CommandSelection environment);
+
+    Event<CommandRegistrationCallback> EVENT = Event.horizon(horizonListeners ->
+        (dispatcher, registryAccess, environment) -> {
+            for (CommandRegistrationCallback horizonListener : horizonListeners) {
+                horizonListener.register(dispatcher, registryAccess, environment);
+            }
+        });
+}
+"#;
+
+/// Bounded loader bootstrap values. They answer the queries entrypoint code
+/// makes during startup (`getModContainer`, `getAllMods`, `getObjectShare`,
+/// `isModLoaded`) without claiming to be the Fabric loader's registry: the
+/// native host answers the same calls from real metadata.
+const FABRIC_LOADER: &str = r#"package net.fabricmc.loader.api;
+
+public final class FabricLoader {
+    private static final FabricLoader HORIZON = new FabricLoader();
+    private static final ModContainer HORIZON_MOD = ModContainer.horizon("minecraft", "26.3");
+    private final ObjectShare horizonObjectShare = new ObjectShare();
+
+    private FabricLoader() {}
+    public static FabricLoader getInstance() { return HORIZON; }
+    public <T> java.util.List<EntrypointContainer<T>> getEntrypointContainers(String key, Class<T> type) { return new java.util.ArrayList<>(); }
+    public java.util.Optional<ModContainer> getModContainer(String modId) { return isModLoaded(modId) ? java.util.Optional.of(HORIZON_MOD) : java.util.Optional.empty(); }
+    public java.util.Collection<ModContainer> getAllMods() { return java.util.Collections.singletonList(HORIZON_MOD); }
+    public ObjectShare getObjectShare() { return horizonObjectShare; }
+    public boolean isModLoaded(String modId) { return "minecraft".equals(modId) || "horizon".equals(modId); }
+    public boolean isDevelopmentEnvironment() { return false; }
+    public String getGameVersion() { return "26.3"; }
+}
+"#;
+
+const FABRIC_MOD_CONTAINER: &str = r#"package net.fabricmc.loader.api;
+
+import net.fabricmc.loader.api.metadata.ModMetadata;
+import net.fabricmc.loader.api.metadata.Version;
+
+public interface ModContainer {
+    ModMetadata getMetadata();
+    default String getModId() { return getMetadata().getId(); }
+    default Version getVersion() { return getMetadata().getVersion(); }
+    static ModContainer horizon(String id, String version) { return () -> ModMetadata.horizon(id, version); }
+}
+"#;
+
+const FABRIC_ENTRYPOINT_CONTAINER: &str = r#"package net.fabricmc.loader.api;
+
+public interface EntrypointContainer<T> {
+    T getEntrypoint();
+    ModContainer getProvider();
+    Object getDefinition();
+}
+"#;
+
+const FABRIC_OBJECT_SHARE: &str = r#"package net.fabricmc.loader.api;
+
+public final class ObjectShare {
+    private final java.util.Map<String, Object> horizonValues = new java.util.concurrent.ConcurrentHashMap<>();
+    public Object get(String key) { return horizonValues.get(key); }
+    @SuppressWarnings("unchecked") public <T> T get(Class<T> type, String key) { Object value = horizonValues.get(key); return type.isInstance(value) ? (T) value : null; }
+    @SuppressWarnings("unchecked") public <T> T getOrDefault(String key, T fallback) { Object value = horizonValues.get(key); return value == null ? fallback : (T) value; }
+    public Object put(String key, Object value) { return horizonValues.put(key, value); }
+    public boolean containsKey(String key) { return horizonValues.containsKey(key); }
+    public Object remove(String key) { return horizonValues.remove(key); }
+    public java.util.Map<String, Object> asMap() { return java.util.Collections.unmodifiableMap(horizonValues); }
+    public boolean isEmpty() { return horizonValues.isEmpty(); }
+    public void clear() { horizonValues.clear(); }
+}
+"#;
+
+const FABRIC_MOD_METADATA: &str = r#"package net.fabricmc.loader.api.metadata;
+
+public interface ModMetadata {
+    String getId();
+    Version getVersion();
+    String getName();
+    String getDescription();
+    static ModMetadata horizon(String id, String version) {
+        return new ModMetadata() {
+            public String getId() { return id; }
+            public Version getVersion() { return Version.horizon(version); }
+            public String getName() { return id; }
+            public String getDescription() { return "Horizon bounded mod metadata"; }
+        };
+    }
+}
+"#;
+
+const FABRIC_VERSION: &str = r#"package net.fabricmc.loader.api.metadata;
+
+public interface Version {
+    String getFriendlyString();
+    static Version horizon(String version) { return () -> version; }
+}
+"#;
+
+const FABRIC_LOADER_SHIMS: &[(&str, &str)] = &[
+    ("net/fabricmc/loader/api/FabricLoader", FABRIC_LOADER),
+    ("net/fabricmc/loader/api/ModContainer", FABRIC_MOD_CONTAINER),
+    (
+        "net/fabricmc/loader/api/EntrypointContainer",
+        FABRIC_ENTRYPOINT_CONTAINER,
+    ),
+    ("net/fabricmc/loader/api/ObjectShare", FABRIC_OBJECT_SHARE),
+    (
+        "net/fabricmc/loader/api/metadata/ModMetadata",
+        FABRIC_MOD_METADATA,
+    ),
+    ("net/fabricmc/loader/api/metadata/Version", FABRIC_VERSION),
+];
+
+/// Bounded NeoForge event base. Result and cancellation are recorded so
+/// bootstrap code can read them back; the host's bus owns ordering and the
+/// listener dispatch itself, so nothing here posts or invokes gameplay.
+const NEOFORGE_EVENT: &str = r#"package net.neoforged.bus.api;
+
+public class Event {
+    public enum Result { DENY, DEFAULT, ALLOW }
+
+    private final boolean horizonCancelable;
+    private boolean horizonCanceled;
+    private Result horizonResult;
+
+    public Event() { this(false); }
+    public Event(boolean cancelable) { this.horizonCancelable = cancelable; }
+    public boolean isCancelable() { return horizonCancelable; }
+    public boolean isCanceled() { return horizonCanceled; }
+    public void setCanceled(boolean canceled) { horizonCanceled = canceled; }
+    public Result getResult() { return horizonResult == null ? Result.DEFAULT : horizonResult; }
+    public void setResult(Result result) { horizonResult = result; }
+    public boolean hasResult() { return horizonResult != null; }
+}
+"#;
+
+/// `@SubscribeEvent` metadata on a method: the annotation is present so mod
+/// listeners compile and can be inspected; the native host records the
+/// listeners it actually dispatches.
+const NEOFORGE_SUBSCRIBE_EVENT: &str = r#"package net.neoforged.bus.api;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface SubscribeEvent {
+    EventPriority priority() default EventPriority.NORMAL;
+    boolean receiveCancelled() default false;
+    boolean receiveCanceled() default false;
+}
+"#;
+
+/// Legacy Forge keeps the same result/cancellation surface in its own package.
+const FORGE_EVENT: &str = r#"package net.minecraftforge.eventbus.api;
+
+public class Event {
+    public enum Result { DENY, DEFAULT, ALLOW }
+
+    private boolean horizonCanceled;
+    private Result horizonResult;
+
+    public boolean isCancelable() { return true; }
+    public boolean isCanceled() { return horizonCanceled; }
+    public void setCanceled(boolean canceled) { horizonCanceled = canceled; }
+    public Result getResult() { return horizonResult == null ? Result.DEFAULT : horizonResult; }
+    public void setResult(Result result) { horizonResult = result; }
+    public boolean hasResult() { return horizonResult != null; }
+}
+"#;
+
+/// Writes one generated shim and records it for the `javac` source list.
+fn write_shim(
+    files: &mut Vec<PathBuf>,
+    src: &Path,
+    class: &str,
+    source: &str,
+) -> Result<(), String> {
+    let file = src.join(format!("{class}.java"));
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    fs::write(&file, source).map_err(|e| format!("{}: {e}", file.display()))?;
+    files.push(file);
+    Ok(())
+}
 
 fn tree(
     name: &str,
@@ -5157,6 +5625,368 @@ mod tests {
         assert!(output.status.success(), "payload probe failed: {stderr}");
         assert!(
             stdout.contains("horizon payload registries ok"),
+            "probe output: {stdout}{stderr}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fabric_event_holders_match_the_api_descriptors() {
+        let server = fabric_event_source(
+            "net.fabricmc.fabric.api.event.lifecycle.v1",
+            "ServerLifecycleEvents",
+            "doc",
+            FABRIC_SERVER_LIFECYCLE,
+        );
+        for (field, callback, method) in [
+            ("SERVER_STARTING", "ServerStarting", "onServerStarting"),
+            ("SERVER_STARTED", "ServerStarted", "onServerStarted"),
+            ("SERVER_STOPPING", "ServerStopping", "onServerStopping"),
+        ] {
+            assert!(
+                server.contains(&format!(
+                    "public static final Event<{callback}> {field} = Event.horizon(horizonListeners ->"
+                )),
+                "missing field {field}"
+            );
+            assert!(
+                server.contains(&format!(
+                    "void {method}(net.minecraft.server.MinecraftServer p0);"
+                )),
+                "missing descriptor {method}"
+            );
+            assert!(
+                server.contains(&format!(
+                    "for ({callback} horizonListener : horizonListeners) horizonListener.{method}(p0);"
+                )),
+                "missing invoker body {method}"
+            );
+        }
+        let client = fabric_event_source(
+            "net.fabricmc.fabric.api.event.lifecycle.v1",
+            "ClientLifecycleEvents",
+            "doc",
+            FABRIC_CLIENT_LIFECYCLE,
+        );
+        assert!(client.contains("void onClientStarted(net.minecraft.client.Minecraft p0);"));
+        assert!(client.contains("void onClientStopping(net.minecraft.client.Minecraft p0);"));
+        let player = fabric_event_source(
+            "net.fabricmc.fabric.api.event.player",
+            "ServerPlayerEvents",
+            "doc",
+            FABRIC_SERVER_PLAYER_EVENTS,
+        );
+        assert!(player.contains(
+            "void afterRespawn(net.minecraft.server.level.ServerPlayer p0, net.minecraft.server.level.ServerPlayer p1, boolean p2);"
+        ));
+        assert!(player.contains(
+            "for (CopyFrom horizonListener : horizonListeners) horizonListener.copyFrom(p0, p1, p2);"
+        ));
+        // Registration order is the only order: the invoker walks the list.
+        assert!(FABRIC_EVENT.contains("private final java.util.List<T> horizonListeners"));
+        assert!(FABRIC_EVENT.contains("horizonListeners.add(listener);"));
+        assert!(FABRIC_EVENT.contains("T invoker();"));
+        // The command callback is functional and carries `EVENT`.
+        assert!(FABRIC_COMMAND_REGISTRATION_CALLBACK.contains("@FunctionalInterface"));
+        assert!(FABRIC_COMMAND_REGISTRATION_CALLBACK.contains(
+            "void register(CommandDispatcher<CommandSourceStack> dispatcher, CommandBuildContext registryAccess, Commands.CommandSelection environment);"
+        ));
+        assert!(FABRIC_COMMAND_REGISTRATION_CALLBACK.contains(
+            "Event<CommandRegistrationCallback> EVENT = Event.horizon(horizonListeners ->"
+        ));
+        assert!(!FABRIC_COMMAND_REGISTRATION_CALLBACK.contains("extends Event<"));
+    }
+
+    #[test]
+    fn fabric_event_shims_only_fill_an_absent_api_class() {
+        let source = include_str!("facade.rs");
+        assert!(source.contains("let uses_fabric_events = target"));
+        assert!(source.contains("let base_absent = !available.contains(event_base);"));
+        assert!(source.contains("if base_absent {"));
+        assert!(source.contains("if available.contains(class) {"));
+        assert!(source.contains("let compilable =\n            |ty: &str| wanted.contains(ty)"));
+        // A client-only callback is skipped on a server-shaped jar.
+        assert!(source.contains("&[\"net/minecraft/client/Minecraft\"][..]"));
+        assert!(source.contains(
+            "if game.contains_key(name) && !lib_names.contains(name) && !own.contains(name) {"
+        ));
+        // The command callback needs the real dispatcher and the nested enum.
+        assert!(source.contains("lib_names.contains(\"com/mojang/brigadier/CommandDispatcher\")"));
+        assert!(
+            source
+                .contains("wanted.contains(\"net/minecraft/commands/Commands$CommandSelection\")")
+        );
+        // The loader slice is all-or-nothing: no mixed real/bounded shapes.
+        assert!(source.contains("FABRIC_LOADER_SHIMS\n            .iter()\n            .all("));
+        for (class, _) in FABRIC_LOADER_SHIMS {
+            assert!(
+                source.contains(&format!("\"{class}\"")),
+                "loader shim not registered: {class}"
+            );
+        }
+    }
+
+    #[test]
+    fn neoforge_event_bus_surface_covers_result_cancel_and_priority() {
+        for fragment in [
+            "public enum Result { DENY, DEFAULT, ALLOW }",
+            "public Result getResult()",
+            "public void setResult(Result result)",
+            "public boolean hasResult()",
+            "public boolean isCanceled()",
+            "public void setCanceled(boolean canceled)",
+            "public boolean isCancelable()",
+        ] {
+            assert!(NEOFORGE_EVENT.contains(fragment), "missing: {fragment}");
+        }
+        assert!(FORGE_EVENT.contains("public Result getResult()"));
+        assert!(FORGE_EVENT.contains("public boolean hasResult()"));
+        for fragment in [
+            "public @interface SubscribeEvent {",
+            "EventPriority priority() default EventPriority.NORMAL;",
+            "boolean receiveCancelled() default false;",
+            "@Target(ElementType.METHOD)",
+        ] {
+            assert!(
+                NEOFORGE_SUBSCRIBE_EVENT.contains(fragment),
+                "missing: {fragment}"
+            );
+        }
+        let source = include_str!("facade.rs");
+        assert!(source.contains("\"net/neoforged/bus/api/SubscribeEvent.java\","));
+        for overload in [
+            "default IEventBus addListener(EventPriority priority, Consumer<?> listener) { return this; }",
+            "default IEventBus addListener(EventPriority priority, boolean receiveCancelled, Consumer<?> listener) { return this; }",
+            "default <T extends Event> IEventBus addListener(Class<T> type, Consumer<T> listener) { return this; }",
+            "default <T extends Event> IEventBus addListener(EventPriority priority, Class<T> type, Consumer<T> listener) { return this; }",
+            "default <T extends Event> IEventBus addListener(EventPriority priority, boolean receiveCancelled, Class<T> type, Consumer<T> listener) { return this; }",
+        ] {
+            assert!(source.contains(overload), "missing overload: {overload}");
+        }
+        assert!(
+            source.contains("public enum EventPriority { HIGHEST, HIGH, NORMAL, LOW, LOWEST }")
+        );
+    }
+
+    #[test]
+    fn fabric_loader_bootstrap_values_are_bounded() {
+        for fragment in [
+            "public static FabricLoader getInstance()",
+            "public <T> java.util.List<EntrypointContainer<T>> getEntrypointContainers(String key, Class<T> type)",
+            "public java.util.Optional<ModContainer> getModContainer(String modId)",
+            "public java.util.Collection<ModContainer> getAllMods()",
+            "public ObjectShare getObjectShare()",
+            "public boolean isModLoaded(String modId)",
+        ] {
+            assert!(FABRIC_LOADER.contains(fragment), "missing: {fragment}");
+        }
+        assert!(FABRIC_MOD_CONTAINER.contains("ModMetadata getMetadata();"));
+        assert!(FABRIC_MOD_CONTAINER.contains("default Version getVersion()"));
+        assert!(FABRIC_MOD_METADATA.contains("Version getVersion();"));
+        assert!(FABRIC_VERSION.contains("String getFriendlyString();"));
+        for fragment in [
+            "public Object get(String key)",
+            "public <T> T get(Class<T> type, String key)",
+            "public <T> T getOrDefault(String key, T fallback)",
+            "public Object put(String key, Object value)",
+        ] {
+            assert!(
+                FABRIC_OBJECT_SHARE.contains(fragment),
+                "missing: {fragment}"
+            );
+        }
+        // Bounded markers must not pull a game class into the loader slice: it
+        // has to link on a jar-only classpath.
+        for source in [
+            FABRIC_LOADER,
+            FABRIC_MOD_CONTAINER,
+            FABRIC_ENTRYPOINT_CONTAINER,
+            FABRIC_OBJECT_SHARE,
+            FABRIC_MOD_METADATA,
+            FABRIC_VERSION,
+        ] {
+            assert!(!source.contains("net.minecraft."));
+        }
+    }
+
+    /// The generated event holders are compiled and run for real: registration
+    /// order and the NeoForge priority contract are behaviour, not a shape.
+    /// When `javac` is unavailable the source assertions above still hold.
+    #[test]
+    fn bounded_event_dispatch_compiles_and_keeps_order() {
+        let server = fabric_event_source(
+            "net.fabricmc.fabric.api.event.lifecycle.v1",
+            "ServerLifecycleEvents",
+            "Bounded server lifecycle events.",
+            FABRIC_SERVER_LIFECYCLE,
+        );
+        let client = fabric_event_source(
+            "net.fabricmc.fabric.api.event.lifecycle.v1",
+            "ClientLifecycleEvents",
+            "Bounded client lifecycle events.",
+            FABRIC_CLIENT_LIFECYCLE,
+        );
+        let player = fabric_event_source(
+            "net.fabricmc.fabric.api.event.player",
+            "ServerPlayerEvents",
+            "Bounded server player events.",
+            FABRIC_SERVER_PLAYER_EVENTS,
+        );
+        let probe = r#"public class BootstrapProbe {
+    public static final class ExampleEvent extends net.neoforged.bus.api.Event {
+        public ExampleEvent() { super(true); }
+    }
+
+    public static final class Listener {
+        @net.neoforged.bus.api.SubscribeEvent(priority = net.neoforged.bus.api.EventPriority.HIGH, receiveCancelled = true)
+        public void on(ExampleEvent event) {}
+    }
+
+    public static void main(String[] args) throws Exception {
+        java.util.List<String> seen = new java.util.ArrayList<>();
+        net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents.SERVER_STARTING.register(server -> seen.add("first"));
+        net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents.SERVER_STARTING.register(server -> seen.add("second"));
+        net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents.ServerStarting invoker =
+            net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents.SERVER_STARTING.invoker();
+        invoker.onServerStarting(null);
+        if (!seen.equals(java.util.Arrays.asList("first", "second"))) throw new AssertionError("order " + seen);
+
+        net.neoforged.bus.api.EventPriority[] byPriority = {
+            net.neoforged.bus.api.EventPriority.HIGHEST,
+            net.neoforged.bus.api.EventPriority.HIGH,
+            net.neoforged.bus.api.EventPriority.NORMAL,
+            net.neoforged.bus.api.EventPriority.LOW,
+            net.neoforged.bus.api.EventPriority.LOWEST,
+        };
+        for (int i = 1; i < byPriority.length; i++) {
+            if (byPriority[i - 1].ordinal() >= byPriority[i].ordinal()) throw new AssertionError("priority order");
+        }
+        ExampleEvent event = new ExampleEvent();
+        if (event.hasResult()) throw new AssertionError("default has no result");
+        event.setResult(net.neoforged.bus.api.Event.Result.DENY);
+        if (!event.hasResult() || event.getResult() != net.neoforged.bus.api.Event.Result.DENY) throw new AssertionError("result");
+        event.setCanceled(true);
+        if (!event.isCanceled() || !event.isCancelable()) throw new AssertionError("cancel");
+
+        net.neoforged.bus.api.SubscribeEvent metadata = Listener.class
+            .getMethod("on", ExampleEvent.class)
+            .getAnnotation(net.neoforged.bus.api.SubscribeEvent.class);
+        if (metadata == null
+            || metadata.priority() != net.neoforged.bus.api.EventPriority.HIGH
+            || !metadata.receiveCancelled()) throw new AssertionError("metadata");
+
+        net.neoforged.bus.api.IEventBus bus = new net.neoforged.bus.api.IEventBus() {};
+        bus.addListener(ExampleEvent.class, e -> {})
+            .addListener(net.neoforged.bus.api.EventPriority.HIGH, ExampleEvent.class, e -> {})
+            .addListener(net.neoforged.bus.api.EventPriority.LOW, true, ExampleEvent.class, e -> {})
+            .register(new Listener());
+        if (bus.post(event)) throw new AssertionError("bounded post");
+
+        net.fabricmc.loader.api.FabricLoader loader = net.fabricmc.loader.api.FabricLoader.getInstance();
+        if (!loader.isModLoaded("minecraft") || loader.isModLoaded("absent")) throw new AssertionError("isModLoaded");
+        net.fabricmc.loader.api.ModContainer container = loader.getModContainer("minecraft").orElseThrow();
+        if (!"minecraft".equals(container.getMetadata().getId())) throw new AssertionError("metadata id");
+        if (!"26.3".equals(container.getMetadata().getVersion().getFriendlyString())) throw new AssertionError("version");
+        if (loader.getAllMods().size() != 1) throw new AssertionError("mods");
+        net.fabricmc.loader.api.ObjectShare share = loader.getObjectShare();
+        share.put("key", "value");
+        if (!"value".equals(share.getOrDefault("key", "fallback"))) throw new AssertionError("share");
+        if (!"fallback".equals(share.getOrDefault("absent", "fallback"))) throw new AssertionError("share fallback");
+        if (!loader.getEntrypointContainers("main", Object.class).isEmpty()) throw new AssertionError("entrypoints");
+        System.out.println("horizon bootstrap facade ok");
+    }
+}
+"#;
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-bootstrap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let mut files = Vec::new();
+        let mut write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write java shim");
+            files.push(file);
+        };
+        write("net/fabricmc/fabric/api/event/Event.java", FABRIC_EVENT);
+        write(
+            "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents.java",
+            &server,
+        );
+        write(
+            "net/fabricmc/fabric/api/event/lifecycle/v1/ClientLifecycleEvents.java",
+            &client,
+        );
+        write(
+            "net/fabricmc/fabric/api/event/player/ServerPlayerEvents.java",
+            &player,
+        );
+        // The smallest game types the callback signatures name.
+        write(
+            "net/minecraft/server/MinecraftServer.java",
+            "package net.minecraft.server;\npublic class MinecraftServer {}\n",
+        );
+        write(
+            "net/minecraft/client/Minecraft.java",
+            "package net.minecraft.client;\npublic class Minecraft {}\n",
+        );
+        write(
+            "net/minecraft/server/level/ServerPlayer.java",
+            "package net.minecraft.server.level;\npublic class ServerPlayer {}\n",
+        );
+        write("net/neoforged/bus/api/Event.java", NEOFORGE_EVENT);
+        write(
+            "net/neoforged/bus/api/SubscribeEvent.java",
+            NEOFORGE_SUBSCRIBE_EVENT,
+        );
+        write(
+            "net/neoforged/bus/api/EventPriority.java",
+            "package net.neoforged.bus.api;\npublic enum EventPriority { HIGHEST, HIGH, NORMAL, LOW, LOWEST }\n",
+        );
+        write(
+            "net/neoforged/bus/api/IEventBus.java",
+            "package net.neoforged.bus.api;\nimport java.util.function.Consumer;\npublic interface IEventBus {\n    default IEventBus addListener(Consumer<?> listener) { return this; }\n    default IEventBus addListener(EventPriority priority, Consumer<?> listener) { return this; }\n    default <T extends Event> IEventBus addListener(Class<T> type, Consumer<T> listener) { return this; }\n    default <T extends Event> IEventBus addListener(EventPriority priority, Class<T> type, Consumer<T> listener) { return this; }\n    default <T extends Event> IEventBus addListener(EventPriority priority, boolean receiveCancelled, Class<T> type, Consumer<T> listener) { return this; }\n    default IEventBus register(Object object) { return this; }\n    default IEventBus unregister(Object object) { return this; }\n    default boolean post(Event event) { return false; }\n}\n",
+        );
+        for (class, source) in FABRIC_LOADER_SHIMS {
+            write(&format!("{class}.java"), source);
+        }
+        write("BootstrapProbe.java", probe);
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(javac_status) = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(
+            javac_status.success(),
+            "javac rejected the generated bootstrap façade"
+        );
+        let java = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("java"))
+            .unwrap_or_else(|| PathBuf::from("java"));
+        let output = Command::new(&java)
+            .arg("-cp")
+            .arg(&classes)
+            .arg("BootstrapProbe")
+            .output()
+            .expect("run the bootstrap probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "bootstrap probe failed: {stderr}");
+        assert!(
+            stdout.contains("horizon bootstrap facade ok"),
             "probe output: {stdout}{stderr}"
         );
         let _ = fs::remove_dir_all(&root);
