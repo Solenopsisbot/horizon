@@ -601,7 +601,7 @@ impl Census {
                     for target in &class.mixin_targets {
                         *self
                             .mixin_method_kinds
-                            .entry(mixin_method_kind(method))
+                            .entry(mixin_method_kind(method).to_string())
                             .or_default() += 1;
                         *points
                             .entry((
@@ -878,7 +878,7 @@ fn member_shape(member: &classes::Member) -> String {
 fn mixin_method_kind(method: &str) -> &'static str {
     if method
         .split('|')
-        .any(|m| m == "<init>" || m.starts_with("<init> "))
+        .any(|m| m == "<init>" || m.starts_with("<init> ") || m.starts_with("<init>("))
     {
         "constructor"
     } else {

@@ -32,6 +32,39 @@ pub struct MethodRef {
     pub descriptor: String,
 }
 
+/// A bounded native translation for one Mixin callback.
+///
+/// The native path deliberately accepts only the common `@Inject(at = HEAD)`
+/// shape.  The callback is invoked before the target method, so the target
+/// keeps its normal return value.  `cancellable` is retained in the plan to
+/// make the unsupported contract explicit: cancellation requires a real
+/// `CallbackInfo` object and is left to the JVM fallback for now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixinInjectionPlan {
+    pub target: MethodRef,
+    pub callback: MethodRef,
+    pub at: String,
+    pub cancellable: bool,
+}
+
+impl MixinInjectionPlan {
+    pub fn inject_at_head(target: MethodRef, callback: MethodRef) -> Self {
+        Self {
+            target,
+            callback,
+            at: "HEAD".into(),
+            cancellable: false,
+        }
+    }
+}
+
+/// Results from executing one supported native Mixin translation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MixinExecutionReport {
+    pub callback_result: Value,
+    pub target_result: Value,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostInvocation {
     pub method: MethodRef,
@@ -62,6 +95,17 @@ pub struct PayloadRegistration {
     pub payload_type: Value,
     pub codec: Value,
     pub handler: Value,
+}
+
+/// Metadata for one Fabric `EntrypointContainer` exposed by the bounded
+/// loader host. The container is a query value: invoking the returned Java
+/// object still requires a supported entrypoint class in the loaded jar and
+/// is not dispatched through an arbitrary host classpath.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricEntrypointContainer {
+    pub kind: String,
+    pub class: String,
+    pub provider: String,
 }
 
 /// A capability lookup crossing the native boundary. The native probe records
@@ -240,6 +284,10 @@ pub struct StdHost {
     posted_events: Vec<Value>,
     registrations: Vec<RegistryEntry>,
     payload_registrations: Vec<PayloadRegistration>,
+    /// Fabric lifecycle entries visible through `FabricLoader#getEntrypoints`.
+    /// Entries are seeded by the loaded jar, so this query never scans a host
+    /// classpath or invents providers.
+    fabric_entrypoint_containers: Vec<FabricEntrypointContainer>,
     /// Identifiers retained by `CustomPacketPayload.Type` values created by
     /// the bounded networking façade.
     packet_types: BTreeMap<String, String>,
@@ -288,6 +336,7 @@ impl StdHost {
             posted_events: Vec::new(),
             registrations: Vec::new(),
             payload_registrations: Vec::new(),
+            fabric_entrypoint_containers: Vec::new(),
             packet_types: BTreeMap::new(),
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
@@ -535,6 +584,31 @@ impl StdHost {
 
     pub fn payload_registrations(&self) -> &[PayloadRegistration] {
         &self.payload_registrations
+    }
+
+    /// Add one bounded Fabric entrypoint container to the loader view.
+    /// Duplicate `(kind, class, provider)` rows are ignored to keep discovery
+    /// deterministic when a launcher seeds the same jar more than once.
+    pub fn with_fabric_entrypoint(
+        mut self,
+        kind: impl Into<String>,
+        class: impl Into<String>,
+        provider: impl Into<String>,
+    ) -> Self {
+        let entry = FabricEntrypointContainer {
+            kind: kind.into(),
+            class: class.into(),
+            provider: provider.into(),
+        };
+        if !self.fabric_entrypoint_containers.contains(&entry) {
+            self.fabric_entrypoint_containers.push(entry);
+        }
+        self
+    }
+
+    /// Inspect the explicitly seeded Fabric entrypoint containers.
+    pub fn fabric_entrypoint_containers(&self) -> &[FabricEntrypointContainer] {
+        &self.fabric_entrypoint_containers
     }
 
     /// Seed one capability result for a game-owned block/entity adapter.
@@ -3920,6 +3994,25 @@ impl Host for StdHost {
                     .collect::<Vec<_>>();
                 Ok(collection_value("list", &values))
             }
+            (
+                "net/fabricmc/loader/api/FabricLoader",
+                "getEntrypoints" | "getEntrypointContainers",
+                "(Ljava/lang/String;)Ljava/util/List;",
+            ) => {
+                let kind = expect_string(Self::argument(r, args, 0)?);
+                let values = self
+                    .fabric_entrypoint_containers
+                    .iter()
+                    .filter(|entry| entry.kind == kind)
+                    .map(|entry| {
+                        Value::Ref(Some(format!(
+                            "fabric-entrypoint/{}/{}/{}",
+                            entry.kind, entry.class, entry.provider
+                        )))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(collection_value("list", &values))
+            }
             ("net/fabricmc/loader/api/FabricLoader", "getGameDir", "()Ljava/nio/file/Path;") => {
                 Ok(Value::Ref(Some("path:/horizon/game".into())))
             }
@@ -3963,6 +4056,36 @@ impl Host for StdHost {
             ) => Ok(Value::Ref(Some(
                 expect_string(Self::argument(r, args, 1)?).to_owned(),
             ))),
+            (
+                "net/fabricmc/loader/api/EntrypointContainer",
+                "getEntrypointClass",
+                "()Ljava/lang/Class;",
+            ) => Ok(Value::Ref(
+                fabric_entrypoint_part(expect_ref(receiver), 2)
+                    .map(|class| class.replace('/', ".")),
+            )),
+            (
+                "net/fabricmc/loader/api/EntrypointContainer",
+                "getEntrypoint",
+                "()Ljava/lang/Object;",
+            ) => Ok(Value::Ref(
+                fabric_entrypoint_part(expect_ref(receiver), 2)
+                    .map(|class| format!("fabric-entrypoint-instance/{class}")),
+            )),
+            (
+                "net/fabricmc/loader/api/EntrypointContainer",
+                "getProvider",
+                "()Lnet/fabricmc/loader/api/ModContainer;",
+            ) => Ok(Value::Ref(
+                fabric_entrypoint_part(expect_ref(receiver), 3).map(|provider| {
+                    let version = self
+                        .mods
+                        .get(&provider)
+                        .map(String::as_str)
+                        .unwrap_or("unknown");
+                    format!("mod-container/{provider}/{version}")
+                }),
+            )),
             (
                 "net/fabricmc/loader/api/ModContainer",
                 "getMetadata",
@@ -4631,6 +4754,11 @@ fn canonical_uuid(text: &str) -> Result<String, NativeError> {
         )));
     }
     Ok(text.to_ascii_lowercase())
+}
+
+fn fabric_entrypoint_part(value: Option<&String>, index: usize) -> Option<String> {
+    let marker = value?.strip_prefix("fabric-entrypoint/")?;
+    marker.split('/').nth(index - 1).map(str::to_owned)
 }
 
 fn metadata_part(value: Option<&String>, index: usize) -> String {
@@ -5686,6 +5814,16 @@ impl NativeJar {
         }
         for dependency in &self.required_mods {
             host = host.with_mod(dependency, "unknown");
+        }
+        let provider = self
+            .fabric_id
+            .as_deref()
+            .or(self.neoforge_id.as_deref())
+            .unwrap_or("unknown");
+        for (kind, entries) in &self.fabric_entrypoints {
+            for entry in entries {
+                host = host.with_fabric_entrypoint(kind, &entry.class, provider);
+            }
         }
         host
     }
