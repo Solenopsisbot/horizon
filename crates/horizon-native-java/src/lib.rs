@@ -14,7 +14,18 @@ pub enum Value {
 }
 
 impl Value {
+    /// Neutral value for a declared type.
+    ///
+    /// Hosts pass either a bare type string (`"V"`, `"I"`, `"Ljava/lang/String;"`,
+    /// a field descriptor) or the full method descriptor of the call they are
+    /// answering without a model for. Both shapes resolve through the same
+    /// table, so a `void` call can never come back as a phantom reference.
     fn default_for(desc: &str) -> Self {
+        let desc = if desc.contains('(') {
+            return_desc(desc)
+        } else {
+            desc
+        };
         match desc {
             "V" => Self::Void,
             "Z" | "B" | "C" | "S" | "I" => Self::Int(0),
@@ -30,6 +41,26 @@ pub struct MethodRef {
     pub owner: String,
     pub name: String,
     pub descriptor: String,
+}
+
+/// One runtime-visible annotation on a class or method.
+///
+/// Only the annotation subset needed for Mixin discovery is modelled.  Nested
+/// annotations and arrays keep their declared shape so `@Inject(method = ...,
+/// at = ...)` can be read without inventing a reflective object graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Annotation {
+    pub descriptor: String,
+    pub values: BTreeMap<String, AnnotationValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnnotationValue {
+    String(String),
+    Bool(bool),
+    Int(i32),
+    Array(Vec<AnnotationValue>),
+    Annotation(Box<Annotation>),
 }
 
 /// A bounded native translation for one Mixin callback.
@@ -53,6 +84,24 @@ impl MixinInjectionPlan {
             target,
             callback,
             at: "HEAD".into(),
+            cancellable: false,
+        }
+    }
+
+    pub fn inject_at_return(target: MethodRef, callback: MethodRef) -> Self {
+        Self {
+            target,
+            callback,
+            at: "RETURN".into(),
+            cancellable: false,
+        }
+    }
+
+    pub fn inject_at_tail(target: MethodRef, callback: MethodRef) -> Self {
+        Self {
+            target,
+            callback,
+            at: "TAIL".into(),
             cancellable: false,
         }
     }
@@ -740,11 +789,55 @@ impl StdHost {
             ))
         })
     }
+
+    /// Record the plain Fabric `Registry.register` path.
+    ///
+    /// The registry arrives as a `registry/<id>` marker (either the receiver
+    /// of the instance form or an argument of the interface's static form) and
+    /// the entry as an `identifier/<ns>:<path>` marker. Without both markers
+    /// the call stays invocation-only: the host never invents ids.
+    fn registry_register(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Option<Value> {
+        if r.owner != "net/minecraft/core/Registry" || r.name != "register" || args.len() < 2 {
+            return None;
+        }
+        let registry = receiver
+            .into_iter()
+            .chain(args.iter())
+            .find_map(|value| match value {
+                Value::Ref(Some(marker)) => marker.strip_prefix("registry/"),
+                _ => None,
+            })?;
+        let id = args.iter().find_map(|value| match value {
+            Value::Ref(Some(marker)) if marker.starts_with("identifier/") => {
+                let (namespace, path) = identifier_parts(value);
+                Some(format!("{namespace}:{path}"))
+            }
+            _ => None,
+        })?;
+        let value = args.last().cloned().unwrap_or(Value::Void);
+        self.registrations.push(RegistryEntry {
+            registry: registry.to_owned(),
+            id,
+            value: value.clone(),
+            declaration: None,
+        });
+        Some(value)
+    }
 }
 
 impl Host for StdHost {
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.record(r, None, &[]);
+        // Registry statics get a stable marker instead of a null constant so
+        // registration calls downstream can name their target registry.
+        if let Some(id) = registry_static_id(&r.owner, &r.name) {
+            return Ok(Value::Ref(Some(format!("registry/{id}"))));
+        }
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("java/lang/Boolean", "TRUE", "Ljava/lang/Boolean;") => {
                 Ok(Value::Ref(Some("true".into())))
@@ -792,6 +885,9 @@ impl Host for StdHost {
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
+        if let Some(value) = self.registry_register(r, None, args) {
+            return Ok(value);
+        }
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             // ServiceLoader is deterministic only when its provider set is
             // explicitly seeded. Never inspect the host JVM class path.
@@ -1537,6 +1633,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(value) = self.registry_register(r, Some(receiver), args) {
+            return Ok(value);
+        }
         if is_throwable_owner(&r.owner) {
             let marker = expect_ref(receiver)
                 .ok_or_else(|| NativeError::Metadata("malformed Throwable marker".into()))?;
@@ -4757,6 +4856,46 @@ fn identifier_parts(value: &Value) -> (&str, &str) {
     value.split_once(':').unwrap_or(("minecraft", value))
 }
 
+/// Registry handles commonly read during Fabric/NeoForge bootstrap.
+///
+/// `Registries` holds the resource keys and `BuiltInRegistries` the registry
+/// objects, but both expose the same field names and both are identified by
+/// the same registry id here. This is a lookup table only: no class is loaded
+/// and no game registry is inspected.
+const REGISTRY_STATICS: &[(&str, &str)] = &[
+    ("ITEM", "minecraft:item"),
+    ("BLOCK", "minecraft:block"),
+    ("ENTITY_TYPE", "minecraft:entity_type"),
+    ("MOB_EFFECT", "minecraft:mob_effect"),
+    ("RECIPE_SERIALIZER", "minecraft:recipe_serializer"),
+    ("RECIPE_TYPE", "minecraft:recipe_type"),
+    ("DATA_COMPONENT_TYPE", "minecraft:data_component_type"),
+    ("ATTACHMENT_TYPE", "minecraft:attachment_type"),
+    ("MENU", "minecraft:menu"),
+    ("BLOCK_ENTITY_TYPE", "minecraft:block_entity_type"),
+    ("SOUND_EVENT", "minecraft:sound_event"),
+    ("PARTICLE_TYPE", "minecraft:particle_type"),
+    ("FLUID", "minecraft:fluid"),
+    ("BIOME", "minecraft:biome"),
+    ("CREATIVE_MODE_TAB", "minecraft:creative_mode_tab"),
+    ("ENCHANTMENT", "minecraft:enchantment"),
+    ("ARMOR_MATERIAL", "minecraft:armor_material"),
+];
+
+/// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
+fn registry_static_id(owner: &str, field: &str) -> Option<&'static str> {
+    if !matches!(
+        owner,
+        "net/minecraft/core/registries/Registries"
+            | "net/minecraft/core/registries/BuiltInRegistries"
+    ) {
+        return None;
+    }
+    REGISTRY_STATICS
+        .iter()
+        .find_map(|(name, id)| (*name == field).then_some(*id))
+}
+
 fn tag_key_value(registry: &str, location: &str) -> Value {
     Value::Ref(Some(format!("tag-key/{registry}|{location}")))
 }
@@ -5478,6 +5617,7 @@ pub struct Method {
     pub access: u16,
     pub code: Option<Vec<u8>>,
     pub max_locals: u16,
+    pub annotations: Vec<Annotation>,
 }
 impl Method {
     pub fn is_static(&self) -> bool {
@@ -5506,6 +5646,7 @@ pub struct ClassFile {
     bootstrap_methods: Vec<BootstrapMethod>,
     pub methods: Vec<Method>,
     pub fields: Vec<Field>,
+    pub annotations: Vec<Annotation>,
 }
 
 #[derive(Debug, Clone)]
@@ -5531,7 +5672,7 @@ impl ClassFile {
         r.skip(interface_count * 2)?;
         let fields = read_fields(&mut r, &pool)?;
         let methods = read_methods(&mut r, &pool)?;
-        let bootstrap_methods = read_bootstrap_methods(&mut r, &pool)?;
+        let (annotations, bootstrap_methods) = read_class_attributes(&mut r, &pool)?;
         Ok(Self {
             name,
             super_name,
@@ -5539,6 +5680,7 @@ impl ClassFile {
             bootstrap_methods,
             methods,
             fields,
+            annotations,
         })
     }
 
@@ -5740,6 +5882,111 @@ impl NativeJar {
             neoforge_entrypoints,
             ..Self::default()
         }
+    }
+
+    /// Discover native Mixin injection plans from runtime-visible annotations.
+    ///
+    /// This is a translation plan, not weaving: it maps `@Mixin` targets and
+    /// `@Inject` callbacks onto the bounded execution anchors already handled
+    /// by [`Self::execute_mixin_chain`] and [`Self::execute_mixin_at_return`].
+    /// Only `HEAD`, `RETURN` and `TAIL` anchors are recorded; other `@At`
+    /// values stay on the JVM fallback instead of being approximated.
+    pub fn mixin_injection_plans(&self) -> Vec<MixinInjectionPlan> {
+        const MIXIN: &str = "Lorg/spongepowered/asm/mixin/Mixin;";
+        const INJECT: &str = "Lorg/spongepowered/asm/mixin/injection/Inject;";
+        let mut plans = Vec::new();
+        for class in self.classes.values() {
+            let Some(mixin) = class
+                .annotations
+                .iter()
+                .find(|annotation| annotation.descriptor == MIXIN)
+            else {
+                continue;
+            };
+            let mut targets: Vec<String> = Vec::new();
+            for key in ["targets", "value"] {
+                let Some(value) = mixin.values.get(key) else {
+                    continue;
+                };
+                for descriptor in annotation_strings(value) {
+                    let Some(owner) = annotation_class_owner(&descriptor) else {
+                        continue;
+                    };
+                    if !targets.contains(&owner) {
+                        targets.push(owner);
+                    }
+                }
+            }
+            for method in &class.methods {
+                for inject in method
+                    .annotations
+                    .iter()
+                    .filter(|annotation| annotation.descriptor == INJECT)
+                {
+                    let cancellable = matches!(
+                        inject.values.get("cancellable"),
+                        Some(AnnotationValue::Bool(true))
+                    );
+                    let method_specs = inject
+                        .values
+                        .get("method")
+                        .map(annotation_strings)
+                        .unwrap_or_default();
+                    let anchors = inject
+                        .values
+                        .get("at")
+                        .map(annotation_at_values)
+                        .unwrap_or_default();
+                    for target_owner in &targets {
+                        for method_spec in &method_specs {
+                            let Some((target_name, target_descriptor)) =
+                                split_injection_method(method_spec)
+                            else {
+                                continue;
+                            };
+                            for anchor in &anchors {
+                                plans.push(MixinInjectionPlan {
+                                    target: MethodRef {
+                                        owner: target_owner.clone(),
+                                        name: target_name.to_owned(),
+                                        descriptor: target_descriptor.to_owned(),
+                                    },
+                                    callback: MethodRef {
+                                        owner: class.name.clone(),
+                                        name: method.name.clone(),
+                                        descriptor: method.descriptor.clone(),
+                                    },
+                                    at: anchor.clone(),
+                                    cancellable,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        plans.sort_by(|a, b| {
+            (
+                &a.target.owner,
+                &a.target.name,
+                &a.target.descriptor,
+                &a.at,
+                &a.callback.owner,
+                &a.callback.name,
+                &a.callback.descriptor,
+            )
+                .cmp(&(
+                    &b.target.owner,
+                    &b.target.name,
+                    &b.target.descriptor,
+                    &b.at,
+                    &b.callback.owner,
+                    &b.callback.name,
+                    &b.callback.descriptor,
+                ))
+        });
+        plans.dedup();
+        plans
     }
 
     pub fn from_path(path: &Path) -> Result<Self, NativeError> {
@@ -8717,6 +8964,7 @@ fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeEr
         let attrs = r.u2()? as usize;
         let mut code = None;
         let mut max_locals = 0;
+        let mut annotations = Vec::new();
         for _ in 0..attrs {
             let attr = utf8(pool, r.u2()?)?;
             let len = r.u4()? as usize;
@@ -8727,7 +8975,13 @@ fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeEr
                 max_locals = c.u2()?;
                 let len = c.u4()? as usize;
                 code = Some(c.bytes(len)?.to_owned());
+            } else if attr == "RuntimeVisibleAnnotations" {
+                let mut body = Reader::new(bytes);
+                annotations.extend(read_annotations(&mut body, pool)?);
             }
+            // RuntimeInvisibleAnnotations and parameter annotations are not
+            // needed for Mixin discovery; their bytes were already bounded by
+            // the attribute length above.
         }
         out.push(Method {
             name,
@@ -8735,6 +8989,7 @@ fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeEr
             access,
             code,
             max_locals,
+            annotations,
         });
     }
     Ok(out)
@@ -8749,36 +9004,164 @@ fn skip_attributes(r: &mut Reader<'_>, pool: &[Cp]) -> Result<(), NativeError> {
     Ok(())
 }
 
-fn read_bootstrap_methods(
+/// Read the class attributes that follow the fields and methods.
+///
+/// `BootstrapMethods` and `RuntimeVisibleAnnotations` share this attribute
+/// table, so both are collected in one pass over it.
+fn read_class_attributes(
     r: &mut Reader<'_>,
     pool: &[Cp],
-) -> Result<Vec<BootstrapMethod>, NativeError> {
+) -> Result<(Vec<Annotation>, Vec<BootstrapMethod>), NativeError> {
     let count = r.u2()? as usize;
+    let mut annotations = Vec::new();
     let mut methods = Vec::new();
     for _ in 0..count {
         let name = utf8(pool, r.u2()?)?;
         let length = r.u4()? as usize;
         let bytes = r.bytes(length)?;
-        if name != "BootstrapMethods" {
-            continue;
-        }
-        let mut body = Reader::new(bytes);
-        let entries = body.u2()? as usize;
-        methods.reserve(entries);
-        for _ in 0..entries {
-            let method_ref = body.u2()?;
-            let argument_count = body.u2()? as usize;
-            let mut arguments = Vec::with_capacity(argument_count);
-            for _ in 0..argument_count {
-                arguments.push(body.u2()?);
+        match name.as_str() {
+            "RuntimeVisibleAnnotations" => {
+                let mut body = Reader::new(bytes);
+                annotations.extend(read_annotations(&mut body, pool)?);
             }
-            methods.push(BootstrapMethod {
-                method_ref,
-                arguments,
-            });
+            "BootstrapMethods" => {
+                let mut body = Reader::new(bytes);
+                let entries = body.u2()? as usize;
+                methods.reserve(entries);
+                for _ in 0..entries {
+                    let method_ref = body.u2()?;
+                    let argument_count = body.u2()? as usize;
+                    let mut arguments = Vec::with_capacity(argument_count);
+                    for _ in 0..argument_count {
+                        arguments.push(body.u2()?);
+                    }
+                    methods.push(BootstrapMethod {
+                        method_ref,
+                        arguments,
+                    });
+                }
+            }
+            _ => {}
         }
     }
-    Ok(methods)
+    Ok((annotations, methods))
+}
+
+fn read_annotations(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Annotation>, NativeError> {
+    let result = (|| {
+        let count = r.u2()? as usize;
+        let mut annotations = Vec::with_capacity(count);
+        for _ in 0..count {
+            annotations.push(read_annotation(r, pool)?);
+        }
+        Ok(annotations)
+    })();
+    result.map_err(|error| match error {
+        NativeError::Truncated => NativeError::InvalidClass("truncated annotation attribute"),
+        other => other,
+    })
+}
+
+fn read_annotation(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Annotation, NativeError> {
+    let descriptor = utf8(pool, r.u2()?)?;
+    let pair_count = r.u2()? as usize;
+    let mut values = BTreeMap::new();
+    for _ in 0..pair_count {
+        let name = utf8(pool, r.u2()?)?;
+        values.insert(name, read_annotation_value(r, pool)?);
+    }
+    Ok(Annotation { descriptor, values })
+}
+
+fn read_annotation_value(r: &mut Reader<'_>, pool: &[Cp]) -> Result<AnnotationValue, NativeError> {
+    match r.u1()? {
+        b's' => Ok(AnnotationValue::String(utf8(pool, r.u2()?)?)),
+        b'Z' => match int_constant(pool, r.u2()?)? {
+            0 => Ok(AnnotationValue::Bool(false)),
+            1 => Ok(AnnotationValue::Bool(true)),
+            _ => Err(NativeError::InvalidClass(
+                "annotation boolean must be 0 or 1",
+            )),
+        },
+        b'I' => Ok(AnnotationValue::Int(int_constant(pool, r.u2()?)?)),
+        // Enum values keep the declared type and constant name as one stable
+        // string; Mixin discovery only needs string-like identity here.
+        b'e' => {
+            let enum_type = utf8(pool, r.u2()?)?;
+            let enum_name = utf8(pool, r.u2()?)?;
+            Ok(AnnotationValue::String(format!("{enum_type}.{enum_name}")))
+        }
+        // A class constant in an annotation is a field descriptor such as
+        // `Lnet/minecraft/world/level/Level;`.
+        b'c' => Ok(AnnotationValue::String(utf8(pool, r.u2()?)?)),
+        b'@' => Ok(AnnotationValue::Annotation(Box::new(read_annotation(
+            r, pool,
+        )?))),
+        b'[' => {
+            let count = r.u2()? as usize;
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                items.push(read_annotation_value(r, pool)?);
+            }
+            Ok(AnnotationValue::Array(items))
+        }
+        _ => Err(NativeError::InvalidClass(
+            "unsupported annotation element value",
+        )),
+    }
+}
+
+fn int_constant(pool: &[Cp], index: u16) -> Result<i32, NativeError> {
+    match pool.get(index as usize) {
+        Some(Cp::Integer(value)) => Ok(*value),
+        other => Err(NativeError::InvalidConstant(index, format!("{other:?}"))),
+    }
+}
+
+/// Flatten a string or array-of-strings annotation value.
+fn annotation_strings(value: &AnnotationValue) -> Vec<String> {
+    match value {
+        AnnotationValue::String(value) => vec![value.clone()],
+        AnnotationValue::Array(items) => items.iter().flat_map(annotation_strings).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Collect the supported anchors from an `@At` array, dropping anchors this
+/// bounded runtime cannot execute.
+fn annotation_at_values(value: &AnnotationValue) -> Vec<String> {
+    match value {
+        AnnotationValue::Annotation(annotation) => annotation
+            .values
+            .get("value")
+            .map(annotation_strings)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|anchor| matches!(anchor.as_str(), "HEAD" | "RETURN" | "TAIL"))
+            .collect(),
+        AnnotationValue::Array(items) => items.iter().flat_map(annotation_at_values).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Convert a class descriptor (`Lnet/minecraft/.../Level;`) to an internal
+/// owner name (`net/minecraft/.../Level`).
+fn annotation_class_owner(descriptor: &str) -> Option<String> {
+    let inner = descriptor.strip_prefix('L')?.strip_suffix(';')?;
+    (!inner.is_empty()).then(|| inner.to_owned())
+}
+
+/// Split an `@Inject.method` value into its name and optional descriptor.
+fn split_injection_method(spec: &str) -> Option<(&str, &str)> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    match spec.find('(') {
+        Some(at) if at > 0 && spec[at..].contains(')') => Some((&spec[..at], &spec[at..])),
+        Some(_) => None,
+        None => Some((spec, "")),
+    }
 }
 
 struct Reader<'a> {
@@ -9150,7 +9533,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xfe]),
                 max_locals: 0,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let e = jar
@@ -9177,6 +9564,8 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x05, 0x06, 0x60, 0xac]),
                     max_locals: 0,
+
+                    annotations: Vec::new(),
                 },
                 Method {
                     name: "branch".into(),
@@ -9184,6 +9573,8 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x03, 0x99, 0, 5, 0x04, 0xac, 0x08, 0xac]),
                     max_locals: 0,
+
+                    annotations: Vec::new(),
                 },
                 Method {
                     name: "narrow".into(),
@@ -9191,6 +9582,8 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x02, 0x91, 0xac]),
                     max_locals: 0,
+
+                    annotations: Vec::new(),
                 },
                 Method {
                     name: "same".into(),
@@ -9198,8 +9591,12 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x2a, 0x2b, 0xa5, 0, 5, 0x03, 0xac, 0x04, 0xac]),
                     max_locals: 2,
+
+                    annotations: Vec::new(),
                 },
             ],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let mut host = NullHost;
@@ -9258,6 +9655,8 @@ mandatory = true
             access: 9,
             code: Some(code),
             max_locals: 0,
+
+            annotations: Vec::new(),
         };
         let class = ClassFile {
             name: "demo/Stack".into(),
@@ -9283,6 +9682,8 @@ mandatory = true
                 ),
                 method("swap", vec![0x04, 0x05, 0x5f, 0x60, 0xac]),
             ],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let expected = [
@@ -9312,6 +9713,8 @@ mandatory = true
             access: 9,
             code: Some(code),
             max_locals: 0,
+
+            annotations: Vec::new(),
         };
         let class = ClassFile {
             name: "demo/Bitwise".into(),
@@ -9328,6 +9731,8 @@ mandatory = true
                 method("ushr", vec![0x10, 0xf8, 0x04, 0x7c, 0xac]),
                 method("neg", vec![0x06, 0x74, 0xac]),
             ],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let expected = [
@@ -9363,7 +9768,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x15, 0x00, 0xac]),
                 max_locals: 1,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -9401,7 +9810,11 @@ mandatory = true
                     0x08, 0xac,
                 ]),
                 max_locals: 0,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -9425,7 +9838,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xa7, 0x7f, 0xff]),
                 max_locals: 0,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let error = jar
@@ -9443,6 +9860,8 @@ mandatory = true
             bootstrap_methods: Vec::new(),
             fields: Vec::new(),
             methods: vec![],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -9465,6 +9884,8 @@ mandatory = true
             bootstrap_methods: Vec::new(),
             fields: Vec::new(),
             methods: vec![],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -9575,7 +9996,11 @@ mandatory = true
                 access: 1,
                 code: Some(vec![0xb1]),
                 max_locals: 3,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let report = jar.execute("demo.NeoMod", None, "neoforge", &mut NullHost);
@@ -13551,7 +13976,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x2a, 0xba, 0, 1, 0, 0, 0xb0]),
                 max_locals: 1,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         let value = jar
@@ -13617,7 +14046,8 @@ mandatory = true
             }],
             fields: Vec::new(),
             methods: Vec::new(),
-        };
+
+            annotations: Vec::new(),};
         assert_eq!(
             class.invoke_dynamic_target(1).unwrap(),
             Some(MethodRef {
@@ -13653,7 +14083,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x2a, 0x08, 0xb5, 0, 1, 0x2a, 0xb4, 0, 1, 0xac]),
                 max_locals: 1,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -13737,6 +14171,8 @@ mandatory = true
                     access: 8,
                     code: Some(vec![0x08, 0xb3, 0, 1, 0xb1]),
                     max_locals: 0,
+
+                    annotations: Vec::new(),
                 },
                 Method {
                     name: "read".into(),
@@ -13744,8 +14180,12 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0xb2, 0, 1, 0xac]),
                     max_locals: 0,
+
+                    annotations: Vec::new(),
                 },
             ],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -13763,6 +14203,8 @@ mandatory = true
             access: 9,
             code: Some(code),
             max_locals: 0,
+
+            annotations: Vec::new(),
         };
         let class = ClassFile {
             name: "demo/Arrays".into(),
@@ -13779,6 +14221,8 @@ mandatory = true
                 ),
                 method("length", vec![0x06, 0xbc, 0x0a, 0xbe, 0xac]),
             ],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([class]);
         assert_eq!(
@@ -14254,6 +14698,8 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x10, 42, 0xac]),
                     max_locals: 0,
+
+                    annotations: Vec::new(),
                 },
                 Method {
                     name: "answer".into(),
@@ -14261,8 +14707,12 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x1a, 0xac]),
                     max_locals: 1,
+
+                    annotations: Vec::new(),
                 },
             ],
+
+            annotations: Vec::new(),
         };
         let classes = BTreeMap::from([(target.name.clone(), target)]);
         let mut host = NullHost;
@@ -14585,7 +15035,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x2a, 0xb0]),
                 max_locals: 1,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let caller = ClassFile {
             name: "demo/Caller".into(),
@@ -14620,6 +15074,8 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x2a, 0x2b, 0xb9, 0, 1, 2, 0, 0xb0]),
                     max_locals: 2,
+
+                    annotations: Vec::new(),
                 },
                 Method {
                     name: "map".into(),
@@ -14627,8 +15083,12 @@ mandatory = true
                     access: 9,
                     code: Some(vec![0x2a, 0x2b, 0xb9, 0, 7, 2, 0, 0xb0]),
                     max_locals: 2,
+
+                    annotations: Vec::new(),
                 },
             ],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([caller, target]);
         let marker = Value::Ref(Some(
@@ -14691,7 +15151,11 @@ mandatory = true
                 access: 1,
                 code: Some(vec![0xb1]),
                 max_locals: 2,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([target]);
         let dispatch = EventDispatch {
@@ -15608,6 +16072,22 @@ mandatory = true
     }
 
     #[test]
+    fn mixin_annotation_values_are_total() {
+        let pool = vec![Cp::Empty];
+        let mut unknown = Reader::new(b"Q");
+        assert!(matches!(
+            read_annotation_value(&mut unknown, &pool),
+            Err(NativeError::InvalidClass(_))
+        ));
+        // One annotation is declared but its descriptor is missing.
+        let mut truncated = Reader::new(&[0, 1]);
+        assert!(matches!(
+            read_annotations(&mut truncated, &pool),
+            Err(NativeError::InvalidClass(_))
+        ));
+    }
+
+    #[test]
     fn executes_bounded_mixin_injection_at_head_before_target() {
         let target = ClassFile {
             name: "demo/Target".into(),
@@ -15621,7 +16101,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x08, 0xac]), // iconst_5; ireturn
                 max_locals: 0,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let callback = ClassFile {
             name: "demo/Mixin".into(),
@@ -15636,7 +16120,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xb1]),
                 max_locals: 1,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([target, callback]);
         let plan = MixinInjectionPlan::inject_at_head(
@@ -15673,7 +16161,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x08, 0xac]),
                 max_locals: 0,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let callback = |name: &str| ClassFile {
             name: format!("demo/{name}"),
@@ -15687,7 +16179,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xb1]),
                 max_locals: 0,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([target, callback("MixinA"), callback("MixinB")]);
         let target_ref = MethodRef {
@@ -15734,7 +16230,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xb1]),
                 max_locals: 0,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let callback = ClassFile {
             name: "demo/Mixin".into(),
@@ -15749,7 +16249,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xb1]),
                 max_locals: 1,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([target, callback]);
         let mut plan = MixinInjectionPlan::inject_at_head(
@@ -15790,7 +16294,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x03, 0xac]),
                 max_locals: 0,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let callback = ClassFile {
             name: "demo/Mixin".into(),
@@ -15804,7 +16312,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0xb1]),
                 max_locals: 0,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([target, callback]);
         let mut plan = MixinInjectionPlan::inject_at_head(
@@ -15845,7 +16357,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x08, 0xac]), // iconst_5; ireturn
                 max_locals: 0,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let replacement = ClassFile {
             name: "demo/Mixin".into(),
@@ -15859,7 +16375,11 @@ mandatory = true
                 access: 9,
                 code: Some(vec![0x10, 9, 0xac]), // bipush 9; ireturn
                 max_locals: 0,
+
+                annotations: Vec::new(),
             }],
+
+            annotations: Vec::new(),
         };
         let jar = NativeJar::from_classes([target, replacement]);
         let mut plan = MixinInjectionPlan::inject_at_head(
@@ -16019,5 +16539,205 @@ mandatory = true
             .execute_mixin_at_head(&plan, None, &[], &mut NullHost)
             .unwrap_err();
         assert!(error.to_string().contains("only @Inject(at = HEAD)"));
+    }
+
+    #[test]
+    fn default_for_normalizes_full_method_descriptors() {
+        assert_eq!(Value::default_for("V"), Value::Void);
+        assert_eq!(Value::default_for("I"), Value::Int(0));
+        assert_eq!(Value::default_for("Ljava/lang/String;"), Value::Ref(None));
+        assert_eq!(Value::default_for("()V"), Value::Void);
+        assert_eq!(
+            Value::default_for("(Lnet/minecraft/world/item/Item$Properties;)V"),
+            Value::Void
+        );
+        assert_eq!(
+            Value::default_for(
+                "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)I"
+            ),
+            Value::Int(0)
+        );
+        assert_eq!(
+            Value::default_for("(I)Ljava/lang/String;"),
+            Value::Ref(None)
+        );
+    }
+
+    #[test]
+    fn standard_host_resolves_registry_statics() {
+        let mut host = StdHost::new();
+        let item = MethodRef {
+            owner: "net/minecraft/core/registries/Registries".into(),
+            name: "ITEM".into(),
+            descriptor: "Lnet/minecraft/core/Registry;".into(),
+        };
+        assert_eq!(
+            Host::get_static(&mut host, &item).unwrap(),
+            Value::Ref(Some("registry/minecraft:item".into()))
+        );
+        let block = MethodRef {
+            owner: "net/minecraft/core/registries/BuiltInRegistries".into(),
+            name: "BLOCK".into(),
+            descriptor: "Lnet/minecraft/core/Registry;".into(),
+        };
+        assert_eq!(
+            Host::get_static(&mut host, &block).unwrap(),
+            Value::Ref(Some("registry/minecraft:block".into()))
+        );
+        let unknown = MethodRef {
+            owner: "net/minecraft/core/registries/Registries".into(),
+            name: "NOT_A_REGISTRY".into(),
+            descriptor: "Lnet/minecraft/core/Registry;".into(),
+        };
+        assert_eq!(
+            Host::get_static(&mut host, &unknown).unwrap(),
+            Value::Ref(None)
+        );
+    }
+
+    #[test]
+    fn standard_host_records_plain_fabric_registry_register() {
+        let register = MethodRef {
+            owner: "net/minecraft/core/Registry".into(),
+            name: "register".into(),
+            descriptor: "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Ljava/lang/Object;".into(),
+        };
+        let mut host = StdHost::new();
+        let registry = Host::get_static(
+            &mut host,
+            &MethodRef {
+                owner: "net/minecraft/core/registries/Registries".into(),
+                name: "ITEM".into(),
+                descriptor: "Lnet/minecraft/core/Registry;".into(),
+            },
+        )
+        .unwrap();
+        let value = Value::Ref(Some("@indy:ruby-wand".into()));
+        assert_eq!(
+            Host::invoke(
+                &mut host,
+                &register,
+                &[
+                    registry,
+                    Value::Ref(Some("identifier/ruby:wand".into())),
+                    value.clone(),
+                ],
+            )
+            .unwrap(),
+            value
+        );
+        assert_eq!(host.registrations().len(), 1);
+        let entry = &host.registrations()[0];
+        assert_eq!(entry.registry, "minecraft:item");
+        assert_eq!(entry.id, "ruby:wand");
+        assert_eq!(entry.value, value);
+
+        // A call without a registry marker stays invocation-only so the host
+        // never invents a registry id.
+        let mut host = StdHost::new();
+        Host::invoke(
+            &mut host,
+            &register,
+            &[
+                Value::Ref(None),
+                Value::Ref(Some("identifier/ruby:wand".into())),
+                Value::Ref(Some("@indy:ruby-wand".into())),
+            ],
+        )
+        .unwrap();
+        assert!(host.registrations().is_empty());
+    }
+
+    #[test]
+    fn void_host_call_does_not_store_a_phantom_reference() {
+        fn u2(bytes: &mut Vec<u8>, value: u16) {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        fn utf8(bytes: &mut Vec<u8>, value: &str) {
+            bytes.push(1);
+            u2(bytes, value.len() as u16);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+
+        // `probe()` loads "ok", calls a host method that the StdHost does not
+        // model and that returns void, stores the loaded value, and reads the
+        // field back.  A void fallback that answered with a phantom `Ref(None)`
+        // made `putstatic` store that phantom instead of "ok".
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xCAFE_BABEu32.to_be_bytes());
+        u2(&mut bytes, 0); // minor
+        u2(&mut bytes, 52); // major
+        u2(&mut bytes, 20); // constant-pool count
+        utf8(&mut bytes, "demo/VoidStore"); // 1
+        bytes.extend_from_slice(&[7, 0, 1]); // 2: Class
+        utf8(&mut bytes, "java/lang/Object"); // 3
+        bytes.extend_from_slice(&[7, 0, 3]); // 4: Class
+        utf8(&mut bytes, "PROPS"); // 5
+        utf8(&mut bytes, "Ljava/lang/String;"); // 6
+        utf8(&mut bytes, "probe"); // 7
+        utf8(&mut bytes, "()Ljava/lang/String;"); // 8
+        utf8(&mut bytes, "ok"); // 9
+        bytes.extend_from_slice(&[8, 0, 9]); // 10: String
+        utf8(&mut bytes, "demo/Host"); // 11
+        bytes.extend_from_slice(&[7, 0, 11]); // 12: Class
+        utf8(&mut bytes, "consume"); // 13
+        utf8(&mut bytes, "()V"); // 14
+        bytes.extend_from_slice(&[12, 0, 13, 0, 14]); // 15: NameAndType
+        bytes.extend_from_slice(&[10, 0, 12, 0, 15]); // 16: Methodref
+        utf8(&mut bytes, "Code"); // 17
+        bytes.extend_from_slice(&[12, 0, 5, 0, 6]); // 18: NameAndType
+        bytes.extend_from_slice(&[9, 0, 2, 0, 18]); // 19: FieldRef
+
+        u2(&mut bytes, 0x0021); // access
+        u2(&mut bytes, 2); // this_class
+        u2(&mut bytes, 4); // super_class
+        u2(&mut bytes, 0); // interfaces
+        u2(&mut bytes, 1); // fields
+        u2(&mut bytes, 0x0009); // public static
+        u2(&mut bytes, 5);
+        u2(&mut bytes, 6);
+        u2(&mut bytes, 0); // attributes
+        u2(&mut bytes, 1); // methods
+        u2(&mut bytes, 0x0009); // public static
+        u2(&mut bytes, 7);
+        u2(&mut bytes, 8);
+        u2(&mut bytes, 1); // attributes
+        u2(&mut bytes, 17); // Code
+        bytes.extend_from_slice(&24u32.to_be_bytes()); // attribute length
+        u2(&mut bytes, 2); // max_stack
+        u2(&mut bytes, 0); // max_locals
+        bytes.extend_from_slice(&12u32.to_be_bytes()); // code length
+        bytes.extend_from_slice(&[
+            0x12, 0x0a, // ldc #10 ("ok")
+            0xb8, 0x00, 0x10, // invokestatic #16 (demo/Host.consume()V)
+            0xb3, 0x00, 0x13, // putstatic #19 (PROPS)
+            0xb2, 0x00, 0x13, // getstatic #19 (PROPS)
+            0xb0, // areturn
+        ]);
+        u2(&mut bytes, 0); // exception_table_length
+        u2(&mut bytes, 0); // code attributes
+        u2(&mut bytes, 0); // class attributes
+
+        let class = ClassFile::parse(&bytes).unwrap();
+        assert!(
+            class
+                .method("probe", "()Ljava/lang/String;")
+                .unwrap()
+                .is_static()
+        );
+        let jar = NativeJar::from_classes([class]);
+        let mut host = StdHost::new();
+        assert_eq!(
+            jar.invoke_method_with_args(
+                "demo/VoidStore",
+                "probe",
+                "()Ljava/lang/String;",
+                None,
+                &[],
+                &mut host,
+            )
+            .unwrap(),
+            Value::Ref(Some("ok".into()))
+        );
     }
 }
