@@ -9,6 +9,7 @@
 
 use crate::content::{Block, BlockProperties, EffectCategory, Item, MobEffect, Rarity};
 use horizon_native_java::{RegistryDeclaration, RegistryEntry, TypedRegistrySink};
+use serde::Serialize;
 use std::collections::BTreeMap;
 
 /// Native declarations are metadata, not an unbounded Java object graph.
@@ -17,6 +18,35 @@ pub const MAX_NATIVE_PROPERTIES: usize = 32;
 pub const MAX_NATIVE_TEXT: usize = 4_096;
 /// Recipe and ingredient JSON is data, not executable code; keep each declaration bounded.
 pub const MAX_NATIVE_JSON: usize = 1 << 20;
+/// The largest hitbox edge a native entity may declare, in blocks. Vanilla's
+/// biggest (the ender dragon, the wither) stay far below this.
+pub const MAX_ENTITY_SIZE: f64 = 64.0;
+/// Vanilla attribute defaults are plain doubles; this is the largest one a
+/// declaration may set (health, damage, follow range).
+pub const MAX_ENTITY_ATTRIBUTE: f64 = 1.0e6;
+/// The height window of a spawn placement is an `i32` inside the build range.
+pub const MAX_SPAWN_HEIGHT: i32 = 2_048;
+
+/// Vanilla's `MobCategory`, as a native entity's builder records it.
+const MOB_CATEGORIES: [&str; 8] = [
+    "AMBIENT",
+    "AXOLOTLS",
+    "CREATURE",
+    "MISC",
+    "MONSTER",
+    "UNDERGROUND_WATER_CREATURE",
+    "WATER_AMBIENT",
+    "WATER_CREATURE",
+];
+/// Vanilla's `SpawnPlacementTypes`.
+const SPAWN_CATEGORIES: [&str; 4] = ["IN_LAVA", "IN_WATER", "NO_RESTRICTIONS", "ON_GROUND"];
+/// Vanilla's `Heightmap.Types`, the ones `SpawnPlacements.register` accepts.
+const SPAWN_HEIGHTMAPS: [&str; 4] = [
+    "MOTION_BLOCKING",
+    "MOTION_BLOCKING_NO_LEAVES",
+    "OCEAN_FLOOR",
+    "WORLD_SURFACE",
+];
 
 /// A custom registration kind whose concrete Horizon adapter is not available
 /// yet. It is retained so diagnostics can name the registration precisely.
@@ -44,15 +74,165 @@ pub struct IngredientDeclaration {
     pub json: Vec<u8>,
 }
 
+/// Where a mob may spawn: vanilla's `SpawnPlacementType` plus the height
+/// window `SpawnPlacements.register` takes. Both names are canonicalised on
+/// parse, so a declaration and its merge compare equal whatever case the
+/// adapter used.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SpawnRestriction {
+    /// `ON_GROUND`, `IN_WATER`, `NO_RESTRICTIONS` or `IN_LAVA`.
+    pub category: String,
+    /// The `Heightmap.Types` the check samples: `MOTION_BLOCKING`,
+    /// `MOTION_BLOCKING_NO_LEAVES`, `OCEAN_FLOOR` or `WORLD_SURFACE`.
+    pub heightmap: String,
+    /// Inclusive height window; absent keeps the placement type's own.
+    pub min_height: Option<i32>,
+    pub max_height: Option<i32>,
+}
+
+/// The four vanilla attribute defaults a loader adapter can set on a new
+/// entity. Vanilla's `Attribute` values are `double` (`MAX_HEALTH`,
+/// `MOVEMENT_SPEED`, `ATTACK_DAMAGE`, `FOLLOW_RANGE` are all registered with
+/// double defaults), so these are `f64` rather than `i32`: a hand-written
+/// `1` would otherwise silently mean 1.0 health. Values are checked for
+/// finiteness and a bound on parse, so no `Eq` (floats are only ordered).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct EntityAttributes {
+    /// `minecraft:generic.max_health`, above 0.
+    pub health: Option<f64>,
+    /// `minecraft:generic.movement_speed`.
+    pub speed: Option<f64>,
+    /// `minecraft:generic.attack_damage`.
+    pub attack_damage: Option<f64>,
+    /// `minecraft:generic.follow_range`.
+    pub follow_range: Option<f64>,
+}
+
 /// A bounded entity registration carried by a loader adapter. The native
 /// world owns the actual entity implementation; this record preserves the
 /// vanilla template and scalar builder options until the live registry is
 /// assembled.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `properties` keeps the adapter's strings, which the live registry assembler
+/// reads; `spawn` and `attributes` are the validated typed view of the same
+/// rows ([`EntityDeclaration::from_registry_properties`]).
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct EntityDeclaration {
     pub id: String,
     pub template: String,
     pub properties: BTreeMap<String, String>,
+    /// Set when the adapter declared a spawn placement.
+    pub spawn: Option<SpawnRestriction>,
+    /// Set when the adapter declared at least one attribute.
+    pub attributes: Option<EntityAttributes>,
+}
+
+impl EntityDeclaration {
+    /// Parses one native entity row from the free-form keys a loader adapter
+    /// records. `properties` holds every key except `template`, which the
+    /// caller has already validated as a vanilla id; unknown keys are rejected
+    /// so a typo cannot silently drop a builder option.
+    ///
+    /// Recognized keys: `width`, `height`, `eye_height` (a size in blocks, 0
+    /// to [`MAX_ENTITY_SIZE`]), `category` (a vanilla `MobCategory`),
+    /// `tracking_range` and `update_interval` (a non-zero `u16`),
+    /// `fire_immune` (bool), the [`EntityAttributes`] keys `max_health`,
+    /// `speed`, `attack_damage`, `follow_range` (a finite `f64`, 0 to
+    /// [`MAX_ENTITY_ATTRIBUTE`]), and the [`SpawnRestriction`] keys
+    /// `spawn_category`, `spawn_heightmap` (both required together) and
+    /// `spawn_min_height`, `spawn_max_height` (an `i32` within
+    /// ±[`MAX_SPAWN_HEIGHT`]). Parsing is locale-free: numbers use Rust's
+    /// `f64`/integer syntax, which always takes `.` as the separator.
+    pub fn from_registry_properties(
+        id: impl Into<String>,
+        template: impl Into<String>,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        let mut attributes = EntityAttributes::default();
+        let mut has_attribute = false;
+        let mut spawn_category = None;
+        let mut spawn_heightmap = None;
+        let mut min_height = None;
+        let mut max_height = None;
+        for (key, value) in properties {
+            match key.as_str() {
+                "width" | "height" | "eye_height" => {
+                    parse_entity_size(key, value)?;
+                }
+                "category" => {
+                    parse_choice(key, value, &MOB_CATEGORIES)?;
+                }
+                "tracking_range" | "update_interval" => {
+                    if parse_u16(key, value)? == 0 {
+                        return Err(format!("native entity property {key} is 1 or more"));
+                    }
+                }
+                "fire_immune" => {
+                    parse_bool(key, value)?;
+                }
+                "max_health" => {
+                    let health = parse_attribute(key, value)?;
+                    if health <= 0.0 {
+                        return Err("native entity property max_health is above 0".into());
+                    }
+                    attributes.health = Some(health);
+                    has_attribute = true;
+                }
+                "speed" => {
+                    attributes.speed = Some(parse_attribute(key, value)?);
+                    has_attribute = true;
+                }
+                "attack_damage" => {
+                    attributes.attack_damage = Some(parse_attribute(key, value)?);
+                    has_attribute = true;
+                }
+                "follow_range" => {
+                    attributes.follow_range = Some(parse_attribute(key, value)?);
+                    has_attribute = true;
+                }
+                "spawn_category" => {
+                    spawn_category = Some(parse_choice(key, value, &SPAWN_CATEGORIES)?);
+                }
+                "spawn_heightmap" => {
+                    spawn_heightmap = Some(parse_choice(key, value, &SPAWN_HEIGHTMAPS)?);
+                }
+                "spawn_min_height" => min_height = Some(parse_spawn_height(key, value)?),
+                "spawn_max_height" => max_height = Some(parse_spawn_height(key, value)?),
+                other => return Err(format!("unknown native entity property {other:?}")),
+            }
+        }
+        let spawn = match (spawn_category, spawn_heightmap) {
+            (None, None) if min_height.is_none() && max_height.is_none() => None,
+            (Some(category), Some(heightmap)) => {
+                if let (Some(min), Some(max)) = (min_height, max_height)
+                    && min > max
+                {
+                    return Err(format!(
+                        "native entity spawn height window {min}..{max} is reversed"
+                    ));
+                }
+                Some(SpawnRestriction {
+                    category,
+                    heightmap,
+                    min_height,
+                    max_height,
+                })
+            }
+            _ => {
+                return Err(
+                    "native entity spawn restriction needs spawn_category and spawn_heightmap"
+                        .into(),
+                );
+            }
+        };
+        Ok(Self {
+            id: id.into(),
+            template: template.into(),
+            properties: properties.clone(),
+            spawn,
+            attributes: has_attribute.then_some(attributes),
+        })
+    }
 }
 
 /// A typed data-component registration. Arbitrary Java codecs remain on the
@@ -206,6 +386,42 @@ impl NativeDeclarations {
             ));
         }
         Ok(())
+    }
+
+    /// A short summary of the declaration set, for the launcher's mod page.
+    ///
+    /// Purely informational: it validates nothing and changes nothing. The
+    /// first line counts every typed row; a second line lists the custom
+    /// registrations by kind, which are the ones Horizon has no adapter for
+    /// (an unknown kind is rejected while it is registered, not here).
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut out = vec![format!(
+            "native declarations: {} blocks, {} items, {} mob effects, {} entities, {} data components, {} attachments, {} recipes, {} ingredients, {} custom",
+            self.blocks.len(),
+            self.items.len(),
+            self.effects.len(),
+            self.entities.len(),
+            self.data_components.len(),
+            self.attachments.len(),
+            self.recipes.len(),
+            self.ingredients.len(),
+            self.custom.len(),
+        )];
+        if !self.custom.is_empty() {
+            let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+            for row in &self.custom {
+                *kinds.entry(row.kind.as_str()).or_default() += 1;
+            }
+            let kinds = kinds
+                .into_iter()
+                .map(|(kind, count)| format!("{kind}={count}"))
+                .collect::<Vec<_>>();
+            out.push(format!(
+                "native custom registration kinds: {}",
+                kinds.join(", ")
+            ));
+        }
+        out
     }
 
     fn ensure_id(id: &str) -> Result<(), String> {
@@ -454,45 +670,25 @@ impl NativeDeclarations {
         }
         let mut retained = properties.clone();
         retained.remove("template");
-        for key in retained.keys() {
-            if !matches!(
-                key.as_str(),
-                "width"
-                    | "height"
-                    | "tracking_range"
-                    | "update_interval"
-                    | "fire_immune"
-                    | "summonable"
-                    | "spawnable"
-            ) {
-                return Err(format!("unknown native entity property {key:?}"));
-            }
+        let entity = EntityDeclaration::from_registry_properties(
+            entry.id.clone(),
+            template.clone(),
+            &retained,
+        )?;
+        self.entities.push(entity);
+        Ok(())
+    }
+
+    /// A data-component or attachment codec is a resource location. Rejecting
+    /// control characters here means a diagnostic can never carry terminal
+    /// escapes copied from an adapter string into the launcher's log.
+    fn ensure_codec(kind: &str, id: &str, codec: &str) -> Result<(), String> {
+        Self::ensure_id(codec)?;
+        if id.chars().chain(codec.chars()).any(char::is_control) {
+            return Err(format!(
+                "native {kind} {id:?} codec {codec:?} has control characters"
+            ));
         }
-        for key in ["width", "height"] {
-            if let Some(value) = retained.get(key) {
-                let parsed = parse_f32(key, value)?;
-                if parsed < 0.0 {
-                    return Err(format!("native entity property {key} is 0 or more"));
-                }
-            }
-        }
-        for key in ["tracking_range", "update_interval"] {
-            if let Some(value) = retained.get(key) {
-                value.parse::<u16>().map_err(|_| {
-                    format!("native entity property {key} is not an unsigned short: {value:?}")
-                })?;
-            }
-        }
-        for key in ["fire_immune", "summonable", "spawnable"] {
-            if let Some(value) = retained.get(key) {
-                parse_bool(key, value)?;
-            }
-        }
-        self.entities.push(EntityDeclaration {
-            id: entry.id.clone(),
-            template: template.clone(),
-            properties: retained,
-        });
         Ok(())
     }
 
@@ -506,7 +702,7 @@ impl NativeDeclarations {
         let codec = properties
             .get("codec")
             .ok_or_else(|| format!("native data component {} has no codec", entry.id))?;
-        Self::ensure_id(codec)?;
+        Self::ensure_codec("data component", &entry.id, codec)?;
         if self
             .data_components
             .iter()
@@ -548,7 +744,7 @@ impl NativeDeclarations {
         let codec = properties
             .get("codec")
             .ok_or_else(|| format!("native attachment {} has no codec", entry.id))?;
-        Self::ensure_id(codec)?;
+        Self::ensure_codec("attachment", &entry.id, codec)?;
         if self
             .attachments
             .iter()
@@ -564,6 +760,12 @@ impl NativeDeclarations {
         if default_value.len() > MAX_NATIVE_TEXT {
             return Err(format!(
                 "native attachment {} default is at most {MAX_NATIVE_TEXT} bytes",
+                entry.id
+            ));
+        }
+        if default_value.chars().any(char::is_control) {
+            return Err(format!(
+                "native attachment {} default has control characters",
                 entry.id
             ));
         }
@@ -703,6 +905,64 @@ fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
         "false" => Ok(false),
         _ => Err(format!("native property {key} is not boolean: {value:?}")),
     }
+}
+
+fn parse_u16(key: &str, value: &str) -> Result<u16, String> {
+    value
+        .parse::<u16>()
+        .map_err(|_| format!("native property {key} is not an unsigned short: {value:?}"))
+}
+
+/// A hitbox edge in blocks: finite and no larger than [`MAX_ENTITY_SIZE`].
+fn parse_entity_size(key: &str, value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("native entity property {key} is not a number: {value:?}"))?;
+    if !parsed.is_finite() || !(0.0..=MAX_ENTITY_SIZE).contains(&parsed) {
+        return Err(format!(
+            "native entity property {key} is a number from 0 to {MAX_ENTITY_SIZE}"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// A vanilla attribute default: finite and no larger than
+/// [`MAX_ENTITY_ATTRIBUTE`].
+fn parse_attribute(key: &str, value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("native entity property {key} is not a number: {value:?}"))?;
+    if !parsed.is_finite() || !(0.0..=MAX_ENTITY_ATTRIBUTE).contains(&parsed) {
+        return Err(format!(
+            "native entity property {key} is a number from 0 to {MAX_ENTITY_ATTRIBUTE}"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// A height-window bound, inside the build range.
+fn parse_spawn_height(key: &str, value: &str) -> Result<i32, String> {
+    let parsed = value
+        .parse::<i32>()
+        .map_err(|_| format!("native entity property {key} is not an integer: {value:?}"))?;
+    if !(-MAX_SPAWN_HEIGHT..=MAX_SPAWN_HEIGHT).contains(&parsed) {
+        return Err(format!(
+            "native entity property {key} is an integer from -{MAX_SPAWN_HEIGHT} to {MAX_SPAWN_HEIGHT}"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// One of a fixed vanilla vocabulary, canonicalised to upper case.
+fn parse_choice(key: &str, value: &str, allowed: &[&str]) -> Result<String, String> {
+    let canonical = value.to_ascii_uppercase();
+    if !allowed.contains(&canonical.as_str()) {
+        return Err(format!(
+            "native entity property {key} is one of {}: {value:?}",
+            allowed.join(", ")
+        ));
+    }
+    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -1186,5 +1446,188 @@ mod tests {
         );
         let error = NativeDeclarations::from_registry_entries([&entry]).unwrap_err();
         assert!(error.contains("more than"), "{error}");
+    }
+
+    /// A typed custom row: the shape loader adapters use for entity,
+    /// data-component and attachment registrations.
+    fn custom(kind: &str, id: &str, properties: &[(&str, &str)]) -> RegistryEntry {
+        let registry = match kind {
+            "entity" => "minecraft:entity_type",
+            "data_component" => "minecraft:data_component_type",
+            _ => "neoforge:attachment",
+        };
+        RegistryEntry::typed(
+            registry,
+            id,
+            RegistryDeclaration::Custom {
+                kind: kind.into(),
+                properties: properties
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+            },
+        )
+    }
+
+    #[test]
+    fn entity_declaration_parses_typed_spawn_and_attributes() {
+        let entry = custom(
+            "entity",
+            "ruby:bird",
+            &[
+                ("template", "minecraft:chicken"),
+                ("width", "0.6"),
+                ("height", "0.8"),
+                ("eye_height", "0.7"),
+                ("category", "creature"),
+                ("tracking_range", "64"),
+                ("update_interval", "3"),
+                ("fire_immune", "false"),
+                ("max_health", "4"),
+                ("speed", "0.25"),
+                ("attack_damage", "0"),
+                ("follow_range", "16.0"),
+                ("spawn_category", "on_ground"),
+                ("spawn_heightmap", "motion_blocking"),
+                ("spawn_min_height", "-64"),
+                ("spawn_max_height", "320"),
+            ],
+        );
+        let declarations = NativeDeclarations::from_registry_entries([&entry]).unwrap();
+        let entity = &declarations.entities[0];
+        assert_eq!(
+            entity.spawn,
+            Some(SpawnRestriction {
+                category: "ON_GROUND".into(),
+                heightmap: "MOTION_BLOCKING".into(),
+                min_height: Some(-64),
+                max_height: Some(320),
+            })
+        );
+        assert_eq!(
+            entity.attributes,
+            Some(EntityAttributes {
+                health: Some(4.0),
+                speed: Some(0.25),
+                attack_damage: Some(0.0),
+                follow_range: Some(16.0),
+            })
+        );
+        // The scalars stay in `properties` for the live registry assembler.
+        assert_eq!(entity.properties["category"], "creature");
+
+        let parse = |properties: &[(&str, &str)]| {
+            let properties = properties
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect();
+            EntityDeclaration::from_registry_properties(
+                "ruby:bird",
+                "minecraft:chicken",
+                &properties,
+            )
+        };
+        let error = parse(&[("weigth", "1")]).unwrap_err();
+        assert!(
+            error.contains("unknown native entity property \"weigth\""),
+            "{error}"
+        );
+        let error = parse(&[("spawn_category", "IN_WATER")]).unwrap_err();
+        assert!(
+            error.contains("needs spawn_category and spawn_heightmap"),
+            "{error}"
+        );
+        let error = parse(&[("speed", "NaN")]).unwrap_err();
+        assert!(error.contains("speed is a number"), "{error}");
+        let error = parse(&[("width", "65")]).unwrap_err();
+        assert!(error.contains("width is a number from 0 to"), "{error}");
+        let error = parse(&[
+            ("spawn_category", "ON_GROUND"),
+            ("spawn_heightmap", "WORLD_SURFACE"),
+            ("spawn_min_height", "10"),
+            ("spawn_max_height", "9"),
+        ])
+        .unwrap_err();
+        assert!(error.contains("is reversed"), "{error}");
+        // No typed rows for an entity that declares neither.
+        let bare = parse(&[("width", "0.6")]).unwrap();
+        assert_eq!((bare.spawn, bare.attributes), (None, None));
+    }
+
+    #[test]
+    fn auxiliary_rows_reject_bad_codecs_and_stay_atomic() {
+        let row = |id: &str, codec: &str| custom("data_component", id, &[("codec", codec)]);
+        let mut declarations = NativeDeclarations::default();
+        declarations
+            .register_entries([&row("ruby:mana", "ruby:mana")])
+            .unwrap();
+        let error = declarations
+            .register_entries([&row("ruby:grit", "ruby:grit"), &row("ruby:broken", "mana")])
+            .unwrap_err();
+        assert!(error.contains("has no namespace"), "{error}");
+        assert_eq!(
+            declarations
+                .data_components
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ruby:mana"]
+        );
+
+        // An attachment default is free text, but not control characters.
+        let control = custom(
+            "attachment",
+            "ruby:tab",
+            &[("codec", "ruby:tab"), ("default", "a\tb")],
+        );
+        let error = declarations.register_entries([&control]).unwrap_err();
+        assert!(error.contains("control characters"), "{error}");
+        assert!(declarations.attachments.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_summarise_counts_and_custom_kinds() {
+        let block = RegistryEntry::typed(
+            "minecraft:block",
+            "ruby:lamp",
+            RegistryDeclaration::Block {
+                template: "minecraft:stone".into(),
+                properties: BTreeMap::new(),
+                item: false,
+            },
+        );
+        let effect = RegistryEntry::typed(
+            "minecraft:mob_effect",
+            "ruby:glow",
+            RegistryDeclaration::MobEffect {
+                category: "beneficial".into(),
+                color: 0x55aa11,
+            },
+        );
+        let mut declarations =
+            NativeDeclarations::from_registry_entries([&block, &effect]).unwrap();
+        assert_eq!(
+            declarations.diagnostics(),
+            [
+                "native declarations: 1 blocks, 0 items, 1 mob effects, 0 entities, 0 data components, 0 attachments, 0 recipes, 0 ingredients, 0 custom"
+            ]
+        );
+        for (registry, id, kind) in [
+            ("minecraft:entity_type", "ruby:bird", "entity"),
+            ("neoforge:attachment", "ruby:mana", "attachment"),
+            ("future:thing", "ruby:widget", "entity"),
+        ] {
+            declarations.custom.push(CustomDeclaration {
+                registry: registry.into(),
+                id: id.into(),
+                kind: kind.into(),
+                properties: BTreeMap::new(),
+            });
+        }
+        assert_eq!(
+            declarations.diagnostics()[1],
+            "native custom registration kinds: attachment=1, entity=2"
+        );
+        assert_eq!(declarations.diagnostics().len(), 2);
     }
 }

@@ -21,6 +21,11 @@ pub const MAX_FILES: usize = 65_536;
 pub const MAX_FILE: u64 = 16 << 20;
 pub const MAX_TOTAL: u64 = 512 << 20;
 
+/// Version of the typed JSON Horizon writes under `data/<namespace>/horizon/`
+/// for entity, data-component and attachment rows. A reader checks it before
+/// it trusts a row's shape.
+pub const NATIVE_FORMAT: u32 = 1;
+
 /// Checks a content path: `assets/` or `data/`, then `/`-separated parts of
 /// `[a-z0-9_.-]`, none of them `.` or `..` (vanilla's resource-location
 /// characters, so the path means the same on every OS).
@@ -335,9 +340,12 @@ impl Content {
     /// Builds the declaration-only content half of a native Java mod.
     ///
     /// The resulting content has no source files, but it participates in the
-    /// same resource-root planning as a packaged `.hmod`. Custom registry
-    /// kinds stay outside this vocabulary until Horizon has a typed adapter
-    /// for them.
+    /// same resource-root planning as a packaged `.hmod`. Every emitted row
+    /// carries a [`NATIVE_FORMAT`] marker: entities add their typed
+    /// [`crate::native::SpawnRestriction`] and
+    /// [`crate::native::EntityAttributes`] blocks, data components and
+    /// attachments their codec flags. Custom registry kinds stay outside this
+    /// vocabulary until Horizon has a typed adapter for them.
     pub fn from_native(
         id: impl Into<String>,
         declarations: crate::native::NativeDeclarations,
@@ -430,6 +438,21 @@ impl Content {
                 .map(|row| row.id.as_str())
                 .collect(),
         )?;
+        // A codec id is a resource location as well, but vanilla codecs
+        // (`minecraft:int`) are legitimate, so this takes vanilla ids too.
+        let check_codec = |kind: &str, value: &str| {
+            (vanilla_id(value) || native_id(value))
+                .then_some(())
+                .ok_or_else(|| {
+                    format!("native {kind} codec {value:?} is not a namespaced codec id")
+                })
+        };
+        for component in &declarations.data_components {
+            check_codec("data component", &component.codec)?;
+        }
+        for attachment in &declarations.attachments {
+            check_codec("attachment", &attachment.codec)?;
+        }
         if !declarations.custom.is_empty() {
             let mut details = declarations
                 .custom
@@ -523,8 +546,11 @@ impl Content {
             let file = format!("data/{namespace}/horizon/entity/{path}.json");
             check_path(&file)?;
             let json = serde_json::json!({
+                "format": NATIVE_FORMAT,
                 "template": entity.template,
                 "properties": entity.properties,
+                "spawn": entity.spawn,
+                "attributes": entity.attributes,
             });
             add_native_file(
                 file,
@@ -540,6 +566,7 @@ impl Content {
             let file = format!("data/{namespace}/horizon/data_component/{path}.json");
             check_path(&file)?;
             let json = serde_json::json!({
+                "format": NATIVE_FORMAT,
                 "codec": component.codec,
                 "persistent": component.persistent,
                 "network_synced": component.network_synced,
@@ -562,6 +589,7 @@ impl Content {
             let file = format!("data/{namespace}/horizon/attachment/{path}.json");
             check_path(&file)?;
             let json = serde_json::json!({
+                "format": NATIVE_FORMAT,
                 "codec": attachment.codec,
                 "default": attachment.default_value,
                 "copy_on_death": attachment.copy_on_death,
@@ -860,6 +888,10 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<(), Str
 mod tests {
     use super::*;
     use crate::manifest::Package;
+    use crate::native::{
+        AttachmentDeclaration, DataComponentDeclaration, EntityDeclaration, NativeDeclarations,
+    };
+    use horizon_native_java::{RegistryDeclaration, RegistryEntry};
 
     const MANIFEST_TEXT: &str = r#"
 id = "ruby"
@@ -879,6 +911,29 @@ capabilities = ["registries"]
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+    /// A typed custom row as a loader adapter emits it.
+    fn native_row(kind: &str, id: &str, properties: &[(&str, &str)]) -> RegistryEntry {
+        let registry = match kind {
+            "entity" => "minecraft:entity_type",
+            "data_component" => "minecraft:data_component_type",
+            _ => "neoforge:attachment",
+        };
+        RegistryEntry::typed(
+            registry,
+            id,
+            RegistryDeclaration::Custom {
+                kind: kind.into(),
+                properties: properties
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+            },
+        )
+    }
+    /// One native JSON file from a planned content.
+    fn native_json(content: &Content, file: &str) -> serde_json::Value {
+        serde_json::from_slice(content.native_files.get(file).unwrap()).unwrap()
     }
     fn hmod(name: &str, manifest: &str, files: &[(&str, &[u8])]) -> Result<Content, String> {
         let dir = scratch(name);
@@ -1284,6 +1339,111 @@ capabilities = ["registries"]
         let e = Content::read(&path, &package.manifest).err().unwrap();
         assert!(e.contains("not capability registries"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn native_entity_rows_carry_typed_spawn_and_attributes() {
+        let entry = native_row(
+            "entity",
+            "ruby:bird",
+            &[
+                ("template", "minecraft:chicken"),
+                ("width", "0.6"),
+                ("max_health", "4"),
+                ("speed", "0.25"),
+                ("spawn_category", "on_ground"),
+                ("spawn_heightmap", "motion_blocking"),
+                ("spawn_min_height", "-64"),
+                ("spawn_max_height", "320"),
+            ],
+        );
+        let declarations = NativeDeclarations::from_registry_entries([&entry]).unwrap();
+        assert_eq!(
+            declarations.entities[0].spawn.as_ref().unwrap().category,
+            "ON_GROUND"
+        );
+        let content = Content::from_native("ruby", declarations).unwrap();
+        let entity = native_json(&content, "data/ruby/horizon/entity/bird.json");
+        assert_eq!(entity["format"], NATIVE_FORMAT);
+        assert_eq!(entity["template"], "minecraft:chicken");
+        assert_eq!(entity["spawn"]["category"], "ON_GROUND");
+        assert_eq!(entity["spawn"]["heightmap"], "MOTION_BLOCKING");
+        assert_eq!(entity["spawn"]["min_height"], -64);
+        assert_eq!(entity["spawn"]["max_height"], 320);
+        assert_eq!(entity["attributes"]["health"], 4.0);
+        assert_eq!(entity["attributes"]["speed"], 0.25);
+        assert!(entity["attributes"]["attack_damage"].is_null());
+
+        // A bare entity has the same shape, with the typed blocks absent.
+        let bare = EntityDeclaration::from_registry_properties(
+            "ruby:plain",
+            "minecraft:chicken",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let content = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                entities: vec![bare],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap();
+        let plain = native_json(&content, "data/ruby/horizon/entity/plain.json");
+        assert_eq!(plain["format"], NATIVE_FORMAT);
+        assert!(plain["spawn"].is_null());
+        assert!(plain["attributes"].is_null());
+    }
+
+    #[test]
+    fn native_auxiliary_rows_carry_format_and_check_codecs() {
+        let component = native_row(
+            "data_component",
+            "ruby:mana",
+            &[("codec", "minecraft:int"), ("network_synced", "true")],
+        );
+        let attachment = native_row(
+            "attachment",
+            "ruby:mana",
+            &[
+                ("codec", "ruby:mana"),
+                ("default", "0"),
+                ("copy_on_death", "true"),
+            ],
+        );
+        let content = Content::from_native(
+            "ruby",
+            NativeDeclarations::from_registry_entries([&component, &attachment]).unwrap(),
+        )
+        .unwrap();
+        let component = native_json(&content, "data/ruby/horizon/data_component/mana.json");
+        assert_eq!(component["format"], NATIVE_FORMAT);
+        assert_eq!(component["codec"], "minecraft:int");
+        assert_eq!(component["network_synced"].as_bool(), Some(true));
+        let attachment = native_json(&content, "data/ruby/horizon/attachment/mana.json");
+        assert_eq!(attachment["format"], NATIVE_FORMAT);
+        assert_eq!(attachment["codec"], "ruby:mana");
+        assert_eq!(attachment["copy_on_death"].as_bool(), Some(true));
+
+        // A bare codec is outside every namespace, and the batch is refused as
+        // a whole: `from_native` never emits a partial plan.
+        let declarations = NativeDeclarations {
+            data_components: vec![DataComponentDeclaration {
+                id: "ruby:mana".into(),
+                codec: "mana".into(),
+                persistent: true,
+                network_synced: false,
+            }],
+            attachments: vec![AttachmentDeclaration {
+                id: "ruby:mana".into(),
+                codec: "ruby:mana".into(),
+                default_value: "0".into(),
+                copy_on_death: false,
+            }],
+            ..NativeDeclarations::default()
+        };
+        let error = Content::from_native("ruby", declarations).unwrap_err();
+        assert!(error.contains("not a namespaced codec id"), "{error}");
     }
 
     #[test]
