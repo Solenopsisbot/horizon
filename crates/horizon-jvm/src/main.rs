@@ -228,16 +228,25 @@ fn run() -> Result<(), String> {
     }
     let mixin_configs = discover_mixin_configs(&classpath, &mixin_config_args);
     let mixin_report = report_mixin_configs(&mixin_configs);
+    // Only configs a supplied jar (or an explicit `--mixin-config`) actually
+    // carries reach the property; a path a jar declares but does not ship is
+    // named in the report and left out so Mixin never chases it.
+    let mixin_property = mixin_config_property(&mixin_configs);
+    let mixin_registered = mixin_registered_count(mixin_property.as_deref());
     let paths = std::env::join_paths(&classpath).map_err(|e| e.to_string())?;
     let paths = paths.to_string_lossy().into_owned();
 
-    let init = InitArgsBuilder::new()
+    let mut init = InitArgsBuilder::new()
         .version(JNIVersion::V8)
         .option(format!("-Djava.class.path={paths}"))
         .option(&heap)
-        .option("-Djava.awt.headless=true")
-        .build()
-        .map_err(|e| format!("JVM options: {e}"))?;
+        .option("-Djava.awt.headless=true");
+    // Mixin reads its config list at launch time, so the property has to be in
+    // the JVM options rather than set after `JavaVM::new`.
+    for option in mixin_jvm_options(mixin_property.as_deref()) {
+        init = init.option(option);
+    }
+    let init = init.build().map_err(|e| format!("JVM options: {e}"))?;
     let jvm = JavaVM::new(init)
         .map_err(|e| format!("could not start a JVM ({e}); set JAVA_HOME to a JDK with libjvm"))?;
     let mut guard = jvm
@@ -260,10 +269,11 @@ fn run() -> Result<(), String> {
     for line in &mixin_report {
         println!("{line}");
     }
+    println!("{}", mixin_configs_line(mixin_registered));
     // Mixin's static bootstrap runs before the first entrypoint, the way a
     // Fabric launch handler does. A jar with no config keeps today's behavior
     // and reports that, so no class is loaded for nothing.
-    let has_mixin_configs = !mixin_configs.is_empty();
+    let has_mixin_configs = mixin_registered > 0;
     println!(
         "{}",
         mixin_bootstrap_line(has_mixin_configs, || mixin_bootstrap_label(env))
@@ -1103,6 +1113,22 @@ impl MixinConfigRef {
         std::io::Read::read_to_string(&mut entry, &mut text).map_err(|_| "unreadable")?;
         Ok(text)
     }
+
+    /// Whether the archive (or the explicit file) really carries the config.
+    /// Chosen over [`Self::read`] so a config above the probe's read bound is
+    /// still handed to Mixin, which has its own limits.
+    fn exists(&self) -> bool {
+        if self.explicit {
+            return fs::metadata(&self.source).is_ok_and(|meta| meta.is_file());
+        }
+        let Ok(file) = File::open(&self.source) else {
+            return false;
+        };
+        let Ok(mut archive) = zip::ZipArchive::new(file) else {
+            return false;
+        };
+        archive.by_name(&self.config).is_ok()
+    }
 }
 
 /// Mixin configs for every jar on the classpath plus the explicit
@@ -1310,7 +1336,9 @@ fn mixin_config_report(reference: &MixinConfigRef) -> (Option<i64>, Vec<String>)
 }
 
 /// Every report line, ordered by Mixin's priority and then the diagnostic text
-/// so the output does not depend on classpath enumeration.
+/// so the output does not depend on classpath enumeration. Identical lines are
+/// folded: a config two jars both declare as missing (or both carry) is named
+/// once.
 fn report_mixin_configs(configs: &[MixinConfigRef]) -> Vec<String> {
     let mut reports: Vec<(Option<i64>, Vec<String>)> =
         configs.iter().map(mixin_config_report).collect();
@@ -1319,7 +1347,85 @@ fn report_mixin_configs(configs: &[MixinConfigRef]) -> Vec<String> {
             .cmp(&b.0.unwrap_or(i64::MIN))
             .then_with(|| a.1.cmp(&b.1))
     });
-    reports.into_iter().flat_map(|(_, lines)| lines).collect()
+    let mut lines: Vec<String> = reports.into_iter().flat_map(|(_, lines)| lines).collect();
+    lines.dedup();
+    lines
+}
+
+/// Upper bound for one `-Dmixin.configs` value. Mixin reads a single property,
+/// so a hostile archive must not be able to grow the JVM argument without
+/// bound.
+const MAX_MIXIN_CONFIG_PROPERTY_BYTES: usize = 8192;
+
+/// The value of `-Dmixin.configs`: Mixin's comma-separated classpath resource
+/// list. Names are sorted and deduplicated so the value never depends on
+/// classpath enumeration, and the list stops at
+/// [`MAX_MIXIN_CONFIG_PROPERTY_BYTES`]. Empty names and names containing a
+/// comma are dropped because the property has no way to express them.
+fn format_mixin_config_property(names: impl IntoIterator<Item = String>) -> Option<String> {
+    let mut names: Vec<String> = names
+        .into_iter()
+        .filter(|name| !name.is_empty() && !name.contains(','))
+        .collect();
+    names.sort();
+    names.dedup();
+    let mut value = String::new();
+    for name in names {
+        let separator = usize::from(!value.is_empty());
+        if value.len() + separator + name.len() > MAX_MIXIN_CONFIG_PROPERTY_BYTES {
+            break;
+        }
+        if separator == 1 {
+            value.push(',');
+        }
+        value.push_str(&name);
+    }
+    (!value.is_empty()).then_some(value)
+}
+
+/// The property for the discovered configs, or `None` when no supplied jar
+/// carries one. Config names come from archive entries or `--mixin-config`
+/// values only, so the list cannot name a path outside them.
+///
+/// Fabric Loader's own hand-off is different: `FabricMixinBootstrap` reads each
+/// mod's *parsed* metadata and calls `Mixins.addConfiguration`, and the loader
+/// exposes no documented launch property for it (there is no
+/// `fabric.mixin.configs`). The embedded bridge seeds container proxies rather
+/// than parsed metadata, so loader registration stays out of this probe: the
+/// legacy property is the only mechanism set, and a real weaving run still
+/// needs the loader to register the same configs.
+fn mixin_config_property(configs: &[MixinConfigRef]) -> Option<String> {
+    format_mixin_config_property(
+        configs
+            .iter()
+            .filter(|config| config.exists())
+            .map(|config| config.config.clone()),
+    )
+}
+
+/// How many configs the property carries, for the deterministic log line.
+fn mixin_registered_count(property: Option<&str>) -> usize {
+    property.map_or(0, |value| {
+        value.split(',').filter(|name| !name.is_empty()).count()
+    })
+}
+
+/// `mixin configs: N registered`, or `mixin configs: none` when discovery found
+/// nothing a jar actually carries.
+fn mixin_configs_line(registered: usize) -> String {
+    if registered == 0 {
+        "mixin configs: none".to_owned()
+    } else {
+        format!("mixin configs: {registered} registered")
+    }
+}
+
+/// The JVM options that hand the config list to Mixin. Kept as an argument list
+/// so a test can inspect the exact property without starting a JVM.
+fn mixin_jvm_options(property: Option<&str>) -> Vec<String> {
+    property
+        .map(|value| vec![format!("-Dmixin.configs={value}")])
+        .unwrap_or_default()
 }
 
 /// `--list-mixin-configs`: one `jar<TAB>config` line per config, sorted. No JVM
@@ -1357,13 +1463,13 @@ fn mixin_bootstrap_line(has_configs: bool, bootstrap: impl FnOnce() -> String) -
 /// runtime or a thrown exception becomes a reported fallback label, never a
 /// failed probe.
 fn mixin_bootstrap_label(env: &mut JNIEnv) -> String {
-    let class = match env.find_class("org/spongepowered/asm/mixin/MixinBootstrap") {
+    let class = match env.find_class("org/spongepowered/asm/launch/MixinBootstrap") {
         Ok(class) => class,
         Err(_) => {
             let _ = env.exception_clear();
             return fallback_label(
                 "java.lang.ClassNotFoundException",
-                Some("org.spongepowered.asm.mixin.MixinBootstrap"),
+                Some("org.spongepowered.asm.launch.MixinBootstrap"),
             )
             .unwrap_or_default();
         }
@@ -1511,10 +1617,12 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Entrypoint, MixinConfigRef, constructor_only_entry_kind, declared_entrypoint_kinds,
-        discover_entries, discover_mixin_configs, entrypoints_from_metadata, fabric_entries,
-        fabric_metadata, fallback_label, format_entrypoints, format_mixin_configs,
+        Entrypoint, MAX_MIXIN_CONFIG_PROPERTY_BYTES, MixinConfigRef, constructor_only_entry_kind,
+        declared_entrypoint_kinds, discover_entries, discover_mixin_configs,
+        entrypoints_from_metadata, fabric_entries, fabric_metadata, fallback_label,
+        format_entrypoints, format_mixin_config_property, format_mixin_configs,
         initializer_for_kind, is_minecraft_class, missing_entry_message, mixin_bootstrap_line,
+        mixin_config_property, mixin_configs_line, mixin_jvm_options, mixin_registered_count,
         neoforge_metadata, nested_jar_name, parse_mixin_config, pre_launch_entries,
         quilt_entrypoint_kind, report_mixin_configs, split_entrypoint,
     };
@@ -1893,6 +2001,88 @@ config="demo.mixins.json""#,
     }
 
     #[test]
+    fn formats_mixin_config_property_sorted_deduped_and_bounded() {
+        assert_eq!(
+            format_mixin_config_property([
+                "b.mixins.json".to_owned(),
+                "a.mixins.json".to_owned(),
+                "b.mixins.json".to_owned(),
+            ])
+            .as_deref(),
+            Some("a.mixins.json,b.mixins.json")
+        );
+        assert_eq!(
+            format_mixin_config_property(std::iter::empty::<String>()),
+            None
+        );
+        // A comma is the property's own separator, so such a name is dropped
+        // rather than silently splitting into two configs.
+        assert_eq!(format_mixin_config_property(["a,b".to_owned()]), None);
+
+        let bounded = format_mixin_config_property(
+            (0..600).map(|index| format!("config-{index:04}.mixins.json")),
+        )
+        .unwrap();
+        assert!(bounded.len() <= MAX_MIXIN_CONFIG_PROPERTY_BYTES);
+        assert!(bounded.split(',').count() < 600);
+        assert!(bounded.starts_with("config-0000.mixins.json,config-0001.mixins.json"));
+
+        assert_eq!(
+            mixin_registered_count(Some("a.mixins.json,b.mixins.json")),
+            2
+        );
+        assert_eq!(mixin_registered_count(None), 0);
+        assert_eq!(mixin_configs_line(0), "mixin configs: none");
+        assert_eq!(mixin_configs_line(2), "mixin configs: 2 registered");
+    }
+
+    #[test]
+    fn mixin_config_property_skips_configs_no_jar_carries() {
+        let first = build_jar(
+            "mixin-property-first",
+            &[
+                (
+                    "fabric.mod.json",
+                    br#"{"id":"first","mixins":["present.mixins.json","absent.mixins.json"]}"#,
+                ),
+                ("present.mixins.json", br#"{"mixins":[]}"#),
+            ],
+        );
+        let second = build_jar(
+            "mixin-property-second",
+            &[(
+                "fabric.mod.json",
+                br#"{"id":"second","mixins":["absent.mixins.json"]}"#,
+            )],
+        );
+        let classpath = vec![first.clone(), second.clone()];
+        let configs = discover_mixin_configs(&classpath, &["missing.mixins.json".to_owned()]);
+        let property = mixin_config_property(&configs).unwrap();
+        assert_eq!(property, "present.mixins.json");
+        assert_eq!(mixin_registered_count(Some(&property)), 1);
+        // A missing config is named once, however many jars declare it, and
+        // never reaches the property.
+        let report = report_mixin_configs(&configs);
+        for missing in ["absent.mixins.json", "missing.mixins.json"] {
+            assert_eq!(
+                report.iter().filter(|line| line.contains(missing)).count(),
+                1
+            );
+        }
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
+    }
+
+    #[test]
+    fn builds_the_mixin_configs_option_before_the_jvm_starts() {
+        assert_eq!(
+            mixin_jvm_options(Some("a.mixins.json,b.mixins.json")),
+            vec!["-Dmixin.configs=a.mixins.json,b.mixins.json"]
+        );
+        assert!(mixin_jvm_options(None).is_empty());
+    }
+
+    #[test]
     fn jar_without_mixin_configs_reports_nothing_and_skips_bootstrap() {
         let path = build_jar(
             "mixin-none",
@@ -1908,6 +2098,9 @@ config="demo.mixins.json""#,
         assert!(configs.is_empty());
         assert!(report_mixin_configs(&configs).is_empty());
         assert!(format_mixin_configs(&configs).is_empty());
+        assert_eq!(mixin_config_property(&configs), None);
+        assert_eq!(mixin_registered_count(None), 0);
+        assert!(mixin_jvm_options(None).is_empty());
         assert_eq!(
             mixin_bootstrap_line(false, || unreachable!("no config must not bootstrap Mixin")),
             "mixin bootstrap: no configs"
