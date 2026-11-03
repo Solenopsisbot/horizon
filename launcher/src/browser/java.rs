@@ -7,7 +7,7 @@
 //!
 //! Installing copies the carried-over folder mod into `horizon-mods/<mod id>/` beside
 //! `options.txt` and turns it on in `horizon-mods.txt`, where the game's Options > Mods reads it.
-use super::{installed::Entry, pick, FileRef, Kind, Project, Source, Support, Version};
+use super::{FileRef, Kind, Project, Source, Support, Version, installed::Entry, pick};
 use horizon_port_pack::check::{self, Check, Verdict};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,12 +24,40 @@ const MAX_DEPTH: usize = 3;
 /// The loaders whose jars port-pack reads.
 pub const LOADERS: [&str; 4] = ["neoforge", "fabric", "forge", "quilt"];
 
-/// How well a checked mod runs.
+/// Adds the bounded native-probe result to the browser verdict. A probe failure does not
+/// change what content can be carried, but it tells the player that Java compatibility will
+/// need the embedded JVM path once that runtime is enabled.
+fn compatibility_note(check: &Check) -> Option<String> {
+    let error = check.native.as_ref()?.error.as_deref()?;
+    let mut detail = error.replace(['\n', '\r'], " ");
+    const MAX_DETAIL: usize = 240;
+    if detail.chars().count() > MAX_DETAIL {
+        detail = detail.chars().take(MAX_DETAIL - 1).collect();
+        detail.push('…');
+    }
+    Some(format!(
+        "Java compatibility probe stopped; embedded JVM fallback may be needed: {detail}"
+    ))
+}
+
 pub fn support_of(check: &Check) -> Support {
+    let reason = || match compatibility_note(check) {
+        Some(note) if check.summary.is_empty() => note,
+        Some(note) => format!("{} {note}", check.summary),
+        None => check.summary.clone(),
+    };
     match check.verdict {
-        Verdict::Works => Support::Works,
-        Verdict::Partly => Support::Partial(check.summary.clone()),
-        Verdict::No => Support::No(check.summary.clone()),
+        Verdict::Works
+            if check
+                .native
+                .as_ref()
+                .is_none_or(|native| native.error.is_none()) =>
+        {
+            Support::Works
+        }
+        Verdict::Works => Support::Partial(reason()),
+        Verdict::Partly => Support::Partial(reason()),
+        Verdict::No => Support::No(reason()),
     }
 }
 
@@ -326,6 +354,41 @@ mod tests {
             "mod.coords_hud:true\n"
         );
         fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn native_probe_failure_is_bounded_and_explains_jvm_fallback() {
+        let check = Check {
+            mod_id: "demo".into(),
+            name: "Demo".into(),
+            version: "1".into(),
+            loader: "fabric".into(),
+            license: "MIT".into(),
+            verdict: Verdict::Works,
+            summary: "Content ports cleanly.".into(),
+            ports: Vec::new(),
+            skipped: Vec::new(),
+            depends: Vec::new(),
+            namespaces: vec!["demo".into()],
+            code: Default::default(),
+            native: Some(horizon_port_pack::check::NativeProbe {
+                kind: Some("main".into()),
+                entrypoint: Some("demo.Main".into()),
+                entrypoints: vec!["demo.Main".into()],
+                seeded_mods: vec!["demo".into()],
+                calls: 0,
+                registrations: 0,
+                listeners: 0,
+                payloads: 0,
+                error: Some("unsupported operation ".to_owned() + &"x".repeat(400)),
+            }),
+        };
+        let Support::Partial(reason) = support_of(&check) else {
+            panic!("probe failures should be visible in the browser verdict")
+        };
+        assert!(reason.starts_with("Content ports cleanly. Java compatibility probe stopped;"));
+        assert!(reason.ends_with('…'));
+        assert!(reason.chars().count() < 400);
     }
 
     #[test]

@@ -213,3 +213,11 @@ says it is coming soon). The CurseForge source (`browser/curseforge.rs`) is kept
 A CurseForge modpack zip or instance the player already has still imports, since that needs no key: its jars come
 from the player's installed instance or, when Modrinth has the same file, from Modrinth. A jar only CurseForge serves
 is listed under the pack as "CurseForge downloads coming soon".
+
+### Java compatibility diagnostics
+
+A checked jar may include a bounded native Java probe. The Mods page keeps the normal content-port
+verdict, and when that probe stops it adds the reason (trimmed to a short, single-line diagnostic) and
+says that the embedded JVM fallback may be needed. This is evidence for compatibility planning; it does
+not execute arbitrary jar code or claim that every Java API is available. The complete check remains in
+`mod-browser/checks-1/<checksum>/check.json` for support reports.
