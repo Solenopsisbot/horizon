@@ -11,6 +11,11 @@ use crate::content::{Block, BlockProperties, EffectCategory, Item, MobEffect, Ra
 use horizon_native_java::{RegistryDeclaration, RegistryEntry, TypedRegistrySink};
 use std::collections::BTreeMap;
 
+/// Native declarations are metadata, not an unbounded Java object graph.
+pub const MAX_NATIVE_DECLARATIONS: usize = 8_192;
+pub const MAX_NATIVE_PROPERTIES: usize = 32;
+pub const MAX_NATIVE_TEXT: usize = 4_096;
+
 /// A custom registration kind whose concrete Horizon adapter is not available
 /// yet. It is retained so diagnostics can name the registration precisely.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,7 +114,95 @@ impl NativeDeclarations {
         for entry in entries {
             staged.register_typed(entry)?;
         }
+        staged.check_count()?;
         *self = staged;
+        Ok(())
+    }
+
+    /// Merge declarations from another adapter transactionally.
+    ///
+    /// Equal rows are coalesced, while a row with the same id and different
+    /// values is rejected. Rows are sorted by id after the merge so metadata
+    /// order and entrypoint execution order cannot change the resource plan.
+    pub fn merge(&mut self, incoming: Self) -> Result<(), String> {
+        let mut staged = self.clone();
+        merge_rows("block", &mut staged.blocks, incoming.blocks, |row| &row.id)?;
+        merge_rows("item", &mut staged.items, incoming.items, |row| &row.id)?;
+        merge_rows("mob effect", &mut staged.effects, incoming.effects, |row| {
+            &row.id
+        })?;
+        merge_rows("entity", &mut staged.entities, incoming.entities, |row| {
+            &row.id
+        })?;
+        merge_rows(
+            "data component",
+            &mut staged.data_components,
+            incoming.data_components,
+            |row| &row.id,
+        )?;
+        merge_rows(
+            "attachment",
+            &mut staged.attachments,
+            incoming.attachments,
+            |row| &row.id,
+        )?;
+        merge_rows("recipe", &mut staged.recipes, incoming.recipes, |row| {
+            &row.id
+        })?;
+        merge_rows(
+            "ingredient",
+            &mut staged.ingredients,
+            incoming.ingredients,
+            |row| &row.id,
+        )?;
+        for row in incoming.custom {
+            if let Some(existing) = staged
+                .custom
+                .iter()
+                .find(|existing| existing.registry == row.registry && existing.id == row.id)
+            {
+                if existing != &row {
+                    return Err(format!(
+                        "conflicting native custom registration {}/{}",
+                        row.registry, row.id
+                    ));
+                }
+            } else if staged
+                .custom
+                .iter()
+                .any(|existing| existing.id == row.id && existing.registry != row.registry)
+            {
+                return Err(format!("conflicting native custom registration {}", row.id));
+            } else {
+                staged.custom.push(row);
+            }
+        }
+        staged.custom.sort_by(|a, b| {
+            a.registry
+                .cmp(&b.registry)
+                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.kind.cmp(&b.kind))
+        });
+        staged.check_count()?;
+        *self = staged;
+        Ok(())
+    }
+
+    fn check_count(&self) -> Result<(), String> {
+        let count = self.blocks.len()
+            + self.items.len()
+            + self.effects.len()
+            + self.entities.len()
+            + self.data_components.len()
+            + self.attachments.len()
+            + self.recipes.len()
+            + self.ingredients.len()
+            + self.custom.len();
+        if count > MAX_NATIVE_DECLARATIONS {
+            return Err(format!(
+                "native declarations exceed {MAX_NATIVE_DECLARATIONS} rows"
+            ));
+        }
         Ok(())
     }
 
@@ -117,7 +210,8 @@ impl NativeDeclarations {
         let Some((namespace, path)) = id.split_once(':') else {
             return Err(format!("native registration {id:?} has no namespace"));
         };
-        if namespace.is_empty()
+        if id.len() > MAX_NATIVE_TEXT
+            || namespace.is_empty()
             || path.is_empty()
             || !namespace
                 .bytes()
@@ -127,6 +221,22 @@ impl NativeDeclarations {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_./-".contains(&b))
         {
             return Err(format!("native registration id {id:?} is invalid"));
+        }
+        Ok(())
+    }
+
+    fn check_properties(kind: &str, properties: &BTreeMap<String, String>) -> Result<(), String> {
+        if properties.len() > MAX_NATIVE_PROPERTIES {
+            return Err(format!(
+                "native {kind} has more than {MAX_NATIVE_PROPERTIES} properties"
+            ));
+        }
+        if properties.iter().any(|(key, value)| {
+            key.is_empty() || key.len() > MAX_NATIVE_TEXT || value.len() > MAX_NATIVE_TEXT
+        }) {
+            return Err(format!(
+                "native {kind} property names and values are at most {MAX_NATIVE_TEXT} bytes"
+            ));
         }
         Ok(())
     }
@@ -158,6 +268,7 @@ impl NativeDeclarations {
         item: bool,
     ) -> Result<(), String> {
         Self::ensure_id(&entry.id)?;
+        Self::check_properties("block", properties)?;
         Self::ensure_id(template)?;
         if self.blocks.iter().any(|block| block.id == entry.id) {
             return Err(format!("duplicate native block {}", entry.id));
@@ -181,6 +292,7 @@ impl NativeDeclarations {
         properties: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         Self::ensure_id(&entry.id)?;
+        Self::check_properties("item", properties)?;
         Self::ensure_id(template)?;
         if self.items.iter().any(|item| item.id == entry.id) {
             return Err(format!("duplicate native item {}", entry.id));
@@ -277,6 +389,7 @@ impl NativeDeclarations {
         properties: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         Self::ensure_id(&entry.id)?;
+        Self::check_properties("entity", properties)?;
         let template = properties
             .get("template")
             .ok_or_else(|| format!("native entity {} has no template", entry.id))?;
@@ -308,7 +421,10 @@ impl NativeDeclarations {
         }
         for key in ["width", "height"] {
             if let Some(value) = retained.get(key) {
-                parse_f32(key, value)?;
+                let parsed = parse_f32(key, value)?;
+                if parsed < 0.0 {
+                    return Err(format!("native entity property {key} is 0 or more"));
+                }
             }
         }
         for key in ["tracking_range", "update_interval"] {
@@ -337,6 +453,7 @@ impl NativeDeclarations {
         properties: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         Self::ensure_id(&entry.id)?;
+        Self::check_properties("data component", properties)?;
         let codec = properties
             .get("codec")
             .ok_or_else(|| format!("native data component {} has no codec", entry.id))?;
@@ -378,6 +495,7 @@ impl NativeDeclarations {
         properties: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         Self::ensure_id(&entry.id)?;
+        Self::check_properties("attachment", properties)?;
         let codec = properties
             .get("codec")
             .ok_or_else(|| format!("native attachment {} has no codec", entry.id))?;
@@ -394,6 +512,12 @@ impl NativeDeclarations {
             .or_else(|| properties.get("default_value"))
             .cloned()
             .unwrap_or_else(|| "null".to_owned());
+        if default_value.len() > MAX_NATIVE_TEXT {
+            return Err(format!(
+                "native attachment {} default is at most {MAX_NATIVE_TEXT} bytes",
+                entry.id
+            ));
+        }
         let copy_on_death = properties
             .get("copy_on_death")
             .or_else(|| properties.get("copy-on-death"))
@@ -478,6 +602,27 @@ impl TypedRegistrySink for NativeDeclarations {
             }
         }
     }
+}
+
+fn merge_rows<T, F>(kind: &str, target: &mut Vec<T>, incoming: Vec<T>, id: F) -> Result<(), String>
+where
+    T: Clone + PartialEq,
+    F: Fn(&T) -> &str + Copy,
+{
+    for row in incoming {
+        if let Some(existing) = target.iter().find(|existing| id(existing) == id(&row)) {
+            if existing != &row {
+                return Err(format!(
+                    "conflicting native {kind} registration {}",
+                    id(&row)
+                ));
+            }
+        } else {
+            target.push(row);
+        }
+    }
+    target.sort_by(|a, b| id(a).cmp(id(b)));
+    Ok(())
 }
 
 fn parse_f32(key: &str, value: &str) -> Result<f32, String> {
@@ -827,5 +972,104 @@ mod tests {
                 .native_files
                 .contains_key("data/ruby/horizon/attachment/mana.json")
         );
+    }
+
+    #[test]
+    fn declaration_merge_coalesces_equal_rows_and_sorts_custom_kinds() {
+        let entity = RegistryEntry::typed(
+            "minecraft:entity_type",
+            "ruby:zebra",
+            RegistryDeclaration::Custom {
+                kind: "entity".into(),
+                properties: BTreeMap::from([("template".into(), "minecraft:horse".into())]),
+            },
+        );
+        let attachment = RegistryEntry::typed(
+            "neoforge:attachment",
+            "ruby:mana",
+            RegistryDeclaration::Custom {
+                kind: "attachment".into(),
+                properties: BTreeMap::from([("codec".into(), "ruby:mana".into())]),
+            },
+        );
+        let left = NativeDeclarations::from_registry_entries([&entity]).unwrap();
+        let right = NativeDeclarations::from_registry_entries([&attachment, &entity]).unwrap();
+        let mut merged = left;
+        merged.merge(right).unwrap();
+        assert_eq!(merged.entities.len(), 1);
+        assert_eq!(merged.attachments[0].id, "ruby:mana");
+        assert!(merged.custom.is_empty());
+
+        let custom_a = NativeDeclarations {
+            custom: vec![CustomDeclaration {
+                registry: "z:registry".into(),
+                id: "ruby:z".into(),
+                kind: "future".into(),
+                properties: BTreeMap::new(),
+            }],
+            ..NativeDeclarations::default()
+        };
+        let custom_b = NativeDeclarations {
+            custom: vec![CustomDeclaration {
+                registry: "a:registry".into(),
+                id: "ruby:a".into(),
+                kind: "future".into(),
+                properties: BTreeMap::new(),
+            }],
+            ..NativeDeclarations::default()
+        };
+        merged.merge(custom_a).unwrap();
+        merged.merge(custom_b).unwrap();
+        assert_eq!(
+            merged
+                .custom
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ruby:a", "ruby:z"]
+        );
+    }
+
+    #[test]
+    fn declaration_merge_rejects_conflicts_and_rolls_back() {
+        let first = RegistryEntry::typed(
+            "minecraft:entity_type",
+            "ruby:bird",
+            RegistryDeclaration::Custom {
+                kind: "entity".into(),
+                properties: BTreeMap::from([("template".into(), "minecraft:chicken".into())]),
+            },
+        );
+        let second = RegistryEntry::typed(
+            "minecraft:entity_type",
+            "ruby:bird",
+            RegistryDeclaration::Custom {
+                kind: "entity".into(),
+                properties: BTreeMap::from([("template".into(), "minecraft:bat".into())]),
+            },
+        );
+        let mut declarations = NativeDeclarations::from_registry_entries([&first]).unwrap();
+        let error = declarations
+            .merge(NativeDeclarations::from_registry_entries([&second]).unwrap())
+            .unwrap_err();
+        assert!(error.contains("conflicting native entity"), "{error}");
+        assert_eq!(declarations.entities[0].template, "minecraft:chicken");
+    }
+
+    #[test]
+    fn native_custom_properties_are_bounded() {
+        let properties = (0..=MAX_NATIVE_PROPERTIES)
+            .map(|index| (format!("p{index}"), "x".to_owned()))
+            .collect();
+        let entry = RegistryEntry::typed(
+            "minecraft:entity_type",
+            "ruby:too_many",
+            RegistryDeclaration::Custom {
+                kind: "entity".into(),
+                properties,
+            },
+        );
+        let error = NativeDeclarations::from_registry_entries([&entry]).unwrap_err();
+        assert!(error.contains("more than"), "{error}");
     }
 }

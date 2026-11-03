@@ -372,6 +372,28 @@ impl Content {
             add_namespace(&attachment.id);
         }
         let mut native_files = BTreeMap::new();
+        let mut native_total = 0u64;
+        let mut add_native_file = |file: String, bytes: Vec<u8>| -> Result<(), String> {
+            check_path(&file)?;
+            if bytes.len() as u64 > MAX_FILE {
+                return Err(format!("{file} is over {} MiB", MAX_FILE >> 20));
+            }
+            if native_files.contains_key(&file) {
+                return Err(format!("native declarations collide at {file}"));
+            }
+            if native_files.len() >= MAX_FILES {
+                return Err(format!("more than {MAX_FILES} native content files"));
+            }
+            native_total = native_total.saturating_add(bytes.len() as u64);
+            if native_total > MAX_TOTAL {
+                return Err(format!(
+                    "native declaration data is over {} MiB",
+                    MAX_TOTAL >> 20
+                ));
+            }
+            native_files.insert(file, bytes);
+            Ok(())
+        };
         for recipe in &declarations.recipes {
             add_namespace(&recipe.id);
             let (namespace, path) = recipe
@@ -379,8 +401,7 @@ impl Content {
                 .split_once(':')
                 .ok_or_else(|| format!("native recipe {} has no namespace", recipe.id))?;
             let file = format!("data/{namespace}/recipe/{path}.json");
-            check_path(&file)?;
-            native_files.insert(file, recipe.json.clone());
+            add_native_file(file, recipe.json.clone())?;
         }
         for ingredient in &declarations.ingredients {
             add_namespace(&ingredient.id);
@@ -389,8 +410,7 @@ impl Content {
                 .split_once(':')
                 .ok_or_else(|| format!("native ingredient {} has no namespace", ingredient.id))?;
             let file = format!("data/{namespace}/ingredient/{path}.json");
-            check_path(&file)?;
-            native_files.insert(file, ingredient.json.clone());
+            add_native_file(file, ingredient.json.clone())?;
         }
         for entity in &declarations.entities {
             let (namespace, path) = entity
@@ -403,12 +423,12 @@ impl Content {
                 "template": entity.template,
                 "properties": entity.properties,
             });
-            native_files.insert(
+            add_native_file(
                 file,
                 serde_json::to_vec(&json).map_err(|error| {
                     format!("native entity {} cannot be encoded: {error}", entity.id)
                 })?,
-            );
+            )?;
         }
         for component in &declarations.data_components {
             let (namespace, path) = component.id.split_once(':').ok_or_else(|| {
@@ -421,7 +441,7 @@ impl Content {
                 "persistent": component.persistent,
                 "network_synced": component.network_synced,
             });
-            native_files.insert(
+            add_native_file(
                 file,
                 serde_json::to_vec(&json).map_err(|error| {
                     format!(
@@ -429,7 +449,7 @@ impl Content {
                         component.id
                     )
                 })?,
-            );
+            )?;
         }
         for attachment in &declarations.attachments {
             let (namespace, path) = attachment
@@ -443,7 +463,7 @@ impl Content {
                 "default": attachment.default_value,
                 "copy_on_death": attachment.copy_on_death,
             });
-            native_files.insert(
+            add_native_file(
                 file,
                 serde_json::to_vec(&json).map_err(|error| {
                     format!(
@@ -451,7 +471,7 @@ impl Content {
                         attachment.id
                     )
                 })?,
-            );
+            )?;
         }
         Ok(Self {
             source: Source::Dir(PathBuf::new()),

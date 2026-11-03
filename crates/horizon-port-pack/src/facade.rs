@@ -1365,7 +1365,7 @@ fn render(
     if class.name == "net/minecraft/world/entity/Entity" {
         let _ = writeln!(
             out,
-            "    protected double horizonX;\n    protected double horizonY;\n    protected double horizonZ;\n    protected double horizonDeltaX;\n    protected double horizonDeltaY;\n    protected double horizonDeltaZ;\n    protected float horizonXRot;\n    protected float horizonYRot;\n    protected net.minecraft.world.level.Level horizonLevel = new net.minecraft.world.level.Level();\n    protected java.util.UUID horizonUuid = new java.util.UUID(0L, 0L);\n    protected net.minecraft.world.phys.AABB horizonBoundingBox = new net.minecraft.world.phys.AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);\n    protected boolean horizonOnGround;\n    protected boolean horizonRemoved;"
+            "    protected double horizonX;\n    protected double horizonY;\n    protected double horizonZ;\n    protected double horizonDeltaX;\n    protected double horizonDeltaY;\n    protected double horizonDeltaZ;\n    protected float horizonXRot;\n    protected float horizonYRot;\n    protected net.minecraft.world.level.Level horizonLevel = new net.minecraft.world.level.Level();\n    protected net.minecraft.world.entity.EntityType horizonType = new net.minecraft.world.entity.EntityType();\n    protected java.util.UUID horizonUuid = new java.util.UUID(0L, 0L);\n    protected int horizonEntityId;\n    protected net.minecraft.world.phys.AABB horizonBoundingBox = new net.minecraft.world.phys.AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);\n    protected boolean horizonOnGround;\n    protected boolean horizonRemoved;\n    protected boolean horizonOnFire;\n    protected boolean horizonInWater;\n    protected boolean horizonInLava;\n    protected boolean horizonCrouching;\n    protected boolean horizonSprinting;"
         );
     }
     if class.name == "net/minecraft/world/entity/EntityType$Builder" {
@@ -2813,6 +2813,24 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         if method == "getKey" && ret == "net.minecraft.resources.Identifier" {
             return "for (java.util.Map.Entry<net.minecraft.resources.Identifier,Object> e : horizonEntries.entrySet()) if (java.util.Objects.equals(e.getValue(), p0)) return e.getKey(); return null;".to_owned();
         }
+        if method == "getId" && ret == "int" {
+            return "int id = 0; for (Object value : horizonEntries.values()) { if (java.util.Objects.equals(value, p0)) return id; id++; } return -1;".to_owned();
+        }
+        if method == "byId" {
+            return format!("int id = p0; if (id < 0 || id >= horizonEntries.size()) return null; return ({ret}) horizonEntries.values().toArray()[id];");
+        }
+        if method == "size" && ret == "int" {
+            return "return horizonEntries.size();".to_owned();
+        }
+        if method == "entrySet" && ret == "java.util.Set" {
+            return "return horizonEntries.entrySet();".to_owned();
+        }
+        if method == "keySet" && ret == "java.util.Set" {
+            return "return horizonEntries.keySet();".to_owned();
+        }
+        if method == "stream" && ret == "java.util.stream.Stream" {
+            return "return horizonEntries.values().stream();".to_owned();
+        }
         if method == "getResourceKey" && ret == "java.util.Optional" {
             return "net.minecraft.resources.Identifier id = getKey(p0); return id == null ? java.util.Optional.empty() : java.util.Optional.ofNullable(horizonKeys.get(id));".to_owned();
         }
@@ -3703,6 +3721,26 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
                 "net.minecraft.world.entity.Entity",
                 "()Lnet/minecraft/world/entity/Entity;",
             ) => return "return null;".to_owned(),
+            ("getId", "int", "()I") => return "return horizonEntityId;".to_owned(),
+            ("setId", "void", "(I)V") => return "horizonEntityId = p0;".to_owned(),
+            (
+                "getType",
+                "net.minecraft.world.entity.EntityType",
+                "()Lnet/minecraft/world/entity/EntityType;",
+            ) => return "return horizonType;".to_owned(),
+            ("getStringUUID", "java.lang.String", "()Ljava/lang/String;") => {
+                return "return horizonUuid.toString();".to_owned();
+            }
+            ("isOnFire", "boolean", "()Z") => return "return horizonOnFire;".to_owned(),
+            ("setSecondsOnFire", "void", "(IZ)V") => return "horizonOnFire = p0 > 0;".to_owned(),
+            ("isInWater", "boolean", "()Z") => return "return horizonInWater;".to_owned(),
+            ("isInLava", "boolean", "()Z") => return "return horizonInLava;".to_owned(),
+            ("isCrouching", "boolean", "()Z") | ("isShiftKeyDown", "boolean", "()Z") => {
+                return "return horizonCrouching;".to_owned();
+            }
+            ("setShiftKeyDown", "void", "(Z)V") => return "horizonCrouching = p0;".to_owned(),
+            ("isSprinting", "boolean", "()Z") => return "return horizonSprinting;".to_owned(),
+            ("setSprinting", "void", "(Z)V") => return "horizonSprinting = p0;".to_owned(),
             ("level", "net.minecraft.world.level.Level", "()Lnet/minecraft/world/level/Level;") => {
                 return "return horizonLevel;".to_owned();
             }
@@ -8286,6 +8324,103 @@ mod tests {
                 "boolean"
             ),
             "return wasItemInteraction;"
+        );
+    }
+
+    #[test]
+    fn entity_facade_retains_identity_and_environment_flags() {
+        let source = include_str!("facade.rs");
+        assert!(source.contains("protected net.minecraft.world.entity.EntityType horizonType"));
+        assert!(source.contains("protected int horizonEntityId;"));
+        assert!(source.contains("protected boolean horizonOnFire;"));
+        assert!(source.contains("protected boolean horizonCrouching;"));
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getId",
+                "int",
+                "()I",
+            ),
+            "return horizonEntityId;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "setId",
+                "void",
+                "(I)V",
+            ),
+            "horizonEntityId = p0;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "getStringUUID",
+                "java.lang.String",
+                "()Ljava/lang/String;",
+            ),
+            "return horizonUuid.toString();"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "setSecondsOnFire",
+                "void",
+                "(IZ)V",
+            ),
+            "horizonOnFire = p0 > 0;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "isShiftKeyDown",
+                "boolean",
+                "()Z",
+            ),
+            "return horizonCrouching;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/Entity",
+                "setSprinting",
+                "void",
+                "(Z)V",
+            ),
+            "horizonSprinting = p0;"
+        );
+    }
+
+    #[test]
+    fn registry_facade_exposes_bounded_ordered_utilities() {
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/Registry",
+                "getId",
+                "int",
+                "(Ljava/lang/Object;)I",
+            ),
+            "int id = 0; for (Object value : horizonEntries.values()) { if (java.util.Objects.equals(value, p0)) return id; id++; } return -1;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/core/DefaultedRegistry",
+                "byId",
+                "java.lang.Object",
+                "(I)Ljava/lang/Object;",
+            ),
+            "int id = p0; if (id < 0 || id >= horizonEntries.size()) return null; return (java.lang.Object) horizonEntries.values().toArray()[id];"
+        );
+        assert_eq!(
+            runtime_body("net/minecraft/core/Registry", "size", "int"),
+            "return horizonEntries.size();"
+        );
+        assert_eq!(
+            runtime_body("net/minecraft/core/Registry", "entrySet", "java.util.Set"),
+            "return horizonEntries.entrySet();"
+        );
+        assert_eq!(
+            runtime_body("net/minecraft/core/Registry", "stream", "java.util.stream.Stream"),
+            "return horizonEntries.values().stream();"
         );
     }
 
