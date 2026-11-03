@@ -3191,6 +3191,26 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     {
         return "return net.minecraft.world.entity.MobCategory.MONSTER;".to_owned();
     }
+    if class == "net/minecraft/world/entity/MobCategory" {
+        match (method, ret) {
+            ("getName", "java.lang.String") => {
+                return "if (name().equals(\"MONSTER\")) return \"monster\"; if (name().equals(\"CREATURE\")) return \"creature\"; if (name().equals(\"AMBIENT\")) return \"ambient\"; if (name().equals(\"AXOLOTLS\")) return \"axolotls\"; if (name().equals(\"UNDERGROUND_WATER_CREATURE\")) return \"underground_water_creature\"; if (name().equals(\"WATER_CREATURE\")) return \"water_creature\"; if (name().equals(\"WATER_AMBIENT\")) return \"water_ambient\"; return \"misc\";".to_owned();
+            }
+            ("getMaxInstancesPerChunk", "int") => {
+                return "if (name().equals(\"MONSTER\")) return 70; if (name().equals(\"CREATURE\")) return 10; if (name().equals(\"AMBIENT\")) return 15; if (name().equals(\"WATER_AMBIENT\")) return 20; if (name().equals(\"MISC\")) return -1; return 5;".to_owned();
+            }
+            ("isFriendly", "boolean") => {
+                return "return !name().equals(\"MONSTER\");".to_owned();
+            }
+            ("isPersistent", "boolean") => {
+                return "return name().equals(\"CREATURE\") || name().equals(\"MISC\");".to_owned();
+            }
+            ("getDespawnDistance", "int") => {
+                return "return name().equals(\"WATER_AMBIENT\") ? 64 : 128;".to_owned();
+            }
+            _ => {}
+        }
+    }
     if class == "net/minecraft/client/KeyMapping$Category"
         && method == "register"
         && ret == "net.minecraft.client.KeyMapping.Category"
@@ -4833,6 +4853,38 @@ mod tests {
                 "net.minecraft.world.entity.MobCategory"
             ),
             "return net.minecraft.world.entity.MobCategory.MONSTER;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/MobCategory",
+                "getName",
+                "java.lang.String"
+            ),
+            "if (name().equals(\"MONSTER\")) return \"monster\"; if (name().equals(\"CREATURE\")) return \"creature\"; if (name().equals(\"AMBIENT\")) return \"ambient\"; if (name().equals(\"AXOLOTLS\")) return \"axolotls\"; if (name().equals(\"UNDERGROUND_WATER_CREATURE\")) return \"underground_water_creature\"; if (name().equals(\"WATER_CREATURE\")) return \"water_creature\"; if (name().equals(\"WATER_AMBIENT\")) return \"water_ambient\"; return \"misc\";"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/MobCategory",
+                "getMaxInstancesPerChunk",
+                "int"
+            ),
+            "if (name().equals(\"MONSTER\")) return 70; if (name().equals(\"CREATURE\")) return 10; if (name().equals(\"AMBIENT\")) return 15; if (name().equals(\"WATER_AMBIENT\")) return 20; if (name().equals(\"MISC\")) return -1; return 5;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/MobCategory",
+                "isFriendly",
+                "boolean"
+            ),
+            "return !name().equals(\"MONSTER\");"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/MobCategory",
+                "getDespawnDistance",
+                "int"
+            ),
+            "return name().equals(\"WATER_AMBIENT\") ? 64 : 128;"
         );
         assert_eq!(
             runtime_body(
