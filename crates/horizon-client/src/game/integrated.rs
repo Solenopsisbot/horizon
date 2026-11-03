@@ -985,8 +985,58 @@ fn serve(
     tasks: Receiver<Task>,
     ready: &Sender<Ready>,
 ) -> Result<()> {
+    let mut options = options;
+    run_server_java_mods(&mut options)?;
     let mut server = server_game(res, pack, options, settings)?;
     server.run_integrated(launch, flags, tasks, ready)
+}
+
+/// Run Java entrypoints in the integrated server's loader context.
+///
+/// The window invokes client entrypoints before resource loading.  The
+/// integrated server is a second `Game` with its own loader role, so server
+/// entrypoints must run on this thread as well.  A client-only jar is valid in
+/// an integrated world and is skipped here; a dedicated server still rejects
+/// it in the top-level startup path.  Declarations are retained on the server
+/// options so a later resource reload can synchronize their content tables.
+fn run_server_java_mods(options: &mut Options) -> Result<()> {
+    if options.java_mods.is_empty() {
+        return Ok(());
+    }
+    let mut additions = Vec::new();
+    for path in &options.java_mods {
+        match super::mods::run_java_mods(
+            std::slice::from_ref(path),
+            ExecutionRole::IntegratedServer,
+        ) {
+            Ok(mut content) => additions.append(&mut content),
+            Err(error) if client_only_server_error(&error) => {
+                log::info!(
+                    "Horizon: skipping client-only Java mod on integrated server: {}",
+                    path.display()
+                );
+            }
+            Err(error) => {
+                return Err(
+                    format!("native Java integrated-server startup failed: {error}").into(),
+                );
+            }
+        }
+    }
+    let content = std::sync::Arc::make_mut(&mut options.java_content);
+    for mod_content in additions {
+        if content.iter().any(|existing| existing.id == mod_content.id) {
+            continue;
+        }
+        content.push(mod_content);
+    }
+    Ok(())
+}
+
+fn client_only_server_error(error: &str) -> bool {
+    error.contains("clientSideOnly mod cannot run for server execution")
+        || (error.contains("no native Fabric or NeoForge entrypoint for server execution")
+            && error.contains("available: client"))
 }
 
 /// Component oracles supply their own synthetic levels and entity phases.
@@ -1035,6 +1085,22 @@ fn server_game(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integrated_server_skips_client_only_java_diagnostics() {
+        assert!(client_only_server_error(
+            "mod.jar: no native Fabric or NeoForge entrypoint for server execution (available: client)"
+        ));
+        assert!(client_only_server_error(
+            "mod.jar: clientSideOnly mod cannot run for server execution"
+        ));
+        assert!(!client_only_server_error(
+            "mod.jar: no native Fabric or NeoForge entrypoint for server execution (available: none)"
+        ));
+        assert!(!client_only_server_error(
+            "mod.jar: native interpreter failed at demo.Mod"
+        ));
+    }
 
     #[test]
     fn shutdown_request_does_not_join_a_server_still_saving() {
