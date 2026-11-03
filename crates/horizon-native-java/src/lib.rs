@@ -113,6 +113,10 @@ pub enum AnnotationValue {
 /// callback that calls `ci.cancel()` suppresses that one call: the interpreter
 /// leaves the invoked descriptor's default value on the stack instead (no
 /// value for a `void` call), and the woven method keeps running.
+///
+/// An empty `at` is the bounded `@Overwrite` shape: the callback takes the
+/// target's whole body, so neither the caller's arguments nor the target's
+/// body are visible to it.  [`MixinInjectionPlan::overwrite`] builds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixinInjectionPlan {
     pub target: MethodRef,
@@ -201,6 +205,21 @@ impl MixinInjectionPlan {
             shift: None,
         }
     }
+
+    /// Plan one `@Overwrite`: an empty `@At` anchor whose callback replaces the
+    /// whole target body.
+    pub fn overwrite(target: MethodRef, callback: MethodRef) -> Self {
+        Self {
+            target,
+            callback,
+            at: String::new(),
+            cancellable: false,
+            invoke_target: None,
+            ordinal: None,
+            slice: None,
+            shift: None,
+        }
+    }
 }
 
 /// One bounded native translation for an `@Inject`/`@Redirect` whose `@At`
@@ -252,6 +271,83 @@ pub struct MixinAnchorReport {
     pub unresolved: usize,
 }
 
+/// One bounded native translation for an `@ModifyArg` callback.
+///
+/// The callback runs immediately before the `@At("INVOKE")` site named by
+/// [`Self::invoke_target`] and its return value replaces argument
+/// [`Self::index`] of that call.  The callback takes the modified argument
+/// alone, or the invoked method's whole argument list, mirroring Mixin's
+/// handler shape; it never captures the target method's arguments.
+/// Cancellation is not part of this injector, so a `cancellable` annotation is
+/// reported instead of executed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixinModifyArgPlan {
+    pub target: MethodRef,
+    pub callback: MethodRef,
+    pub invoke_target: MethodRef,
+    /// Zero-based argument index of the invoked method to replace.
+    pub index: usize,
+    /// `@At.ordinal`: only the ordinal-th matching call site is modified.
+    pub ordinal: Option<usize>,
+}
+
+/// One bounded native translation for an `@ModifyVariable` callback.
+///
+/// The callback runs at each `STORE` or `LOAD` of the selected local and its
+/// return value replaces the stored/loaded value.  The local is selected by
+/// [`Self::index`] (the absolute slot) or [`Self::ordinal`] (the nth store or
+/// load of the callback's value type), never both.  Primitive callbacks match
+/// their exact opcode family (`boolean`/`byte`/`char`/`short` share `int`),
+/// while a reference callback matches any reference opcode: the bounded
+/// interpreter has no local-variable table to name the concrete type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixinModifyVariablePlan {
+    pub target: MethodRef,
+    pub callback: MethodRef,
+    /// `STORE` or `LOAD`.
+    pub at: String,
+    /// The absolute local slot, when the annotation selected one.
+    pub index: Option<usize>,
+    /// The nth store/load of the callback's value type, when selected.
+    pub ordinal: Option<usize>,
+}
+
+/// Counts of every Mixin plan family a jar declares.
+///
+/// `injections`/`anchors`/`overwrites`/`modify_args`/`modify_variables` are the
+/// executable sets their `NativeJar` accessors return, and each
+/// `unresolved_*` field counts the report-only entries whose own accessor
+/// explains the reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MixinDiscoveryReport {
+    pub injections: usize,
+    pub unresolved_injections: usize,
+    pub anchors: usize,
+    pub unresolved_anchors: usize,
+    pub overwrites: usize,
+    pub unresolved_overwrites: usize,
+    pub modify_args: usize,
+    pub unresolved_modify_args: usize,
+    pub modify_variables: usize,
+    pub unresolved_modify_variables: usize,
+}
+
+impl MixinDiscoveryReport {
+    /// Every executable plan this jar declares.
+    pub fn plans(&self) -> usize {
+        self.injections + self.anchors + self.overwrites + self.modify_args + self.modify_variables
+    }
+
+    /// Every report-only plan discovery rejected.
+    pub fn unresolved(&self) -> usize {
+        self.unresolved_injections
+            + self.unresolved_anchors
+            + self.unresolved_overwrites
+            + self.unresolved_modify_args
+            + self.unresolved_modify_variables
+    }
+}
+
 /// Results from executing one supported native Mixin translation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MixinExecutionReport {
@@ -259,17 +355,20 @@ pub struct MixinExecutionReport {
     pub callback_result: Value,
     /// The value the woven method answers with.
     ///
-    /// HEAD and `@Overwrite` plans report the target body's result (or the
-    /// descriptor's default when a HEAD callback cancelled it).  RETURN/TAIL
-    /// plans report the last `CallbackInfoReturnable.setReturnValue` override
-    /// when one exists, and the target's own result otherwise; see
-    /// [`Self::return_value_overridden`].
+    /// HEAD plans report the target body's result (or the descriptor's default
+    /// when a HEAD callback cancelled it), and an `@Overwrite` reports the
+    /// replacement body's result.  RETURN/TAIL plans report the last
+    /// `CallbackInfoReturnable.setReturnValue` override when one exists, and the
+    /// target's own result otherwise; see [`Self::return_value_overridden`].
     pub target_result: Value,
     /// Every callback result in execution order.
     ///
-    /// Single-plan entry points record their one callback here; the
-    /// discovered-injection path records each callback in plan order so a
-    /// caller can verify what ran without depending on host side effects.
+    /// Single-plan entry points record their one callback here.  The
+    /// discovered path records each callback where it ran: HEAD callbacks
+    /// first, then the body's `@ModifyArg`/`@ModifyVariable` callbacks
+    /// interleaved with the call sites and locals they hook, then RETURN/TAIL
+    /// callbacks.  A caller can verify what ran without depending on host side
+    /// effects.
     pub callback_results: Vec<Value>,
     /// Whether a `CallbackInfo.cancel()` stopped this injection.
     ///
@@ -291,18 +390,19 @@ pub struct MixinExecutionReport {
     ///
     /// A site is counted by `(class, method, bytecode offset)`, so a call
     /// site inside a loop counts once while two sibling calls count twice.
-    /// Zero for HEAD, RETURN/TAIL and `@Overwrite` executions.  A target that
-    /// answered a cancellable callback's `ci.cancel()` still counts the site:
-    /// the callback ran, the call did not.
+    /// `@ModifyArg` sites join this count.  Zero for HEAD, RETURN/TAIL and
+    /// `@Overwrite` executions.  A target that answered a cancellable
+    /// callback's `ci.cancel()` still counts the site: the callback ran, the
+    /// call did not.
     pub matched_invoke_sites: usize,
     /// Distinct `FIELD`/`NEW`/`JUMP` bytecode sites that ran at least one
     /// anchor callback.
     ///
     /// A site is counted by `(class, method, bytecode offset)`, so a field
     /// access inside a loop counts once while two sibling accesses count
-    /// twice.  Zero for the HEAD/RETURN/TAIL/INVOKE entry points and for a
-    /// `@Redirect` at `HEAD`, which replaces the whole body rather than
-    /// hooking a site.
+    /// twice.  `@ModifyVariable` store/load sites join this count.  Zero for
+    /// the HEAD/RETURN/TAIL/INVOKE entry points and for a `@Redirect` at
+    /// `HEAD`, which replaces the whole body rather than hooking a site.
     pub matched_anchor_sites: usize,
 }
 
@@ -620,6 +720,202 @@ impl AnchorHooks {
     }
 }
 
+/// One `@ModifyArg` callback bound to one invoke site.
+#[derive(Debug, Clone)]
+struct ModifyArgHookEntry {
+    callback: MethodRef,
+    /// The receiver the callback runs with; `None` for a static callback.
+    receiver: Option<Value>,
+    is_static: bool,
+    /// The argument type the callback replaces.
+    value_descriptor: String,
+    /// Zero-based argument index inside the invoked descriptor.
+    index: usize,
+    /// True when the callback mirrors the invoked method's whole argument
+    /// list; false when it takes only the modified argument.
+    full_subject: bool,
+    /// `@At.ordinal`, counted over matching call sites.
+    ordinal: Option<usize>,
+    hits: usize,
+}
+
+/// Which local-variable instruction an `@ModifyVariable` callback hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VariableAnchor {
+    Store,
+    Load,
+}
+
+/// One `@ModifyVariable` callback bound to the `STORE` or `LOAD` of one local.
+#[derive(Debug, Clone)]
+struct ModifyVariableHookEntry {
+    callback: MethodRef,
+    receiver: Option<Value>,
+    is_static: bool,
+    /// The value type the callback consumes and returns.
+    value_descriptor: String,
+    anchor: VariableAnchor,
+    /// The absolute local slot, when the annotation selected one.
+    index: Option<usize>,
+    /// The nth store/load of `value_descriptor`, when selected.
+    ordinal: Option<usize>,
+    /// The target method's arguments appended after the value, as Mixin's
+    /// optional capture; empty when the callback takes only the value.
+    base_args: Vec<Value>,
+    hits: usize,
+}
+
+/// Bounded `@ModifyArg`/`@ModifyVariable` table for one woven method.
+///
+/// The interpreter consults it before an invoke (one argument replacement) and
+/// at every local store/load the selected callback matches.  Like the other
+/// hook tables it keeps one `CallbackInfo` marker per woven method and never
+/// recurses into itself while a callback runs.
+#[derive(Debug, Default)]
+struct ModifyHooks {
+    /// The one method this table is installed for; a call into another method
+    /// leaves the table alone.
+    target: Option<MethodRef>,
+    /// Invoke-site key to `args` entry indices, in insertion order.
+    arg_sites: BTreeMap<String, Vec<usize>>,
+    args: Vec<ModifyArgHookEntry>,
+    variables: Vec<ModifyVariableHookEntry>,
+    results: Vec<Value>,
+    /// `@ModifyArg` sites, counted like `@At(INVOKE)` sites.
+    matched_invoke_sites: BTreeSet<(String, String, usize)>,
+    /// `@ModifyVariable` store/load sites.
+    matched_anchor_sites: BTreeSet<(String, String, usize)>,
+    dispatching: bool,
+}
+
+impl ModifyHooks {
+    fn applies(&self, class: &str, method: &str, descriptor: &str) -> bool {
+        self.target.as_ref().is_some_and(|target| {
+            target.owner == class && target.name == method && target.descriptor == descriptor
+        })
+    }
+
+    fn insert_arg(
+        &mut self,
+        site: &MethodRef,
+        entry: ModifyArgHookEntry,
+    ) -> Result<(), NativeError> {
+        if self.args.len() >= MAX_INVOKE_HOOKS {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin execution reached the bound of {MAX_INVOKE_HOOKS} @ModifyArg hooks"
+            )));
+        }
+        let index = self.args.len();
+        self.arg_sites
+            .entry(invoke_site_key(site))
+            .or_default()
+            .push(index);
+        self.args.push(entry);
+        Ok(())
+    }
+
+    fn insert_variable(&mut self, entry: ModifyVariableHookEntry) -> Result<(), NativeError> {
+        if self.variables.len() >= MAX_INVOKE_HOOKS {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin execution reached the bound of {MAX_INVOKE_HOOKS} @ModifyVariable hooks"
+            )));
+        }
+        self.variables.push(entry);
+        Ok(())
+    }
+
+    /// Entries bound to one invoked method, with their hit counter advanced.
+    ///
+    /// A selector without a descriptor matches every overload, so the exact
+    /// key and the name-only key are merged, like [`InvokeHooks::lookup`].
+    fn arg_candidates(&mut self, site: &MethodRef) -> Vec<ModifyArgHookEntry> {
+        let mut indices = Vec::new();
+        for key in [invoke_site_key(site), invoke_name_key(site)] {
+            if let Some(bound) = self.arg_sites.get(&key) {
+                indices.extend_from_slice(bound);
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        let mut matched = Vec::new();
+        for index in indices {
+            let Some(entry) = self.args.get_mut(index) else {
+                continue;
+            };
+            let hit = entry.hits;
+            entry.hits = entry.hits.saturating_add(1);
+            if entry.ordinal.is_none_or(|ordinal| ordinal == hit) {
+                matched.push(entry.clone());
+            }
+        }
+        matched
+    }
+
+    /// Entries bound to one local store/load, with their hit counter advanced.
+    ///
+    /// A hit only counts when the instruction's opcode type fits the
+    /// callback's value type and, when selected, the local slot matches, so
+    /// `ordinal` counts the stores/loads of exactly the captured variable.
+    fn variable_candidates(
+        &mut self,
+        anchor: VariableAnchor,
+        slot: usize,
+        instruction_type: &str,
+    ) -> Vec<ModifyVariableHookEntry> {
+        let mut matched = Vec::new();
+        for entry in &mut self.variables {
+            if entry.anchor != anchor {
+                continue;
+            }
+            if entry.index.is_some_and(|index| index != slot) {
+                continue;
+            }
+            if !variable_type_matches(&entry.value_descriptor, instruction_type) {
+                continue;
+            }
+            let hit = entry.hits;
+            entry.hits = entry.hits.saturating_add(1);
+            if entry.ordinal.is_none_or(|ordinal| ordinal == hit) {
+                matched.push(entry.clone());
+            }
+        }
+        matched
+    }
+}
+
+/// Whether a callback's declared value type can capture an instruction whose
+/// opcode reads or writes `instruction_type`.
+///
+/// The JVM has one store/load opcode per type family, so `iload`/`istore` cover
+/// `boolean`, `byte`, `char`, `short` and `int`, and every reference opcode
+/// covers every object and array type.
+fn variable_type_matches(declared: &str, instruction_type: &str) -> bool {
+    match (declared, instruction_type) {
+        ("Z" | "B" | "C" | "S" | "I", "I") | ("J", "J") | ("F", "F") | ("D", "D") => true,
+        (declared, instruction_type) => {
+            is_reference_descriptor(declared) && is_reference_descriptor(instruction_type)
+        }
+    }
+}
+
+fn is_reference_descriptor(descriptor: &str) -> bool {
+    descriptor.starts_with('L') || descriptor.starts_with('[')
+}
+
+/// The local type family of one `xLOAD`/`xSTORE` opcode group.
+///
+/// Group 0 is `i*` (which also covers `boolean`, `byte`, `char` and `short`),
+/// 1 is `l*`, 2 is `f*`, 3 is `d*` and every reference opcode is group 4.
+fn local_opcode_type(group: u8) -> &'static str {
+    match group {
+        0 => "I",
+        1 => "J",
+        2 => "F",
+        3 => "D",
+        _ => "Ljava/lang/Object;",
+    }
+}
+
 /// Normalize a callback's `setReturnValue` argument to the target's declared
 /// return descriptor.
 ///
@@ -629,15 +925,24 @@ impl AnchorHooks {
 /// handing it a primitive is a bounded diagnostic instead of a phantom
 /// coercion.  `Value::Void` clears the override (handled by the caller).
 fn return_override(desc: &str, value: Value) -> Result<Option<Value>, NativeError> {
+    adapt_value(desc, value, "native Mixin CallbackInfoReturnable override")
+}
+
+/// Shared shape check for a value a callback produces for a declared type.
+///
+/// `context` names the producing callback in the diagnostics, so a
+/// `@ModifyArg`/`@ModifyVariable` mismatch never claims to be a
+/// `CallbackInfoReturnable` problem.
+fn adapt_value(desc: &str, value: Value, context: &str) -> Result<Option<Value>, NativeError> {
     let desc = if desc.contains('(') {
         return_desc(desc)
     } else {
         desc
     };
     match desc {
-        "V" => Err(NativeError::Metadata(
-            "native Mixin CallbackInfoReturnable cannot override a void target".into(),
-        )),
+        "V" => Err(NativeError::Metadata(format!(
+            "{context} cannot produce a value for a void descriptor"
+        ))),
         "Z" | "B" | "C" | "S" | "I" | "J" | "D" | "F" => {
             // A `long` target keeps its exact 64 bits, and an `F`/`D` target
             // keeps its floating-point value (rounded to `f32` for `F`); every
@@ -657,7 +962,7 @@ fn return_override(desc: &str, value: Value) -> Result<Option<Value>, NativeErro
             };
             let integer = integer.ok_or_else(|| {
                 NativeError::Metadata(format!(
-                    "native Mixin CallbackInfoReturnable override {} does not fit primitive return {desc}",
+                    "{context} {} does not fit primitive return {desc}",
                     value_marker(&value)
                 ))
             })?;
@@ -671,7 +976,7 @@ fn return_override(desc: &str, value: Value) -> Result<Option<Value>, NativeErro
             Value::Ref(_) => Ok(Some(value)),
             Value::Int(_) | Value::Long(_) | Value::Float(_) => {
                 Err(NativeError::Metadata(format!(
-                    "native Mixin CallbackInfoReturnable override {} is primitive but return {desc} is a reference",
+                    "{context} {} is primitive but return {desc} is a reference",
                     value_marker(&value)
                 )))
             }
@@ -7956,6 +8261,357 @@ impl NativeJar {
         (plans, unresolved)
     }
 
+    /// Discover the `@Overwrite` plans this jar declares.
+    ///
+    /// An overwrite takes its target name from the annotated method and the
+    /// target owner from `@Mixin`.  When the target class is in the jar the
+    /// descriptor is resolved against its overloads and validated for an exact
+    /// signature and static-ness match; when the target lives in the game the
+    /// plan keeps the callback's descriptor for execution-time validation.
+    /// Two overwrites of the same target, a name the target does not declare,
+    /// an ambiguous overload set and a bodiless callback stay out of this set
+    /// and are reported by [`Self::unresolved_overwrite_plans`].
+    pub fn mixin_overwrite_plans(&self) -> Vec<MixinInjectionPlan> {
+        self.mixin_overwrite_scan().0
+    }
+
+    /// `@Overwrite` candidates this runtime cannot execute, with a precise
+    /// reason.  Diagnostics, not executable plans.
+    pub fn unresolved_overwrite_plans(&self) -> Vec<(MixinInjectionPlan, String)> {
+        self.mixin_overwrite_scan().1
+    }
+
+    fn mixin_overwrite_scan(&self) -> (Vec<MixinInjectionPlan>, Vec<(MixinInjectionPlan, String)>) {
+        const MIXIN: &str = "Lorg/spongepowered/asm/mixin/Mixin;";
+        const OVERWRITE: &str = "Lorg/spongepowered/asm/mixin/Overwrite;";
+        let mut candidates = Vec::new();
+        for class in self.classes.values() {
+            let Some(mixin) = class
+                .annotations
+                .iter()
+                .find(|annotation| annotation.descriptor == MIXIN)
+            else {
+                continue;
+            };
+            let targets = mixin_target_owners(mixin);
+            for method in &class.methods {
+                if !method
+                    .annotations
+                    .iter()
+                    .any(|annotation| annotation.descriptor == OVERWRITE)
+                {
+                    continue;
+                }
+                for owner in &targets {
+                    let callback = MethodRef {
+                        owner: class.name.clone(),
+                        name: method.name.clone(),
+                        descriptor: method.descriptor.clone(),
+                    };
+                    let mut target = MethodRef {
+                        owner: owner.clone(),
+                        name: method.name.clone(),
+                        descriptor: method.descriptor.clone(),
+                    };
+                    let mut reason =
+                        overwrite_shape_reason(self, method, &callback, owner, &mut target);
+                    if method.code.is_none() && reason.is_none() {
+                        reason = Some(format!(
+                            "@Overwrite callback {}#{}{} has no body",
+                            callback.owner, callback.name, callback.descriptor
+                        ));
+                    }
+                    candidates.push((MixinInjectionPlan::overwrite(target, callback), reason));
+                }
+            }
+        }
+        // Once the target descriptors are resolved, more than one executable
+        // overwrite of the same method is ambiguous: Mixin applies exactly one,
+        // and guessing which would silently discard another mod's body.
+        let mut groups: BTreeMap<(String, String, String), Vec<usize>> = BTreeMap::new();
+        for (index, (plan, reason)) in candidates.iter().enumerate() {
+            if reason.is_none() {
+                groups
+                    .entry((
+                        plan.target.owner.clone(),
+                        plan.target.name.clone(),
+                        plan.target.descriptor.clone(),
+                    ))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        for indices in groups.values().filter(|indices| indices.len() > 1) {
+            let label = {
+                let plan = &candidates[indices[0]].0;
+                format!(
+                    "{}#{}{}",
+                    plan.target.owner, plan.target.name, plan.target.descriptor
+                )
+            };
+            for &index in indices {
+                candidates[index].1 = Some(format!(
+                    "target {label} has {} @Overwrite methods; native execution supports exactly one",
+                    indices.len()
+                ));
+            }
+        }
+        let mut plans = Vec::new();
+        let mut unresolved = Vec::new();
+        for (plan, reason) in candidates {
+            match reason {
+                Some(reason) => unresolved.push((plan, reason)),
+                None => plans.push(plan),
+            }
+        }
+        plans.sort_by(|a, b| mixin_plan_sort_key(a).cmp(&mixin_plan_sort_key(b)));
+        plans.dedup();
+        unresolved.sort_by(|a, b| {
+            mixin_plan_sort_key(&a.0)
+                .cmp(&mixin_plan_sort_key(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        unresolved.dedup();
+        (plans, unresolved)
+    }
+
+    /// Discover the `@ModifyArg` plans this jar declares.
+    ///
+    /// Each plan names one `@At("INVOKE")` site and the zero-based argument it
+    /// replaces.  The callback must return the argument's own type and either
+    /// take that argument alone or mirror the invoked method's whole argument
+    /// list, which is Mixin's bounded handler shape.  Cancellation, slices,
+    /// shifts, a missing call descriptor and an out-of-range index stay out of
+    /// this set and are reported by [`Self::unresolved_modify_arg_plans`].
+    pub fn mixin_modify_arg_plans(&self) -> Vec<MixinModifyArgPlan> {
+        self.mixin_modify_arg_scan().0
+    }
+
+    /// `@ModifyArg` candidates this runtime cannot execute, with a precise
+    /// reason.
+    pub fn unresolved_modify_arg_plans(&self) -> Vec<(MixinModifyArgPlan, String)> {
+        self.mixin_modify_arg_scan().1
+    }
+
+    fn mixin_modify_arg_scan(
+        &self,
+    ) -> (Vec<MixinModifyArgPlan>, Vec<(MixinModifyArgPlan, String)>) {
+        const MIXIN: &str = "Lorg/spongepowered/asm/mixin/Mixin;";
+        const MODIFY_ARG: &str = "Lorg/spongepowered/asm/mixin/injection/ModifyArg;";
+        let mut plans = Vec::new();
+        let mut unresolved = Vec::new();
+        for class in self.classes.values() {
+            let Some(mixin) = class
+                .annotations
+                .iter()
+                .find(|annotation| annotation.descriptor == MIXIN)
+            else {
+                continue;
+            };
+            let targets = mixin_target_owners(mixin);
+            for method in &class.methods {
+                for annotation in method
+                    .annotations
+                    .iter()
+                    .filter(|annotation| annotation.descriptor == MODIFY_ARG)
+                {
+                    let callback = MethodRef {
+                        owner: class.name.clone(),
+                        name: method.name.clone(),
+                        descriptor: method.descriptor.clone(),
+                    };
+                    let method_specs = annotation
+                        .values
+                        .get("method")
+                        .map(annotation_strings)
+                        .unwrap_or_default();
+                    let anchors = annotation
+                        .values
+                        .get("at")
+                        .map(annotation_anchor_selectors)
+                        .unwrap_or_default();
+                    let cancellable = annotation_bool(annotation, "cancellable");
+                    let slices = annotation.values.contains_key("slice");
+                    let index = annotation_int(annotation, "index").unwrap_or(0);
+                    for owner in &targets {
+                        for method_spec in &method_specs {
+                            let Some((target_name, target_descriptor)) =
+                                split_injection_method(method_spec)
+                            else {
+                                continue;
+                            };
+                            for anchor in &anchors {
+                                let mut plan = MixinModifyArgPlan {
+                                    target: MethodRef {
+                                        owner: owner.clone(),
+                                        name: target_name.to_owned(),
+                                        descriptor: target_descriptor.to_owned(),
+                                    },
+                                    callback: callback.clone(),
+                                    invoke_target: MethodRef {
+                                        owner: String::new(),
+                                        name: String::new(),
+                                        descriptor: String::new(),
+                                    },
+                                    index: 0,
+                                    ordinal: None,
+                                };
+                                let reason = modify_arg_plan_reason(
+                                    anchor,
+                                    &callback,
+                                    index,
+                                    cancellable,
+                                    slices,
+                                    &mut plan,
+                                );
+                                match reason {
+                                    Some(reason) => unresolved.push((plan, reason)),
+                                    None => plans.push(plan),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        plans.sort_by(|a, b| mixin_modify_arg_sort_key(a).cmp(&mixin_modify_arg_sort_key(b)));
+        plans.dedup();
+        unresolved.sort_by(|a, b| {
+            mixin_modify_arg_sort_key(&a.0)
+                .cmp(&mixin_modify_arg_sort_key(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        unresolved.dedup();
+        (plans, unresolved)
+    }
+
+    /// Discover the `@ModifyVariable` plans this jar declares.
+    ///
+    /// Each plan hooks the `STORE` or `LOAD` of one local, selected by its
+    /// absolute `index` or by the `ordinal`-th store/load of the callback's
+    /// value type.  The callback returns that same type and may append the
+    /// target method's arguments to capture them.  An implicit selection (no
+    /// `index` and no `ordinal`), both selectors at once, a non-`STORE`/`LOAD`
+    /// anchor and an unsupported annotation member stay out of this set and are
+    /// reported by [`Self::unresolved_modify_variable_plans`].
+    pub fn mixin_modify_variable_plans(&self) -> Vec<MixinModifyVariablePlan> {
+        self.mixin_modify_variable_scan().0
+    }
+
+    /// `@ModifyVariable` candidates this runtime cannot execute, with a precise
+    /// reason.
+    pub fn unresolved_modify_variable_plans(&self) -> Vec<(MixinModifyVariablePlan, String)> {
+        self.mixin_modify_variable_scan().1
+    }
+
+    fn mixin_modify_variable_scan(
+        &self,
+    ) -> (
+        Vec<MixinModifyVariablePlan>,
+        Vec<(MixinModifyVariablePlan, String)>,
+    ) {
+        const MIXIN: &str = "Lorg/spongepowered/asm/mixin/Mixin;";
+        const MODIFY_VARIABLE: &str = "Lorg/spongepowered/asm/mixin/injection/ModifyVariable;";
+        let mut plans = Vec::new();
+        let mut unresolved = Vec::new();
+        for class in self.classes.values() {
+            let Some(mixin) = class
+                .annotations
+                .iter()
+                .find(|annotation| annotation.descriptor == MIXIN)
+            else {
+                continue;
+            };
+            let targets = mixin_target_owners(mixin);
+            for method in &class.methods {
+                for annotation in method
+                    .annotations
+                    .iter()
+                    .filter(|annotation| annotation.descriptor == MODIFY_VARIABLE)
+                {
+                    let callback = MethodRef {
+                        owner: class.name.clone(),
+                        name: method.name.clone(),
+                        descriptor: method.descriptor.clone(),
+                    };
+                    let method_specs = annotation
+                        .values
+                        .get("method")
+                        .map(annotation_strings)
+                        .unwrap_or_default();
+                    let anchors = annotation
+                        .values
+                        .get("at")
+                        .map(annotation_anchor_selectors)
+                        .unwrap_or_default();
+                    let index = annotation_int(annotation, "index").unwrap_or(-1);
+                    let ordinal = annotation_int(annotation, "ordinal").unwrap_or(-1);
+                    for owner in &targets {
+                        for method_spec in &method_specs {
+                            let Some((target_name, target_descriptor)) =
+                                split_injection_method(method_spec)
+                            else {
+                                continue;
+                            };
+                            for anchor in &anchors {
+                                let mut plan = MixinModifyVariablePlan {
+                                    target: MethodRef {
+                                        owner: owner.clone(),
+                                        name: target_name.to_owned(),
+                                        descriptor: target_descriptor.to_owned(),
+                                    },
+                                    callback: callback.clone(),
+                                    at: anchor.anchor.clone(),
+                                    index: None,
+                                    ordinal: None,
+                                };
+                                let reason = modify_variable_plan_reason(
+                                    self, annotation, anchor, &callback, index, ordinal, &mut plan,
+                                );
+                                match reason {
+                                    Some(reason) => unresolved.push((plan, reason)),
+                                    None => plans.push(plan),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        plans.sort_by(|a, b| {
+            mixin_modify_variable_sort_key(a).cmp(&mixin_modify_variable_sort_key(b))
+        });
+        plans.dedup();
+        unresolved.sort_by(|a, b| {
+            mixin_modify_variable_sort_key(&a.0)
+                .cmp(&mixin_modify_variable_sort_key(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        unresolved.dedup();
+        (plans, unresolved)
+    }
+
+    /// Counts of every Mixin plan family this jar declares.
+    pub fn mixin_discovery_report(&self) -> MixinDiscoveryReport {
+        let (injections, unresolved_injections) = self.mixin_plan_scan();
+        let (anchors, unresolved_anchors) = self.mixin_anchor_scan();
+        let (overwrites, unresolved_overwrites) = self.mixin_overwrite_scan();
+        let (modify_args, unresolved_modify_args) = self.mixin_modify_arg_scan();
+        let (modify_variables, unresolved_modify_variables) = self.mixin_modify_variable_scan();
+        MixinDiscoveryReport {
+            injections: injections.len(),
+            unresolved_injections: unresolved_injections.len(),
+            anchors: anchors.len(),
+            unresolved_anchors: unresolved_anchors.len(),
+            overwrites: overwrites.len(),
+            unresolved_overwrites: unresolved_overwrites.len(),
+            modify_args: modify_args.len(),
+            unresolved_modify_args: unresolved_modify_args.len(),
+            modify_variables: modify_variables.len(),
+            unresolved_modify_variables: unresolved_modify_variables.len(),
+        }
+    }
+
     /// Enumerate the target methods this jar would weave, sorted and
     /// deduplicated.
     ///
@@ -8383,6 +9039,7 @@ impl NativeJar {
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
             anchor_hooks: None,
+            modify_hooks: None,
             pending_skipped_new: Vec::new(),
         };
         if !runtime.classes.contains_key(&class_name) {
@@ -8478,6 +9135,7 @@ impl NativeJar {
             callback_infos,
             None,
             None,
+            None,
         )
     }
 
@@ -8504,6 +9162,34 @@ impl NativeJar {
             callback_infos,
             None,
             Some(anchor_hooks),
+            None,
+        )
+    }
+
+    /// Invoke one jar method with the runtime-owned callback table and the
+    /// `@ModifyArg`/`@ModifyVariable` table one target declares.
+    fn invoke_with_modify_hooks<H: Host>(
+        &self,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+        callback_infos: &mut CallbackInfos,
+        modify_hooks: &mut ModifyHooks,
+    ) -> Result<Value, NativeError> {
+        self.invoke_with_hooks(
+            class,
+            method,
+            descriptor,
+            receiver,
+            args,
+            host,
+            callback_infos,
+            None,
+            None,
+            Some(modify_hooks),
         )
     }
 
@@ -8520,6 +9206,7 @@ impl NativeJar {
         callback_infos: &mut CallbackInfos,
         invoke_hooks: Option<&mut InvokeHooks>,
         anchor_hooks: Option<&mut AnchorHooks>,
+        modify_hooks: Option<&mut ModifyHooks>,
     ) -> Result<Value, NativeError> {
         let class_name = class.replace('.', "/");
         let mut runtime = Runtime {
@@ -8540,6 +9227,7 @@ impl NativeJar {
             callback_infos,
             invoke_hooks,
             anchor_hooks,
+            modify_hooks,
             pending_skipped_new: Vec::new(),
         };
         runtime.invoke(&class_name, method, descriptor, receiver, args)
@@ -9107,7 +9795,7 @@ impl NativeJar {
                 "native Mixin @At(INVOKE) chain is empty".into(),
             ));
         };
-        self.execute_invoke_plans(&first.target, plans, receiver, args, host)
+        self.execute_invoke_plans(&first.target, plans, receiver, args, host, None)
     }
 
     /// Run one woven method with the `@At("INVOKE")` hook table its plans
@@ -9119,6 +9807,7 @@ impl NativeJar {
         receiver: Option<Value>,
         args: &[Value],
         host: &mut H,
+        mut modify_hooks: Option<&mut ModifyHooks>,
     ) -> Result<MixinExecutionReport, NativeError> {
         let target_class = self.classes.get(&target.owner).ok_or_else(|| {
             NativeError::MissingMethod(format!(
@@ -9201,14 +9890,26 @@ impl NativeJar {
             &mut callback_infos,
             Some(&mut hooks),
             None,
+            modify_hooks.as_deref_mut(),
         )?;
+        let mut matched_sites = hooks.matched_sites.clone();
+        if let Some(modify) = &modify_hooks {
+            matched_sites.extend(modify.matched_invoke_sites.iter().cloned());
+        }
+        let callback_results = if hooks.results.is_empty() {
+            modify_hooks
+                .as_ref()
+                .map_or_else(Vec::new, |hooks| hooks.results.clone())
+        } else {
+            hooks.results.clone()
+        };
         Ok(MixinExecutionReport {
-            callback_result: hooks.results.last().cloned().unwrap_or(Value::Void),
+            callback_result: callback_results.last().cloned().unwrap_or(Value::Void),
             target_result,
-            callback_results: hooks.results.clone(),
+            callback_results,
             cancelled: hooks.cancelled,
             return_value_overridden: false,
-            matched_invoke_sites: hooks.matched_sites.len(),
+            matched_invoke_sites: matched_sites.len(),
             matched_anchor_sites: 0,
         })
     }
@@ -9240,6 +9941,18 @@ impl NativeJar {
     /// `NativeError::Metadata`; they stay on the JVM fallback rather than
     /// approximating a call-site hook and an around-the-body hook at once.
     /// HEAD and RETURN/TAIL callbacks do run together, as in one woven method.
+    ///
+    /// An `@Overwrite` of the target replaces the body outright: the overwrite
+    /// method runs with the same receiver and arguments and its value is the
+    /// target's result.  The original body never runs, and an overwrite that
+    /// shares its target with any other executable plan is rejected instead of
+    /// picking one.
+    ///
+    /// `@ModifyArg` and `@ModifyVariable` plans run inside the target body:
+    /// each argument modifier replaces its argument of the matched call just
+    /// before that call, and each local modifier replaces the value stored to
+    /// or loaded from its selected slot.  Their results join
+    /// [`MixinExecutionReport::callback_results`] at the point they ran.
     pub fn execute_discovered_mixins<H: Host>(
         &self,
         target: &MethodRef,
@@ -9247,11 +9960,27 @@ impl NativeJar {
         args: &[Value],
         host: &mut H,
     ) -> Result<MixinExecutionReport, NativeError> {
+        let overwrites = self
+            .mixin_overwrite_plans()
+            .into_iter()
+            .filter(|plan| plan_target_matches(&plan.target, target))
+            .collect::<Vec<_>>();
+        if !overwrites.is_empty() {
+            return self.execute_overwrite_plans(target, &overwrites, receiver, args, host);
+        }
+        let mut modify_hooks = self.discovered_modify_hooks(target, receiver.as_ref(), args)?;
         let plans = self.discovered_mixin_plans(target)?;
         // One anchor family per target: an INVOKE selection runs the target
         // once with the call-site hook table.
         if plans.first().is_some_and(|plan| plan.at == "INVOKE") {
-            return self.execute_invoke_plans(target, &plans, receiver, args, host);
+            return self.execute_invoke_plans(
+                target,
+                &plans,
+                receiver,
+                args,
+                host,
+                modify_hooks.as_mut(),
+            );
         }
         let target_class = self.classes.get(&target.owner).ok_or_else(|| {
             NativeError::MissingMethod(format!(
@@ -9288,9 +10017,9 @@ impl NativeJar {
         callback_infos.open(&marker)?;
         let mut cancelled = false;
         let mut overridden = None;
-        let mut callback_results = Vec::with_capacity(plans.len());
+        let mut head_results = Vec::with_capacity(head_count);
         for plan in &plans[..head_count] {
-            callback_results.push(self.invoke_mixin_callback(
+            head_results.push(self.invoke_mixin_callback(
                 plan,
                 receiver.clone(),
                 args,
@@ -9312,20 +10041,33 @@ impl NativeJar {
                     .clone()
                     .unwrap_or_else(|| Value::Ref(Some(target.owner.clone())))
             });
-            let result = self.invoke_with_callback_infos(
-                &target.owner,
-                &target.name,
-                &target.descriptor,
-                target_receiver,
-                args,
-                host,
-                &mut callback_infos,
-            )?;
+            let result = match modify_hooks.as_mut() {
+                Some(hooks) => self.invoke_with_modify_hooks(
+                    &target.owner,
+                    &target.name,
+                    &target.descriptor,
+                    target_receiver,
+                    args,
+                    host,
+                    &mut callback_infos,
+                    hooks,
+                )?,
+                None => self.invoke_with_callback_infos(
+                    &target.owner,
+                    &target.name,
+                    &target.descriptor,
+                    target_receiver,
+                    args,
+                    host,
+                    &mut callback_infos,
+                )?,
+            };
             if return_desc(&target.descriptor) != "V" {
                 callback_infos.set_actual(&marker, result.clone())?;
             }
+            let mut return_results = Vec::with_capacity(plans.len() - head_count);
             for plan in &plans[head_count..] {
-                callback_results.push(self.invoke_mixin_callback(
+                return_results.push(self.invoke_mixin_callback(
                     plan,
                     receiver.clone(),
                     args,
@@ -9336,17 +10078,274 @@ impl NativeJar {
                 // callback that clears it falls back to the target's result.
                 overridden = callback_infos.take_override(&marker, &target.descriptor)?;
             }
-            overridden.clone().unwrap_or(result)
+            // Execution order: HEAD callbacks, the body's modify callbacks,
+            // then RETURN/TAIL callbacks.
+            let mut callback_results = head_results;
+            if let Some(hooks) = &modify_hooks {
+                callback_results.extend(hooks.results.iter().cloned());
+            }
+            callback_results.extend(return_results);
+            return Ok(MixinExecutionReport {
+                callback_result: callback_results.last().cloned().unwrap_or(Value::Void),
+                target_result: overridden.clone().unwrap_or(result),
+                callback_results,
+                cancelled,
+                return_value_overridden: overridden.is_some(),
+                matched_invoke_sites: modify_hooks
+                    .as_ref()
+                    .map_or(0, |hooks| hooks.matched_invoke_sites.len()),
+                matched_anchor_sites: modify_hooks
+                    .as_ref()
+                    .map_or(0, |hooks| hooks.matched_anchor_sites.len()),
+            });
         };
         Ok(MixinExecutionReport {
-            callback_result: callback_results.last().cloned().unwrap_or(Value::Void),
+            callback_result: head_results.last().cloned().unwrap_or(Value::Void),
             target_result,
-            callback_results,
+            callback_results: head_results,
             cancelled,
-            return_value_overridden: overridden.is_some(),
+            return_value_overridden: false,
             matched_invoke_sites: 0,
             matched_anchor_sites: 0,
         })
+    }
+
+    /// Run an `@Overwrite` in place of the target body.
+    ///
+    /// Exactly one executable overwrite may name a target.  It also cannot
+    /// share the target with any other executable plan: an overwrite replaces
+    /// the whole body, so running an injection or modifier around it would
+    /// silently resurrect the behavior the overwrite removed.
+    fn execute_overwrite_plans<H: Host>(
+        &self,
+        target: &MethodRef,
+        plans: &[MixinInjectionPlan],
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        let Some(plan) = plans.first() else {
+            return Err(NativeError::Metadata(format!(
+                "no executable native @Overwrite for {}#{}{}",
+                target.owner, target.name, target.descriptor
+            )));
+        };
+        if plans.len() > 1 {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin target {}#{}{} has {} @Overwrite methods; native execution supports exactly one",
+                target.owner,
+                target.name,
+                target.descriptor,
+                plans.len()
+            )));
+        }
+        let injections = self
+            .mixin_injection_plans()
+            .iter()
+            .filter(|candidate| plan_target_matches(&candidate.target, target))
+            .count();
+        let anchors = self
+            .mixin_anchor_plans()
+            .iter()
+            .filter(|candidate| plan_target_matches(&candidate.target, target))
+            .count();
+        let modify_args = self
+            .mixin_modify_arg_plans()
+            .iter()
+            .filter(|candidate| plan_target_matches(&candidate.target, target))
+            .count();
+        let modify_variables = self
+            .mixin_modify_variable_plans()
+            .iter()
+            .filter(|candidate| plan_target_matches(&candidate.target, target))
+            .count();
+        let others = injections + anchors + modify_args + modify_variables;
+        if others > 0 {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin target {}#{}{} has an @Overwrite and {others} other executable plan(s); an overwrite replaces the whole body and cannot coexist",
+                target.owner, target.name, target.descriptor
+            )));
+        }
+        self.execute_mixin_overwrite(plan, receiver, args, host)
+    }
+
+    /// Build the `@ModifyArg`/`@ModifyVariable` table one target declares.
+    ///
+    /// The callbacks are validated against the loaded target before the body
+    /// runs: an argument index outside the invoked signature, a callback that
+    /// returns a different type, a local capture that does not take the value
+    /// first and a mismatched target-argument capture are all bounded
+    /// diagnostics rather than half-applied hooks.
+    fn discovered_modify_hooks(
+        &self,
+        target: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<ModifyHooks>, NativeError> {
+        let arg_plans = self
+            .mixin_modify_arg_plans()
+            .into_iter()
+            .filter(|plan| plan_target_matches(&plan.target, target))
+            .collect::<Vec<_>>();
+        let variable_plans = self
+            .mixin_modify_variable_plans()
+            .into_iter()
+            .filter(|plan| plan_target_matches(&plan.target, target))
+            .collect::<Vec<_>>();
+        if arg_plans.is_empty() && variable_plans.is_empty() {
+            return Ok(None);
+        }
+        let target_class = self.classes.get(&target.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                target.owner, target.name, target.descriptor
+            ))
+        })?;
+        target_class
+            .method(&target.name, &target.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    target.owner, target.name, target.descriptor
+                ))
+            })?;
+        let target_args = descriptor_arguments(&target.descriptor);
+        let mut hooks = ModifyHooks {
+            target: Some(target.clone()),
+            ..ModifyHooks::default()
+        };
+        for plan in arg_plans {
+            let callback_class = self.classes.get(&plan.callback.owner).ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                ))
+            })?;
+            let callback_method = callback_class
+                .method(&plan.callback.name, &plan.callback.descriptor)
+                .ok_or_else(|| {
+                    NativeError::MissingMethod(format!(
+                        "{}#{}{}",
+                        plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                    ))
+                })?;
+            let subject_args = descriptor_arguments(&plan.invoke_target.descriptor);
+            let Some(value_descriptor) = subject_args.get(plan.index).cloned() else {
+                return Err(NativeError::Metadata(format!(
+                    "native @ModifyArg callback {}#{}{} targets argument {} outside {}#{}{}",
+                    plan.callback.owner,
+                    plan.callback.name,
+                    plan.callback.descriptor,
+                    plan.index,
+                    plan.invoke_target.owner,
+                    plan.invoke_target.name,
+                    plan.invoke_target.descriptor
+                )));
+            };
+            let callback_args = descriptor_arguments(&plan.callback.descriptor);
+            let simple = callback_args.len() == 1 && callback_args[0] == value_descriptor;
+            let full_subject = callback_args == subject_args;
+            if !simple && !full_subject {
+                return Err(NativeError::Metadata(format!(
+                    "native @ModifyArg callback {}#{}{} must take the modified {value_descriptor} argument alone or mirror the invoked method's arguments",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                )));
+            }
+            if return_desc(&plan.callback.descriptor) != value_descriptor {
+                return Err(NativeError::Metadata(format!(
+                    "native @ModifyArg callback {}#{}{} returns {} but argument {} of the call is {value_descriptor}",
+                    plan.callback.owner,
+                    plan.callback.name,
+                    plan.callback.descriptor,
+                    return_desc(&plan.callback.descriptor),
+                    plan.index
+                )));
+            }
+            hooks.insert_arg(
+                &plan.invoke_target,
+                ModifyArgHookEntry {
+                    callback: plan.callback,
+                    receiver: receiver.cloned(),
+                    is_static: callback_method.is_static(),
+                    value_descriptor,
+                    index: plan.index,
+                    full_subject,
+                    ordinal: plan.ordinal,
+                    hits: 0,
+                },
+            )?;
+        }
+        for plan in variable_plans {
+            let callback_class = self.classes.get(&plan.callback.owner).ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                ))
+            })?;
+            let callback_method = callback_class
+                .method(&plan.callback.name, &plan.callback.descriptor)
+                .ok_or_else(|| {
+                    NativeError::MissingMethod(format!(
+                        "{}#{}{}",
+                        plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                    ))
+                })?;
+            let callback_args = descriptor_arguments(&plan.callback.descriptor);
+            let Some(value_descriptor) = callback_args.first().cloned() else {
+                return Err(NativeError::Metadata(format!(
+                    "native @ModifyVariable callback {}#{}{} takes no value to modify",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                )));
+            };
+            if captures_callback_info(&callback_args[1..]) {
+                return Err(NativeError::Metadata(format!(
+                    "native @ModifyVariable callback {}#{}{} takes a trailing CallbackInfo; local modification is not cancellable",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                )));
+            }
+            let captures = &callback_args[1..];
+            let captures_target = !captures.is_empty();
+            if captures_target && captures != target_args.as_slice() {
+                return Err(NativeError::Metadata(format!(
+                    "native @ModifyVariable callback {}#{}{} must take the {value_descriptor} value alone or followed by the target method's arguments {target_args:?}",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                )));
+            }
+            if return_desc(&plan.callback.descriptor) != value_descriptor {
+                return Err(NativeError::Metadata(format!(
+                    "native @ModifyVariable callback {}#{}{} returns {} but captures a {value_descriptor} local",
+                    plan.callback.owner,
+                    plan.callback.name,
+                    plan.callback.descriptor,
+                    return_desc(&plan.callback.descriptor)
+                )));
+            }
+            let anchor = match plan.at.as_str() {
+                "STORE" => VariableAnchor::Store,
+                "LOAD" => VariableAnchor::Load,
+                other => {
+                    return Err(NativeError::Metadata(format!(
+                        "native @ModifyVariable supports STORE and LOAD, got {other}"
+                    )));
+                }
+            };
+            hooks.insert_variable(ModifyVariableHookEntry {
+                callback: plan.callback,
+                receiver: receiver.cloned(),
+                is_static: callback_method.is_static(),
+                value_descriptor,
+                anchor,
+                index: plan.index,
+                ordinal: plan.ordinal,
+                base_args: if captures_target {
+                    args.to_vec()
+                } else {
+                    Vec::new()
+                },
+                hits: 0,
+            })?;
+        }
+        Ok(Some(hooks))
     }
 
     /// Execute every `FIELD`/`NEW`/`JUMP` `@Inject` and `@Redirect` anchor
@@ -9380,6 +10379,16 @@ impl NativeJar {
         args: &[Value],
         host: &mut H,
     ) -> Result<MixinExecutionReport, NativeError> {
+        if self
+            .mixin_overwrite_plans()
+            .iter()
+            .any(|plan| plan_target_matches(&plan.target, target))
+        {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin target {}#{}{} has an @Overwrite; an overwrite replaces the whole body and cannot run alongside anchor hooks",
+                target.owner, target.name, target.descriptor
+            )));
+        }
         let plans = self
             .mixin_anchor_plans()
             .into_iter()
@@ -9926,6 +10935,9 @@ struct Runtime<'a, H> {
     /// The `FIELD`/`NEW`/`JUMP`/`@Redirect` anchor table this execution
     /// installed, if any.
     anchor_hooks: Option<&'a mut AnchorHooks>,
+    /// The `@ModifyArg`/`@ModifyVariable` table this execution installed, if
+    /// any.
+    modify_hooks: Option<&'a mut ModifyHooks>,
     /// Classes whose cancelled `new` site must skip the matching constructor
     /// call.  LIFO, because a constructor argument may itself construct an
     /// object before the outer `<init>` runs.
@@ -10076,6 +11088,209 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         Ok(false)
+    }
+
+    /// Record one modify callback result in the execution's result stream.
+    ///
+    /// When the same execution also installed an `@At("INVOKE")` table, the
+    /// result also lands there so [`InvokeHooks::results`] keeps the true
+    /// interleaved order of every callback the woven body ran.
+    fn record_modify_result(&mut self, value: &Value) {
+        if let Some(hooks) = self.modify_hooks.as_deref_mut() {
+            hooks.results.push(value.clone());
+        }
+        if let Some(hooks) = self.invoke_hooks.as_deref_mut() {
+            hooks.results.push(value.clone());
+        }
+    }
+
+    fn set_modify_dispatching(&mut self, value: bool) {
+        if let Some(hooks) = self.modify_hooks.as_deref_mut() {
+            hooks.dispatching = value;
+        }
+    }
+
+    fn record_modify_arg_site(&mut self, class: &str, method: &str, pc: usize) {
+        if let Some(hooks) = self.modify_hooks.as_deref_mut() {
+            hooks
+                .matched_invoke_sites
+                .insert((class.to_owned(), method.to_owned(), pc));
+        }
+    }
+
+    fn record_modify_variable_site(&mut self, class: &str, method: &str, pc: usize) {
+        if let Some(hooks) = self.modify_hooks.as_deref_mut() {
+            hooks
+                .matched_anchor_sites
+                .insert((class.to_owned(), method.to_owned(), pc));
+        }
+    }
+
+    /// Replace one argument of the invoke about to run, through every
+    /// `@ModifyArg` callback bound to that call site.
+    ///
+    /// Each callback sees the value the previous one produced, matching
+    /// Mixin's sequential argument modifiers.
+    fn dispatch_modify_arg(
+        &mut self,
+        site: &MethodRef,
+        args: &mut [Value],
+        class: &str,
+        method: &str,
+        descriptor: &str,
+        pc: usize,
+    ) -> Result<(), NativeError> {
+        if self
+            .modify_hooks
+            .as_deref()
+            .is_none_or(|hooks| hooks.dispatching || !hooks.applies(class, method, descriptor))
+        {
+            return Ok(());
+        }
+        let entries = match self.modify_hooks.as_deref_mut() {
+            Some(hooks) => hooks.arg_candidates(site),
+            None => return Ok(()),
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.set_modify_dispatching(true);
+        let outcome = self.run_modify_arg_callbacks(&entries, args);
+        self.set_modify_dispatching(false);
+        outcome?;
+        self.record_modify_arg_site(class, method, pc);
+        Ok(())
+    }
+
+    fn run_modify_arg_callbacks(
+        &mut self,
+        entries: &[ModifyArgHookEntry],
+        args: &mut [Value],
+    ) -> Result<(), NativeError> {
+        for entry in entries {
+            let original = args.get(entry.index).cloned().ok_or_else(|| {
+                NativeError::Metadata(format!(
+                    "native @ModifyArg callback {}#{}{} targets argument {} outside the invoked call",
+                    entry.callback.owner, entry.callback.name, entry.callback.descriptor, entry.index
+                ))
+            })?;
+            let values = if entry.full_subject {
+                args.to_vec()
+            } else {
+                vec![original]
+            };
+            let receiver = (!entry.is_static).then(|| {
+                entry
+                    .receiver
+                    .clone()
+                    .unwrap_or_else(|| Value::Ref(Some(entry.callback.owner.clone())))
+            });
+            let result = self.invoke(
+                &entry.callback.owner,
+                &entry.callback.name,
+                &entry.callback.descriptor,
+                receiver,
+                &values,
+            )?;
+            let replacement = adapt_value(
+                &entry.value_descriptor,
+                result,
+                "native Mixin @ModifyArg callback result",
+            )?
+            .ok_or_else(|| {
+                NativeError::Metadata(format!(
+                    "native Mixin @ModifyArg callback {}#{}{} returned void for {}",
+                    entry.callback.owner,
+                    entry.callback.name,
+                    entry.callback.descriptor,
+                    entry.value_descriptor
+                ))
+            })?;
+            self.record_modify_result(&replacement);
+            if let Some(slot) = args.get_mut(entry.index) {
+                *slot = replacement;
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace the value of one local store or load through the
+    /// `@ModifyVariable` callbacks bound to it.
+    fn dispatch_modify_variable(
+        &mut self,
+        anchor: VariableAnchor,
+        slot: usize,
+        instruction_type: &str,
+        value: Value,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+        pc: usize,
+    ) -> Result<Value, NativeError> {
+        if self
+            .modify_hooks
+            .as_deref()
+            .is_none_or(|hooks| hooks.dispatching || !hooks.applies(class, method, descriptor))
+        {
+            return Ok(value);
+        }
+        let entries = match self.modify_hooks.as_deref_mut() {
+            Some(hooks) => hooks.variable_candidates(anchor, slot, instruction_type),
+            None => return Ok(value),
+        };
+        if entries.is_empty() {
+            return Ok(value);
+        }
+        self.set_modify_dispatching(true);
+        let outcome = self.run_modify_variable_callbacks(&entries, value);
+        self.set_modify_dispatching(false);
+        let value = outcome?;
+        self.record_modify_variable_site(class, method, pc);
+        Ok(value)
+    }
+
+    fn run_modify_variable_callbacks(
+        &mut self,
+        entries: &[ModifyVariableHookEntry],
+        mut value: Value,
+    ) -> Result<Value, NativeError> {
+        for entry in entries {
+            let mut values = Vec::with_capacity(1 + entry.base_args.len());
+            values.push(value);
+            values.extend(entry.base_args.iter().cloned());
+            let receiver = (!entry.is_static).then(|| {
+                entry
+                    .receiver
+                    .clone()
+                    .unwrap_or_else(|| Value::Ref(Some(entry.callback.owner.clone())))
+            });
+            let result = self.invoke(
+                &entry.callback.owner,
+                &entry.callback.name,
+                &entry.callback.descriptor,
+                receiver,
+                &values,
+            )?;
+            value = adapt_value(
+                &entry.value_descriptor,
+                result,
+                &format!(
+                    "native Mixin @ModifyVariable callback {}#{}{} result",
+                    entry.callback.owner, entry.callback.name, entry.callback.descriptor
+                ),
+            )?
+            .ok_or_else(|| {
+                NativeError::Metadata(format!(
+                    "native Mixin @ModifyVariable callback {}#{}{} returned void for {}",
+                    entry.callback.owner,
+                    entry.callback.name,
+                    entry.callback.descriptor,
+                    entry.value_descriptor
+                ))
+            })?;
+            self.record_modify_result(&value);
+        }
+        Ok(value)
     }
 
     /// Collect and count the anchor entries bound to one site.
@@ -11598,7 +12813,17 @@ impl<H: Host> Runtime<'_, H> {
                 0x15..=0x19 => {
                     let index = *code.get(pc).ok_or(NativeError::Truncated)? as usize;
                     pc += 1;
-                    stack.push(locals.get(index).cloned().unwrap_or(Value::Ref(None)));
+                    let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
+                    stack.push(self.dispatch_modify_variable(
+                        VariableAnchor::Load,
+                        index,
+                        local_opcode_type(op - 0x15),
+                        loaded,
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?);
                 }
                 0x12 => {
                     let i = *code.get(pc).ok_or(NativeError::Truncated)? as u16;
@@ -11833,20 +13058,165 @@ impl<H: Host> Runtime<'_, H> {
                     let lhs = pop_float(&mut stack, class, method)?;
                     stack.push(Value::Int(compare_float(lhs, rhs, op == 0x97)));
                 }
-                0x1a..=0x1d => stack.push(locals[(op - 0x1a) as usize].clone()),
-                0x1e..=0x21 => stack.push(locals[(op - 0x1e) as usize].clone()),
-                0x22..=0x25 => stack.push(locals[(op - 0x22) as usize].clone()),
-                0x26..=0x29 => stack.push(locals[(op - 0x26) as usize].clone()),
-                0x2a..=0x2d => stack.push(locals[(op - 0x2a) as usize].clone()),
-                0x3b..=0x3e => locals[(op - 0x3b) as usize] = pop(&mut stack, class, method)?,
-                0x3f..=0x42 => locals[(op - 0x3f) as usize] = pop(&mut stack, class, method)?,
-                0x43..=0x46 => locals[(op - 0x43) as usize] = pop(&mut stack, class, method)?,
-                0x47..=0x4a => locals[(op - 0x47) as usize] = pop(&mut stack, class, method)?,
-                0x4b..=0x4e => locals[(op - 0x4b) as usize] = pop(&mut stack, class, method)?,
+                0x1a..=0x1d => {
+                    let index = (op - 0x1a) as usize;
+                    let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
+                    stack.push(self.dispatch_modify_variable(
+                        VariableAnchor::Load,
+                        index,
+                        "I",
+                        loaded,
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?);
+                }
+                0x1e..=0x21 => {
+                    let index = (op - 0x1e) as usize;
+                    let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
+                    stack.push(self.dispatch_modify_variable(
+                        VariableAnchor::Load,
+                        index,
+                        "J",
+                        loaded,
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?);
+                }
+                0x22..=0x25 => {
+                    let index = (op - 0x22) as usize;
+                    let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
+                    stack.push(self.dispatch_modify_variable(
+                        VariableAnchor::Load,
+                        index,
+                        "F",
+                        loaded,
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?);
+                }
+                0x26..=0x29 => {
+                    let index = (op - 0x26) as usize;
+                    let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
+                    stack.push(self.dispatch_modify_variable(
+                        VariableAnchor::Load,
+                        index,
+                        "D",
+                        loaded,
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?);
+                }
+                0x2a..=0x2d => {
+                    let index = (op - 0x2a) as usize;
+                    let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
+                    stack.push(self.dispatch_modify_variable(
+                        VariableAnchor::Load,
+                        index,
+                        "Ljava/lang/Object;",
+                        loaded,
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?);
+                }
+                0x3b..=0x3e => {
+                    let index = (op - 0x3b) as usize;
+                    let value = pop(&mut stack, class, method)?;
+                    let value = self.dispatch_modify_variable(
+                        VariableAnchor::Store,
+                        index,
+                        "I",
+                        value,
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?;
+                    locals[index] = value;
+                }
+                0x3f..=0x42 => {
+                    let index = (op - 0x3f) as usize;
+                    let value = pop(&mut stack, class, method)?;
+                    let value = self.dispatch_modify_variable(
+                        VariableAnchor::Store,
+                        index,
+                        "J",
+                        value,
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?;
+                    locals[index] = value;
+                }
+                0x43..=0x46 => {
+                    let index = (op - 0x43) as usize;
+                    let value = pop(&mut stack, class, method)?;
+                    let value = self.dispatch_modify_variable(
+                        VariableAnchor::Store,
+                        index,
+                        "F",
+                        value,
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?;
+                    locals[index] = value;
+                }
+                0x47..=0x4a => {
+                    let index = (op - 0x47) as usize;
+                    let value = pop(&mut stack, class, method)?;
+                    let value = self.dispatch_modify_variable(
+                        VariableAnchor::Store,
+                        index,
+                        "D",
+                        value,
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?;
+                    locals[index] = value;
+                }
+                0x4b..=0x4e => {
+                    let index = (op - 0x4b) as usize;
+                    let value = pop(&mut stack, class, method)?;
+                    let value = self.dispatch_modify_variable(
+                        VariableAnchor::Store,
+                        index,
+                        "Ljava/lang/Object;",
+                        value,
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?;
+                    locals[index] = value;
+                }
                 0x36..=0x3a => {
                     let index = *code.get(pc).ok_or(NativeError::Truncated)? as usize;
                     pc += 1;
                     let value = pop(&mut stack, class, method)?;
+                    let value = self.dispatch_modify_variable(
+                        VariableAnchor::Store,
+                        index,
+                        local_opcode_type(op - 0x36),
+                        value,
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?;
                     if let Some(local) = locals.get_mut(index) {
                         *local = value;
                     }
@@ -12238,6 +13608,10 @@ impl<H: Host> Runtime<'_, H> {
                     } else {
                         Some(pop(&mut stack, class, method)?)
                     };
+                    // `@ModifyArg` replaces one argument before the call runs;
+                    // a redirect that replaces the whole call sees (and then
+                    // discards) the modified value, deterministically.
+                    self.dispatch_modify_arg(&r, &mut args, class, method, desc, at)?;
                     // A cancelled `new` left a null reference behind; its
                     // matching `<init>` is skipped so the construction has no
                     // side effect.  The LIFO check keeps a constructor
@@ -13970,6 +15344,393 @@ fn mixin_plan_sort_key(
     )
 }
 
+/// Every target owner a `@Mixin` annotation names, in declaration order.
+///
+/// Both `targets` (the literal descriptors) and `value` (the `Class<?>` array)
+/// are read, and a duplicate owner appears once.
+fn mixin_target_owners(mixin: &Annotation) -> Vec<String> {
+    let mut targets = Vec::new();
+    for key in ["targets", "value"] {
+        let Some(value) = mixin.values.get(key) else {
+            continue;
+        };
+        for descriptor in annotation_strings(value) {
+            let Some(owner) = annotation_class_owner(&descriptor) else {
+                continue;
+            };
+            if !targets.contains(&owner) {
+                targets.push(owner);
+            }
+        }
+    }
+    targets
+}
+
+/// A boolean annotation element; absent or non-boolean is false.
+fn annotation_bool(annotation: &Annotation, key: &str) -> bool {
+    matches!(
+        annotation.values.get(key),
+        Some(AnnotationValue::Bool(true))
+    )
+}
+
+/// An integer annotation element, absent when the value is not an `int`.
+fn annotation_int(annotation: &Annotation, key: &str) -> Option<i32> {
+    match annotation.values.get(key) {
+        Some(AnnotationValue::Int(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Resolve and validate one `@Overwrite` target against the jar's copy of the
+/// target class.
+///
+/// When the target class is absent (the common case for a mod mixing into the
+/// game) the callback's descriptor is kept and execution validates it against
+/// the loaded class.  When it is present, the overload set selects the exact
+/// target and the descriptor and static-ness must match.
+fn overwrite_shape_reason(
+    jar: &NativeJar,
+    method: &Method,
+    callback: &MethodRef,
+    target_owner: &str,
+    target: &mut MethodRef,
+) -> Option<String> {
+    let target_class = jar.classes.get(target_owner)?;
+    let callback_label = format!(
+        "{}#{}{}",
+        callback.owner, callback.name, callback.descriptor
+    );
+    let overloads = target_class
+        .methods
+        .iter()
+        .filter(|candidate| candidate.name == method.name)
+        .collect::<Vec<_>>();
+    let mismatch = |descriptor: &str, is_static: bool| {
+        Some(format!(
+            "@Overwrite callback {callback_label} must match target {target_owner}#{}{}; the target is {} and the earlier body is not used",
+            method.name,
+            descriptor,
+            if is_static {
+                "static"
+            } else {
+                "an instance method"
+            }
+        ))
+    };
+    match overloads.as_slice() {
+        [] => Some(format!(
+            "target class {target_owner} has no method named {}; @Overwrite must name an existing method",
+            method.name
+        )),
+        [only] => {
+            target.descriptor = only.descriptor.clone();
+            if only.descriptor != method.descriptor {
+                Some(format!(
+                    "@Overwrite callback {callback_label} does not match any target {target_owner}#{}; the only overload is {}",
+                    method.name, only.descriptor
+                ))
+            } else if only.is_static() != method.is_static() {
+                mismatch(&only.descriptor, only.is_static())
+            } else {
+                None
+            }
+        }
+        many => {
+            let exact = many
+                .iter()
+                .find(|candidate| candidate.descriptor == method.descriptor);
+            match exact {
+                Some(exact) => {
+                    target.descriptor = exact.descriptor.clone();
+                    if exact.is_static() != method.is_static() {
+                        mismatch(&exact.descriptor, exact.is_static())
+                    } else {
+                        None
+                    }
+                }
+                None => Some(format!(
+                    "@Overwrite callback {callback_label} does not match any of the {} overloads of {target_owner}#{}",
+                    many.len(),
+                    method.name
+                )),
+            }
+        }
+    }
+}
+
+/// Sort key shared by `@ModifyArg` discovery and its unresolved report.
+fn mixin_modify_arg_sort_key(
+    plan: &MixinModifyArgPlan,
+) -> (
+    &str,
+    &str,
+    &str,
+    &str,
+    &str,
+    &str,
+    &str,
+    &str,
+    &str,
+    usize,
+    Option<usize>,
+) {
+    (
+        &plan.target.owner,
+        &plan.target.name,
+        &plan.target.descriptor,
+        &plan.invoke_target.owner,
+        &plan.invoke_target.name,
+        &plan.invoke_target.descriptor,
+        &plan.callback.owner,
+        &plan.callback.name,
+        &plan.callback.descriptor,
+        plan.index,
+        plan.ordinal,
+    )
+}
+
+/// Sort key shared by `@ModifyVariable` discovery and its unresolved report.
+fn mixin_modify_variable_sort_key(
+    plan: &MixinModifyVariablePlan,
+) -> (
+    &str,
+    &str,
+    &str,
+    &str,
+    Option<usize>,
+    Option<usize>,
+    &str,
+    &str,
+    &str,
+) {
+    (
+        &plan.target.owner,
+        &plan.target.name,
+        &plan.target.descriptor,
+        &plan.at,
+        plan.index,
+        plan.ordinal,
+        &plan.callback.owner,
+        &plan.callback.name,
+        &plan.callback.descriptor,
+    )
+}
+
+/// Validate one `@ModifyArg` selector and callback, filling `plan` when it is
+/// executable.
+fn modify_arg_plan_reason(
+    anchor: &AtSelector,
+    callback: &MethodRef,
+    index: i32,
+    cancellable: bool,
+    slices: bool,
+    plan: &mut MixinModifyArgPlan,
+) -> Option<String> {
+    let label = format!(
+        "{}#{}{}",
+        callback.owner, callback.name, callback.descriptor
+    );
+    if cancellable {
+        return Some(format!(
+            "@ModifyArg callback {label} is cancellable; argument modification is not a cancellable injector"
+        ));
+    }
+    if slices {
+        return Some(format!(
+            "@ModifyArg callback {label} declares @Slice; slices are not modeled for argument modification"
+        ));
+    }
+    if anchor.anchor != "INVOKE" {
+        return Some(format!(
+            "@ModifyArg callback {label} uses @At(\"{}\"); native argument modification supports INVOKE",
+            anchor.anchor
+        ));
+    }
+    if anchor.shift.is_some() || anchor.by.is_some() {
+        return Some(format!(
+            "@ModifyArg callback {label} declares @At.shift/by; call-site shifts are not modeled for argument modification"
+        ));
+    }
+    if anchor.ordinal.is_some_and(|ordinal| ordinal < 0) {
+        return Some(format!(
+            "@ModifyArg @At.ordinal {} is negative; native call sites count from zero",
+            anchor.ordinal.unwrap_or_default()
+        ));
+    }
+    if index < 0 {
+        return Some(format!(
+            "@ModifyArg callback {label} uses index {index}; only a non-negative zero-based argument index is modeled"
+        ));
+    }
+    plan.index = usize::try_from(index).unwrap_or_default();
+    plan.ordinal = anchor
+        .ordinal
+        .and_then(|ordinal| usize::try_from(ordinal).ok());
+    let Some(spec) = anchor.target.as_deref() else {
+        return Some(format!(
+            "@ModifyArg callback {label} has no @At.target call site"
+        ));
+    };
+    let Some(site) = parse_invoke_selector(spec) else {
+        return Some(format!(
+            "@ModifyArg INVOKE selector {spec:?} is not one of the bounded call-site forms"
+        ));
+    };
+    if site.descriptor.is_empty() {
+        return Some(format!(
+            "@ModifyArg INVOKE selector {spec:?} omits the call descriptor; argument modification needs the invoked signature"
+        ));
+    }
+    let subject_args = descriptor_arguments(&site.descriptor);
+    let Some(value_descriptor) = subject_args.get(plan.index) else {
+        return Some(format!(
+            "@ModifyArg index {} is outside {}#{}{}'s {} argument(s)",
+            plan.index,
+            site.owner,
+            site.name,
+            site.descriptor,
+            subject_args.len()
+        ));
+    };
+    let callback_args = descriptor_arguments(&callback.descriptor);
+    let simple = callback_args.len() == 1 && callback_args[0] == *value_descriptor;
+    let full_subject = callback_args == subject_args;
+    if !simple && !full_subject {
+        return Some(format!(
+            "@ModifyArg callback {label} must take the modified {value_descriptor} argument alone or mirror the invoked method's arguments {subject_args:?}"
+        ));
+    }
+    let callback_return = return_desc(&callback.descriptor);
+    if callback_return != value_descriptor {
+        return Some(format!(
+            "@ModifyArg callback {label} returns {callback_return} but argument {} of the call is {value_descriptor}",
+            plan.index
+        ));
+    }
+    plan.invoke_target = site;
+    None
+}
+
+/// Validate one `@ModifyVariable` selector and callback, filling `plan` when it
+/// is executable.
+fn modify_variable_plan_reason(
+    jar: &NativeJar,
+    annotation: &Annotation,
+    anchor: &AtSelector,
+    callback: &MethodRef,
+    index: i32,
+    ordinal: i32,
+    plan: &mut MixinModifyVariablePlan,
+) -> Option<String> {
+    let label = format!(
+        "{}#{}{}",
+        callback.owner, callback.name, callback.descriptor
+    );
+    if annotation_bool(annotation, "print") {
+        return Some(format!(
+            "@ModifyVariable callback {label} sets print = true; the diagnostic print mode is not executed"
+        ));
+    }
+    if annotation_bool(annotation, "argsOnly") {
+        return Some(format!(
+            "@ModifyVariable callback {label} restricts capture to method arguments with argsOnly; native local hooks model the whole frame"
+        ));
+    }
+    if annotation
+        .values
+        .get("name")
+        .is_some_and(|value| !annotation_strings(value).is_empty())
+    {
+        return Some(format!(
+            "@ModifyVariable callback {label} selects a local by name; native local hooks use index or ordinal"
+        ));
+    }
+    if annotation.values.contains_key("slice") {
+        return Some(format!(
+            "@ModifyVariable callback {label} declares @Slice; slices are not modeled for local variables"
+        ));
+    }
+    if anchor.anchor != "STORE" && anchor.anchor != "LOAD" {
+        return Some(format!(
+            "@ModifyVariable callback {label} uses @At(\"{}\"); native local hooks support STORE and LOAD",
+            anchor.anchor
+        ));
+    }
+    if anchor.shift.is_some() || anchor.by.is_some() || anchor.ordinal.is_some() {
+        return Some(format!(
+            "@ModifyVariable callback {label} declares @At.shift/by/ordinal; select the local with the annotation's index or ordinal"
+        ));
+    }
+    if index < -1 || ordinal < -1 {
+        return Some(format!(
+            "@ModifyVariable callback {label} has index {index} and ordinal {ordinal}; both are -1 (automatic) or non-negative"
+        ));
+    }
+    if index >= 0 && ordinal >= 0 {
+        return Some(format!(
+            "@ModifyVariable callback {label} declares both index {index} and ordinal {ordinal}; native local hooks select one"
+        ));
+    }
+    if index == -1 && ordinal == -1 {
+        return Some(format!(
+            "@ModifyVariable callback {label} has no index or ordinal; implicit local capture is not modeled"
+        ));
+    }
+    plan.index = (index >= 0).then_some(index as usize);
+    plan.ordinal = (ordinal >= 0).then_some(ordinal as usize);
+    let callback_args = descriptor_arguments(&callback.descriptor);
+    let Some(value_descriptor) = callback_args.first().cloned() else {
+        return Some(format!(
+            "@ModifyVariable callback {label} takes no value to modify"
+        ));
+    };
+    if is_callback_info_descriptor(&value_descriptor) {
+        return Some(format!(
+            "@ModifyVariable callback {label} takes a CallbackInfo where the modified value belongs"
+        ));
+    }
+    if return_desc(&callback.descriptor) != value_descriptor {
+        return Some(format!(
+            "@ModifyVariable callback {label} returns {} but captures a {value_descriptor} local",
+            return_desc(&callback.descriptor)
+        ));
+    }
+    let captures = &callback_args[1..];
+    if captures
+        .iter()
+        .any(|argument| is_callback_info_descriptor(argument))
+    {
+        return Some(format!(
+            "@ModifyVariable callback {label} takes a trailing CallbackInfo; local modification is not a cancellable injector"
+        ));
+    }
+    if !captures.is_empty() && !plan.target.descriptor.is_empty() {
+        let target_args = descriptor_arguments(&plan.target.descriptor);
+        if captures != target_args.as_slice() {
+            return Some(format!(
+                "@ModifyVariable callback {label} must take the {value_descriptor} value alone or followed by the target method's arguments {target_args:?}"
+            ));
+        }
+    }
+    // A target class the jar owns must actually declare the method, so an
+    // otherwise-plausible local hook never attaches to a typo.
+    if let Some(target_class) = jar.classes.get(&plan.target.owner) {
+        if !plan.target.descriptor.is_empty()
+            && target_class
+                .method(&plan.target.name, &plan.target.descriptor)
+                .is_none()
+        {
+            return Some(format!(
+                "target {}{} is not declared by {}",
+                plan.target.name, plan.target.descriptor, plan.target.owner
+            ));
+        }
+    }
+    plan.at = anchor.anchor.clone();
+    None
+}
+
 /// Build one raw anchor plan from an `@Inject`/`@Redirect` annotation.
 fn anchor_plan(
     mixin: &str,
@@ -14482,6 +16243,25 @@ fn invoke_site_key(site: &MethodRef) -> String {
     format!("{}#{}{}", site.owner, site.name, site.descriptor)
 }
 
+/// Whether one plan's target names the method a caller asked to execute.
+///
+/// A descriptor-less plan matches every overload, exactly as Mixin reads
+/// `method = "name"`.
+fn plan_target_matches(candidate: &MethodRef, target: &MethodRef) -> bool {
+    candidate.owner == target.owner
+        && candidate.name == target.name
+        && (candidate.descriptor.is_empty() || candidate.descriptor == target.descriptor)
+}
+
+/// Whether a modify callback's extra parameters contain a `CallbackInfo`
+/// marker.  Local and argument modification are not cancellable, so accepting
+/// one would hand the callback a knob the injector does not honor.
+fn captures_callback_info(arguments: &[String]) -> bool {
+    arguments
+        .iter()
+        .any(|argument| is_callback_info_descriptor(argument))
+}
+
 /// Key a descriptor-less `@At.target` selector matches: `owner#name`.
 fn invoke_name_key(site: &MethodRef) -> String {
     format!("{}#{}", site.owner, site.name)
@@ -14700,6 +16480,7 @@ mod tests {
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
             anchor_hooks: None,
+            modify_hooks: None,
             pending_skipped_new: Vec::new(),
         };
         let method = MethodRef {
@@ -14740,6 +16521,7 @@ mod tests {
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
             anchor_hooks: None,
+            modify_hooks: None,
             pending_skipped_new: Vec::new(),
         };
         let method = MethodRef {
@@ -20522,6 +22304,7 @@ mandatory = true
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
             anchor_hooks: None,
+            modify_hooks: None,
             pending_skipped_new: Vec::new(),
         };
         let first = runtime.new_object("demo/Fields");
@@ -20667,6 +22450,7 @@ mandatory = true
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
             anchor_hooks: None,
+            modify_hooks: None,
             pending_skipped_new: Vec::new(),
         };
         let new_instance = MethodRef {
@@ -20865,6 +22649,7 @@ mandatory = true
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
             anchor_hooks: None,
+            modify_hooks: None,
             pending_skipped_new: Vec::new(),
         };
         let stream = runtime
@@ -21167,6 +22952,7 @@ mandatory = true
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
             anchor_hooks: None,
+            modify_hooks: None,
             pending_skipped_new: Vec::new(),
         };
         let lookup = MethodRef {
@@ -21389,6 +23175,7 @@ mandatory = true
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
             anchor_hooks: None,
+            modify_hooks: None,
             pending_skipped_new: Vec::new(),
         };
         let class = Value::Ref(Some("demo/ReflectiveFields".into()));
