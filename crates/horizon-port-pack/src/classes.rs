@@ -605,6 +605,10 @@ fn text(value: &Value) -> Option<String> {
     }
 }
 
+/// The longest `@At` text kept: a longer selector is cut at a character
+/// boundary and marked with `…`, so no report carries an unbounded string.
+const AT_TEXT_MAX: usize = 512;
+
 fn at_value(value: &Value) -> Option<String> {
     let Value::Ann(a) = value else { return None };
     let mut out = Vec::new();
@@ -636,7 +640,46 @@ fn at_value(value: &Value) -> Option<String> {
             );
         }
     }
-    Some(out.join("|"))
+    // Added after the keys above so existing text keeps its shape.
+    for key in ["desc", "id"] {
+        if let Some(v) = a.values.get(key) {
+            out.extend(
+                items(v)
+                    .iter()
+                    .filter_map(|v| text(v).map(|t| format!("{key}:{t}"))),
+            );
+        }
+    }
+    // `remap = false` is `@At`'s default: only an explicit true is worth text.
+    if a.values
+        .get("remap")
+        .is_some_and(|v| items(v).iter().any(|v| matches!(v, Value::Bool(true))))
+    {
+        out.push("remap:true".to_owned());
+    }
+    // Mixin Extras' `@Local`/`@Share` selectors are nested annotations: as
+    // with any annotation this module does not model, presence is the text.
+    for key in ["local", "share"] {
+        if let Some(v) = a.values.get(key) {
+            out.extend(
+                items(v)
+                    .iter()
+                    .filter_map(|v| metadata_text(v).map(|t| format!("{key}:{t}"))),
+            );
+        }
+    }
+    Some(bounded_text(out.join("|")))
+}
+
+/// Cuts `text` to `AT_TEXT_MAX` characters, marking the cut with `…` so a
+/// truncated selector is not mistaken for one that ends there.
+fn bounded_text(text: String) -> String {
+    if text.chars().count() <= AT_TEXT_MAX {
+        return text;
+    }
+    let mut out: String = text.chars().take(AT_TEXT_MAX).collect();
+    out.push('…');
+    out
 }
 
 fn scalar_text(value: &Value) -> Option<String> {
@@ -650,16 +693,9 @@ fn scalar_text(value: &Value) -> Option<String> {
 
 fn metadata_text(value: &Value) -> Option<String> {
     if let Value::Ann(annotation) = value {
-        let simple = annotation
-            .ty
-            .trim_start_matches('L')
-            .trim_end_matches(';')
-            .rsplit('/')
-            .next()
-            .unwrap_or_default();
-        if simple == "Slice" {
-            let from = annotation.values.get("from").and_then(text);
-            let to = annotation.values.get("to").and_then(text);
+        if annotation_simple(&annotation.ty) == "Slice" {
+            let from = annotation.values.get("from").and_then(boundary_text);
+            let to = annotation.values.get("to").and_then(boundary_text);
             if from.is_some() || to.is_some() {
                 return Some(format!(
                     "from:{}|to:{}",
@@ -671,6 +707,16 @@ fn metadata_text(value: &Value) -> Option<String> {
         return Some("present".to_owned());
     }
     scalar_text(value)
+}
+
+/// A `@Slice` boundary: an `@At` renders through `at_value` (so a selector
+/// like `from = @At(value = "INVOKE", target = "...")` keeps its target), a
+/// string or enum names an anchor directly (`HEAD`, `TAIL`).
+fn boundary_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Ann(_) => at_value(value),
+        other => text(other),
+    }
 }
 
 fn annotation_simple(ty: &str) -> &str {
@@ -1177,6 +1223,12 @@ pub(crate) mod tests_support {
         let head = utf(&mut pool, "HEAD");
         let target_name = utf(&mut pool, "target");
         let at_target = utf(&mut pool, &format!("L{target};{method}"));
+        let slice_name = utf(&mut pool, "slice");
+        let slice_ty = utf(&mut pool, "Lorg/spongepowered/asm/mixin/injection/Slice;");
+        let from_name = utf(&mut pool, "from");
+        let to_name = utf(&mut pool, "to");
+        let invoke = utf(&mut pool, "INVOKE");
+        let return_anchor = utf(&mut pool, "RETURN");
         let runtime_annotations = utf(&mut pool, "RuntimeVisibleAnnotations");
         let run = utf(&mut pool, "run");
         let desc = utf(&mut pool, "()V");
@@ -1196,7 +1248,7 @@ pub(crate) mod tests_support {
         let mut ma = Vec::new();
         ma.extend([0, 1]); // one annotation
         ma.extend(inject_ty.to_be_bytes());
-        ma.extend([0, 2]); // method + at
+        ma.extend([0, 3]); // method, at, slice
         ma.extend(method_name.to_be_bytes());
         ma.extend(*b"s");
         ma.extend(method_str.to_be_bytes());
@@ -1210,6 +1262,30 @@ pub(crate) mod tests_support {
         ma.extend(target_name.to_be_bytes());
         ma.extend(*b"s");
         ma.extend(at_target.to_be_bytes());
+        // `slice = @Slice(from = @At(value = "INVOKE", target = ...),
+        //                 to = @At("RETURN"))`: a nested annotation inside a
+        // nested annotation, the shape real mods carry.
+        ma.extend(slice_name.to_be_bytes());
+        ma.extend(*b"@");
+        ma.extend(slice_ty.to_be_bytes());
+        ma.extend([0, 2]);
+        ma.extend(from_name.to_be_bytes());
+        ma.extend(*b"@");
+        ma.extend(at_ty.to_be_bytes());
+        ma.extend([0, 2]);
+        ma.extend(value_name.to_be_bytes());
+        ma.extend(*b"s");
+        ma.extend(invoke.to_be_bytes());
+        ma.extend(target_name.to_be_bytes());
+        ma.extend(*b"s");
+        ma.extend(at_target.to_be_bytes());
+        ma.extend(to_name.to_be_bytes());
+        ma.extend(*b"@");
+        ma.extend(at_ty.to_be_bytes());
+        ma.extend([0, 1]);
+        ma.extend(value_name.to_be_bytes());
+        ma.extend(*b"s");
+        ma.extend(return_anchor.to_be_bytes());
         out.extend([0, 1]);
         out.extend(runtime_annotations.to_be_bytes());
         out.extend((ma.len() as u32).to_be_bytes());
@@ -1233,6 +1309,25 @@ pub(crate) mod tests_support {
 mod tests {
     use super::tests_support::class_with as class_file;
     use super::*;
+
+    const AT: &str = "Lorg/spongepowered/asm/mixin/injection/At;";
+    const SLICE: &str = "Lorg/spongepowered/asm/mixin/injection/Slice;";
+
+    /// A nested annotation value, built directly: the same model `value`
+    /// produces from `element_value` tags `@` and `[`.
+    fn ann(ty: &str, values: Vec<(&str, Value)>) -> Value {
+        Value::Ann(Annotation {
+            ty: ty.to_owned(),
+            values: values
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect(),
+        })
+    }
+
+    fn s(text: &str) -> Value {
+        Value::Str(text.to_owned())
+    }
 
     #[test]
     fn reads_the_header_methods_and_pool() {
@@ -1298,6 +1393,160 @@ mod tests {
             Some(
                 "INVOKE|target:Lnet/minecraft/Target;method()V|args:log=true,slice=outer|ordinal:2|shift:BY|by:1".to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn slice_boundaries_render_nested_at_in_both_directions() {
+        let block_target = "Lnet/minecraft/world/level/block/Block;getBlockState()Lnet/minecraft/world/level/block/state/BlockState;";
+        let slice = ann(
+            SLICE,
+            vec![
+                (
+                    "from",
+                    ann(
+                        AT,
+                        vec![("value", s("INVOKE")), ("target", s(block_target))],
+                    ),
+                ),
+                ("to", ann(AT, vec![("value", s("RETURN"))])),
+            ],
+        );
+        assert_eq!(
+            metadata_text(&slice).as_deref(),
+            Some(format!("from:INVOKE|target:{block_target}|to:RETURN").as_str())
+        );
+        // And the other way round: a plain anchor `from`, a nested `to`.
+        let reversed = ann(
+            SLICE,
+            vec![
+                ("from", s("HEAD")),
+                ("to", ann(AT, vec![("value", s("TAIL"))])),
+            ],
+        );
+        assert_eq!(
+            metadata_text(&reversed).as_deref(),
+            Some("from:HEAD|to:TAIL")
+        );
+    }
+
+    #[test]
+    fn slice_without_boundaries_keeps_the_presence_marker() {
+        assert_eq!(
+            metadata_text(&ann(SLICE, vec![])).as_deref(),
+            Some("present")
+        );
+    }
+
+    #[test]
+    fn at_value_keeps_every_selector_after_the_anchor() {
+        let at = ann(
+            AT,
+            vec![
+                ("value", s("INVOKE")),
+                ("target", s("Lnet/minecraft/Target;method()V")),
+                ("desc", s("(I)V")),
+                ("ordinal", Value::Number(1.0)),
+                (
+                    "shift",
+                    Value::Enum(
+                        "Lorg/spongepowered/asm/mixin/injection/At$Shift;".to_owned(),
+                        "BEFORE".to_owned(),
+                    ),
+                ),
+                ("by", Value::Number(2.0)),
+                ("id", s("anchor")),
+                ("remap", Value::Bool(true)),
+            ],
+        );
+        assert_eq!(
+            at_value(&at).as_deref(),
+            Some(
+                "INVOKE|target:Lnet/minecraft/Target;method()V|ordinal:1|shift:BEFORE|by:2|desc:(I)V|id:anchor|remap:true"
+            )
+        );
+    }
+
+    #[test]
+    fn at_value_drops_remap_false_and_marks_local_present() {
+        let at = ann(
+            AT,
+            vec![
+                ("value", s("NEW")),
+                (
+                    "local",
+                    ann(
+                        "Lcom/llamalad7/mixinextras/sugar/Local;",
+                        vec![("ordinal", Value::Number(1.0))],
+                    ),
+                ),
+                ("remap", Value::Bool(false)),
+            ],
+        );
+        assert_eq!(at_value(&at).as_deref(), Some("NEW|local:present"));
+    }
+
+    #[test]
+    fn at_arrays_keep_their_declaration_order() {
+        let inject = Annotation {
+            ty: "Lorg/spongepowered/asm/mixin/injection/Inject;".to_owned(),
+            values: BTreeMap::from([
+                ("method".to_owned(), s("tick()V")),
+                (
+                    "at".to_owned(),
+                    Value::Array(vec![
+                        ann(
+                            AT,
+                            vec![("value", s("INVOKE")), ("target", s("La/First;run()V"))],
+                        ),
+                        ann(
+                            AT,
+                            vec![("value", s("FIELD")), ("target", s("La/Second;f:I"))],
+                        ),
+                    ]),
+                ),
+            ]),
+        };
+        let methods = BTreeMap::from([("run".to_owned(), vec![inject])]);
+        let parsed = injections(&methods, &BTreeMap::new());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].at,
+            "INVOKE|target:La/First;run()V|FIELD|target:La/Second;f:I"
+        );
+    }
+
+    #[test]
+    fn long_at_selectors_are_truncated_deterministically() {
+        let long = "x".repeat(4096);
+        let at = ann(AT, vec![("value", s("INVOKE")), ("target", s(&long))]);
+        let text = at_value(&at).expect("an @At always has text");
+        assert_eq!(text.chars().count(), AT_TEXT_MAX + 1);
+        assert!(text.starts_with("INVOKE|target:xxx"), "{text}");
+        assert!(text.ends_with('…'));
+        assert_eq!(at_value(&at).as_deref(), Some(text.as_str()));
+    }
+
+    #[test]
+    fn reads_nested_at_and_slice_from_class_bytes() {
+        let bytes = super::tests_support::annotated_mixin(
+            "m/Mix",
+            "net/minecraft/Target",
+            "destroyBlock()V",
+        );
+        let c = parse(&bytes).expect("the fixture is a valid class file");
+        assert_eq!(c.injections.len(), 1);
+        assert_eq!(c.injections[0].kind, "inject");
+        assert_eq!(
+            c.injections[0].at,
+            "HEAD|target:Lnet/minecraft/Target;destroyBlock()V"
+        );
+        assert_eq!(
+            c.injections[0]
+                .metadata_values
+                .get("slice")
+                .map(String::as_str),
+            Some("from:INVOKE|target:Lnet/minecraft/Target;destroyBlock()V|to:RETURN")
         );
     }
 
