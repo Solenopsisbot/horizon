@@ -15,7 +15,7 @@ pub mod weaver;
 pub use weaver::{
     ReturnMode, WovenClasses, callback_info_class, callback_info_returnable_class, weave_class,
     weave_class_with_extras, weave_classes, weave_classes_with_extras, weave_head,
-    weave_head_cancellable, weave_plans, weave_return,
+    weave_head_cancellable, weave_invoke, weave_invoke_plan, weave_plans, weave_return,
 };
 
 #[derive(Debug, Clone, PartialEq)]

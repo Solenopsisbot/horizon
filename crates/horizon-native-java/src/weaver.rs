@@ -163,13 +163,20 @@
 //! instead rejects an anchor it cannot weave and a per-class plan overflow with
 //! a reason.
 //!
-//! `@At("INVOKE")` stays on the interpreter path: it moves or guards a call site,
-//! which needs bytecode a plain insert cannot express.  A cancellable
-//! `RETURN`/`TAIL` on a `void` target, and a cancellable `HEAD` on a non-void
-//! one, stay there too: the first has no result to carry, the second needs the
-//! descriptor's default value in the target's shape.  A non-void `RETURN`/`TAIL`
-//! callback that does not declare the trailing `CallbackInfoReturnable` cannot
-//! observe the result and stays there as well.
+//! `@At("INVOKE")` is applied by [`weave_invoke`] (and [`weave_invoke_plan`]),
+//! not by [`weave_class`]: a call-site hook is a different edit from an
+//! around-the-body one, and keeping them apart means a plan set that names a
+//! call site cannot be mistaken for one that names the method.  The bounded
+//! shape is a `void` or value-returning `invokevirtual`/`invokestatic`/
+//! `invokeinterface` for a non-cancellable callback; cancellation also needs a
+//! `void` call and exactly one matching instruction, because a value would have
+//! to be replaced by the callee descriptor's default.  `invokespecial` call
+//! sites stay on the interpreter path.  A cancellable `RETURN`/`TAIL` on a
+//! `void` target, and a cancellable `HEAD` on a non-void one, stay there too:
+//! the first has no result to carry, the second needs the descriptor's default
+//! value in the target's shape.  A non-void `RETURN`/`TAIL` callback that does
+//! not declare the trailing `CallbackInfoReturnable` cannot observe the result
+//! and stays there as well.
 //!
 //! The synthetic `CallbackInfoReturnable` is the smallest class that carries the
 //! result, so it does not extend Mixin's `CallbackInfo`: a callback that casts
@@ -177,10 +184,22 @@
 //! is outside the bounded subset.  A jar that already declares the class keeps
 //! its own copy.
 //!
-//! A class whose constant pool uses `CONSTANT_Dynamic` (condy) is rejected
-//! because the writer copies the pool verbatim but would have to re-encode the
-//! `BootstrapMethods` attribute's arguments to append anything the index shift
-//! touches, and no bounded evaluation of the bootstrap method is attempted.
+//! # `CONSTANT_Dynamic`
+//!
+//! A class whose constant pool already uses `CONSTANT_Dynamic` (condy) is
+//! preserved, not rejected - including a class that also carries javac's
+//! `invokedynamic` string-concatenation bootstrap.  The writer appends new
+//! constants after the original entries, so no existing index moves, and it
+//! re-encodes the pool and `BootstrapMethods` through an index map so the same
+//! guarantee holds if a caller ever compacts the pool.  Before weaving, every
+//! condy entry is validated as a coherent shape: the name/type is a field
+//! descriptor, the bootstrap index names a `BootstrapMethods` row, that row's
+//! handle is a legal `CONSTANT_MethodHandle`, and every static argument is a
+//! loadable constant, recursively for another condy.  The bootstrap method is
+//! never evaluated; only its references are preserved.  A malformed entry that
+//! names the reserved index 0 keeps the historical blanket rejection, because
+//! there is no coherent condy shape to relocate.
+//!
 //! Non-ASCII constant pool strings and code that would exceed the class-file
 //! `code_length` limit are rejected with a reason rather than written.
 
@@ -379,28 +398,98 @@ struct MethodLayout<'a> {
     attributes: Vec<AttributeLayout<'a>>,
 }
 
-/// The class file as ordered byte ranges, so the writer can copy everything it
-/// does not mean to change.
+/// One actual constant-pool entry, in file order.
+///
+/// The writer reconstructs the pool from these entries so a constant-pool
+/// relocation can rewrite every index-bearing tag, `CONSTANT_Dynamic` and
+/// `CONSTANT_InvokeDynamic` included.  The payload is kept verbatim so an
+/// untouched entry still re-encodes byte-for-byte.
+struct PoolEntry<'a> {
+    /// The index this entry occupies.  A `long`/`double` leaves the next slot
+    /// empty, which is why this is not the vector position.
+    index: u16,
+    tag: u8,
+    /// The bytes after the tag.
+    payload: &'a [u8],
+}
+
+/// One `BootstrapMethods` row: the bootstrap method handle and its static
+/// arguments, both constant-pool indices.
+struct BootstrapMethod {
+    method_ref: u16,
+    arguments: Vec<u16>,
+}
+
+/// One class attribute.  `BootstrapMethods` is parsed because a relocated pool
+/// has to keep every `CONSTANT_Dynamic`/`CONSTANT_InvokeDynamic` row pointing at
+/// the same constants; every other attribute keeps its bytes.
+enum ClassAttribute<'a> {
+    Raw {
+        name_index: u16,
+        body: &'a [u8],
+    },
+    BootstrapMethods {
+        name_index: u16,
+        methods: Vec<BootstrapMethod>,
+    },
+}
+
+impl ClassAttribute<'_> {
+    fn name_index(&self) -> u16 {
+        match self {
+            Self::Raw { name_index, .. } | Self::BootstrapMethods { name_index, .. } => *name_index,
+        }
+    }
+}
+
+/// The class file as ordered pieces, so the writer can copy everything it does
+/// not mean to change.
 struct Layout<'a> {
     /// `magic`, `minor_version`, `major_version`.
     version: &'a [u8],
     pool_count: u16,
-    pool: &'a [u8],
+    /// Every actual pool entry, in file order.
+    pool_entries: Vec<PoolEntry<'a>>,
     /// `Option<&str>` per constant pool index; `None` for non-`Utf8` entries.
     pool_utf8: Vec<Option<&'a str>>,
-    /// Constant pool tags in file order, used to reject tags the weaver cannot
-    /// preserve (condy) even though the writer copies them verbatim.
+    /// Constant-pool tag per index (0 for the reserved slot and the second slot
+    /// of a `long`/`double`), used to validate `CONSTANT_Dynamic` references.
     pool_tags: Vec<u8>,
     /// `access_flags`, `this_class`, `super_class` and the interfaces table.
     after_pool: &'a [u8],
     /// The whole field table, count included.
     fields: &'a [u8],
     methods: Vec<MethodLayout<'a>>,
-    /// The whole class attribute table, count included.
-    class_attributes: &'a [u8],
+    /// The class attribute table, parsed far enough to relocate
+    /// `BootstrapMethods`.
+    class_attributes: Vec<ClassAttribute<'a>>,
     /// Bytes after the class attributes.  Kept so `write` is byte-exact even
     /// for a class file that carries trailing data.
     tail: &'a [u8],
+}
+
+/// An old-to-new constant-pool index map.
+///
+/// Appending constants never moves an existing entry, so the writer normally
+/// uses the identity map.  A caller that compacts the pool can pass any
+/// one-to-one map; [`Layout::write_pool`] and [`Layout::write_class_attributes`]
+/// apply it to every index the entries and `BootstrapMethods` rows name,
+/// `CONSTANT_Dynamic` included.
+struct PoolMap(Vec<u16>);
+
+impl PoolMap {
+    fn identity(count: u16) -> Self {
+        Self((0..count).collect())
+    }
+
+    fn get(&self, index: u16) -> Result<u16, String> {
+        self.0.get(index as usize).copied().ok_or_else(|| {
+            format!(
+                "constant pool index {index} is outside the {}-entry pool being written",
+                self.0.len()
+            )
+        })
+    }
 }
 
 impl<'a> Layout<'a> {
@@ -413,9 +502,11 @@ impl<'a> Layout<'a> {
         let version = &bytes[..8];
 
         let pool_count = r.u2()?;
-        let pool_start = r.at;
-        let (pool_utf8, pool_tags) = parse_pool(&mut r, pool_count)?;
-        let pool = &bytes[pool_start..r.at];
+        let (pool_utf8, pool_entries) = parse_pool(&mut r, pool_count)?;
+        let mut pool_tags = vec![0u8; pool_count as usize];
+        for entry in &pool_entries {
+            pool_tags[entry.index as usize] = entry.tag;
+        }
 
         let after_pool_start = r.at;
         let _access = r.u2()?;
@@ -469,20 +560,30 @@ impl<'a> Layout<'a> {
             });
         }
 
-        let class_attribute_start = r.at;
         let class_attribute_count = r.u2()? as usize;
+        let mut class_attributes = Vec::with_capacity(class_attribute_count);
         for _ in 0..class_attribute_count {
-            r.skip(2)?; // attribute_name_index
+            let name_index = r.u2()?;
             let length = r.u4()? as usize;
-            r.skip(length)?;
+            let body = r.bytes(length)?;
+            class_attributes.push(
+                if pool_utf8.get(name_index as usize).copied().flatten() == Some("BootstrapMethods")
+                {
+                    ClassAttribute::BootstrapMethods {
+                        name_index,
+                        methods: parse_bootstrap_methods(body)?,
+                    }
+                } else {
+                    ClassAttribute::Raw { name_index, body }
+                },
+            );
         }
-        let class_attributes = &bytes[class_attribute_start..r.at];
         let tail = &bytes[r.at..];
 
         Ok(Self {
             version,
             pool_count,
-            pool,
+            pool_entries,
             pool_utf8,
             pool_tags,
             after_pool,
@@ -504,6 +605,241 @@ impl<'a> Layout<'a> {
     fn method_descriptor(&self, method: &MethodLayout<'a>) -> Option<&'a str> {
         self.utf8(method.descriptor_index)
     }
+
+    /// The one `BootstrapMethods` row list, if the class declares the attribute.
+    fn bootstrap_methods(&self) -> Option<&[BootstrapMethod]> {
+        self.class_attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                ClassAttribute::BootstrapMethods { methods, .. } => Some(methods.as_slice()),
+                ClassAttribute::Raw { .. } => None,
+            })
+    }
+
+    fn pool_entry(&self, index: u16) -> Option<&PoolEntry<'a>> {
+        self.pool_entries.iter().find(|entry| entry.index == index)
+    }
+
+    fn pool_tag(&self, index: u16) -> Option<u8> {
+        self.pool_tags
+            .get(index as usize)
+            .copied()
+            .filter(|tag| *tag != 0)
+    }
+
+    /// The name and descriptor one `CONSTANT_NameAndType` names.
+    fn name_type(&self, index: u16) -> Result<(&'a str, &'a str), String> {
+        let entry = self
+            .pool_entry(index)
+            .filter(|entry| entry.tag == 12)
+            .ok_or_else(|| format!("constant pool index {index} is not a CONSTANT_NameAndType"))?;
+        let name_index = payload_u2(entry.payload, 0)?;
+        let descriptor_index = payload_u2(entry.payload, 2)?;
+        let name = self
+            .utf8(name_index)
+            .ok_or_else(|| format!("constant pool index {name_index} is not a Utf8 name"))?;
+        let descriptor = self.utf8(descriptor_index).ok_or_else(|| {
+            format!("constant pool index {descriptor_index} is not a Utf8 descriptor")
+        })?;
+        Ok((name, descriptor))
+    }
+
+    /// Check every `CONSTANT_Dynamic` entry and its bootstrap chain.
+    ///
+    /// Appending constants after the original entries cannot move an index, so
+    /// the writer does not have to renumber anything to preserve a condy pool.
+    /// It does have to be sure the class it writes is coherent, which is what
+    /// this validation establishes: the name/type is a field descriptor, the
+    /// bootstrap index names a `BootstrapMethods` row, that row's handle is a
+    /// legal `CONSTANT_MethodHandle`, and every static argument is a loadable
+    /// constant (recursively, for another `CONSTANT_Dynamic`).
+    ///
+    /// A malformed entry that names the reserved index 0 keeps the historical
+    /// blanket rejection: that is not a condy shape the writer can relocate,
+    /// and a class built by splicing an empty tag is outside the subset.
+    fn validate_constant_pool(&self) -> Result<(), String> {
+        if !self.pool_tags.contains(&17) {
+            return Ok(());
+        }
+        let bootstrap_attributes = self
+            .class_attributes
+            .iter()
+            .filter(|attribute| matches!(attribute, ClassAttribute::BootstrapMethods { .. }))
+            .count();
+        if bootstrap_attributes > 1 {
+            return Err("class declares more than one BootstrapMethods attribute".to_owned());
+        }
+        let mut visiting = BTreeSet::new();
+        for entry in &self.pool_entries {
+            if entry.tag == 17 {
+                self.validate_dynamic(entry.index, &mut visiting)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_dynamic(&self, index: u16, visiting: &mut BTreeSet<u16>) -> Result<(), String> {
+        if !visiting.insert(index) {
+            return Err(format!(
+                "CONSTANT_Dynamic {index} is part of a bootstrap cycle"
+            ));
+        }
+        let entry = self
+            .pool_entry(index)
+            .filter(|entry| entry.tag == 17)
+            .ok_or_else(|| format!("constant pool index {index} is not a CONSTANT_Dynamic"))?;
+        let bootstrap = payload_u2(entry.payload, 0)?;
+        let nt = payload_u2(entry.payload, 2)?;
+        if nt == 0 {
+            // The reserved index 0 is not a shape this writer can relocate.
+            return Err(
+                "class constant pool uses CONSTANT_Dynamic (condy), which the bounded weaver does not rewrite"
+                    .to_owned(),
+            );
+        }
+        let (name, descriptor) = self.name_type(nt)?;
+        if name.is_empty() || !crate::valid_field_descriptor(descriptor) {
+            return Err(format!(
+                "CONSTANT_Dynamic {index} names {name:?}{descriptor}, which is not a field descriptor"
+            ));
+        }
+        let methods = self.bootstrap_methods().ok_or_else(|| {
+            format!("CONSTANT_Dynamic {index} has no BootstrapMethods attribute to name")
+        })?;
+        let method = methods.get(bootstrap as usize).ok_or_else(|| {
+            format!(
+                "CONSTANT_Dynamic {index} names bootstrap method {bootstrap}, but the class declares {}",
+                methods.len()
+            )
+        })?;
+        self.validate_bootstrap_handle(method.method_ref, index)?;
+        for (position, argument) in method.arguments.iter().enumerate() {
+            match self.pool_tag(*argument) {
+                Some(17) => self.validate_dynamic(*argument, visiting)?,
+                Some(3 | 4 | 5 | 6 | 7 | 8 | 15 | 16) => {}
+                Some(18) => {
+                    return Err(format!(
+                        "CONSTANT_Dynamic {index}'s static argument {position} is a CONSTANT_InvokeDynamic, which is not a loadable constant"
+                    ));
+                }
+                Some(tag) => {
+                    return Err(format!(
+                        "CONSTANT_Dynamic {index}'s static argument {position} (index {argument}) has tag {tag}, which is not a loadable constant"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "CONSTANT_Dynamic {index}'s static argument {position} names constant pool index {argument}, which the class does not declare"
+                    ));
+                }
+            }
+        }
+        visiting.remove(&index);
+        Ok(())
+    }
+
+    fn validate_bootstrap_handle(&self, handle_index: u16, dynamic: u16) -> Result<(), String> {
+        let entry = self
+            .pool_entry(handle_index)
+            .filter(|entry| entry.tag == 15)
+            .ok_or_else(|| {
+                format!(
+                    "CONSTANT_Dynamic {dynamic} names bootstrap method {handle_index}, which is not a CONSTANT_MethodHandle"
+                )
+            })?;
+        let kind = entry
+            .payload
+            .first()
+            .copied()
+            .ok_or_else(|| "a CONSTANT_MethodHandle has no reference kind".to_owned())?;
+        let reference = payload_u2(entry.payload, 1)?;
+        let reference_tag = self.pool_tag(reference).unwrap_or(0);
+        let legal = match kind {
+            1..=4 => reference_tag == 9,
+            5 | 8 => reference_tag == 10,
+            6 | 7 => matches!(reference_tag, 10 | 11),
+            9 => reference_tag == 11,
+            _ => false,
+        };
+        if !legal {
+            return Err(format!(
+                "CONSTANT_Dynamic {dynamic}'s bootstrap method handle has kind {kind} and references constant-pool tag {reference_tag}, which is not a legal handle target"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Re-encode the constant pool through an index map.
+    ///
+    /// The identity map reproduces the input bytes exactly; a compaction map
+    /// rewrites every index-bearing entry, including `CONSTANT_Dynamic`'s
+    /// `bootstrap_method_attr_index` and `name_and_type_index`.
+    fn write_pool(&self, out: &mut Vec<u8>, map: &PoolMap) -> Result<(), String> {
+        // Entries are written in their *new* index order, so a compaction that
+        // moves an entry also moves its bytes; every index a payload names is
+        // rewritten through the same map.
+        let mut ordered = self
+            .pool_entries
+            .iter()
+            .map(|entry| Ok((map.get(entry.index)?, entry)))
+            .collect::<Result<Vec<_>, String>>()?;
+        ordered.sort_by_key(|(index, _)| *index);
+        let mut expected = 1u16;
+        for (index, entry) in &ordered {
+            if *index != expected {
+                return Err(format!(
+                    "constant-pool relocation is not contiguous at index {index} (expected {expected})"
+                ));
+            }
+            expected = expected
+                .checked_add(if matches!(entry.tag, 5 | 6) { 2 } else { 1 })
+                .ok_or("constant pool index overflow")?;
+        }
+        for (_, entry) in ordered {
+            out.push(entry.tag);
+            match entry.tag {
+                1 | 3 | 4 | 5 | 6 => out.extend_from_slice(entry.payload),
+                7 | 8 | 16 | 19 | 20 => push_u2(out, map.get(payload_u2(entry.payload, 0)?)?),
+                9 | 10 | 11 | 12 | 17 | 18 => {
+                    push_u2(out, map.get(payload_u2(entry.payload, 0)?)?);
+                    push_u2(out, map.get(payload_u2(entry.payload, 2)?)?);
+                }
+                15 => {
+                    let kind = entry.payload.first().copied().ok_or_else(|| {
+                        "a CONSTANT_MethodHandle has no reference kind".to_owned()
+                    })?;
+                    out.push(kind);
+                    push_u2(out, map.get(payload_u2(entry.payload, 1)?)?);
+                }
+                other => {
+                    return Err(format!(
+                        "constant pool tag {other} is not supported by the class writer"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_class_attributes(&self, out: &mut Vec<u8>, map: &PoolMap) -> Result<(), String> {
+        let count = u16::try_from(self.class_attributes.len())
+            .map_err(|_| "class file has too many attributes".to_owned())?;
+        out.extend_from_slice(&count.to_be_bytes());
+        for attribute in &self.class_attributes {
+            out.extend_from_slice(&attribute.name_index().to_be_bytes());
+            let body = match attribute {
+                ClassAttribute::Raw { body, .. } => body.to_vec(),
+                ClassAttribute::BootstrapMethods { methods, .. } => {
+                    encode_bootstrap_methods(methods, map)?
+                }
+            };
+            let length = u32::try_from(body.len())
+                .map_err(|_| "attribute is longer than 4 GiB".to_owned())?;
+            out.extend_from_slice(&length.to_be_bytes());
+            out.extend_from_slice(&body);
+        }
+        Ok(())
+    }
 }
 
 fn skip_attributes(r: &mut Bytes<'_>) -> Result<(), String> {
@@ -519,17 +855,18 @@ fn skip_attributes(r: &mut Bytes<'_>) -> Result<(), String> {
 fn parse_pool<'a>(
     r: &mut Bytes<'a>,
     count: u16,
-) -> Result<(Vec<Option<&'a str>>, Vec<u8>), String> {
+) -> Result<(Vec<Option<&'a str>>, Vec<PoolEntry<'a>>), String> {
     if count == 0 {
         return Err("class file constant pool count is zero".to_owned());
     }
     let mut utf8 = vec![None; count as usize];
-    let mut tags = Vec::new();
+    let mut entries = Vec::new();
     let mut index = 1usize;
     while index < count as usize {
         let offset = r.at;
+        let entry_index = u16::try_from(index).map_err(|_| "constant pool index overflow")?;
         let tag = r.u1()?;
-        tags.push(tag);
+        let payload_start = r.at;
         match tag {
             1 => {
                 let length = r.u2()? as usize;
@@ -552,9 +889,33 @@ fn parse_pool<'a>(
                 ));
             }
         }
+        entries.push(PoolEntry {
+            index: entry_index,
+            tag,
+            payload: &r.bytes[payload_start..r.at],
+        });
         index += 1;
     }
-    Ok((utf8, tags))
+    Ok((utf8, entries))
+}
+
+fn parse_bootstrap_methods(body: &[u8]) -> Result<Vec<BootstrapMethod>, String> {
+    let mut r = Bytes::new(body);
+    let count = r.u2()? as usize;
+    let mut methods = Vec::with_capacity(count);
+    for _ in 0..count {
+        let method_ref = r.u2()?;
+        let argument_count = r.u2()? as usize;
+        let mut arguments = Vec::with_capacity(argument_count);
+        for _ in 0..argument_count {
+            arguments.push(r.u2()?);
+        }
+        methods.push(BootstrapMethod {
+            method_ref,
+            arguments,
+        });
+    }
+    Ok(methods)
 }
 
 fn parse_code<'a>(body: &'a [u8], pool: &[Option<&'a str>]) -> Result<CodeLayout<'a>, String> {
@@ -848,6 +1209,32 @@ impl<'a> PoolBuilder<'a> {
 
 fn push_u2(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_be_bytes());
+}
+
+/// Read a `u2` from a constant-pool entry payload.
+fn payload_u2(payload: &[u8], at: usize) -> Result<u16, String> {
+    let bytes = payload
+        .get(at..at + 2)
+        .ok_or_else(|| format!("constant pool entry is truncated at payload offset {at}"))?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+/// Re-encode a `BootstrapMethods` table through an index map.
+fn encode_bootstrap_methods(methods: &[BootstrapMethod], map: &PoolMap) -> Result<Vec<u8>, String> {
+    let count = u16::try_from(methods.len())
+        .map_err(|_| "BootstrapMethods has too many entries".to_owned())?;
+    let mut out = Vec::new();
+    push_u2(&mut out, count);
+    for method in methods {
+        push_u2(&mut out, map.get(method.method_ref)?);
+        let arguments = u16::try_from(method.arguments.len())
+            .map_err(|_| "a BootstrapMethods row has too many arguments".to_owned())?;
+        push_u2(&mut out, arguments);
+        for argument in &method.arguments {
+            push_u2(&mut out, map.get(*argument)?);
+        }
+    }
+    Ok(out)
 }
 
 fn push_u4(out: &mut Vec<u8>, value: u32) {
@@ -1200,10 +1587,11 @@ fn emit<'a>(
     let pool_count = layout.pool_count as usize + added.len();
     let pool_count =
         u16::try_from(pool_count).map_err(|_| "constant pool has no free entries".to_owned())?;
-    let mut out = Vec::with_capacity(layout.version.len() + layout.pool.len() + 64);
+    let map = PoolMap::identity(layout.pool_count);
+    let mut out = Vec::with_capacity(layout.pool_entries.len() * 4 + 64);
     out.extend_from_slice(layout.version);
     out.extend_from_slice(&pool_count.to_be_bytes());
-    out.extend_from_slice(layout.pool);
+    layout.write_pool(&mut out, &map)?;
     for constant in added {
         encode_constant(&mut out, constant)?;
     }
@@ -1238,7 +1626,7 @@ fn emit<'a>(
             out.extend_from_slice(attribute.body);
         }
     }
-    out.extend_from_slice(layout.class_attributes);
+    layout.write_class_attributes(&mut out, &map)?;
     out.extend_from_slice(layout.tail);
     Ok(out)
 }
@@ -2296,6 +2684,22 @@ enum FrameSites {
     InsertOnly,
 }
 
+/// A frame the rewrite synthesises where the original class had none.
+///
+/// A cancellable insert branches, so the instruction it jumps to becomes a
+/// basic block and needs a verifier frame; a split conditional needs one for
+/// its fallthrough.  The locals are slot-based (a wide value fills two slots)
+/// and the stack is value-based, like the derivation that produces them.
+#[derive(Clone)]
+struct SyntheticFrame {
+    offset: usize,
+    locals: Vec<ValueType>,
+    stack: Vec<ValueType>,
+    /// `true` maps the offset to the instruction itself (after any insert at
+    /// that offset); `false` maps it to the start of an insert there.
+    at_instruction: bool,
+}
+
 /// Rewrite one method's code around a set of same-size inserts.
 ///
 /// The layout pass places every instruction (and re-pads every switch) in the
@@ -2314,7 +2718,7 @@ fn relocate<'a>(
     max_locals: u16,
     entry: TargetEntry,
     sites: FrameSites,
-    extra_frames: &[(usize, Vec<ValueType>)],
+    extra_frames: &[SyntheticFrame],
     pool: &mut PoolBuilder<'_>,
 ) -> Result<CodePatch<'a>, String> {
     let insertions = validate_insertions(label, scan, code.code.len(), insertions, bytes.len())?;
@@ -2353,10 +2757,10 @@ fn relocate<'a>(
     }
 
     // Frames the rewrite introduces that no original frame describes: the
-    // caller's (a cancellable `HEAD` body) plus the fallthrough of every
-    // conditional the layout had to split.  A class file below version 50
-    // ignores `StackMapTable` and is verified by type inference, so it needs
-    // none of them.
+    // callers' (a cancellable `HEAD` body, an INVOKE call and its
+    // continuation) plus the fallthrough of every conditional the layout had
+    // to split.  A class file below version 50 ignores `StackMapTable` and is
+    // verified by type inference, so it needs none of them.
     let mut extras = extra_frames.to_vec();
     for at in &plan.expanded {
         let fallthrough = at + 3;
@@ -2364,13 +2768,18 @@ fn relocate<'a>(
             continue;
         }
         let state = derive_state_at(label, target, code, scan, fallthrough)?;
-        extras.push((fallthrough, state.locals));
+        extras.push(SyntheticFrame {
+            offset: fallthrough,
+            locals: state.locals,
+            stack: Vec::new(),
+            at_instruction: entry == TargetEntry::Skip,
+        });
     }
     if target.major() < 50 {
         extras.clear();
     }
     let mut seen = BTreeSet::new();
-    extras.retain(|(offset, _)| !code_frames_have(code, *offset) && seen.insert(*offset));
+    extras.retain(|frame| !code_frames_have(code, frame.offset) && seen.insert(frame.offset));
 
     let mut attributes = Vec::with_capacity(code.attributes.len() + 1);
     let mut has_stack_map = false;
@@ -2389,7 +2798,6 @@ fn relocate<'a>(
                         &insertions,
                         sites,
                         &extras,
-                        entry,
                         pool,
                     )?
                 };
@@ -2407,7 +2815,7 @@ fn relocate<'a>(
         let name_index = pool.utf8("StackMapTable")?;
         attributes.push(CodeAttribute::StackMap {
             name_index,
-            frames: synthesize_frames(label, &extras, &plan, entry, pool)?,
+            frames: synthesize_frames(label, &extras, &plan, pool)?,
         });
     }
 
@@ -2579,8 +2987,7 @@ fn relocate_frames_full(
     plan: &CodePlan,
     insertions: &[(usize, usize)],
     sites: FrameSites,
-    extras: &[(usize, Vec<ValueType>)],
-    entry: TargetEntry,
+    extras: &[SyntheticFrame],
     pool: &mut PoolBuilder<'_>,
 ) -> Result<Vec<StackMapFrame>, String> {
     let full = full_frames(target, frames)?;
@@ -2598,17 +3005,21 @@ fn relocate_frames_full(
         let mapped = map_offset(label, plan, *offset, true)?;
         out.push(full_frame(label, mapped, locals, stack, plan, pool)?);
     }
-    for (offset, slots) in extras {
-        let mapped = map_target(label, plan, *offset, entry)?;
-        out.push(StackMapFrame {
-            frame_type: 255,
-            offset: mapped,
-            locals: values_from_slots(slots)
-                .iter()
-                .map(|value| verification_from_value(label, value, plan, pool))
-                .collect::<Result<Vec<_>, _>>()?,
-            stack: Vec::new(),
-        });
+    for extra in extras {
+        let mapped = if extra.at_instruction {
+            map_offset(label, plan, extra.offset, true)?
+        } else {
+            map_offset(label, plan, extra.offset, false)?
+        };
+        let locals = values_from_slots(&extra.locals);
+        out.push(full_frame(
+            label,
+            mapped,
+            &locals,
+            &extra.stack,
+            plan,
+            pool,
+        )?);
     }
     sort_frames(label, out)
 }
@@ -2617,23 +3028,26 @@ fn relocate_frames_full(
 /// extras this rewrite introduces.
 fn synthesize_frames(
     label: &str,
-    extras: &[(usize, Vec<ValueType>)],
+    extras: &[SyntheticFrame],
     plan: &CodePlan,
-    entry: TargetEntry,
     pool: &mut PoolBuilder<'_>,
 ) -> Result<Vec<StackMapFrame>, String> {
     let mut out = Vec::with_capacity(extras.len());
-    for (offset, slots) in extras {
-        let mapped = map_target(label, plan, *offset, entry)?;
-        out.push(StackMapFrame {
-            frame_type: 255,
-            offset: mapped,
-            locals: values_from_slots(slots)
-                .iter()
-                .map(|value| verification_from_value(label, value, plan, pool))
-                .collect::<Result<Vec<_>, _>>()?,
-            stack: Vec::new(),
-        });
+    for extra in extras {
+        let mapped = if extra.at_instruction {
+            map_offset(label, plan, extra.offset, true)?
+        } else {
+            map_offset(label, plan, extra.offset, false)?
+        };
+        let locals = values_from_slots(&extra.locals);
+        out.push(full_frame(
+            label,
+            mapped,
+            &locals,
+            &extra.stack,
+            plan,
+            pool,
+        )?);
     }
     sort_frames(label, out)
 }
@@ -2883,12 +3297,9 @@ fn prepare_target<'a>(class: &'a ClassFile, target: &MethodRef) -> Result<Target
         ));
     }
     let layout = Layout::parse(&class.raw)?;
-    if layout.pool_tags.contains(&17) {
-        return Err(format!(
-            "{}.{}: class constant pool uses CONSTANT_Dynamic (condy), which the bounded weaver does not rewrite",
-            class.name, target.name
-        ));
-    }
+    layout
+        .validate_constant_pool()
+        .map_err(|error| format!("{}.{}: {error}", class.name, target.name))?;
     let method_index = find_target(&class.name, &layout, target)?;
     let method = &layout.methods[method_index];
     let descriptor = layout
@@ -3022,6 +3433,18 @@ fn pool_method(pool: &[Cp], index: u16) -> Option<(&str, &str)> {
     match pool.get(index as usize) {
         Some(Cp::MethodRef { nt, .. } | Cp::InterfaceMethodRef { nt, .. }) => {
             pool_name_type_at(pool, *nt)
+        }
+        _ => None,
+    }
+}
+
+/// The owner, name and descriptor one `Methodref`/`InterfaceMethodref` names.
+fn invoke_method_ref(pool: &[Cp], index: u16) -> Option<(&str, &str, &str)> {
+    match pool.get(index as usize) {
+        Some(Cp::MethodRef { class, nt } | Cp::InterfaceMethodRef { class, nt }) => {
+            let owner = pool_class_at(pool, *class)?;
+            let (name, descriptor) = pool_name_type_at(pool, *nt)?;
+            Some((owner, name, descriptor))
         }
         _ => None,
     }
@@ -4157,7 +4580,7 @@ fn returnable_call(
 /// the rewrite.
 ///
 /// Errors name the reason a method is outside the subset instead of guessing:
-/// condy, abstract/native methods, a mismatched callback descriptor,
+/// malformed condy, abstract/native methods, a mismatched callback descriptor,
 /// `CallbackInfo` parameters, a `wide` prefix that is not a local-variable
 /// instruction, or a conditional branch the split cannot express.
 pub fn weave_head(
@@ -4242,8 +4665,9 @@ pub fn weave_head(
 /// keep their targets and frames.  Unlike a `HEAD` insert, a `RETURN` insert is
 /// entered by the branches and switch cases that named the `return`.
 /// Every other rejection matches
-/// [`weave_head`]: condy, abstract/native methods, a mismatched callback
-/// descriptor, or a `void` target whose callback asks for a `CallbackInfo`.
+/// [`weave_head`]: malformed condy, abstract/native methods, a mismatched
+/// callback descriptor, or a `void` target whose callback asks for a
+/// `CallbackInfo`.
 pub fn weave_return(
     class: &ClassFile,
     target: &MethodRef,
@@ -4331,19 +4755,19 @@ pub fn weave_return(
     )
 }
 
-/// Emit one cancellable `void` `HEAD` insert.
+/// Emit the shared prefix of a cancellable insert: construct one
+/// `CallbackInfo`, call the callback with the target's arguments (and receiver,
+/// when it declares it) plus that object, and leave the object on the stack.
 ///
-/// The insert builds a `CallbackInfo`, calls the callback with the target's
-/// arguments plus that object, and branches around the target body when the
-/// callback cancelled.  A cancelled `void` method answers with its only
-/// possible default: a plain `return`.
-fn cancellable_head_call(
+/// Returns the bytes, the peak number of operand-stack slots they need, and
+/// the highest local slot they read plus one.
+fn callback_info_call(
     target: &Target<'_>,
     callback: &MethodRef,
     takes_receiver: bool,
     slot: u16,
     pool: &mut PoolBuilder<'_>,
-) -> Result<CallbackCall, String> {
+) -> Result<(Vec<u8>, u16, u16), String> {
     let mut bytes = Vec::new();
     let info = pool.class(CALLBACK_INFO_CLASS)?;
     bytes.push(0xbb); // new CallbackInfo
@@ -4372,6 +4796,24 @@ fn cancellable_head_call(
     bytes.push(0xb8); // invokestatic callback
     bytes.extend_from_slice(&callback_index.to_be_bytes());
     local_opcode(&mut bytes, 0x19, slot); // aload <slot>
+    Ok((bytes, slots.saturating_add(1).max(2), local_slots))
+}
+
+/// Emit one cancellable `void` `HEAD` insert.
+///
+/// The insert builds a `CallbackInfo`, calls the callback with the target's
+/// arguments plus that object, and branches around the target body when the
+/// callback cancelled.  A cancelled `void` method answers with its only
+/// possible default: a plain `return`.
+fn cancellable_head_call(
+    target: &Target<'_>,
+    callback: &MethodRef,
+    takes_receiver: bool,
+    slot: u16,
+    pool: &mut PoolBuilder<'_>,
+) -> Result<CallbackCall, String> {
+    let (mut bytes, stack_slots, local_slots) =
+        callback_info_call(target, callback, takes_receiver, slot, pool)?;
     let is_cancelled = pool.method_ref(&MethodRef {
         owner: CALLBACK_INFO_CLASS.to_owned(),
         name: "isCancelled".to_owned(),
@@ -4395,7 +4837,7 @@ fn cancellable_head_call(
         bytes,
         // `new` + `dup` while the stack is empty, then the arguments and the
         // `CallbackInfo` at the call.
-        stack_slots: slots.saturating_add(1).max(2),
+        stack_slots,
         local_slots,
     })
 }
@@ -4476,7 +4918,12 @@ pub fn weave_head_cancellable(
         max_locals,
         TargetEntry::Skip,
         FrameSites::Both,
-        &[(0, entry)],
+        &[SyntheticFrame {
+            offset: 0,
+            locals: entry,
+            stack: Vec::new(),
+            at_instruction: true,
+        }],
         &mut pool,
     )?;
 
@@ -4491,13 +4938,394 @@ pub fn weave_head_cancellable(
     )
 }
 
+/// One invocation instruction a plan selects: `invokevirtual`, `invokestatic`
+/// or `invokeinterface`.
+struct InvokeSite {
+    at: usize,
+    size: usize,
+    descriptor: String,
+    /// Whether the call pushes a receiver (`invokevirtual`/`invokeinterface`).
+    receiver: bool,
+}
+
+/// The call sites of `call_site` in one method.
+///
+/// A selector with an empty descriptor matches every overload of the name.
+/// `invokespecial` is reported rather than matched: rewriting a constructor or
+/// private call is outside the bounded shape.
+fn invoke_sites(
+    label: &str,
+    target: &Target<'_>,
+    code: &CodeLayout<'_>,
+    scan: &CodeScan,
+    call_site: &MethodRef,
+) -> Result<Vec<InvokeSite>, String> {
+    let mut sites = Vec::new();
+    for instruction in &scan.instructions {
+        let opcode = code_u1(code.code, instruction.at)?;
+        if !matches!(opcode, 0xb6..=0xb9) {
+            continue;
+        }
+        let index = code_u2(code.code, instruction.at + 1)?;
+        let Some((owner, name, descriptor)) = invoke_method_ref(target.pool, index) else {
+            continue;
+        };
+        if owner != call_site.owner
+            || name != call_site.name
+            || (!call_site.descriptor.is_empty() && descriptor != call_site.descriptor)
+        {
+            continue;
+        }
+        if opcode == 0xb7 {
+            return Err(format!(
+                "{label}: INVOKE weaving cannot rewrite the invokespecial {owner}.{name}{descriptor} call site at {}; only invokevirtual, invokestatic and invokeinterface are bounded",
+                instruction.at
+            ));
+        }
+        sites.push(InvokeSite {
+            at: instruction.at,
+            size: instruction.size,
+            descriptor: descriptor.to_owned(),
+            receiver: opcode != 0xb8,
+        });
+    }
+    Ok(sites)
+}
+
+/// The `pop`/`pop2` opcode that removes one call argument of this descriptor.
+fn pop_opcode(descriptor: &str) -> Result<u8, String> {
+    let first = descriptor
+        .as_bytes()
+        .first()
+        .copied()
+        .ok_or_else(|| "empty call argument descriptor".to_owned())?;
+    Ok(match first {
+        b'J' | b'D' => 0x58, // pop2
+        b'V' => {
+            return Err(format!("call argument descriptor {descriptor:?} is void"));
+        }
+        _ => 0x57, // pop
+    })
+}
+
+/// One cancellable call-site insert with the positions of the two branch
+/// operands the layout has to patch.
+struct CancellableInvoke {
+    bytes: Vec<u8>,
+    ifeq: usize,
+    ifeq_operand: usize,
+    goto: usize,
+    goto_operand: usize,
+    stack_slots: u16,
+    local_slots: u16,
+}
+
+/// Emit the insert that runs one callback before a `void` call and, when the
+/// callback cancelled, pops the call's receiver and arguments and jumps to the
+/// instruction after the call.
+///
+/// The inserted shape is:
+///
+/// ```text
+/// <CallbackInfo setup and callback call>
+/// aload <slot>; invokevirtual CallbackInfo.isCancelled()Z
+/// ifeq <the call>          (not cancelled)
+/// pop/pop2 ...             (the call's arguments, then the receiver)
+/// goto <after the call>
+/// <the call itself>        (the original instruction, at insert end)
+/// <after the call>         (the original next instruction)
+/// ```
+///
+/// Both branch operands are patched from the stable layout, because the `goto`
+/// has to land on the start of any insert in front of the original next
+/// instruction, not on the instruction itself.
+fn cancellable_invoke_call(
+    target: &Target<'_>,
+    callback: &MethodRef,
+    takes_receiver: bool,
+    site: &InvokeSite,
+    slot: u16,
+    pool: &mut PoolBuilder<'_>,
+) -> Result<CancellableInvoke, String> {
+    let (mut bytes, stack_slots, local_slots) =
+        callback_info_call(target, callback, takes_receiver, slot, pool)?;
+    let is_cancelled = pool.method_ref(&MethodRef {
+        owner: CALLBACK_INFO_CLASS.to_owned(),
+        name: "isCancelled".to_owned(),
+        descriptor: "()Z".to_owned(),
+    })?;
+    bytes.push(0xb6); // invokevirtual isCancelled
+    bytes.extend_from_slice(&is_cancelled.to_be_bytes());
+    push_ifeq(&mut bytes);
+    let ifeq = bytes.len() - 3;
+    let ifeq_operand = ifeq + 1;
+    for argument in crate::descriptor_arguments(&site.descriptor).iter().rev() {
+        bytes.push(pop_opcode(argument)?);
+    }
+    if site.receiver {
+        bytes.push(0x57); // pop the receiver
+    }
+    push_goto(&mut bytes);
+    let goto = bytes.len() - 3;
+    let goto_operand = goto + 1;
+    Ok(CancellableInvoke {
+        bytes,
+        ifeq,
+        ifeq_operand,
+        goto,
+        goto_operand,
+        stack_slots,
+        local_slots,
+    })
+}
+
+fn push_ifeq(out: &mut Vec<u8>) {
+    out.push(0x99); // ifeq
+    out.extend_from_slice(&[0, 0]);
+}
+
+fn push_goto(out: &mut Vec<u8>) {
+    out.push(0xa7); // goto
+    out.extend_from_slice(&[0, 0]);
+}
+
+/// Insert a callback immediately before every call site a plan selects.
+///
+/// `target` is the woven method (the plan's `target`); `call_site` is the
+/// `@At(INVOKE)` selector.  Only `invokevirtual`, `invokestatic` and
+/// `invokeinterface` call sites are bounded: those are the instructions whose
+/// operand stack the insert can leave untouched (non-cancellable) or pop with
+/// known types (cancellable).  A selector with an empty descriptor matches
+/// every overload of the name.
+///
+/// The callback shape is the one the interpreter validates for an INVOKE plan:
+/// it mirrors the woven method's arguments, may take the woven method's
+/// receiver first, may end with a `CallbackInfo` when `cancellable`, and
+/// returns `void`.  The callback therefore sees the method the call site lives
+/// in, not the callee's arguments.
+///
+/// A non-cancellable insert is stack-neutral: it is the same load-arguments and
+/// `invokestatic` sequence a `HEAD` insert emits, placed before each matching
+/// call.  A cancellable insert constructs [`callback_info_class`], calls the
+/// callback, and - when `ci.cancel()` ran - pops the call's arguments with
+/// their own widths and branches around the call.  Cancellation is bounded to
+/// a `void` call site with exactly one matching instruction, because a
+/// non-void call would also have to push the callee descriptor's default value.
+///
+/// Both shapes relocate branches, switches, the exception table and
+/// `StackMapTable` exactly as [`weave_head`] does.  A cancellable insert adds
+/// the two verifier frames its branches need (the call and the instruction
+/// after it), derived from the method's own frames instead of guessed.
+pub fn weave_invoke(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    call_site: &MethodRef,
+    cancellable: bool,
+) -> Result<Vec<u8>, String> {
+    let target = prepare_target(class, target)?;
+    let label = target.label();
+    let takes_receiver = callback_arguments(
+        &target.class_name,
+        target.is_static,
+        &target.descriptor,
+        &callback.descriptor,
+        "INVOKE",
+        if cancellable {
+            Injected::Cancellable
+        } else {
+            Injected::None
+        },
+    )?;
+    let code = target.code()?;
+    let scan = scan_code(&label, code.code)?;
+    let sites = invoke_sites(&label, &target, code, &scan, call_site)?;
+    if sites.is_empty() {
+        return Err(format!(
+            "{label}: INVOKE weaving found no {}{} call site; the selector matches invokevirtual, invokestatic and invokeinterface instructions by owner, name and descriptor",
+            call_site.owner, call_site.name
+        ));
+    }
+    if cancellable {
+        let [site] = sites.as_slice() else {
+            return Err(format!(
+                "{label}: cancellable INVOKE weaving needs exactly one matching call site, but the selector matches {}",
+                sites.len()
+            ));
+        };
+        return weave_cancellable_invoke(&target, callback, takes_receiver, site, code, &scan);
+    }
+
+    let mut pool = PoolBuilder::new(&class.pool);
+    let call = callback_call(&target, callback, takes_receiver, &mut pool)?;
+    if code.code.len() + call.bytes.len() * sites.len() > MAX_CODE_LENGTH {
+        return Err(format!(
+            "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
+        ));
+    }
+    let max_stack = u32::from(code.max_stack)
+        .checked_add(u32::from(call.stack_slots))
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(|| format!("{label}: woven max_stack overflows u16"))?;
+    let max_locals = code.max_locals.max(call.local_slots);
+    let insertions = sites
+        .iter()
+        .map(|site| (site.at, call.bytes.len()))
+        .collect::<Vec<_>>();
+    let patch = relocate(
+        &label,
+        &target,
+        code,
+        &scan,
+        &insertions,
+        &call.bytes,
+        max_stack,
+        max_locals,
+        TargetEntry::Enter,
+        FrameSites::Both,
+        &[],
+        &mut pool,
+    )?;
+    emit(
+        &target.layout,
+        Some(Patch {
+            method: target.method_index,
+            attribute: target.attribute_index,
+            code: patch,
+        }),
+        &pool.added,
+    )
+}
+
+fn weave_cancellable_invoke(
+    target: &Target<'_>,
+    callback: &MethodRef,
+    takes_receiver: bool,
+    site: &InvokeSite,
+    code: &CodeLayout<'_>,
+    scan: &CodeScan,
+) -> Result<Vec<u8>, String> {
+    let label = target.label();
+    if crate::return_desc(&site.descriptor) != "V" {
+        return Err(format!(
+            "{label}: cancellable INVOKE weaving is bounded to void call sites; the selected call site's descriptor {} answers a value, which would also need the callee descriptor's default pushed on cancellation",
+            site.descriptor
+        ));
+    }
+    if site.at + site.size >= code.code.len() {
+        return Err(format!(
+            "{label}: the call site at {} has no instruction after it for the cancellation branch to reach",
+            site.at
+        ));
+    }
+    let slot = code.max_locals.max(argument_slots(target)?);
+    let mut pool = PoolBuilder::new(target.pool);
+    let mut call =
+        cancellable_invoke_call(target, callback, takes_receiver, site, slot, &mut pool)?;
+    if code.code.len() + call.bytes.len() > MAX_CODE_LENGTH {
+        return Err(format!(
+            "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
+        ));
+    }
+
+    // The insert's length is fixed before its branch operands are known, so the
+    // stable layout can be computed first and the operands patched into the
+    // bytes the relocation will place at that same offset.
+    let insertions = [(site.at, call.bytes.len())];
+    let insertions =
+        validate_insertions(&label, scan, code.code.len(), &insertions, call.bytes.len())?;
+    let plan = stable_plan(&label, scan, &insertions, TargetEntry::Enter)?;
+    let call_at = plan.offsets.get(&site.at).copied().ok_or_else(|| {
+        format!(
+            "{label}: the call site at {} is not an instruction boundary",
+            site.at
+        )
+    })?;
+    let insert_start = call_at
+        .checked_sub(call.bytes.len())
+        .ok_or_else(|| format!("{label}: the insert at {} does not fit the layout", site.at))?;
+    let after = map_offset(&label, &plan, site.at + site.size, false)?;
+    let ifeq_delta = i16::try_from(call_at as i64 - (insert_start + call.ifeq) as i64)
+        .map_err(|_| format!("{label}: the cancellation branch cannot reach the call"))?;
+    let goto_delta = i16::try_from(after as i64 - (insert_start + call.goto) as i64)
+        .map_err(|_| format!("{label}: the cancellation branch cannot reach the continuation"))?;
+    call.bytes[call.ifeq_operand..call.ifeq_operand + 2].copy_from_slice(&ifeq_delta.to_be_bytes());
+    call.bytes[call.goto_operand..call.goto_operand + 2].copy_from_slice(&goto_delta.to_be_bytes());
+
+    let before = derive_state_at(&label, target, code, scan, site.at)?;
+    let after_state = derive_state_at(&label, target, code, scan, site.at + site.size)?;
+    let extras = [
+        SyntheticFrame {
+            offset: site.at,
+            locals: before.locals,
+            stack: before.stack,
+            at_instruction: true,
+        },
+        SyntheticFrame {
+            offset: site.at + site.size,
+            locals: after_state.locals,
+            stack: after_state.stack,
+            at_instruction: false,
+        },
+    ];
+    let max_stack = u32::from(code.max_stack)
+        .checked_add(u32::from(call.stack_slots))
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(|| format!("{label}: woven max_stack overflows u16"))?;
+    let max_locals = code.max_locals.max(call.local_slots);
+    let patch = relocate(
+        &label,
+        target,
+        code,
+        scan,
+        &[(site.at, call.bytes.len())],
+        &call.bytes,
+        max_stack,
+        max_locals,
+        TargetEntry::Enter,
+        FrameSites::Both,
+        &extras,
+        &mut pool,
+    )?;
+    emit(
+        &target.layout,
+        Some(Patch {
+            method: target.method_index,
+            attribute: target.attribute_index,
+            code: patch,
+        }),
+        &pool.added,
+    )
+}
+
+/// Apply one `@At("INVOKE")` plan: [`weave_invoke`] with the plan's callback,
+/// target and selected call site.
+pub fn weave_invoke_plan(class: &ClassFile, plan: &MixinInjectionPlan) -> Result<Vec<u8>, String> {
+    if plan.at != "INVOKE" {
+        return Err(format!(
+            "{}.{}: plan anchor is {}, not INVOKE",
+            plan.target.owner, plan.target.name, plan.at
+        ));
+    }
+    let site = plan.invoke_target.as_ref().ok_or_else(|| {
+        format!(
+            "{}.{}: the @At(INVOKE) plan has no resolved call site",
+            plan.target.owner, plan.target.name
+        )
+    })?;
+    weave_invoke(class, &plan.target, &plan.callback, site, plan.cancellable)
+}
+
 /// Apply every plan that targets `class`: `HEAD` plans first, then
 /// `RETURN`/`TAIL` plans, each group in declaration order.
 ///
 /// Plans for other classes are skipped.  A matching plan that asks for an
 /// anchor or object this file cannot produce is an error rather than a silent
-/// skip: `INVOKE` call-site rewriting, cancelling a `void` target, an unknown
-/// anchor, and more than `MAX_WEAVE_PLANS_PER_CLASS` plans for one class.
+/// skip: `INVOKE` call-site rewriting (use [`weave_invoke_plan`] for that
+/// anchor), cancelling a `void` target, an unknown anchor, and more than
+/// `MAX_WEAVE_PLANS_PER_CLASS` plans for one class.
 ///
 /// A `RETURN`/`TAIL` plan on a non-void target references the synthetic
 /// `CallbackInfoReturnable`; [`weave_class_with_extras`] reports that class
@@ -4626,12 +5454,13 @@ fn plan_returns_value(class: &ClassFile, plan: &MixinInjectionPlan) -> bool {
 /// and `TAIL` plans, and rejects anchors and cancellable plans it cannot weave
 /// instead of skipping them.
 ///
-/// Not supported here, and left on the interpreter path: `RETURN`, `TAIL` and
-/// `INVOKE` anchors; cancellation; and `CallbackInfo`/`CallbackInfoReturnable`
-/// parameters.  Errors from a matching plan (ambiguous target descriptor,
-/// callback mismatch, a condy pool, a `wide` prefix that is not a
-/// local-variable instruction, a conditional branch the split cannot express)
-/// propagate rather than being silently skipped.
+/// Not supported here, and left to the interpreter: `RETURN`, `TAIL` and
+/// `INVOKE` anchors (the last is [`weave_invoke_plan`]); cancellation; and
+/// `CallbackInfo`/`CallbackInfoReturnable` parameters.  Errors from a matching
+/// plan (ambiguous target descriptor, callback mismatch, a malformed condy
+/// pool, a `wide` prefix that is not a local-variable instruction, a
+/// conditional branch the split cannot express) propagate rather than being
+/// silently skipped.
 ///
 /// Every insert lands at offset 0, so when several plans match one method the
 /// last plan applied is the first callback to run.  Callers that need Mixin's
@@ -5393,5 +6222,140 @@ mod tests {
         let high = read();
         let cases = (low..=high).map(|_| read()).collect();
         (default, low, high, cases)
+    }
+
+    /// A minimal class with one `CONSTANT_Dynamic`: pool index 19 is the condy,
+    /// its name/type (index 10) is `condyName`/`I`, bootstrap row 0 is a
+    /// `ConstantBootstraps`-shaped handle (index 18) with one `String` argument
+    /// (index 20, whose `Utf8` is index 11).
+    fn condy_fixture() -> Vec<u8> {
+        let mut out = Vec::new();
+        u4(&mut out, 0xCAFE_BABE);
+        u2(&mut out, 0);
+        u2(&mut out, 52);
+        u2(&mut out, 22);
+        utf8(&mut out, "demo/C"); // 1
+        out.extend_from_slice(&[7, 0, 1]); // 2
+        utf8(&mut out, "java/lang/Object"); // 3
+        out.extend_from_slice(&[7, 0, 3]); // 4
+        utf8(&mut out, "m"); // 5
+        utf8(&mut out, "()V"); // 6
+        utf8(&mut out, "Code"); // 7
+        utf8(&mut out, "condyName"); // 8
+        utf8(&mut out, "I"); // 9
+        out.extend_from_slice(&[12, 0, 8, 0, 9]); // 10 NameAndType
+        utf8(&mut out, "extra"); // 11
+        utf8(&mut out, "java/lang/invoke/ConstantBootstraps"); // 12
+        utf8(&mut out, "bootstrap"); // 13
+        utf8(&mut out, "()Ljava/lang/Object;"); // 14
+        out.extend_from_slice(&[12, 0, 13, 0, 14]); // 15 NameAndType
+        out.extend_from_slice(&[7, 0, 12]); // 16 Class
+        out.extend_from_slice(&[10, 0, 16, 0, 15]); // 17 Methodref
+        out.extend_from_slice(&[15, 6, 0, 17]); // 18 MethodHandle
+        out.extend_from_slice(&[17, 0, 0, 0, 10]); // 19 Dynamic
+        out.extend_from_slice(&[8, 0, 11]); // 20 String
+        utf8(&mut out, "BootstrapMethods"); // 21
+
+        u2(&mut out, 0x0021); // access
+        u2(&mut out, 2); // this
+        u2(&mut out, 4); // super
+        u2(&mut out, 0); // interfaces
+        u2(&mut out, 0); // fields
+        u2(&mut out, 1); // methods
+        u2(&mut out, 0x0001);
+        u2(&mut out, 5);
+        u2(&mut out, 6);
+        u2(&mut out, 1); // attributes
+        u2(&mut out, 7); // Code
+        let mut body = Vec::new();
+        u2(&mut body, 0); // max_stack
+        u2(&mut body, 0); // max_locals
+        u4(&mut body, 1); // code_length
+        body.push(0xb1); // return
+        u2(&mut body, 0); // exception table
+        u2(&mut body, 0); // Code attributes
+        u4(&mut out, body.len() as u32);
+        out.extend_from_slice(&body);
+
+        u2(&mut out, 1); // class attributes
+        u2(&mut out, 21);
+        let mut bootstrap = Vec::new();
+        u2(&mut bootstrap, 1); // rows
+        u2(&mut bootstrap, 18); // method handle
+        u2(&mut bootstrap, 1); // static arguments
+        u2(&mut bootstrap, 20);
+        u4(&mut out, bootstrap.len() as u32);
+        out.extend_from_slice(&bootstrap);
+        out
+    }
+
+    #[test]
+    fn condy_pools_are_accepted_and_round_trip() {
+        let bytes = condy_fixture();
+        let class = ClassFile::parse(&bytes).unwrap();
+        assert_eq!(class.write().unwrap(), bytes, "identity round-trip");
+        let layout = Layout::parse(&bytes).unwrap();
+        layout
+            .validate_constant_pool()
+            .expect("a well-formed condy is inside the writer's subset");
+    }
+
+    /// A relocated pool rewrites `CONSTANT_Dynamic`'s name/type and the
+    /// `BootstrapMethods` static argument, so a future compaction cannot leave
+    /// the condy pointing at the wrong constant.
+    #[test]
+    fn pool_relocation_rewrites_dynamic_and_bootstrap_references() {
+        let bytes = condy_fixture();
+        let layout = Layout::parse(&bytes).unwrap();
+        let identity = PoolMap::identity(layout.pool_count);
+
+        let mut pool = Vec::new();
+        layout.write_pool(&mut pool, &identity).unwrap();
+        assert_eq!(
+            &bytes[10..10 + pool.len()],
+            pool.as_slice(),
+            "the identity map reproduces the pool bytes"
+        );
+        let mut attributes = Vec::new();
+        layout
+            .write_class_attributes(&mut attributes, &identity)
+            .unwrap();
+        assert_eq!(
+            &bytes[bytes.len() - attributes.len()..],
+            attributes.as_slice(),
+            "the identity map reproduces the BootstrapMethods bytes"
+        );
+
+        let mut map = PoolMap::identity(layout.pool_count);
+        map.0.swap(8, 11);
+        let mut relocated = Vec::new();
+        layout.write_pool(&mut relocated, &map).unwrap();
+        let mut r = Bytes::new(&relocated);
+        let (utf8, entries) = parse_pool(&mut r, layout.pool_count).unwrap();
+        assert_eq!(utf8[8], Some("extra"));
+        assert_eq!(utf8[11], Some("condyName"));
+        let entry = |index: u16| {
+            entries
+                .iter()
+                .find(|entry| entry.index == index)
+                .expect("relocated entry")
+        };
+        assert_eq!(entry(10).tag, 12);
+        assert_eq!(payload_u2(entry(10).payload, 0).unwrap(), 11);
+        assert_eq!(payload_u2(entry(10).payload, 2).unwrap(), 9);
+        assert_eq!(entry(19).tag, 17);
+        assert_eq!(payload_u2(entry(19).payload, 0).unwrap(), 0);
+        assert_eq!(payload_u2(entry(19).payload, 2).unwrap(), 10);
+        assert_eq!(entry(20).tag, 8);
+        assert_eq!(payload_u2(entry(20).payload, 0).unwrap(), 8);
+
+        let mut relocated_attributes = Vec::new();
+        layout
+            .write_class_attributes(&mut relocated_attributes, &map)
+            .unwrap();
+        assert_eq!(
+            relocated_attributes, attributes,
+            "the bootstrap row keeps its handle and argument indices"
+        );
     }
 }
