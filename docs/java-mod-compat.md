@@ -390,8 +390,8 @@ The native probe also reads Mixin annotations from real classfiles. Class and me
 `RuntimeVisibleAnnotations` survive parsing, so `@Mixin` targets (both `targets` and `value`) and `@Inject`
 methods with `method` (name or `name(descriptor)`), nested `@At` anchors (`HEAD`, `RETURN`, `TAIL`) and
 `cancellable` become deterministic `MixinInjectionPlan`s. `NativeJar::execute_discovered_mixins` runs the
-HEAD callbacks in declaration order, invokes the target once, then runs RETURN/TAIL callbacks, and rejects
-mixed-anchor or non-void-callback plans before executing any of them. A cancellable HEAD plan receives a
+HEAD callbacks in declaration order, invokes the target once, then runs RETURN/TAIL callbacks on the same
+target, and validates every callback before executing any of them (INVOKE remains a separate anchor family). A cancellable HEAD plan receives a
 runtime-owned `CallbackInfo`; `cancel()` stops the remaining HEAD callbacks and the target body and returns
 the target's default value, and the report says `cancelled`. RETURN/TAIL callbacks receive a
 `CallbackInfoReturnable` seeded with the real result; `setReturnValue` overrides it, and a non-void target
