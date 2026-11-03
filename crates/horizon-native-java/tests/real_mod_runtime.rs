@@ -155,6 +155,94 @@ version = "1.0"
 }
 
 #[test]
+fn runtime_built_mixin_fixture_dispatches_ordered_callback_chain() {
+    use horizon_native_java::{MethodRef, MixinInjectionPlan, Value};
+
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "demo/Target.java",
+        r#"package demo;
+public final class Target {
+    public static void run(int value) {
+        System.getenv("target");
+    }
+}
+"#,
+    );
+    sources.insert(
+        "demo/Callbacks.java",
+        r#"package demo;
+public final class Callbacks {
+    public static void first(int value) {
+        System.getenv("first");
+    }
+    public static void second(int value) {
+        System.getenv("second");
+    }
+}
+"#,
+    );
+    let (root, jar_path) = build_jar(
+        "mixin-chain",
+        sources,
+        "fabric.mod.json",
+        br#"{"id":"mixin-chain-fixture","version":"1.0"}"#,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let target = MethodRef {
+        owner: "demo/Target".into(),
+        name: "run".into(),
+        descriptor: "(I)V".into(),
+    };
+    let first = MixinInjectionPlan::inject_at_head(
+        target.clone(),
+        MethodRef {
+            owner: "demo/Callbacks".into(),
+            name: "first".into(),
+            descriptor: "(I)V".into(),
+        },
+    );
+    let second = MixinInjectionPlan::inject_at_head(
+        target.clone(),
+        MethodRef {
+            owner: "demo/Callbacks".into(),
+            name: "second".into(),
+            descriptor: "(I)V".into(),
+        },
+    );
+
+    let mut host = StdHost::new();
+    let report = jar
+        .execute_mixin_chain(&[first, second], None, &[Value::Int(7)], &mut host)
+        .unwrap();
+    assert_eq!(report.callback_result, Value::Void);
+    assert_eq!(report.target_result, Value::Void);
+
+    let getenv = MethodRef {
+        owner: "java/lang/System".into(),
+        name: "getenv".into(),
+        descriptor: "(Ljava/lang/String;)Ljava/lang/String;".into(),
+    };
+    let markers: Vec<_> = host
+        .invocations()
+        .iter()
+        .filter(|invocation| invocation.method == getenv)
+        .filter_map(|invocation| invocation.args.first().cloned())
+        .collect();
+    assert_eq!(markers.len(), 3);
+    let first_marker = Value::Ref(Some("first".into()));
+    let target_marker = Value::Ref(Some("target".into()));
+    let second_marker = Value::Ref(Some("second".into()));
+    assert_eq!(markers.iter().filter(|marker| **marker == first_marker).count(), 1);
+    assert_eq!(markers.iter().filter(|marker| **marker == target_marker).count(), 1);
+    assert_eq!(markers.iter().filter(|marker| **marker == second_marker).count(), 1);
+    let first_index = markers.iter().position(|marker| *marker == first_marker).unwrap();
+    let second_index = markers.iter().position(|marker| *marker == second_marker).unwrap();
+    assert!(first_index < second_index, "callbacks must run in declaration order");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn runtime_built_mixin_fixture_executes_bounded_injectors() {
     use horizon_native_java::{MethodRef, MixinInjectionPlan, Value};
 
