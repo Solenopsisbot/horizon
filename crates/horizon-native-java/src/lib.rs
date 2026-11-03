@@ -4010,7 +4010,7 @@ impl Host for StdHost {
             ) => Ok(collection_empty("list")),
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
-                "getAuthors" | "getLicense",
+                "getAuthors" | "getContributors" | "getLicense",
                 "()Ljava/util/Collection;",
             ) => Ok(collection_empty("list")),
             (

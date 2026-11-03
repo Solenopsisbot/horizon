@@ -131,6 +131,30 @@ fn fabric_fixture_runs_entrypoint_and_carries_resource_and_registry_declaration(
         .unwrap(),
         Value::Int(0)
     );
+    let contributors = host
+        .invoke_instance(
+            &MethodRef {
+                owner: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
+                name: "getContributors".into(),
+                descriptor: "()Ljava/util/Collection;".into(),
+            },
+            &metadata,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        host.invoke_instance(
+            &MethodRef {
+                owner: "java/util/Collection".into(),
+                name: "size".into(),
+                descriptor: "()I".into(),
+            },
+            &contributors,
+            &[],
+        )
+        .unwrap(),
+        Value::Int(0)
+    );
     let mut sink = Recording(Vec::new());
     for declaration in &jar.native_declarations {
         sink.register_typed(declaration).unwrap();
