@@ -93,11 +93,24 @@
 //! growing an instruction moves everything after it, so the next pass has to
 //! agree.  A layout that does not settle inside the bound is rejected.
 //!
-//! A conditional branch (`if*`, `ifnull`, `ifnonnull`) has no wide encoding.
-//! Splitting one into an inverted branch over a `goto_w` would add a branch and
-//! a frame at a site the weaver cannot derive, so a conditional whose relocated
-//! target no longer fits 16 bits is rejected with the distance instead of
-//! written wrong.
+//! A conditional branch (`if*`, `ifnull`, `ifnonnull`) has no wide encoding, so
+//! one whose relocated target no longer fits 16 bits is split in place:
+//!
+//! ```text
+//! if<inverse> +8       (skips the wide jump when the original condition is false)
+//! goto_w target
+//! <the original fallthrough instruction>
+//! ```
+//!
+//! The fallthrough instruction becomes a branch target and therefore needs a
+//! `StackMapTable` frame.  The frame's locals are derived by following the
+//! straight-line region from the nearest preceding frame (or the method entry)
+//! with a bounded type model - local loads and stores, constants, fields,
+//! calls, arrays, `checkcast` and the stack shuffles - so the frame is exact
+//! rather than guessed; an instruction the model cannot follow is a reason, not
+//! a guessed frame.  When such a frame is added, every frame in the method is
+//! re-encoded as a `full_frame`, because a later `append`/`chop` frame's delta
+//! is relative to the frame in front of it.
 //!
 //! An insert sits in front of the instruction it precedes, and two details
 //! follow from that.  A `RETURN`/`TAIL` insert is *entered*: a branch or switch
@@ -129,7 +142,11 @@
 //! return `void`.  An instance target's callback may instead take the target
 //! instance as an extra first parameter, which the inserted `aload_0` supplies.
 //! A non-void `RETURN`/`TAIL` callback must end with a
-//! `CallbackInfoReturnable`, which the insert supplies.
+//! `CallbackInfoReturnable`, which the insert supplies.  A cancellable `void`
+//! `HEAD` callback ends with a `CallbackInfo` instead: the insert constructs
+//! [`callback_info_class`], passes it, and emits
+//! `if (!ci.isCancelled()) goto body; return`, so a cancelled callback skips the
+//! target body and the method answers with the `void` default.
 //!
 //! [`weave_class`] applies every matching `HEAD` plan first, then every
 //! `RETURN`/`TAIL` plan, re-parsing the class between edits and skipping plans
@@ -141,33 +158,37 @@
 //!
 //! # What it does not support
 //!
-//! [`weave_plans`] applies only `HEAD` plans, in plan order, and skips plans
-//! that target another class or ask for cancellation; [`weave_class`] instead
-//! rejects an anchor it cannot weave, a `void` cancellation and a per-class plan
-//! overflow with a reason.
+//! [`weave_plans`] applies only plain `HEAD` plans, in plan order, and skips
+//! plans that target another class or ask for cancellation; [`weave_class`]
+//! instead rejects an anchor it cannot weave and a per-class plan overflow with
+//! a reason.
 //!
-//! Cancelling a `void` target and `@At("INVOKE")` stay on the interpreter path:
-//! cancellation needs a runtime-owned `CallbackInfo` object, and `INVOKE` moves
-//! or guards a call site - both need bytecode a plain insert cannot express.  A
-//! non-void `RETURN`/`TAIL` callback that does not declare the trailing
-//! `CallbackInfoReturnable` stays there too, because it cannot observe the
-//! result.
+//! `@At("INVOKE")` stays on the interpreter path: it moves or guards a call site,
+//! which needs bytecode a plain insert cannot express.  A cancellable
+//! `RETURN`/`TAIL` on a `void` target, and a cancellable `HEAD` on a non-void
+//! one, stay there too: the first has no result to carry, the second needs the
+//! descriptor's default value in the target's shape.  A non-void `RETURN`/`TAIL`
+//! callback that does not declare the trailing `CallbackInfoReturnable` cannot
+//! observe the result and stays there as well.
 //!
 //! The synthetic `CallbackInfoReturnable` is the smallest class that carries the
 //! result, so it does not extend Mixin's `CallbackInfo`: a callback that casts
-//! it to `CallbackInfo` or reads `isCancellable` is outside the bounded subset.
-//! A jar that already declares the class keeps its own copy.
+//! it to `CallbackInfo`, or that asks either synthetic class for `isCancellable`,
+//! is outside the bounded subset.  A jar that already declares the class keeps
+//! its own copy.
 //!
 //! A class whose constant pool uses `CONSTANT_Dynamic` (condy) is rejected
-//! because the writer cannot re-encode its bootstrap arguments.  Non-ASCII
-//! constant pool strings and code that would exceed the class-file
+//! because the writer copies the pool verbatim but would have to re-encode the
+//! `BootstrapMethods` attribute's arguments to append anything the index shift
+//! touches, and no bounded evaluation of the bootstrap method is attempted.
+//! Non-ASCII constant pool strings and code that would exceed the class-file
 //! `code_length` limit are rejected with a reason rather than written.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    CALLBACK_INFO_RETURNABLE_CLASS, CALLBACK_INFO_RETURNABLE_DESC, ClassFile, Cp, MethodRef,
-    MixinInjectionPlan,
+    CALLBACK_INFO_CLASS, CALLBACK_INFO_DESC, CALLBACK_INFO_RETURNABLE_CLASS,
+    CALLBACK_INFO_RETURNABLE_DESC, ClassFile, Cp, MethodRef, MixinInjectionPlan,
 };
 
 const ACC_STATIC: u16 = 0x0008;
@@ -191,6 +212,10 @@ const MAX_RELOCATION_PASSES: usize = 16;
 /// Plans [`weave_class`] applies to one class.  A jar with more matching plans
 /// than this is outside the bounded weaver instead of growing the edit loop.
 const MAX_WEAVE_PLANS_PER_CLASS: usize = 32;
+/// Conditional branches one method may split.  Each split walks the straight-line
+/// region to derive a frame, so a method that needs more is outside the bounded
+/// weaver rather than a quadratic derivation.
+const MAX_EXPANDED_BRANCHES: usize = 64;
 
 /// Which return instruction a [`weave_return`] insert lands before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1061,6 +1086,97 @@ pub fn callback_info_returnable_class() -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// The bounded JVM-side `CallbackInfo` a woven cancellable `void` `HEAD`
+/// insert constructs.
+///
+/// Like [`callback_info_returnable_class`], this is the smallest class a callback
+/// needs rather than Mixin's own: a `cancelled` field, the `()V` constructor,
+/// `cancel` and `isCancelled`.  No member branches, so it needs no
+/// `StackMapTable`.
+pub fn callback_info_class() -> Result<Vec<u8>, String> {
+    const NAME: &str = CALLBACK_INFO_CLASS;
+    let mut pool: Vec<Cp> = vec![Cp::Empty];
+    let this_class = pool_class(&mut pool, NAME);
+    let super_class = pool_class(&mut pool, "java/lang/Object");
+    let code_name = pool_utf8(&mut pool, "Code");
+    let name_cancelled = pool_utf8(&mut pool, "cancelled");
+    let name_init = pool_utf8(&mut pool, "<init>");
+    let name_cancel = pool_utf8(&mut pool, "cancel");
+    let name_is_cancelled = pool_utf8(&mut pool, "isCancelled");
+    let desc_boolean = pool_utf8(&mut pool, "Z");
+    let desc_void = pool_utf8(&mut pool, "()V");
+    let desc_is_cancelled = pool_utf8(&mut pool, "()Z");
+    let cancelled = pool_field_ref(&mut pool, NAME, name_cancelled, desc_boolean);
+    let object_init = pool_method_ref(&mut pool, "java/lang/Object", name_init, desc_void);
+
+    // `<init>()V`: `aload_0; invokespecial Object.<init>; return`.
+    let mut init_bytes = vec![0x2a, 0xb7];
+    init_bytes.extend_from_slice(&object_init.to_be_bytes());
+    init_bytes.push(0xb1);
+    // `cancel()V`: `aload_0; iconst_1; putfield cancelled; return`.
+    let mut cancel_bytes = vec![0x2a, 0x04, 0xb5];
+    cancel_bytes.extend_from_slice(&cancelled.to_be_bytes());
+    cancel_bytes.push(0xb1);
+    // `isCancelled()Z`: `aload_0; getfield cancelled; ireturn`.
+    let mut is_cancelled_bytes = vec![0x2a, 0xb4];
+    is_cancelled_bytes.extend_from_slice(&cancelled.to_be_bytes());
+    is_cancelled_bytes.push(0xac);
+
+    let mut out = Vec::new();
+    push_u4(&mut out, 0xCAFE_BABE);
+    push_u2(&mut out, 0); // minor_version
+    push_u2(&mut out, SYNTHETIC_CLASS_MAJOR);
+    push_u2(&mut out, pool.len() as u16);
+    for constant in &pool[1..] {
+        encode_constant(&mut out, constant)?;
+    }
+    push_u2(&mut out, ACC_PUBLIC | ACC_SUPER);
+    push_u2(&mut out, this_class);
+    push_u2(&mut out, super_class);
+    push_u2(&mut out, 0); // interfaces
+    push_u2(&mut out, 1); // fields
+    push_synthetic_field(&mut out, ACC_PRIVATE, name_cancelled, desc_boolean);
+    push_u2(&mut out, 3); // methods
+    push_synthetic_method(
+        &mut out,
+        code_name,
+        ACC_PUBLIC,
+        name_init,
+        desc_void,
+        SyntheticCode {
+            max_stack: 1,
+            max_locals: 1,
+            bytes: &init_bytes,
+        },
+    );
+    push_synthetic_method(
+        &mut out,
+        code_name,
+        ACC_PUBLIC,
+        name_cancel,
+        desc_void,
+        SyntheticCode {
+            max_stack: 2,
+            max_locals: 1,
+            bytes: &cancel_bytes,
+        },
+    );
+    push_synthetic_method(
+        &mut out,
+        code_name,
+        ACC_PUBLIC,
+        name_is_cancelled,
+        desc_is_cancelled,
+        SyntheticCode {
+            max_stack: 1,
+            max_locals: 1,
+            bytes: &is_cancelled_bytes,
+        },
+    );
+    push_u2(&mut out, 0); // class attributes
+    Ok(out)
+}
+
 /// The rewritten `Code` attribute of one method.
 struct CodePatch<'a> {
     code: Vec<u8>,
@@ -1719,6 +1835,9 @@ struct CodePlan {
     boundaries: BTreeMap<usize, usize>,
     /// Instructions that grew from `goto`/`jsr` to `goto_w`/`jsr_w`.
     widened: BTreeSet<usize>,
+    /// Conditional branches that no longer reach their target in 16 bits and
+    /// were split into an inverted branch over a `goto_w`.
+    expanded: BTreeSet<usize>,
     /// New offset of the exclusive end of the code.
     end: usize,
     /// The original code's length, so an offset at the (exclusive) end maps
@@ -1745,11 +1864,13 @@ fn layout_pass(
     scan: &CodeScan,
     insertions: &[(usize, usize)],
     widened: &BTreeSet<usize>,
+    expanded: &BTreeSet<usize>,
 ) -> Result<CodePlan, String> {
     let mut plan = CodePlan {
         offsets: BTreeMap::new(),
         boundaries: BTreeMap::new(),
         widened: widened.clone(),
+        expanded: expanded.clone(),
         end: 0,
         original_len: scan
             .instructions
@@ -1765,6 +1886,7 @@ fn layout_pass(
         plan.offsets.insert(instruction.at, out);
         let size = match instruction.switch {
             Some(index) => scan.switches[index].kind.len_at(out),
+            None if expanded.contains(&instruction.at) => 8,
             None if widened.contains(&instruction.at) => 5,
             None => instruction.size,
         };
@@ -1800,8 +1922,9 @@ fn stable_plan(
     entry: TargetEntry,
 ) -> Result<CodePlan, String> {
     let mut widened = BTreeSet::new();
+    let mut expanded = BTreeSet::new();
     for _ in 0..MAX_RELOCATION_PASSES {
-        let plan = layout_pass(label, scan, insertions, &widened)?;
+        let plan = layout_pass(label, scan, insertions, &widened, &expanded)?;
         let offset = |at: usize| {
             plan.offsets
                 .get(&at)
@@ -1811,6 +1934,19 @@ fn stable_plan(
         let mut grew = false;
         for branch in &scan.branches {
             let opcode_at = offset(branch.at)?;
+            if expanded.contains(&branch.at) {
+                // The branch is now `if<inverse> +8; goto_w target`; only the
+                // wide jump's 32-bit operand has to fit.
+                let target = map_target(label, &plan, branch.target, entry)?;
+                if i32::try_from(target as i64 - (opcode_at as i64 + 3)).is_err() {
+                    return Err(format!(
+                        "{label}: the widened {} at offset {} would exceed the 32-bit branch range",
+                        opcode_name(branch.opcode),
+                        branch.at
+                    ));
+                }
+                continue;
+            }
             let delta = map_target(label, &plan, branch.target, entry)? as i64 - opcode_at as i64;
             if branch.wide {
                 if i32::try_from(delta).is_err() {
@@ -1825,14 +1961,36 @@ fn stable_plan(
             if i16::try_from(delta).is_ok() {
                 continue;
             }
-            if widened_opcode(branch.opcode).is_none() {
+            if widened_opcode(branch.opcode).is_some() {
+                if widened.insert(branch.at) {
+                    grew = true;
+                }
+                continue;
+            }
+            if inverse_conditional(branch.opcode).is_none() {
                 return Err(format!(
-                    "{label}: {} at offset {} would sit {delta} bytes from its target after weaving, past the 16-bit branch range; the weaver only widens goto/jsr, so this conditional branch stays on the interpreter path",
+                    "{label}: {} at offset {} would sit {delta} bytes from its target after weaving, past the 16-bit branch range; the weaver only widens goto/jsr and splits the if* family",
                     opcode_name(branch.opcode),
                     branch.at
                 ));
             }
-            if widened.insert(branch.at) {
+            // `if*` has no wide encoding: overwrite it with the inverse
+            // condition branching over a `goto_w`, which is 8 bytes instead of
+            // 3.  The fallthrough instruction becomes the inverse branch's
+            // target, so it needs a frame the relocation emits below.
+            if !scan.starts().contains(&(branch.at + 3)) {
+                return Err(format!(
+                    "{label}: {} at offset {} has no fallthrough instruction to split around",
+                    opcode_name(branch.opcode),
+                    branch.at
+                ));
+            }
+            if expanded.len() >= MAX_EXPANDED_BRANCHES {
+                return Err(format!(
+                    "{label}: more than {MAX_EXPANDED_BRANCHES} conditional branches would need splitting after weaving; the bounded weaver stops here"
+                ));
+            }
+            if expanded.insert(branch.at) {
                 grew = true;
             }
         }
@@ -2015,6 +2173,34 @@ fn emit_woven(
         };
         let target = map_target(label, plan, branch.target, entry)?;
         let delta = target as i64 - at as i64;
+        if plan.expanded.contains(&branch.at) {
+            // `if<inverse> +8; goto_w target`: the inverse condition jumps over
+            // the wide branch to the original fallthrough instruction, which
+            // sits at `at + 8` (any insert in front of it begins there too).
+            let inverse = inverse_conditional(branch.opcode).ok_or_else(|| {
+                format!(
+                    "{label}: {} at offset {} has no inverting conditional",
+                    opcode_name(branch.opcode),
+                    branch.at
+                )
+            })?;
+            let fallthrough = map_target(label, plan, branch.at + 3, entry)?;
+            let skip = i16::try_from(fallthrough as i64 - at as i64).map_err(|_| {
+                format!(
+                    "{label}: the split {} at offset {} cannot reach its fallthrough",
+                    opcode_name(branch.opcode),
+                    branch.at
+                )
+            })?;
+            out.push(inverse);
+            out.extend_from_slice(&skip.to_be_bytes());
+            let wide_delta = i32::try_from(target as i64 - (at as i64 + 3)).map_err(|_| {
+                format!("{label}: a widened branch exceeds the 32-bit branch range")
+            })?;
+            out.push(0xc8); // goto_w
+            out.extend_from_slice(&wide_delta.to_be_bytes());
+            continue;
+        }
         match widened_opcode(branch.opcode).filter(|_| plan.widened.contains(&branch.at)) {
             Some(opcode) => {
                 out.push(opcode);
@@ -2119,6 +2305,7 @@ enum FrameSites {
 /// `StackMapTable` frame deltas and `uninitialized` offsets.
 fn relocate<'a>(
     label: &str,
+    target: &Target<'a>,
     code: &CodeLayout<'a>,
     scan: &CodeScan,
     insertions: &[(usize, usize)],
@@ -2127,6 +2314,8 @@ fn relocate<'a>(
     max_locals: u16,
     entry: TargetEntry,
     sites: FrameSites,
+    extra_frames: &[(usize, Vec<ValueType>)],
+    pool: &mut PoolBuilder<'_>,
 ) -> Result<CodePatch<'a>, String> {
     let insertions = validate_insertions(label, scan, code.code.len(), insertions, bytes.len())?;
     let plan = stable_plan(label, scan, &insertions, entry)?;
@@ -2163,11 +2352,64 @@ fn relocate<'a>(
         });
     }
 
-    let attributes = code
-        .attributes
-        .iter()
-        .map(|attribute| relocate_attribute(label, attribute, &plan, &insertions, sites))
-        .collect::<Result<Vec<_>, String>>()?;
+    // Frames the rewrite introduces that no original frame describes: the
+    // caller's (a cancellable `HEAD` body) plus the fallthrough of every
+    // conditional the layout had to split.  A class file below version 50
+    // ignores `StackMapTable` and is verified by type inference, so it needs
+    // none of them.
+    let mut extras = extra_frames.to_vec();
+    for at in &plan.expanded {
+        let fallthrough = at + 3;
+        if code_frames_have(code, fallthrough) {
+            continue;
+        }
+        let state = derive_state_at(label, target, code, scan, fallthrough)?;
+        extras.push((fallthrough, state.locals));
+    }
+    if target.major() < 50 {
+        extras.clear();
+    }
+    let mut seen = BTreeSet::new();
+    extras.retain(|(offset, _)| !code_frames_have(code, *offset) && seen.insert(*offset));
+
+    let mut attributes = Vec::with_capacity(code.attributes.len() + 1);
+    let mut has_stack_map = false;
+    for attribute in &code.attributes {
+        match attribute {
+            CodeAttribute::StackMap { name_index, frames } => {
+                has_stack_map = true;
+                let frames = if extras.is_empty() {
+                    relocate_frames(label, frames, &plan, &insertions, sites)?
+                } else {
+                    relocate_frames_full(
+                        label,
+                        target,
+                        frames,
+                        &plan,
+                        &insertions,
+                        sites,
+                        &extras,
+                        entry,
+                        pool,
+                    )?
+                };
+                attributes.push(CodeAttribute::StackMap {
+                    name_index: *name_index,
+                    frames,
+                });
+            }
+            other => {
+                attributes.push(relocate_attribute(label, other, &plan)?);
+            }
+        }
+    }
+    if !has_stack_map && !extras.is_empty() {
+        let name_index = pool.utf8("StackMapTable")?;
+        attributes.push(CodeAttribute::StackMap {
+            name_index,
+            frames: synthesize_frames(label, &extras, &plan, entry, pool)?,
+        });
+    }
 
     Ok(CodePatch {
         code: woven,
@@ -2178,12 +2420,18 @@ fn relocate<'a>(
     })
 }
 
+/// Whether the method already carries a stack-map frame at `offset`.
+fn code_frames_have(code: &CodeLayout<'_>, offset: usize) -> bool {
+    code.attributes.iter().any(|attribute| match attribute {
+        CodeAttribute::StackMap { frames, .. } => frames.iter().any(|frame| frame.offset == offset),
+        _ => false,
+    })
+}
+
 fn relocate_attribute<'a>(
     label: &str,
     attribute: &CodeAttribute<'a>,
     plan: &CodePlan,
-    insertions: &[(usize, usize)],
-    sites: FrameSites,
 ) -> Result<CodeAttribute<'a>, String> {
     Ok(match attribute {
         CodeAttribute::Raw { name_index, body } => CodeAttribute::Raw {
@@ -2216,10 +2464,11 @@ fn relocate_attribute<'a>(
                 .map(|entry| relocate_local(label, entry, plan))
                 .collect::<Result<Vec<_>, String>>()?,
         },
-        CodeAttribute::StackMap { name_index, frames } => CodeAttribute::StackMap {
-            name_index: *name_index,
-            frames: relocate_frames(label, frames, plan, insertions, sites)?,
-        },
+        CodeAttribute::StackMap { .. } => {
+            return Err(format!(
+                "{label}: a stack map is relocated by the frame pass, not by itself"
+            ));
+        }
     })
 }
 
@@ -2315,6 +2564,115 @@ fn push_frame(
     Ok(())
 }
 
+/// Relocate a stack map as a table of full frames, so a frame this rewrite
+/// synthesises can be inserted without changing what a later delta frame means.
+///
+/// Compressed frames (`same`, `append`, `chop`) are deltas from the previous
+/// frame.  Inserting a frame in the middle would make a following `append`
+/// append to the new frame instead of the original one, so every frame in this
+/// path is written as a `full_frame` with its absolute locals and stack.
+#[allow(clippy::too_many_arguments)]
+fn relocate_frames_full(
+    label: &str,
+    target: &Target<'_>,
+    frames: &[StackMapFrame],
+    plan: &CodePlan,
+    insertions: &[(usize, usize)],
+    sites: FrameSites,
+    extras: &[(usize, Vec<ValueType>)],
+    entry: TargetEntry,
+    pool: &mut PoolBuilder<'_>,
+) -> Result<Vec<StackMapFrame>, String> {
+    let full = full_frames(target, frames)?;
+    let mut out = Vec::with_capacity(full.len() * 2 + extras.len());
+    for (offset, locals, stack) in &full {
+        if inserted_at(insertions, *offset).is_some()
+            && (*offset > 0 || sites == FrameSites::InsertOnly)
+        {
+            let boundary = map_offset(label, plan, *offset, false)?;
+            out.push(full_frame(label, boundary, locals, stack, plan, pool)?);
+            if sites == FrameSites::InsertOnly {
+                continue;
+            }
+        }
+        let mapped = map_offset(label, plan, *offset, true)?;
+        out.push(full_frame(label, mapped, locals, stack, plan, pool)?);
+    }
+    for (offset, slots) in extras {
+        let mapped = map_target(label, plan, *offset, entry)?;
+        out.push(StackMapFrame {
+            frame_type: 255,
+            offset: mapped,
+            locals: values_from_slots(slots)
+                .iter()
+                .map(|value| verification_from_value(label, value, plan, pool))
+                .collect::<Result<Vec<_>, _>>()?,
+            stack: Vec::new(),
+        });
+    }
+    sort_frames(label, out)
+}
+
+/// The frames for a method that had no `StackMapTable`, built only from the
+/// extras this rewrite introduces.
+fn synthesize_frames(
+    label: &str,
+    extras: &[(usize, Vec<ValueType>)],
+    plan: &CodePlan,
+    entry: TargetEntry,
+    pool: &mut PoolBuilder<'_>,
+) -> Result<Vec<StackMapFrame>, String> {
+    let mut out = Vec::with_capacity(extras.len());
+    for (offset, slots) in extras {
+        let mapped = map_target(label, plan, *offset, entry)?;
+        out.push(StackMapFrame {
+            frame_type: 255,
+            offset: mapped,
+            locals: values_from_slots(slots)
+                .iter()
+                .map(|value| verification_from_value(label, value, plan, pool))
+                .collect::<Result<Vec<_>, _>>()?,
+            stack: Vec::new(),
+        });
+    }
+    sort_frames(label, out)
+}
+
+fn full_frame(
+    label: &str,
+    offset: usize,
+    locals: &[ValueType],
+    stack: &[ValueType],
+    plan: &CodePlan,
+    pool: &mut PoolBuilder<'_>,
+) -> Result<StackMapFrame, String> {
+    Ok(StackMapFrame {
+        frame_type: 255,
+        offset,
+        locals: locals
+            .iter()
+            .map(|value| verification_from_value(label, value, plan, pool))
+            .collect::<Result<Vec<_>, _>>()?,
+        stack: stack
+            .iter()
+            .map(|value| verification_from_value(label, value, plan, pool))
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn sort_frames(label: &str, mut frames: Vec<StackMapFrame>) -> Result<Vec<StackMapFrame>, String> {
+    frames.sort_by_key(|frame| frame.offset);
+    for pair in frames.windows(2) {
+        if pair[0].offset == pair[1].offset {
+            return Err(format!(
+                "{label}: two stack-map frames land at offset {}",
+                pair[0].offset
+            ));
+        }
+    }
+    Ok(frames)
+}
+
 fn relocate_verification(
     label: &str,
     verification: &VerificationType,
@@ -2365,6 +2723,17 @@ fn find_target(class_name: &str, layout: &Layout<'_>, target: &MethodRef) -> Res
     }
 }
 
+/// The object one weave shape appends as the callback's last argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Injected {
+    /// No injected object: a `HEAD` or `void` `RETURN`/`TAIL` callback.
+    None,
+    /// The `CallbackInfoReturnable` a non-void `RETURN`/`TAIL` insert builds.
+    Returnable,
+    /// The `CallbackInfo` a cancellable `void` `HEAD` insert builds.
+    Cancellable,
+}
+
 /// Check a callback descriptor against the weave shape.
 ///
 /// Returns whether the callback takes the target instance as an extra first
@@ -2372,17 +2741,16 @@ fn find_target(class_name: &str, layout: &Layout<'_>, target: &MethodRef) -> Res
 /// callback must take exactly the target's arguments; an instance target's
 /// callback may take them with or without the receiver.
 ///
-/// `returns_value` is true for a non-void `RETURN`/`TAIL` target, whose callback
-/// must end with the `CallbackInfoReturnable` the insert supplies.  Every other
-/// anchor passes `false`, and a callback-info argument is then rejected: those
-/// shapes need a runtime-owned `CallbackInfo` this insert cannot construct.
+/// `injected` names the object the callback must end with, if any: the
+/// `CallbackInfoReturnable` a non-void return insert builds, or the
+/// `CallbackInfo` a cancellable `void` `HEAD` insert builds.
 fn callback_arguments(
     class_name: &str,
     is_static: bool,
     target_descriptor: &str,
     callback_descriptor: &str,
     anchor: &str,
-    returns_value: bool,
+    injected: Injected,
 ) -> Result<bool, String> {
     if !crate::valid_method_descriptor(callback_descriptor) {
         return Err(format!(
@@ -2390,30 +2758,45 @@ fn callback_arguments(
         ));
     }
     let callback_arguments = crate::descriptor_arguments(callback_descriptor);
-    let takes_returnable = callback_arguments
-        .last()
-        .is_some_and(|last| last == CALLBACK_INFO_RETURNABLE_DESC);
-    if !returns_value {
-        if let Some(last) = callback_arguments.last() {
-            if crate::is_callback_info_descriptor(last) {
+    let last = callback_arguments.last().map(String::as_str);
+    let trailing_desc = match injected {
+        Injected::None => {
+            if let Some(last) = last
+                && crate::is_callback_info_descriptor(last)
+            {
                 return Err(format!(
                     "callback {callback_descriptor} takes a trailing CallbackInfo; {anchor} weaving with CallbackInfo needs the interpreter path"
                 ));
             }
+            None
         }
-    } else if !takes_returnable {
-        let detail = if callback_arguments
-            .last()
-            .is_some_and(|last| crate::is_callback_info_descriptor(last))
-        {
-            "a plain CallbackInfo cannot carry the result"
-        } else {
-            "the callback declares no such argument"
-        };
-        return Err(format!(
-            "{anchor} weaving a non-void target needs the callback's last argument to be {CALLBACK_INFO_RETURNABLE_DESC}: the insert boxes the target's result into that object and returns getReturnValue(), so no override branch and no synthesised StackMapTable frame is needed; {detail}, so {callback_descriptor} cannot observe or replace the result and stays on the interpreter path"
-        ));
-    }
+        Injected::Returnable => {
+            if last != Some(CALLBACK_INFO_RETURNABLE_DESC) {
+                let detail = if last.is_some_and(crate::is_callback_info_descriptor) {
+                    "a plain CallbackInfo cannot carry the result"
+                } else {
+                    "the callback declares no such argument"
+                };
+                return Err(format!(
+                    "{anchor} weaving a non-void target needs the callback's last argument to be {CALLBACK_INFO_RETURNABLE_DESC}: the insert boxes the target's result into that object and returns getReturnValue(), so no override branch and no synthesised StackMapTable frame is needed; {detail}, so {callback_descriptor} cannot observe or replace the result and stays on the interpreter path"
+                ));
+            }
+            Some(CALLBACK_INFO_RETURNABLE_DESC)
+        }
+        Injected::Cancellable => {
+            if last != Some(CALLBACK_INFO_DESC) {
+                let detail = if last == Some(CALLBACK_INFO_RETURNABLE_DESC) {
+                    "a CallbackInfoReturnable belongs on a non-void RETURN/TAIL anchor"
+                } else {
+                    "the callback declares no CallbackInfo argument"
+                };
+                return Err(format!(
+                    "{anchor} weaving a cancellable void target needs the callback's last argument to be {CALLBACK_INFO_DESC}, which the insert constructs and cancels with; {detail}, so {callback_descriptor} cannot cancel and stays on the interpreter path"
+                ));
+            }
+            Some(CALLBACK_INFO_DESC)
+        }
+    };
     if crate::return_desc(callback_descriptor) != "V" {
         return Err(format!(
             "callback {callback_descriptor} must return void for {anchor} weaving"
@@ -2430,8 +2813,8 @@ fn callback_arguments(
         for argument in &target_arguments {
             shape.push_str(argument);
         }
-        if takes_returnable {
-            shape.push_str(CALLBACK_INFO_RETURNABLE_DESC);
+        if let Some(trailing) = trailing_desc {
+            shape.push_str(trailing);
         }
         shape.push_str(")V");
         shape
@@ -2460,6 +2843,9 @@ fn callback_arguments(
 struct Target<'a> {
     layout: Layout<'a>,
     class_name: String,
+    /// The parsed constant pool, so the verifier-state derivation can resolve
+    /// field and method descriptors the code names.
+    pool: &'a [Cp],
     method_index: usize,
     attribute_index: usize,
     name: String,
@@ -2470,6 +2856,12 @@ struct Target<'a> {
 impl<'a> Target<'a> {
     fn label(&self) -> String {
         format!("{}.{}{}", self.class_name, self.name, self.descriptor)
+    }
+
+    /// The class-file major version, which decides whether a `StackMapTable`
+    /// is authoritative (50 and up) or ignored (49 and below).
+    fn major(&self) -> u16 {
+        u16::from_be_bytes([self.layout.version[6], self.layout.version[7]])
     }
 
     fn code(&self) -> Result<&CodeLayout<'a>, String> {
@@ -2542,11 +2934,940 @@ fn prepare_target<'a>(class: &'a ClassFile, target: &MethodRef) -> Result<Target
     Ok(Target {
         layout,
         class_name: class.name.clone(),
+        pool: &class.pool,
         method_index,
         attribute_index,
         name,
         descriptor,
         is_static,
+    })
+}
+
+/// The JVM type model this module needs to re-derive one `StackMapTable`
+/// frame: enough to follow the local-variable types along a straight-line
+/// region, not a full verifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ValueType {
+    Top,
+    Int,
+    Float,
+    Long,
+    Double,
+    Null,
+    UninitializedThis,
+    /// An initialized reference, by internal name or array descriptor.
+    Object(String),
+    /// An object whose `new` sits at this original bytecode offset and whose
+    /// constructor has not run yet.
+    Uninitialized(usize),
+}
+
+impl ValueType {
+    fn width(&self) -> usize {
+        match self {
+            Self::Long | Self::Double => 2,
+            _ => 1,
+        }
+    }
+
+    /// The type one field or argument descriptor names.
+    fn from_descriptor(descriptor: &str) -> Result<Self, String> {
+        match descriptor.as_bytes().first().copied() {
+            Some(b'I' | b'Z' | b'B' | b'C' | b'S') => Ok(Self::Int),
+            Some(b'J') => Ok(Self::Long),
+            Some(b'F') => Ok(Self::Float),
+            Some(b'D') => Ok(Self::Double),
+            Some(b'L') if descriptor.ends_with(';') && descriptor.len() > 2 => {
+                Ok(Self::Object(descriptor[1..descriptor.len() - 1].to_owned()))
+            }
+            Some(b'[') => Ok(Self::Object(descriptor.to_owned())),
+            _ => Err(format!("descriptor {descriptor:?} is not a value type")),
+        }
+    }
+}
+
+fn pool_utf8_at(pool: &[Cp], index: u16) -> Option<&str> {
+    match pool.get(index as usize) {
+        Some(Cp::Utf8(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn pool_class_at(pool: &[Cp], index: u16) -> Option<&str> {
+    match pool.get(index as usize) {
+        Some(Cp::Class(name)) => pool_utf8_at(pool, *name),
+        _ => None,
+    }
+}
+
+fn pool_name_type_at(pool: &[Cp], index: u16) -> Option<(&str, &str)> {
+    match pool.get(index as usize) {
+        Some(Cp::NameType { name, descriptor }) => {
+            Some((pool_utf8_at(pool, *name)?, pool_utf8_at(pool, *descriptor)?))
+        }
+        _ => None,
+    }
+}
+
+fn pool_field_type(pool: &[Cp], index: u16) -> Option<&str> {
+    match pool.get(index as usize) {
+        Some(Cp::FieldRef { nt, .. }) => {
+            pool_name_type_at(pool, *nt).map(|(_, descriptor)| descriptor)
+        }
+        _ => None,
+    }
+}
+
+fn pool_method(pool: &[Cp], index: u16) -> Option<(&str, &str)> {
+    match pool.get(index as usize) {
+        Some(Cp::MethodRef { nt, .. } | Cp::InterfaceMethodRef { nt, .. }) => {
+            pool_name_type_at(pool, *nt)
+        }
+        _ => None,
+    }
+}
+
+fn pool_invoke_dynamic_descriptor(pool: &[Cp], index: u16) -> Option<&str> {
+    match pool.get(index as usize) {
+        Some(Cp::InvokeDynamic { nt, .. }) => {
+            pool_name_type_at(pool, *nt).map(|(_, descriptor)| descriptor)
+        }
+        _ => None,
+    }
+}
+
+/// The local-variable types a method starts with, as a `StackMapTable` locals
+/// list (wide values take one entry).
+fn initial_local_values(target: &Target<'_>) -> Result<Vec<ValueType>, String> {
+    let mut values = Vec::new();
+    if !target.is_static {
+        values.push(if target.name == "<init>" {
+            ValueType::UninitializedThis
+        } else {
+            ValueType::Object(target.class_name.clone())
+        });
+    }
+    for argument in crate::descriptor_arguments(&target.descriptor) {
+        values.push(ValueType::from_descriptor(&argument)?);
+    }
+    Ok(values)
+}
+
+/// Expand a `StackMapTable` locals list (one entry per value) to one entry per
+/// local slot, which is how the derivation stores and reads it.
+fn slots_from_values(values: &[ValueType]) -> Vec<ValueType> {
+    let mut slots = Vec::new();
+    for value in values {
+        slots.push(value.clone());
+        if value.width() == 2 {
+            slots.push(ValueType::Top);
+        }
+    }
+    slots
+}
+
+/// Collapse one entry per local slot back to a `StackMapTable` locals list,
+/// dropping the trailing `Top`s the table leaves implicit.
+fn values_from_slots(slots: &[ValueType]) -> Vec<ValueType> {
+    let mut values = Vec::new();
+    let mut at = 0;
+    while at < slots.len() {
+        let value = slots[at].clone();
+        let width = value.width();
+        values.push(value);
+        at += width;
+    }
+    while values.last() == Some(&ValueType::Top) {
+        values.pop();
+    }
+    values
+}
+
+fn value_from_verification(
+    pool: &[Cp],
+    verification: &VerificationType,
+) -> Result<ValueType, String> {
+    Ok(match verification {
+        VerificationType::Simple(0) => ValueType::Top,
+        VerificationType::Simple(1) => ValueType::Int,
+        VerificationType::Simple(2) => ValueType::Float,
+        VerificationType::Simple(3) => ValueType::Double,
+        VerificationType::Simple(4) => ValueType::Long,
+        VerificationType::Simple(5) => ValueType::Null,
+        VerificationType::Simple(6) => ValueType::UninitializedThis,
+        VerificationType::Simple(other) => {
+            return Err(format!("stack-map type {other} is reserved"));
+        }
+        VerificationType::Object(index) => ValueType::Object(
+            pool_class_at(pool, *index)
+                .ok_or_else(|| format!("stack-map object index {index} is not a class"))?
+                .to_owned(),
+        ),
+        VerificationType::Uninitialized(offset) => ValueType::Uninitialized(*offset as usize),
+    })
+}
+
+fn verification_from_value(
+    label: &str,
+    value: &ValueType,
+    plan: &CodePlan,
+    pool: &mut PoolBuilder<'_>,
+) -> Result<VerificationType, String> {
+    Ok(match value {
+        ValueType::Top => VerificationType::Simple(0),
+        ValueType::Int => VerificationType::Simple(1),
+        ValueType::Float => VerificationType::Simple(2),
+        ValueType::Double => VerificationType::Simple(3),
+        ValueType::Long => VerificationType::Simple(4),
+        ValueType::Null => VerificationType::Simple(5),
+        ValueType::UninitializedThis => VerificationType::Simple(6),
+        ValueType::Object(name) => VerificationType::Object(pool.class(name)?),
+        ValueType::Uninitialized(offset) => VerificationType::Uninitialized(shifted_u2(
+            label,
+            map_offset(label, plan, *offset, true)?,
+            "an uninitialized offset",
+        )?),
+    })
+}
+
+/// One `StackMapTable` frame with its locals and stack expanded to absolute,
+/// delta-free lists.
+fn full_frames(
+    target: &Target<'_>,
+    frames: &[StackMapFrame],
+) -> Result<Vec<(usize, Vec<ValueType>, Vec<ValueType>)>, String> {
+    let mut locals = initial_local_values(target)?;
+    let mut out = Vec::with_capacity(frames.len());
+    for frame in frames {
+        match frame.frame_type {
+            0..=63 | 64..=127 | 247 => {}
+            248..=251 => {
+                let chop = 251 - frame.frame_type as usize;
+                if chop > locals.len() {
+                    return Err(format!(
+                        "{}: a stack-map chop frame removes more locals than the method declares",
+                        target.label()
+                    ));
+                }
+                locals.truncate(locals.len() - chop);
+            }
+            252..=254 => {
+                for verification in &frame.locals {
+                    locals.push(value_from_verification(target.pool, verification)?);
+                }
+            }
+            255 => {
+                locals = frame
+                    .locals
+                    .iter()
+                    .map(|verification| value_from_verification(target.pool, verification))
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            other => {
+                return Err(format!(
+                    "{}: stack-map frame type {other} is reserved",
+                    target.label()
+                ));
+            }
+        }
+        let stack = frame
+            .stack
+            .iter()
+            .map(|verification| value_from_verification(target.pool, verification))
+            .collect::<Result<Vec<_>, _>>()?;
+        out.push((frame.offset, locals.clone(), stack));
+    }
+    Ok(out)
+}
+
+/// The verifier state this module derives at one bytecode offset.
+struct SimState {
+    locals: Vec<ValueType>,
+    stack: Vec<ValueType>,
+}
+
+fn pop_stack(stack: &mut Vec<ValueType>, count: usize) -> Result<(), String> {
+    for _ in 0..count {
+        stack
+            .pop()
+            .ok_or_else(|| "the operand stack underflows while deriving a frame".to_owned())?;
+    }
+    Ok(())
+}
+
+fn read_local(locals: &[ValueType], slot: usize) -> Result<ValueType, String> {
+    if slot > 0
+        && matches!(
+            locals.get(slot - 1),
+            Some(ValueType::Long | ValueType::Double)
+        )
+    {
+        return Err(format!(
+            "local slot {slot} is the second half of a wide local"
+        ));
+    }
+    match locals.get(slot) {
+        Some(ValueType::Top) | None => Err(format!("local slot {slot} holds no value")),
+        Some(value) => Ok(value.clone()),
+    }
+}
+
+fn write_local(locals: &mut Vec<ValueType>, slot: usize, value: ValueType) {
+    // A store over either half of an old wide value leaves the other half
+    // unusable, exactly as a `Top` slot.
+    if slot > 0
+        && matches!(
+            locals.get(slot - 1),
+            Some(ValueType::Long | ValueType::Double)
+        )
+    {
+        locals[slot - 1] = ValueType::Top;
+    }
+    if matches!(locals.get(slot), Some(ValueType::Long | ValueType::Double))
+        && let Some(next) = locals.get_mut(slot + 1)
+    {
+        *next = ValueType::Top;
+    }
+    if locals.len() <= slot {
+        locals.resize(slot + 1, ValueType::Top);
+    }
+    let wide = value.width() == 2;
+    locals[slot] = value;
+    if wide {
+        if locals.len() <= slot + 1 {
+            locals.resize(slot + 2, ValueType::Top);
+        }
+        locals[slot + 1] = ValueType::Top;
+    }
+}
+
+fn code_u1(code: &[u8], at: usize) -> Result<u8, String> {
+    code.get(at)
+        .copied()
+        .ok_or_else(|| format!("bytecode is truncated at offset {at}"))
+}
+
+fn code_u2(code: &[u8], at: usize) -> Result<u16, String> {
+    let bytes = code
+        .get(at..at + 2)
+        .ok_or_else(|| format!("bytecode is truncated at offset {at}"))?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+/// The top one or two values that span two local/operand slots: a `long` or
+/// `double`, or two category-1 values.
+fn pop_two_slots(stack: &mut Vec<ValueType>) -> Result<Vec<ValueType>, String> {
+    let top = stack
+        .pop()
+        .ok_or_else(|| "the operand stack underflows while deriving a frame".to_owned())?;
+    if top.width() == 2 {
+        return Ok(vec![top]);
+    }
+    let under = stack
+        .pop()
+        .ok_or_else(|| "the operand stack underflows while deriving a frame".to_owned())?;
+    if under.width() != 1 {
+        return Err("a category-2 value sits where a category-1 value is required".to_owned());
+    }
+    Ok(vec![under, top])
+}
+
+fn pop_category_one(stack: &mut Vec<ValueType>) -> Result<ValueType, String> {
+    let value = stack
+        .pop()
+        .ok_or_else(|| "the operand stack underflows while deriving a frame".to_owned())?;
+    if value.width() != 1 {
+        return Err("a category-2 value sits where a category-1 value is required".to_owned());
+    }
+    Ok(value)
+}
+
+fn push_values(stack: &mut Vec<ValueType>, values: Vec<ValueType>) {
+    stack.extend(values);
+}
+
+/// The component type an `aaload` reads from an array descriptor.
+fn array_component(descriptor: &str) -> Result<ValueType, String> {
+    let rest = descriptor
+        .strip_prefix('[')
+        .ok_or_else(|| format!("{descriptor:?} is not an array descriptor"))?;
+    if rest.starts_with('[') {
+        Ok(ValueType::Object(rest.to_owned()))
+    } else {
+        ValueType::from_descriptor(rest)
+    }
+}
+
+/// The type one `ldc`/`ldc_w` constant pushes.
+fn constant_type(pool: &[Cp], index: u16) -> Result<ValueType, String> {
+    Ok(match pool.get(index as usize) {
+        Some(Cp::Integer(_)) => ValueType::Int,
+        Some(Cp::Float(_)) => ValueType::Float,
+        Some(Cp::String(_)) => ValueType::Object("java/lang/String".to_owned()),
+        Some(Cp::Class(_)) => ValueType::Object("java/lang/Class".to_owned()),
+        Some(Cp::MethodType) => ValueType::Object("java/lang/invoke/MethodType".to_owned()),
+        Some(Cp::MethodHandle { .. }) => {
+            ValueType::Object("java/lang/invoke/MethodHandle".to_owned())
+        }
+        other => {
+            return Err(format!(
+                "ldc constant {other:?} has no operand-stack type in the bounded derivation"
+            ));
+        }
+    })
+}
+
+/// Apply one instruction to the derived state.  `Ok(true)` means control falls
+/// through to the next instruction, `Ok(false)` that it transfers elsewhere
+/// (or ends the method).
+fn simulate_instruction(
+    target: &Target<'_>,
+    code: &CodeLayout<'_>,
+    at: usize,
+    state: &mut SimState,
+) -> Result<bool, String> {
+    let bytes = code.code;
+    let opcode = code_u1(bytes, at)?;
+    match opcode {
+        0x00 => {}
+        0x01 => state.stack.push(ValueType::Null),
+        0x02..=0x08 => state.stack.push(ValueType::Int),
+        0x09..=0x0a => state.stack.push(ValueType::Long),
+        0x0b..=0x0d => state.stack.push(ValueType::Float),
+        0x0e..=0x0f => state.stack.push(ValueType::Double),
+        0x10 => state.stack.push(ValueType::Int),
+        0x11 => state.stack.push(ValueType::Int),
+        0x12 => {
+            let index = code_u1(bytes, at + 1)? as u16;
+            state.stack.push(constant_type(target.pool, index)?);
+        }
+        0x13 => {
+            let index = code_u2(bytes, at + 1)?;
+            state.stack.push(constant_type(target.pool, index)?);
+        }
+        0x14 => {
+            let index = code_u2(bytes, at + 1)?;
+            let value = match target.pool.get(index as usize) {
+                Some(Cp::Long(_)) => ValueType::Long,
+                Some(Cp::Double(_)) => ValueType::Double,
+                other => {
+                    return Err(format!("ldc2_w constant {other:?} is not a long or double"));
+                }
+            };
+            state.stack.push(value);
+        }
+        0x15..=0x19 => {
+            let slot = code_u1(bytes, at + 1)? as usize;
+            state.stack.push(read_local(&state.locals, slot)?);
+        }
+        0x1a..=0x1d => {
+            let slot = (opcode - 0x1a) as usize;
+            state.stack.push(read_local(&state.locals, slot)?);
+        }
+        0x1e..=0x21 => {
+            let slot = (opcode - 0x1e) as usize;
+            state.stack.push(read_local(&state.locals, slot)?);
+        }
+        0x22..=0x25 => {
+            let slot = (opcode - 0x22) as usize;
+            state.stack.push(read_local(&state.locals, slot)?);
+        }
+        0x26..=0x29 => {
+            let slot = (opcode - 0x26) as usize;
+            state.stack.push(read_local(&state.locals, slot)?);
+        }
+        0x2a..=0x2d => {
+            let slot = (opcode - 0x2a) as usize;
+            state.stack.push(read_local(&state.locals, slot)?);
+        }
+        0x2e..=0x35 => {
+            pop_stack(&mut state.stack, 1)?; // index
+            let array = state
+                .stack
+                .pop()
+                .ok_or_else(|| "an array load has no array on the stack".to_owned())?;
+            let loaded = match opcode {
+                0x2e | 0x33 | 0x34 | 0x35 => ValueType::Int,
+                0x2f => ValueType::Long,
+                0x30 => ValueType::Float,
+                0x31 => ValueType::Double,
+                _ => match array {
+                    ValueType::Object(descriptor) => array_component(&descriptor)?,
+                    _ => ValueType::Object("java/lang/Object".to_owned()),
+                },
+            };
+            state.stack.push(loaded);
+        }
+        0x36..=0x3a => {
+            let slot = code_u1(bytes, at + 1)? as usize;
+            let value = state
+                .stack
+                .pop()
+                .ok_or_else(|| "the operand stack underflows while deriving a frame".to_owned())?;
+            write_local(&mut state.locals, slot, value);
+        }
+        0x3b..=0x3e => {
+            let slot = (opcode - 0x3b) as usize;
+            let value = state
+                .stack
+                .pop()
+                .ok_or_else(|| "the operand stack underflows while deriving a frame".to_owned())?;
+            write_local(&mut state.locals, slot, value);
+        }
+        0x3f..=0x42 => {
+            let slot = (opcode - 0x3f) as usize;
+            let value = state
+                .stack
+                .pop()
+                .ok_or_else(|| "the operand stack underflows while deriving a frame".to_owned())?;
+            write_local(&mut state.locals, slot, value);
+        }
+        0x43..=0x46 => {
+            let slot = (opcode - 0x43) as usize;
+            let value = state
+                .stack
+                .pop()
+                .ok_or_else(|| "the operand stack underflows while deriving a frame".to_owned())?;
+            write_local(&mut state.locals, slot, value);
+        }
+        0x47..=0x4a => {
+            let slot = (opcode - 0x47) as usize;
+            let value = state
+                .stack
+                .pop()
+                .ok_or_else(|| "the operand stack underflows while deriving a frame".to_owned())?;
+            write_local(&mut state.locals, slot, value);
+        }
+        0x4b..=0x4e => {
+            let slot = (opcode - 0x4b) as usize;
+            let value = state
+                .stack
+                .pop()
+                .ok_or_else(|| "the operand stack underflows while deriving a frame".to_owned())?;
+            write_local(&mut state.locals, slot, value);
+        }
+        0x4f..=0x56 => pop_stack(&mut state.stack, 3)?,
+        0x57 => pop_stack(&mut state.stack, 1)?,
+        0x58 => {
+            let _ = pop_two_slots(&mut state.stack)?;
+        }
+        0x59 => {
+            let value = pop_category_one(&mut state.stack)?;
+            state.stack.push(value.clone());
+            state.stack.push(value);
+        }
+        0x5a => {
+            let top = pop_category_one(&mut state.stack)?;
+            let under = pop_category_one(&mut state.stack)?;
+            state.stack.push(top.clone());
+            state.stack.push(under);
+            state.stack.push(top);
+        }
+        0x5b => {
+            let top = pop_category_one(&mut state.stack)?;
+            let under = pop_two_slots(&mut state.stack)?;
+            state.stack.push(top.clone());
+            push_values(&mut state.stack, under);
+            state.stack.push(top);
+        }
+        0x5c => {
+            let group = pop_two_slots(&mut state.stack)?;
+            push_values(&mut state.stack, group.clone());
+            push_values(&mut state.stack, group);
+        }
+        0x5d => {
+            let group = pop_two_slots(&mut state.stack)?;
+            let under = pop_category_one(&mut state.stack)?;
+            push_values(&mut state.stack, group.clone());
+            state.stack.push(under);
+            push_values(&mut state.stack, group);
+        }
+        0x5e => {
+            let group = pop_two_slots(&mut state.stack)?;
+            let under = pop_two_slots(&mut state.stack)?;
+            push_values(&mut state.stack, group.clone());
+            push_values(&mut state.stack, under);
+            push_values(&mut state.stack, group);
+        }
+        0x5f => {
+            let top = pop_category_one(&mut state.stack)?;
+            let under = pop_category_one(&mut state.stack)?;
+            state.stack.push(top);
+            state.stack.push(under);
+        }
+        0x60..=0x63 => {
+            pop_stack(&mut state.stack, 2)?;
+            state.stack.push(match opcode {
+                0x61 => ValueType::Long,
+                0x62 => ValueType::Float,
+                0x63 => ValueType::Double,
+                _ => ValueType::Int,
+            });
+        }
+        0x64..=0x67 => {
+            pop_stack(&mut state.stack, 2)?;
+            state.stack.push(match opcode {
+                0x65 => ValueType::Long,
+                0x66 => ValueType::Float,
+                0x67 => ValueType::Double,
+                _ => ValueType::Int,
+            });
+        }
+        0x68..=0x6b => {
+            pop_stack(&mut state.stack, 2)?;
+            state.stack.push(match opcode {
+                0x69 => ValueType::Long,
+                0x6a => ValueType::Float,
+                0x6b => ValueType::Double,
+                _ => ValueType::Int,
+            });
+        }
+        0x6c..=0x6f => {
+            pop_stack(&mut state.stack, 2)?;
+            state.stack.push(match opcode {
+                0x6d => ValueType::Long,
+                0x6e => ValueType::Float,
+                0x6f => ValueType::Double,
+                _ => ValueType::Int,
+            });
+        }
+        0x70..=0x73 => {
+            pop_stack(&mut state.stack, 2)?;
+            state.stack.push(match opcode {
+                0x71 => ValueType::Long,
+                0x72 => ValueType::Float,
+                0x73 => ValueType::Double,
+                _ => ValueType::Int,
+            });
+        }
+        0x74..=0x77 => {
+            pop_stack(&mut state.stack, 1)?;
+            state.stack.push(match opcode {
+                0x75 => ValueType::Long,
+                0x76 => ValueType::Float,
+                0x77 => ValueType::Double,
+                _ => ValueType::Int,
+            });
+        }
+        0x78 | 0x7a | 0x7c => {
+            pop_stack(&mut state.stack, 2)?;
+            state.stack.push(ValueType::Int);
+        }
+        0x79 | 0x7b | 0x7d => {
+            pop_stack(&mut state.stack, 2)?;
+            state.stack.push(ValueType::Long);
+        }
+        0x7e | 0x80 | 0x82 => {
+            pop_stack(&mut state.stack, 2)?;
+            state.stack.push(ValueType::Int);
+        }
+        0x7f | 0x81 | 0x83 => {
+            pop_stack(&mut state.stack, 2)?;
+            state.stack.push(ValueType::Long);
+        }
+        0x84 => {
+            // `iinc` keeps the local's `int` type.
+        }
+        0x85..=0x93 => {
+            let converted = match opcode {
+                0x85 => ValueType::Long,
+                0x86 => ValueType::Float,
+                0x87 => ValueType::Double,
+                0x88 | 0x8b | 0x8e | 0x91 | 0x92 | 0x93 => ValueType::Int,
+                0x89 | 0x8c | 0x8f => ValueType::Float,
+                0x8a | 0x8d | 0x90 => ValueType::Double,
+                _ => unreachable!(),
+            };
+            pop_stack(&mut state.stack, 1)?;
+            state.stack.push(converted);
+        }
+        0x94..=0x98 => {
+            pop_stack(&mut state.stack, 2)?;
+            state.stack.push(ValueType::Int);
+        }
+        0x99..=0x9e | 0xc6 | 0xc7 => pop_stack(&mut state.stack, 1)?,
+        0x9f..=0xa6 => pop_stack(&mut state.stack, 2)?,
+        0xa7 => return Ok(false),
+        0xa8 => {
+            return Err(
+                "the derived state cannot follow a jsr; the bounded weaver does not rewrite subroutines"
+                    .to_owned(),
+            );
+        }
+        0xa9 => return Ok(false),
+        0xac..=0xb1 => return Ok(false),
+        0xb2 | 0xb4 => {
+            let index = code_u2(bytes, at + 1)?;
+            let descriptor = pool_field_type(target.pool, index)
+                .ok_or_else(|| format!("field reference {index} is missing from the pool"))?;
+            if opcode == 0xb4 {
+                pop_stack(&mut state.stack, 1)?;
+            }
+            state.stack.push(ValueType::from_descriptor(descriptor)?);
+        }
+        0xb3 | 0xb5 => {
+            let index = code_u2(bytes, at + 1)?;
+            if pool_field_type(target.pool, index).is_none() {
+                return Err(format!("field reference {index} is missing from the pool"));
+            }
+            pop_stack(&mut state.stack, 1)?;
+            if opcode == 0xb5 {
+                pop_stack(&mut state.stack, 1)?;
+            }
+        }
+        0xb6..=0xb9 => {
+            let index = code_u2(bytes, at + 1)?;
+            let (name, descriptor) = pool_method(target.pool, index)
+                .ok_or_else(|| format!("method reference {index} is missing from the pool"))?;
+            let arguments = crate::descriptor_arguments(descriptor);
+            pop_stack(&mut state.stack, arguments.len())?;
+            let receiver = if opcode == 0xb8 {
+                None
+            } else {
+                Some(
+                    state
+                        .stack
+                        .pop()
+                        .ok_or_else(|| "a method call has no receiver on the stack".to_owned())?,
+                )
+            };
+            if let Some(receiver) = receiver
+                && opcode == 0xb7
+                && name == "<init>"
+            {
+                let uninitialized = receiver.clone();
+                let initialized = match receiver {
+                    ValueType::Uninitialized(offset) => {
+                        let new_at = offset;
+                        let class_index = code_u2(bytes, new_at + 1)?;
+                        ValueType::Object(
+                            pool_class_at(target.pool, class_index)
+                                .ok_or_else(|| {
+                                    format!("new at offset {new_at} names an unknown class")
+                                })?
+                                .to_owned(),
+                        )
+                    }
+                    ValueType::UninitializedThis => ValueType::Object(target.class_name.clone()),
+                    other => other,
+                };
+                for value in state.stack.iter_mut().chain(state.locals.iter_mut()) {
+                    if *value == uninitialized {
+                        *value = initialized.clone();
+                    }
+                }
+            }
+            let returned = crate::return_desc(descriptor);
+            if returned != "V" {
+                state.stack.push(ValueType::from_descriptor(returned)?);
+            }
+        }
+        0xba => {
+            let index = code_u2(bytes, at + 1)?;
+            let descriptor =
+                pool_invoke_dynamic_descriptor(target.pool, index).ok_or_else(|| {
+                    format!("invokedynamic reference {index} is missing from the pool")
+                })?;
+            pop_stack(
+                &mut state.stack,
+                crate::descriptor_arguments(descriptor).len(),
+            )?;
+            let returned = crate::return_desc(descriptor);
+            if returned != "V" {
+                state.stack.push(ValueType::from_descriptor(returned)?);
+            }
+        }
+        0xbb => {
+            let index = code_u2(bytes, at + 1)?;
+            let name = pool_class_at(target.pool, index)
+                .ok_or_else(|| format!("new names class {index}, which is not a class"))?;
+            state.stack.push(ValueType::Uninitialized(at));
+            let _ = name;
+        }
+        0xbc => {
+            pop_stack(&mut state.stack, 1)?;
+            let array = match code_u1(bytes, at + 1)? {
+                4 => "[Z",
+                5 => "[C",
+                6 => "[F",
+                7 => "[D",
+                8 => "[B",
+                9 => "[S",
+                10 => "[I",
+                11 => "[J",
+                other => {
+                    return Err(format!(
+                        "newarray type {other} is not a primitive array type"
+                    ));
+                }
+            };
+            state.stack.push(ValueType::Object(array.to_owned()));
+        }
+        0xbd => {
+            pop_stack(&mut state.stack, 1)?;
+            let index = code_u2(bytes, at + 1)?;
+            let name = pool_class_at(target.pool, index)
+                .ok_or_else(|| format!("anewarray names class {index}, which is not a class"))?;
+            state.stack.push(ValueType::Object(format!("[L{name};")));
+        }
+        0xbe => {
+            pop_stack(&mut state.stack, 1)?;
+            state.stack.push(ValueType::Int);
+        }
+        0xbf => {
+            pop_stack(&mut state.stack, 1)?;
+            return Ok(false);
+        }
+        0xc0 => {
+            pop_stack(&mut state.stack, 1)?;
+            let index = code_u2(bytes, at + 1)?;
+            let name = pool_class_at(target.pool, index)
+                .ok_or_else(|| format!("checkcast names class {index}, which is not a class"))?;
+            state.stack.push(ValueType::Object(name.to_owned()));
+        }
+        0xc1 => {
+            pop_stack(&mut state.stack, 1)?;
+            state.stack.push(ValueType::Int);
+        }
+        0xc2 | 0xc3 => pop_stack(&mut state.stack, 1)?,
+        0xc4 => {
+            let sub = code_u1(bytes, at + 1)?;
+            match sub {
+                0x15..=0x19 => {
+                    let slot = code_u2(bytes, at + 2)? as usize;
+                    state.stack.push(read_local(&state.locals, slot)?);
+                }
+                0x36..=0x3a => {
+                    let slot = code_u2(bytes, at + 2)? as usize;
+                    let value = state.stack.pop().ok_or_else(|| {
+                        "the operand stack underflows while deriving a frame".to_owned()
+                    })?;
+                    write_local(&mut state.locals, slot, value);
+                }
+                0x84 => {}
+                0xa9 => return Ok(false),
+                other => {
+                    return Err(format!(
+                        "wide prefixes opcode 0x{other:02x}, which the bounded derivation cannot follow"
+                    ));
+                }
+            }
+        }
+        0xc5 => {
+            let dimensions = code_u1(bytes, at + 3)? as usize;
+            pop_stack(&mut state.stack, dimensions)?;
+            let index = code_u2(bytes, at + 1)?;
+            let name = pool_class_at(target.pool, index).ok_or_else(|| {
+                format!("multianewarray names class {index}, which is not a class")
+            })?;
+            state.stack.push(ValueType::Object(name.to_owned()));
+        }
+        0xc8 => return Ok(false),
+        0xc9 => {
+            return Err(
+                "the derived state cannot follow a jsr_w; the bounded weaver does not rewrite subroutines"
+                    .to_owned(),
+            );
+        }
+        other => {
+            return Err(format!(
+                "the bounded frame derivation does not model opcode 0x{other:02x}"
+            ));
+        }
+    }
+    Ok(true)
+}
+
+/// Derive the verifier state just before the instruction at `stop` by following
+/// the straight-line region from the nearest preceding `StackMapTable` frame
+/// (or the method entry), and applying every instruction's effect on the local
+/// variables and the operand stack.
+///
+/// The region between two frames cannot have a second entry - an instruction a
+/// branch could reach would carry its own frame - so a straight-line walk is
+/// exact.  An instruction the bounded model cannot follow, or control that does
+/// not fall through, is a reason rather than a guessed frame.
+fn derive_state_at(
+    label: &str,
+    target: &Target<'_>,
+    code: &CodeLayout<'_>,
+    scan: &CodeScan,
+    stop: usize,
+) -> Result<SimState, String> {
+    let frames = match code
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            CodeAttribute::StackMap { frames, .. } => Some(frames),
+            _ => None,
+        }) {
+        Some(frames) => full_frames(target, frames)?,
+        None => Vec::new(),
+    };
+    let (start, mut state) = match frames.iter().rev().find(|(offset, _, _)| *offset <= stop) {
+        Some((offset, locals, stack)) => (
+            *offset,
+            SimState {
+                locals: slots_from_values(locals),
+                stack: stack.clone(),
+            },
+        ),
+        None => (
+            0,
+            SimState {
+                locals: slots_from_values(&initial_local_values(target)?),
+                stack: Vec::new(),
+            },
+        ),
+    };
+    if start == stop {
+        return Ok(state);
+    }
+    let instructions = scan
+        .instructions
+        .iter()
+        .map(|instruction| (instruction.at, instruction))
+        .collect::<BTreeMap<_, _>>();
+    let mut at = start;
+    while at < stop {
+        let instruction = instructions.get(&at).ok_or_else(|| {
+            format!(
+                "{label}: cannot derive the verifier state at {stop}: offset {at} is not an instruction boundary"
+            )
+        })?;
+        if instruction.switch.is_some() {
+            pop_stack(&mut state.stack, 1)?;
+        } else if !simulate_instruction(target, code, at, &mut state)? {
+            return Err(format!(
+                "{label}: cannot derive the verifier state at {stop}: control does not fall through from offset {at}"
+            ));
+        }
+        at = instruction.at + instruction.size;
+    }
+    Ok(state)
+}
+
+/// The opcode of the branch that skips the wide jump of an expanded
+/// conditional, or `None` when the branch cannot be split this way.
+fn inverse_conditional(opcode: u8) -> Option<u8> {
+    Some(match opcode {
+        0x99 => 0x9a, // ifeq <-> ifne
+        0x9a => 0x99,
+        0x9b => 0x9c, // iflt <-> ifge
+        0x9c => 0x9b,
+        0x9d => 0x9e, // ifgt <-> ifle
+        0x9e => 0x9d,
+        0x9f => 0xa0, // if_icmpeq <-> if_icmpne
+        0xa0 => 0x9f,
+        0xa1 => 0xa2, // if_icmplt <-> if_icmpge
+        0xa2 => 0xa1,
+        0xa3 => 0xa4, // if_icmpgt <-> if_icmple
+        0xa4 => 0xa3,
+        0xa5 => 0xa6, // if_acmpeq <-> if_acmpne
+        0xa6 => 0xa5,
+        0xc6 => 0xc7, // ifnull <-> ifnonnull
+        0xc7 => 0xc6,
+        _ => return None,
     })
 }
 
@@ -2838,7 +4159,7 @@ fn returnable_call(
 /// Errors name the reason a method is outside the subset instead of guessing:
 /// condy, abstract/native methods, a mismatched callback descriptor,
 /// `CallbackInfo` parameters, a `wide` prefix that is not a local-variable
-/// instruction, or a conditional branch whose target no longer fits 16 bits.
+/// instruction, or a conditional branch the split cannot express.
 pub fn weave_head(
     class: &ClassFile,
     target: &MethodRef,
@@ -2852,7 +4173,7 @@ pub fn weave_head(
         &target.descriptor,
         &callback.descriptor,
         "HEAD",
-        false,
+        Injected::None,
     )?;
 
     let mut pool = PoolBuilder::new(&class.pool);
@@ -2872,6 +4193,7 @@ pub fn weave_head(
     let max_locals = code.max_locals.max(call.local_slots);
     let patch = relocate(
         &label,
+        &target,
         code,
         &scan,
         &[(0, call.bytes.len())],
@@ -2880,6 +4202,8 @@ pub fn weave_head(
         max_locals,
         TargetEntry::Skip,
         FrameSites::Both,
+        &[],
+        &mut pool,
     )?;
 
     emit(
@@ -2936,7 +4260,11 @@ pub fn weave_return(
         &target.descriptor,
         &callback.descriptor,
         anchor,
-        returns_value,
+        if returns_value {
+            Injected::Returnable
+        } else {
+            Injected::None
+        },
     )?;
 
     let code = target.code()?;
@@ -2979,6 +4307,7 @@ pub fn weave_return(
         .collect::<Vec<_>>();
     let patch = relocate(
         &label,
+        &target,
         code,
         &scan,
         &insertions,
@@ -2987,6 +4316,168 @@ pub fn weave_return(
         max_locals,
         TargetEntry::Enter,
         frame_sites,
+        &[],
+        &mut pool,
+    )?;
+
+    emit(
+        &target.layout,
+        Some(Patch {
+            method: target.method_index,
+            attribute: target.attribute_index,
+            code: patch,
+        }),
+        &pool.added,
+    )
+}
+
+/// Emit one cancellable `void` `HEAD` insert.
+///
+/// The insert builds a `CallbackInfo`, calls the callback with the target's
+/// arguments plus that object, and branches around the target body when the
+/// callback cancelled.  A cancelled `void` method answers with its only
+/// possible default: a plain `return`.
+fn cancellable_head_call(
+    target: &Target<'_>,
+    callback: &MethodRef,
+    takes_receiver: bool,
+    slot: u16,
+    pool: &mut PoolBuilder<'_>,
+) -> Result<CallbackCall, String> {
+    let mut bytes = Vec::new();
+    let info = pool.class(CALLBACK_INFO_CLASS)?;
+    bytes.push(0xbb); // new CallbackInfo
+    bytes.extend_from_slice(&info.to_be_bytes());
+    bytes.push(0x59); // dup
+    let init = pool.method_ref(&MethodRef {
+        owner: CALLBACK_INFO_CLASS.to_owned(),
+        name: "<init>".to_owned(),
+        descriptor: "()V".to_owned(),
+    })?;
+    bytes.push(0xb7); // invokespecial CallbackInfo.<init>()V
+    bytes.extend_from_slice(&init.to_be_bytes());
+    local_opcode(&mut bytes, 0x3a, slot); // astore <slot>
+    let mut slots = 0u16;
+    let mut local_slots = slot
+        .checked_add(1)
+        .ok_or("the fresh local does not fit the class-file local-slot limit")?;
+    for load in argument_loads(target, takes_receiver)? {
+        load.emit(&mut bytes);
+        let (index, width) = load.span();
+        local_slots = local_slots.max(index.saturating_add(width));
+        slots = slots.saturating_add(width);
+    }
+    local_opcode(&mut bytes, 0x19, slot); // aload <slot>
+    let callback_index = pool.method_ref(callback)?;
+    bytes.push(0xb8); // invokestatic callback
+    bytes.extend_from_slice(&callback_index.to_be_bytes());
+    local_opcode(&mut bytes, 0x19, slot); // aload <slot>
+    let is_cancelled = pool.method_ref(&MethodRef {
+        owner: CALLBACK_INFO_CLASS.to_owned(),
+        name: "isCancelled".to_owned(),
+        descriptor: "()Z".to_owned(),
+    })?;
+    bytes.push(0xb6); // invokevirtual isCancelled
+    bytes.extend_from_slice(&is_cancelled.to_be_bytes());
+    // `ifeq body; return`: the branch target is the first original instruction,
+    // which the insert places right after these bytes, so the operand is the
+    // fixed distance over the `return`.
+    let ifeq_at = bytes.len();
+    bytes.push(0x99); // ifeq
+    let operand = bytes.len();
+    bytes.extend_from_slice(&[0, 0]);
+    bytes.push(0xb1); // return
+    let body = bytes.len();
+    let delta = i16::try_from(body as i64 - ifeq_at as i64)
+        .map_err(|_| "the cancellable insert cannot reach its body".to_owned())?;
+    bytes[operand..operand + 2].copy_from_slice(&delta.to_be_bytes());
+    Ok(CallbackCall {
+        bytes,
+        // `new` + `dup` while the stack is empty, then the arguments and the
+        // `CallbackInfo` at the call.
+        stack_slots: slots.saturating_add(1).max(2),
+        local_slots,
+    })
+}
+
+/// The `void` target's entry locals, extended with the fresh local the
+/// cancellable insert stores the `CallbackInfo` in.
+fn cancellable_entry_locals(target: &Target<'_>, slot: u16) -> Result<Vec<ValueType>, String> {
+    let mut slots = slots_from_values(&initial_local_values(target)?);
+    if slots.len() < slot as usize {
+        slots.resize(slot as usize, ValueType::Top);
+    }
+    write_local(
+        &mut slots,
+        slot as usize,
+        ValueType::Object(CALLBACK_INFO_CLASS.to_owned()),
+    );
+    Ok(slots)
+}
+
+/// Insert a cancellable `CallbackInfo` callback at offset 0 of a `void`
+/// `target`.
+///
+/// The insert constructs [`callback_info_class`], calls the callback with the
+/// target's arguments (and receiver, when it declares it) plus that object, and
+/// emits `if (!ci.isCancelled()) goto body; return`, so a cancelled callback
+/// skips the target body and the method answers with the `void` default.  A
+/// non-cancellable `HEAD` plan keeps the plain [`weave_head`] shape byte for
+/// byte.
+///
+/// Only a `void` target is covered: a non-void one would also need a default
+/// value in the target's shape, which the interpreter path supplies.
+pub fn weave_head_cancellable(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+) -> Result<Vec<u8>, String> {
+    let target = prepare_target(class, target)?;
+    let label = target.label();
+    if crate::return_desc(&target.descriptor) != "V" {
+        return Err(format!(
+            "{label}: cancellable HEAD weaving is bounded to void targets; a non-void target needs a CallbackInfoReturnable and stays on the interpreter path"
+        ));
+    }
+    let takes_receiver = callback_arguments(
+        &target.class_name,
+        target.is_static,
+        &target.descriptor,
+        &callback.descriptor,
+        "HEAD",
+        Injected::Cancellable,
+    )?;
+
+    let code = target.code()?;
+    let scan = scan_code(&label, code.code)?;
+    let slot = code.max_locals.max(argument_slots(&target)?);
+    let mut pool = PoolBuilder::new(&class.pool);
+    let call = cancellable_head_call(&target, callback, takes_receiver, slot, &mut pool)?;
+    if code.code.len() + call.bytes.len() > MAX_CODE_LENGTH {
+        return Err(format!(
+            "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
+        ));
+    }
+    let max_stack = u32::from(code.max_stack)
+        .checked_add(u32::from(call.stack_slots))
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(|| format!("{label}: woven max_stack overflows u16"))?;
+    let max_locals = code.max_locals.max(call.local_slots);
+    let entry = cancellable_entry_locals(&target, slot)?;
+    let patch = relocate(
+        &label,
+        &target,
+        code,
+        &scan,
+        &[(0, call.bytes.len())],
+        &call.bytes,
+        max_stack,
+        max_locals,
+        TargetEntry::Skip,
+        FrameSites::Both,
+        &[(0, entry)],
+        &mut pool,
     )?;
 
     emit(
@@ -3019,8 +4510,9 @@ pub fn weave_class(class: &ClassFile, plans: &[MixinInjectionPlan]) -> Result<Ve
 ///
 /// `added` is keyed by internal class name and holds
 /// [`callback_info_returnable_class`] when a non-void `RETURN`/`TAIL` insert
+/// landed and [`callback_info_class`] when a cancellable `void` `HEAD` insert
 /// landed; it is empty otherwise.  The weaver cannot tell whether the jar
-/// already declares that class, so [`weave_classes_with_extras`] drops the
+/// already declares a class, so [`weave_classes_with_extras`] drops the
 /// duplicates.
 pub fn weave_class_with_extras(
     class: &ClassFile,
@@ -3045,22 +4537,35 @@ pub fn weave_class_with_extras(
             ));
         }
         // A non-void `RETURN`/`TAIL` builds the `CallbackInfoReturnable` the
-        // callback cancels with, so only the `void` targets still need the
-        // interpreter's runtime-owned `CallbackInfo`.
-        if plan.cancellable && !plan_returns_value(class, plan) {
+        // callback cancels with; a `void` `HEAD` builds the `CallbackInfo`.
+        // Every other cancellable shape still needs a runtime-owned object the
+        // bounded weaver does not construct.
+        if plan.cancellable && plan.at != "HEAD" && !plan_returns_value(class, plan) {
             return Err(format!(
                 "{}.{}: cancellable {} weaving needs a runtime-owned CallbackInfo, which the bounded weaver cannot construct",
                 plan.target.owner, plan.target.name, plan.at
+            ));
+        }
+        if plan.cancellable && plan.at == "HEAD" && plan_returns_value_for_head(class, plan) {
+            return Err(format!(
+                "{}.{}: cancellable HEAD weaving of a non-void target needs the descriptor's default value in the target's shape; only void targets are bounded",
+                plan.target.owner, plan.target.name
             ));
         }
     }
 
     let mut current = class.write()?;
     let mut needs_returnable = false;
+    let mut needs_callback_info = false;
     for plan in matching.iter().filter(|plan| plan.at == "HEAD") {
         let next = ClassFile::parse(&current)
             .map_err(|error| format!("rewritten class did not parse again: {error}"))?;
-        current = weave_head(&next, &plan.target, &plan.callback)?;
+        current = if plan.cancellable {
+            needs_callback_info = true;
+            weave_head_cancellable(&next, &plan.target, &plan.callback)?
+        } else {
+            weave_head(&next, &plan.target, &plan.callback)?
+        };
     }
     for plan in matching
         .iter()
@@ -3083,7 +4588,17 @@ pub fn weave_class_with_extras(
             callback_info_returnable_class()?,
         );
     }
+    if needs_callback_info {
+        added.insert(CALLBACK_INFO_CLASS.to_owned(), callback_info_class()?);
+    }
     Ok((current, added))
+}
+
+/// Whether a `HEAD` plan targets a method whose descriptor returns a value.
+fn plan_returns_value_for_head(class: &ClassFile, plan: &MixinInjectionPlan) -> bool {
+    class
+        .method(&plan.target.name, &plan.target.descriptor)
+        .is_some_and(|method| crate::return_desc(&method.descriptor) != "V")
 }
 
 /// Whether one `RETURN`/`TAIL` plan targets a method with a value to carry.
@@ -3103,8 +4618,9 @@ fn plan_returns_value(class: &ClassFile, plan: &MixinInjectionPlan) -> bool {
 /// Only plans whose [`MixinInjectionPlan::at`] is `"HEAD"`, whose target owner
 /// is this class and whose target method exists are applied; plans for other
 /// classes and every other anchor are left to the interpreter.  Cancellable
-/// plans are skipped because their callback takes a `CallbackInfo`, which this
-/// bytecode insert cannot construct.
+/// plans are skipped: this entry point returns only bytes, so it cannot report
+/// the synthetic `CallbackInfo` they reference - [`weave_class_with_extras`]
+/// can.
 ///
 /// [`weave_class`] is the whole-class entry point: it also applies `RETURN`
 /// and `TAIL` plans, and rejects anchors and cancellable plans it cannot weave
@@ -3114,7 +4630,7 @@ fn plan_returns_value(class: &ClassFile, plan: &MixinInjectionPlan) -> bool {
 /// `INVOKE` anchors; cancellation; and `CallbackInfo`/`CallbackInfoReturnable`
 /// parameters.  Errors from a matching plan (ambiguous target descriptor,
 /// callback mismatch, a condy pool, a `wide` prefix that is not a
-/// local-variable instruction, a conditional branch past the 16-bit range)
+/// local-variable instruction, a conditional branch the split cannot express)
 /// propagate rather than being silently skipped.
 ///
 /// Every insert lands at offset 0, so when several plans match one method the
@@ -3744,13 +5260,16 @@ mod tests {
     }
 
     #[test]
-    fn head_rejects_a_conditional_branch_past_the_16_bit_range() {
-        // The same shape with `ifeq`, which has no wide encoding: splitting it
-        // would add a branch and a frame the weaver cannot derive, so the method
-        // is rejected with the distance rather than written invalid.
-        let mut code = vec![0x99, 0x7f, 0xff, 0xb1];
-        code.resize(4 + 32_763, 0x00);
+    fn head_expands_a_conditional_branch_past_the_16_bit_range() {
+        // `iconst_0; ifeq +32766; return; 32762 nops; return`: the branch sits
+        // at 1 and names 32767.  Two RETURN inserts (at 4 and at 32767) push the
+        // target to 32770, past the 16-bit range, so the `ifeq` is split into
+        // `ifne +8; goto_w target` and the fallthrough - offset 4, now a branch
+        // target - gets a synthesised frame.
+        let mut code = vec![0x03, 0x99, 0x7f, 0xfe, 0xb1];
+        code.resize(32_767, 0x00);
         code.push(0xb1);
+        assert_eq!(code.len(), 32_768);
         let bytes = fixture(0x0009, "()V", 0, &code, &[]);
         let class = ClassFile::parse(&bytes).unwrap();
         let target = MethodRef {
@@ -3758,11 +5277,42 @@ mod tests {
             name: "m".into(),
             descriptor: "()V".into(),
         };
-        let error =
-            weave_return(&class, &target, &callback("()V"), ReturnMode::Return).unwrap_err();
-        assert!(error.contains("ifeq"), "{error}");
-        assert!(error.contains("16-bit"), "{error}");
-        assert!(error.contains("32770"), "{error}");
+        let woven = weave_return(&class, &target, &callback("()V"), ReturnMode::Return).unwrap();
+        let (woven_code, _, _) = woven_code(&woven, "m", "()V");
+        assert_eq!(woven_code[0], 0x03, "iconst_0 stays first");
+        assert_eq!(woven_code[1], 0x9a, "ifeq became ifne");
+        assert_eq!(
+            i16::from_be_bytes([woven_code[2], woven_code[3]]),
+            8,
+            "the inverse branch skips the wide jump"
+        );
+        assert_eq!(woven_code[4], 0xc8, "the far target uses goto_w");
+        assert_eq!(
+            i32::from_be_bytes([woven_code[5], woven_code[6], woven_code[7], woven_code[8]]),
+            32_771,
+            "goto_w names the relocated target"
+        );
+        // The fallthrough return moved to 9 and starts with its callback.
+        assert_eq!(woven_code[9], 0xb8);
+
+        // The method had no StackMapTable, so the split adds one with a single
+        // full frame at the fallthrough.
+        let layout = Layout::parse(&woven).unwrap();
+        let method = &layout.methods[0];
+        let code = method.attributes[0].code.as_ref().unwrap();
+        let frames = code
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                CodeAttribute::StackMap { frames, .. } => Some(frames),
+                _ => None,
+            })
+            .expect("a synthesised StackMapTable");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].offset, 9);
+        assert_eq!(frames[0].frame_type, 255);
+        assert!(frames[0].locals.is_empty());
+        assert!(frames[0].stack.is_empty());
     }
 
     /// Cancellable `RETURN`/`TAIL` on a non-void target.
