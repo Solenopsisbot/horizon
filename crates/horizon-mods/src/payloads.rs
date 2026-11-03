@@ -107,6 +107,55 @@ impl PayloadDeclaration {
     }
 }
 
+/// The payload kinds the transport can check without running mod code. Any
+/// other codec id is treated as opaque bytes: the frame still travels, but
+/// only its declared id and direction are validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadCodec {
+    /// The codec's bytes are opaque (`minecraft:byte_array`, `minecraft:raw`).
+    Raw,
+    /// A UTF-8 string (`minecraft:string`, `minecraft:utf8`).
+    Utf8,
+    /// No payload bytes (`minecraft:unit`, `minecraft:empty`).
+    Empty,
+}
+
+impl PayloadCodec {
+    /// The codec a declaration names, when it is one the transport checks.
+    pub fn parse(codec: &str) -> Option<Self> {
+        match codec {
+            "minecraft:byte_array" | "minecraft:raw" | "minecraft:byte_buffer" => Some(Self::Raw),
+            "minecraft:string" | "minecraft:utf8" | "minecraft:utf_8" => Some(Self::Utf8),
+            "minecraft:unit" | "minecraft:empty" | "minecraft:void" => Some(Self::Empty),
+            _ => None,
+        }
+    }
+
+    /// Check a frame's bytes against this codec.
+    pub fn validate(self, bytes: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Raw => Ok(()),
+            Self::Utf8 => std::str::from_utf8(bytes)
+                .map(|_| ())
+                .map_err(|_| "payload codec minecraft:string expects UTF-8 bytes".to_owned()),
+            Self::Empty if !bytes.is_empty() => Err(format!(
+                "payload codec minecraft:empty expects no bytes, got {}",
+                bytes.len()
+            )),
+            Self::Empty => Ok(()),
+        }
+    }
+}
+
+/// Validate a frame against its declaration's codec, when the codec is one
+/// the transport models. Unknown codecs stay opaque.
+pub fn validate_payload(declaration: &PayloadDeclaration, bytes: &[u8]) -> Result<(), String> {
+    match declaration.codec.as_deref().and_then(PayloadCodec::parse) {
+        Some(codec) => codec.validate(bytes),
+        None => Ok(()),
+    }
+}
+
 /// A namespaced resource location, bounded and free of control characters so
 /// a diagnostic can carry it into a log.
 fn check_id(id: &str) -> Result<(), String> {
@@ -540,5 +589,34 @@ mod tests {
         let big = vec![0; MAX_PAYLOAD_BYTES + 1];
         assert!(PayloadFrame::new("demo:big", PlayToClient, big).is_err());
         assert!(PayloadFrame::new("", PlayToClient, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn supported_codecs_validate_their_bytes() {
+        assert_eq!(
+            PayloadCodec::parse("minecraft:string"),
+            Some(PayloadCodec::Utf8)
+        );
+        assert_eq!(
+            PayloadCodec::parse("minecraft:byte_array"),
+            Some(PayloadCodec::Raw)
+        );
+        assert_eq!(
+            PayloadCodec::parse("minecraft:unit"),
+            Some(PayloadCodec::Empty)
+        );
+        assert_eq!(PayloadCodec::parse("demo:custom"), None);
+        assert!(PayloadCodec::Utf8.validate("hé".as_bytes()).is_ok());
+        assert!(PayloadCodec::Utf8.validate(&[0xff]).is_err());
+        assert!(PayloadCodec::Empty.validate(&[]).is_ok());
+        assert!(PayloadCodec::Empty.validate(&[1]).is_err());
+        assert!(PayloadCodec::Raw.validate(&[0xff, 0x00]).is_ok());
+        let declaration = PayloadDeclaration {
+            id: "demo:string".into(),
+            direction: PayloadDirection::PlayToServer,
+            codec: Some("minecraft:string".into()),
+        };
+        assert!(validate_payload(&declaration, b"ok").is_ok());
+        assert!(validate_payload(&declaration, &[0xff]).is_err());
     }
 }
