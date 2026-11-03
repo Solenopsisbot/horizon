@@ -13,9 +13,11 @@ path (the probe returns the registered value only after it recorded the row), a
 second NeoForge jar registers payloads and has its ``payload_directions`` checked
 exactly, and a Fabric jar whose entrypoint lacks ``onInitialize`` must be rejected
 with the class and method named in its error report.  A compiled Mixin jar covers
-the plan report (``--mixin-plans`` and the normal JSON run) end to end: two
-``HEAD``/``RETURN`` callbacks become plans while an ``INVOKE`` callback is left
-out.
+the plan report (``--mixin-plans`` and the normal JSON run) end to end:
+``HEAD``/``RETURN``/``INVOKE`` callbacks become plans (the INVOKE one carrying
+its resolved call site), the Fabric ``mixins`` declaration and the root config
+are reported with every modelled field, and one malformed root config stays a
+visible error instead of hiding the rest.
 """
 
 from __future__ import annotations
@@ -315,10 +317,11 @@ public final class Forge {
 
 
 # A compiled Mixin jar exercises the whole plan path: javac writes real
-# ``RuntimeVisibleAnnotations``, ``--mixin-plans`` reports the two supported
-# anchors, and the same jar still runs through a normal Fabric entrypoint.
-# ``demo/Probe`` is compile-only, so the target's call crosses the host and the
-# normal run proves the packaged target class executed.
+# ``RuntimeVisibleAnnotations``, ``--mixin-plans`` reports the three supported
+# anchors (with the INVOKE plan's resolved call site), and the same jar still
+# runs through a normal Fabric entrypoint.  ``demo/Probe`` is compile-only, so
+# the target's call crosses the host and the normal run proves the packaged
+# target class executed.
 MIXIN_SOURCES = {
     "org/spongepowered/asm/mixin/Mixin.java": """
 package org.spongepowered.asm.mixin;
@@ -346,6 +349,7 @@ import java.lang.annotation.Target;
 @Target({})
 public @interface At {
     String value();
+    String target() default "";
 }
 """,
     "org/spongepowered/asm/mixin/injection/Inject.java": """
@@ -369,6 +373,11 @@ package demo;
 
 public final class Probe {
     public static void mark(String marker, int value) {
+    }
+
+    // The overload the resolvable INVOKE mixin names, so its ``@At.target``
+    // descriptor is a real method of the compile-only target.
+    public static void mark(String marker) {
     }
 }
 """,
@@ -401,8 +410,8 @@ public abstract class TargetMixin {
     }
 }
 """,
-    # ``INVOKE`` is not a native execution anchor: discovery must drop this
-    # callback instead of approximating it, so the jar still reports two plans.
+    # A resolvable INVOKE selector becomes an executable plan that carries the
+    # parsed call site, so ``unresolved`` stays empty.
     "demo/InvokeMixin.java": """
 package demo;
 
@@ -412,10 +421,33 @@ import org.spongepowered.asm.mixin.injection.Inject;
 
 @Mixin(targets = "Ldemo/Target;")
 public abstract class InvokeMixin {
-    @Inject(method = "run(I)V", at = @At("INVOKE"))
+    @Inject(
+        method = "run(I)V",
+        at = @At(value = "INVOKE", target = "Ldemo/Probe;mark(Ljava/lang/String;)V"))
     private static void invokeOnly(int value) {
         Probe.mark("invoke", value);
     }
+}
+""",
+    # Declared under ``client``/``server`` in ``demo.mixins.json``: real mixin
+    # classes with no ``@Inject``, so the config lists resolve without adding
+    # a fourth plan.
+    "demo/ClientMixin.java": """
+package demo;
+
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(targets = "Ldemo/Target;")
+public abstract class ClientMixin {
+}
+""",
+    "demo/ServerMixin.java": """
+package demo;
+
+import org.spongepowered.asm.mixin.Mixin;
+
+@Mixin(targets = "Ldemo/Target;")
+public abstract class ServerMixin {
 }
 """,
     "demo/MixinEntry.java": """
@@ -539,6 +571,16 @@ def expect_mixin_probe(archive: Path) -> dict | None:
             "target": "demo/Target",
             "method": "run",
             "descriptor": "(I)V",
+            "callback": "demo/InvokeMixin#invokeOnly",
+            "callback_descriptor": "(I)V",
+            "at": "INVOKE",
+            "invoke_target": "demo/Probe#mark(Ljava/lang/String;)V",
+            "cancellable": False,
+        },
+        {
+            "target": "demo/Target",
+            "method": "run",
+            "descriptor": "(I)V",
             "callback": "demo/TargetMixin#after",
             "callback_descriptor": "(I)V",
             "at": "RETURN",
@@ -547,6 +589,19 @@ def expect_mixin_probe(archive: Path) -> dict | None:
         },
     ]
     expected_targets = ["demo/Target#run(I)V"]
+    # ``package`` qualifies every class list, so the reported entries are fully
+    # qualified even though the config writes them short.
+    expected_configs = [
+        {
+            "path": "demo.mixins.json",
+            "package": "demo",
+            "mixins": ["demo.TargetMixin", "demo.InvokeMixin"],
+            "client": ["demo.ClientMixin"],
+            "server": ["demo.ServerMixin"],
+            "required": False,
+            "priority": 1500,
+        }
+    ]
     status, plans_report, output = probe_json(archive, "--mixin-plans")
     if plans_report is None:
         print(f"native mixin plan probe failed ({status}):\n{output}", file=sys.stderr)
@@ -564,13 +619,44 @@ def expect_mixin_probe(archive: Path) -> dict | None:
     else:
         if plans != expected_plans:
             problems.append(f"plans {plans!r}, expected {expected_plans!r}")
-        # The separate INVOKE mixin is dropped at discovery; no plan may name it.
-        if any(
-            str(plan.get("callback", "")).startswith("demo/InvokeMixin#")
-            for plan in plans
-            if isinstance(plan, dict)
-        ):
-            problems.append("INVOKE callback leaked into the plans")
+        # Every INVOKE plan must name the call site it hooks; a plan that cannot
+        # be resolved belongs in ``unresolved`` instead.
+        for plan in plans:
+            if isinstance(plan, dict) and plan.get("at") == "INVOKE" and not plan.get(
+                "invoke_target"
+            ):
+                problems.append(f"INVOKE plan without a call site: {plan!r}")
+    if plans_report.get("unresolved") != []:
+        problems.append(
+            f"unresolved plans {plans_report.get('unresolved')!r}, expected []"
+        )
+    if plans_report.get("configs") != expected_configs:
+        problems.append(
+            f"configs {plans_report.get('configs')!r}, expected {expected_configs!r}"
+        )
+    # One malformed config is a diagnostic: it must be reported and must not
+    # hide the readable one.
+    config_errors = plans_report.get("config_errors")
+    if not isinstance(config_errors, list):
+        problems.append(f"config errors {config_errors!r}, expected a list")
+    elif len(config_errors) != 1:
+        problems.append(f"config errors {config_errors!r}, expected exactly 1")
+    else:
+        entry = config_errors[0] if isinstance(config_errors[0], list) else []
+        if len(entry) != 2:
+            problems.append(
+                f"config error {config_errors[0]!r}, expected [path, reason]"
+            )
+        else:
+            path, reason = entry
+            if path != "broken.mixins.json":
+                problems.append(
+                    f"config error path {path!r}, expected 'broken.mixins.json'"
+                )
+            if not isinstance(reason, str) or "JSON object" not in reason:
+                problems.append(
+                    f"config error reason {reason!r} does not name the shape"
+                )
     status, run_report, output = probe_json(archive, "main")
     if run_report is None:
         print(f"native mixin run failed ({status}):\n{output}", file=sys.stderr)
@@ -583,6 +669,11 @@ def expect_mixin_probe(archive: Path) -> dict | None:
         problems.append(
             f"run mixin plans {run_report.get('mixin_plans')!r}, "
             f"expected {len(expected_plans)}"
+        )
+    if run_report.get("mixin_configs") != len(expected_configs):
+        problems.append(
+            f"run mixin configs {run_report.get('mixin_configs')!r}, "
+            f"expected {len(expected_configs)}"
         )
     if run_report.get("mixin_targets") != expected_targets:
         problems.append(
@@ -693,7 +784,9 @@ def main() -> int:
             encoding="utf-8",
         )
         # The Mixin jar declares an ordinary entrypoint, so the same classes
-        # serve the plan report and a normal execution run.
+        # serve the plan report and a normal execution run.  Its Fabric
+        # ``mixins`` list names the root config, which carries every modelled
+        # field; a second root config is malformed on purpose.
         (mixin_metadata / "fabric.mod.json").write_text(
             json.dumps(
                 {
@@ -702,10 +795,27 @@ def main() -> int:
                     "version": "1.0.0",
                     "depends": {"minecraft": "26.3", "fabricloader": "*"},
                     "entrypoints": {"main": ["demo.MixinEntry"]},
+                    "mixins": ["demo.mixins.json"],
                 }
             ),
             encoding="utf-8",
         )
+        (mixin_metadata / "demo.mixins.json").write_text(
+            json.dumps(
+                {
+                    "package": "demo",
+                    "mixins": ["TargetMixin", "InvokeMixin"],
+                    "client": ["ClientMixin"],
+                    "server": ["ServerMixin"],
+                    "required": False,
+                    "priority": 1500,
+                }
+            ),
+            encoding="utf-8",
+        )
+        # ``[]`` is not a config object: discovery keeps it visible as one
+        # config error and still reports ``demo.mixins.json``.
+        (mixin_metadata / "broken.mixins.json").write_text("[]", encoding="utf-8")
         # The NeoForge marker is compiled as an ordinary annotation class, so
         # this second jar also exercises annotation discovery and constructor
         # entrypoint execution without shipping a loader dependency.
@@ -790,8 +900,12 @@ def main() -> int:
             (classes, "demo/Target.class"),
             (classes, "demo/TargetMixin.class"),
             (classes, "demo/InvokeMixin.class"),
+            (classes, "demo/ClientMixin.class"),
+            (classes, "demo/ServerMixin.class"),
             (classes, "demo/MixinEntry.class"),
             (mixin_metadata, "fabric.mod.json"),
+            (mixin_metadata, "demo.mixins.json"),
+            (mixin_metadata, "broken.mixins.json"),
         )
         if package_result:
             return package_result
