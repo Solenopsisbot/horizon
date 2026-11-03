@@ -34,7 +34,8 @@
 //! its own offset (a `RETURN` insert only moves the bytes after that `return`):
 //!
 //! - 16-bit branch offsets (`if*`, `goto`, `jsr`, `ifnull`, `ifnonnull`) and the
-//!   32-bit `goto_w`/`jsr_w`, keeping each target on the instruction it named;
+//!   32-bit `goto_w`/`jsr_w`, keeping each target on the instruction it named
+//!   (or on the insert in front of it, per the `RETURN` rule below);
 //! - the exception table's `start_pc`, `end_pc` and `handler_pc`: the inserted
 //!   callback is never caught by the target's own handler, because an insert at
 //!   a range start lands before it and an insert at the exclusive end lands
@@ -45,6 +46,41 @@
 //!   offsets as cumulative `offset_delta`s, plus the `uninitialized` offsets
 //!   inside frames.  A frame whose delta no longer fits its compact form is
 //!   widened (`same_frame` to `same_frame_extended`, and so on).
+//! - the `default` and case offsets of a `tableswitch`/`lookupswitch`, and the
+//!   alignment padding its own new offset forces.  The padding is 0..=3 bytes,
+//!   so relocating a switch can move the bytes after it a second time, on top
+//!   of the insert.
+//!
+//! A relocation is therefore a layout pass, not a single splice: the pass walks
+//! the original instructions left to right, places the inserted bytes at the
+//! instruction they precede, and gives each switch the padding its *new* offset
+//! asks for.  Padding depends only on that offset, which the pass has already
+//! fixed, so one pass is self-consistent.  The pass repeats - bounded by
+//! `MAX_RELOCATION_PASSES` - only when a `goto`/`jsr` has to grow to
+//! `goto_w`/`jsr_w` because an insert pushed its target past the 16-bit range;
+//! growing an instruction moves everything after it, so the next pass has to
+//! agree.  A layout that does not settle inside the bound is rejected.
+//!
+//! A conditional branch (`if*`, `ifnull`, `ifnonnull`) has no wide encoding.
+//! Splitting one into an inverted branch over a `goto_w` would add a branch and
+//! a frame at a site the weaver cannot derive, so a conditional whose relocated
+//! target no longer fits 16 bits is rejected with the distance instead of
+//! written wrong.
+//!
+//! An insert sits in front of the instruction it precedes, and two details
+//! follow from that.  A `RETURN`/`TAIL` insert is *entered*: a branch or switch
+//! case that named the `return` now lands on the callback, so a `return` that is
+//! also a jump target - the body of a `switch` case, an `if` arm - still calls
+//! back.  A `HEAD` insert is *skipped*: a backward branch to the method's first
+//! instruction lands after the callback, so the callback runs once at entry.
+//! When an insert lands on a `StackMapTable` frame position the frame is emitted
+//! twice, once before the callback and once at the instruction, because the
+//! bytes after an unconditional transfer start a basic block whether or not
+//! anything branches to them and the callback runs in the same state.
+//!
+//! `wide`-prefixed local instructions (`wide` load/store, `iinc`, `ret`) are
+//! walked at their real length and copied verbatim, so a method whose local
+//! slots exceed 255 weaves exactly like one below the limit.
 //!
 //! `max_stack` is raised conservatively (HEAD: `original + argument slots + 1`;
 //! RETURN/TAIL: `original + argument slots`), `max_locals` is raised to the
@@ -76,16 +112,23 @@
 //! guards a call site - all three need object construction or call-site
 //! rewriting a plain insert cannot express.
 //!
-//! `tableswitch`/`lookupswitch` are rejected because their alignment padding
-//! depends on the instruction's own offset, so relocating them needs a second
-//! pass over the rewritten buffer.  `wide` is rejected because the weaver never
-//! grows a local-slot operand and a slot above 255 would need one.  A class
-//! whose constant pool uses `CONSTANT_Dynamic` (condy) is rejected because the
-//! writer cannot re-encode its bootstrap arguments.  Non-ASCII constant pool
-//! strings and code that would exceed the class-file `code_length` limit are
-//! rejected with a reason rather than written.
+//! A non-void `RETURN` is rejected rather than half-woven, and the reason is a
+//! hard one: Mixin's callback is static and void, so it must receive a live
+//! `CallbackInfoReturnable`.  Emitting that means `new`/`dup`/`<init>` plus a
+//! boxing conversion of the value already on the stack; reading an override
+//! back means `getReturnValue` plus `checkcast`/unboxing and a branch that
+//! either keeps the original value or replaces it.  Every one of those branches
+//! needs a `StackMapTable` frame, and this module relocates frames but cannot
+//! synthesise one.  The crate also has no JVM-side helper class to delegate to:
+//! `CallbackInfos` is interpreter state, not a class in the woven jar.  So the
+//! target is rejected with that reason and the interpreter handles it.
+//!
+//! A class whose constant pool uses `CONSTANT_Dynamic` (condy) is rejected
+//! because the writer cannot re-encode its bootstrap arguments.  Non-ASCII
+//! constant pool strings and code that would exceed the class-file
+//! `code_length` limit are rejected with a reason rather than written.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{ClassFile, Cp, MethodRef, MixinInjectionPlan};
 
@@ -93,6 +136,12 @@ const ACC_STATIC: u16 = 0x0008;
 const ACC_ABSTRACT: u16 = 0x0400;
 const ACC_NATIVE: u16 = 0x0100;
 const MAX_CODE_LENGTH: usize = 65_535;
+/// Relocation passes before a layout has to be stable.  A pass only ever grows
+/// an instruction (`goto`/`jsr` to `goto_w`/`jsr_w`), never shrinks one, so the
+/// layout is monotone and settles in at most one pass per widening round plus
+/// one to confirm; the bound keeps a pathological method bounded instead of
+/// looping, and a method that hits it is rejected rather than written.
+const MAX_RELOCATION_PASSES: usize = 16;
 /// Plans [`weave_class`] applies to one class.  A jar with more matching plans
 /// than this is outside the bounded weaver instead of growing the edit loop.
 const MAX_WEAVE_PLANS_PER_CLASS: usize = 32;
@@ -1010,20 +1059,121 @@ fn opcode_name(opcode: u8) -> &'static str {
 struct BranchSite {
     /// Offset of the opcode in the original code.
     at: usize,
+    /// The branch opcode, kept so a `goto`/`jsr` can be widened and an `if*`
+    /// can be rejected by name.
+    opcode: u8,
     /// Whether the offset field is 32 bits (`goto_w`/`jsr_w`).
     wide: bool,
     /// Absolute target offset in the original code.
     target: usize,
 }
 
-/// One pass over a method's code: its branches and its return instructions.
+/// One `tableswitch`/`lookupswitch`, with every target as an absolute offset in
+/// the original code.
+struct SwitchSite {
+    /// Offset of the opcode in the original code.
+    at: usize,
+    kind: SwitchKind,
+}
+
+enum SwitchKind {
+    /// `tableswitch`: `targets[i]` answers `low + i`.
+    Table {
+        default: usize,
+        low: i32,
+        high: i32,
+        targets: Vec<usize>,
+    },
+    /// `lookupswitch`: `pairs[i]` is `(match, target)`.
+    Lookup {
+        default: usize,
+        pairs: Vec<(i32, usize)>,
+    },
+}
+
+impl SwitchKind {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Table { .. } => "tableswitch",
+            Self::Lookup { .. } => "lookupswitch",
+        }
+    }
+
+    fn opcode(&self) -> u8 {
+        match self {
+            Self::Table { .. } => 0xaa,
+            Self::Lookup { .. } => 0xab,
+        }
+    }
+
+    fn default(&self) -> usize {
+        match self {
+            Self::Table { default, .. } | Self::Lookup { default, .. } => *default,
+        }
+    }
+
+    /// The `default` target followed by every case target.
+    fn all_targets(&self) -> Vec<usize> {
+        let mut targets = vec![self.default()];
+        match self {
+            Self::Table { targets: cases, .. } => targets.extend_from_slice(cases),
+            Self::Lookup { pairs, .. } => {
+                targets.extend(pairs.iter().map(|(_, target)| *target));
+            }
+        }
+        targets
+    }
+
+    /// The encoded bytes after the opcode and its alignment padding.
+    fn operand_len(&self) -> usize {
+        match self {
+            Self::Table { targets, .. } => 12 + 4 * targets.len(),
+            Self::Lookup { pairs, .. } => 8 + 8 * pairs.len(),
+        }
+    }
+
+    /// The instruction's length when its opcode sits at `at`, which is only
+    /// known once the layout has placed it.
+    fn len_at(&self, at: usize) -> usize {
+        1 + switch_padding(at) + self.operand_len()
+    }
+}
+
+/// The alignment padding a switch at `at` needs so its first operand starts on
+/// a 4-byte boundary counted from the start of the `code` array.
+fn switch_padding(at: usize) -> usize {
+    (4 - (at + 1) % 4) % 4
+}
+
+/// One instruction of the original code.
+struct Instruction {
+    at: usize,
+    size: usize,
+    /// Index into [`CodeScan::switches`] when this instruction is a switch.
+    switch: Option<usize>,
+}
+
+/// One pass over a method's code: its instruction boundaries, its branches, its
+/// switches and its return instructions.
 struct CodeScan {
+    /// Instructions in file order, covering the code without gaps.
+    instructions: Vec<Instruction>,
     branches: Vec<BranchSite>,
+    switches: Vec<SwitchSite>,
     returns: Vec<usize>,
 }
 
-/// The byte size of one fixed-length instruction, or `None` for an unknown or
-/// variable-length opcode.
+impl CodeScan {
+    fn starts(&self) -> BTreeSet<usize> {
+        self.instructions
+            .iter()
+            .map(|instruction| instruction.at)
+            .collect()
+    }
+}
+
+/// The byte size of one fixed-length instruction, or `None` for an opcode whose
+/// size the caller has to work out (`tableswitch`, `lookupswitch`, `wide`).
 fn instruction_size(opcode: u8) -> Option<usize> {
     Some(match opcode {
         0x00..=0x0f => 1,
@@ -1055,38 +1205,140 @@ fn instruction_size(opcode: u8) -> Option<usize> {
     })
 }
 
-/// Walk a method's code, rejecting the opcodes whose size a plain insert cannot
-/// keep valid, and recording every branch target and return offset.
+/// The length of a `wide`-prefixed instruction at `at`: `wide` plus a two-byte
+/// local index plus, for `iinc`, its two-byte constant.
+fn wide_instruction_size(label: &str, code: &[u8], at: usize) -> Result<usize, String> {
+    let sub = code
+        .get(at + 1)
+        .copied()
+        .ok_or_else(|| format!("{label} has a truncated wide instruction at offset {at}"))?;
+    match sub {
+        // wide iload/lload/fload/dload/aload, the stores, and ret.
+        0x15..=0x19 | 0x36..=0x3a | 0xa9 => Ok(4),
+        // wide iinc <index> <const>.
+        0x84 => Ok(6),
+        other => Err(format!(
+            "{label} uses wide opcode 0x{other:02x} at offset {at}; wide only prefixes a local-variable instruction"
+        )),
+    }
+}
+
+/// Parse one switch.  Bounds are checked against the code the switch lives in,
+/// so a truncated table is a reason, not an allocation.
+fn parse_switch(label: &str, code: &[u8], at: usize) -> Result<(SwitchSite, usize), String> {
+    let opcode = code[at];
+    let mut r = Bytes::new(code);
+    r.at = at + 1 + switch_padding(at);
+    let relative = |r: &mut Bytes<'_>| -> Result<usize, String> {
+        let delta = r.u4()? as i32;
+        let target = at as i64 + i64::from(delta);
+        if target < 0 || target as usize >= code.len() {
+            return Err(format!(
+                "{} at offset {at} jumps to {target}, which is outside the {}-byte code",
+                opcode_name(opcode),
+                code.len()
+            ));
+        }
+        Ok(target as usize)
+    };
+    let kind = match opcode {
+        0xaa => {
+            let default = relative(&mut r)?;
+            let low = r.u4()? as i32;
+            let high = r.u4()? as i32;
+            let count = if i64::from(high) < i64::from(low) {
+                if i64::from(high) == i64::from(low) - 1 {
+                    0
+                } else {
+                    return Err(format!(
+                        "tableswitch at offset {at} declares low {low} above high {high}"
+                    ));
+                }
+            } else {
+                let count = (i64::from(high) - i64::from(low) + 1) as u64;
+                if count > (code.len() - r.at) as u64 / 4 {
+                    return Err(format!(
+                        "{label} has a tableswitch at offset {at} declaring {count} jump targets, more than the code holds"
+                    ));
+                }
+                count as usize
+            };
+            let mut targets = Vec::with_capacity(count);
+            for _ in 0..count {
+                targets.push(relative(&mut r)?);
+            }
+            SwitchKind::Table {
+                default,
+                low,
+                high,
+                targets,
+            }
+        }
+        0xab => {
+            let default = relative(&mut r)?;
+            let pairs = r.u4()? as i32;
+            if pairs < 0 {
+                return Err(format!(
+                    "lookupswitch at offset {at} declares {pairs} match-offset pairs"
+                ));
+            }
+            let pairs = pairs as usize;
+            if pairs as u64 > (code.len() - r.at) as u64 / 8 {
+                return Err(format!(
+                    "{label} has a lookupswitch at offset {at} declaring {pairs} match-offset pairs, more than the code holds"
+                ));
+            }
+            let mut entries = Vec::with_capacity(pairs);
+            for _ in 0..pairs {
+                let key = r.u4()? as i32;
+                let target = relative(&mut r)?;
+                entries.push((key, target));
+            }
+            SwitchKind::Lookup {
+                default,
+                pairs: entries,
+            }
+        }
+        other => {
+            return Err(format!(
+                "opcode 0x{other:02x} at offset {at} is not a switch"
+            ));
+        }
+    };
+    let size = r.at - at;
+    Ok((SwitchSite { at, kind }, size))
+}
+
+/// Walk a method's code, recording every instruction boundary, branch target,
+/// switch target and return offset.
 ///
-/// `tableswitch`/`lookupswitch` are rejected because their alignment padding
-/// depends on the instruction's own offset, so relocating them needs a second
-/// pass over the rewritten buffer; `wide` is rejected because the weaver never
-/// grows a local-slot operand and a 16-bit slot would need one.
+/// Every target has to name an instruction boundary: a relocation maps targets
+/// through the layout, so a target inside an instruction would otherwise become
+/// a branch into the middle of one.
 fn scan_code(label: &str, code: &[u8]) -> Result<CodeScan, String> {
     let mut scan = CodeScan {
+        instructions: Vec::new(),
         branches: Vec::new(),
+        switches: Vec::new(),
         returns: Vec::new(),
     };
     let mut at = 0usize;
     while at < code.len() {
         let opcode = code[at];
-        match opcode {
+        let (size, switch) = match opcode {
             0xaa | 0xab => {
-                return Err(format!(
-                    "{label} contains {} at offset {at}; the bounded weaver rejects switches because their alignment padding makes relocation iterative",
-                    opcode_name(opcode)
-                ));
+                let (site, size) = parse_switch(label, code, at)?;
+                scan.switches.push(site);
+                (size, Some(scan.switches.len() - 1))
             }
-            0xc4 => {
-                return Err(format!(
-                    "{label} contains wide at offset {at}; the bounded weaver does not rewrite local-variable operands"
-                ));
+            0xc4 => (wide_instruction_size(label, code, at)?, None),
+            _ => {
+                let size = instruction_size(opcode).ok_or_else(|| {
+                    format!("{label} uses unknown or reserved opcode 0x{opcode:02x} at offset {at}")
+                })?;
+                (size, None)
             }
-            _ => {}
-        }
-        let size = instruction_size(opcode).ok_or_else(|| {
-            format!("{label} uses unknown or reserved opcode 0x{opcode:02x} at offset {at}")
-        })?;
+        };
         let end = at
             .checked_add(size)
             .ok_or_else(|| "code offset overflow".to_owned())?;
@@ -1099,9 +1351,38 @@ fn scan_code(label: &str, code: &[u8]) -> Result<CodeScan, String> {
             scan.returns.push(at);
         }
         if let Some((wide, target)) = branch_target(opcode, code, at)? {
-            scan.branches.push(BranchSite { at, wide, target });
+            scan.branches.push(BranchSite {
+                at,
+                opcode,
+                wide,
+                target,
+            });
         }
+        scan.instructions.push(Instruction { at, size, switch });
         at = end;
+    }
+
+    let starts = scan.starts();
+    for branch in &scan.branches {
+        if !starts.contains(&branch.target) {
+            return Err(format!(
+                "{label}: {} at offset {} targets {}, which is not an instruction boundary",
+                opcode_name(branch.opcode),
+                branch.at,
+                branch.target
+            ));
+        }
+    }
+    for site in &scan.switches {
+        for target in site.kind.all_targets() {
+            if !starts.contains(&target) {
+                return Err(format!(
+                    "{label}: {} at offset {} targets {target}, which is not an instruction boundary",
+                    site.kind.name(),
+                    site.at
+                ));
+            }
+        }
     }
     Ok(scan)
 }
@@ -1137,7 +1418,158 @@ fn branch_target(opcode: u8, code: &[u8], at: usize) -> Result<Option<(bool, usi
     Ok(Some((wide, target as usize)))
 }
 
-/// Shift an original code offset by every insert that lands at or before it.
+/// One relocation pass's answer: where every original instruction start, every
+/// insert and the end of the code now sit.
+struct CodePlan {
+    /// New offset of each instruction start, keyed by its original offset.
+    offsets: BTreeMap<usize, usize>,
+    /// New offset where the bytes inserted before an instruction begin, i.e.
+    /// the position an exclusive range end keeps the insert outside of.
+    boundaries: BTreeMap<usize, usize>,
+    /// Instructions that grew from `goto`/`jsr` to `goto_w`/`jsr_w`.
+    widened: BTreeSet<usize>,
+    /// New offset of the exclusive end of the code.
+    end: usize,
+    /// The original code's length, so an offset at the (exclusive) end maps
+    /// without pretending it is an instruction.
+    original_len: usize,
+}
+
+/// The length of the insert at `offset`, or `None`.  `insertions` is sorted by
+/// offset, which [`relocate`] guarantees.
+fn inserted_at(insertions: &[(usize, usize)], offset: usize) -> Option<usize> {
+    insertions
+        .binary_search_by_key(&offset, |(at, _)| *at)
+        .ok()
+        .map(|index| insertions[index].1)
+}
+
+/// Place every instruction of the original code in the rewritten buffer.
+///
+/// A switch's size is computed from the offset this pass gives it, so its
+/// alignment padding is exact rather than carried over from the original
+/// layout; an instruction in `widened` is five bytes instead of three.
+fn layout_pass(
+    label: &str,
+    scan: &CodeScan,
+    insertions: &[(usize, usize)],
+    widened: &BTreeSet<usize>,
+) -> Result<CodePlan, String> {
+    let mut plan = CodePlan {
+        offsets: BTreeMap::new(),
+        boundaries: BTreeMap::new(),
+        widened: widened.clone(),
+        end: 0,
+        original_len: scan
+            .instructions
+            .last()
+            .map_or(0, |instruction| instruction.at + instruction.size),
+    };
+    let mut out = 0usize;
+    for instruction in &scan.instructions {
+        plan.boundaries.insert(instruction.at, out);
+        out = out
+            .checked_add(inserted_at(insertions, instruction.at).unwrap_or(0))
+            .ok_or_else(|| format!("{label}: woven code length overflow"))?;
+        plan.offsets.insert(instruction.at, out);
+        let size = match instruction.switch {
+            Some(index) => scan.switches[index].kind.len_at(out),
+            None if widened.contains(&instruction.at) => 5,
+            None => instruction.size,
+        };
+        out = out
+            .checked_add(size)
+            .ok_or_else(|| format!("{label}: woven code length overflow"))?;
+    }
+    plan.end = out;
+    Ok(plan)
+}
+
+/// The opcode a wide branch has: `goto_w`/`jsr_w`.
+fn widened_opcode(opcode: u8) -> Option<u8> {
+    match opcode {
+        0xa7 => Some(0xc8),
+        0xa8 => Some(0xc9),
+        _ => None,
+    }
+}
+
+/// Relocate until the layout stops changing, bounded by
+/// [`MAX_RELOCATION_PASSES`].
+///
+/// The only thing that can move between passes is a `goto`/`jsr` that had to
+/// grow, because a grown instruction shifts every offset after it.  Widening is
+/// monotone - a branch that fits stays narrow - so the loop cannot oscillate;
+/// the bound exists to reject a method whose relocation does not settle instead
+/// of spinning.
+fn stable_plan(
+    label: &str,
+    scan: &CodeScan,
+    insertions: &[(usize, usize)],
+    entry: TargetEntry,
+) -> Result<CodePlan, String> {
+    let mut widened = BTreeSet::new();
+    for _ in 0..MAX_RELOCATION_PASSES {
+        let plan = layout_pass(label, scan, insertions, &widened)?;
+        let offset = |at: usize| {
+            plan.offsets
+                .get(&at)
+                .copied()
+                .ok_or_else(|| format!("{label}: offset {at} is not an instruction boundary"))
+        };
+        let mut grew = false;
+        for branch in &scan.branches {
+            let opcode_at = offset(branch.at)?;
+            let delta = map_target(label, &plan, branch.target, entry)? as i64 - opcode_at as i64;
+            if branch.wide {
+                if i32::try_from(delta).is_err() {
+                    return Err(format!(
+                        "{label}: relocating the {} at offset {} would exceed the 32-bit branch range",
+                        opcode_name(branch.opcode),
+                        branch.at
+                    ));
+                }
+                continue;
+            }
+            if i16::try_from(delta).is_ok() {
+                continue;
+            }
+            if widened_opcode(branch.opcode).is_none() {
+                return Err(format!(
+                    "{label}: {} at offset {} would sit {delta} bytes from its target after weaving, past the 16-bit branch range; the weaver only widens goto/jsr, so this conditional branch stays on the interpreter path",
+                    opcode_name(branch.opcode),
+                    branch.at
+                ));
+            }
+            if widened.insert(branch.at) {
+                grew = true;
+            }
+        }
+        for site in &scan.switches {
+            let opcode_at = plan.offsets.get(&site.at).copied().ok_or_else(|| {
+                format!("{label}: offset {} is not an instruction boundary", site.at)
+            })?;
+            for target in site.kind.all_targets() {
+                let target = map_target(label, &plan, target, entry)?;
+                if i32::try_from(target as i64 - opcode_at as i64).is_err() {
+                    return Err(format!(
+                        "{label}: relocating the {} at offset {} would exceed the 32-bit switch range",
+                        site.kind.name(),
+                        site.at
+                    ));
+                }
+            }
+        }
+        if !grew {
+            return Ok(plan);
+        }
+    }
+    Err(format!(
+        "{label}: relocating switches and branches did not converge in {MAX_RELOCATION_PASSES} passes"
+    ))
+}
+
+/// Where an original code offset now sits.
 ///
 /// `inclusive` selects the two cases a rewrite distinguishes.  With `true` the
 /// result is where the original byte at `offset` now sits: an insert exactly at
@@ -1146,77 +1578,235 @@ fn branch_target(opcode: u8, code: &[u8], at: usize) -> Result<Option<(bool, usi
 /// debug-table start all name.  With `false` the result is the start of the
 /// inserted block at `offset`, which is where an exclusive range end belongs so
 /// the inserted bytes stay outside the range.
-fn shift_offset(
+fn map_offset(
     label: &str,
-    insertions: &[(usize, usize)],
+    plan: &CodePlan,
     offset: usize,
     inclusive: bool,
 ) -> Result<usize, String> {
-    let mut shifted = offset;
-    for (at, length) in insertions {
-        if *at < offset || (inclusive && *at == offset) {
-            shifted = shifted
-                .checked_add(*length)
-                .ok_or_else(|| format!("{label}: code offset overflow"))?;
-        }
+    if offset == plan.original_len {
+        return Ok(plan.end);
     }
-    Ok(shifted)
-}
-
-/// Where the original byte at `offset` now sits.
-fn shifted_position(
-    label: &str,
-    insertions: &[(usize, usize)],
-    offset: usize,
-) -> Result<usize, String> {
-    shift_offset(label, insertions, offset, true)
-}
-
-/// The start of the inserted block at `offset`, i.e. the position an exclusive
-/// range end keeps the inserted bytes outside of.
-fn shifted_boundary(
-    label: &str,
-    insertions: &[(usize, usize)],
-    offset: usize,
-) -> Result<usize, String> {
-    shift_offset(label, insertions, offset, false)
+    let mapped = if inclusive {
+        plan.offsets.get(&offset)
+    } else {
+        plan.boundaries.get(&offset)
+    };
+    mapped
+        .copied()
+        .ok_or_else(|| format!("{label}: offset {offset} is not an instruction boundary"))
 }
 
 fn shifted_u2(label: &str, value: usize, what: &str) -> Result<u16, String> {
     u16::try_from(value).map_err(|_| format!("{label}: {what} moves past the 65535-byte limit"))
 }
 
-/// Splice `bytes` in at every `(offset, len)` site.
-fn splice(
+/// Where a branch or switch target lands when it names an instruction that has
+/// an insert in front of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetEntry {
+    /// Keep the target on the original instruction, so the insert runs only
+    /// when control falls into it.  `HEAD`'s insert sits at offset 0 and uses
+    /// this: a backward branch to the method's first instruction must not run
+    /// the callback a second time.
+    Skip,
+    /// Point the target at the inserted bytes, so every path that reaches the
+    /// instruction runs the callback first.  `RETURN`/`TAIL` need this: a
+    /// `return` that is also a branch or switch target - the body of a
+    /// `switch` case, `try` handler tail, `if` arm - must still call back.
+    Enter,
+}
+
+/// The new offset a branch or switch target maps to.
+fn map_target(
+    label: &str,
+    plan: &CodePlan,
+    offset: usize,
+    entry: TargetEntry,
+) -> Result<usize, String> {
+    map_offset(label, plan, offset, entry == TargetEntry::Skip)
+}
+
+/// Write one switch at its planned offset, re-deriving its padding, its
+/// relative `default`/case offsets and (for `tableswitch`) its `low`/`high`.
+fn write_switch(
+    label: &str,
+    out: &mut Vec<u8>,
+    site: &SwitchSite,
+    plan: &CodePlan,
+    entry: TargetEntry,
+) -> Result<(), String> {
+    let opcode_at = plan
+        .offsets
+        .get(&site.at)
+        .copied()
+        .ok_or_else(|| "a switch is missing from the layout".to_owned())?;
+    if out.len() != opcode_at {
+        return Err("a switch does not sit at its planned offset".to_owned());
+    }
+    let relative = |target: usize| -> Result<i32, String> {
+        let target = map_target(label, plan, target, entry)?;
+        i32::try_from(target as i64 - opcode_at as i64)
+            .map_err(|_| "a relocated switch offset exceeds its 32-bit operand".to_owned())
+    };
+    out.push(site.kind.opcode());
+    for _ in 0..switch_padding(opcode_at) {
+        out.push(0);
+    }
+    match &site.kind {
+        SwitchKind::Table {
+            default,
+            low,
+            high,
+            targets,
+        } => {
+            out.extend_from_slice(&relative(*default)?.to_be_bytes());
+            out.extend_from_slice(&low.to_be_bytes());
+            out.extend_from_slice(&high.to_be_bytes());
+            for target in targets {
+                out.extend_from_slice(&relative(*target)?.to_be_bytes());
+            }
+        }
+        SwitchKind::Lookup { default, pairs } => {
+            out.extend_from_slice(&relative(*default)?.to_be_bytes());
+            let count = i32::try_from(pairs.len())
+                .map_err(|_| "lookupswitch has too many match-offset pairs".to_owned())?;
+            out.extend_from_slice(&count.to_be_bytes());
+            for (key, target) in pairs {
+                out.extend_from_slice(&key.to_be_bytes());
+                out.extend_from_slice(&relative(*target)?.to_be_bytes());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build the rewritten code from the stable plan: insert each callback at its
+/// instruction, re-encode switches and branches, copy everything else.
+fn emit_woven(
     label: &str,
     code: &[u8],
+    scan: &CodeScan,
+    plan: &CodePlan,
     insertions: &[(usize, usize)],
     bytes: &[u8],
+    entry: TargetEntry,
 ) -> Result<Vec<u8>, String> {
-    let extra = insertions
-        .len()
-        .checked_mul(bytes.len())
-        .ok_or_else(|| format!("{label}: woven code length overflow"))?;
-    let mut out = Vec::with_capacity(code.len() + extra);
-    let mut at = 0usize;
-    for (offset, length) in insertions {
-        if *length != bytes.len() || *offset < at || *offset > code.len() {
+    let branches = scan
+        .branches
+        .iter()
+        .map(|branch| (branch.at, branch))
+        .collect::<BTreeMap<usize, &BranchSite>>();
+    let mut out = Vec::with_capacity(plan.end);
+    for instruction in &scan.instructions {
+        if inserted_at(insertions, instruction.at).is_some() {
+            out.extend_from_slice(bytes);
+        }
+        if let Some(index) = instruction.switch {
+            write_switch(label, &mut out, &scan.switches[index], plan, entry)?;
+            continue;
+        }
+        let at = plan.offsets.get(&instruction.at).copied().ok_or_else(|| {
+            format!(
+                "{label}: instruction at {} is missing from the layout",
+                instruction.at
+            )
+        })?;
+        if out.len() != at {
+            return Err(format!(
+                "{label}: the woven layout disagrees at offset {}",
+                instruction.at
+            ));
+        }
+        let Some(branch) = branches.get(&instruction.at) else {
+            out.extend_from_slice(&code[instruction.at..instruction.at + instruction.size]);
+            continue;
+        };
+        let target = map_target(label, plan, branch.target, entry)?;
+        let delta = target as i64 - at as i64;
+        match widened_opcode(branch.opcode).filter(|_| plan.widened.contains(&branch.at)) {
+            Some(opcode) => {
+                out.push(opcode);
+                let delta = i32::try_from(delta).map_err(|_| {
+                    format!("{label}: a widened branch exceeds the 32-bit branch range")
+                })?;
+                out.extend_from_slice(&delta.to_be_bytes());
+            }
+            None if branch.wide => {
+                out.push(branch.opcode);
+                let delta = i32::try_from(delta)
+                    .map_err(|_| format!("{label}: a branch exceeds the 32-bit branch range"))?;
+                out.extend_from_slice(&delta.to_be_bytes());
+            }
+            None => {
+                out.push(branch.opcode);
+                let delta = i16::try_from(delta).map_err(|_| {
+                    format!(
+                        "{label}: {} at offset {} exceeds the 16-bit branch range after weaving",
+                        opcode_name(branch.opcode),
+                        branch.at
+                    )
+                })?;
+                out.extend_from_slice(&delta.to_be_bytes());
+            }
+        }
+    }
+    if out.len() != plan.end {
+        return Err(format!(
+            "{label}: the woven code is {} bytes, planned {}",
+            out.len(),
+            plan.end
+        ));
+    }
+    Ok(out)
+}
+
+/// Check that a rewritten buffer is still a well-formed instruction stream.
+///
+/// The layout is the authority on where things moved; re-scanning is the cheap
+/// independent check that every branch and switch target still lands on an
+/// instruction boundary and every switch's padding agrees with its offset.
+fn verify_woven(label: &str, code: &[u8]) -> Result<(), String> {
+    scan_code(label, code)
+        .map(|_| ())
+        .map_err(|error| format!("{label}: the woven code does not re-scan: {error}"))
+}
+
+/// The insert sites, checked and sorted: every one carries the same bytes and
+/// lands on an instruction boundary.
+fn validate_insertions(
+    label: &str,
+    scan: &CodeScan,
+    code_len: usize,
+    insertions: &[(usize, usize)],
+    length: usize,
+) -> Result<Vec<(usize, usize)>, String> {
+    let mut sorted = insertions.to_vec();
+    sorted.sort_unstable_by_key(|(at, _)| *at);
+    let starts = scan.starts();
+    for (index, (at, insert)) in sorted.iter().enumerate() {
+        if *insert != length {
             return Err(format!("{label}: inconsistent insert sites"));
         }
-        out.extend_from_slice(&code[at..*offset]);
-        out.extend_from_slice(bytes);
-        at = *offset;
+        if index > 0 && sorted[index - 1].0 == *at {
+            return Err(format!("{label}: two inserts land at offset {at}"));
+        }
+        if *at >= code_len || !starts.contains(at) {
+            return Err(format!(
+                "{label}: an insert lands at offset {at}, which is not an instruction boundary"
+            ));
+        }
     }
-    out.extend_from_slice(&code[at..]);
-    Ok(out)
+    Ok(sorted)
 }
 
 /// Rewrite one method's code around a set of same-size inserts.
 ///
-/// Every structure that names a bytecode offset is shifted by the insert delta
-/// that applies at that offset: branch offsets, `goto_w`/`jsr_w`, exception
-/// table ranges, `LineNumberTable`/`LocalVariableTable`/`LocalVariableTypeTable`
-/// `start_pc`, `StackMapTable` frame deltas and `uninitialized` offsets.
+/// The layout pass places every instruction (and re-pads every switch) in the
+/// new buffer; then every structure that names a bytecode offset is mapped
+/// through it: branch operands, switch tables, exception table ranges,
+/// `LineNumberTable`/`LocalVariableTable`/`LocalVariableTypeTable` `start_pc`,
+/// `StackMapTable` frame deltas and `uninitialized` offsets.
 fn relocate<'a>(
     label: &str,
     code: &CodeLayout<'a>,
@@ -1225,34 +1815,12 @@ fn relocate<'a>(
     bytes: &[u8],
     max_stack: u16,
     max_locals: u16,
+    entry: TargetEntry,
 ) -> Result<CodePatch<'a>, String> {
-    let mut woven = splice(label, code.code, insertions, bytes)?;
-    for branch in &scan.branches {
-        let opcode_at = shifted_position(label, insertions, branch.at)?;
-        let target = shifted_position(label, insertions, branch.target)?;
-        let field = opcode_at + 1;
-        // JVM branch offsets are relative to the address of the branch opcode,
-        // not to the end of the instruction.
-        if branch.wide {
-            let delta = target as i64 - opcode_at as i64;
-            let delta = i32::try_from(delta).map_err(|_| {
-                format!(
-                    "{label}: relocating the branch at offset {} would exceed the 32-bit branch range",
-                    branch.at
-                )
-            })?;
-            woven[field..field + 4].copy_from_slice(&delta.to_be_bytes());
-        } else {
-            let delta = target as i64 - opcode_at as i64;
-            let delta = i16::try_from(delta).map_err(|_| {
-                format!(
-                    "{label}: relocating the branch at offset {} would exceed the 16-bit branch range and the weaver does not emit goto_w",
-                    branch.at
-                )
-            })?;
-            woven[field..field + 2].copy_from_slice(&delta.to_be_bytes());
-        }
-    }
+    let insertions = validate_insertions(label, scan, code.code.len(), insertions, bytes.len())?;
+    let plan = stable_plan(label, scan, &insertions, entry)?;
+    let woven = emit_woven(label, code.code, scan, &plan, &insertions, bytes, entry)?;
+    verify_woven(label, &woven)?;
 
     let mut exception_table = Vec::with_capacity(code.exception_table.len());
     for handler in &code.exception_table {
@@ -1261,16 +1829,16 @@ fn relocate<'a>(
         // after it, so the callback is never caught by the target's own handler.
         let (start, end) = if handler.start_pc == handler.end_pc {
             (
-                shifted_boundary(label, insertions, handler.start_pc as usize)?,
-                shifted_boundary(label, insertions, handler.end_pc as usize)?,
+                map_offset(label, &plan, handler.start_pc as usize, false)?,
+                map_offset(label, &plan, handler.end_pc as usize, false)?,
             )
         } else {
             (
-                shifted_position(label, insertions, handler.start_pc as usize)?,
-                shifted_boundary(label, insertions, handler.end_pc as usize)?,
+                map_offset(label, &plan, handler.start_pc as usize, true)?,
+                map_offset(label, &plan, handler.end_pc as usize, false)?,
             )
         };
-        let handler_pc = shifted_position(label, insertions, handler.handler_pc as usize)?;
+        let handler_pc = map_target(label, &plan, handler.handler_pc as usize, entry)?;
         if start > end || handler_pc >= woven.len() {
             return Err(format!(
                 "{label}: relocating the exception table produced an invalid range"
@@ -1287,7 +1855,7 @@ fn relocate<'a>(
     let attributes = code
         .attributes
         .iter()
-        .map(|attribute| relocate_attribute(label, attribute, insertions))
+        .map(|attribute| relocate_attribute(label, attribute, &plan, &insertions))
         .collect::<Result<Vec<_>, String>>()?;
 
     Ok(CodePatch {
@@ -1302,6 +1870,7 @@ fn relocate<'a>(
 fn relocate_attribute<'a>(
     label: &str,
     attribute: &CodeAttribute<'a>,
+    plan: &CodePlan,
     insertions: &[(usize, usize)],
 ) -> Result<CodeAttribute<'a>, String> {
     Ok(match attribute {
@@ -1317,7 +1886,7 @@ fn relocate_attribute<'a>(
                     Ok(LineNumber {
                         start_pc: shifted_u2(
                             label,
-                            shifted_position(label, insertions, line.start_pc as usize)?,
+                            map_offset(label, plan, line.start_pc as usize, true)?,
                             "a line number",
                         )?,
                         line_number: line.line_number,
@@ -1332,12 +1901,12 @@ fn relocate_attribute<'a>(
             name_index: *name_index,
             entries: entries
                 .iter()
-                .map(|entry| relocate_local(label, entry, insertions))
+                .map(|entry| relocate_local(label, entry, plan))
                 .collect::<Result<Vec<_>, String>>()?,
         },
         CodeAttribute::StackMap { name_index, frames } => CodeAttribute::StackMap {
             name_index: *name_index,
-            frames: relocate_frames(label, frames, insertions)?,
+            frames: relocate_frames(label, frames, plan, insertions)?,
         },
     })
 }
@@ -1345,13 +1914,14 @@ fn relocate_attribute<'a>(
 fn relocate_local(
     label: &str,
     entry: &LocalVariable,
-    insertions: &[(usize, usize)],
+    plan: &CodePlan,
 ) -> Result<LocalVariable, String> {
-    let start = shifted_position(label, insertions, entry.start_pc as usize)?;
-    let end = shifted_boundary(
+    let start = map_offset(label, plan, entry.start_pc as usize, true)?;
+    let end = map_offset(
         label,
-        insertions,
+        plan,
         entry.start_pc as usize + entry.length as usize,
+        false,
     )?;
     if end < start {
         return Err(format!(
@@ -1370,48 +1940,72 @@ fn relocate_local(
 fn relocate_frames(
     label: &str,
     frames: &[StackMapFrame],
+    plan: &CodePlan,
     insertions: &[(usize, usize)],
 ) -> Result<Vec<StackMapFrame>, String> {
-    let mut out = Vec::with_capacity(frames.len());
+    let mut out = Vec::with_capacity(frames.len() * 2);
     for frame in frames {
-        let offset = shifted_position(label, insertions, frame.offset)?;
-        if let Some(previous) = out.last() {
-            let previous: &StackMapFrame = previous;
-            if offset <= previous.offset {
-                return Err(format!(
-                    "{label}: relocating stack-map frames produced a duplicate"
-                ));
-            }
+        // An insert at a frame position puts the callback in front of the
+        // instruction that frame describes, which leaves the callback where the
+        // verifier still wants a frame: the instruction after an unconditional
+        // transfer (the `goto`/switch that named this position) starts a basic
+        // block even when nothing branches to the inserted bytes.  The callback
+        // runs in exactly the frame's state - it only pushes its arguments and
+        // calls `invokestatic` - so the same frame is valid at both offsets.
+        if frame.offset > 0 && inserted_at(insertions, frame.offset).is_some() {
+            let boundary = map_offset(label, plan, frame.offset, false)?;
+            push_frame(label, &mut out, frame, boundary, plan)?;
         }
-        out.push(StackMapFrame {
-            frame_type: frame.frame_type,
-            offset,
-            locals: frame
-                .locals
-                .iter()
-                .map(|verification| relocate_verification(label, verification, insertions))
-                .collect::<Result<Vec<_>, String>>()?,
-            stack: frame
-                .stack
-                .iter()
-                .map(|verification| relocate_verification(label, verification, insertions))
-                .collect::<Result<Vec<_>, String>>()?,
-        });
+        let offset = map_offset(label, plan, frame.offset, true)?;
+        push_frame(label, &mut out, frame, offset, plan)?;
     }
     Ok(out)
+}
+
+/// Append one relocated frame, keeping the table strictly increasing.
+fn push_frame(
+    label: &str,
+    out: &mut Vec<StackMapFrame>,
+    frame: &StackMapFrame,
+    offset: usize,
+    plan: &CodePlan,
+) -> Result<(), String> {
+    if let Some(previous) = out.last() {
+        let previous: &StackMapFrame = previous;
+        if offset <= previous.offset {
+            return Err(format!(
+                "{label}: relocating stack-map frames produced a duplicate"
+            ));
+        }
+    }
+    out.push(StackMapFrame {
+        frame_type: frame.frame_type,
+        offset,
+        locals: frame
+            .locals
+            .iter()
+            .map(|verification| relocate_verification(label, verification, plan))
+            .collect::<Result<Vec<_>, String>>()?,
+        stack: frame
+            .stack
+            .iter()
+            .map(|verification| relocate_verification(label, verification, plan))
+            .collect::<Result<Vec<_>, String>>()?,
+    });
+    Ok(())
 }
 
 fn relocate_verification(
     label: &str,
     verification: &VerificationType,
-    insertions: &[(usize, usize)],
+    plan: &CodePlan,
 ) -> Result<VerificationType, String> {
     Ok(match verification {
         VerificationType::Simple(tag) => VerificationType::Simple(*tag),
         VerificationType::Object(index) => VerificationType::Object(*index),
         VerificationType::Uninitialized(offset) => VerificationType::Uninitialized(shifted_u2(
             label,
-            shifted_position(label, insertions, *offset as usize)?,
+            map_offset(label, plan, *offset as usize, true)?,
             "an uninitialized offset",
         )?),
     })
@@ -1632,7 +2226,6 @@ fn callback_call(
     takes_receiver: bool,
     pool: &mut PoolBuilder<'_>,
 ) -> Result<CallbackCall, String> {
-    let label = target.label();
     let arguments = crate::descriptor_arguments(&target.descriptor);
     let mut inserted = Vec::new();
     let mut slot = if target.is_static { 0 } else { 1 };
@@ -1643,13 +2236,19 @@ fn callback_call(
     }
     for argument in &arguments {
         let (opcode, width) = load_opcode(argument)?;
+        // A slot above 255 needs the `wide` prefix; the class-file format caps a
+        // method's parameter slots well below that, so this only runs for a
+        // hand-built descriptor the verifier would reject anyway, but emitting
+        // the wide form keeps the insert faithful to the slots it is told to
+        // read instead of silently truncating the index.
         if slot > u8::MAX as u16 {
-            return Err(format!(
-                "{label}: argument local slot {slot} needs wide, which the bounded weaver does not emit"
-            ));
+            inserted.push(0xc4); // wide
+            inserted.push(opcode);
+            inserted.extend_from_slice(&slot.to_be_bytes());
+        } else {
+            inserted.push(opcode);
+            inserted.push(slot as u8);
         }
-        inserted.push(opcode);
-        inserted.push(slot as u8);
         slot = slot.checked_add(width).ok_or("local slot overflow")?;
         slots = slots.checked_add(width).ok_or("argument slot overflow")?;
     }
@@ -1675,13 +2274,14 @@ fn callback_call(
 /// what the inserted `aload_0` supplies; a callback that does not declare it
 /// gets the arguments only, and no receiver is pushed.
 ///
-/// The insert moves every branch target, exception range, stack-map frame and
-/// debug-table offset after it; see [`crate::weaver`] for the rewrite.
+/// The insert moves every branch target, switch table, exception range,
+/// stack-map frame and debug-table offset after it; see [`crate::weaver`] for
+/// the rewrite.
 ///
 /// Errors name the reason a method is outside the subset instead of guessing:
-/// switches, `wide`, `ret` outside `jsr`, condy, abstract/native methods, a
-/// local slot above 255, a mismatched callback descriptor, or `CallbackInfo`
-/// parameters.
+/// condy, abstract/native methods, a mismatched callback descriptor,
+/// `CallbackInfo` parameters, a `wide` prefix that is not a local-variable
+/// instruction, or a conditional branch whose target no longer fits 16 bits.
 pub fn weave_head(
     class: &ClassFile,
     target: &MethodRef,
@@ -1720,6 +2320,7 @@ pub fn weave_head(
         &call.bytes,
         max_stack,
         max_locals,
+        TargetEntry::Skip,
     )?;
 
     emit(
@@ -1741,18 +2342,22 @@ pub fn weave_head(
 /// Mixin's `RETURN` and `TAIL` anchors.
 ///
 /// Only `void` targets are woven.  A non-void target would need a
-/// `CallbackInfoReturnable` carrying the target's boxed result, which needs
-/// object construction this bounded insert cannot emit; that target is
+/// `CallbackInfoReturnable` carrying the target's boxed result plus an override
+/// branch that reloads or replaces it, which needs object construction and
+/// synthesised stack-map frames this bounded insert cannot emit; that target is
 /// rejected with a reason and stays on the interpreter path.
 ///
 /// The callback is invoked with `invokestatic`.  A callback takes the target's
 /// arguments in order and returns `void`.  An instance target's callback may
 /// take the target instance first, which the inserted `aload_0` supplies.
 /// Each insert relocates the offsets after it exactly as [`weave_head`] does,
-/// so a branchy method, a loop and an exception handler keep their targets and
-/// frames.  Every other rejection matches [`weave_head`]: switches, `wide`,
-/// condy, abstract/native methods, a local slot above 255, a mismatched
-/// callback descriptor, or `CallbackInfo`/`CallbackInfoReturnable` parameters.
+/// so a branchy method, a loop, a `tableswitch`/`lookupswitch` (whose padding is
+/// re-derived from its new offset), a `wide` local and an exception handler
+/// keep their targets and frames.  Unlike a `HEAD` insert, a `RETURN` insert is
+/// entered by the branches and switch cases that named the `return`.
+/// Every other rejection matches
+/// [`weave_head`]: condy, abstract/native methods, a mismatched callback
+/// descriptor, or `CallbackInfo`/`CallbackInfoReturnable` parameters.
 pub fn weave_return(
     class: &ClassFile,
     target: &MethodRef,
@@ -1764,7 +2369,7 @@ pub fn weave_return(
     let anchor = mode.anchor();
     if crate::return_desc(&target.descriptor) != "V" {
         return Err(format!(
-            "{label}: {anchor} weaving a non-void target needs a CallbackInfoReturnable object, which the bounded weaver cannot construct; only void targets are woven (the interpreter handles this one)"
+            "{label}: {anchor} weaving a non-void target needs a CallbackInfoReturnable carrying the target's boxed result and an override branch that reloads or replaces it; the bounded weaver cannot construct the object or synthesise the StackMapTable frames such a branch needs, so only void targets are woven (the interpreter handles this one)"
         ));
     }
     let takes_receiver = callback_arguments(
@@ -1811,6 +2416,7 @@ pub fn weave_return(
         &call.bytes,
         max_stack,
         max_locals,
+        TargetEntry::Enter,
     )?;
 
     emit(
@@ -1896,8 +2502,9 @@ pub fn weave_class(class: &ClassFile, plans: &[MixinInjectionPlan]) -> Result<Ve
 /// Not supported here, and left on the interpreter path: `RETURN`, `TAIL` and
 /// `INVOKE` anchors; cancellation; and `CallbackInfo`/`CallbackInfoReturnable`
 /// parameters.  Errors from a matching plan (ambiguous target descriptor,
-/// callback mismatch, a switch/`wide`/condy target) propagate rather than being
-/// silently skipped.
+/// callback mismatch, a condy pool, a `wide` prefix that is not a
+/// local-variable instruction, a conditional branch past the 16-bit range)
+/// propagate rather than being silently skipped.
 ///
 /// Every insert lands at offset 0, so when several plans match one method the
 /// last plan applied is the first callback to run.  Callers that need Mixin's
@@ -2348,29 +2955,186 @@ mod tests {
     }
 
     #[test]
-    fn head_rejects_a_switch() {
-        // `tableswitch`, which the weaver cannot relocate: its padding depends
-        // on the instruction's own offset.
+    fn head_relocates_a_tableswitch() {
+        // 0: tableswitch (three padding bytes), default -> 24, low 0, high 1,
+        // case 0 -> 25, case 1 -> 26; then three `ireturn`.
         let code = [
             0xaa, 0, 0, 0, // opcode and alignment padding
-            0, 0, 0, 4, // default
+            0, 0, 0, 24, // default
             0, 0, 0, 0, // low
-            0, 0, 0, 0, // high
-            0, 0, 0, 4, // one jump
+            0, 0, 0, 1, // high
+            0, 0, 0, 25, // case 0
+            0, 0, 0, 26, // case 1
+            0xac, 0xac, 0xac,
         ];
+        assert_eq!(code.len(), 27);
         let bytes = fixture(0x0001, "(II)I", 3, &code, &[]);
         let class = ClassFile::parse(&bytes).unwrap();
-        let error = weave_head(&class, &target(), &callback("(Ldemo/T;II)V")).unwrap_err();
-        assert!(error.contains("tableswitch"), "{error}");
-        assert!(error.contains("iterative"), "{error}");
+        // `iload_1; iload_2; invokestatic` is 7 bytes, which is not a multiple
+        // of four: the switch's padding has to be re-derived, so it shrinks from
+        // 24 bytes to 21 and everything after it moves a second time.
+        let woven = weave_head(&class, &target(), &callback("(II)V")).unwrap();
+        let (woven_code, _, _) = woven_code(&woven, "m", "(II)I");
+        assert_eq!(woven_code.len(), 27 + 7 - 3);
+        assert_eq!(woven_code[7], 0xaa);
+        assert_eq!(switch_header(&woven_code, 7), (21, 0, 1, vec![22, 23]));
+        assert_eq!(&woven_code[28..], &[0xac, 0xac, 0xac]);
     }
 
     #[test]
-    fn head_rejects_wide() {
-        let code = [0xc4, 0x15, 0x01, 0x00, 0xb1];
+    fn head_relocates_a_lookupswitch() {
+        // 0: lookupswitch (three padding bytes), default -> 28, two pairs
+        // (1 -> 29, 100 -> 30); then three `ireturn`.
+        let code = [
+            0xab, 0, 0, 0, // opcode and alignment padding
+            0, 0, 0, 28, // default
+            0, 0, 0, 2, // npairs
+            0, 0, 0, 1, 0, 0, 0, 29, // key 1 -> 29
+            0, 0, 0, 100, 0, 0, 0, 30, // key 100 -> 30
+            0xac, 0xac, 0xac,
+        ];
+        assert_eq!(code.len(), 31);
         let bytes = fixture(0x0001, "(II)I", 3, &code, &[]);
         let class = ClassFile::parse(&bytes).unwrap();
-        let error = weave_head(&class, &target(), &callback("(Ldemo/T;II)V")).unwrap_err();
-        assert!(error.contains("wide"), "{error}");
+        let woven = weave_head(&class, &target(), &callback("(II)V")).unwrap();
+        let (woven_code, _, _) = woven_code(&woven, "m", "(II)I");
+        // Padding drops from three bytes to none, so the switch shrinks 3 bytes
+        // and the three returns land at 32, 33 and 34.
+        assert_eq!(woven_code.len(), 31 + 7 - 3);
+        assert_eq!(woven_code[7], 0xab);
+        assert_eq!(woven_code[8..12], 25i32.to_be_bytes());
+        assert_eq!(woven_code[12..16], 2i32.to_be_bytes());
+        assert_eq!(woven_code[16..20], 1i32.to_be_bytes());
+        assert_eq!(woven_code[20..24], 26i32.to_be_bytes());
+        assert_eq!(woven_code[24..28], 100i32.to_be_bytes());
+        assert_eq!(woven_code[28..32], 27i32.to_be_bytes());
+        assert_eq!(&woven_code[32..], &[0xac, 0xac, 0xac]);
+    }
+
+    #[test]
+    fn switch_padding_grows_when_an_insert_moves_a_switch_off_the_grid() {
+        // The same jump table behind one `nop`, so the switch starts at offset 1
+        // and needs two padding bytes.  A 7-byte insert puts it at 8, where it
+        // needs three: the instruction grows by one on top of the insert.
+        let code = [
+            0x00, // nop
+            0xaa, 0, 0, // opcode and two padding bytes
+            0, 0, 0, 20, // default -> 21
+            0, 0, 0, 0, // low
+            0, 0, 0, 0, // high
+            0, 0, 0, 19, // case 0 -> 20
+            0xac, 0xac, // ireturn, ireturn
+        ];
+        assert_eq!(code.len(), 22);
+        let bytes = fixture(0x0001, "(II)I", 3, &code, &[]);
+        let class = ClassFile::parse(&bytes).unwrap();
+        let woven = weave_head(&class, &target(), &callback("(II)V")).unwrap();
+        let (woven_code, _, _) = woven_code(&woven, "m", "(II)I");
+        assert_eq!(woven_code.len(), code.len() + 7 + 1);
+        assert_eq!(&woven_code[..4], &[0x15, 0x01, 0x15, 0x02]);
+        assert_eq!(woven_code[4], 0xb8); // invokestatic
+        assert_eq!(woven_code[7], 0x00, "the nop moved to 7");
+        assert_eq!(woven_code[8], 0xaa);
+        // default -> 29, the case -> 28, both relative to the switch at 8.
+        assert_eq!(switch_header(&woven_code, 8), (21, 0, 0, vec![20]));
+        assert_eq!(&woven_code[28..], &[0xac, 0xac]);
+    }
+
+    #[test]
+    fn head_weaves_a_method_with_wide_locals() {
+        // `wide iload 256; wide iinc 257 by 3; ireturn`.  `javac` cannot emit
+        // this (a source method's slots stop below 256), so it is assembled by
+        // hand: the weaver has to walk the 4- and 6-byte wide forms instead of
+        // treating `wide` as a one-byte opcode.
+        let code = [
+            0xc4, 0x15, 0x01, 0x00, // wide iload 256
+            0xc4, 0x84, 0x01, 0x01, 0x00, 0x03, // wide iinc 257, 3
+            0xac, // ireturn
+        ];
+        let bytes = fixture(0x0001, "()I", 260, &code, &[]);
+        let class = ClassFile::parse(&bytes).unwrap();
+        let target = MethodRef {
+            owner: "demo/T".into(),
+            name: "m".into(),
+            descriptor: "()I".into(),
+        };
+        let woven = weave_head(&class, &target, &callback("(Ldemo/T;)V")).unwrap();
+        let (woven_code, _, max_locals) = woven_code(&woven, "m", "()I");
+        assert_eq!(woven_code.len(), code.len() + 4); // aload_0 + invokestatic
+        assert_eq!(&woven_code[4..], &code);
+        assert_eq!(max_locals, 260, "the wide slots raise nothing");
+    }
+
+    #[test]
+    fn head_grows_a_goto_that_would_leave_the_16_bit_range() {
+        // `goto +32767; return; 32763 nops; return`: the goto sits exactly at
+        // the edge of its 16-bit operand.  A RETURN insert in front of the first
+        // return pushes the target past it, so the goto has to become `goto_w`.
+        let mut code = vec![0xa7, 0x7f, 0xff, 0xb1];
+        code.resize(4 + 32_763, 0x00);
+        code.push(0xb1);
+        assert_eq!(code.len(), 32_768);
+        let bytes = fixture(0x0009, "()V", 0, &code, &[]);
+        let class = ClassFile::parse(&bytes).unwrap();
+        let target = MethodRef {
+            owner: "demo/T".into(),
+            name: "m".into(),
+            descriptor: "()V".into(),
+        };
+        let woven = weave_return(&class, &target, &callback("()V"), ReturnMode::Return).unwrap();
+        let (woven_code, _, _) = woven_code(&woven, "m", "()V");
+        // Two 3-byte inserts, plus the two bytes the widening adds.
+        assert_eq!(woven_code.len(), code.len() + 6 + 2);
+        assert_eq!(woven_code[0], 0xc8, "the goto grew to goto_w");
+        // A RETURN target enters the callback: 32767 + 3 (the first insert) +
+        // 2 (the wider goto), the inserted call itself starting there.
+        assert_eq!(woven_code[1..5], 32_772i32.to_be_bytes());
+        assert_eq!(woven_code[5], 0xb8, "the first callback sits before it");
+        assert_eq!(woven_code[8], 0xb1);
+        assert_eq!(*woven_code.last().unwrap(), 0xb1);
+    }
+
+    #[test]
+    fn head_rejects_a_conditional_branch_past_the_16_bit_range() {
+        // The same shape with `ifeq`, which has no wide encoding: splitting it
+        // would add a branch and a frame the weaver cannot derive, so the method
+        // is rejected with the distance rather than written invalid.
+        let mut code = vec![0x99, 0x7f, 0xff, 0xb1];
+        code.resize(4 + 32_763, 0x00);
+        code.push(0xb1);
+        let bytes = fixture(0x0009, "()V", 0, &code, &[]);
+        let class = ClassFile::parse(&bytes).unwrap();
+        let target = MethodRef {
+            owner: "demo/T".into(),
+            name: "m".into(),
+            descriptor: "()V".into(),
+        };
+        let error =
+            weave_return(&class, &target, &callback("()V"), ReturnMode::Return).unwrap_err();
+        assert!(error.contains("ifeq"), "{error}");
+        assert!(error.contains("16-bit"), "{error}");
+        assert!(error.contains("32770"), "{error}");
+    }
+
+    /// `(default, low, high, cases)` of the `tableswitch` at `at`, with the
+    /// relative offsets kept relative to the opcode.
+    fn switch_header(code: &[u8], at: usize) -> (i32, i32, i32, Vec<i32>) {
+        assert_eq!(code[at], 0xaa);
+        let mut field = at + 1 + super::switch_padding(at);
+        let mut read = || {
+            let value = i32::from_be_bytes([
+                code[field],
+                code[field + 1],
+                code[field + 2],
+                code[field + 3],
+            ]);
+            field += 4;
+            value
+        };
+        let default = read();
+        let low = read();
+        let high = read();
+        let cases = (low..=high).map(|_| read()).collect();
+        (default, low, high, cases)
     }
 }

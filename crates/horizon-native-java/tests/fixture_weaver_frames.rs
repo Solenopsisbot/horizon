@@ -620,24 +620,37 @@ fn tail_relocates_only_the_last_return() {
 }
 
 #[test]
-fn switch_and_wide_are_rejected_with_a_reason() {
+fn switches_and_wide_locals_are_now_weaveable() {
     let classes = compile("unsupported");
     let bytes = read_class(&classes, "demo/Target");
     let class = ClassFile::parse(&bytes).unwrap();
-    let switch = weave_head(
+    // `switchy` and the 300-local `Wide.wide` used to be rejected here.  The
+    // weaver now re-derives a switch's padding and walks `wide` instructions, so
+    // both weave; `fixture_weaver_switches.rs` checks their results in a JVM.
+    let woven = weave_head(
         &class,
         &method("demo/Target", "switchy", "(I)I"),
         &callback("classify", "(I)V"),
     )
-    .unwrap_err();
+    .unwrap();
+    let reparsed = ClassFile::parse(&woven).unwrap();
+    assert_eq!(reparsed.write().unwrap(), woven, "woven class round-trips");
+    let code = reparsed
+        .method("switchy", "(I)I")
+        .unwrap()
+        .code
+        .clone()
+        .unwrap();
     assert!(
-        switch.contains("tableswitch") || switch.contains("lookupswitch"),
-        "{switch}"
+        code.iter()
+            .take(16)
+            .any(|opcode| matches!(opcode, 0xaa | 0xab)),
+        "the woven switchy has no switch: {code:02x?}"
     );
 
     let wide_bytes = read_class(&classes, "demo/Wide");
     let wide = ClassFile::parse(&wide_bytes).unwrap();
-    let error = weave_head(
+    let woven = weave_head(
         &wide,
         &method("demo/Wide", "wide", "()I"),
         &MethodRef {
@@ -646,8 +659,12 @@ fn switch_and_wide_are_rejected_with_a_reason() {
             descriptor: "()V".into(),
         },
     )
-    .unwrap_err();
-    assert!(error.contains("wide"), "{error}");
+    .unwrap();
+    assert_eq!(
+        ClassFile::parse(&woven).unwrap().write().unwrap(),
+        woven,
+        "the wide fixture round-trips"
+    );
 }
 
 #[test]
