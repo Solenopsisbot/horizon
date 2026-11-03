@@ -226,7 +226,12 @@ fn run() -> Result<(), String> {
     if let Some(bridge) = nested.compile_loader_bridge() {
         classpath.insert(0, bridge);
     }
-    let mixin_configs = discover_mixin_configs(&classpath, &mixin_config_args);
+    // The selected environment filters the hand-off: a `client` config never
+    // reaches a server run, and `main`/`preLaunch`/`neoforge` keep both sides.
+    let mixin_environment = MixinEnvironment::selected(&entry_kind);
+    let discovered = discover_mixin_configs(&classpath, &mixin_config_args);
+    let mixin_skipped = skipped_mixin_configs(&discovered, mixin_environment);
+    let mixin_configs = select_mixin_configs(discovered, mixin_environment);
     let mixin_report = report_mixin_configs(&mixin_configs);
     // Only configs a supplied jar (or an explicit `--mixin-config`) actually
     // carries reach the property; a path a jar declares but does not ship is
@@ -270,6 +275,11 @@ fn run() -> Result<(), String> {
         println!("{} preLaunch entrypoint(s)", pre_launch.len());
     }
     for line in &mixin_report {
+        println!("{line}");
+    }
+    // One line per config this side leaves out, so a client/server split is
+    // visible instead of a config silently disappearing.
+    for line in &mixin_skipped {
         println!("{line}");
     }
     println!("{}", mixin_configs_line(mixin_registered));
@@ -990,7 +1000,8 @@ struct NeoForgeMetadata {
     mod_loader: Option<String>,
     mod_ids: Vec<String>,
     jar_jars: usize,
-    mixin_configs: Vec<String>,
+    /// `[[mixins]] config` with the `environment` its block declares, if any.
+    mixin_configs: Vec<(String, MixinEnvironment)>,
 }
 
 impl NeoForgeMetadata {
@@ -1019,13 +1030,19 @@ impl NeoForgeMetadata {
 }
 
 /// Hand parser: only the top-level `modLoader`, `[[mods]] modId` and
-/// `[[mixins]] config` keys matter, and no TOML dependency is worth adding.
+/// `[[mixins]] config`/`environment` keys matter, and no TOML dependency is
+/// worth adding.
 fn parse_neoforge_toml(text: &str) -> NeoForgeMetadata {
     let mut metadata = NeoForgeMetadata::default();
     let mut section = String::new();
+    // The `[[mixins]]` block in progress. `environment` may come before or
+    // after its `config`, so the pair is flushed when the block ends.
+    let mut mixin_config: Option<String> = None;
+    let mut mixin_environment = MixinEnvironment::Both;
     for raw in text.lines() {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.starts_with('[') {
+            flush_mixin_block(&mut metadata, &mut mixin_config, &mut mixin_environment);
             section = line.to_owned();
             continue;
         }
@@ -1039,11 +1056,25 @@ fn parse_neoforge_toml(text: &str) -> NeoForgeMetadata {
         match (section.as_str(), key.trim()) {
             ("", "modLoader") => metadata.mod_loader = Some(value.to_owned()),
             ("[[mods]]", "modId") => push_unique(&mut metadata.mod_ids, value),
-            ("[[mixins]]", "config") => push_unique(&mut metadata.mixin_configs, value),
+            ("[[mixins]]", "config") => mixin_config = Some(value.to_owned()),
+            ("[[mixins]]", "environment") => mixin_environment = MixinEnvironment::parse(value),
             _ => {}
         }
     }
+    flush_mixin_block(&mut metadata, &mut mixin_config, &mut mixin_environment);
     metadata
+}
+
+/// Commit one parsed `[[mixins]]` block and reset the next block's state.
+fn flush_mixin_block(
+    metadata: &mut NeoForgeMetadata,
+    mixin_config: &mut Option<String>,
+    mixin_environment: &mut MixinEnvironment,
+) {
+    if let Some(config) = mixin_config.take() {
+        push_mixin_config(&mut metadata.mixin_configs, &config, *mixin_environment);
+    }
+    *mixin_environment = MixinEnvironment::Both;
 }
 
 fn neoforge_metadata(jar: &Path) -> Result<NeoForgeMetadata, String> {
@@ -1071,7 +1102,7 @@ fn neoforge_metadata(jar: &Path) -> Result<NeoForgeMetadata, String> {
                 metadata.jar_jars += 1;
             }
         } else if is_mixin_config_name(&name) {
-            push_unique(&mut metadata.mixin_configs, &name);
+            push_root_mixin_config(&mut metadata.mixin_configs, &name);
         }
     }
     Ok(metadata)
@@ -1087,6 +1118,86 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
     }
 }
 
+/// The side a mixin config was declared for. Fabric and Quilt spell `*` for
+/// "both", and a declaration with no environment at all means the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MixinEnvironment {
+    Client,
+    Server,
+    /// `*`, an unknown value, or no environment declared: both sides.
+    Both,
+}
+
+impl MixinEnvironment {
+    /// A declared environment. Unknown values stay on both sides instead of
+    /// dropping a config the loader would still load.
+    fn parse(declared: &str) -> Self {
+        match declared.trim().to_ascii_lowercase().as_str() {
+            "client" => Self::Client,
+            "server" => Self::Server,
+            _ => Self::Both,
+        }
+    }
+
+    /// The environment `--entry-kind` selects. Loader-lifecycle kinds
+    /// (`main`, `preLaunch`, `neoforge`, `init`) can run on either side.
+    fn selected(entry_kind: &str) -> Self {
+        match entry_kind {
+            "client" | "client_init" => Self::Client,
+            "server" | "server_init" => Self::Server,
+            _ => Self::Both,
+        }
+    }
+
+    /// Whether a config declared for `self` is registered on `selected`. A
+    /// `*` selection takes everything, and an undeclared config loads
+    /// everywhere.
+    fn matches(self, selected: Self) -> bool {
+        selected == Self::Both || self == Self::Both || self == selected
+    }
+
+    /// The `--list-mixin-configs` column and skipped-line spelling.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Server => "server",
+            Self::Both => "*",
+        }
+    }
+
+    /// Two declarations of one file merge permissively: `*` wins, and a
+    /// client+server pair is both sides.
+    fn broadest(self, other: Self) -> Self {
+        if self == other { self } else { Self::Both }
+    }
+}
+
+/// Adds a declared config, folding a second declaration of the same file into
+/// the broader environment. Declaration order is kept; callers sort.
+fn push_mixin_config(
+    configs: &mut Vec<(String, MixinEnvironment)>,
+    config: &str,
+    environment: MixinEnvironment,
+) {
+    if config.is_empty() {
+        return;
+    }
+    match configs.iter_mut().find(|(declared, _)| declared == config) {
+        Some((_, existing)) => *existing = existing.broadest(environment),
+        None => configs.push((config.to_owned(), environment)),
+    }
+}
+
+/// A config the root `*.mixins.json` scan found. It declares no environment,
+/// and being on the jar root must not widen one a metadata declaration already
+/// gave this file.
+fn push_root_mixin_config(configs: &mut Vec<(String, MixinEnvironment)>, config: &str) {
+    if config.is_empty() || configs.iter().any(|(declared, _)| declared == config) {
+        return;
+    }
+    configs.push((config.to_owned(), MixinEnvironment::Both));
+}
+
 /// One mixin config a jar declares, or one passed with `--mixin-config`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MixinConfigRef {
@@ -1094,6 +1205,8 @@ struct MixinConfigRef {
     source: PathBuf,
     /// The zip entry name, or the path as typed for `--mixin-config`.
     config: String,
+    /// The side the declaration named; `*` when it named none.
+    environment: MixinEnvironment,
     explicit: bool,
 }
 
@@ -1160,6 +1273,8 @@ fn discover_mixin_configs(classpath: &[PathBuf], explicit: &[String]) -> Vec<Mix
         .map(|path| MixinConfigRef {
             source: PathBuf::from(path),
             config: path.clone(),
+            // An explicit config names no side, so it loads on both.
+            environment: MixinEnvironment::Both,
             explicit: true,
         })
         .collect();
@@ -1167,11 +1282,16 @@ fn discover_mixin_configs(classpath: &[PathBuf], explicit: &[String]) -> Vec<Mix
         let Some(configs) = jar_mixin_configs(path) else {
             continue;
         };
-        out.extend(configs.into_iter().map(|config| MixinConfigRef {
-            source: path.clone(),
-            config,
-            explicit: false,
-        }));
+        out.extend(
+            configs
+                .into_iter()
+                .map(|(config, environment)| MixinConfigRef {
+                    source: path.clone(),
+                    config,
+                    environment,
+                    explicit: false,
+                }),
+        );
     }
     out.sort_by(|a, b| (a.jar_label(), &a.config).cmp(&(b.jar_label(), &b.config)));
     out.dedup();
@@ -1182,19 +1302,18 @@ fn discover_mixin_configs(classpath: &[PathBuf], explicit: &[String]) -> Vec<Mix
     out
 }
 
-/// The mixin configs a jar declares or carries at its root: Fabric metadata
-/// `mixins` entries, NeoForge `[[mixins]] config`, and root `*.mixins.json`.
-fn jar_mixin_configs(jar: &Path) -> Option<Vec<String>> {
+/// The mixin configs a jar declares or carries at its root: Fabric/Quilt
+/// metadata entries, NeoForge `[[mixins]] config`, and root `*.mixins.json`
+/// (the last two with no environment, so `*`).
+fn jar_mixin_configs(jar: &Path) -> Option<Vec<(String, MixinEnvironment)>> {
     let file = File::open(jar).ok()?;
     let mut archive = zip::ZipArchive::new(file).ok()?;
     let mut configs = Vec::new();
-    if let Ok(mut metadata) = archive.by_name("fabric.mod.json") {
-        let mut text = String::new();
-        if std::io::Read::read_to_string(&mut metadata, &mut text).is_ok() {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                configs.extend(fabric_mixin_configs(&value));
-            }
-        }
+    if let Some(value) = archive_json(&mut archive, "fabric.mod.json") {
+        extend_mixin_configs(&mut configs, fabric_mixin_configs(&value));
+    }
+    if let Some(value) = archive_json(&mut archive, "quilt.mod.json") {
+        extend_mixin_configs(&mut configs, quilt_mixin_configs(&value));
     }
     for name in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
         let Ok(mut entry) = archive.by_name(name) else {
@@ -1202,7 +1321,7 @@ fn jar_mixin_configs(jar: &Path) -> Option<Vec<String>> {
         };
         let mut text = String::new();
         if std::io::Read::read_to_string(&mut entry, &mut text).is_ok() {
-            configs.extend(parse_neoforge_toml(&text).mixin_configs);
+            extend_mixin_configs(&mut configs, parse_neoforge_toml(&text).mixin_configs);
         }
         break;
     }
@@ -1210,35 +1329,74 @@ fn jar_mixin_configs(jar: &Path) -> Option<Vec<String>> {
         let Ok(entry) = archive.by_index(index) else {
             continue;
         };
-        let name = entry.name();
+        let name = entry.name().to_owned();
         if !name.contains('/') && name.ends_with(".mixins.json") {
-            configs.push(name.to_owned());
+            push_root_mixin_config(&mut configs, &name);
         }
     }
-    configs.retain(|config| !config.is_empty());
-    configs.sort();
-    configs.dedup();
+    configs.retain(|(config, _)| !config.is_empty());
+    configs.sort_by(|a, b| a.0.cmp(&b.0));
     Some(configs)
 }
 
+/// One metadata file parsed as JSON. Discovery is best-effort: a jar without
+/// the file, or with unreadable JSON in it, contributes no declarations.
+fn archive_json(archive: &mut zip::ZipArchive<File>, name: &str) -> Option<serde_json::Value> {
+    let mut entry = archive.by_name(name).ok()?;
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut entry, &mut text).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn extend_mixin_configs(
+    out: &mut Vec<(String, MixinEnvironment)>,
+    configs: Vec<(String, MixinEnvironment)>,
+) {
+    for (config, environment) in configs {
+        push_mixin_config(out, &config, environment);
+    }
+}
+
 /// Fabric's `mixins` list: classpath strings, or `{config, environment}`
-/// objects. A bare string is accepted for hand-written metadata.
-fn fabric_mixin_configs(value: &serde_json::Value) -> Vec<String> {
-    let Some(entries) = value.get("mixins") else {
-        return Vec::new();
-    };
-    json_values(entries)
-        .into_iter()
-        .filter_map(|value| match value {
-            serde_json::Value::String(config) => Some(config.clone()),
-            serde_json::Value::Object(object) => object
-                .get("config")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            _ => None,
-        })
-        .filter(|config| !config.is_empty())
-        .collect()
+/// objects. A bare string is accepted for hand-written metadata and has no
+/// environment, so it loads on either side.
+fn fabric_mixin_configs(value: &serde_json::Value) -> Vec<(String, MixinEnvironment)> {
+    value
+        .get("mixins")
+        .map_or_else(Vec::new, mixin_declarations)
+}
+
+/// Quilt's `mixin` key: one config path or a list of them, plus the same
+/// `{mixin, environment}` object form Fabric uses.
+fn quilt_mixin_configs(value: &serde_json::Value) -> Vec<(String, MixinEnvironment)> {
+    value.get("mixin").map_or_else(Vec::new, mixin_declarations)
+}
+
+/// A declaration list whose elements are strings or `{config|mixin,
+/// environment}` objects, in declaration order.
+fn mixin_declarations(value: &serde_json::Value) -> Vec<(String, MixinEnvironment)> {
+    let mut out = Vec::new();
+    for value in json_values(value) {
+        match value {
+            serde_json::Value::String(config) => {
+                push_mixin_config(&mut out, config, MixinEnvironment::Both);
+            }
+            serde_json::Value::Object(object) => {
+                let config = object
+                    .get("config")
+                    .or_else(|| object.get("mixin"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let environment = object
+                    .get("environment")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or(MixinEnvironment::Both, MixinEnvironment::parse);
+                push_mixin_config(&mut out, config, environment);
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A JSON list, or a single value where a list was expected.
@@ -1422,6 +1580,39 @@ fn mixin_config_property(configs: &[MixinConfigRef]) -> Option<String> {
     )
 }
 
+/// The configs the selected environment registers: everything for `*`, and
+/// the `*`-plus-own-side declarations for one side. The property and the
+/// `addConfiguration` calls both walk this list, so filtering happens once.
+fn select_mixin_configs(
+    configs: Vec<MixinConfigRef>,
+    selected: MixinEnvironment,
+) -> Vec<MixinConfigRef> {
+    configs
+        .into_iter()
+        .filter(|config| config.environment.matches(selected))
+        .collect()
+}
+
+/// One `mixin configs: skipped <environment> <config>` line per config the
+/// selected environment leaves out. Sorted and folded, so a config two jars
+/// declare is named once and the order never depends on the classpath.
+fn skipped_mixin_configs(configs: &[MixinConfigRef], selected: MixinEnvironment) -> Vec<String> {
+    let mut lines: Vec<String> = configs
+        .iter()
+        .filter(|config| !config.environment.matches(selected))
+        .map(|config| {
+            format!(
+                "mixin configs: skipped {} {}",
+                config.environment.label(),
+                config.config
+            )
+        })
+        .collect();
+    lines.sort();
+    lines.dedup();
+    lines
+}
+
 /// The configs the property carries, in the property's own order. Registration
 /// walks this list, so the JVM property and the `addConfiguration` calls cannot
 /// drift apart.
@@ -1454,9 +1645,11 @@ fn mixin_jvm_options(property: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `--list-mixin-configs`: one `jar<TAB>config` line per config, sorted. No JVM
-/// starts, and only the jars named on the command line are scanned (nested
-/// jars are a classpath-time expansion).
+/// `--list-mixin-configs`: one `jar<TAB>config<TAB>environment` line per
+/// declaration, sorted. Everything is listed regardless of `--entry-kind`, so
+/// the column is how a filtered run's decision can be checked. No JVM starts,
+/// and only the jars named on the command line are scanned (nested jars are a
+/// classpath-time expansion).
 fn list_mixin_configs(jars: &[String], explicit: &[String]) -> Result<(), String> {
     let classpath: Vec<PathBuf> = jars.iter().map(PathBuf::from).collect();
     let configs = discover_mixin_configs(&classpath, explicit);
@@ -1467,7 +1660,14 @@ fn list_mixin_configs(jars: &[String], explicit: &[String]) -> Result<(), String
 fn format_mixin_configs(configs: &[MixinConfigRef]) -> String {
     let mut lines: Vec<String> = configs
         .iter()
-        .map(|config| format!("{}\t{}", config.jar_label(), config.config))
+        .map(|config| {
+            format!(
+                "{}\t{}\t{}",
+                config.jar_label(),
+                config.config,
+                config.environment.label()
+            )
+        })
         .collect();
     lines.sort();
     lines.dedup();
@@ -1783,14 +1983,16 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
 mod tests {
     use super::{
         Entrypoint, MAX_MIXIN_CONFIG_PROPERTY_BYTES, MixinBootstrap, MixinConfigRef,
-        MixinRegistrar, MixinStage, constructor_only_entry_kind, declared_entrypoint_kinds,
-        discover_entries, discover_mixin_configs, entrypoints_from_metadata, fabric_entries,
-        fabric_metadata, fallback_label, format_entrypoints, format_mixin_config_property,
-        format_mixin_configs, initializer_for_kind, is_minecraft_class, missing_entry_message,
-        mixin_bootstrap_line, mixin_config_names, mixin_config_property, mixin_configs_line,
-        mixin_jvm_options, mixin_registered_count, mixin_stages, neoforge_metadata,
-        nested_jar_name, parse_mixin_config, pre_launch_entries, quilt_entrypoint_kind,
-        register_mixin_configs, report_mixin_configs, split_entrypoint,
+        MixinEnvironment, MixinRegistrar, MixinStage, constructor_only_entry_kind,
+        declared_entrypoint_kinds, discover_entries, discover_mixin_configs,
+        entrypoints_from_metadata, fabric_entries, fabric_metadata, fabric_mixin_configs,
+        fallback_label, format_entrypoints, format_mixin_config_property, format_mixin_configs,
+        initializer_for_kind, is_minecraft_class, missing_entry_message, mixin_bootstrap_line,
+        mixin_config_names, mixin_config_property, mixin_configs_line, mixin_jvm_options,
+        mixin_registered_count, mixin_stages, neoforge_metadata, nested_jar_name,
+        parse_mixin_config, pre_launch_entries, quilt_entrypoint_kind, quilt_mixin_configs,
+        register_mixin_configs, report_mixin_configs, select_mixin_configs, skipped_mixin_configs,
+        split_entrypoint,
     };
     use std::{fs::File, io::Write, path::PathBuf};
     use zip::write::SimpleFileOptions;
@@ -2008,7 +2210,10 @@ config="example.mixins.json""#[..],
         assert_eq!(metadata.mod_loader.as_deref(), Some("javafml"));
         assert_eq!(metadata.mod_ids, ["example"]);
         assert_eq!(metadata.jar_jars, 1);
-        assert_eq!(metadata.mixin_configs, ["example.mixins.json"]);
+        assert_eq!(
+            metadata.mixin_configs,
+            [("example.mixins.json".to_owned(), MixinEnvironment::Both)]
+        );
         assert!(metadata.diagnostic().unwrap().contains("diagnostics only"));
         // A NeoForge jar has no `preLaunch` list: the `@Mod` classes must not
         // be re-run as preLaunch callbacks before the constructor-only pass.
@@ -2067,19 +2272,208 @@ config="example.mixins.json""#[..],
 [[mods]]
 modId="demo"
 [[mixins]]
+environment="client"
 config="demo.mixins.json""#,
                 ),
                 ("demo.mixins.json", br#"{"mixins":["DemoMixin"]}"#),
             ],
         );
         let configs = discover_mixin_configs(std::slice::from_ref(&path), &[]);
-        // The toml declaration and the root scan name the same file.
+        // The toml declaration and the root scan name the same file once, and
+        // `environment` may precede its block's `config`. The root scan must
+        // not widen the side the block declared.
         assert_eq!(
             configs
                 .iter()
-                .map(|config| config.config.as_str())
+                .map(|config| (config.config.as_str(), config.environment))
                 .collect::<Vec<_>>(),
-            ["demo.mixins.json"]
+            [("demo.mixins.json", MixinEnvironment::Client)]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn maps_entry_kinds_and_declarations_to_environments() {
+        assert_eq!(
+            MixinEnvironment::selected("client"),
+            MixinEnvironment::Client
+        );
+        assert_eq!(
+            MixinEnvironment::selected("server"),
+            MixinEnvironment::Server
+        );
+        // Loader-lifecycle kinds run on both sides.
+        for both in ["main", "preLaunch", "neoforge", "init"] {
+            assert_eq!(MixinEnvironment::selected(both), MixinEnvironment::Both);
+        }
+        assert_eq!(
+            MixinEnvironment::parse(" CLIENT "),
+            MixinEnvironment::Client
+        );
+        assert_eq!(MixinEnvironment::parse("server"), MixinEnvironment::Server);
+        // An unknown declaration stays on both sides rather than vanishing.
+        assert_eq!(
+            MixinEnvironment::parse("something-else"),
+            MixinEnvironment::Both
+        );
+        assert_eq!(MixinEnvironment::Both.label(), "*");
+        assert_eq!(MixinEnvironment::Server.label(), "server");
+        // A config with no environment is kept for every side...
+        assert!(MixinEnvironment::Both.matches(MixinEnvironment::Client));
+        assert!(MixinEnvironment::Both.matches(MixinEnvironment::Server));
+        assert!(MixinEnvironment::Both.matches(MixinEnvironment::Both));
+        // ...while a declared one only loads on its own side, or when the
+        // selection is both sides.
+        assert!(!MixinEnvironment::Client.matches(MixinEnvironment::Server));
+        assert!(MixinEnvironment::Client.matches(MixinEnvironment::Both));
+    }
+
+    #[test]
+    fn merges_duplicate_declarations_to_the_broader_environment() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"mixins":[
+                {"config":"same.mixins.json","environment":"client"},
+                {"config":"same.mixins.json","environment":"server"},
+                {"config":"star.mixins.json","environment":"client"},
+                {"config":"star.mixins.json","environment":"*"}
+            ]}"#,
+        )
+        .unwrap();
+        // Client + server is both sides, and `*` wins over one side.
+        assert_eq!(
+            fabric_mixin_configs(&value),
+            [
+                ("same.mixins.json".to_owned(), MixinEnvironment::Both),
+                ("star.mixins.json".to_owned(), MixinEnvironment::Both),
+            ]
+        );
+    }
+
+    #[test]
+    fn filters_mixin_configs_by_the_selected_environment() {
+        let path = build_jar(
+            "mixin-environment",
+            &[
+                (
+                    "fabric.mod.json",
+                    br#"{"id":"demo","mixins":[
+                        {"config":"client.mixins.json","environment":"client"},
+                        {"config":"server.mixins.json","environment":"server"},
+                        {"config":"both.mixins.json","environment":"*"},
+                        {"config":"plain.mixins.json"}
+                    ]}"#,
+                ),
+                ("client.mixins.json", br#"{"mixins":[]}"#),
+                ("server.mixins.json", br#"{"mixins":[]}"#),
+                ("both.mixins.json", br#"{"mixins":[]}"#),
+                ("plain.mixins.json", br#"{"mixins":[]}"#),
+            ],
+        );
+        let configs = discover_mixin_configs(std::slice::from_ref(&path), &[]);
+        let selected = |environment: MixinEnvironment| {
+            select_mixin_configs(configs.clone(), environment)
+                .into_iter()
+                .map(|config| config.config)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            selected(MixinEnvironment::Client),
+            [
+                "both.mixins.json",
+                "client.mixins.json",
+                "plain.mixins.json"
+            ]
+        );
+        assert_eq!(
+            selected(MixinEnvironment::Server),
+            [
+                "both.mixins.json",
+                "plain.mixins.json",
+                "server.mixins.json"
+            ]
+        );
+        // `main` runs both sides, so nothing is filtered.
+        assert_eq!(selected(MixinEnvironment::Both).len(), 4);
+        // The filtered list is what the property (and so registration) carries.
+        assert_eq!(
+            mixin_config_property(&select_mixin_configs(
+                configs.clone(),
+                MixinEnvironment::Server
+            ))
+            .as_deref(),
+            Some("both.mixins.json,plain.mixins.json,server.mixins.json")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reports_skipped_mixin_configs_once_in_sorted_order() {
+        let first = build_jar(
+            "mixin-skip-first",
+            &[(
+                "fabric.mod.json",
+                br#"{"id":"first","mixins":[
+                    {"config":"shared.mixins.json","environment":"client"},
+                    {"config":"alpha.mixins.json","environment":"client"}
+                ]}"#,
+            )],
+        );
+        let second = build_jar(
+            "mixin-skip-second",
+            &[(
+                "fabric.mod.json",
+                br#"{"id":"second","mixins":[{"config":"shared.mixins.json","environment":"client"}]}"#,
+            )],
+        );
+        let configs = discover_mixin_configs(&[first.clone(), second.clone()], &[]);
+        assert_eq!(
+            skipped_mixin_configs(&configs, MixinEnvironment::Server),
+            [
+                "mixin configs: skipped client alpha.mixins.json",
+                "mixin configs: skipped client shared.mixins.json",
+            ]
+        );
+        // Nothing is skipped when both sides are selected.
+        assert!(skipped_mixin_configs(&configs, MixinEnvironment::Both).is_empty());
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
+    }
+
+    #[test]
+    fn discovers_quilt_mixin_declarations() {
+        // The single-path form and the list form both parse.
+        let single: serde_json::Value =
+            serde_json::from_str(r#"{"mixin":"solo.mixins.json"}"#).unwrap();
+        assert_eq!(
+            quilt_mixin_configs(&single),
+            [("solo.mixins.json".to_owned(), MixinEnvironment::Both)]
+        );
+        let path = build_jar(
+            "mixin-quilt",
+            &[
+                (
+                    "quilt.mod.json",
+                    br#"{"mixin":["a.mixins.json",{"mixin":"b.mixins.json","environment":"server"}]}"#,
+                ),
+                ("a.mixins.json", br#"{"mixins":[]}"#),
+                ("b.mixins.json", br#"{"mixins":[]}"#),
+            ],
+        );
+        let configs = discover_mixin_configs(std::slice::from_ref(&path), &[]);
+        assert_eq!(
+            configs
+                .iter()
+                .map(|config| (config.config.as_str(), config.environment))
+                .collect::<Vec<_>>(),
+            [
+                ("a.mixins.json", MixinEnvironment::Both),
+                ("b.mixins.json", MixinEnvironment::Server),
+            ]
+        );
+        // A server-side config is not registered on a client run.
+        assert_eq!(
+            skipped_mixin_configs(&configs, MixinEnvironment::Client),
+            ["mixin configs: skipped server b.mixins.json"]
         );
         let _ = std::fs::remove_file(path);
     }
@@ -2117,21 +2511,34 @@ config="demo.mixins.json""#,
     }
 
     #[test]
-    fn formats_listed_mixin_configs_as_sorted_jar_tab_config_lines() {
-        let entry = |jar: &str, config: &str, explicit: bool| MixinConfigRef {
-            source: PathBuf::from(jar),
-            config: config.to_owned(),
-            explicit,
+    fn formats_listed_mixin_configs_as_sorted_jar_config_environment_lines() {
+        let entry = |jar: &str, config: &str, environment: MixinEnvironment, explicit: bool| {
+            MixinConfigRef {
+                source: PathBuf::from(jar),
+                config: config.to_owned(),
+                environment,
+                explicit,
+            }
         };
         let listed = format_mixin_configs(&[
-            entry("mods/b.jar", "b.mixins.json", false),
-            entry("mods/a.jar", "z.mixins.json", false),
-            entry("mods/a.jar", "a.mixins.json", false),
-            entry("explicit.mixins.json", "explicit.mixins.json", true),
+            entry("mods/b.jar", "b.mixins.json", MixinEnvironment::Both, false),
+            entry(
+                "mods/a.jar",
+                "z.mixins.json",
+                MixinEnvironment::Server,
+                false,
+            ),
+            entry("mods/a.jar", "a.mixins.json", MixinEnvironment::Both, false),
+            entry(
+                "explicit.mixins.json",
+                "explicit.mixins.json",
+                MixinEnvironment::Both,
+                true,
+            ),
         ]);
         assert_eq!(
             listed,
-            "-\texplicit.mixins.json\nmods/a.jar\ta.mixins.json\nmods/a.jar\tz.mixins.json\nmods/b.jar\tb.mixins.json\n"
+            "-\texplicit.mixins.json\t*\nmods/a.jar\ta.mixins.json\t*\nmods/a.jar\tz.mixins.json\tserver\nmods/b.jar\tb.mixins.json\t*\n"
         );
     }
 
