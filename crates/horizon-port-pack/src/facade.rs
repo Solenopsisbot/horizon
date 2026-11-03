@@ -98,6 +98,36 @@ pub fn generate_many(
             .iter()
             .any(|r| r == "net/fabricmc/fabric/api/networking/v1/PayloadTypeRegistry")
     });
+    // Fabric's client modules (HUD rendering, client ticks, key bindings, item
+    // tooltips) are library classes as well: they are emitted below only when
+    // the real API class is absent, and only when the client game types their
+    // callback signatures name resolve on this game jar.
+    let fabric_client_holders = [
+        "net/fabricmc/fabric/api/client/rendering/v1/HudRenderCallback",
+        "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents",
+        "net/fabricmc/fabric/api/client/keybinding/v1/KeyBindingHelper",
+        "net/fabricmc/fabric/api/client/item/tooltip/v1/ItemTooltipCallback",
+    ];
+    let uses_fabric_client = target.iter().any(|class| {
+        class
+            .refs
+            .iter()
+            .any(|r| fabric_client_holders.contains(&r.as_str()))
+    });
+    // NeoForge's client event classes are library classes too. The loader
+    // probe already guards the event bus they extend, so this only selects the
+    // client slice (one extra file) for a target that names one of them.
+    let uses_neoforge_client = uses_neoforge
+        && target.iter().any(|class| {
+            class.refs.iter().any(|r| {
+                matches!(
+                    r.as_str(),
+                    "net/neoforged/neoforge/client/event/RegisterKeyMappingsEvent"
+                        | "net/neoforged/neoforge/client/event/ClientTickEvent"
+                        | "net/neoforged/neoforge/client/event/RenderGuiEvent"
+                )
+            })
+        });
     // Fabric API's event holders, command callback and the loader's bootstrap
     // queries are library classes too. They are only filled in below when the
     // target's jars do not carry the real class, so a real API jar is never
@@ -175,6 +205,21 @@ pub fn generate_many(
                 wanted.insert(name.to_owned());
             }
         }
+    }
+    // The client shims name game types in their callback signatures, and a mod
+    // that writes `EVENT.register((context, ticks) -> {})` carries no reference
+    // to them. Resolve each role against the game jar (26.3 renamed
+    // `GuiGraphics` to `GuiGraphicsExtractor`, so the first candidate present
+    // wins) and seed the real class so the shim compiles against it. A
+    // server-shaped jar resolves nothing and the shims that need it are skipped
+    // below, rather than fabricating client types a mod would then call into.
+    let client = if uses_fabric_client || uses_neoforge_client {
+        resolve_client_types(&game, &lib_names, &wanted)
+    } else {
+        BTreeMap::new()
+    };
+    for name in client.values() {
+        wanted.insert(name.clone());
     }
     let mut used: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
     for class in &target {
@@ -525,6 +570,76 @@ pub fn generate_many(
                 &src,
                 command,
                 FABRIC_COMMAND_REGISTRATION_CALLBACK,
+            )?;
+        }
+    }
+    // Fabric API's client bootstrap surface: the same bounded `Event` dispatch
+    // as the server holders (registration order, `invoker()` returns the
+    // combined handler), plus the key-binding registry. Each class is emitted
+    // only when the real API class is absent, and only when the client types
+    // its signature names resolved against the game jar.
+    let client_shims = ClientShims {
+        src: &src,
+        available: &available,
+        types: &client,
+    };
+    let fill_client = |template: &str| fill_client_types(template, &client);
+    if uses_fabric_client {
+        let key_binding = "net/fabricmc/fabric/api/client/keybinding/v1/KeyBindingHelper";
+        client_shims.emit(
+            &mut files,
+            &mut report,
+            key_binding,
+            &["key_mapping"],
+            || fill_client(FABRIC_KEY_BINDING_HELPER),
+        )?;
+        let event_base = "net/fabricmc/fabric/api/event/Event";
+        // `Event.horizon` is this slice's factory, so a real `Event` interface
+        // (no such member) leaves the three event holders out instead of
+        // shadowing half of the API.
+        if available.contains(event_base) {
+            for class in [
+                "net/fabricmc/fabric/api/client/rendering/v1/HudRenderCallback",
+                "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents",
+                "net/fabricmc/fabric/api/client/item/tooltip/v1/ItemTooltipCallback",
+            ] {
+                if !available.contains(class) {
+                    report
+                        .missing
+                        .push(format!("{class} (needs {event_base} absent)"));
+                }
+            }
+        } else {
+            if !uses_fabric_events {
+                write_shim(&mut files, &src, event_base, FABRIC_EVENT)?;
+            }
+            let hud = "net/fabricmc/fabric/api/client/rendering/v1/HudRenderCallback";
+            client_shims.emit(&mut files, &mut report, hud, &["gui", "ticks"], || {
+                fill_client(FABRIC_HUD_RENDER_CALLBACK)
+            })?;
+            let ticks = "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents";
+            client_shims.emit(&mut files, &mut report, ticks, &["minecraft"], || {
+                // The generator names the client class fully qualified in
+                // the signature and the invoker lambda; take the resolved
+                // 26.3 name rather than assuming `Minecraft`.
+                fabric_event_source(
+                    "net.fabricmc.fabric.api.client.event.lifecycle.v1",
+                    "ClientTickEvents",
+                    "Bounded client tick events: ordered listeners, invoked by the host.",
+                    FABRIC_CLIENT_TICK_EVENTS,
+                )
+                .replace(
+                    "net.minecraft.client.Minecraft",
+                    &java_name(&client["minecraft"]),
+                )
+            })?;
+            let tooltip = "net/fabricmc/fabric/api/client/item/tooltip/v1/ItemTooltipCallback";
+            client_shims.emit(
+                &mut files,
+                &mut report,
+                tooltip,
+                &["item_stack", "tooltip_context", "tooltip_type", "component"],
+                || fill_client(FABRIC_ITEM_TOOLTIP_CALLBACK),
             )?;
         }
     }
@@ -997,6 +1112,28 @@ pub fn generate_many(
             }
             fs::write(&file, source).map_err(|e| format!("{}: {e}", file.display()))?;
             files.push(file);
+        }
+        // NeoForge's client bootstrap surface: key-mapping registration keeps
+        // the mappings it was handed, and the tick/render events stay markers
+        // the host posts. Same availability guard as the Fabric slice, so a
+        // real NeoForge jar is never shadowed.
+        if uses_neoforge_client {
+            let key_mappings = "net/neoforged/neoforge/client/event/RegisterKeyMappingsEvent";
+            client_shims.emit(
+                &mut files,
+                &mut report,
+                key_mappings,
+                &["key_mapping"],
+                || fill_client(NEOFORGE_REGISTER_KEY_MAPPINGS),
+            )?;
+            let tick = "net/neoforged/neoforge/client/event/ClientTickEvent";
+            client_shims.emit(&mut files, &mut report, tick, &[], || {
+                NEOFORGE_CLIENT_TICK_EVENT.to_owned()
+            })?;
+            let render = "net/neoforged/neoforge/client/event/RenderGuiEvent";
+            client_shims.emit(&mut files, &mut report, render, &["gui"], || {
+                fill_client(NEOFORGE_RENDER_GUI_EVENT)
+            })?;
         }
     }
     if files.is_empty() {
@@ -1476,6 +1613,26 @@ const FABRIC_CLIENT_LIFECYCLE: &[FabricEvent] = &[
     ),
 ];
 
+/// `ClientTickEvents`: the two per-tick callbacks a client initializer attaches
+/// to. Same `Event` shape as the lifecycle holders, so registration order and
+/// `invoker()` behave identically.
+const FABRIC_CLIENT_TICK_EVENTS: &[FabricEvent] = &[
+    (
+        "START_CLIENT_TICK",
+        "StartTick",
+        "onStartTick",
+        CLIENT_PARAMS,
+        "p0",
+    ),
+    (
+        "END_CLIENT_TICK",
+        "EndTick",
+        "onEndTick",
+        CLIENT_PARAMS,
+        "p0",
+    ),
+];
+
 const FABRIC_SERVER_PLAYER_EVENTS: &[FabricEvent] = &[
     (
         "AFTER_RESPAWN",
@@ -1547,6 +1704,80 @@ public interface CommandRegistrationCallback {
                 horizonListener.register(dispatcher, registryAccess, environment);
             }
         });
+}
+"#;
+
+/// Fabric API's client HUD callback. `DrawContext`/`RenderTickCounter` are the
+/// 26.3 slice's resolved names for the GUI and tick-counter values; the holder
+/// is a functional interface with a static `EVENT`, exactly as the real API, so
+/// `EVENT.register((context, ticks) -> ...)` compiles and dispatch order is the
+/// registration order. Nothing is drawn: the host calls the invoker per frame.
+const FABRIC_HUD_RENDER_CALLBACK: &str = r#"package net.fabricmc.fabric.api.client.rendering.v1;
+
+import net.fabricmc.fabric.api.event.Event;
+import {gui};
+import {ticks};
+
+@FunctionalInterface
+public interface HudRenderCallback {
+    void onHudRender({gui} drawContext, {ticks} tickCounter);
+
+    Event<HudRenderCallback> EVENT = Event.horizon(horizonListeners ->
+        (drawContext, tickCounter) -> {
+            for (HudRenderCallback horizonListener : horizonListeners) {
+                horizonListener.onHudRender(drawContext, tickCounter);
+            }
+        });
+}
+"#;
+
+/// Fabric API's item tooltip callback: listeners may append to the mutable
+/// line list the host passes, in registration order. The stack, tooltip
+/// context, flag and text types are the resolved game types, because a mod
+/// that implements the interface explicitly writes them in its override.
+const FABRIC_ITEM_TOOLTIP_CALLBACK: &str = r#"package net.fabricmc.fabric.api.client.item.tooltip.v1;
+
+import java.util.List;
+import net.fabricmc.fabric.api.event.Event;
+import {item_stack};
+import {tooltip_context};
+import {tooltip_type};
+import {component};
+
+@FunctionalInterface
+public interface ItemTooltipCallback {
+    void getTooltip({item_stack} stack, {tooltip_context} tooltipContext, {tooltip_type} tooltipType, List<{component}> lines);
+
+    Event<ItemTooltipCallback> EVENT = Event.horizon(horizonListeners ->
+        (stack, tooltipContext, tooltipType, lines) -> {
+            for (ItemTooltipCallback horizonListener : horizonListeners) {
+                horizonListener.getTooltip(stack, tooltipContext, tooltipType, lines);
+            }
+        });
+}
+"#;
+
+/// Fabric API's key-binding registry. `registerKeyBinding` returns the mapping
+/// it was handed (a mod keeps the reference to read its `consumeClick` state),
+/// and the registrations are retained in order so bootstrap can be inspected
+/// without a live options screen.
+const FABRIC_KEY_BINDING_HELPER: &str = r#"package net.fabricmc.fabric.api.client.keybinding.v1;
+
+import {key_mapping};
+
+public final class KeyBindingHelper {
+    private static final java.util.List<{key_mapping}> HORIZON_BINDINGS = new java.util.ArrayList<>();
+
+    private KeyBindingHelper() {}
+
+    public static {key_mapping} registerKeyBinding({key_mapping} binding) {
+        if (binding != null) HORIZON_BINDINGS.add(binding);
+        return binding;
+    }
+
+    public static java.util.List<{key_mapping}> horizonKeyBindings() {
+        return java.util.Collections.unmodifiableList(HORIZON_BINDINGS);
+    }
 }
 "#;
 
@@ -1694,6 +1925,66 @@ public @interface SubscribeEvent {
 }
 "#;
 
+/// NeoForge's key-mapping registration event. `register` retains the mappings
+/// in order so bootstrap code can be inspected without a live options screen;
+/// the host owns when the event is posted.
+const NEOFORGE_REGISTER_KEY_MAPPINGS: &str = r#"package net.neoforged.neoforge.client.event;
+
+import net.neoforged.bus.api.Event;
+import {key_mapping};
+
+public class RegisterKeyMappingsEvent extends Event {
+    private final java.util.List<{key_mapping}> horizonKeyMappings = new java.util.ArrayList<>();
+
+    public void register({key_mapping} binding) {
+        if (binding != null) horizonKeyMappings.add(binding);
+    }
+
+    public java.util.List<{key_mapping}> horizonKeyMappings() {
+        return java.util.Collections.unmodifiableList(horizonKeyMappings);
+    }
+}
+"#;
+
+/// NeoForge's client tick event and its two phases, as markers: the host posts
+/// them and the listeners are the mod's own `@SubscribeEvent` methods, so the
+/// façade only needs the type hierarchy.
+const NEOFORGE_CLIENT_TICK_EVENT: &str = r#"package net.neoforged.neoforge.client.event;
+
+import net.neoforged.bus.api.Event;
+
+public abstract class ClientTickEvent extends Event {
+    private ClientTickEvent() {}
+
+    public static final class Pre extends ClientTickEvent {}
+    public static final class Post extends ClientTickEvent {}
+}
+"#;
+
+/// NeoForge's render-GUI event: it carries the frame's GUI value through to the
+/// listener. Drawing is the host's work.
+const NEOFORGE_RENDER_GUI_EVENT: &str = r#"package net.neoforged.neoforge.client.event;
+
+import net.neoforged.bus.api.Event;
+import {gui};
+
+public class RenderGuiEvent extends Event {
+    private final {gui} horizonGuiGraphics;
+
+    protected RenderGuiEvent({gui} guiGraphics) { this.horizonGuiGraphics = guiGraphics; }
+
+    public {gui} getGuiGraphics() { return horizonGuiGraphics; }
+
+    public static final class Pre extends RenderGuiEvent {
+        public Pre({gui} guiGraphics) { super(guiGraphics); }
+    }
+
+    public static final class Post extends RenderGuiEvent {
+        public Post({gui} guiGraphics) { super(guiGraphics); }
+    }
+}
+"#;
+
 /// Legacy Forge keeps the same result/cancellation surface in its own package.
 const FORGE_EVENT: &str = r#"package net.minecraftforge.eventbus.api;
 
@@ -1711,6 +2002,138 @@ public class Event {
     public boolean hasResult() { return horizonResult != null; }
 }
 "#;
+
+/// The client game types the client-only shim signatures name, in 26.3
+/// preference order (26.3 renamed `GuiGraphics` to `GuiGraphicsExtractor`).
+/// The first candidate the game jar carries wins; a server-shaped jar carries
+/// none of them, and the shims that need a role are then skipped.
+const CLIENT_TYPE_CANDIDATES: &[(&str, &[&str])] = &[
+    (
+        "gui",
+        &[
+            "net/minecraft/client/gui/GuiGraphicsExtractor",
+            "net/minecraft/client/gui/GuiGraphics",
+            "net/minecraft/client/gui/DrawContext",
+        ],
+    ),
+    (
+        "ticks",
+        &[
+            "net/minecraft/client/render/RenderTickCounter",
+            "net/minecraft/client/gui/render/RenderTickCounter",
+            "net/minecraft/client/DeltaTracker",
+        ],
+    ),
+    (
+        "minecraft",
+        &[
+            "net/minecraft/client/Minecraft",
+            "net/minecraft/client/MinecraftClient",
+        ],
+    ),
+    ("key_mapping", &["net/minecraft/client/KeyMapping"]),
+    (
+        "item_stack",
+        &[
+            "net/minecraft/world/item/ItemStack",
+            "net/minecraft/item/ItemStack",
+        ],
+    ),
+    (
+        "tooltip_context",
+        &[
+            "net/minecraft/world/item/Item$TooltipContext",
+            "net/minecraft/item/Item$TooltipContext",
+        ],
+    ),
+    (
+        "tooltip_type",
+        &[
+            "net/minecraft/world/item/TooltipFlag",
+            "net/minecraft/item/tooltip/TooltipType",
+            "net/minecraft/world/inventory/tooltip/TooltipType",
+            "net/minecraft/client/item/TooltipContext",
+        ],
+    ),
+    (
+        "component",
+        &[
+            "net/minecraft/network/chat/Component",
+            "net/minecraft/text/Text",
+        ],
+    ),
+];
+
+/// Resolve the client roles this game jar carries. A type the mod itself names
+/// wins over the table order, so an explicitly typed listener (`public void
+/// getTooltip(ItemStack stack, Item.TooltipContext context, TooltipFlag flag,
+/// List<Component> lines)`) still overrides the signature it was compiled
+/// against.
+fn resolve_client_types(
+    game: &BTreeMap<String, Class>,
+    lib_names: &BTreeSet<String>,
+    referenced: &BTreeSet<String>,
+) -> BTreeMap<&'static str, String> {
+    let mut out = BTreeMap::new();
+    for (role, candidates) in CLIENT_TYPE_CANDIDATES {
+        let present = |name: &str| game.contains_key(name) && !lib_names.contains(name);
+        let picked = candidates
+            .iter()
+            .copied()
+            .find(|name| referenced.contains(*name) && present(name))
+            .or_else(|| candidates.iter().copied().find(|name| present(name)));
+        if let Some(name) = picked {
+            out.insert(*role, name.to_owned());
+        }
+    }
+    out
+}
+
+/// `{gui}` → the resolved class's Java source name.
+fn fill_client_types(template: &str, types: &BTreeMap<&'static str, String>) -> String {
+    types
+        .iter()
+        .fold(template.to_owned(), |source, (role, name)| {
+            source.replace(&format!("{{{role}}}"), &java_name(name))
+        })
+}
+
+/// Writes the client shims: a real API class is never shadowed, and a shim
+/// whose signature names a client role this game jar cannot resolve is
+/// reported instead of emitted.
+struct ClientShims<'a> {
+    src: &'a Path,
+    available: &'a BTreeSet<String>,
+    types: &'a BTreeMap<&'static str, String>,
+}
+
+impl ClientShims<'_> {
+    fn emit(
+        &self,
+        files: &mut Vec<PathBuf>,
+        report: &mut Report,
+        class: &str,
+        requires: &[&str],
+        source: impl FnOnce() -> String,
+    ) -> Result<(), String> {
+        if self.available.contains(class) {
+            return Ok(());
+        }
+        let missing: Vec<&str> = requires
+            .iter()
+            .copied()
+            .filter(|role| !self.types.contains_key(role))
+            .collect();
+        if !missing.is_empty() {
+            report.missing.push(format!(
+                "{class} (needs client type {})",
+                missing.join(", ")
+            ));
+            return Ok(());
+        }
+        write_shim(files, self.src, class, &source())
+    }
+}
 
 /// Writes one generated shim and records it for the `javac` source list.
 fn write_shim(
@@ -10664,5 +11087,405 @@ mod tests {
         drop(extracted);
         assert!(!root.exists());
         let _ = fs::remove_file(outer);
+    }
+
+    #[test]
+    fn client_facade_descriptors_match_the_api_shapes() {
+        // HUD: functional holder with a static `EVENT`, invoked per frame.
+        for fragment in [
+            "@FunctionalInterface\npublic interface HudRenderCallback {",
+            "void onHudRender({gui} drawContext, {ticks} tickCounter);",
+            "Event<HudRenderCallback> EVENT = Event.horizon(horizonListeners ->",
+            "for (HudRenderCallback horizonListener : horizonListeners) {",
+            "horizonListener.onHudRender(drawContext, tickCounter);",
+        ] {
+            assert!(
+                FABRIC_HUD_RENDER_CALLBACK.contains(fragment),
+                "missing HUD fragment: {fragment}"
+            );
+        }
+        // Tooltip: the four-argument signature, with the mutable line list last.
+        for fragment in [
+            "void getTooltip({item_stack} stack, {tooltip_context} tooltipContext, {tooltip_type} tooltipType, List<{component}> lines);",
+            "Event<ItemTooltipCallback> EVENT = Event.horizon(horizonListeners ->",
+            "for (ItemTooltipCallback horizonListener : horizonListeners) {",
+            "horizonListener.getTooltip(stack, tooltipContext, tooltipType, lines);",
+        ] {
+            assert!(
+                FABRIC_ITEM_TOOLTIP_CALLBACK.contains(fragment),
+                "missing tooltip fragment: {fragment}"
+            );
+        }
+        // Key binding: registration returns the mapping it was handed.
+        for fragment in [
+            "public static {key_mapping} registerKeyBinding({key_mapping} binding) {",
+            "if (binding != null) HORIZON_BINDINGS.add(binding);",
+            "return binding;",
+            "public static java.util.List<{key_mapping}> horizonKeyBindings() {",
+        ] {
+            assert!(
+                FABRIC_KEY_BINDING_HELPER.contains(fragment),
+                "missing key-binding fragment: {fragment}"
+            );
+        }
+        // Client ticks reuse the server event generator, so their shape is the
+        // same ordered-dispatch holder.
+        let ticks = fabric_event_source(
+            "net.fabricmc.fabric.api.client.event.lifecycle.v1",
+            "ClientTickEvents",
+            "doc",
+            FABRIC_CLIENT_TICK_EVENTS,
+        );
+        for (field, callback, method) in [
+            ("START_CLIENT_TICK", "StartTick", "onStartTick"),
+            ("END_CLIENT_TICK", "EndTick", "onEndTick"),
+        ] {
+            assert!(ticks.contains(&format!(
+                "public static final Event<{callback}> {field} = Event.horizon(horizonListeners ->"
+            )));
+            assert!(ticks.contains(&format!(
+                "void {method}(net.minecraft.client.Minecraft p0);"
+            )));
+            assert!(ticks.contains(&format!(
+                "for ({callback} horizonListener : horizonListeners) horizonListener.{method}(p0);"
+            )));
+        }
+        // NeoForge: registrations are retained; tick and render are markers.
+        for fragment in [
+            "public class RegisterKeyMappingsEvent extends Event {",
+            "public void register({key_mapping} binding) {",
+            "if (binding != null) horizonKeyMappings.add(binding);",
+            "public java.util.List<{key_mapping}> horizonKeyMappings() {",
+        ] {
+            assert!(
+                NEOFORGE_REGISTER_KEY_MAPPINGS.contains(fragment),
+                "missing NeoForge fragment: {fragment}"
+            );
+        }
+        assert!(
+            NEOFORGE_CLIENT_TICK_EVENT
+                .contains("public static final class Pre extends ClientTickEvent {}")
+        );
+        assert!(
+            NEOFORGE_CLIENT_TICK_EVENT
+                .contains("public static final class Post extends ClientTickEvent {}")
+        );
+        assert!(
+            NEOFORGE_RENDER_GUI_EVENT
+                .contains("public {gui} getGuiGraphics() { return horizonGuiGraphics; }")
+        );
+    }
+
+    #[test]
+    fn client_types_resolve_against_the_game_jar() {
+        let game = |names: &[&str]| -> BTreeMap<String, Class> {
+            names
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_owned(),
+                        Class {
+                            name: (*name).to_owned(),
+                            ..Class::default()
+                        },
+                    )
+                })
+                .collect()
+        };
+        let none = BTreeSet::new();
+        assert!(resolve_client_types(&game(&[]), &none, &none).is_empty());
+        // 26.3's renamed class wins over the names it replaced.
+        let renamed = game(&[
+            "net/minecraft/client/gui/GuiGraphicsExtractor",
+            "net/minecraft/client/gui/GuiGraphics",
+            "net/minecraft/client/gui/DrawContext",
+        ]);
+        assert_eq!(
+            resolve_client_types(&renamed, &none, &none)["gui"],
+            "net/minecraft/client/gui/GuiGraphicsExtractor"
+        );
+        // The type the mod itself names wins over the table order, so an
+        // explicitly typed listener overrides the signature it was built for.
+        let referenced = BTreeSet::from(["net/minecraft/client/gui/DrawContext".to_owned()]);
+        assert_eq!(
+            resolve_client_types(&renamed, &none, &referenced)["gui"],
+            "net/minecraft/client/gui/DrawContext"
+        );
+        // A library jar's class is real and never becomes a façade role.
+        let library = BTreeSet::from(["net/minecraft/client/gui/GuiGraphicsExtractor".to_owned()]);
+        assert_eq!(
+            resolve_client_types(&renamed, &library, &none)["gui"],
+            "net/minecraft/client/gui/GuiGraphics"
+        );
+        // Nested roles are written the Java way.
+        let nested = game(&["net/minecraft/world/item/Item$TooltipContext"]);
+        let resolved = resolve_client_types(&nested, &none, &none);
+        assert_eq!(
+            fill_client_types("import {tooltip_context};", &resolved),
+            "import net.minecraft.world.item.Item.TooltipContext;"
+        );
+        // A `$` name the jar lacks leaves the role unresolved.
+        assert!(
+            !resolve_client_types(&game(&["net/minecraft/item/ItemStack"]), &none, &none)
+                .contains_key("tooltip_context")
+        );
+    }
+
+    #[test]
+    fn client_shims_only_fill_an_absent_api_class() {
+        let source = include_str!("facade.rs");
+        assert!(source.contains("let uses_fabric_client = target"));
+        assert!(source.contains("let uses_neoforge_client = uses_neoforge"));
+        assert!(source.contains("resolve_client_types(&game, &lib_names, &wanted)"));
+        // Absent API classes only, and no fabricated client type.
+        assert!(source.contains("if self.available.contains(class) {"));
+        assert!(source.contains("(needs client type {})"));
+        // `Event` is written once even when the server and client slices both
+        // need it.
+        assert!(source.contains("if !uses_fabric_events {"));
+        for class in [
+            "net/fabricmc/fabric/api/client/rendering/v1/HudRenderCallback",
+            "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents",
+            "net/fabricmc/fabric/api/client/keybinding/v1/KeyBindingHelper",
+            "net/fabricmc/fabric/api/client/item/tooltip/v1/ItemTooltipCallback",
+            "net/neoforged/neoforge/client/event/RegisterKeyMappingsEvent",
+            "net/neoforged/neoforge/client/event/ClientTickEvent",
+            "net/neoforged/neoforge/client/event/RenderGuiEvent",
+        ] {
+            assert!(
+                source.contains(&format!("\"{class}\"")),
+                "client shim not registered: {class}"
+            );
+        }
+        for role in [
+            "gui",
+            "ticks",
+            "minecraft",
+            "key_mapping",
+            "item_stack",
+            "tooltip_context",
+            "tooltip_type",
+            "component",
+        ] {
+            assert!(
+                CLIENT_TYPE_CANDIDATES.iter().any(|(name, _)| *name == role),
+                "missing client role: {role}"
+            );
+        }
+        // Every client type is a placeholder: a hard-coded name would freeze a
+        // 26.3 rename into the template.
+        for template in [
+            FABRIC_HUD_RENDER_CALLBACK,
+            FABRIC_ITEM_TOOLTIP_CALLBACK,
+            FABRIC_KEY_BINDING_HELPER,
+            NEOFORGE_REGISTER_KEY_MAPPINGS,
+            NEOFORGE_RENDER_GUI_EVENT,
+        ] {
+            assert!(
+                !template.contains("net.minecraft."),
+                "hard-coded client type in a template"
+            );
+        }
+    }
+
+    /// The client HUD, tooltip and key-binding shims are compiled and run for
+    /// real: ordered dispatch and retained registrations are behaviour, not a
+    /// shape. Skipped cleanly when no JDK is installed.
+    #[test]
+    fn client_facade_compiles_and_dispatches_in_order() {
+        use std::{path::PathBuf, process::Command};
+        let types: BTreeMap<&'static str, String> = BTreeMap::from([
+            (
+                "gui",
+                "net/minecraft/client/gui/GuiGraphicsExtractor".to_owned(),
+            ),
+            (
+                "ticks",
+                "net/minecraft/client/render/RenderTickCounter".to_owned(),
+            ),
+            ("minecraft", "net/minecraft/client/Minecraft".to_owned()),
+            ("key_mapping", "net/minecraft/client/KeyMapping".to_owned()),
+            (
+                "item_stack",
+                "net/minecraft/world/item/ItemStack".to_owned(),
+            ),
+            (
+                "tooltip_context",
+                "net/minecraft/world/item/Item$TooltipContext".to_owned(),
+            ),
+            (
+                "tooltip_type",
+                "net/minecraft/world/item/TooltipFlag".to_owned(),
+            ),
+            (
+                "component",
+                "net/minecraft/network/chat/Component".to_owned(),
+            ),
+        ]);
+        let probe = r#"public class ClientProbe {
+    public static void main(String[] args) {
+        java.util.List<String> seen = new java.util.ArrayList<>();
+        net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback.EVENT.register((context, ticks) -> seen.add("first"));
+        net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback.EVENT.register((context, ticks) -> seen.add("second"));
+        net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback.EVENT.invoker().onHudRender(null, null);
+        if (!seen.equals(java.util.Arrays.asList("first", "second"))) throw new AssertionError("hud order " + seen);
+
+        java.util.List<net.minecraft.network.chat.Component> lines = new java.util.ArrayList<>();
+        net.minecraft.network.chat.Component first = new net.minecraft.network.chat.Component();
+        first.horizonName = "first";
+        net.minecraft.network.chat.Component second = new net.minecraft.network.chat.Component();
+        second.horizonName = "second";
+        net.fabricmc.fabric.api.client.item.tooltip.v1.ItemTooltipCallback.EVENT.register((stack, context, flag, target) -> target.add(first));
+        net.fabricmc.fabric.api.client.item.tooltip.v1.ItemTooltipCallback.EVENT.register((stack, context, flag, target) -> target.add(second));
+        net.fabricmc.fabric.api.client.item.tooltip.v1.ItemTooltipCallback.EVENT.invoker().getTooltip(null, null, null, lines);
+        if (lines.size() != 2 || !"first".equals(lines.get(0).horizonName) || !"second".equals(lines.get(1).horizonName)) throw new AssertionError("tooltip order " + lines.size());
+
+        net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.START_CLIENT_TICK.register(client -> seen.add("tick"));
+        net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.START_CLIENT_TICK.invoker().onStartTick(null);
+        if (!"tick".equals(seen.get(seen.size() - 1))) throw new AssertionError("tick " + seen);
+
+        net.minecraft.client.KeyMapping one = new net.minecraft.client.KeyMapping();
+        net.minecraft.client.KeyMapping two = new net.minecraft.client.KeyMapping();
+        if (net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper.registerKeyBinding(one) != one) throw new AssertionError("key binding identity");
+        net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper.registerKeyBinding(two);
+        net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper.registerKeyBinding(null);
+        if (net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper.horizonKeyBindings().size() != 2) throw new AssertionError("key bindings");
+
+        net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent event = new net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent();
+        event.register(one);
+        event.register(two);
+        event.register(null);
+        if (event.horizonKeyMappings().size() != 2) throw new AssertionError("mappings " + event.horizonKeyMappings().size());
+        if (event.horizonKeyMappings().get(0) != one || event.horizonKeyMappings().get(1) != two) throw new AssertionError("mapping order");
+        if (!(new net.neoforged.neoforge.client.event.ClientTickEvent.Pre() instanceof net.neoforged.bus.api.Event)) throw new AssertionError("tick marker");
+        net.neoforged.neoforge.client.event.RenderGuiEvent.Pre render = new net.neoforged.neoforge.client.event.RenderGuiEvent.Pre(null);
+        if (render.getGuiGraphics() != null) throw new AssertionError("render gui");
+        System.out.println("horizon client facade ok");
+    }
+}
+"#;
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-client-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let mut files = Vec::new();
+        let mut write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write java shim");
+            files.push(file);
+        };
+        write("net/fabricmc/fabric/api/event/Event.java", FABRIC_EVENT);
+        write(
+            "net/fabricmc/fabric/api/client/rendering/v1/HudRenderCallback.java",
+            &fill_client_types(FABRIC_HUD_RENDER_CALLBACK, &types),
+        );
+        write(
+            "net/fabricmc/fabric/api/client/item/tooltip/v1/ItemTooltipCallback.java",
+            &fill_client_types(FABRIC_ITEM_TOOLTIP_CALLBACK, &types),
+        );
+        write(
+            "net/fabricmc/fabric/api/client/keybinding/v1/KeyBindingHelper.java",
+            &fill_client_types(FABRIC_KEY_BINDING_HELPER, &types),
+        );
+        write(
+            "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents.java",
+            &fabric_event_source(
+                "net.fabricmc.fabric.api.client.event.lifecycle.v1",
+                "ClientTickEvents",
+                "doc",
+                FABRIC_CLIENT_TICK_EVENTS,
+            ),
+        );
+        // The smallest game types the callback signatures name.
+        write(
+            "net/minecraft/client/gui/GuiGraphicsExtractor.java",
+            "package net.minecraft.client.gui;\npublic class GuiGraphicsExtractor {}\n",
+        );
+        write(
+            "net/minecraft/client/render/RenderTickCounter.java",
+            "package net.minecraft.client.render;\npublic class RenderTickCounter {}\n",
+        );
+        write(
+            "net/minecraft/client/Minecraft.java",
+            "package net.minecraft.client;\npublic class Minecraft {}\n",
+        );
+        write(
+            "net/minecraft/client/KeyMapping.java",
+            "package net.minecraft.client;\npublic class KeyMapping {}\n",
+        );
+        write(
+            "net/minecraft/world/item/ItemStack.java",
+            "package net.minecraft.world.item;\npublic class ItemStack {}\n",
+        );
+        write(
+            "net/minecraft/world/item/TooltipFlag.java",
+            "package net.minecraft.world.item;\npublic class TooltipFlag {}\n",
+        );
+        write(
+            "net/minecraft/network/chat/Component.java",
+            "package net.minecraft.network.chat;\npublic class Component { public String horizonName; }\n",
+        );
+        write(
+            "net/minecraft/world/item/Item.java",
+            "package net.minecraft.world.item;\npublic class Item { public static class TooltipContext {} }\n",
+        );
+        write("net/neoforged/bus/api/Event.java", NEOFORGE_EVENT);
+        for (relative, source) in [
+            (
+                "net/neoforged/neoforge/client/event/RegisterKeyMappingsEvent.java",
+                fill_client_types(NEOFORGE_REGISTER_KEY_MAPPINGS, &types),
+            ),
+            (
+                "net/neoforged/neoforge/client/event/ClientTickEvent.java",
+                NEOFORGE_CLIENT_TICK_EVENT.to_owned(),
+            ),
+            (
+                "net/neoforged/neoforge/client/event/RenderGuiEvent.java",
+                fill_client_types(NEOFORGE_RENDER_GUI_EVENT, &types),
+            ),
+        ] {
+            write(relative, &source);
+        }
+        write("ClientProbe.java", probe);
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(javac_status) = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(
+            javac_status.success(),
+            "javac rejected the generated client façade"
+        );
+        let java = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("java"))
+            .unwrap_or_else(|| PathBuf::from("java"));
+        let output = Command::new(&java)
+            .arg("-cp")
+            .arg(&classes)
+            .arg("ClientProbe")
+            .output()
+            .expect("run the client probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "client probe failed: {stderr}");
+        assert!(
+            stdout.contains("horizon client facade ok"),
+            "probe output: {stdout}{stderr}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
