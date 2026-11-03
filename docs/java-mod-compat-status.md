@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 3 November 2026, commit `423e4e3a9`.
+Last checked: 3 November 2026, commit `fea7e8e7f`.
 
 ## Supported now
 
@@ -29,7 +29,7 @@ Last checked: 3 November 2026, commit `423e4e3a9`.
 
 - [ ] Full Mixin weaving. Native execution now covers void-only non-cancellable `@Inject(at = HEAD)`, `RETURN`, and `TAIL` callbacks with mirrored arguments; return-value callbacks, other anchors, and cancellation remain JVM fallback. Single-hook empty-`@At` overwrites are emitted as executable replacement plans. The census reads config targets, injection annotations, `@At`, plugins, refmaps, and access metadata; it does not execute plugins, apply access changes, or rewrite bytecode.
 - [ ] Unmatched Mixin injection points. They are listed under `hook_points` with an empty `native_hooks` array and counted in `points_report_only`.
-- [ ] Java registration markers. Explicit `META-INF/horizon-native.json` declarations and registrations enriched through `StdHost::attach_registration_declaration` now cross the typed sink for blocks/items/effects/recipes/ingredients plus entities, data components, attachments, and bounded custom rows; registry synchronization into all live server stores remains incomplete.
+- [ ] Java registration markers. Explicit `META-INF/horizon-native.json` declarations and registrations enriched through `StdHost::attach_registration_declaration` now cross the typed sink for blocks/items/effects/recipes/ingredients plus entities, data components, attachments, and bounded custom rows; the server thread now atomically snapshots sorted blocks/items/entities/data-components/attachments and applies mob effects through a bounded helper; full live object/table synchronization remains incomplete.
 - [ ] JVM fallback coverage. Unsupported native calls, dynamic classpath failures, and reflective or incompatible missing façade members now have explicit diagnostics; the JVM path still needs broader loader façades and real-mod fixtures.
 - [ ] Java classpath discovery. The census reports `ServiceLoader`, arbitrary `ClassLoader` loading, and `Class.forName` as dynamic diagnostics. Native `ServiceLoader.load`/`loadInstalled`, `ClassLoader.loadClass`, and current-jar `Class.forName` now support only explicitly bounded values; arbitrary external discovery and resources outside the loaded jar remain report-only.
 
@@ -46,11 +46,11 @@ Last checked: 3 November 2026, commit `423e4e3a9`.
 
 ## Validation snapshot
 
-- `horizon-native-java`: 107 unit tests passing, including bounded jar-resource stream reads and cursor operations, Fabric `MappingResolver` identity queries, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection and bounded field metadata, TagKey values, bounded primitive optionals, custom payload type identity, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries, and bounded Map.Entry equality/hashing.
+- `horizon-native-java`: 107 unit tests passing, including bounded jar-resource stream reads and cursor operations, compiled HEAD/RETURN/TAIL injector fixtures and overwrite replacement execution, Fabric `MappingResolver` identity queries, plus runtime-built Fabric, Forge, NeoForge, Fabric-event, and Forge-event fixtures, including seeded class loading, current-jar reflection and bounded field metadata, TagKey values, bounded primitive optionals, custom payload type identity, `Number` accessors, callback combinators, restricted string formatting, deterministic Thread markers, Throwable metadata, and explicit ServiceLoader provider boundaries, and bounded Map.Entry equality/hashing.
 - `horizon-mods`: 36 unit tests passing, plus the runtime-built typed declaration adapter fixture.
 - `horizon-port-pack`: 177 unit tests passing, including bounded Item.Properties and BlockBehaviour.Properties façade values, Mixin `@At`/slice boundary metadata and values (including descriptor-bearing `@At(target:...)` selectors), config edge values, Mixin Extras injector normalization, loader ABI classification, Mojang codec/datafixer ABI coverage, native declaration-kind reporting, deduplicated Mixin hook matching, Class.forName boundary diagnostics, Registry holder lookup bodies, Identifier façade bodies, sealed InteractionResult façade values, BlockHitResult state coverage, FriendlyByteBuf façade values, and descriptor normalization coverage.
 - `horizon-jvm`: 12 unit tests passing, including explicit fallback labels, static-initialization fallback diagnostics, and NeoForge constructor-only entry selection.
-- `horizon-client` game mod tests: 12 passing, including bundled-resource loading, typed content, client/server role selection, and client-only NeoForge rejection.
+- `horizon-client` game mod tests: 13 passing, including bundled-resource loading, typed content, client/server role selection, and client-only NeoForge rejection.
 - Workspace check, full client clippy, compatibility-crate clippy, formatting, and `tools/native_java_smoke.py` passing with compiled OptionalLong/OptionalDouble paths.
 
 Every compatibility commit should update this checklist when a surface moves between these sections and should include the focused test or probe that justifies the change.
