@@ -641,7 +641,8 @@ impl StdHost {
         marker: impl Into<String>,
         slots: impl IntoIterator<Item = Value>,
     ) {
-        self.item_handlers.insert(marker.into(), slots.into_iter().collect());
+        self.item_handlers
+            .insert(marker.into(), slots.into_iter().collect());
     }
 
     /// Inspect explicitly seeded item-handler slots after a native callback.
@@ -1880,9 +1881,8 @@ impl Host for StdHost {
             };
         }
         if is_item_handler_owner(&r.owner) {
-            let marker = expect_ref(receiver).ok_or_else(|| {
-                NativeError::Metadata("malformed item-handler marker".into())
-            })?;
+            let marker = expect_ref(receiver)
+                .ok_or_else(|| NativeError::Metadata("malformed item-handler marker".into()))?;
             let slots = self.item_handlers.get_mut(marker).ok_or_else(|| {
                 NativeError::Metadata(format!("unseeded item-handler marker {marker}"))
             })?;
@@ -1907,9 +1907,14 @@ impl Host for StdHost {
                 }
                 ("isItemValid", "(ILnet/minecraft/world/item/ItemStack;)Z") => {
                     let index = expect_int(r, Self::argument(r, args, 0)?)?;
-                    return Ok(Value::Int((index >= 0 && (index as usize) < slots.len()) as i32));
+                    return Ok(Value::Int(
+                        (index >= 0 && (index as usize) < slots.len()) as i32,
+                    ));
                 }
-                ("insertItem", "(ILnet/minecraft/world/item/ItemStack;Z)Lnet/minecraft/world/item/ItemStack;") => {
+                (
+                    "insertItem",
+                    "(ILnet/minecraft/world/item/ItemStack;Z)Lnet/minecraft/world/item/ItemStack;",
+                ) => {
                     let index = expect_int(r, Self::argument(r, args, 0)?)?;
                     let stack = Self::argument(r, args, 1)?.clone();
                     let simulate = expect_int(r, Self::argument(r, args, 2)?)? != 0;
@@ -4903,8 +4908,7 @@ fn capability_text(value: &Value) -> String {
 fn is_item_handler_owner(owner: &str) -> bool {
     matches!(
         owner,
-        "net/neoforged/neoforge/items/IItemHandler"
-            | "net/minecraftforge/items/IItemHandler"
+        "net/neoforged/neoforge/items/IItemHandler" | "net/minecraftforge/items/IItemHandler"
     )
 }
 
