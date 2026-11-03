@@ -125,7 +125,7 @@ mod tests {
             },
         ]);
         assert_eq!(snapshot.blocks, ["ruby:stone"]);
-        assert_eq!(snapshot.items, ["ruby:pickaxe"]);
+        assert_eq!(snapshot.items, ["ruby:shard"]);
         assert_eq!(snapshot.entities, ["ruby:zombie"]);
         assert_eq!(snapshot.data_components, ["ruby:power"]);
         assert_eq!(snapshot.attachments, ["ruby:power"]);
