@@ -79,6 +79,16 @@ pub fn generate_many(
     let uses_neoforge = target
         .iter()
         .any(|class| class.refs.iter().any(|r| r.starts_with("net/neoforged/")));
+    // Legacy Forge jars do not carry NeoForge's package names, but they still
+    // need the bounded loader/event/capability shims below. Keep this probe
+    // separate so a Forge-only mod receives the same ABI coverage without
+    // treating every game class as a loader dependency.
+    let uses_legacy_forge = target.iter().any(|class| {
+        class
+            .refs
+            .iter()
+            .any(|r| r.starts_with("net/minecraftforge/"))
+    });
     let own: BTreeSet<&str> = target.iter().map(|c| c.name.as_str()).collect();
     // Shapes from dependency jars are real classes on javac/the probe
     // classpaths. Keep their names available when deciding whether a game
@@ -362,7 +372,7 @@ pub fn generate_many(
         .map_err(|e| format!("{}: {e}", model_layers_shim.display()))?;
         files.push(model_layers_shim);
     }
-    if uses_neoforge {
+    if uses_neoforge || uses_legacy_forge {
         let shims = [
             (
                 "net/neoforged/fml/common/Mod.java",
@@ -406,6 +416,60 @@ pub fn generate_many(
                 concat!(
                     "package net.neoforged.bus.api;\n",
                     "public enum EventPriority { HIGHEST, HIGH, NORMAL, LOW, LOWEST }\n",
+                ),
+            ),
+            // Forge 1.20.x kept the event-bus ABI in its own package.  These
+            // aliases intentionally mirror only the registration and posting
+            // surface used during mod bootstrap; dispatch is recorded by the
+            // native host and unsupported listener invocation remains a
+            // diagnostic boundary.
+            (
+                "net/minecraftforge/eventbus/api/Event.java",
+                "package net.minecraftforge.eventbus.api; public class Event { public boolean isCancelable() { return false; } public boolean isCanceled() { return false; } public void setCanceled(boolean value) {} }\n",
+            ),
+            (
+                "net/minecraftforge/eventbus/api/EventPriority.java",
+                "package net.minecraftforge.eventbus.api; public enum EventPriority { HIGHEST, HIGH, NORMAL, LOW, LOWEST }\n",
+            ),
+            (
+                "net/minecraftforge/eventbus/api/SubscribeEvent.java",
+                concat!(
+                    "package net.minecraftforge.eventbus.api;\n",
+                    "import java.lang.annotation.ElementType;\n",
+                    "import java.lang.annotation.Retention;\n",
+                    "import java.lang.annotation.RetentionPolicy;\n",
+                    "import java.lang.annotation.Target;\n",
+                    "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)\n",
+                    "public @interface SubscribeEvent { EventPriority priority() default EventPriority.NORMAL; boolean receiveCanceled() default false; }\n",
+                ),
+            ),
+            (
+                "net/minecraftforge/eventbus/api/IEventBus.java",
+                concat!(
+                    "package net.minecraftforge.eventbus.api;\n",
+                    "import java.util.function.Consumer;\n",
+                    "public interface IEventBus {\n",
+                    "    default IEventBus addListener(Consumer<?> listener) { return this; }\n",
+                    "    default IEventBus addListener(EventPriority priority, Consumer<?> listener) { return this; }\n",
+                    "    default IEventBus addListener(EventPriority priority, boolean receiveCancelled, Consumer<?> listener) { return this; }\n",
+                    "    default <T extends Event> IEventBus addListener(Class<T> type, Consumer<T> listener) { return this; }\n",
+                    "    default <T extends Event> IEventBus addListener(EventPriority priority, Class<T> type, Consumer<T> listener) { return this; }\n",
+                    "    default <T extends Event> IEventBus addListener(EventPriority priority, boolean receiveCancelled, Class<T> type, Consumer<T> listener) { return this; }\n",
+                    "    default IEventBus register(Object object) { return this; }\n",
+                    "    default IEventBus unregister(Object object) { return this; }\n",
+                    "    default boolean post(Event event) { return false; }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "net/minecraftforge/common/MinecraftForge.java",
+                concat!(
+                    "package net.minecraftforge.common;\n",
+                    "import net.minecraftforge.eventbus.api.IEventBus;\n",
+                    "public final class MinecraftForge {\n",
+                    "    private MinecraftForge() {}\n",
+                    "    public static final IEventBus EVENT_BUS = new IEventBus() {};\n",
+                    "}\n",
                 ),
             ),
             (
@@ -481,6 +545,30 @@ pub fn generate_many(
                 "package net.minecraftforge.common.capabilities; public final class CapabilityManager { private CapabilityManager() {} public static <T> Capability<T> get(CapabilityToken<T> token) { return new Capability<>(); } }\n",
             ),
             (
+                "net/minecraftforge/common/capabilities/ICapabilityProvider.java",
+                concat!(
+                    "package net.minecraftforge.common.capabilities;\n",
+                    "import net.minecraft.core.Direction;\n",
+                    "import net.minecraftforge.common.util.LazyOptional;\n",
+                    "public interface ICapabilityProvider {\n",
+                    "    default <T> LazyOptional<T> getCapability(Capability<T> capability, Direction side) { return LazyOptional.empty(); }\n",
+                    "    default <T> LazyOptional<T> getCapability(Capability<T> capability) { return getCapability(capability, null); }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/ICapabilityProvider.java",
+                concat!(
+                    "package net.neoforged.neoforge.capabilities;\n",
+                    "import net.minecraft.core.Direction;\n",
+                    "import net.neoforged.neoforge.common.util.LazyOptional;\n",
+                    "public interface ICapabilityProvider {\n",
+                    "    default <T> LazyOptional<T> getCapability(Capability<T> capability, Direction side) { return LazyOptional.empty(); }\n",
+                    "    default <T> LazyOptional<T> getCapability(Capability<T> capability) { return getCapability(capability, null); }\n",
+                    "}\n",
+                ),
+            ),
+            (
                 "net/minecraftforge/common/util/LazyOptional.java",
                 concat!(
                     "package net.minecraftforge.common.util;\n",
@@ -553,6 +641,28 @@ pub fn generate_many(
                     "public class FMLJavaModLoadingContext {\n",
                     "    public static FMLJavaModLoadingContext get() { return new FMLJavaModLoadingContext(); }\n",
                     "    public IEventBus getModEventBus() { return new IEventBus() {}; }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext.java",
+                concat!(
+                    "package net.minecraftforge.fml.javafmlmod;\n",
+                    "import net.minecraftforge.eventbus.api.IEventBus;\n",
+                    "public class FMLJavaModLoadingContext {\n",
+                    "    public static FMLJavaModLoadingContext get() { return new FMLJavaModLoadingContext(); }\n",
+                    "    public IEventBus getModEventBus() { return net.minecraftforge.common.MinecraftForge.EVENT_BUS; }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "net/minecraftforge/fml/ModContainer.java",
+                concat!(
+                    "package net.minecraftforge.fml;\n",
+                    "import net.minecraftforge.eventbus.api.IEventBus;\n",
+                    "public class ModContainer {\n",
+                    "    public IEventBus getEventBus() { return net.minecraftforge.common.MinecraftForge.EVENT_BUS; }\n",
+                    "    public String getModId() { return \"\"; }\n",
                     "}\n",
                 ),
             ),
@@ -2060,6 +2170,136 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             _ => {}
         }
     }
+    // Primitive and cursor operations cover the wire-level portion used by
+    // modern Fabric/Forge payload records.  Keep values typed in the same
+    // bounded sequence as the existing UTF/VarInt support: this lets a
+    // payload encode/decode round-trip during bootstrap without pretending to
+    // implement Netty's backing buffer or packet framing.
+    if class == "net/minecraft/network/FriendlyByteBuf" {
+        match (method, ret, descriptor) {
+            (
+                "writeByte",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
+            )
+            | (
+                "writeShort",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonValues.add(p0); return this;".to_owned();
+            }
+            ("readByte", "byte", "()B") => {
+                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Number ? ((Number) horizonValues.get(horizonReadIndex - 1)).byteValue() : 0;".to_owned();
+            }
+            ("readShort", "short", "()S") => {
+                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Number ? ((Number) horizonValues.get(horizonReadIndex - 1)).shortValue() : 0;".to_owned();
+            }
+            (
+                "writeLong",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(J)Lnet/minecraft/network/FriendlyByteBuf;",
+            )
+            | (
+                "writeVarLong",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(J)Lnet/minecraft/network/FriendlyByteBuf;",
+            )
+            | (
+                "writeFloat",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(F)Lnet/minecraft/network/FriendlyByteBuf;",
+            )
+            | (
+                "writeDouble",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(D)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonValues.add(p0); return this;".to_owned();
+            }
+            ("readLong", "long", "()J") | ("readVarLong", "long", "()J") => {
+                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Number ? ((Number) horizonValues.get(horizonReadIndex - 1)).longValue() : 0L;".to_owned();
+            }
+            ("readFloat", "float", "()F") => {
+                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Number ? ((Number) horizonValues.get(horizonReadIndex - 1)).floatValue() : 0.0f;".to_owned();
+            }
+            ("readDouble", "double", "()D") => {
+                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Number ? ((Number) horizonValues.get(horizonReadIndex - 1)).doubleValue() : 0.0d;".to_owned();
+            }
+            (
+                "writeByteArray",
+                "net.minecraft.network.FriendlyByteBuf",
+                "([B)Lnet/minecraft/network/FriendlyByteBuf;",
+            )
+            | (
+                "writeBytes",
+                "net.minecraft.network.FriendlyByteBuf",
+                "([B)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonValues.add(p0 == null ? new byte[0] : p0.clone()); return this;"
+                    .to_owned();
+            }
+            ("readByteArray", "byte[]", "()[B") => {
+                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof byte[] ? ((byte[]) horizonValues.get(horizonReadIndex - 1)).clone() : new byte[0];".to_owned();
+            }
+            ("readByteArray", "byte[]", "(I)[B") => {
+                return "if (horizonReadIndex >= horizonValues.size() || !(horizonValues.get(horizonReadIndex++) instanceof byte[])) return new byte[0]; byte[] value = ((byte[]) horizonValues.get(horizonReadIndex - 1)).clone(); return value.length <= p0 ? value : java.util.Arrays.copyOf(value, p0);".to_owned();
+            }
+            (
+                "writeUUID",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(Ljava/util/UUID;)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonValues.add(p0); return this;".to_owned();
+            }
+            ("readUUID", "java.util.UUID", "()Ljava/util/UUID;") => {
+                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof java.util.UUID ? (java.util.UUID) horizonValues.get(horizonReadIndex - 1) : new java.util.UUID(0L, 0L);".to_owned();
+            }
+            (
+                "readerIndex",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonReadIndex = Math.max(0, Math.min(p0, horizonValues.size())); return this;".to_owned();
+            }
+            ("readerIndex", "int", "()I") => return "return horizonReadIndex;".to_owned(),
+            ("readableBytes", "int", "()I") => {
+                return "return Math.max(0, horizonValues.size() - horizonReadIndex);".to_owned();
+            }
+            ("isReadable", "boolean", "()Z") => {
+                return "return horizonReadIndex < horizonValues.size();".to_owned();
+            }
+            (
+                "skipBytes",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonReadIndex = Math.min(horizonValues.size(), horizonReadIndex + Math.max(0, p0)); return this;".to_owned();
+            }
+            (
+                "clear",
+                "net.minecraft.network.FriendlyByteBuf",
+                "()Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonValues.clear(); horizonReadIndex = 0; return this;".to_owned();
+            }
+            (
+                "writeOptional",
+                "net.minecraft.network.FriendlyByteBuf",
+                "(Ljava/util/Optional;Ljava/util/function/BiConsumer;)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonValues.add(p0); return this;".to_owned();
+            }
+            (
+                "readOptional",
+                "java.util.Optional",
+                "(Ljava/util/function/Function;)Ljava/util/Optional;",
+            ) => {
+                return "if (horizonReadIndex >= horizonValues.size()) return java.util.Optional.empty(); Object value = horizonValues.get(horizonReadIndex++); return value instanceof java.util.Optional ? (java.util.Optional) value : java.util.Optional.ofNullable(value);".to_owned();
+            }
+            _ => {}
+        }
+    }
     if class == "net/minecraft/world/InteractionResult$Success" {
         match (method, ret, descriptor) {
             ("consumesAction", "boolean", _) => return "return true;".to_owned(),
@@ -2938,14 +3178,6 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             {
                 return "return horizonComponents.containsKey(p0);".to_owned();
             }
-            _ => {}
-        }
-    }
-    if class == "net/minecraft/world/entity/Entity" {
-        match (method, ret, descriptor) {
-            ("getEyeHeight", "float", "()F") => return "return 1.62f;".to_owned(),
-            ("getBbHeight", "float", "()F") => return "return 1.8f;".to_owned(),
-            ("getBbWidth", "float", "()F") => return "return 0.6f;".to_owned(),
             _ => {}
         }
     }

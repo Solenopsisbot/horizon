@@ -401,10 +401,13 @@ cargo run -q -p horizon-native-java -- --json mods/example.jar main
 
 When `--entry` is omitted, the runner discovers Fabric's `fabric.mod.json` entrypoints (including the
 string, object, and array forms), selects `main` by default, and executes every declaration in metadata
-order; `--entry-kind client` or `server` selects the other environment. NeoForge jars are scanned for
-top-level classes carrying `@Mod` and each discovered class is executed in sorted order unless an explicit
-`--entry` override selects one. Full Mixin weaving,
-the object contract, and semantics for real game objects remain later phases.
+order; `--entry-kind client` or `server` selects the other environment. Quilt's `quilt.mod.json` keys
+(`init`, `client_init`, and `server_init`) map to those same lifecycle methods, so Quilt jars use the
+same default and side selections. A wrong-side selection reports the entrypoint kinds declared by the
+jar before asking for an explicit `--entry` override. NeoForge jars are scanned for top-level classes
+carrying `@Mod` and each discovered class is executed in sorted order unless an explicit `--entry`
+override selects one. Full Mixin weaving, the object contract, and semantics for real game objects
+remain later phases.
 
 The selected Fabric kind now dispatches to its matching lifecycle method (`onInitialize`,
 `onInitializeClient`, or `onInitializeServer`), and the embedded runner seeds fresh loader game/config
@@ -481,7 +484,9 @@ with the registry, id, and kind named, rather than silently entering the native 
 
 The embedded JVM runner treats a discovered `neoforge` entrypoint as constructor-only, invoking the
 mod constructor and optional Mixin `onLoad` hook without fabricating a Fabric `onInitialize` call.
-Static initialization failures are labeled explicitly for JVM fallback diagnostics.
+Static initialization failures, native-library linkage failures, and bytecode/linkage failures are
+labeled explicitly for JVM fallback diagnostics, so a launcher can distinguish an unsupported façade
+member from a broken class definition or missing native dependency.
 The game-facing startup tests cover the corresponding native `--java-mod` content path, client/server role rejection, and typed metadata merge behavior.
 
 The façade now also has the first NeoForge registration boundary: `FMLJavaModLoadingContext.get()` and

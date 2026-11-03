@@ -128,6 +128,72 @@ public final class PayloadRegistrar {
 """,
 }
 
+# A small legacy Forge jar keeps the compatibility probe honest for packs that
+# still carry ``META-INF/mods.toml``. Forge and NeoForge share the constructor
+# and registration ABI, but the package names and metadata marker differ; the
+# native loader intentionally treats this as a bounded legacy alias and reports
+# the same ``neoforge`` execution kind.
+FORGE_SOURCES = {
+    "net/minecraftforge/fml/common/Mod.java": """
+package net.minecraftforge.fml.common;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.TYPE)
+public @interface Mod {
+    String value();
+}
+""",
+    "net/minecraftforge/registries/RegistryObject.java": """
+package net.minecraftforge.registries;
+
+public final class RegistryObject<T> {}
+""",
+    "net/minecraftforge/registries/DeferredRegister.java": """
+package net.minecraftforge.registries;
+
+import java.util.function.Supplier;
+
+public final class DeferredRegister<T> {
+    public static <T> DeferredRegister<T> create(Object registry, String id) {
+        return new DeferredRegister<>();
+    }
+
+    public <V extends T> RegistryObject<V> register(String id, Supplier<V> value) {
+        return new RegistryObject<>();
+    }
+}
+""",
+    "net/minecraftforge/network/simple/SimpleChannel.java": """
+package net.minecraftforge.network.simple;
+
+public final class SimpleChannel {
+    public SimpleChannel registerMessage(
+            int id, Class<?> type, Object encoder, Object decoder, Object handler) {
+        return this;
+    }
+}
+""",
+    "demo/Forge.java": """
+package demo;
+
+@net.minecraftforge.fml.common.Mod("native-smoke-forge")
+public final class Forge {
+    public Forge() {
+        net.minecraftforge.registries.DeferredRegister
+            .create("item", "native-smoke-forge")
+            .register("crystal", null);
+        new net.minecraftforge.network.simple.SimpleChannel()
+            .registerMessage(0, Object.class, null, null, null);
+    }
+}
+""",
+}
+
 
 def run(command: list[str], *, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
@@ -147,7 +213,7 @@ def main() -> int:
         source_root.mkdir()
         classes.mkdir()
         metadata.mkdir()
-        for relative, source in {**SOURCES, **NEO_SOURCES}.items():
+        for relative, source in {**SOURCES, **NEO_SOURCES, **FORGE_SOURCES}.items():
             path = source_root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(source.lstrip(), encoding="utf-8")
@@ -171,7 +237,10 @@ def main() -> int:
                 "17",
                 "-d",
                 str(classes),
-                *(str(source_root / relative) for relative in {**SOURCES, **NEO_SOURCES}),
+                *(
+                    str(source_root / relative)
+                    for relative in {**SOURCES, **NEO_SOURCES, **FORGE_SOURCES}
+                ),
             ]
         )
         if compile_result.returncode:
@@ -199,6 +268,19 @@ def main() -> int:
             '[[mods]]\nmodId = "native-smoke-neo"\nversion = "1.0.0"\n',
             encoding="utf-8",
         )
+        forge_metadata = metadata / "mods.toml"
+        forge_metadata.write_text(
+            'modLoader = "javafml"\n'
+            'loaderVersion = "[1,)"\n'
+            'license = "MIT"\n'
+            '[[mods]]\n'
+            'modId = "native-smoke-forge"\n'
+            'version = "1.0.0"\n'
+            '[[dependencies.native-smoke-forge]]\n'
+            'modId = "minecraft"\n'
+            'mandatory = true\n',
+            encoding="utf-8",
+        )
 
         fabric_jar = root / "native-smoke-fabric.jar"
         package_result = run(
@@ -213,6 +295,37 @@ def main() -> int:
                 "-C",
                 str(metadata),
                 "fabric.mod.json",
+            ]
+        )
+        if package_result.returncode:
+            print(package_result.stderr, file=sys.stderr, end="")
+            return package_result.returncode
+
+        forge_jar = root / "native-smoke-forge.jar"
+        package_result = run(
+            [
+                "jar",
+                "--create",
+                "--file",
+                str(forge_jar),
+                "-C",
+                str(classes),
+                "demo/Forge.class",
+                "-C",
+                str(classes),
+                "net/minecraftforge/fml/common/Mod.class",
+                "-C",
+                str(classes),
+                "net/minecraftforge/registries/DeferredRegister.class",
+                "-C",
+                str(classes),
+                "net/minecraftforge/registries/RegistryObject.class",
+                "-C",
+                str(classes),
+                "net/minecraftforge/network/simple/SimpleChannel.class",
+                "-C",
+                str(metadata),
+                "mods.toml",
             ]
         )
         if package_result.returncode:
@@ -314,7 +427,43 @@ def main() -> int:
         ):
             print(f"native NeoForge probe failed: {json.dumps(neo_report, sort_keys=True)}", file=sys.stderr)
             return 1
-        print(json.dumps({"fabric": report, "neoforge": neo_report}, sort_keys=True))
+        forge_probe = run(
+            [
+                "cargo",
+                "run",
+                "--quiet",
+                "-p",
+                "horizon-native-java",
+                "--",
+                "--json",
+                str(forge_jar),
+                "neoforge",
+            ]
+        )
+        if forge_probe.returncode:
+            print(forge_probe.stderr, file=sys.stderr, end="")
+            print(forge_probe.stdout, file=sys.stderr, end="")
+            return forge_probe.returncode
+        try:
+            forge_report = json.loads(forge_probe.stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError) as error:
+            print(f"native Forge probe returned invalid JSON: {error}\n{forge_probe.stdout}", file=sys.stderr)
+            return 1
+        if (
+            forge_report.get("status") != "ok"
+            or forge_report.get("kind") != "neoforge"
+            or forge_report.get("entrypoints") != ["demo.Forge"]
+            or not isinstance(forge_report.get("host_calls"), int)
+            or forge_report["host_calls"] < 2
+        ):
+            print(f"native Forge probe failed: {json.dumps(forge_report, sort_keys=True)}", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                {"fabric": report, "forge": forge_report, "neoforge": neo_report},
+                sort_keys=True,
+            )
+        )
         return 0
 
 
