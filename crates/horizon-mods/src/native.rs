@@ -3,9 +3,11 @@
 //! Java registration callbacks do not carry enough information to construct a
 //! Horizon block or item by themselves. A loader adapter first enriches a
 //! [`horizon_native_java::RegistryEntry`] with a typed declaration, then this
-//! sink validates the small declaration vocabulary used by the content loader.
-//! It deliberately collects declarations; the game applies them before its
-//! immutable resource tables are built.
+//! sink validates the small declaration vocabulary used by the content loader:
+//! blocks, items, mob effects, entities, data components, attachments, menus
+//! and block-entity types. Recipes and ingredients stay data. It deliberately
+//! collects declarations; the game applies them before its immutable resource
+//! tables are built.
 
 use crate::content::{Block, BlockProperties, EffectCategory, Item, MobEffect, Rarity};
 use horizon_native_java::{RegistryDeclaration, RegistryEntry, TypedRegistrySink};
@@ -26,6 +28,13 @@ pub const MAX_ENTITY_SIZE: f64 = 64.0;
 pub const MAX_ENTITY_ATTRIBUTE: f64 = 1.0e6;
 /// The height window of a spawn placement is an `i32` inside the build range.
 pub const MAX_SPAWN_HEIGHT: i32 = 2_048;
+/// A menu's slots, its own plus the player inventory's. Vanilla's largest
+/// (`GENERIC_9x6` with the inventory) is 90; a declared menu is capped well
+/// above the biggest station slot count so a row stays plainly bounded.
+pub const MAX_MENU_SLOTS: u32 = 256;
+/// `BlockEntityType.validBlocks` for one declared type. Vanilla's longest
+/// list (the signs') stays far below this.
+pub const MAX_BLOCK_ENTITY_BLOCKS: usize = 64;
 
 /// Vanilla's `MobCategory`, as a native entity's builder records it.
 const MOB_CATEGORIES: [&str; 8] = [
@@ -254,6 +263,153 @@ pub struct AttachmentDeclaration {
     pub copy_on_death: bool,
 }
 
+/// A typed menu registration (`MenuType`): the id a server opens with
+/// `ClientboundOpenScreenPacket`, the translation key its title resolves
+/// through, and how many slots it holds. The live menu still belongs to the
+/// game; this row only names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MenuDeclaration {
+    pub id: String,
+    /// A translation key (`container.ruby.crate`), not a rendered title.
+    pub title_key: String,
+    /// Slots the menu holds, 0 to [`MAX_MENU_SLOTS`].
+    pub slots: u32,
+}
+
+impl MenuDeclaration {
+    /// Parses one native menu row from the free-form keys a loader adapter
+    /// records. `title_key` and `slots` are both required: a `MenuType`
+    /// without a title or a slot count has nothing to open. Every other key
+    /// is rejected so a typo cannot silently drop a constructor option.
+    pub fn from_registry_properties(
+        id: impl Into<String>,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        let mut title_key = None;
+        let mut slots = None;
+        for (key, value) in properties {
+            match key.as_str() {
+                "title_key" => title_key = Some(value.clone()),
+                "slots" => slots = Some(parse_u32(key, value)?),
+                other => return Err(format!("unknown native menu property {other:?}")),
+            }
+        }
+        let menu = Self {
+            id: id.into(),
+            title_key: title_key.ok_or_else(|| "native menu has no title_key".to_owned())?,
+            slots: slots.ok_or_else(|| "native menu has no slots".to_owned())?,
+        };
+        menu.validate()?;
+        Ok(menu)
+    }
+
+    /// The fences a menu row passes whether the registry sink parsed it or it
+    /// was built by hand: a namespaced id, a translation key (`a-z0-9_.-`,
+    /// bounded, no control characters) and 0 to [`MAX_MENU_SLOTS`] slots.
+    pub fn validate(&self) -> Result<(), String> {
+        NativeDeclarations::ensure_id(&self.id)?;
+        if self.title_key.is_empty()
+            || self.title_key.len() > MAX_NATIVE_TEXT
+            || !self
+                .title_key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        {
+            return Err(format!(
+                "native menu {} title_key {:?} is a key of a-z0-9_.-",
+                self.id, self.title_key
+            ));
+        }
+        if self.slots > MAX_MENU_SLOTS {
+            return Err(format!(
+                "native menu {} slots is 0 to {MAX_MENU_SLOTS}",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A typed block-entity registration: a vanilla `BlockEntityType` template
+/// under a new id, the blocks that carry it and whether it ticks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockEntityDeclaration {
+    pub id: String,
+    /// The vanilla block entity type it copies, `minecraft:<path>`.
+    pub template: String,
+    /// Whether the game ticks it (`BlockEntityTicker`).
+    pub ticker: bool,
+    /// `BlockEntityType.validBlocks`: the blocks that carry it, sorted.
+    pub valid_blocks: Vec<String>,
+}
+
+impl BlockEntityDeclaration {
+    /// Parses one native block-entity row from the free-form keys a loader
+    /// adapter records. `template` (a vanilla block entity type) and
+    /// `valid_blocks` (comma-separated ids, at most
+    /// [`MAX_BLOCK_ENTITY_BLOCKS`] of them) are required; `ticker` is a bool
+    /// and defaults to false. The block list is sorted and may not repeat an
+    /// id, so metadata order cannot change the declaration. Every other key
+    /// is rejected.
+    pub fn from_registry_properties(
+        id: impl Into<String>,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        let mut template = None;
+        let mut ticker = false;
+        let mut valid_blocks = None;
+        for (key, value) in properties {
+            match key.as_str() {
+                "template" => template = Some(value.clone()),
+                "ticker" => ticker = parse_bool(key, value)?,
+                "valid_blocks" => valid_blocks = Some(parse_valid_blocks(value)?),
+                other => return Err(format!("unknown native block entity property {other:?}")),
+            }
+        }
+        let block_entity = Self {
+            id: id.into(),
+            template: template.ok_or_else(|| "native block entity has no template".to_owned())?,
+            ticker,
+            valid_blocks: valid_blocks
+                .ok_or_else(|| "native block entity has no valid_blocks".to_owned())?,
+        };
+        block_entity.validate()?;
+        Ok(block_entity)
+    }
+
+    /// The fences a block-entity row passes whether the registry sink parsed it
+    /// or it was built by hand: a namespaced id, a vanilla template, and 1 to
+    /// [`MAX_BLOCK_ENTITY_BLOCKS`] distinct block ids.
+    pub fn validate(&self) -> Result<(), String> {
+        NativeDeclarations::ensure_id(&self.id)?;
+        NativeDeclarations::ensure_id(&self.template)?;
+        if !self.template.starts_with("minecraft:") {
+            return Err(format!(
+                "native block entity {} template {:?} must be a vanilla id",
+                self.id, self.template
+            ));
+        }
+        if self.valid_blocks.is_empty() || self.valid_blocks.len() > MAX_BLOCK_ENTITY_BLOCKS {
+            return Err(format!(
+                "native block entity {} has 1 to {MAX_BLOCK_ENTITY_BLOCKS} valid blocks",
+                self.id
+            ));
+        }
+        let mut sorted = self.valid_blocks.clone();
+        sorted.sort();
+        if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(format!(
+                "native block entity {} valid_blocks repeats an id",
+                self.id
+            ));
+        }
+        for block in &self.valid_blocks {
+            NativeDeclarations::ensure_id(block)?;
+        }
+        Ok(())
+    }
+}
+
 /// Typed registrations waiting for the pre-resource load phase.
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct NativeDeclarations {
@@ -263,6 +419,8 @@ pub struct NativeDeclarations {
     pub entities: Vec<EntityDeclaration>,
     pub data_components: Vec<DataComponentDeclaration>,
     pub attachments: Vec<AttachmentDeclaration>,
+    pub menus: Vec<MenuDeclaration>,
+    pub block_entities: Vec<BlockEntityDeclaration>,
     pub recipes: Vec<RecipeDeclaration>,
     pub ingredients: Vec<IngredientDeclaration>,
     pub custom: Vec<CustomDeclaration>,
@@ -328,6 +486,13 @@ impl NativeDeclarations {
             incoming.attachments,
             |row| &row.id,
         )?;
+        merge_rows("menu", &mut staged.menus, incoming.menus, |row| &row.id)?;
+        merge_rows(
+            "block entity",
+            &mut staged.block_entities,
+            incoming.block_entities,
+            |row| &row.id,
+        )?;
         merge_rows("recipe", &mut staged.recipes, incoming.recipes, |row| {
             &row.id
         })?;
@@ -377,6 +542,8 @@ impl NativeDeclarations {
             + self.entities.len()
             + self.data_components.len()
             + self.attachments.len()
+            + self.menus.len()
+            + self.block_entities.len()
             + self.recipes.len()
             + self.ingredients.len()
             + self.custom.len();
@@ -396,13 +563,15 @@ impl NativeDeclarations {
     /// (an unknown kind is rejected while it is registered, not here).
     pub fn diagnostics(&self) -> Vec<String> {
         let mut out = vec![format!(
-            "native declarations: {} blocks, {} items, {} mob effects, {} entities, {} data components, {} attachments, {} recipes, {} ingredients, {} custom",
+            "native declarations: {} blocks, {} items, {} mob effects, {} entities, {} data components, {} attachments, {} menus, {} block entities, {} recipes, {} ingredients, {} custom",
             self.blocks.len(),
             self.items.len(),
             self.effects.len(),
             self.entities.len(),
             self.data_components.len(),
             self.attachments.len(),
+            self.menus.len(),
+            self.block_entities.len(),
             self.recipes.len(),
             self.ingredients.len(),
             self.custom.len(),
@@ -789,6 +958,45 @@ impl NativeDeclarations {
         });
         Ok(())
     }
+
+    fn add_menu(
+        &mut self,
+        entry: &RegistryEntry,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        Self::ensure_registration_id(&entry.id)?;
+        Self::check_properties("menu", properties)?;
+        if self.menus.iter().any(|menu| menu.id == entry.id) {
+            return Err(format!("duplicate native menu {}", entry.id));
+        }
+        self.menus.push(MenuDeclaration::from_registry_properties(
+            entry.id.clone(),
+            properties,
+        )?);
+        Ok(())
+    }
+
+    fn add_block_entity(
+        &mut self,
+        entry: &RegistryEntry,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        Self::ensure_registration_id(&entry.id)?;
+        Self::check_properties("block entity", properties)?;
+        if self
+            .block_entities
+            .iter()
+            .any(|block_entity| block_entity.id == entry.id)
+        {
+            return Err(format!("duplicate native block entity {}", entry.id));
+        }
+        self.block_entities
+            .push(BlockEntityDeclaration::from_registry_properties(
+                entry.id.clone(),
+                properties,
+            )?);
+        Ok(())
+    }
 }
 
 impl TypedRegistrySink for NativeDeclarations {
@@ -845,6 +1053,12 @@ impl TypedRegistrySink for NativeDeclarations {
                     }
                     "attachment" | "attachments" => {
                         return self.add_attachment(entry, properties);
+                    }
+                    "menu" | "menus" => {
+                        return self.add_menu(entry, properties);
+                    }
+                    "block_entity" | "block-entity" | "blockentity" => {
+                        return self.add_block_entity(entry, properties);
                     }
                     _ => {}
                 }
@@ -963,6 +1177,38 @@ fn parse_choice(key: &str, value: &str, allowed: &[&str]) -> Result<String, Stri
         ));
     }
     Ok(canonical)
+}
+
+/// An unsigned integer property.
+fn parse_u32(key: &str, value: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("native property {key} is not an unsigned integer: {value:?}"))
+}
+
+/// `BlockEntityType.validBlocks` as a comma-separated list: at most
+/// [`MAX_BLOCK_ENTITY_BLOCKS`] ids, each a resource location, sorted and
+/// without repeats.
+fn parse_valid_blocks(value: &str) -> Result<Vec<String>, String> {
+    let mut blocks = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err("native block entity valid_blocks has an empty id".to_owned());
+        }
+        NativeDeclarations::ensure_id(part)?;
+        blocks.push(part.to_owned());
+        if blocks.len() > MAX_BLOCK_ENTITY_BLOCKS {
+            return Err(format!(
+                "native block entity valid_blocks has more than {MAX_BLOCK_ENTITY_BLOCKS} ids"
+            ));
+        }
+    }
+    blocks.sort();
+    if blocks.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("native block entity valid_blocks repeats an id".to_owned());
+    }
+    Ok(blocks)
 }
 
 #[cfg(test)]
@@ -1449,11 +1695,13 @@ mod tests {
     }
 
     /// A typed custom row: the shape loader adapters use for entity,
-    /// data-component and attachment registrations.
+    /// data-component, attachment, menu and block-entity registrations.
     fn custom(kind: &str, id: &str, properties: &[(&str, &str)]) -> RegistryEntry {
         let registry = match kind {
             "entity" => "minecraft:entity_type",
             "data_component" => "minecraft:data_component_type",
+            "menu" => "minecraft:menu",
+            "block_entity" => "minecraft:block_entity_type",
             _ => "neoforge:attachment",
         };
         RegistryEntry::typed(
@@ -1609,7 +1857,7 @@ mod tests {
         assert_eq!(
             declarations.diagnostics(),
             [
-                "native declarations: 1 blocks, 0 items, 1 mob effects, 0 entities, 0 data components, 0 attachments, 0 recipes, 0 ingredients, 0 custom"
+                "native declarations: 1 blocks, 0 items, 1 mob effects, 0 entities, 0 data components, 0 attachments, 0 menus, 0 block entities, 0 recipes, 0 ingredients, 0 custom"
             ]
         );
         for (registry, id, kind) in [
@@ -1629,5 +1877,126 @@ mod tests {
             "native custom registration kinds: attachment=1, entity=2"
         );
         assert_eq!(declarations.diagnostics().len(), 2);
+    }
+
+    #[test]
+    fn menu_and_block_entity_rows_survive_the_registry_batch() {
+        let menu = custom(
+            "menu",
+            "ruby:crate",
+            &[("title_key", "container.ruby.crate"), ("slots", "27")],
+        );
+        // Out of order and spaced: the row keeps a sorted set either way.
+        let block_entity = custom(
+            "block_entity",
+            "ruby:crate",
+            &[
+                ("template", "minecraft:barrel"),
+                ("ticker", "true"),
+                ("valid_blocks", "ruby:crate_block, minecraft:barrel"),
+            ],
+        );
+        let declarations =
+            NativeDeclarations::from_registry_entries([&menu, &block_entity]).unwrap();
+        // Both kinds are typed, so neither lands in the custom bucket.
+        assert_eq!(declarations.custom, []);
+        assert_eq!(
+            declarations.menus[0],
+            MenuDeclaration {
+                id: "ruby:crate".into(),
+                title_key: "container.ruby.crate".into(),
+                slots: 27,
+            }
+        );
+        assert_eq!(
+            declarations.block_entities[0],
+            BlockEntityDeclaration {
+                id: "ruby:crate".into(),
+                template: "minecraft:barrel".into(),
+                ticker: true,
+                valid_blocks: vec!["minecraft:barrel".into(), "ruby:crate_block".into()],
+            }
+        );
+        assert!(declarations.diagnostics()[0].contains("1 menus, 1 block entities"));
+        // A kind without a typed adapter still reaches the custom bucket.
+        let unknown = custom("widget", "ruby:widget", &[]);
+        let declarations = NativeDeclarations::from_registry_entries([&unknown]).unwrap();
+        assert_eq!(declarations.custom[0].kind, "widget");
+    }
+
+    #[test]
+    fn menu_and_block_entity_rows_reject_bad_values_atomically() {
+        let menu = |id: &str, title: &str, slots: &str| {
+            custom("menu", id, &[("title_key", title), ("slots", slots)])
+        };
+        let block_entity = |id: &str, template: &str, blocks: &str| {
+            custom(
+                "block_entity",
+                id,
+                &[("template", template), ("valid_blocks", blocks)],
+            )
+        };
+        let mut declarations = NativeDeclarations::default();
+        declarations
+            .register_entries([&menu("ruby:crate", "container.ruby", "9")])
+            .unwrap();
+        let too_many = (0..=MAX_BLOCK_ENTITY_BLOCKS)
+            .map(|index| format!("ruby:b{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (row, why) in [
+            (menu("ruby:blank", "container ruby", "9"), "title_key"),
+            (menu("ruby:wide", "container.ruby", "257"), "is 0 to"),
+            (
+                custom("menu", "ruby:missing", &[("title_key", "ruby")]),
+                "has no slots",
+            ),
+            (
+                custom(
+                    "menu",
+                    "ruby:extra",
+                    &[("title_key", "ruby"), ("slots", "9"), ("tabs", "2")],
+                ),
+                "unknown native menu property",
+            ),
+            (
+                block_entity("ruby:template", "ruby:barrel", "ruby:crate"),
+                "must be a vanilla id",
+            ),
+            (
+                block_entity("ruby:bare", "minecraft:barrel", "crate"),
+                "has no namespace",
+            ),
+            (
+                block_entity("ruby:empty", "minecraft:barrel", ""),
+                "empty id",
+            ),
+            (
+                block_entity("ruby:repeat", "minecraft:barrel", "ruby:a,ruby:a"),
+                "repeats an id",
+            ),
+            (
+                custom(
+                    "block_entity",
+                    "ruby:none",
+                    &[("template", "minecraft:barrel")],
+                ),
+                "has no valid_blocks",
+            ),
+            (
+                block_entity("ruby:many", "minecraft:barrel", &too_many),
+                "more than",
+            ),
+        ] {
+            let error = declarations.register_entries([&row]).unwrap_err();
+            assert!(error.contains(why), "{error}");
+            // The batch rolled back: the good menu is still the only one.
+            assert_eq!(declarations.menus.len(), 1);
+            assert!(declarations.block_entities.is_empty());
+        }
+        let error = declarations
+            .register_entries([&menu("ruby:crate", "container.ruby", "9")])
+            .unwrap_err();
+        assert!(error.contains("duplicate native menu"), "{error}");
     }
 }

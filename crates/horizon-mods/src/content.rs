@@ -7,7 +7,9 @@
 //! manifest lists), plus additions to vanilla tags and to the convention
 //! tags (`c`, which NeoForge and Fabric mods share). Paths are plain, files
 //! and totals are capped, vanilla ids cannot be redefined, and no two mods
-//! share a namespace ([`clash`]).
+//! share a namespace ([`clash`]). Native declarations ([`Content::from_native`])
+//! add entities, data components, attachments, menus and block entities under
+//! the same fences.
 use crate::manifest::{Capability, MANIFEST, Manifest};
 use serde::Deserialize;
 use std::{
@@ -218,6 +220,10 @@ pub struct Content {
     pub data_components: Vec<crate::native::DataComponentDeclaration>,
     /// Typed attachment registrations emitted by a native Java adapter.
     pub attachments: Vec<crate::native::AttachmentDeclaration>,
+    /// Typed menu registrations emitted by a native Java adapter.
+    pub menus: Vec<crate::native::MenuDeclaration>,
+    /// Typed block-entity registrations emitted by a native Java adapter.
+    pub block_entities: Vec<crate::native::BlockEntityDeclaration>,
     /// Data files supplied by a native adapter (recipes and ingredients). These
     /// are written into the same resource overlay as packaged mod files.
     pub native_files: BTreeMap<String, Vec<u8>>,
@@ -311,6 +317,8 @@ impl Content {
             entities: Vec::new(),
             data_components: Vec::new(),
             attachments: Vec::new(),
+            menus: Vec::new(),
+            block_entities: Vec::new(),
             native_files: BTreeMap::new(),
             namespaces: manifest.owned_namespaces().map(str::to_owned).collect(),
         };
@@ -334,6 +342,8 @@ impl Content {
             && self.entities.is_empty()
             && self.data_components.is_empty()
             && self.attachments.is_empty()
+            && self.menus.is_empty()
+            && self.block_entities.is_empty()
             && self.native_files.is_empty()
     }
 
@@ -344,8 +354,10 @@ impl Content {
     /// carries a [`NATIVE_FORMAT`] marker: entities add their typed
     /// [`crate::native::SpawnRestriction`] and
     /// [`crate::native::EntityAttributes`] blocks, data components and
-    /// attachments their codec flags. Custom registry kinds stay outside this
-    /// vocabulary until Horizon has a typed adapter for them.
+    /// attachments their codec flags, menus their title key and slot count,
+    /// and block entities their vanilla template, ticker and valid blocks.
+    /// Custom registry kinds stay outside this vocabulary until Horizon has a
+    /// typed adapter for them.
     pub fn from_native(
         id: impl Into<String>,
         declarations: crate::native::NativeDeclarations,
@@ -423,6 +435,22 @@ impl Content {
                 .collect(),
         )?;
         check_unique(
+            "menu",
+            declarations
+                .menus
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect(),
+        )?;
+        check_unique(
+            "block entity",
+            declarations
+                .block_entities
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect(),
+        )?;
+        check_unique(
             "recipe",
             declarations
                 .recipes
@@ -452,6 +480,14 @@ impl Content {
         }
         for attachment in &declarations.attachments {
             check_codec("attachment", &attachment.codec)?;
+        }
+        // A menu or block-entity row may also be built by hand rather than
+        // parsed by the registry sink; re-check the shape `from_native` emits.
+        for menu in &declarations.menus {
+            menu.validate()?;
+        }
+        for block_entity in &declarations.block_entities {
+            block_entity.validate()?;
         }
         if !declarations.custom.is_empty() {
             let mut details = declarations
@@ -496,6 +532,12 @@ impl Content {
         }
         for attachment in &declarations.attachments {
             add_namespace(&attachment.id);
+        }
+        for menu in &declarations.menus {
+            add_namespace(&menu.id);
+        }
+        for block_entity in &declarations.block_entities {
+            add_namespace(&block_entity.id);
         }
         let mut native_files = BTreeMap::new();
         let mut native_total = 0u64;
@@ -604,6 +646,47 @@ impl Content {
                 })?,
             )?;
         }
+        for menu in &declarations.menus {
+            let (namespace, path) = menu
+                .id
+                .split_once(':')
+                .ok_or_else(|| format!("native menu {} has no namespace", menu.id))?;
+            let file = format!("data/{namespace}/horizon/menu/{path}.json");
+            check_path(&file)?;
+            let json = serde_json::json!({
+                "format": NATIVE_FORMAT,
+                "title_key": menu.title_key,
+                "slots": menu.slots,
+            });
+            add_native_file(
+                file,
+                serde_json::to_vec(&json).map_err(|error| {
+                    format!("native menu {} cannot be encoded: {error}", menu.id)
+                })?,
+            )?;
+        }
+        for block_entity in &declarations.block_entities {
+            let (namespace, path) = block_entity.id.split_once(':').ok_or_else(|| {
+                format!("native block entity {} has no namespace", block_entity.id)
+            })?;
+            let file = format!("data/{namespace}/horizon/block_entity/{path}.json");
+            check_path(&file)?;
+            let json = serde_json::json!({
+                "format": NATIVE_FORMAT,
+                "template": block_entity.template,
+                "ticker": block_entity.ticker,
+                "valid_blocks": block_entity.valid_blocks,
+            });
+            add_native_file(
+                file,
+                serde_json::to_vec(&json).map_err(|error| {
+                    format!(
+                        "native block entity {} cannot be encoded: {error}",
+                        block_entity.id
+                    )
+                })?,
+            )?;
+        }
         Ok(Self {
             source: Source::Dir(PathBuf::new()),
             files: Vec::new(),
@@ -613,6 +696,8 @@ impl Content {
             entities: declarations.entities,
             data_components: declarations.data_components,
             attachments: declarations.attachments,
+            menus: declarations.menus,
+            block_entities: declarations.block_entities,
             native_files,
             namespaces,
         })
@@ -889,7 +974,8 @@ mod tests {
     use super::*;
     use crate::manifest::Package;
     use crate::native::{
-        AttachmentDeclaration, DataComponentDeclaration, EntityDeclaration, NativeDeclarations,
+        AttachmentDeclaration, BlockEntityDeclaration, DataComponentDeclaration, EntityDeclaration,
+        MenuDeclaration, NativeDeclarations,
     };
     use horizon_native_java::{RegistryDeclaration, RegistryEntry};
 
@@ -917,6 +1003,8 @@ capabilities = ["registries"]
         let registry = match kind {
             "entity" => "minecraft:entity_type",
             "data_component" => "minecraft:data_component_type",
+            "menu" => "minecraft:menu",
+            "block_entity" => "minecraft:block_entity_type",
             _ => "neoforge:attachment",
         };
         RegistryEntry::typed(
@@ -1444,6 +1532,102 @@ capabilities = ["registries"]
         };
         let error = Content::from_native("ruby", declarations).unwrap_err();
         assert!(error.contains("not a namespaced codec id"), "{error}");
+    }
+
+    #[test]
+    fn native_menu_and_block_entity_rows_become_planner_files() {
+        let menu = native_row(
+            "menu",
+            "ruby:crate",
+            &[("title_key", "container.ruby.crate"), ("slots", "27")],
+        );
+        let block_entity = native_row(
+            "block_entity",
+            "ruby:crate",
+            &[
+                ("template", "minecraft:barrel"),
+                ("ticker", "true"),
+                ("valid_blocks", "ruby:crate_block,minecraft:barrel"),
+            ],
+        );
+        // A row in another mod's namespace joins the content's namespace list.
+        let foreign = native_row(
+            "menu",
+            "jade:crate",
+            &[("title_key", "container.jade"), ("slots", "0")],
+        );
+        let content = Content::from_native(
+            "ruby",
+            NativeDeclarations::from_registry_entries([&menu, &block_entity, &foreign]).unwrap(),
+        )
+        .unwrap();
+        assert!(!content.is_empty());
+        assert_eq!(content.menus.len(), 2);
+        assert_eq!(content.block_entities.len(), 1);
+        assert_eq!(content.namespaces, ["ruby", "jade"]);
+
+        let menu = native_json(&content, "data/ruby/horizon/menu/crate.json");
+        assert_eq!(menu["format"], NATIVE_FORMAT);
+        assert_eq!(menu["title_key"], "container.ruby.crate");
+        assert_eq!(menu["slots"], 27);
+
+        let block_entity = native_json(&content, "data/ruby/horizon/block_entity/crate.json");
+        assert_eq!(block_entity["format"], NATIVE_FORMAT);
+        assert_eq!(block_entity["template"], "minecraft:barrel");
+        assert_eq!(block_entity["ticker"].as_bool(), Some(true));
+        assert_eq!(
+            block_entity["valid_blocks"],
+            serde_json::json!(["minecraft:barrel", "ruby:crate_block"])
+        );
+    }
+
+    #[test]
+    fn native_menu_and_block_entity_rows_fence_ids_and_duplicates() {
+        let menu = MenuDeclaration {
+            id: "ruby:crate".into(),
+            title_key: "container.ruby".into(),
+            slots: 9,
+        };
+        let error = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                menus: vec![menu.clone(), menu.clone()],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate native menu"), "{error}");
+
+        let block_entity = BlockEntityDeclaration {
+            id: "ruby:crate".into(),
+            template: "minecraft:barrel".into(),
+            ticker: false,
+            valid_blocks: vec!["ruby:crate_block".into()],
+        };
+        let error = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                block_entities: vec![block_entity.clone(), block_entity.clone()],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate native block entity"), "{error}");
+
+        // A vanilla id is not a mod's to define; the whole plan is refused.
+        let error = Content::from_native(
+            "ruby",
+            NativeDeclarations {
+                menus: vec![menu],
+                block_entities: vec![BlockEntityDeclaration {
+                    id: "minecraft:barrel".into(),
+                    ..block_entity
+                }],
+                ..NativeDeclarations::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("outside a mod namespace"), "{error}");
     }
 
     #[test]
