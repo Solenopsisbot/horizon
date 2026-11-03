@@ -183,6 +183,9 @@ public final class Callbacks {
     public static void after(int value) {
         int marker = value + 100;
     }
+    public static void second(int value) {
+        int marker = value + 1000;
+    }
 }
 "#,
     );
@@ -216,6 +219,24 @@ public final class Callbacks {
     assert_eq!(head_report.callback_result, Value::Void);
     assert_eq!(head_report.target_result, Value::Void);
     assert!(head_host.calls().is_empty());
+
+    // A real mod can contribute several callbacks at one hook. The native
+    // chain must invoke every callback while running the target exactly once.
+    let chain = vec![
+        MixinInjectionPlan::inject_at_head(target.clone(), callback.clone()),
+        MixinInjectionPlan {
+            callback: MethodRef {
+                name: "second".into(),
+                ..callback.clone()
+            },
+            ..MixinInjectionPlan::inject_at_head(target.clone(), callback.clone())
+        },
+    ];
+    let chain_report = jar
+        .execute_mixin_chain(&chain, None, &[Value::Int(7)], &mut StdHost::new())
+        .unwrap();
+    assert_eq!(chain_report.callback_result, Value::Void);
+    assert_eq!(chain_report.target_result, Value::Void);
 
     let mut return_host = StdHost::new();
     let return_plan = MixinInjectionPlan {
