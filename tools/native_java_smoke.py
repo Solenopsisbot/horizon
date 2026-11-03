@@ -315,15 +315,6 @@ def main() -> int:
                 str(classes),
                 "net/minecraftforge/fml/common/Mod.class",
                 "-C",
-                str(classes),
-                "net/minecraftforge/registries/DeferredRegister.class",
-                "-C",
-                str(classes),
-                "net/minecraftforge/registries/RegistryObject.class",
-                "-C",
-                str(classes),
-                "net/minecraftforge/network/simple/SimpleChannel.class",
-                "-C",
                 str(metadata),
                 "mods.toml",
             ]
@@ -455,6 +446,7 @@ def main() -> int:
             or forge_report.get("entrypoints") != ["demo.Forge"]
             or not isinstance(forge_report.get("host_calls"), int)
             or forge_report["host_calls"] < 2
+            or forge_report.get("payload_directions") != ["playBidirectional"]
         ):
             print(f"native Forge probe failed: {json.dumps(forge_report, sort_keys=True)}", file=sys.stderr)
             return 1

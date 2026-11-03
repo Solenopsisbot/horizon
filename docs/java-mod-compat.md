@@ -415,7 +415,12 @@ directories. It also seeds lightweight `ModContainer`/`ModMetadata` proxies from
 `fabric.mod.json` files, so entrypoints that query `FabricLoader.getModContainer` see the jars being
 probed without requiring Fabric's full game provider. The metadata proxy exposes bounded empty author and
 license collections and an empty icon-path optional, matching the no-host-files policy while allowing
-common display/bootstrap queries to complete. Hollow Dawn's `CoreClient` now reaches and returns
+common display/bootstrap queries to complete. The native host also seeds Fabric's
+`EntrypointContainer` view from each loaded jar's declared lifecycle entries: bounded
+`FabricLoader.getEntrypoints`/`getEntrypointContainers` calls return deterministic containers whose
+`getEntrypointClass`, `getEntrypoint`, and `getProvider` values remain markers tied to the jar id.
+This view never scans the process classpath; unsupported provider invocation still falls back to the JVM.
+Hollow Dawn's `CoreClient` now reaches and returns
 from `onInitializeClient`; Lithium's `onInitialize` now completes through the same path. Entrypoint
 classes exposing the Mixin config-plugin `onLoad(String)` callback receive their package before the
 lifecycle call, which lets FabricProxy-Lite initialize its config. NeoForge
@@ -885,6 +890,10 @@ for bootstrap checks.
 `EntityType.Builder` preserves bounded size, client tracking range, update interval, and fire-immunity values through `build`; the generated `EntityType` exposes those values for bootstrap inspection without installing a live entity registry entry.
 The generated `MobCategory` enum also preserves its common name, per-chunk limit, friendliness,
 persistence, and despawn-distance queries for entity registration and spawn-placement branches.
+Entity bootstrap now carries the bounded `EntityType.Builder` category through `of(..., MobCategory)`
+and `build`, while `Entity` exposes stable dimensions, eye position, and block-coordinate queries.
+`Mob` retains baby and persistence-required flags alongside its existing AI and target values, keeping
+common spawn, leash, and lifecycle branches linkable without claiming live entity synchronization.
 `ItemStack.getUseAnimation()` now returns the deterministic `UseAnim.NONE` façade value, and `getTags()`
 returns a bounded empty stream alongside the existing count, copy, damage, component, and tag queries, keeping
 common item bootstrap branches linkable.

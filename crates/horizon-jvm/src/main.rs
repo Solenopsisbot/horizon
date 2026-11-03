@@ -167,10 +167,17 @@ fn run() -> Result<(), String> {
     let entry_specs = match entry {
         Some(entry) => vec![entry],
         None => {
-            let entries = discover_entries(Path::new(&args[0]), &entry_kind)?;
+            let jar = Path::new(&args[0]);
+            let entries = discover_entries(jar, &entry_kind)?;
             if entries.is_empty() {
+                let declared = declared_entrypoint_kinds(jar)?;
+                let declared = if declared.is_empty() {
+                    String::new()
+                } else {
+                    format!("; declared kinds: {}", declared.join(", "))
+                };
                 return Err(format!(
-                    "no {entry_kind} entrypoint found in {}; pass --entry <class>",
+                    "no {entry_kind} entrypoint found in {}{declared}; pass --entry <class>",
                     args[0]
                 ));
             }
@@ -487,9 +494,9 @@ fn set_loader_path(
 
 fn initializer_for_kind(kind: &str) -> Result<(&'static str, &'static str), String> {
     match kind {
-        "main" => Ok(("onInitialize", "onInitialize")),
-        "client" => Ok(("onInitializeClient", "onInitializeClient")),
-        "server" => Ok(("onInitializeServer", "onInitializeServer")),
+        "main" | "init" => Ok(("onInitialize", "onInitialize")),
+        "client" | "client_init" => Ok(("onInitializeClient", "onInitializeClient")),
+        "server" | "server_init" => Ok(("onInitializeServer", "onInitializeServer")),
         other => Err(format!(
             "invalid --entry-kind {other}; expected main, client, server, or neoforge"
         )),
@@ -566,6 +573,18 @@ fn fallback_label(class: &str, detail: Option<&str>) -> Option<String> {
             "JVM fallback selected for static initialization failure{}",
             detail.map_or_else(String::new, |value| format!(": {value}"))
         )),
+        "java.lang.UnsatisfiedLinkError" => Some(format!(
+            "JVM fallback selected for native linkage failure{}",
+            detail.map_or_else(String::new, |value| format!(": {value}"))
+        )),
+        "java.lang.VerifyError"
+        | "java.lang.ClassFormatError"
+        | "java.lang.BootstrapMethodError"
+        | "java.lang.IllegalAccessError"
+        | "java.lang.InstantiationError" => Some(format!(
+            "JVM fallback selected for runtime linkage failure{}",
+            detail.map_or_else(String::new, |value| format!(": {value}"))
+        )),
         _ => None,
     }
 }
@@ -586,11 +605,22 @@ fn take(args: &mut Vec<String>, name: &str) -> Option<String> {
 fn discover_entries(jar: &Path, kind: &str) -> Result<Vec<String>, String> {
     let file = File::open(jar).map_err(|e| format!("{}: {e}", jar.display()))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", jar.display()))?;
-    if let Ok(mut metadata) = archive.by_name("fabric.mod.json") {
+    let metadata_name = if archive.by_name("fabric.mod.json").is_ok() {
+        Some("fabric.mod.json")
+    } else if archive.by_name("quilt.mod.json").is_ok() {
+        Some("quilt.mod.json")
+    } else {
+        None
+    };
+    if let Some(metadata_name) = metadata_name {
+        let mut metadata = archive
+            .by_name(metadata_name)
+            .map_err(|e| format!("{}: {metadata_name}: {e}", jar.display()))?;
         let mut text = String::new();
         std::io::Read::read_to_string(&mut metadata, &mut text)
-            .map_err(|e| format!("{}: fabric.mod.json: {e}", jar.display()))?;
-        return fabric_entries(&text, kind);
+            .map_err(|e| format!("{}: {metadata_name}: {e}", jar.display()))?;
+        let metadata_kind = quilt_entrypoint_kind(metadata_name, kind);
+        return fabric_entries(&text, metadata_kind);
     }
     let mut out = Vec::new();
     for index in 0..archive.len() {
@@ -616,6 +646,65 @@ fn discover_entries(jar: &Path, kind: &str) -> Result<Vec<String>, String> {
     }
     out.sort();
     Ok(out)
+}
+
+fn quilt_entrypoint_kind<'a>(metadata_name: &str, kind: &'a str) -> &'a str {
+    if metadata_name != "quilt.mod.json" {
+        return kind;
+    }
+    match kind {
+        "main" => "init",
+        "client" => "client_init",
+        "server" => "server_init",
+        other => other,
+    }
+}
+
+/// Lists the entrypoint keys declared by a jar for a useful wrong-side error.
+/// NeoForge has no metadata list, so an annotated class is represented by the
+/// single `neoforge` kind after the bounded class scan.
+fn declared_entrypoint_kinds(jar: &Path) -> Result<Vec<String>, String> {
+    let file = File::open(jar).map_err(|e| format!("{}: {e}", jar.display()))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", jar.display()))?;
+    for metadata_name in ["fabric.mod.json", "quilt.mod.json"] {
+        let Ok(mut metadata) = archive.by_name(metadata_name) else {
+            continue;
+        };
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut metadata, &mut text)
+            .map_err(|e| format!("{}: {metadata_name}: {e}", jar.display()))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("{}: {metadata_name}: {e}", jar.display()))?;
+        let mut kinds = value
+            .get("entrypoints")
+            .and_then(serde_json::Value::as_object)
+            .map(|groups| groups.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        kinds.sort();
+        return Ok(kinds);
+    }
+    let has_neoforge = (0..archive.len()).any(|index| {
+        let Ok(mut entry) = archive.by_index(index) else {
+            return false;
+        };
+        let name = entry.name().to_owned();
+        if !name.ends_with(".class") || name.contains('$') {
+            return false;
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).is_ok()
+            && (bytes
+                .windows(b"Lnet/neoforged/fml/common/Mod;".len())
+                .any(|window| window == b"Lnet/neoforged/fml/common/Mod;")
+                || bytes
+                    .windows(b"Lnet/minecraftforge/fml/common/Mod;".len())
+                    .any(|window| window == b"Lnet/minecraftforge/fml/common/Mod;"))
+    });
+    Ok(if has_neoforge {
+        vec!["neoforge".to_owned()]
+    } else {
+        Vec::new()
+    })
 }
 
 fn fabric_entries(text: &str, kind: &str) -> Result<Vec<String>, String> {
@@ -747,8 +836,9 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        constructor_only_entry_kind, discover_entries, fabric_entries, fabric_metadata,
-        fallback_label, is_minecraft_class, nested_jar_name, split_entrypoint,
+        constructor_only_entry_kind, declared_entrypoint_kinds, discover_entries, fabric_entries,
+        fabric_metadata, fallback_label, is_minecraft_class, nested_jar_name,
+        quilt_entrypoint_kind, split_entrypoint,
     };
     use std::{fs::File, io::Write};
     use zip::write::SimpleFileOptions;
@@ -879,6 +969,78 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    #[test]
+    fn labels_runtime_linkage_fallbacks() {
+        for class in [
+            "java.lang.UnsatisfiedLinkError",
+            "java.lang.VerifyError",
+            "java.lang.ClassFormatError",
+            "java.lang.BootstrapMethodError",
+            "java.lang.IllegalAccessError",
+            "java.lang.InstantiationError",
+        ] {
+            assert_eq!(
+                fallback_label(class, Some("dev.example.Mod")),
+                Some(format!(
+                    "JVM fallback selected for {}: dev.example.Mod",
+                    if class == "java.lang.UnsatisfiedLinkError" {
+                        "native linkage failure"
+                    } else {
+                        "runtime linkage failure"
+                    }
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn maps_quilt_entrypoint_kinds_to_fabric_lifecycle_names() {
+        assert_eq!(quilt_entrypoint_kind("quilt.mod.json", "main"), "init");
+        assert_eq!(
+            quilt_entrypoint_kind("quilt.mod.json", "client"),
+            "client_init"
+        );
+        assert_eq!(
+            quilt_entrypoint_kind("quilt.mod.json", "server"),
+            "server_init"
+        );
+        assert_eq!(quilt_entrypoint_kind("fabric.mod.json", "main"), "main");
+    }
+
+    #[test]
+    fn discovers_quilt_init_entrypoint_and_declared_kinds() {
+        let path = std::env::temp_dir().join(format!(
+            "horizon-jvm-quilt-{}-{}.jar",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = File::create(&path).unwrap();
+        let mut jar = zip::ZipWriter::new(file);
+        jar.start_file("quilt.mod.json", SimpleFileOptions::default())
+            .unwrap();
+        jar.write_all(
+            br#"{"entrypoints":{"init":"dev.example.Main","client_init":[{"value":"dev.example.Client"}]}}"#,
+        )
+        .unwrap();
+        jar.finish().unwrap();
+        assert_eq!(
+            discover_entries(&path, "main").unwrap(),
+            vec!["dev.example.Main"]
+        );
+        assert_eq!(
+            discover_entries(&path, "client").unwrap(),
+            vec!["dev.example.Client"]
+        );
+        assert_eq!(
+            declared_entrypoint_kinds(&path).unwrap(),
+            vec!["client_init", "init"]
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
