@@ -233,6 +233,9 @@ fn run() -> Result<(), String> {
     // named in the report and left out so Mixin never chases it.
     let mixin_property = mixin_config_property(&mixin_configs);
     let mixin_registered = mixin_registered_count(mixin_property.as_deref());
+    // Registration walks the same list the property carries, so the two
+    // hand-offs can never name different configs or a different order.
+    let mixin_names = mixin_config_names(mixin_property.as_deref());
     let paths = std::env::join_paths(&classpath).map_err(|e| e.to_string())?;
     let paths = paths.to_string_lossy().into_owned();
 
@@ -270,14 +273,30 @@ fn run() -> Result<(), String> {
         println!("{line}");
     }
     println!("{}", mixin_configs_line(mixin_registered));
-    // Mixin's static bootstrap runs before the first entrypoint, the way a
-    // Fabric launch handler does. A jar with no config keeps today's behavior
-    // and reports that, so no class is loaded for nothing.
-    let has_mixin_configs = mixin_registered > 0;
-    println!(
-        "{}",
-        mixin_bootstrap_line(has_mixin_configs, || mixin_bootstrap_label(env))
-    );
+    // Mixin's hand-off follows the config report in Fabric's order: the static
+    // bootstrap, then one `Mixins.addConfiguration` per config. A run with no
+    // config has no stage, reports that, and loads no Mixin class at all.
+    let stages = mixin_stages(mixin_registered);
+    if stages.is_empty() {
+        println!("mixin bootstrap: no configs");
+    }
+    let mut bootstrap = None;
+    for stage in stages {
+        match stage {
+            MixinStage::Bootstrap => {
+                let outcome = mixin_bootstrap_label(env);
+                println!("mixin bootstrap: {}", mixin_bootstrap_line(&outcome));
+                bootstrap = Some(outcome);
+            }
+            MixinStage::Registration => {
+                let mut registrar = JniMixinRegistrar::new(&mut *env);
+                for line in register_mixin_configs(bootstrap.as_ref(), &mixin_names, &mut registrar)
+                {
+                    println!("{line}");
+                }
+            }
+        }
+    }
     // Fabric runs loader-level `preLaunch` callbacks before the selected
     // environment's entrypoints; NeoForge has none and stays constructor-only.
     let mut work: Vec<(&str, &str)> = pre_launch
@@ -1388,12 +1407,12 @@ fn format_mixin_config_property(names: impl IntoIterator<Item = String>) -> Opti
 /// values only, so the list cannot name a path outside them.
 ///
 /// Fabric Loader's own hand-off is different: `FabricMixinBootstrap` reads each
-/// mod's *parsed* metadata and calls `Mixins.addConfiguration`, and the loader
-/// exposes no documented launch property for it (there is no
-/// `fabric.mixin.configs`). The embedded bridge seeds container proxies rather
-/// than parsed metadata, so loader registration stays out of this probe: the
-/// legacy property is the only mechanism set, and a real weaving run still
-/// needs the loader to register the same configs.
+/// mod's *parsed* metadata and calls `Mixins.addConfiguration`. The embedded
+/// bridge seeds container proxies rather than parsed metadata, so the probe
+/// registers this same list itself after the static bootstrap
+/// ([`register_mixin_configs`]); the legacy property stays set for Mixin builds
+/// that read it at launch. A real weaving run still needs the loader to agree on
+/// the list.
 fn mixin_config_property(configs: &[MixinConfigRef]) -> Option<String> {
     format_mixin_config_property(
         configs
@@ -1403,11 +1422,18 @@ fn mixin_config_property(configs: &[MixinConfigRef]) -> Option<String> {
     )
 }
 
+/// The configs the property carries, in the property's own order. Registration
+/// walks this list, so the JVM property and the `addConfiguration` calls cannot
+/// drift apart.
+fn mixin_config_names(property: Option<&str>) -> Vec<&str> {
+    property
+        .map(|value| value.split(',').filter(|name| !name.is_empty()).collect())
+        .unwrap_or_default()
+}
+
 /// How many configs the property carries, for the deterministic log line.
 fn mixin_registered_count(property: Option<&str>) -> usize {
-    property.map_or(0, |value| {
-        value.split(',').filter(|name| !name.is_empty()).count()
-    })
+    mixin_config_names(property).len()
 }
 
 /// `mixin configs: N registered`, or `mixin configs: none` when discovery found
@@ -1448,41 +1474,180 @@ fn format_mixin_configs(configs: &[MixinConfigRef]) -> String {
     lines.into_iter().map(|line| line + "\n").collect()
 }
 
-/// The line printed before the first entrypoint. Mixin's own bootstrap only
-/// runs when discovery found a config, so a jar with none keeps today's
-/// behavior; `bootstrap` is lazy so no JNI call happens in that case.
-fn mixin_bootstrap_line(has_configs: bool, bootstrap: impl FnOnce() -> String) -> String {
-    if !has_configs {
-        return "mixin bootstrap: no configs".to_owned();
+/// The static bootstrap's outcome: `Ok(())` means Mixin came up far enough to
+/// accept `addConfiguration`; `Err` is the fallback label for the reported
+/// failure. A failure leaves the property hand-off in place and skips
+/// registration, which is only meaningful after a successful bootstrap.
+type MixinBootstrap = Result<(), String>;
+
+/// One step of the Mixin hand-off between the config report and the first
+/// entrypoint, in Fabric's order. The plan is data, so a test can assert the
+/// sequence without starting a JVM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MixinStage {
+    /// `MixinBootstrap.init()`, reported as `mixin bootstrap: <label>`.
+    Bootstrap,
+    /// `Mixins.addConfiguration(name)` per config, reported per failure plus a
+    /// final summary.
+    Registration,
+}
+
+/// The stages a run with `registered` configs performs, in order. A run with
+/// none has no stage: it reports `mixin bootstrap: no configs` and loads no
+/// Mixin class for nothing. Registration always follows the bootstrap that
+/// makes it meaningful.
+fn mixin_stages(registered: usize) -> &'static [MixinStage] {
+    if registered == 0 {
+        &[]
+    } else {
+        &[MixinStage::Bootstrap, MixinStage::Registration]
     }
-    format!("mixin bootstrap: {}", bootstrap())
+}
+
+/// The text after `mixin bootstrap:`: `ok`, or the failure's fallback label.
+fn mixin_bootstrap_line(outcome: &MixinBootstrap) -> &str {
+    outcome.as_ref().err().map_or("ok", String::as_str)
+}
+
+/// The two JVM effects registration needs, so the unavailable and
+/// partial-failure paths run in a unit test instead of a started JVM.
+trait MixinRegistrar {
+    /// Whether `org.spongepowered.asm.mixin.Mixins` and its
+    /// `addConfiguration(Ljava/lang/String;)V` exist.
+    fn available(&mut self) -> bool;
+
+    /// One `addConfiguration` call. Anything thrown is cleared either way;
+    /// `Err` carries the label the failure line reports.
+    fn add_configuration(&mut self, config: &str) -> Result<(), String>;
+}
+
+/// Mixin's public registration API, the same call Fabric's
+/// `FabricMixinBootstrap` makes for each mod's parsed metadata.
+const MIXINS_CLASS: &str = "org/spongepowered/asm/mixin/Mixins";
+const ADD_CONFIGURATION: &str = "addConfiguration";
+const ADD_CONFIGURATION_SIG: &str = "(Ljava/lang/String;)V";
+
+/// [`MixinRegistrar`] over JNI. The `Mixins` class is resolved once, when
+/// availability is checked, so N configs cost one class lookup and N calls.
+struct JniMixinRegistrar<'env, 'local> {
+    env: &'env mut JNIEnv<'local>,
+    class: Option<JClass<'local>>,
+}
+
+impl<'env, 'local> JniMixinRegistrar<'env, 'local> {
+    fn new(env: &'env mut JNIEnv<'local>) -> Self {
+        Self { env, class: None }
+    }
+}
+
+impl MixinRegistrar for JniMixinRegistrar<'_, '_> {
+    fn available(&mut self) -> bool {
+        let Ok(class) = self.env.find_class(MIXINS_CLASS) else {
+            let _ = self.env.exception_clear();
+            return false;
+        };
+        // A class without the method is as unavailable as a missing class:
+        // keep the property hand-off and let the probe continue.
+        if self
+            .env
+            .get_static_method_id(&class, ADD_CONFIGURATION, ADD_CONFIGURATION_SIG)
+            .is_err()
+        {
+            let _ = self.env.exception_clear();
+            return false;
+        }
+        self.class = Some(class);
+        true
+    }
+
+    fn add_configuration(&mut self, config: &str) -> Result<(), String> {
+        let Some(class) = self.class.as_ref() else {
+            return Err("Mixins is not available".to_owned());
+        };
+        let name = self
+            .env
+            .new_string(config)
+            .map_err(|error| format!("config name: {error}"))?;
+        let name = JObject::from(name);
+        match self.env.call_static_method(
+            class,
+            ADD_CONFIGURATION,
+            ADD_CONFIGURATION_SIG,
+            &[JValue::Object(&name)],
+        ) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let fallback = (error.to_string() == "Java exception was thrown")
+                    .then(|| exception_fallback(self.env))
+                    .flatten();
+                // One bad config must not poison the next call, and its
+                // exception trace would repeat the config list per failure.
+                let _ = self.env.exception_clear();
+                Err(fallback.unwrap_or_else(|| error.to_string()))
+            }
+        }
+    }
+}
+
+/// The registration stage: one `Mixins.addConfiguration` per config the
+/// property carries, in the property's order. Pure apart from
+/// [`MixinRegistrar`], so the skip, unavailable and partial-failure paths are
+/// unit tested without a JVM.
+///
+/// Diagnostics stay bounded: a failing config gets one `failed` line (its
+/// fallback label, never the whole config list), and one summary closes the
+/// stage.
+fn register_mixin_configs(
+    bootstrap: Option<&MixinBootstrap>,
+    configs: &[&str],
+    registrar: &mut impl MixinRegistrar,
+) -> Vec<String> {
+    if !bootstrap.is_some_and(|bootstrap| bootstrap.is_ok()) || configs.is_empty() {
+        return Vec::new();
+    }
+    if !registrar.available() {
+        return vec!["mixin registration: unavailable".to_owned()];
+    }
+    let mut lines = Vec::new();
+    let mut registered = 0usize;
+    for config in configs {
+        match registrar.add_configuration(config) {
+            Ok(()) => registered += 1,
+            Err(label) => lines.push(format!("mixin registration: failed ({label})")),
+        }
+    }
+    lines.push(format!(
+        "mixin registration: {registered}/{} registered",
+        configs.len()
+    ));
+    lines
 }
 
 /// Mixin's static bootstrap (`MixinBootstrap.init`), the way Fabric's launch
 /// handler runs it. Bounded to the classes the classpath already has: a missing
 /// runtime or a thrown exception becomes a reported fallback label, never a
 /// failed probe.
-fn mixin_bootstrap_label(env: &mut JNIEnv) -> String {
+fn mixin_bootstrap_label(env: &mut JNIEnv) -> MixinBootstrap {
     let class = match env.find_class("org/spongepowered/asm/launch/MixinBootstrap") {
         Ok(class) => class,
         Err(_) => {
             let _ = env.exception_clear();
-            return fallback_label(
+            return Err(fallback_label(
                 "java.lang.ClassNotFoundException",
                 Some("org.spongepowered.asm.launch.MixinBootstrap"),
             )
-            .unwrap_or_default();
+            .unwrap_or_default());
         }
     };
     match env.call_static_method(&class, "init", "()V", &[]) {
-        Ok(_) => "ok".to_owned(),
+        Ok(_) => Ok(()),
         Err(error) => {
             let fallback = (error.to_string() == "Java exception was thrown")
                 .then(|| exception_fallback(env))
                 .flatten();
             let _ = env.exception_describe();
             let _ = env.exception_clear();
-            fallback.unwrap_or_else(|| error.to_string())
+            Err(fallback.unwrap_or_else(|| error.to_string()))
         }
     }
 }
@@ -1617,14 +1782,15 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Entrypoint, MAX_MIXIN_CONFIG_PROPERTY_BYTES, MixinConfigRef, constructor_only_entry_kind,
-        declared_entrypoint_kinds, discover_entries, discover_mixin_configs,
-        entrypoints_from_metadata, fabric_entries, fabric_metadata, fallback_label,
-        format_entrypoints, format_mixin_config_property, format_mixin_configs,
-        initializer_for_kind, is_minecraft_class, missing_entry_message, mixin_bootstrap_line,
-        mixin_config_property, mixin_configs_line, mixin_jvm_options, mixin_registered_count,
-        neoforge_metadata, nested_jar_name, parse_mixin_config, pre_launch_entries,
-        quilt_entrypoint_kind, report_mixin_configs, split_entrypoint,
+        Entrypoint, MAX_MIXIN_CONFIG_PROPERTY_BYTES, MixinBootstrap, MixinConfigRef,
+        MixinRegistrar, MixinStage, constructor_only_entry_kind, declared_entrypoint_kinds,
+        discover_entries, discover_mixin_configs, entrypoints_from_metadata, fabric_entries,
+        fabric_metadata, fallback_label, format_entrypoints, format_mixin_config_property,
+        format_mixin_configs, initializer_for_kind, is_minecraft_class, missing_entry_message,
+        mixin_bootstrap_line, mixin_config_names, mixin_config_property, mixin_configs_line,
+        mixin_jvm_options, mixin_registered_count, mixin_stages, neoforge_metadata,
+        nested_jar_name, parse_mixin_config, pre_launch_entries, quilt_entrypoint_kind,
+        register_mixin_configs, report_mixin_configs, split_entrypoint,
     };
     use std::{fs::File, io::Write, path::PathBuf};
     use zip::write::SimpleFileOptions;
@@ -2101,15 +2267,138 @@ config="demo.mixins.json""#,
         assert_eq!(mixin_config_property(&configs), None);
         assert_eq!(mixin_registered_count(None), 0);
         assert!(mixin_jvm_options(None).is_empty());
+        // No config means no Mixin class load: the plan has no stage and the
+        // run keeps today's `mixin bootstrap: no configs` line.
+        assert!(mixin_stages(0).is_empty());
         assert_eq!(
-            mixin_bootstrap_line(false, || unreachable!("no config must not bootstrap Mixin")),
-            "mixin bootstrap: no configs"
-        );
-        assert_eq!(
-            mixin_bootstrap_line(true, || "ok".to_owned()),
-            "mixin bootstrap: ok"
+            mixin_stages(1),
+            &[MixinStage::Bootstrap, MixinStage::Registration]
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A [`MixinRegistrar`] that records calls and throws for one named config,
+    /// standing in for the JNI one so the plan needs no JVM.
+    struct FakeRegistrar {
+        available: bool,
+        fail: Option<&'static str>,
+        calls: Vec<String>,
+    }
+
+    impl MixinRegistrar for FakeRegistrar {
+        fn available(&mut self) -> bool {
+            self.available
+        }
+
+        fn add_configuration(&mut self, config: &str) -> Result<(), String> {
+            self.calls.push(config.to_owned());
+            match self.fail {
+                Some(fail) if fail == config => Err(format!(
+                    "JVM fallback selected for unsupported native call: {config}"
+                )),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn orders_mixin_stages_bootstrap_then_registration() {
+        // The sequence is the same for one config or many; only the count line
+        // upstream changes.
+        for registered in [1, 2, 64] {
+            assert_eq!(
+                mixin_stages(registered),
+                &[MixinStage::Bootstrap, MixinStage::Registration]
+            );
+        }
+        assert!(mixin_stages(0).is_empty());
+    }
+
+    #[test]
+    fn registration_matches_the_property_order() {
+        assert_eq!(
+            mixin_config_names(Some("a.mixins.json,b.mixins.json")),
+            ["a.mixins.json", "b.mixins.json"]
+        );
+        // The same derivation backs the count, so the two cannot disagree.
+        assert_eq!(
+            mixin_registered_count(Some("a.mixins.json,b.mixins.json")),
+            mixin_config_names(Some("a.mixins.json,b.mixins.json")).len()
+        );
+        assert!(mixin_config_names(None).is_empty());
+        assert!(mixin_config_names(Some("")).is_empty());
+    }
+
+    #[test]
+    fn registration_skips_without_a_ready_bootstrap_or_configs() {
+        let mut registrar = FakeRegistrar {
+            available: true,
+            fail: None,
+            calls: Vec::new(),
+        };
+        let ready: MixinBootstrap = Ok(());
+        assert!(register_mixin_configs(Some(&ready), &[], &mut registrar).is_empty());
+        assert!(register_mixin_configs(None, &["a.mixins.json"], &mut registrar).is_empty());
+        let failed: MixinBootstrap =
+            Err("JVM fallback selected for static initialization failure".to_owned());
+        assert!(
+            register_mixin_configs(Some(&failed), &["a.mixins.json"], &mut registrar).is_empty()
+        );
+        // None of those cases reached Mixin.
+        assert!(registrar.calls.is_empty());
+        assert_eq!(mixin_bootstrap_line(&ready), "ok");
+        assert_eq!(
+            mixin_bootstrap_line(&failed),
+            "JVM fallback selected for static initialization failure"
+        );
+    }
+
+    #[test]
+    fn registration_reports_an_absent_mixin_api_once() {
+        let mut registrar = FakeRegistrar {
+            available: false,
+            fail: None,
+            calls: Vec::new(),
+        };
+        let ready: MixinBootstrap = Ok(());
+        assert_eq!(
+            register_mixin_configs(
+                Some(&ready),
+                &["a.mixins.json", "b.mixins.json"],
+                &mut registrar
+            ),
+            vec!["mixin registration: unavailable".to_owned()]
+        );
+        assert!(registrar.calls.is_empty());
+    }
+
+    #[test]
+    fn registration_continues_after_a_config_throws() {
+        let ready: MixinBootstrap = Ok(());
+        let mut registrar = FakeRegistrar {
+            available: true,
+            fail: Some("b.mixins.json"),
+            calls: Vec::new(),
+        };
+        let lines = register_mixin_configs(
+            Some(&ready),
+            &["a.mixins.json", "b.mixins.json", "c.mixins.json"],
+            &mut registrar,
+        );
+        // Every config was attempted, in property order.
+        assert_eq!(
+            registrar.calls,
+            ["a.mixins.json", "b.mixins.json", "c.mixins.json"]
+        );
+        // One line for the failure (its fallback label, not the config list)
+        // and one summary; no duplicate diagnostics per config.
+        assert_eq!(
+            lines,
+            vec![
+                "mixin registration: failed (JVM fallback selected for unsupported native call: b.mixins.json)".to_owned(),
+                "mixin registration: 2/3 registered".to_owned(),
+            ]
+        );
     }
 
     #[test]
