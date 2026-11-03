@@ -12,7 +12,10 @@ On top of that the Fabric entrypoint resolves ``Registries.ITEM`` and an
 path (the probe returns the registered value only after it recorded the row), a
 second NeoForge jar registers payloads and has its ``payload_directions`` checked
 exactly, and a Fabric jar whose entrypoint lacks ``onInitialize`` must be rejected
-with the class and method named in its error report.
+with the class and method named in its error report.  A compiled Mixin jar covers
+the plan report (``--mixin-plans`` and the normal JSON run) end to end: two
+``HEAD``/``RETURN`` callbacks become plans while an ``INVOKE`` callback is left
+out.
 """
 
 from __future__ import annotations
@@ -311,6 +314,122 @@ public final class Forge {
 }
 
 
+# A compiled Mixin jar exercises the whole plan path: javac writes real
+# ``RuntimeVisibleAnnotations``, ``--mixin-plans`` reports the two supported
+# anchors, and the same jar still runs through a normal Fabric entrypoint.
+# ``demo/Probe`` is compile-only, so the target's call crosses the host and the
+# normal run proves the packaged target class executed.
+MIXIN_SOURCES = {
+    "org/spongepowered/asm/mixin/Mixin.java": """
+package org.spongepowered.asm.mixin;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.TYPE)
+public @interface Mixin {
+    String[] value() default {};
+    String[] targets() default {};
+}
+""",
+    "org/spongepowered/asm/mixin/injection/At.java": """
+package org.spongepowered.asm.mixin.injection;
+
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target({})
+public @interface At {
+    String value();
+}
+""",
+    "org/spongepowered/asm/mixin/injection/Inject.java": """
+package org.spongepowered.asm.mixin.injection;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface Inject {
+    String[] method();
+    At[] at();
+    boolean cancellable() default false;
+}
+""",
+    "demo/Probe.java": """
+package demo;
+
+public final class Probe {
+    public static void mark(String marker, int value) {
+    }
+}
+""",
+    "demo/Target.java": """
+package demo;
+
+public final class Target {
+    public static void run(int value) {
+        Probe.mark("target", value);
+    }
+}
+""",
+    "demo/TargetMixin.java": """
+package demo;
+
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+
+@Mixin(targets = "Ldemo/Target;")
+public abstract class TargetMixin {
+    @Inject(method = "run(I)V", at = @At("HEAD"))
+    private static void before(int value) {
+        Probe.mark("head", value);
+    }
+
+    @Inject(method = "run(I)V", at = @At("RETURN"))
+    private static void after(int value) {
+        Probe.mark("return", value);
+    }
+}
+""",
+    # ``INVOKE`` is not a native execution anchor: discovery must drop this
+    # callback instead of approximating it, so the jar still reports two plans.
+    "demo/InvokeMixin.java": """
+package demo;
+
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+
+@Mixin(targets = "Ldemo/Target;")
+public abstract class InvokeMixin {
+    @Inject(method = "run(I)V", at = @At("INVOKE"))
+    private static void invokeOnly(int value) {
+        Probe.mark("invoke", value);
+    }
+}
+""",
+    "demo/MixinEntry.java": """
+package demo;
+
+public final class MixinEntry {
+    public void onInitialize() {
+        Target.run(21);
+    }
+}
+""",
+}
+
+
 def run(command: list[str], *, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
 
@@ -403,6 +522,85 @@ def expect_probe(
     return report
 
 
+def expect_mixin_probe(archive: Path) -> dict | None:
+    """Check plan discovery plus a normal run of the same compiled Mixin jar."""
+    expected_plans = [
+        {
+            "target": "demo/Target",
+            "method": "run",
+            "descriptor": "(I)V",
+            "callback": "demo/TargetMixin#before",
+            "callback_descriptor": "(I)V",
+            "at": "HEAD",
+            "cancellable": False,
+        },
+        {
+            "target": "demo/Target",
+            "method": "run",
+            "descriptor": "(I)V",
+            "callback": "demo/TargetMixin#after",
+            "callback_descriptor": "(I)V",
+            "at": "RETURN",
+            "cancellable": False,
+        },
+    ]
+    expected_targets = ["demo/Target#run(I)V"]
+    status, plans_report, output = probe_json(archive, "--mixin-plans")
+    if plans_report is None:
+        print(f"native mixin plan probe failed ({status}):\n{output}", file=sys.stderr)
+        return None
+    problems = []
+    if plans_report.get("status") != "ok":
+        problems.append(f"plan status {plans_report.get('status')!r}")
+    if plans_report.get("targets") != expected_targets:
+        problems.append(
+            f"plan targets {plans_report.get('targets')!r}, expected {expected_targets!r}"
+        )
+    plans = plans_report.get("plans")
+    if not isinstance(plans, list):
+        problems.append(f"plans {plans!r}, expected a list")
+    else:
+        if plans != expected_plans:
+            problems.append(f"plans {plans!r}, expected {expected_plans!r}")
+        # The separate INVOKE mixin is dropped at discovery; no plan may name it.
+        if any(
+            str(plan.get("callback", "")).startswith("demo/InvokeMixin#")
+            for plan in plans
+            if isinstance(plan, dict)
+        ):
+            problems.append("INVOKE callback leaked into the plans")
+    status, run_report, output = probe_json(archive, "main")
+    if run_report is None:
+        print(f"native mixin run failed ({status}):\n{output}", file=sys.stderr)
+        return None
+    if run_report.get("status") != "ok":
+        problems.append(f"run status {run_report.get('status')!r}")
+    if run_report.get("entrypoints") != ["demo.MixinEntry"]:
+        problems.append(f"run entrypoints {run_report.get('entrypoints')!r}")
+    if run_report.get("mixin_plans") != len(expected_plans):
+        problems.append(
+            f"run mixin plans {run_report.get('mixin_plans')!r}, "
+            f"expected {len(expected_plans)}"
+        )
+    if run_report.get("mixin_targets") != expected_targets:
+        problems.append(
+            f"run mixin targets {run_report.get('mixin_targets')!r}, "
+            f"expected {expected_targets!r}"
+        )
+    # The entrypoint calls the packaged target, whose Probe.mark crosses the
+    # host, so at least one call proves the normal run executed the class.
+    if not isinstance(run_report.get("host_calls"), int) or run_report["host_calls"] < 1:
+        problems.append(f"run host calls {run_report.get('host_calls')!r}, expected >= 1")
+    if problems:
+        print(
+            f"native mixin probe failed: {', '.join(problems)}: "
+            f"{json.dumps({'plans': plans_report, 'run': run_report}, sort_keys=True)}",
+            file=sys.stderr,
+        )
+        return None
+    return {"plans": plans_report, "run": run_report}
+
+
 def expect_rejected(archive: Path, class_name: str, method: str) -> bool:
     """A jar whose entrypoint lacks ``method`` must fail and name both."""
     result = run_probe(archive)
@@ -439,11 +637,13 @@ def main() -> int:
         classes = root / "classes"
         metadata = root / "metadata"
         negative_metadata = root / "negative-metadata"
+        mixin_metadata = root / "mixin-metadata"
         source_root.mkdir()
         classes.mkdir()
         metadata.mkdir()
         negative_metadata.mkdir()
-        sources = {**SOURCES, **NEO_SOURCES, **FORGE_SOURCES}
+        mixin_metadata.mkdir()
+        sources = {**SOURCES, **NEO_SOURCES, **FORGE_SOURCES, **MIXIN_SOURCES}
         for relative, source in sources.items():
             path = source_root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -486,6 +686,20 @@ def main() -> int:
                     "version": "1.0.0",
                     "depends": {"minecraft": "26.3", "fabricloader": "*"},
                     "entrypoints": {"main": ["demo.Negative"]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        # The Mixin jar declares an ordinary entrypoint, so the same classes
+        # serve the plan report and a normal execution run.
+        (mixin_metadata / "fabric.mod.json").write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "id": "native-smoke-mixin",
+                    "version": "1.0.0",
+                    "depends": {"minecraft": "26.3", "fabricloader": "*"},
+                    "entrypoints": {"main": ["demo.MixinEntry"]},
                 }
             ),
             encoding="utf-8",
@@ -565,6 +779,21 @@ def main() -> int:
         if package_result:
             return package_result
 
+        # Only the mod classes and metadata are packaged: the annotation stubs
+        # and demo/Probe stay out, so discovery reads real annotations and the
+        # target's Probe.mark crosses the host.
+        mixin_jar = root / "native-smoke-mixin.jar"
+        package_result = package_jar(
+            mixin_jar,
+            (classes, "demo/Target.class"),
+            (classes, "demo/TargetMixin.class"),
+            (classes, "demo/InvokeMixin.class"),
+            (classes, "demo/MixinEntry.class"),
+            (mixin_metadata, "fabric.mod.json"),
+        )
+        if package_result:
+            return package_result
+
         report = expect_probe(
             "fabric",
             fabric_jar,
@@ -598,6 +827,9 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+        mixin_report = expect_mixin_probe(mixin_jar)
+        if mixin_report is None:
+            return 1
         neo_report = expect_probe(
             "neoforge", neo_jar, "neoforge", ["demo.Neo"], ["configurationToClient"], 4, ""
         )
@@ -629,6 +861,7 @@ def main() -> int:
                 {
                     "fabric": report,
                     "forge": forge_report,
+                    "mixin": mixin_report,
                     "neoforge": neo_report,
                     "neoforge_payload": payload_report,
                 },
