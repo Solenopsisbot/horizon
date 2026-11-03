@@ -1035,15 +1035,11 @@ fn run_server_java_mods(options: &mut Options) -> Result<()> {
     // loaded, even though the broader content/resource tables still rebuild
     // on the next resource reload.
     super::mods::register_mob_effects(content);
-    let registry = super::java_registry::synchronize(content);
-    log::info!(
-        "Horizon: synchronized Java registries ({} blocks, {} items, {} entities, {} data components, {} attachments)",
-        registry.blocks.len(),
-        registry.items.len(),
-        registry.entities.len(),
-        registry.data_components.len(),
-        registry.attachments.len(),
-    );
+    let registry = super::java_registry::try_synchronize(content)
+        .map_err(|error| format!("native Java registry synchronization failed: {error}"))?;
+    for line in registry.diagnostics() {
+        log::info!("Horizon: {line}");
+    }
     Ok(())
 }
 

@@ -262,6 +262,7 @@ pub(super) fn try_synchronize(
 ///
 /// [`try_synchronize`] is the same work with the error returned instead of
 /// logged, for callers that prefer to stop startup.
+#[cfg(test)]
 pub(super) fn synchronize(
     mods: &[horizon_client::mod_content::ContentMod],
 ) -> JavaRegistrySnapshot {
