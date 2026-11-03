@@ -46,6 +46,7 @@ import java.util.function.Consumer;
 public final class LazyOptional<T> {
   public boolean isPresent() { return false; }
   public void ifPresent(Consumer<? super T> consumer) {}
+  public T orElse(T other) { return other; }
 }
 "#,
     )
@@ -76,7 +77,11 @@ import net.minecraftforge.common.util.LazyOptional;
     Capability<Object> capability = new Capability<>();
     LazyOptional<Object> value = level.getCapability(capability, "NORTH");
     if (!value.isPresent()) throw new IllegalStateException("seeded capability missing");
-    value.ifPresent(item -> { if (!item.toString().equals("energy")) throw new IllegalStateException("wrong capability value"); });
+    // The bounded host resolves LazyOptional contents through orElse/get; it
+    // cannot run an arbitrary Java Consumer, so the callback form stays on the
+    // JVM fallback and the value check uses the supported accessor.
+    Object item = value.orElse("missing");
+    if (!item.toString().equals("energy")) throw new IllegalStateException("wrong capability value");
   }
 }
 "#,
@@ -130,7 +135,7 @@ version = "1.0"
     let mut host = jar.seed_host(StdHost::new());
     host.seed_capability(
         "net/minecraft/world/level/Level",
-        "ref:capability",
+        "net/minecraftforge/common/capabilities/Capability#1",
         None::<String>,
         Some("NORTH"),
         Value::Ref(Some("energy".into())),

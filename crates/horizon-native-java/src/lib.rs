@@ -299,6 +299,16 @@ pub trait Host {
     ) -> Result<Value, NativeError> {
         self.invoke(r, args)
     }
+
+    /// Message a host recorded for one bounded Throwable marker.
+    ///
+    /// The interpreter keeps objects as markers, so a host that answers
+    /// `Throwable#getMessage` can report the same text an `athrow` carries.
+    /// Hosts that do not model exceptions keep the default: an uncaught throw
+    /// is still diagnosed, just without a message.
+    fn throwable_message(&self, _marker: &str) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1030,6 +1040,12 @@ impl StdHost {
 }
 
 impl Host for StdHost {
+    /// Read back what the bounded `Throwable.<init>` surface recorded, so an
+    /// `athrow` diagnostic names the same message `getMessage` would return.
+    fn throwable_message(&self, marker: &str) -> Option<String> {
+        self.throwable_messages.get(marker).cloned().flatten()
+    }
+
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.record(r, None, &[]);
         // Registry statics get a stable marker instead of a null constant so
@@ -5465,6 +5481,39 @@ fn is_throwable_marker(marker: &str) -> bool {
         .is_some_and(|(owner, _)| is_throwable_owner(owner))
 }
 
+/// Class name an `athrow` diagnostic reports.
+///
+/// `athrow` has no constant-pool operand: the verifier types its operand as
+/// `Throwable`. The runtime keeps objects as `<class>#<n>` markers, so the
+/// owning class of a real Throwable is on the marker. A null operand, or a
+/// marker whose owner is not a Throwable, keeps the opcode's own type rather
+/// than inventing a Java class or panicking.
+fn thrown_class(value: &Value) -> String {
+    let Some(marker) = expect_ref(value) else {
+        return "java/lang/Throwable".to_owned();
+    };
+    let class = marker
+        .split_once('#')
+        .map_or(marker.as_str(), |(class, _)| class);
+    if is_throwable_owner(class) {
+        class.to_owned()
+    } else {
+        "java/lang/Throwable".to_owned()
+    }
+}
+
+/// Message the host recorded for a thrown Throwable marker.
+///
+/// Only markers the host itself built through the bounded `Throwable`
+/// constructors are consulted; a non-Throwable value carries no message.
+fn thrown_message<H: Host>(value: &Value, host: &H) -> Option<String> {
+    let marker = expect_ref(value)?;
+    if !is_throwable_marker(marker) {
+        return None;
+    }
+    host.throwable_message(marker)
+}
+
 fn capability_text(value: &Value) -> String {
     match value {
         Value::Int(value) => value.to_string(),
@@ -6239,12 +6288,32 @@ pub enum NativeError {
         method: String,
         target: isize,
     },
+    /// An uncaught Java exception ended native execution.
+    ///
+    /// The bounded interpreter models no exception table, so `athrow` always
+    /// leaves the invocation with this diagnostic. The caller that crossed
+    /// into the interpreter (the game's native-mod loader, or the JVM fallback
+    /// boundary) decides whether to report the mod as failed or hand it to a
+    /// real JVM.
+    UncaughtException {
+        /// Internal binary name of the thrown class, `java/lang/Throwable`
+        /// when the operand is null or is not a Throwable marker.
+        class: String,
+        /// The message the bounded `Throwable` constructor recorded, if any.
+        message: Option<String>,
+    },
     Zip(String),
     Metadata(String),
 }
 impl std::fmt::Display for NativeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::UncaughtException { class, message } => match message {
+                Some(message) => write!(f, "uncaught exception {class}: {message}"),
+                None => write!(f, "uncaught exception {class}"),
+            },
+            _ => write!(f, "{self:?}"),
+        }
     }
 }
 impl std::error::Error for NativeError {}
@@ -8942,13 +9011,18 @@ impl<H: Host> Runtime<'_, H> {
                     }
                 }
                 0xbf => {
-                    // Exception paths are not modeled. Stop this bounded call
-                    // with the declared neutral return value instead of
-                    // leaking an unsupported bytecode failure.
-                    if !stack.is_empty() {
-                        let _ = stack.pop();
-                    }
-                    return Ok(Value::default_for(return_desc(desc)));
+                    // `athrow` ends the invocation. The bounded interpreter
+                    // carries no exception table, so there is no handler to
+                    // land in and the diagnostic propagates to whoever crossed
+                    // into the interpreter - the game's native-mod loader, or
+                    // the JVM fallback boundary. Constructing a Throwable still
+                    // records its message and cause in the host and returns
+                    // normally; only throwing it fails.
+                    let thrown = pop(&mut stack, class, method)?;
+                    return Err(NativeError::UncaughtException {
+                        class: thrown_class(&thrown),
+                        message: thrown_message(&thrown, self.host),
+                    });
                 }
                 0xac..=0xb0 => return pop(&mut stack, class, method),
                 0xb1 => return Ok(Value::Void),
@@ -16725,6 +16799,80 @@ mandatory = true
             host.invoke_instance(&to_string, &error, &[]).unwrap(),
             Value::Ref(Some("IllegalStateException: bad state".into()))
         );
+    }
+
+    /// A minimal class with two `athrow` probes: one throws `null`, the other
+    /// a marker whose owner is not a Throwable. Neither carries a message.
+    fn athrow_probe_class() -> ClassFile {
+        fn u2(bytes: &mut Vec<u8>, value: u16) {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        fn utf8(bytes: &mut Vec<u8>, value: &str) {
+            bytes.push(1);
+            u2(bytes, value.len() as u16);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xCAFE_BABEu32.to_be_bytes());
+        u2(&mut bytes, 0); // minor
+        u2(&mut bytes, 52); // major
+        u2(&mut bytes, 11); // constant-pool count
+        utf8(&mut bytes, "demo/Throws"); // 1
+        bytes.extend_from_slice(&[7, 0, 1]); // 2: Class
+        utf8(&mut bytes, "java/lang/Object"); // 3
+        bytes.extend_from_slice(&[7, 0, 3]); // 4: Class
+        utf8(&mut bytes, "nullThrow"); // 5
+        utf8(&mut bytes, "()V"); // 6
+        utf8(&mut bytes, "Code"); // 7
+        utf8(&mut bytes, "demo/Plain"); // 8
+        bytes.extend_from_slice(&[7, 0, 8]); // 9: Class
+        utf8(&mut bytes, "otherThrow"); // 10
+
+        u2(&mut bytes, 0x0021); // access
+        u2(&mut bytes, 2); // this_class
+        u2(&mut bytes, 4); // super_class
+        u2(&mut bytes, 0); // interfaces
+        u2(&mut bytes, 0); // fields
+        u2(&mut bytes, 2); // methods
+        for (name, code) in [
+            (5u16, &[0x01, 0xbf][..]),              // aconst_null; athrow
+            (10u16, &[0xbb, 0x00, 0x09, 0xbf][..]), // new demo/Plain; athrow
+        ] {
+            u2(&mut bytes, 0x0009); // public static
+            u2(&mut bytes, name);
+            u2(&mut bytes, 6); // ()V
+            u2(&mut bytes, 1); // attributes
+            u2(&mut bytes, 7); // Code
+            bytes.extend_from_slice(&(12 + code.len() as u32).to_be_bytes()); // attribute length
+            u2(&mut bytes, 1); // max_stack
+            u2(&mut bytes, 0); // max_locals
+            bytes.extend_from_slice(&(code.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(code);
+            u2(&mut bytes, 0); // exception_table_length
+            u2(&mut bytes, 0); // code attributes
+        }
+        u2(&mut bytes, 0); // class attributes
+        ClassFile::parse(&bytes).unwrap()
+    }
+
+    #[test]
+    fn athrow_without_a_throwable_marker_reports_a_total_diagnostic() {
+        let jar = NativeJar::from_classes([athrow_probe_class()]);
+        let mut host = NullHost;
+        for method in ["nullThrow", "otherThrow"] {
+            let error = jar
+                .invoke_method("demo/Throws", method, "()V", None, &mut host)
+                .expect_err("athrow must not return a neutral value");
+            match &error {
+                NativeError::UncaughtException { class, message } => {
+                    assert_eq!(class, "java/lang/Throwable", "{method}");
+                    assert_eq!(*message, None, "{method}");
+                }
+                other => panic!("{method} reported {other:?}"),
+            }
+            assert_eq!(error.to_string(), "uncaught exception java/lang/Throwable");
+        }
     }
 
     #[test]
