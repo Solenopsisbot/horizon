@@ -89,6 +89,15 @@ pub fn generate_many(
             .iter()
             .any(|r| r.starts_with("net/minecraftforge/"))
     });
+    // Fabric's payload registry lives in the Fabric API jar, not in the game
+    // jar: a target that registers payloads only links when that API is on the
+    // compile classpath, so keep a bounded marker for the jar-only slice.
+    let uses_fabric_payloads = target.iter().any(|class| {
+        class
+            .refs
+            .iter()
+            .any(|r| r == "net/fabricmc/fabric/api/networking/v1/PayloadTypeRegistry")
+    });
     let own: BTreeSet<&str> = target.iter().map(|c| c.name.as_str()).collect();
     // Shapes from dependency jars are real classes on javac/the probe
     // classpaths. Keep their names available when deciding whether a game
@@ -383,6 +392,20 @@ pub fn generate_many(
         )
         .map_err(|e| format!("{}: {e}", model_layers_shim.display()))?;
         files.push(model_layers_shim);
+    }
+    // Fabric API's `PayloadTypeRegistry` is a library class: when the API jar
+    // is part of the target's classpath it stays real, and this bounded marker
+    // only fills the jar-only slice where `playS2C()/playC2S()` would
+    // otherwise fail to link.
+    let payload_registry = "net/fabricmc/fabric/api/networking/v1/PayloadTypeRegistry";
+    if uses_fabric_payloads && !available.contains(payload_registry) {
+        let payload_registry_file = src.join(format!("{payload_registry}.java"));
+        if let Some(parent) = payload_registry_file.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        fs::write(&payload_registry_file, FABRIC_PAYLOAD_TYPE_REGISTRY)
+            .map_err(|e| format!("{}: {e}", payload_registry_file.display()))?;
+        files.push(payload_registry_file);
     }
     if uses_neoforge || uses_legacy_forge {
         let shims = [
@@ -788,16 +811,7 @@ pub fn generate_many(
             ),
             (
                 "net/neoforged/neoforge/network/registration/PayloadRegistrar.java",
-                concat!(
-                    "package net.neoforged.neoforge.network.registration;\n",
-                    "public class PayloadRegistrar {\n",
-                    "    private int horizonRegistrationCount;\n",
-                    "    public int horizonRegistrationCount() { return horizonRegistrationCount; }\n",
-                    "    public PayloadRegistrar playToServer(Object type, Object codec, Object handler) { horizonRegistrationCount++; return this; }\n",
-                    "    public PayloadRegistrar playToClient(Object type, Object codec, Object handler) { horizonRegistrationCount++; return this; }\n",
-                    "    public PayloadRegistrar playBidirectional(Object type, Object codec, Object handler) { horizonRegistrationCount++; return this; }\n",
-                    "}\n",
-                ),
+                NEOFORGE_PAYLOAD_REGISTRAR,
             ),
             (
                 "net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent.java",
@@ -994,6 +1008,257 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
     }
     Some(name)
 }
+
+/// The generated `FriendlyByteBuf`'s wire state: a bounded, growable
+/// big-endian byte buffer with a read cursor, plus the `horizonValues` marker
+/// FIFO that keeps opaque values (NBT tags) without a wire shape.
+///
+/// Every allocation is bounded by the `HORIZON_MAX_BYTES` (1 MiB) constant,
+/// the same limit Fabric's payload accessor advertises. Reads past the end
+/// answer the primitive zero (or `""`) rather than throwing, because a façade
+/// buffer is also handed to decoders the game fills elsewhere; only a declared
+/// length that cannot be valid throws.
+const FRIENDLY_BYTE_BUF_STATE: &str = r#"    protected java.util.List<Object> horizonValues = new java.util.ArrayList<>();
+    protected int horizonReadIndex;
+    protected byte[] horizonBytes = new byte[0];
+    protected int horizonWriteIndex;
+    protected int horizonByteReadIndex;
+    protected static final int HORIZON_MAX_BYTES = 1048576;
+    protected void horizonEnsure(int extra) {
+        if (extra < 0 || extra > HORIZON_MAX_BYTES) throw new IllegalArgumentException("Invalid payload length: " + extra);
+        int needed = horizonWriteIndex + extra;
+        if (needed > HORIZON_MAX_BYTES) throw new IllegalArgumentException("Payload exceeds " + HORIZON_MAX_BYTES + " bytes");
+        if (needed > horizonBytes.length) {
+            int grown = Math.max(needed, Math.max(64, horizonBytes.length * 2));
+            horizonBytes = java.util.Arrays.copyOf(horizonBytes, Math.min(grown, HORIZON_MAX_BYTES));
+        }
+    }
+    protected void horizonPut(int value) {
+        horizonEnsure(1);
+        horizonBytes[horizonWriteIndex++] = (byte) value;
+    }
+    protected void horizonPutBytes(byte[] value) {
+        if (value == null || value.length == 0) return;
+        horizonEnsure(value.length);
+        System.arraycopy(value, 0, horizonBytes, horizonWriteIndex, value.length);
+        horizonWriteIndex += value.length;
+    }
+    protected int horizonGet() {
+        if (horizonByteReadIndex >= horizonWriteIndex) return 0;
+        return horizonBytes[horizonByteReadIndex++] & 255;
+    }
+    protected int horizonReadable() {
+        return Math.max(0, horizonWriteIndex - horizonByteReadIndex);
+    }
+    protected void horizonSkip(int count) {
+        horizonByteReadIndex = Math.min(horizonWriteIndex, horizonByteReadIndex + Math.max(0, count));
+    }
+    protected void horizonCompact() {
+        int readable = horizonReadable();
+        if (horizonByteReadIndex > 0 && readable > 0) System.arraycopy(horizonBytes, horizonByteReadIndex, horizonBytes, 0, readable);
+        horizonWriteIndex = readable;
+        horizonByteReadIndex = 0;
+    }
+    protected void horizonSetWriterIndex(int index) {
+        int limit = Math.max(0, Math.min(index, HORIZON_MAX_BYTES));
+        if (limit > horizonWriteIndex) {
+            horizonEnsure(limit - horizonWriteIndex);
+            java.util.Arrays.fill(horizonBytes, horizonWriteIndex, limit, (byte) 0);
+        }
+        horizonWriteIndex = limit;
+        if (horizonByteReadIndex > limit) horizonByteReadIndex = limit;
+    }
+    protected void horizonPutShort(int value) {
+        horizonPut(value >> 8);
+        horizonPut(value);
+    }
+    protected int horizonGetShort() {
+        return (horizonGet() << 8) | horizonGet();
+    }
+    protected void horizonPutInt(int value) {
+        horizonPut(value >> 24);
+        horizonPut(value >> 16);
+        horizonPut(value >> 8);
+        horizonPut(value);
+    }
+    protected int horizonGetInt() {
+        return (horizonGet() << 24) | (horizonGet() << 16) | (horizonGet() << 8) | horizonGet();
+    }
+    protected void horizonPutLong(long value) {
+        for (int shift = 56; shift >= 0; shift -= 8) horizonPut((int) (value >> shift));
+    }
+    protected long horizonGetLong() {
+        long value = 0L;
+        for (int i = 0; i < 8; i++) value = (value << 8) | (long) horizonGet();
+        return value;
+    }
+    protected void horizonPutVarInt(int value) {
+        int remaining = value;
+        while ((remaining & -128) != 0) {
+            horizonPut((remaining & 127) | 128);
+            remaining >>>= 7;
+        }
+        horizonPut(remaining);
+    }
+    protected int horizonGetVarInt() {
+        int value = 0;
+        for (int shift = 0; shift < 35; shift += 7) {
+            int next = horizonGet();
+            value |= (next & 127) << shift;
+            if ((next & 128) == 0) return value;
+        }
+        return value;
+    }
+    protected void horizonPutVarLong(long value) {
+        long remaining = value;
+        while ((remaining & -128L) != 0L) {
+            horizonPut((int) (remaining & 127L) | 128);
+            remaining >>>= 7;
+        }
+        horizonPut((int) remaining);
+    }
+    protected long horizonGetVarLong() {
+        long value = 0L;
+        for (int shift = 0; shift < 70; shift += 7) {
+            int next = horizonGet();
+            value |= (long) (next & 127) << shift;
+            if ((next & 128) == 0) return value;
+        }
+        return value;
+    }
+    protected void horizonPutUtf(String value, int maxLength) {
+        int limit = (int) Math.min((long) Math.max(0, maxLength) * 3L, (long) HORIZON_MAX_BYTES);
+        byte[] data = (value == null ? "" : value).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        if (data.length > limit) throw new IllegalArgumentException("String too big (was " + data.length + " bytes encoded, max " + limit + ")");
+        horizonPutVarInt(data.length);
+        horizonPutBytes(data);
+    }
+    protected String horizonGetUtf(int maxLength) {
+        int limit = (int) Math.min((long) Math.max(0, maxLength) * 3L, (long) HORIZON_MAX_BYTES);
+        int length = horizonGetVarInt();
+        if (length < 0 || length > limit) throw new IllegalArgumentException("Invalid string length: " + length);
+        if (length > horizonReadable()) return "";
+        byte[] data = new byte[length];
+        for (int i = 0; i < length; i++) data[i] = (byte) horizonGet();
+        return new String(data, java.nio.charset.StandardCharsets.UTF_8);
+    }
+    protected byte[] horizonGetByteArray(int maxLength) {
+        int limit = maxLength < 0 ? HORIZON_MAX_BYTES : Math.min(maxLength, HORIZON_MAX_BYTES);
+        int length = horizonGetVarInt();
+        if (length < 0 || length > limit) throw new IllegalArgumentException("Invalid byte array length: " + length);
+        if (length > horizonReadable()) return new byte[0];
+        byte[] data = new byte[length];
+        for (int i = 0; i < length; i++) data[i] = (byte) horizonGet();
+        return data;
+    }
+"#;
+
+/// Bounded stand-in for NeoForge's payload registrar. Every play/configuration
+/// direction keeps chaining, and the payload type objects it was handed stay in
+/// a static map keyed by that direction, so bootstrap can read the registered
+/// `Identifier`s back (`horizonPayloadIds`) without a live channel.
+///
+/// `id()` is read reflectively so this shim has no game-class dependency and
+/// stays compilable on a jar-only classpath.
+const NEOFORGE_PAYLOAD_REGISTRAR: &str = r#"package net.neoforged.neoforge.network.registration;
+
+public class PayloadRegistrar {
+    private static final java.util.Map<String, java.util.List<Object>> horizonPayloads = new java.util.LinkedHashMap<>();
+    private int horizonRegistrationCount;
+
+    public int horizonRegistrationCount() { return horizonRegistrationCount; }
+
+    public static java.util.List<Object> horizonPayloadTypes(String direction) {
+        java.util.List<Object> values = horizonPayloads.get(direction);
+        return values == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(values);
+    }
+
+    public static java.util.List<Object> horizonPayloadIds(String direction) {
+        java.util.List<Object> ids = new java.util.ArrayList<>();
+        for (Object type : horizonPayloadTypes(direction)) {
+            Object id = horizonPayloadId(type);
+            if (id != null) ids.add(id);
+        }
+        return ids;
+    }
+
+    private static Object horizonPayloadId(Object type) {
+        if (type == null) return null;
+        try { return type.getClass().getMethod("id").invoke(type); } catch (Throwable ignored) { return null; }
+    }
+
+    private PayloadRegistrar horizonRetain(String direction, Object type) {
+        horizonPayloads.computeIfAbsent(direction, key -> new java.util.ArrayList<>()).add(type);
+        horizonRegistrationCount++;
+        return this;
+    }
+
+    public PayloadRegistrar playToServer(Object type, Object codec, Object handler) { return horizonRetain("playToServer", type); }
+    public PayloadRegistrar playToClient(Object type, Object codec, Object handler) { return horizonRetain("playToClient", type); }
+    public PayloadRegistrar playBidirectional(Object type, Object codec, Object handler) { return horizonRetain("playBidirectional", type); }
+    public PayloadRegistrar configurationToServer(Object type, Object codec, Object handler) { return horizonRetain("configurationToServer", type); }
+    public PayloadRegistrar configurationToClient(Object type, Object codec, Object handler) { return horizonRetain("configurationToClient", type); }
+    public PayloadRegistrar configurationBidirectional(Object type, Object codec, Object handler) { return horizonRetain("configurationBidirectional", type); }
+    public PayloadRegistrar optional() { return this; }
+    public PayloadRegistrar versioned(String version) { return this; }
+}
+"#;
+
+/// Bounded stand-in for Fabric API's `PayloadTypeRegistry`. Only emitted when
+/// the real Fabric API class is absent from the target's classpath, so a
+/// jar-only slice keeps `PayloadTypeRegistry.playS2C().register(...)` linking.
+///
+/// Registration stays a marker, but each direction keeps the payload type
+/// objects it was handed in a static map, and `horizonPayloadIds` reads their
+/// `id()` (reflection, so no game class is required here) when a caller wants
+/// the `Identifier`s.
+const FABRIC_PAYLOAD_TYPE_REGISTRY: &str = r#"package net.fabricmc.fabric.api.networking.v1;
+
+public final class PayloadTypeRegistry {
+    private static final java.util.Map<String, java.util.List<Object>> horizonPayloads = new java.util.LinkedHashMap<>();
+
+    private PayloadTypeRegistry() {}
+
+    public static <T> PayloadTypeRegistrar<T> playS2C() { return new PayloadTypeRegistrar<>("playToClient"); }
+    public static <T> PayloadTypeRegistrar<T> playC2S() { return new PayloadTypeRegistrar<>("playToServer"); }
+    public static <T> PayloadTypeRegistrar<T> configurationS2C() { return new PayloadTypeRegistrar<>("configurationToClient"); }
+    public static <T> PayloadTypeRegistrar<T> configurationC2S() { return new PayloadTypeRegistrar<>("configurationToServer"); }
+
+    public static java.util.List<Object> horizonPayloadTypes(String direction) {
+        java.util.List<Object> values = horizonPayloads.get(direction);
+        return values == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(values);
+    }
+
+    public static java.util.List<Object> horizonPayloadIds(String direction) {
+        java.util.List<Object> ids = new java.util.ArrayList<>();
+        for (Object type : horizonPayloadTypes(direction)) {
+            Object id = horizonPayloadId(type);
+            if (id != null) ids.add(id);
+        }
+        return ids;
+    }
+
+    private static Object horizonPayloadId(Object type) {
+        if (type == null) return null;
+        try { return type.getClass().getMethod("id").invoke(type); } catch (Throwable ignored) { return null; }
+    }
+
+    public static final class PayloadTypeRegistrar<T> {
+        private final String horizonDirection;
+        private int horizonRegistrationCount;
+
+        PayloadTypeRegistrar(String direction) { this.horizonDirection = direction; }
+        public int horizonRegistrationCount() { return horizonRegistrationCount; }
+        public String horizonDirection() { return horizonDirection; }
+
+        public PayloadTypeRegistrar<T> register(Object type, Object codec) {
+            horizonPayloads.computeIfAbsent(horizonDirection, key -> new java.util.ArrayList<>()).add(type);
+            horizonRegistrationCount++;
+            return this;
+        }
+    }
+}
+"#;
 
 fn tree(
     name: &str,
@@ -1402,10 +1667,7 @@ fn render(
         );
     }
     if class.name == "net/minecraft/network/FriendlyByteBuf" {
-        let _ = writeln!(
-            out,
-            "    protected java.util.List<Object> horizonValues = new java.util.ArrayList<>();\n    protected int horizonReadIndex;"
-        );
+        let _ = write!(out, "{FRIENDLY_BYTE_BUF_STATE}");
     }
     if class.name == "net/minecraft/world/level/block/state/BlockState" {
         let _ = writeln!(
@@ -1633,6 +1895,13 @@ fn render(
             && method.descriptor == "(Lnet/minecraft/resources/Identifier;)V"
         {
             "this.horizonId = p0;"
+        } else if class.name == "net/minecraft/network/FriendlyByteBuf"
+            && method.descriptor == "(Lio/netty/buffer/ByteBuf;)V"
+        {
+            // A Netty-backed buffer copies its readable window into the
+            // bounded façade buffer, so a payload the game hands in decodes
+            // through the same cursor the façade wrote with.
+            "if (p0 != null) { int length = Math.min(p0.readableBytes(), HORIZON_MAX_BYTES); if (length > 0) { byte[] bytes = new byte[length]; p0.readBytes(bytes); this.horizonBytes = bytes; this.horizonWriteIndex = length; } }"
         } else if class.name == "net/minecraft/world/level/block/entity/BlockEntity"
             && method.descriptor
                 == "(Lnet/minecraft/world/level/block/entity/BlockEntityType;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;)V"
@@ -2198,217 +2467,225 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     {
         return "return this instanceof InteractionResult.Success;".to_owned();
     }
+    // Bounded wire semantics for the generated `FriendlyByteBuf`: every
+    // wire-shaped write encodes big-endian bytes into the growable in-memory
+    // buffer injected beside the class fields, and every read decodes them at
+    // a bounded cursor, so a mod's encode/decode pair round-trips without a
+    // Netty buffer or packet framing. Values with no wire shape (NBT tags)
+    // keep the `horizonValues` marker FIFO. Reads past the end answer the
+    // primitive zero (or `""`) instead of throwing, because a façade buffer is
+    // also handed to decoders the game fills elsewhere.
     if class == "net/minecraft/network/FriendlyByteBuf" {
         match (method, ret, descriptor) {
-            (
-                "writeUtf",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;",
-            )
-            | (
-                "writeUtf",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(Ljava/lang/String;I)Lnet/minecraft/network/FriendlyByteBuf;",
-            ) => {
-                return "horizonValues.add(p0); return this;".to_owned();
+            // Primitives and varints.
+            ("writeByte", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPut(p0); return this;".to_owned();
             }
-            ("readUtf", "java.lang.String", "()Ljava/lang/String;")
-            | ("readUtf", "java.lang.String", "(I)Ljava/lang/String;") => {
-                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof String ? (String) horizonValues.get(horizonReadIndex - 1) : \"\";".to_owned();
+            ("readByte", "byte", "()B") => return "return (byte) horizonGet();".to_owned(),
+            ("readUnsignedByte", "short", "()S") => {
+                return "return (short) horizonGet();".to_owned();
             }
-            (
-                "writeVarInt",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
-            )
-            | (
-                "writeInt",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
-            ) => {
-                return "horizonValues.add(p0); return this;".to_owned();
+            ("writeShort", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutShort(p0); return this;".to_owned();
             }
-            ("readVarInt", "int", "()I") | ("readInt", "int", "()I") => {
-                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Integer ? ((Integer) horizonValues.get(horizonReadIndex - 1)).intValue() : 0;".to_owned();
+            ("readShort", "short", "()S") => {
+                return "return (short) horizonGetShort();".to_owned();
             }
-            (
-                "writeBoolean",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(Z)Lnet/minecraft/network/FriendlyByteBuf;",
-            ) => {
-                return "horizonValues.add(p0); return this;".to_owned();
+            ("readUnsignedShort", "int", "()I") => {
+                return "return horizonGetShort();".to_owned();
+            }
+            ("writeChar", _, "(C)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutShort(p0); return this;".to_owned();
+            }
+            ("readChar", "char", "()C") => return "return (char) horizonGetShort();".to_owned(),
+            ("writeInt", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutInt(p0); return this;".to_owned();
+            }
+            ("readInt", "int", "()I") => return "return horizonGetInt();".to_owned(),
+            ("writeVarInt", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutVarInt(p0); return this;".to_owned();
+            }
+            ("readVarInt", "int", "()I") => return "return horizonGetVarInt();".to_owned(),
+            ("writeLong", _, "(J)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutLong(p0); return this;".to_owned();
+            }
+            ("readLong", "long", "()J") => return "return horizonGetLong();".to_owned(),
+            ("writeVarLong", _, "(J)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutVarLong(p0); return this;".to_owned();
+            }
+            ("readVarLong", "long", "()J") => return "return horizonGetVarLong();".to_owned(),
+            ("writeFloat", _, "(F)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutInt(Float.floatToRawIntBits(p0)); return this;".to_owned();
+            }
+            ("readFloat", "float", "()F") => {
+                return "return Float.intBitsToFloat(horizonGetInt());".to_owned();
+            }
+            ("writeDouble", _, "(D)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutLong(Double.doubleToRawLongBits(p0)); return this;".to_owned();
+            }
+            ("readDouble", "double", "()D") => {
+                return "return Double.longBitsToDouble(horizonGetLong());".to_owned();
+            }
+            ("writeBoolean", _, "(Z)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPut(p0 ? 1 : 0); return this;".to_owned();
             }
             ("readBoolean", "boolean", "()Z") => {
-                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Boolean && ((Boolean) horizonValues.get(horizonReadIndex - 1)).booleanValue();".to_owned();
+                return "return horizonGet() != 0;".to_owned();
             }
+            // Strings: a UTF-8 length-prefixed payload bounded by `maxLength`
+            // characters (vanilla's 3-bytes-per-char worst case).
+            ("writeUtf", _, "(Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutUtf(p0, 32767); return this;".to_owned();
+            }
+            ("writeUtf", _, "(Ljava/lang/String;I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutUtf(p0, p1); return this;".to_owned();
+            }
+            ("readUtf", "java.lang.String", "()Ljava/lang/String;") => {
+                return "return horizonGetUtf(32767);".to_owned();
+            }
+            ("readUtf", "java.lang.String", "(I)Ljava/lang/String;") => {
+                return "return horizonGetUtf(p0);".to_owned();
+            }
+            // Identifiers (`ResourceLocation` before the 26.3 rename).
             (
-                "writeResourceLocation",
-                "net.minecraft.network.FriendlyByteBuf",
+                "writeResourceLocation" | "writeIdentifier",
+                _,
                 "(Lnet/minecraft/resources/Identifier;)Lnet/minecraft/network/FriendlyByteBuf;",
             ) => {
-                return "horizonValues.add(p0); return this;".to_owned();
+                return "horizonPutUtf(p0 == null ? \"\" : p0.toString(), 32767); return this;"
+                    .to_owned();
             }
             (
-                "readResourceLocation",
+                "readResourceLocation" | "readIdentifier",
                 "net.minecraft.resources.Identifier",
                 "()Lnet/minecraft/resources/Identifier;",
             ) => {
-                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof net.minecraft.resources.Identifier ? (net.minecraft.resources.Identifier) horizonValues.get(horizonReadIndex - 1) : new net.minecraft.resources.Identifier();".to_owned();
+                return "String value = horizonGetUtf(32767); int separator = value.indexOf(':'); return separator < 0 ? new net.minecraft.resources.Identifier(\"minecraft\", value) : new net.minecraft.resources.Identifier(value.substring(0, separator), value.substring(separator + 1));"
+                    .to_owned();
+            }
+            // Value objects.
+            ("writeUUID", _, "(Ljava/util/UUID;)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutLong(p0.getMostSignificantBits()); horizonPutLong(p0.getLeastSignificantBits()); return this;"
+                    .to_owned();
+            }
+            ("readUUID", "java.util.UUID", "()Ljava/util/UUID;") => {
+                return "return new java.util.UUID(horizonGetLong(), horizonGetLong());".to_owned();
             }
             (
-                "writeEnum",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(Ljava/lang/Enum;)Lnet/minecraft/network/FriendlyByteBuf;",
+                "writeBlockPos",
+                _,
+                "(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/network/FriendlyByteBuf;",
             ) => {
-                return "horizonValues.add(p0); return this;".to_owned();
+                return "horizonPutLong(((long) p0.getX() & 0x3FFFFFFL) << 38 | ((long) p0.getZ() & 0x3FFFFFFL) << 12 | ((long) p0.getY() & 0xFFFL)); return this;"
+                    .to_owned();
+            }
+            ("readBlockPos", "net.minecraft.core.BlockPos", "()Lnet/minecraft/core/BlockPos;") => {
+                return "long packed = horizonGetLong(); return new net.minecraft.core.BlockPos((int) (packed >> 38), (int) (packed << 52 >> 52), (int) (packed << 26 >> 38));"
+                    .to_owned();
+            }
+            (
+                "writeChunkPos",
+                _,
+                "(Lnet/minecraft/core/ChunkPos;)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonPutInt(p0.x); horizonPutInt(p0.z); return this;".to_owned();
+            }
+            ("readChunkPos", "net.minecraft.core.ChunkPos", "()Lnet/minecraft/core/ChunkPos;") => {
+                return "return new net.minecraft.core.ChunkPos(horizonGetInt(), horizonGetInt());"
+                    .to_owned();
+            }
+            // Arrays: `writeByteArray` keeps the length prefix, `writeBytes`
+            // is Netty's raw form with the same bounded buffer underneath.
+            ("writeByteArray", _, "([B)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); horizonPutBytes(p0); return this;"
+                    .to_owned();
+            }
+            ("writeBytes", _, "([B)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutBytes(p0); return this;".to_owned();
+            }
+            ("readByteArray", "byte[]", "()[B") => {
+                return "return horizonGetByteArray(HORIZON_MAX_BYTES);".to_owned();
+            }
+            ("readByteArray", "byte[]", "(I)[B") => {
+                return "return horizonGetByteArray(p0);".to_owned();
+            }
+            // Enums travel as their ordinal VarInt, like vanilla.
+            ("writeEnum", _, "(Ljava/lang/Enum;)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutVarInt(p0 == null ? -1 : p0.ordinal()); return this;".to_owned();
             }
             ("readEnum", "java.lang.Enum", "(Ljava/lang/Class;)Ljava/lang/Enum;") => {
-                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof java.lang.Enum ? (java.lang.Enum) horizonValues.get(horizonReadIndex - 1) : null;".to_owned();
+                return "int ordinal = horizonGetVarInt(); if (p0 == null) return null; Object[] constants = p0.getEnumConstants(); return constants != null && ordinal >= 0 && ordinal < constants.length ? (java.lang.Enum) constants[ordinal] : null;"
+                    .to_owned();
             }
+            // Nullable/optional values write a presence byte and delegate the
+            // value itself to the caller's bounded writer, so the pair
+            // round-trips through the same cursor.
             (
                 "writeNullable",
-                "net.minecraft.network.FriendlyByteBuf",
+                _,
                 "(Ljava/lang/Object;Ljava/util/function/BiConsumer;)Lnet/minecraft/network/FriendlyByteBuf;",
             ) => {
-                return "horizonValues.add(p0); return this;".to_owned();
+                return "if (p0 == null) { horizonPut(0); } else { horizonPut(1); p1.accept(this, p0); } return this;"
+                    .to_owned();
             }
             (
                 "readNullable",
                 "java.lang.Object",
                 "(Ljava/util/function/Function;)Ljava/lang/Object;",
             ) => {
-                return "return horizonReadIndex < horizonValues.size() ? horizonValues.get(horizonReadIndex++) : null;".to_owned();
-            }
-            _ => {}
-        }
-    }
-    // Primitive and cursor operations cover the wire-level portion used by
-    // modern Fabric/Forge payload records.  Keep values typed in the same
-    // bounded sequence as the existing UTF/VarInt support: this lets a
-    // payload encode/decode round-trip during bootstrap without pretending to
-    // implement Netty's backing buffer or packet framing.
-    if class == "net/minecraft/network/FriendlyByteBuf" {
-        match (method, ret, descriptor) {
-            (
-                "writeByte",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
-            )
-            | (
-                "writeShort",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
-            ) => {
-                return "horizonValues.add(p0); return this;".to_owned();
-            }
-            ("readByte", "byte", "()B") => {
-                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Number ? ((Number) horizonValues.get(horizonReadIndex - 1)).byteValue() : 0;".to_owned();
-            }
-            ("readShort", "short", "()S") => {
-                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Number ? ((Number) horizonValues.get(horizonReadIndex - 1)).shortValue() : 0;".to_owned();
-            }
-            (
-                "writeLong",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(J)Lnet/minecraft/network/FriendlyByteBuf;",
-            )
-            | (
-                "writeVarLong",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(J)Lnet/minecraft/network/FriendlyByteBuf;",
-            )
-            | (
-                "writeFloat",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(F)Lnet/minecraft/network/FriendlyByteBuf;",
-            )
-            | (
-                "writeDouble",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(D)Lnet/minecraft/network/FriendlyByteBuf;",
-            ) => {
-                return "horizonValues.add(p0); return this;".to_owned();
-            }
-            ("readLong", "long", "()J") | ("readVarLong", "long", "()J") => {
-                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Number ? ((Number) horizonValues.get(horizonReadIndex - 1)).longValue() : 0L;".to_owned();
-            }
-            ("readFloat", "float", "()F") => {
-                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Number ? ((Number) horizonValues.get(horizonReadIndex - 1)).floatValue() : 0.0f;".to_owned();
-            }
-            ("readDouble", "double", "()D") => {
-                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Number ? ((Number) horizonValues.get(horizonReadIndex - 1)).doubleValue() : 0.0d;".to_owned();
-            }
-            (
-                "writeByteArray",
-                "net.minecraft.network.FriendlyByteBuf",
-                "([B)Lnet/minecraft/network/FriendlyByteBuf;",
-            )
-            | (
-                "writeBytes",
-                "net.minecraft.network.FriendlyByteBuf",
-                "([B)Lnet/minecraft/network/FriendlyByteBuf;",
-            ) => {
-                return "horizonValues.add(p0 == null ? new byte[0] : p0.clone()); return this;"
-                    .to_owned();
-            }
-            ("readByteArray", "byte[]", "()[B") => {
-                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof byte[] ? ((byte[]) horizonValues.get(horizonReadIndex - 1)).clone() : new byte[0];".to_owned();
-            }
-            ("readByteArray", "byte[]", "(I)[B") => {
-                return "if (horizonReadIndex >= horizonValues.size() || !(horizonValues.get(horizonReadIndex++) instanceof byte[])) return new byte[0]; byte[] value = ((byte[]) horizonValues.get(horizonReadIndex - 1)).clone(); return value.length <= p0 ? value : java.util.Arrays.copyOf(value, p0);".to_owned();
-            }
-            (
-                "writeUUID",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(Ljava/util/UUID;)Lnet/minecraft/network/FriendlyByteBuf;",
-            ) => {
-                return "horizonValues.add(p0); return this;".to_owned();
-            }
-            ("readUUID", "java.util.UUID", "()Ljava/util/UUID;") => {
-                return "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof java.util.UUID ? (java.util.UUID) horizonValues.get(horizonReadIndex - 1) : new java.util.UUID(0L, 0L);".to_owned();
-            }
-            (
-                "readerIndex",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
-            ) => {
-                return "horizonReadIndex = Math.max(0, Math.min(p0, horizonValues.size())); return this;".to_owned();
-            }
-            ("readerIndex", "int", "()I") => return "return horizonReadIndex;".to_owned(),
-            ("readableBytes", "int", "()I") => {
-                return "return Math.max(0, horizonValues.size() - horizonReadIndex);".to_owned();
-            }
-            ("isReadable", "boolean", "()Z") => {
-                return "return horizonReadIndex < horizonValues.size();".to_owned();
-            }
-            (
-                "skipBytes",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
-            ) => {
-                return "horizonReadIndex = Math.min(horizonValues.size(), horizonReadIndex + Math.max(0, p0)); return this;".to_owned();
-            }
-            (
-                "clear",
-                "net.minecraft.network.FriendlyByteBuf",
-                "()Lnet/minecraft/network/FriendlyByteBuf;",
-            ) => {
-                return "horizonValues.clear(); horizonReadIndex = 0; return this;".to_owned();
+                return "return horizonGet() == 0 ? null : p0.apply(this);".to_owned();
             }
             (
                 "writeOptional",
-                "net.minecraft.network.FriendlyByteBuf",
+                _,
                 "(Ljava/util/Optional;Ljava/util/function/BiConsumer;)Lnet/minecraft/network/FriendlyByteBuf;",
             ) => {
-                return "horizonValues.add(p0); return this;".to_owned();
+                return "if (p0 == null || p0.isEmpty()) { horizonPut(0); } else { horizonPut(1); p1.accept(this, p0.get()); } return this;"
+                    .to_owned();
             }
             (
                 "readOptional",
                 "java.util.Optional",
                 "(Ljava/util/function/Function;)Ljava/util/Optional;",
             ) => {
-                return "if (horizonReadIndex >= horizonValues.size()) return java.util.Optional.empty(); Object value = horizonValues.get(horizonReadIndex++); return value instanceof java.util.Optional ? (java.util.Optional) value : java.util.Optional.ofNullable(value);".to_owned();
+                return "return horizonGet() == 0 ? java.util.Optional.empty() : java.util.Optional.ofNullable(p0.apply(this));"
+                    .to_owned();
             }
+            // Opaque markers: an NBT tag has no wire shape in the façade, so
+            // it keeps the kind-checked FIFO and a null past the end.
+            ("writeNbt", _, _) => return "horizonValues.add(p0); return this;".to_owned(),
+            ("readNbt", _, _) => {
+                return format!(
+                    "return horizonReadIndex < horizonValues.size() ? ({ret}) horizonValues.get(horizonReadIndex++) : null;"
+                );
+            }
+            // Bounded buffer counters.
+            ("readerIndex", "int", "()I") => return "return horizonByteReadIndex;".to_owned(),
+            ("readerIndex", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonByteReadIndex = Math.max(0, Math.min(p0, horizonWriteIndex)); return this;"
+                    .to_owned();
+            }
+            ("writerIndex", "int", "()I") => return "return horizonWriteIndex;".to_owned(),
+            ("writerIndex", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonSetWriterIndex(p0); return this;".to_owned();
+            }
+            ("readableBytes", "int", "()I") | ("remaining", "int", "()I") => {
+                return "return horizonReadable();".to_owned();
+            }
+            ("isReadable", "boolean", "()Z") => {
+                return "return horizonReadable() > 0;".to_owned();
+            }
+            ("isReadable", "boolean", "(I)Z") => {
+                return "return horizonReadable() >= p0;".to_owned();
+            }
+            ("skipBytes", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonSkip(p0); return this;".to_owned();
+            }
+            ("clear", _, _) => {
+                return "horizonWriteIndex = 0; horizonByteReadIndex = 0; horizonBytes = new byte[0]; horizonValues.clear(); horizonReadIndex = 0; return this;"
+                    .to_owned();
+            }
+            ("discardReadBytes", _, _) => return "horizonCompact(); return this;".to_owned(),
             _ => {}
         }
     }
@@ -4738,6 +5015,151 @@ mod tests {
         assert!(source.contains("private final PayloadRegistrar horizonRegistrar"));
         assert!(source.contains("return horizonRegistrar;"));
         assert!(source.contains("default IEventBus unregister(Object object) { return this; }"));
+        // Each direction keeps the payload types it was handed, so bootstrap
+        // can read back the registered ids without a live channel.
+        assert!(source.contains(
+            "private static final java.util.Map<String, java.util.List<Object>> horizonPayloads"
+        ));
+        for direction in [
+            "playToServer",
+            "playToClient",
+            "playBidirectional",
+            "configurationToServer",
+            "configurationToClient",
+            "configurationBidirectional",
+        ] {
+            let retained = format!("horizonRetain(\"{direction}\", type)");
+            assert!(
+                source.contains(&retained),
+                "missing direction: {directive}",
+                directive = direction
+            );
+        }
+        assert!(source.contains(
+            "try { return type.getClass().getMethod(\"id\").invoke(type); } catch (Throwable ignored) { return null; }"
+        ));
+        assert!(source.contains("public PayloadRegistrar optional() { return this; }"));
+    }
+
+    #[test]
+    fn fabric_payload_type_registry_retains_direction_payloads() {
+        let source = include_str!("facade.rs");
+        // The marker is a Fabric API library class: it is emitted only when
+        // the real API jar is not on the target's classpath.
+        assert!(source.contains("let uses_fabric_payloads = target.iter().any(|class| {"));
+        assert!(
+            source.contains("if uses_fabric_payloads && !available.contains(payload_registry) {")
+        );
+        assert!(source.contains("const FABRIC_PAYLOAD_TYPE_REGISTRY: &str"));
+        for entry in [
+            "public static <T> PayloadTypeRegistrar<T> playS2C() { return new PayloadTypeRegistrar<>(\"playToClient\"); }",
+            "public static <T> PayloadTypeRegistrar<T> playC2S() { return new PayloadTypeRegistrar<>(\"playToServer\"); }",
+            "public static <T> PayloadTypeRegistrar<T> configurationS2C() { return new PayloadTypeRegistrar<>(\"configurationToClient\"); }",
+            "public static <T> PayloadTypeRegistrar<T> configurationC2S() { return new PayloadTypeRegistrar<>(\"configurationToServer\"); }",
+            "public PayloadTypeRegistrar<T> register(Object type, Object codec) {",
+            "public static java.util.List<Object> horizonPayloadIds(String direction) {",
+        ] {
+            assert!(source.contains(entry), "missing fragment: {entry}");
+        }
+        // No game class is required for the id lookup, so the shim stays
+        // compilable against a jar-only target.
+        assert!(!FABRIC_PAYLOAD_TYPE_REGISTRY.contains("net.minecraft."));
+        assert!(!NEOFORGE_PAYLOAD_REGISTRAR.contains("net.minecraft."));
+        assert!(FABRIC_PAYLOAD_TYPE_REGISTRY.contains("public final class PayloadTypeRegistry {"));
+    }
+
+    /// The payload registries are compiled and run for real: direction-keyed
+    /// id retention is behaviour, not a source shape.
+    #[test]
+    fn payload_registries_compile_and_retain_ids() {
+        use std::{path::PathBuf, process::Command};
+        let probe = r#"public class PayloadProbe {
+    public static final class Type {
+        private final Object id;
+        public Type(Object id) { this.id = id; }
+        public Object id() { return id; }
+    }
+    public static void main(String[] args) {
+        net.neoforged.neoforge.network.registration.PayloadRegistrar registrar = new net.neoforged.neoforge.network.registration.PayloadRegistrar();
+        registrar.playToServer(new Type("mod:server"), null, null).playToClient(new Type("mod:client"), null, null);
+        registrar.configurationToServer(new Type("mod:config"), null, null).optional().versioned("1").playBidirectional(new Type("mod:both"), null, null);
+        if (registrar.horizonRegistrationCount() != 4) throw new AssertionError("count " + registrar.horizonRegistrationCount());
+        if (!"mod:server".equals(net.neoforged.neoforge.network.registration.PayloadRegistrar.horizonPayloadIds("playToServer").get(0).toString())) throw new AssertionError("server id");
+        if (!"mod:client".equals(net.neoforged.neoforge.network.registration.PayloadRegistrar.horizonPayloadIds("playToClient").get(0).toString())) throw new AssertionError("client id");
+        if (!"mod:config".equals(net.neoforged.neoforge.network.registration.PayloadRegistrar.horizonPayloadIds("configurationToServer").get(0).toString())) throw new AssertionError("config id");
+        if (!"mod:both".equals(net.neoforged.neoforge.network.registration.PayloadRegistrar.horizonPayloadIds("playBidirectional").get(0).toString())) throw new AssertionError("both id");
+        net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.PayloadTypeRegistrar<Object> fabric = net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.playS2C();
+        fabric.register(new Type("mod:s2c"), null).register(new Type("mod:s2c2"), null);
+        net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.playC2S().register(new Type("mod:c2s"), null);
+        net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.configurationS2C().register(new Type("mod:cfg"), null);
+        if (fabric.horizonRegistrationCount() != 2) throw new AssertionError("fabric count");
+        if (!"playToClient".equals(fabric.horizonDirection())) throw new AssertionError("fabric direction");
+        if (net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.horizonPayloadIds("playToClient").size() != 2) throw new AssertionError("fabric ids");
+        if (!"mod:c2s".equals(net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.horizonPayloadIds("playToServer").get(0).toString())) throw new AssertionError("fabric c2s id");
+        if (net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.horizonPayloadIds("configurationToClient").size() != 1) throw new AssertionError("fabric config ids");
+        System.out.println("horizon payload registries ok");
+    }
+}
+"#;
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-payloads-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let mut files = Vec::new();
+        let mut write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write java shim");
+            files.push(file);
+        };
+        write(
+            "net/neoforged/neoforge/network/registration/PayloadRegistrar.java",
+            NEOFORGE_PAYLOAD_REGISTRAR,
+        );
+        write(
+            "net/fabricmc/fabric/api/networking/v1/PayloadTypeRegistry.java",
+            FABRIC_PAYLOAD_TYPE_REGISTRY,
+        );
+        write("PayloadProbe.java", probe);
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(javac_status) = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(
+            javac_status.success(),
+            "javac rejected the generated payload registries"
+        );
+        let java = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("java"))
+            .unwrap_or_else(|| PathBuf::from("java"));
+        let output = Command::new(&java)
+            .arg("-cp")
+            .arg(&classes)
+            .arg("PayloadProbe")
+            .output()
+            .expect("run the payload probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "payload probe failed: {stderr}");
+        assert!(
+            stdout.contains("horizon payload registries ok"),
+            "probe output: {stdout}{stderr}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4860,132 +5282,427 @@ mod tests {
         assert!(source.contains("(\"getCount\", \"()I\", \"int\", \"\")"));
     }
 
-    #[test]
-    fn friendly_byte_buf_keeps_bounded_payload_values() {
-        let source = include_str!("facade.rs");
-        assert!(source.contains("protected java.util.List<Object> horizonValues"));
-        assert!(source.contains("horizonValues.add(p0); return this;"));
-        assert_eq!(
-            runtime_body_with_descriptor(
-                "net/minecraft/network/FriendlyByteBuf",
-                "writeUtf",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;",
-            ),
-            "horizonValues.add(p0); return this;"
-        );
-        assert_eq!(
-            runtime_body_with_descriptor(
-                "net/minecraft/network/FriendlyByteBuf",
-                "readVarInt",
-                "int",
-                "()I",
-            ),
-            "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Integer ? ((Integer) horizonValues.get(horizonReadIndex - 1)).intValue() : 0;"
-        );
-        assert_eq!(
-            runtime_body_with_descriptor(
-                "net/minecraft/network/FriendlyByteBuf",
-                "readResourceLocation",
-                "net.minecraft.resources.Identifier",
-                "()Lnet/minecraft/resources/Identifier;",
-            ),
-            "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof net.minecraft.resources.Identifier ? (net.minecraft.resources.Identifier) horizonValues.get(horizonReadIndex - 1) : new net.minecraft.resources.Identifier();"
-        );
-        assert_eq!(
-            runtime_body_with_descriptor(
-                "net/minecraft/network/FriendlyByteBuf",
-                "writeEnum",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(Ljava/lang/Enum;)Lnet/minecraft/network/FriendlyByteBuf;",
-            ),
-            "horizonValues.add(p0); return this;"
-        );
-        assert_eq!(
-            runtime_body_with_descriptor(
-                "net/minecraft/network/FriendlyByteBuf",
-                "readEnum",
-                "java.lang.Enum",
-                "(Ljava/lang/Class;)Ljava/lang/Enum;",
-            ),
-            "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof java.lang.Enum ? (java.lang.Enum) horizonValues.get(horizonReadIndex - 1) : null;"
-        );
-        assert_eq!(
-            runtime_body_with_descriptor(
-                "net/minecraft/network/FriendlyByteBuf",
-                "readNullable",
-                "java.lang.Object",
-                "(Ljava/util/function/Function;)Ljava/lang/Object;",
-            ),
-            "return horizonReadIndex < horizonValues.size() ? horizonValues.get(horizonReadIndex++) : null;"
-        );
+    /// Every `FriendlyByteBuf` pair the façade encodes for real. The table
+    /// drives both the body assertions and the Java compile probe, so a pair
+    /// that silently falls back to the throwing stub fails the suite.
+    const FRIENDLY_BYTE_BUF_PAIRS: &[(&str, &str)] = &[
+        ("writeByte", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readByte", "()B"),
+        ("readUnsignedByte", "()S"),
+        ("writeShort", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readShort", "()S"),
+        ("readUnsignedShort", "()I"),
+        ("writeChar", "(C)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readChar", "()C"),
+        ("writeInt", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readInt", "()I"),
+        ("writeVarInt", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readVarInt", "()I"),
+        ("writeLong", "(J)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readLong", "()J"),
+        ("writeVarLong", "(J)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readVarLong", "()J"),
+        ("writeFloat", "(F)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readFloat", "()F"),
+        ("writeDouble", "(D)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readDouble", "()D"),
+        ("writeBoolean", "(Z)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readBoolean", "()Z"),
+        (
+            "writeUtf",
+            "(Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        (
+            "writeUtf",
+            "(Ljava/lang/String;I)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readUtf", "()Ljava/lang/String;"),
+        ("readUtf", "(I)Ljava/lang/String;"),
+        (
+            "writeResourceLocation",
+            "(Lnet/minecraft/resources/Identifier;)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        (
+            "readResourceLocation",
+            "()Lnet/minecraft/resources/Identifier;",
+        ),
+        (
+            "writeIdentifier",
+            "(Lnet/minecraft/resources/Identifier;)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readIdentifier", "()Lnet/minecraft/resources/Identifier;"),
+        (
+            "writeUUID",
+            "(Ljava/util/UUID;)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readUUID", "()Ljava/util/UUID;"),
+        (
+            "writeBlockPos",
+            "(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readBlockPos", "()Lnet/minecraft/core/BlockPos;"),
+        (
+            "writeChunkPos",
+            "(Lnet/minecraft/core/ChunkPos;)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readChunkPos", "()Lnet/minecraft/core/ChunkPos;"),
+        (
+            "writeByteArray",
+            "([B)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readByteArray", "()[B"),
+        ("readByteArray", "(I)[B"),
+        ("writeBytes", "([B)Lnet/minecraft/network/FriendlyByteBuf;"),
+        (
+            "writeEnum",
+            "(Ljava/lang/Enum;)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readEnum", "(Ljava/lang/Class;)Ljava/lang/Enum;"),
+        (
+            "writeNullable",
+            "(Ljava/lang/Object;Ljava/util/function/BiConsumer;)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        (
+            "readNullable",
+            "(Ljava/util/function/Function;)Ljava/lang/Object;",
+        ),
+        (
+            "writeOptional",
+            "(Ljava/util/Optional;Ljava/util/function/BiConsumer;)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        (
+            "readOptional",
+            "(Ljava/util/function/Function;)Ljava/util/Optional;",
+        ),
+        ("readerIndex", "()I"),
+        ("readerIndex", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("writerIndex", "()I"),
+        ("writerIndex", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readableBytes", "()I"),
+        ("remaining", "()I"),
+        ("isReadable", "()Z"),
+        ("isReadable", "(I)Z"),
+        ("skipBytes", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("clear", "()Lnet/minecraft/network/FriendlyByteBuf;"),
+        (
+            "discardReadBytes",
+            "()Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+    ];
+
+    fn friendly_byte_buf_body(method: &str, descriptor: &str) -> String {
+        let (ret, _) = signature(descriptor);
+        runtime_body_with_descriptor(
+            "net/minecraft/network/FriendlyByteBuf",
+            method,
+            &ret,
+            descriptor,
+        )
     }
 
     #[test]
-    fn friendly_byte_buf_supports_typed_primitives_and_cursor() {
+    fn friendly_byte_buf_state_is_bounded_and_wire_backed() {
+        let source = include_str!("facade.rs");
+        assert!(source.contains("protected java.util.List<Object> horizonValues"));
+        assert!(source.contains("protected byte[] horizonBytes = new byte[0];"));
+        assert!(source.contains("protected int horizonWriteIndex;"));
+        assert!(source.contains("protected int horizonByteReadIndex;"));
+        assert!(source.contains("protected static final int HORIZON_MAX_BYTES = 1048576;"));
+        for helper in [
+            "protected void horizonEnsure(int extra)",
+            "protected void horizonPutBytes(byte[] value)",
+            "protected void horizonPutVarInt(int value)",
+            "protected long horizonGetVarLong()",
+            "protected void horizonPutUtf(String value, int maxLength)",
+            "protected String horizonGetUtf(int maxLength)",
+            "protected byte[] horizonGetByteArray(int maxLength)",
+            "protected void horizonCompact()",
+            "protected void horizonSetWriterIndex(int index)",
+        ] {
+            assert!(source.contains(helper), "missing helper: {helper}");
+        }
+        // The state block is injected into the generated buffer, and a
+        // Netty-backed construction copies its readable window in.
+        assert!(source.contains("write!(out, \"{FRIENDLY_BYTE_BUF_STATE}\");"));
+        assert!(source.contains("\"(Lio/netty/buffer/ByteBuf;)V\""));
+        assert!(source.contains("p0.readBytes(bytes)"));
+    }
+
+    #[test]
+    fn friendly_byte_buf_bodies_encode_and_decode() {
+        for (method, descriptor) in FRIENDLY_BYTE_BUF_PAIRS {
+            let body = friendly_byte_buf_body(method, descriptor);
+            assert!(
+                !body.contains("UnsupportedOperationException"),
+                "{method}{descriptor} has no body: {body}"
+            );
+            // `clear` empties both cursors, which is the one legitimate
+            // mention of the opaque marker FIFO in a wire pair.
+            assert!(
+                *method == "clear" || !body.contains("horizonValues"),
+                "{method}{descriptor} still uses the marker FIFO: {body}"
+            );
+        }
+        assert_eq!(
+            friendly_byte_buf_body("writeVarInt", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+            "horizonPutVarInt(p0); return this;"
+        );
+        assert_eq!(
+            friendly_byte_buf_body("readInt", "()I"),
+            "return horizonGetInt();"
+        );
+        assert_eq!(
+            friendly_byte_buf_body("readUtf", "(I)Ljava/lang/String;"),
+            "return horizonGetUtf(p0);"
+        );
+        assert_eq!(
+            friendly_byte_buf_body(
+                "writeUtf",
+                "(Ljava/lang/String;I)Lnet/minecraft/network/FriendlyByteBuf;"
+            ),
+            "horizonPutUtf(p0, p1); return this;"
+        );
+        assert!(
+            friendly_byte_buf_body(
+                "readResourceLocation",
+                "()Lnet/minecraft/resources/Identifier;"
+            )
+            .contains("new net.minecraft.resources.Identifier(value.substring(0, separator)")
+        );
+        assert!(
+            friendly_byte_buf_body(
+                "writeBlockPos",
+                "(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/network/FriendlyByteBuf;"
+            )
+            .contains("horizonPutLong(((long) p0.getX() & 0x3FFFFFFL) << 38")
+        );
+        assert_eq!(
+            friendly_byte_buf_body(
+                "writeChunkPos",
+                "(Lnet/minecraft/core/ChunkPos;)Lnet/minecraft/network/FriendlyByteBuf;"
+            ),
+            "horizonPutInt(p0.x); horizonPutInt(p0.z); return this;"
+        );
+        assert_eq!(
+            friendly_byte_buf_body("readChunkPos", "()Lnet/minecraft/core/ChunkPos;"),
+            "return new net.minecraft.core.ChunkPos(horizonGetInt(), horizonGetInt());"
+        );
+        assert_eq!(
+            friendly_byte_buf_body(
+                "writeByteArray",
+                "([B)Lnet/minecraft/network/FriendlyByteBuf;"
+            ),
+            "horizonPutVarInt(p0 == null ? 0 : p0.length); horizonPutBytes(p0); return this;"
+        );
+        assert_eq!(
+            friendly_byte_buf_body(
+                "readNullable",
+                "(Ljava/util/function/Function;)Ljava/lang/Object;"
+            ),
+            "return horizonGet() == 0 ? null : p0.apply(this);"
+        );
+        // The enum pair keeps working, now as the ordinal VarInt vanilla writes.
+        assert_eq!(
+            friendly_byte_buf_body(
+                "writeEnum",
+                "(Ljava/lang/Enum;)Lnet/minecraft/network/FriendlyByteBuf;"
+            ),
+            "horizonPutVarInt(p0 == null ? -1 : p0.ordinal()); return this;"
+        );
+        let read_enum = friendly_byte_buf_body("readEnum", "(Ljava/lang/Class;)Ljava/lang/Enum;");
+        assert!(read_enum.contains("p0.getEnumConstants()"), "{read_enum}");
+        assert!(
+            read_enum.contains("(java.lang.Enum) constants[ordinal]"),
+            "{read_enum}"
+        );
+        // Opaque values keep the kind-checked marker FIFO.
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/network/FriendlyByteBuf",
-                "writeLong",
+                "writeNbt",
                 "net.minecraft.network.FriendlyByteBuf",
-                "(J)Lnet/minecraft/network/FriendlyByteBuf;",
+                "(Lnet/minecraft/nbt/Tag;)Lnet/minecraft/network/FriendlyByteBuf;",
             ),
             "horizonValues.add(p0); return this;"
         );
         assert_eq!(
             runtime_body_with_descriptor(
                 "net/minecraft/network/FriendlyByteBuf",
-                "readDouble",
-                "double",
-                "()D",
+                "readNbt",
+                "net.minecraft.nbt.Tag",
+                "()Lnet/minecraft/nbt/Tag;",
             ),
-            "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof Number ? ((Number) horizonValues.get(horizonReadIndex - 1)).doubleValue() : 0.0d;"
+            "return horizonReadIndex < horizonValues.size() ? (net.minecraft.nbt.Tag) horizonValues.get(horizonReadIndex++) : null;"
         );
-        assert_eq!(
-            runtime_body_with_descriptor(
+    }
+
+    /// The probe `main` the compile test runs: every bounded pair must survive
+    /// a write → read round trip at the same cursor.
+    const FRIENDLY_BYTE_BUF_PROBE: &str = r#"    public static void main(String[] args) {
+        FriendlyByteBuf buf = new FriendlyByteBuf();
+        buf.writeByte(-7).writeShort(-300).writeInt(-123456789).writeVarInt(1234567);
+        buf.writeLong(-9007199254740993L).writeVarLong(1234567890123L);
+        buf.writeFloat(1.5f).writeDouble(-2.25d).writeBoolean(true).writeChar('Z');
+        buf.writeUtf("h\u00e9llo").writeUtf("bounded", 16);
+        buf.writeResourceLocation(new net.minecraft.resources.Identifier("mod", "payload"));
+        buf.writeUUID(new java.util.UUID(1L, 2L));
+        buf.writeBlockPos(new net.minecraft.core.BlockPos(-1000, 64, 2000));
+        buf.writeChunkPos(new net.minecraft.core.ChunkPos(-5, 6));
+        buf.writeByteArray(new byte[] {1, 2, 3});
+        if (buf.readByte() != -7) throw new AssertionError("byte");
+        if (buf.readShort() != -300) throw new AssertionError("short");
+        if (buf.readInt() != -123456789) throw new AssertionError("int");
+        if (buf.readVarInt() != 1234567) throw new AssertionError("varint");
+        if (buf.readLong() != -9007199254740993L) throw new AssertionError("long");
+        if (buf.readVarLong() != 1234567890123L) throw new AssertionError("varlong");
+        if (buf.readFloat() != 1.5f) throw new AssertionError("float");
+        if (buf.readDouble() != -2.25d) throw new AssertionError("double");
+        if (!buf.readBoolean()) throw new AssertionError("boolean");
+        if (buf.readChar() != 'Z') throw new AssertionError("char");
+        if (!"h\u00e9llo".equals(buf.readUtf())) throw new AssertionError("utf");
+        if (!"bounded".equals(buf.readUtf(16))) throw new AssertionError("utf max");
+        if (!"mod:payload".equals(buf.readResourceLocation().toString())) throw new AssertionError("identifier");
+        java.util.UUID id = buf.readUUID();
+        if (id.getMostSignificantBits() != 1L || id.getLeastSignificantBits() != 2L) throw new AssertionError("uuid");
+        net.minecraft.core.BlockPos pos = buf.readBlockPos();
+        if (pos.getX() != -1000 || pos.getY() != 64 || pos.getZ() != 2000) throw new AssertionError("blockpos " + pos);
+        net.minecraft.core.ChunkPos chunk = buf.readChunkPos();
+        if (chunk.x != -5 || chunk.z != 6) throw new AssertionError("chunkpos");
+        byte[] raw = buf.readByteArray();
+        if (raw.length != 3 || raw[2] != 3) throw new AssertionError("byte array");
+        if (buf.readableBytes() != 0 || buf.isReadable()) throw new AssertionError("drained " + buf.readableBytes());
+        java.util.function.BiConsumer<FriendlyByteBuf, String> writeString = (b, value) -> b.writeUtf(value);
+        java.util.function.Function<FriendlyByteBuf, Object> readString = b -> b.readUtf();
+        FriendlyByteBuf second = new FriendlyByteBuf();
+        second.writeEnum(java.time.DayOfWeek.THURSDAY).writeNullable("value", writeString);
+        second.writeOptional(java.util.Optional.of("opt"), writeString);
+        if (second.readEnum(java.time.DayOfWeek.class) != java.time.DayOfWeek.THURSDAY) throw new AssertionError("enum");
+        if (!"value".equals(second.readNullable(readString))) throw new AssertionError("nullable");
+        if (!java.util.Optional.of("opt").equals(second.readOptional(readString))) throw new AssertionError("optional");
+        if (new FriendlyByteBuf().readNullable(readString) != null) throw new AssertionError("empty nullable");
+        if (!new FriendlyByteBuf().readUtf().isEmpty()) throw new AssertionError("empty utf");
+        if (new FriendlyByteBuf().readInt() != 0) throw new AssertionError("empty int");
+        FriendlyByteBuf cursor = new FriendlyByteBuf();
+        cursor.writeInt(0x01020304);
+        if (cursor.writerIndex() != 4 || cursor.readerIndex() != 0 || cursor.remaining() != 4) throw new AssertionError("index");
+        cursor.writerIndex(2);
+        if (cursor.readUnsignedShort() != 0x0102) throw new AssertionError("writer truncate");
+        cursor.discardReadBytes();
+        if (cursor.readerIndex() != 0 || cursor.readableBytes() != 0) throw new AssertionError("discard");
+        cursor.writeInt(42);
+        cursor.skipBytes(1);
+        if (cursor.readableBytes() != 3) throw new AssertionError("skip");
+        cursor.readerIndex(0);
+        cursor.discardReadBytes();
+        if (cursor.readInt() != 42) throw new AssertionError("compact read");
+        cursor.clear();
+        if (cursor.writerIndex() != 0 || cursor.readerIndex() != 0) throw new AssertionError("clear");
+        System.out.println("horizon FriendlyByteBuf round-trip ok");
+    }
+"#;
+
+    /// Minimal game-value stubs so the generated bodies compile on their own.
+    const FRIENDLY_BYTE_BUF_STUBS: &[(&str, &str)] = &[
+        (
+            "net/minecraft/resources/Identifier.java",
+            "package net.minecraft.resources;\npublic class Identifier {\n    private String horizonNamespace = \"minecraft\";\n    private String horizonPath = \"\";\n    public Identifier() {}\n    public Identifier(String namespace, String path) { this.horizonNamespace = namespace; this.horizonPath = path; }\n    public String getNamespace() { return horizonNamespace; }\n    public String getPath() { return horizonPath; }\n    public String toString() { return horizonNamespace + \":\" + horizonPath; }\n}\n",
+        ),
+        (
+            "net/minecraft/core/BlockPos.java",
+            "package net.minecraft.core;\npublic class BlockPos {\n    private int horizonX;\n    private int horizonY;\n    private int horizonZ;\n    public BlockPos() {}\n    public BlockPos(int x, int y, int z) { this.horizonX = x; this.horizonY = y; this.horizonZ = z; }\n    public int getX() { return horizonX; }\n    public int getY() { return horizonY; }\n    public int getZ() { return horizonZ; }\n    public String toString() { return horizonX + \",\" + horizonY + \",\" + horizonZ; }\n}\n",
+        ),
+        (
+            "net/minecraft/core/ChunkPos.java",
+            "package net.minecraft.core;\npublic class ChunkPos {\n    public final int x;\n    public final int z;\n    public ChunkPos(int x, int z) { this.x = x; this.z = z; }\n}\n",
+        ),
+        (
+            "net/minecraft/nbt/Tag.java",
+            "package net.minecraft.nbt;\npublic class Tag {}\n",
+        ),
+    ];
+
+    fn friendly_byte_buf_java_source() -> String {
+        use std::fmt::Write as _;
+        // The probe class is the generated shape itself: package, return
+        // type, and helper block as the façade writes them.
+        let mut source =
+            String::from("package net.minecraft.network;\n\npublic class FriendlyByteBuf {\n");
+        source.push_str(FRIENDLY_BYTE_BUF_STATE);
+        for (method, descriptor) in FRIENDLY_BYTE_BUF_PAIRS {
+            let (ret, params) = signature(descriptor);
+            let body = runtime_body_with_descriptor(
                 "net/minecraft/network/FriendlyByteBuf",
-                "writeByteArray",
-                "net.minecraft.network.FriendlyByteBuf",
-                "([B)Lnet/minecraft/network/FriendlyByteBuf;",
-            ),
-            "horizonValues.add(p0 == null ? new byte[0] : p0.clone()); return this;"
+                method,
+                &ret,
+                descriptor,
+            );
+            let _ = writeln!(source, "    public {ret} {method}({params}) {{ {body} }}");
+        }
+        source.push_str(FRIENDLY_BYTE_BUF_PROBE);
+        source.push_str("}\n");
+        source
+    }
+
+    #[test]
+    fn friendly_byte_buf_bodies_compile_and_round_trip() {
+        use std::{path::PathBuf, process::Command};
+        let source = friendly_byte_buf_java_source();
+        assert!(source.contains("protected byte[] horizonBytes = new byte[0];"));
+        assert!(!source.contains("UnsupportedOperationException"));
+        let root = std::env::temp_dir().join(format!("horizon-facade-fbb-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let mut files = Vec::new();
+        let mut write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write java stub");
+            files.push(file);
+        };
+        for (relative, text) in FRIENDLY_BYTE_BUF_STUBS {
+            write(relative, text);
+        }
+        write("net/minecraft/network/FriendlyByteBuf.java", &source);
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let javac_status = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status();
+        let Ok(javac_status) = javac_status else {
+            // No JDK here: the source assertions above remain the check.
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(
+            javac_status.success(),
+            "javac rejected the generated FriendlyByteBuf bodies"
         );
-        assert_eq!(
-            runtime_body_with_descriptor(
-                "net/minecraft/network/FriendlyByteBuf",
-                "readByteArray",
-                "byte[]",
-                "(I)[B",
-            ),
-            "if (horizonReadIndex >= horizonValues.size() || !(horizonValues.get(horizonReadIndex++) instanceof byte[])) return new byte[0]; byte[] value = ((byte[]) horizonValues.get(horizonReadIndex - 1)).clone(); return value.length <= p0 ? value : java.util.Arrays.copyOf(value, p0);"
+        let java = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("java"))
+            .unwrap_or_else(|| PathBuf::from("java"));
+        let output = Command::new(&java)
+            .arg("-cp")
+            .arg(&classes)
+            .arg("net.minecraft.network.FriendlyByteBuf")
+            .output()
+            .expect("run the generated buffer");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "probe failed: {stderr}");
+        assert!(
+            stdout.contains("horizon FriendlyByteBuf round-trip ok"),
+            "probe output: {stdout}{stderr}"
         );
-        assert_eq!(
-            runtime_body_with_descriptor(
-                "net/minecraft/network/FriendlyByteBuf",
-                "readUUID",
-                "java.util.UUID",
-                "()Ljava/util/UUID;",
-            ),
-            "return horizonReadIndex < horizonValues.size() && horizonValues.get(horizonReadIndex++) instanceof java.util.UUID ? (java.util.UUID) horizonValues.get(horizonReadIndex - 1) : new java.util.UUID(0L, 0L);"
-        );
-        assert_eq!(
-            runtime_body_with_descriptor(
-                "net/minecraft/network/FriendlyByteBuf",
-                "readerIndex",
-                "net.minecraft.network.FriendlyByteBuf",
-                "(I)Lnet/minecraft/network/FriendlyByteBuf;",
-            ),
-            "horizonReadIndex = Math.max(0, Math.min(p0, horizonValues.size())); return this;"
-        );
-        assert_eq!(
-            runtime_body_with_descriptor(
-                "net/minecraft/network/FriendlyByteBuf",
-                "readOptional",
-                "java.util.Optional",
-                "(Ljava/util/function/Function;)Ljava/util/Optional;",
-            ),
-            "if (horizonReadIndex >= horizonValues.size()) return java.util.Optional.empty(); Object value = horizonValues.get(horizonReadIndex++); return value instanceof java.util.Optional ? (java.util.Optional) value : java.util.Optional.ofNullable(value);"
-        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
