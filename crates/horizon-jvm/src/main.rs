@@ -21,9 +21,11 @@ use jni::{
     objects::{JClass, JObject, JObjectArray, JValue, JValueOwned},
 };
 use std::{
+    ffi::OsString,
     fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::{Command, ExitCode, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -282,7 +284,29 @@ fn main() -> ExitCode {
 }
 
 /// The usage line, kept as data so a test can check the kinds it names.
-const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...";
+const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...";
+
+/// The FML listing/report flags, removed from the jar list before anything is
+/// resolved. `--fml-list` is the short spelling of `--list-fml-mods`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FmlFlags {
+    list: bool,
+    report: bool,
+    json: bool,
+}
+
+fn take_fml_flags(args: &mut Vec<String>) -> FmlFlags {
+    let list = take_flag(args, &["--list-fml-mods", "--fml-list"]);
+    let report = take_flag(args, &["--fml-report"]);
+    let json = take_flag(args, &["--json"]);
+    FmlFlags { list, report, json }
+}
+
+fn take_flag(args: &mut Vec<String>, names: &[&str]) -> bool {
+    let before = args.len();
+    args.retain(|arg| !names.contains(&arg.as_str()));
+    args.len() != before
+}
 
 fn run() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -297,6 +321,7 @@ fn run() -> Result<(), String> {
     // Run the real Fabric or NeoForge loader instead of this probe's own scan.
     let real_loader = args.iter().any(|arg| arg == "--real-loader");
     args.retain(|arg| arg != "--real-loader");
+    let fml_flags = take_fml_flags(&mut args);
     let mixin_config_args = take_all(&mut args, "--mixin-config");
     let entry = take(&mut args, "--entry");
     let entry_kind = take(&mut args, "--entry-kind").unwrap_or_else(|| "main".to_owned());
@@ -310,7 +335,7 @@ fn run() -> Result<(), String> {
     if list_mixin_configs_only {
         return list_mixin_configs(&args, &mixin_config_args);
     }
-    if args.is_empty() {
+    if args.is_empty() && !fml_flags.list && !fml_flags.report {
         return Err(USAGE.to_owned());
     }
     if list_entrypoints_only {
@@ -318,15 +343,21 @@ fn run() -> Result<(), String> {
     }
     // The FML path starts its own Java process with the loader's exact
     // classpath; an embedded JVM changes how FML's in-dev locator sees it.
-    if real_loader && entry_kind == "neoforge" {
+    // `--list-fml-mods`/`--fml-report` use that same child probe without an
+    // entrypoint, so they select this path even without `--real-loader`.
+    if fml_flags.list || fml_flags.report || (real_loader && entry_kind == "neoforge") {
         let Some(libs) = libs.as_ref() else {
-            return Err(
-                "--real-loader --entry-kind neoforge needs --libs <installed server>/libraries"
-                    .to_owned(),
-            );
+            return Err("the FML probe needs --libs <installed server>/libraries".to_owned());
         };
         let mods: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
-        return run_real_neoforge(libs, &mods);
+        let mode = if fml_flags.list {
+            FmlMode::List
+        } else if fml_flags.report {
+            FmlMode::Report
+        } else {
+            FmlMode::Run
+        };
+        return run_real_neoforge(libs, &mods, mode, fml_flags.json);
     }
     let (entry_specs, pre_launch) = if real_loader {
         (Vec::new(), Vec::new())
@@ -1768,7 +1799,13 @@ public final class FmlProbe {
     FMLLoader loader = FMLLoader.create(startup);
     LoadingModList list = loader.getLoadingModList();
     System.out.println("mods=" + list.getMods().size());
-    for (var mod : list.getMods()) System.out.println("mod=" + mod.getModId());
+    for (var mod : list.getMods()) {
+      String version = versionOf(mod);
+      System.out.println("mod=" + mod.getModId() + (version.isEmpty() ? "" : "\t" + version));
+    }
+    // Discovery is the whole listing probe: no game bootstrap and no mod
+    // entrypoint runs when the child is started with `--list`.
+    if (args.length > 0 && args[0].equals("--list")) return;
     ClassLoader game = loader.getGameLayer().findLoader("minecraft");
     Class<?> constants = Class.forName("net.minecraft.SharedConstants", true, game);
     constants.getMethod("tryDetectVersion").invoke(null);
@@ -1777,12 +1814,275 @@ public final class FmlProbe {
     ModLoader.gatherAndInitializeMods(Runnable::run, Runnable::run, () -> {});
     System.out.println("initialized");
   }
+
+  private static String versionOf(Object mod) {
+    for (String name : new String[]{"getVersionString", "getVersion"}) {
+      try {
+        Object value = mod.getClass().getMethod(name).invoke(mod);
+        if (value != null) {
+          String text = value.toString();
+          if (!text.isEmpty()) return text;
+        }
+      } catch (ReflectiveOperationException ignored) {
+        // Try the next accessor, then report no version.
+      }
+    }
+    return "";
+  }
 }
 "#;
 
+const MAX_FML_MODS: usize = 512;
+const MAX_FML_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_FML_STDERR_BYTES: usize = 8 * 1024;
+
+/// The full run, a discovery-only listing, or a report over the same output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FmlMode {
+    Run,
+    List,
+    Report,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FmlMod {
+    id: String,
+    version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FmlReport {
+    status: &'static str,
+    server: String,
+    jars: usize,
+    mods: Vec<FmlMod>,
+    initialized: bool,
+    error: Option<String>,
+}
+
+impl FmlReport {
+    fn text(&self) -> String {
+        let mut lines = vec![
+            format!("status: {}", self.status),
+            format!("server: {}", self.server),
+            format!("jars: {}", self.jars),
+            format!("mods: {}", self.mods.len()),
+            format!("initialized: {}", self.initialized),
+        ];
+        lines.extend(fml_list_lines(&self.mods));
+        lines.extend(self.error.iter().map(|error| format!("error: {error}")));
+        bound_text(&(lines.join("\n") + "\n"), MAX_FML_OUTPUT_BYTES)
+    }
+
+    fn json(&self) -> String {
+        let mods: Vec<_> = self
+            .mods
+            .iter()
+            .map(|m| serde_json::json!({"id": m.id, "version": m.version.as_deref()}))
+            .collect();
+        let text = serde_json::json!({
+            "status": self.status, "server": self.server, "jars": self.jars,
+            "mods": mods, "initialized": self.initialized, "error": self.error,
+        })
+        .to_string();
+        if text.len() <= MAX_FML_OUTPUT_BYTES {
+            return text;
+        }
+        // Keep a hostile path or id under the bound without corrupting JSON.
+        serde_json::json!({
+            "status": self.status, "server": "", "jars": self.jars,
+            "mods": [], "initialized": self.initialized, "error": "report truncated",
+        })
+        .to_string()
+    }
+}
+
+/// `id<TAB>version`, or the id when FML exposes no version.
+fn fml_list_lines(mods: &[FmlMod]) -> Vec<String> {
+    mods.iter()
+        .map(|m| {
+            m.version
+                .as_ref()
+                .map_or_else(|| m.id.clone(), |version| format!("{}\t{version}", m.id))
+        })
+        .collect()
+}
+
+/// The child probe's `mod=<id>` lines; `mods=N` and diagnostics are ignored.
+fn parse_fml_mods(stdout: &str) -> Vec<FmlMod> {
+    let mut mods: Vec<FmlMod> = stdout
+        .lines()
+        .filter_map(|line| {
+            let entry = line.strip_prefix("mod=")?;
+            let (id, version) = entry
+                .split_once('\t')
+                .map_or((entry, None), |(id, version)| (id, Some(version)));
+            let id = id.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let version = version
+                .map(str::trim)
+                .filter(|version| !version.is_empty())
+                .map(str::to_owned);
+            Some(FmlMod {
+                id: id.to_owned(),
+                version,
+            })
+        })
+        .collect();
+    mods.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.version.cmp(&b.version)));
+    mods.dedup();
+    mods.truncate(MAX_FML_MODS);
+    mods
+}
+
+fn first_fml_error_line(stderr: &str, stdout: &str) -> String {
+    let mut fallback = None;
+    for line in stderr.lines().chain(stdout.lines()).map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        fallback.get_or_insert(line);
+        let lower = line.to_ascii_lowercase();
+        if [
+            "exception",
+            "error",
+            "failed",
+            "could not",
+            "caused by",
+            "unable to",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+        {
+            return line.chars().take(400).collect();
+        }
+    }
+    fallback.unwrap_or("no output").chars().take(400).collect()
+}
+
+/// Keep the first `limit` bytes, on a char boundary.
+fn bound_text(text: &str, limit: usize) -> String {
+    const MARKER: &str = "\n...(truncated)\n";
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit.saturating_sub(MARKER.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARKER}", &text[..end])
+}
+
+struct FmlCapture {
+    stdout: String,
+    stderr: String,
+    success: bool,
+    truncated: bool,
+}
+
+/// Read at most `limit` bytes, draining the rest so a chatty child cannot
+/// block on a full pipe or grow memory.
+fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<(String, bool)> {
+    let mut text = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        if text.len() < limit {
+            let take = (limit - text.len()).min(read);
+            text.extend_from_slice(&chunk[..take]);
+            truncated |= take < read;
+        } else {
+            truncated = true;
+        }
+    }
+    Ok((String::from_utf8_lossy(&text).into_owned(), truncated))
+}
+
+fn run_fml_probe(mut command: Command) -> Result<FmlCapture, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("could not start Java: {e}"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .map(|reader| std::thread::spawn(move || read_bounded(reader, MAX_FML_STDERR_BYTES)));
+    let stdout = match child.stdout.take() {
+        Some(reader) => read_bounded(reader, MAX_FML_OUTPUT_BYTES),
+        None => Ok((String::new(), false)),
+    };
+    let status = child.wait().map_err(|e| format!("waiting for Java: {e}"))?;
+    let (stdout, stdout_truncated) = stdout.map_err(|e| format!("FML stdout: {e}"))?;
+    let (stderr, stderr_truncated) = match stderr {
+        Some(handle) => handle
+            .join()
+            .map_err(|_| "FML stderr reader panicked".to_owned())?
+            .map_err(|e| format!("FML stderr: {e}"))?,
+        None => (String::new(), false),
+    };
+    Ok(FmlCapture {
+        stdout,
+        stderr,
+        success: status.success(),
+        truncated: stdout_truncated || stderr_truncated,
+    })
+}
+
+/// The child JVM arguments. Kept separate from [`Command`] so a test can check
+/// the exact listing/run hand-off without starting Java.
+fn fml_probe_args(
+    libs: &Path,
+    classpath: &Path,
+    versions: &[(String, String)],
+    mode: FmlMode,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "--add-opens".into(),
+        "java.base/java.lang.invoke=ALL-UNNAMED".into(),
+        "-Djdk.attach.allowAttachSelf=true".into(),
+        format!("-DlibraryDirectory={}", libs.display()).into(),
+        "-cp".into(),
+        classpath.as_os_str().to_owned(),
+    ];
+    for (name, value) in versions {
+        args.push(format!("-Dhorizon.fml.{name}={value}").into());
+    }
+    args.push("horizon.FmlProbe".into());
+    if mode == FmlMode::List {
+        args.push("--list".into());
+    }
+    args
+}
+
+fn fml_probe_command(
+    java: &Path,
+    game: &Path,
+    libs: &Path,
+    classpath: &Path,
+    versions: &[(String, String)],
+    mode: FmlMode,
+) -> Command {
+    let mut command = Command::new(java);
+    command
+        .current_dir(game)
+        .args(fml_probe_args(libs, classpath, versions, mode));
+    command
+}
+
 /// Run the FML probe in a child JVM: FML's game locator assumes an ordinary
 /// `java -cp` launch, which an embedded JNI VM does not reproduce.
-fn run_real_neoforge(libs: &Path, mods: &[PathBuf]) -> Result<(), String> {
+fn run_real_neoforge(
+    libs: &Path,
+    mods: &[PathBuf],
+    mode: FmlMode,
+    json: bool,
+) -> Result<(), String> {
     let classpath = fml_classpath(libs);
     if classpath.is_empty() {
         return Err(format!(
@@ -1825,9 +2125,11 @@ fn run_real_neoforge(libs: &Path, mods: &[PathBuf]) -> Result<(), String> {
         .output()
         .map_err(|e| format!("javac: {e}"))?;
     if !compiled.status.success() {
+        let stderr = String::from_utf8_lossy(&compiled.stderr);
+        let stdout = String::from_utf8_lossy(&compiled.stdout);
         return Err(format!(
             "FML probe did not compile: {}",
-            String::from_utf8_lossy(&compiled.stderr)
+            first_fml_error_line(&stderr, &stdout)
         ));
     }
     let mut classpath = classpath;
@@ -1837,34 +2139,70 @@ fn run_real_neoforge(libs: &Path, mods: &[PathBuf]) -> Result<(), String> {
         .map(PathBuf::from)
         .map(|home| home.join("bin").join("java"))
         .unwrap_or_else(|| PathBuf::from("java"));
-    let mut command = Command::new(java);
-    command
-        .current_dir(&game)
-        .arg("--add-opens")
-        .arg("java.base/java.lang.invoke=ALL-UNNAMED")
-        .arg("-Djdk.attach.allowAttachSelf=true")
-        .arg(format!("-DlibraryDirectory={}", libs.display()))
-        .arg("-cp")
-        .arg(&classpath);
-    for (name, value) in fml_versions(Some(libs)) {
-        command.arg(format!("-Dhorizon.fml.{name}={value}"));
-    }
-    command.arg("horizon.FmlProbe");
-    let output = command
-        .output()
-        .map_err(|e| format!("could not start Java: {e}"))?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    let command = fml_probe_command(
+        &java,
+        &game,
+        libs,
+        Path::new(&classpath),
+        &fml_versions(Some(libs)),
+        mode,
     );
-    print!("{text}");
+    let capture = run_fml_probe(command)?;
     let _ = fs::remove_dir_all(&root);
-    if !output.status.success() {
-        return Err(format!("FML probe failed ({})", output.status));
+    match mode {
+        FmlMode::List => {
+            for line in fml_list_lines(&parse_fml_mods(&capture.stdout)) {
+                println!("{line}");
+            }
+            if capture.success {
+                Ok(())
+            } else {
+                Err(format!(
+                    "FML probe failed: {}",
+                    first_fml_error_line(&capture.stderr, &capture.stdout)
+                ))
+            }
+        }
+        FmlMode::Report => {
+            let report = FmlReport {
+                status: if capture.success { "ok" } else { "failed" },
+                server: libs.display().to_string(),
+                jars: mods.len(),
+                mods: parse_fml_mods(&capture.stdout),
+                initialized: capture
+                    .stdout
+                    .lines()
+                    .any(|line| line.trim() == "initialized"),
+                error: (!capture.success)
+                    .then(|| first_fml_error_line(&capture.stderr, &capture.stdout)),
+            };
+            if json {
+                println!("{}", report.json());
+            } else {
+                print!("{}", report.text());
+            }
+            Ok(())
+        }
+        FmlMode::Run => {
+            if !capture.success {
+                return Err(format!(
+                    "FML probe failed: {}",
+                    first_fml_error_line(&capture.stderr, &capture.stdout)
+                ));
+            }
+            print!("{}", capture.stdout);
+            if !capture.stderr.is_empty() {
+                eprint!("{}", capture.stderr);
+            }
+            if capture.truncated {
+                eprintln!(
+                    "horizon-jvm: FML probe output truncated (stdout {MAX_FML_OUTPUT_BYTES} bytes, stderr {MAX_FML_STDERR_BYTES} bytes)"
+                );
+            }
+            println!("real loader: FML probe completed");
+            Ok(())
+        }
     }
-    println!("real loader: FML probe completed");
-    Ok(())
 }
 
 /// The exact runtime classpath an installed NeoForge server's `unix_args.txt`
@@ -5128,7 +5466,12 @@ mod real_loader_tests {
 /// The FML probe and its classpath/version discovery, without starting FML.
 #[cfg(test)]
 mod fml_probe_tests {
-    use super::{FML_PROBE_SOURCE, USAGE, fml_classpath, fml_versions};
+    use super::{
+        FML_PROBE_SOURCE, FmlFlags, FmlMod, FmlMode, FmlReport, MAX_FML_MODS, MAX_FML_OUTPUT_BYTES,
+        MAX_FML_STDERR_BYTES, USAGE, bound_text, first_fml_error_line, fml_classpath,
+        fml_list_lines, fml_probe_args, fml_probe_command, fml_versions, parse_fml_mods,
+        read_bounded, take_fml_flags,
+    };
     use std::{fs, path::Path};
 
     #[test]
@@ -5140,10 +5483,127 @@ mod fml_probe_tests {
             "gatherAndInitializeMods",
             "bootStrap",
             "initialized",
+            "versionOf",
+            "--list",
         ] {
             assert!(FML_PROBE_SOURCE.contains(needed), "missing {needed}");
         }
         assert!(USAGE.contains("--real-loader"));
+        assert!(USAGE.contains("--list-fml-mods"));
+        assert!(USAGE.contains("--fml-report"));
+        assert!(USAGE.contains("--json"));
+    }
+
+    #[test]
+    fn parses_fml_flags_and_mod_lines_deterministically() {
+        let mut args = ["--fml-list", "--fml-report", "--json", "mod.jar"]
+            .map(str::to_owned)
+            .to_vec();
+        assert_eq!(
+            take_fml_flags(&mut args),
+            FmlFlags {
+                list: true,
+                report: true,
+                json: true
+            }
+        );
+        assert_eq!(args.join(","), "mod.jar");
+        let mods = parse_fml_mods("mods=3\nmod=zmod\t2.0\nmod=amod\nmod=amod\t1.0\n");
+        assert_eq!(
+            mods.iter()
+                .map(|m| (m.id.as_str(), m.version.as_deref()))
+                .collect::<Vec<_>>(),
+            [("amod", None), ("amod", Some("1.0")), ("zmod", Some("2.0"))]
+        );
+        assert_eq!(fml_list_lines(&mods).join(","), "amod,amod\t1.0,zmod\t2.0");
+    }
+
+    #[test]
+    fn caps_mod_lines_and_bounds_output() {
+        let stdout = (0..MAX_FML_MODS + 5)
+            .map(|index| format!("mod=mod{index:04}\t1.0"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(parse_fml_mods(&stdout).len(), MAX_FML_MODS);
+        for (text, limit) in [
+            ("x".repeat(MAX_FML_OUTPUT_BYTES * 2), MAX_FML_OUTPUT_BYTES),
+            ("y".repeat(MAX_FML_STDERR_BYTES * 2), MAX_FML_STDERR_BYTES),
+        ] {
+            let bounded = bound_text(&text, limit);
+            assert!(bounded.len() <= limit && bounded.ends_with("...(truncated)\n"));
+        }
+        let (stderr, truncated) = read_bounded(std::io::Cursor::new("z".repeat(64)), 8).unwrap();
+        assert!(truncated && stderr.len() <= 8);
+    }
+
+    #[test]
+    fn formats_the_report_and_names_the_first_error_line() {
+        let mut report = FmlReport {
+            status: "ok",
+            server: "/srv/libraries".to_owned(),
+            jars: 8,
+            mods: vec![FmlMod {
+                id: "demo".to_owned(),
+                version: Some("1.0".to_owned()),
+            }],
+            initialized: true,
+            error: None,
+        };
+        let text = report.text();
+        assert!(
+            text.starts_with(
+                "status: ok\nserver: /srv/libraries\njars: 8\nmods: 1\ninitialized: true\n"
+            ) && text.contains("demo\t1.0")
+        );
+        let json: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
+        assert_eq!(
+            (
+                json["status"].as_str(),
+                json["mods"][0]["id"].as_str(),
+                json["mods"][0]["version"].as_str()
+            ),
+            (Some("ok"), Some("demo"), Some("1.0"))
+        );
+        report.status = "failed";
+        report.error = Some("boom".to_owned());
+        assert!(report.text().contains("error: boom"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&report.json()).unwrap()["error"],
+            "boom"
+        );
+        assert_eq!(
+            first_fml_error_line(
+                "warn\njava.lang.RuntimeException: boom\n\tat a.b(C.java:1)",
+                ""
+            ),
+            "java.lang.RuntimeException: boom"
+        );
+        assert_eq!(first_fml_error_line("", "plain output"), "plain output");
+    }
+
+    #[test]
+    fn builds_a_probe_command_without_starting_a_jvm() {
+        let command = fml_probe_command(
+            Path::new("/nonexistent/java"),
+            Path::new("/tmp/game"),
+            Path::new("/srv/libraries"),
+            Path::new("/srv/a.jar"),
+            &[("mcVersion".to_owned(), "26.3".to_owned())],
+            FmlMode::List,
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(command.get_program(), "/nonexistent/java");
+        assert!(args.contains(&"-Dhorizon.fml.mcVersion=26.3".to_owned()));
+        assert_eq!(args[args.len() - 2..].join(","), "horizon.FmlProbe,--list");
+        assert_eq!(
+            fml_probe_args(Path::new("/l"), Path::new("/c"), &[], FmlMode::Run)
+                .last()
+                .unwrap(),
+            "horizon.FmlProbe"
+        );
     }
 
     #[test]
