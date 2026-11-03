@@ -17,6 +17,12 @@ pub use weaver::{ReturnMode, weave_class, weave_classes, weave_head, weave_plans
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Int(i32),
+    /// An exact 64-bit Java `long`, including a boxed `Long`.
+    ///
+    /// Longs are their own variant rather than a widened `Int` so long ids,
+    /// timers and arithmetic keep all 64 bits. A boxed `Long` uses the same
+    /// variant: the bounded runtime is untyped, so [`boxed_long`] accepts it.
+    Long(i64),
     Ref(Option<String>),
     Void,
 }
@@ -37,8 +43,10 @@ impl Value {
         match desc {
             "V" => Self::Void,
             "Z" | "B" | "C" | "S" | "I" => Self::Int(0),
-            // Wide primitive values use the bounded integer representation.
-            "J" | "D" => Self::Int(0),
+            "J" => Self::Long(0),
+            // Floating-point values are still neutralised in the bounded
+            // integer representation.
+            "D" => Self::Int(0),
             _ => Self::Ref(None),
         }
     }
@@ -423,6 +431,13 @@ fn return_override(desc: &str, value: Value) -> Result<Option<Value>, NativeErro
             "native Mixin CallbackInfoReturnable cannot override a void target".into(),
         )),
         "Z" | "B" | "C" | "S" | "I" | "J" | "D" | "F" => {
+            // A `long` target keeps its exact 64 bits; every other primitive
+            // keeps the bounded integer coercion.
+            if let Value::Long(long) = &value {
+                if desc == "J" {
+                    return Ok(Some(Value::Long(*long)));
+                }
+            }
             let integer = if let Some(flag) =
                 expect_ref(&value).and_then(|marker| marker.strip_prefix("boolean:"))
             {
@@ -439,7 +454,7 @@ fn return_override(desc: &str, value: Value) -> Result<Option<Value>, NativeErro
         }
         _ => match value {
             Value::Ref(_) => Ok(Some(value)),
-            Value::Int(_) => Err(NativeError::Metadata(format!(
+            Value::Int(_) | Value::Long(_) => Err(NativeError::Metadata(format!(
                 "native Mixin CallbackInfoReturnable override {} is primitive but return {desc} is a reference",
                 value_marker(&value)
             ))),
@@ -1400,6 +1415,11 @@ impl Host for StdHost {
             ("java/lang/Boolean", "FALSE", "Ljava/lang/Boolean;") => {
                 Ok(Value::Ref(Some("false".into())))
             }
+            // `Long.MAX_VALUE`/`MIN_VALUE` are the long bounds a mod compares
+            // timers and ids against; a neutral `0` would silently truncate
+            // every comparison to "less than max".
+            ("java/lang/Long", "MAX_VALUE", "J") => Ok(Value::Long(i64::MAX)),
+            ("java/lang/Long", "MIN_VALUE", "J") => Ok(Value::Long(i64::MIN)),
             ("java/util/Locale", "US", "Ljava/util/Locale;") => {
                 Ok(Value::Ref(Some("locale/US".into())))
             }
@@ -1746,6 +1766,28 @@ impl Host for StdHost {
             ("java/lang/Long", "valueOf", "(Ljava/lang/String;)Ljava/lang/Long;") => {
                 Ok(long_value(parse_java_long(Self::argument(r, args, 0)?)?))
             }
+            ("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;") => {
+                Ok(long_value(expect_long(r, Self::argument(r, args, 0)?)?))
+            }
+            ("java/lang/Long", "hashCode", "(J)I") => {
+                let value = expect_long(r, Self::argument(r, args, 0)?)? as u64;
+                Ok(Value::Int((value ^ (value >> 32)) as i32))
+            }
+            ("java/lang/Long", "sum", "(JJ)J") => {
+                let left = expect_long(r, Self::argument(r, args, 0)?)?;
+                let right = expect_long(r, Self::argument(r, args, 1)?)?;
+                Ok(long_value(left.wrapping_add(right)))
+            }
+            ("java/lang/Long", "max", "(JJ)J") => {
+                let left = expect_long(r, Self::argument(r, args, 0)?)?;
+                let right = expect_long(r, Self::argument(r, args, 1)?)?;
+                Ok(long_value(left.max(right)))
+            }
+            ("java/lang/Long", "min", "(JJ)J") => {
+                let left = expect_long(r, Self::argument(r, args, 0)?)?;
+                let right = expect_long(r, Self::argument(r, args, 1)?)?;
+                Ok(long_value(left.min(right)))
+            }
             ("java/lang/Long", "toString", "(J)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 expect_long(r, Self::argument(r, args, 0)?)?.to_string(),
             ))),
@@ -2011,6 +2053,9 @@ impl Host for StdHost {
             ("java/lang/String", "valueOf", "(I)Ljava/lang/String;")
             | ("java/lang/Integer", "toString", "(I)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 expect_int(r, Self::argument(r, args, 0)?)?.to_string(),
+            ))),
+            ("java/lang/String", "valueOf", "(J)Ljava/lang/String;") => Ok(Value::Ref(Some(
+                expect_long(r, Self::argument(r, args, 0)?)?.to_string(),
             ))),
             ("java/lang/Short", "toString", "(S)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 i16::try_from(expect_int(r, Self::argument(r, args, 0)?)?)
@@ -3894,6 +3939,49 @@ impl Host for StdHost {
                     NativeError::Metadata("malformed java/lang/Long marker".into())
                 })?))
             }
+            ("java/lang/Long", "intValue", "()I") => {
+                Ok(Value::Int(number_int_value(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Long marker".into())
+                })?))
+            }
+            ("java/lang/Long", "shortValue", "()S") => {
+                Ok(Value::Int(number_short_value(receiver).ok_or_else(
+                    || NativeError::Metadata("malformed java/lang/Long marker".into()),
+                )?))
+            }
+            ("java/lang/Long", "byteValue", "()B") => {
+                Ok(Value::Int(number_byte_value(receiver).ok_or_else(
+                    || NativeError::Metadata("malformed java/lang/Long marker".into()),
+                )?))
+            }
+            ("java/lang/Long", "floatValue", "()F") => {
+                Ok(float_value(boxed_long(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Long marker".into())
+                })? as f64))
+            }
+            ("java/lang/Long", "doubleValue", "()D") => {
+                Ok(double_value(boxed_long(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Long marker".into())
+                })? as f64))
+            }
+            ("java/lang/Long", "hashCode", "()I") => {
+                let value = boxed_long(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Long marker".into())
+                })? as u64;
+                Ok(Value::Int((value ^ (value >> 32)) as i32))
+            }
+            ("java/lang/Long", "compareTo", "(Ljava/lang/Long;)I") => {
+                let left = boxed_long(receiver).ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/Long marker".into())
+                })?;
+                let right = expect_long(r, Self::argument(r, args, 0)?)?;
+                Ok(Value::Int(left.cmp(&right) as i32))
+            }
+            ("java/lang/Long", "equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
+                (boxed_long(Self::argument(r, args, 0)?)
+                    .is_some_and(|other| Some(other) == boxed_long(receiver)))
+                    as i32,
+            )),
             ("java/lang/Long", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
                 boxed_long(receiver)
                     .ok_or_else(|| NativeError::Metadata("malformed java/lang/Long marker".into()))?
@@ -5385,10 +5473,14 @@ fn builder_append_text(r: &MethodRef, args: &[Value]) -> Result<String, NativeEr
             Value::Ref(Some(value)) => value.clone(),
             Value::Ref(None) => "null".into(),
             Value::Int(value) => value.to_string(),
+            Value::Long(value) => value.to_string(),
             Value::Void => "void".into(),
         },
         "(I)Ljava/lang/StringBuilder;" | "(I)Ljava/lang/StringBuffer;" => {
             expect_int(r, value)?.to_string()
+        }
+        "(J)Ljava/lang/StringBuilder;" | "(J)Ljava/lang/StringBuffer;" => {
+            expect_long(r, value)?.to_string()
         }
         "(Z)Ljava/lang/StringBuilder;" | "(Z)Ljava/lang/StringBuffer;" => {
             match expect_int(r, value)? {
@@ -5594,6 +5686,7 @@ fn enum_ordinal(value: &Value) -> i32 {
 fn value_marker(value: &Value) -> String {
     match value {
         Value::Int(value) => format!("i{value}"),
+        Value::Long(value) => format!("l{value}"),
         Value::Ref(Some(value)) => format!("r{}", value.replace('\\', "\\\\").replace(',', "\\,")),
         Value::Ref(None) => "null".to_owned(),
         Value::Void => "void".to_owned(),
@@ -5648,6 +5741,7 @@ fn builder_number(descriptor: &str, value: &Value) -> Option<String> {
     } else {
         match value {
             Value::Int(value) => Some(value.to_string()),
+            Value::Long(value) => Some(value.to_string()),
             _ => None,
         }
     }
@@ -5857,6 +5951,7 @@ fn thrown_message<H: Host>(value: &Value, host: &H) -> Option<String> {
 fn capability_text(value: &Value) -> String {
     match value {
         Value::Int(value) => value.to_string(),
+        Value::Long(value) => value.to_string(),
         Value::Ref(Some(value)) => value.replace("\\,", ",").replace("\\\\", "\\"),
         Value::Ref(None) => "".to_owned(),
         Value::Void => "void".to_owned(),
@@ -5913,9 +6008,12 @@ fn optional_int_value(value: &Value) -> Option<i32> {
 }
 
 fn optional_long_value(value: &Value) -> Option<i64> {
-    expect_ref(value)
-        .and_then(|marker| marker.strip_prefix("optional-long/"))
-        .and_then(|value| value.parse().ok())
+    match value {
+        Value::Long(value) => Some(*value),
+        _ => expect_ref(value)
+            .and_then(|marker| marker.strip_prefix("optional-long/"))
+            .and_then(|value| value.parse().ok()),
+    }
 }
 
 fn optional_double_value(value: &Value) -> Option<f64> {
@@ -5945,6 +6043,7 @@ fn value_text(value: &Value) -> String {
         }
         Value::Ref(None) => "null".into(),
         Value::Int(value) => value.to_string(),
+        Value::Long(value) => value.to_string(),
         Value::Void => "void".into(),
     }
 }
@@ -6013,10 +6112,15 @@ fn format_java_string_call<H: Host>(
                 let value = values.get(next).ok_or_else(|| {
                     NativeError::Metadata("String.format missing %d argument".into())
                 })?;
-                let value = boxed_integer(value).ok_or_else(|| {
-                    NativeError::Metadata("String.format %d requires an integer".into())
-                })?;
-                output.push_str(&value.to_string());
+                // `%d` covers `Long` as well as `Integer`; a long keeps all 64
+                // bits instead of truncating.
+                let text = boxed_integer(value)
+                    .map(|value| value.to_string())
+                    .or_else(|| boxed_long(value).map(|value| value.to_string()))
+                    .ok_or_else(|| {
+                        NativeError::Metadata("String.format %d requires an integer".into())
+                    })?;
+                output.push_str(&text);
             }
             'f' => {
                 let value = values.get(next).ok_or_else(|| {
@@ -6098,6 +6202,7 @@ fn boxed_character(value: &Value) -> Option<i32> {
 fn boxed_number(value: &Value) -> Option<f64> {
     match value {
         Value::Int(value) => Some(f64::from(*value)),
+        Value::Long(value) => Some(*value as f64),
         Value::Ref(Some(value)) => value
             .strip_prefix("integer:")
             .or_else(|| value.strip_prefix("byte:"))
@@ -6112,6 +6217,7 @@ fn boxed_number(value: &Value) -> Option<f64> {
 
 fn number_int_value(value: &Value) -> Option<i32> {
     match value {
+        Value::Long(value) => Some(*value as i32),
         Value::Ref(Some(value)) if value.starts_with("long:") => value
             .strip_prefix("long:")?
             .parse::<i64>()
@@ -6123,6 +6229,7 @@ fn number_int_value(value: &Value) -> Option<i32> {
 
 fn number_long_value(value: &Value) -> Option<i64> {
     match value {
+        Value::Long(value) => Some(*value),
         Value::Ref(Some(value)) if value.starts_with("long:") => {
             value.strip_prefix("long:")?.parse::<i64>().ok()
         }
@@ -6185,13 +6292,19 @@ fn parse_java_long(value: &Value) -> Result<i64, NativeError> {
     })
 }
 
+/// Box a Java `long`.
+///
+/// The bounded runtime has no separate object graph for boxed numbers: the
+/// exact 64-bit value is the boxed `Long` too, so `longValue`, `toString`,
+/// `compareTo` and `equals` all read it back without a marker round trip.
 fn long_value(value: i64) -> Value {
-    Value::Ref(Some(format!("long:{value}")))
+    Value::Long(value)
 }
 
 fn boxed_long(value: &Value) -> Option<i64> {
     match value {
         Value::Int(value) => Some(i64::from(*value)),
+        Value::Long(value) => Some(*value),
         Value::Ref(Some(value)) => value
             .strip_prefix("long:")
             .and_then(|value| value.parse::<i64>().ok()),
@@ -6392,6 +6505,7 @@ fn collection_text(value: &Value) -> Result<String, NativeError> {
             Ok(Value::Ref(Some(value))) => value,
             Ok(Value::Ref(None)) => "null".into(),
             Ok(Value::Int(value)) => value.to_string(),
+            Ok(Value::Long(value)) => value.to_string(),
             Ok(Value::Void) => "void".into(),
             Err(_) => value.clone(),
         })
@@ -6602,15 +6716,34 @@ enum Cp {
     Integer(i32),
     Float(f32),
     Long(i64),
+    /// A `CONSTANT_Double`: two pool slots, neutralised by the value model.
+    Double,
     Class(u16),
     String(u16),
-    FieldRef { class: u16, nt: u16 },
-    MethodRef { class: u16, nt: u16 },
-    InterfaceMethodRef { class: u16, nt: u16 },
-    MethodHandle { reference_index: u16 },
+    FieldRef {
+        class: u16,
+        nt: u16,
+    },
+    MethodRef {
+        class: u16,
+        nt: u16,
+    },
+    InterfaceMethodRef {
+        class: u16,
+        nt: u16,
+    },
+    MethodHandle {
+        reference_index: u16,
+    },
     MethodType,
-    InvokeDynamic { bootstrap: u16, nt: u16 },
-    NameType { name: u16, descriptor: u16 },
+    InvokeDynamic {
+        bootstrap: u16,
+        nt: u16,
+    },
+    NameType {
+        name: u16,
+        descriptor: u16,
+    },
 }
 
 #[derive(Debug)]
@@ -8527,6 +8660,12 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
             .map(Value::Int)
             .map_err(|_| NativeError::Metadata(format!("invalid integer capture {marker}")));
     }
+    if let Some(value) = marker.strip_prefix('l') {
+        return value
+            .parse::<i64>()
+            .map(Value::Long)
+            .map_err(|_| NativeError::Metadata(format!("invalid long capture {marker}")));
+    }
     if let Some(value) = marker.strip_prefix('r') {
         return Ok(Value::Ref(Some(value.to_owned())));
     }
@@ -9439,11 +9578,17 @@ impl<H: Host> Runtime<'_, H> {
             locals[0] = receiver.unwrap_or(Value::Ref(None));
             local = 1;
         }
-        for arg in args {
+        // A `long` argument occupies two local slots, exactly as on the JVM, so
+        // a following parameter is not read out of a truncated slot.
+        let arguments = descriptor_arguments(desc);
+        for (index, arg) in args.iter().enumerate() {
             if let Some(slot) = locals.get_mut(local) {
                 *slot = arg.clone();
-                local += 1;
             }
+            local += match arguments.get(index).map(String::as_str) {
+                Some("J" | "D") => 2,
+                _ => 1,
+            };
         }
         let mut stack = Vec::new();
         let mut pc = 0;
@@ -9455,11 +9600,14 @@ impl<H: Host> Runtime<'_, H> {
                 0x00 => {}
                 0x01 => stack.push(Value::Ref(None)),
                 0x02..=0x08 => stack.push(Value::Int(op as i32 - 3)),
-                // lconst_0/1, fconst_0/1/2, dconst_0/1. `fconst_2` is the
-                // only constant above one, so it is the one a value of 2 (a
-                // common property such as a block's strength) lands on.
-                0x09..=0x0f => stack.push(Value::Int(match op {
-                    0x0a | 0x0c | 0x0f => 1,
+                0x09 => stack.push(Value::Long(0)),
+                0x0a => stack.push(Value::Long(1)),
+                // fconst_0/1/2, dconst_0/1. `fconst_2` is the only constant
+                // above one, so it is the one a value of 2 (a common property
+                // such as a block's strength) lands on. Floating-point values
+                // stay neutralised in the bounded integer representation.
+                0x0b..=0x0f => stack.push(Value::Int(match op {
+                    0x0c | 0x0f => 1,
                     0x0d => 2,
                     _ => 0,
                 })),
@@ -9488,18 +9636,19 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 0x14 => {
                     let i = read_u16(code, &mut pc)?;
-                    stack.push(constant_value(&file.pool, i)?);
+                    stack.push(constant_wide_value(&file.pool, i)?);
                 }
-                0x60 | 0x61 | 0x64 | 0x65 | 0x68 | 0x69 | 0x6c | 0x6d | 0x70 | 0x71 => {
+                // iadd/isub/imul/idiv/irem. The long twins (odd opcodes) take
+                // the 64-bit path below so no long value is truncated.
+                0x60 | 0x64 | 0x68 | 0x6c | 0x70 => {
                     let rhs = pop_int(&mut stack, class, method)?;
                     let lhs = pop_int(&mut stack, class, method)?;
                     let value = match op {
-                        0x60 | 0x61 => lhs.checked_add(rhs),
-                        0x64 | 0x65 => lhs.checked_sub(rhs),
-                        0x68 | 0x69 => lhs.checked_mul(rhs),
-                        0x6c | 0x6d => lhs.checked_div(rhs),
-                        0x70 | 0x71 => lhs.checked_rem(rhs),
-                        _ => None,
+                        0x60 => lhs.checked_add(rhs),
+                        0x64 => lhs.checked_sub(rhs),
+                        0x68 => lhs.checked_mul(rhs),
+                        0x6c => lhs.checked_div(rhs),
+                        _ => lhs.checked_rem(rhs),
                     }
                     .ok_or_else(|| NativeError::Arithmetic {
                         class: class.to_owned(),
@@ -9507,29 +9656,70 @@ impl<H: Host> Runtime<'_, H> {
                     })?;
                     stack.push(Value::Int(value));
                 }
+                0x61 | 0x65 | 0x69 | 0x6d | 0x71 => {
+                    let rhs = pop_long(&mut stack, class, method)?;
+                    let lhs = pop_long(&mut stack, class, method)?;
+                    let value = match op {
+                        0x61 => lhs.checked_add(rhs),
+                        0x65 => lhs.checked_sub(rhs),
+                        0x69 => lhs.checked_mul(rhs),
+                        0x6d => lhs.checked_div(rhs),
+                        _ => lhs.checked_rem(rhs),
+                    }
+                    .ok_or_else(|| NativeError::Arithmetic {
+                        class: class.to_owned(),
+                        method: method.to_owned(),
+                    })?;
+                    stack.push(Value::Long(value));
+                }
                 0x74 => {
                     let value = pop_int(&mut stack, class, method)?;
                     stack.push(Value::Int(value.wrapping_neg()));
                 }
-                0x78..=0x83 => {
+                0x75 => {
+                    let value = pop_long(&mut stack, class, method)?;
+                    stack.push(Value::Long(value.wrapping_neg()));
+                }
+                0x78 | 0x7a | 0x7c => {
                     let rhs = pop_int(&mut stack, class, method)?;
                     let lhs = pop_int(&mut stack, class, method)?;
                     let value = match op {
-                        0x78 | 0x79 => {
-                            lhs.wrapping_shl((rhs & if op == 0x79 { 0x3f } else { 0x1f }) as u32)
-                        }
-                        0x7a | 0x7b => {
-                            lhs.wrapping_shr((rhs & if op == 0x7b { 0x3f } else { 0x1f }) as u32)
-                        }
-                        0x7c | 0x7d => {
-                            ((lhs as u32) >> (rhs & if op == 0x7d { 0x3f } else { 0x1f })) as i32
-                        }
-                        0x7e | 0x7f => lhs & rhs,
-                        0x80 | 0x81 => lhs | rhs,
-                        0x82 | 0x83 => lhs ^ rhs,
-                        _ => unreachable!(),
+                        0x78 => lhs.wrapping_shl((rhs & 0x1f) as u32),
+                        0x7a => lhs.wrapping_shr((rhs & 0x1f) as u32),
+                        _ => ((lhs as u32) >> (rhs & 0x1f)) as i32,
                     };
                     stack.push(Value::Int(value));
+                }
+                // Long shifts keep the shift count an `int`.
+                0x79 | 0x7b | 0x7d => {
+                    let rhs = pop_int(&mut stack, class, method)?;
+                    let lhs = pop_long(&mut stack, class, method)?;
+                    let value = match op {
+                        0x79 => lhs.wrapping_shl((rhs & 0x3f) as u32),
+                        0x7b => lhs.wrapping_shr((rhs & 0x3f) as u32),
+                        _ => ((lhs as u64) >> (rhs & 0x3f)) as i64,
+                    };
+                    stack.push(Value::Long(value));
+                }
+                0x7e | 0x80 | 0x82 => {
+                    let rhs = pop_int(&mut stack, class, method)?;
+                    let lhs = pop_int(&mut stack, class, method)?;
+                    let value = match op {
+                        0x7e => lhs & rhs,
+                        0x80 => lhs | rhs,
+                        _ => lhs ^ rhs,
+                    };
+                    stack.push(Value::Int(value));
+                }
+                0x7f | 0x81 | 0x83 => {
+                    let rhs = pop_long(&mut stack, class, method)?;
+                    let lhs = pop_long(&mut stack, class, method)?;
+                    let value = match op {
+                        0x7f => lhs & rhs,
+                        0x81 => lhs | rhs,
+                        _ => lhs ^ rhs,
+                    };
+                    stack.push(Value::Long(value));
                 }
                 0x84 => {
                     let index = *code.get(pc).ok_or(NativeError::Truncated)? as usize;
@@ -9555,17 +9745,54 @@ impl<H: Host> Runtime<'_, H> {
                         });
                     }
                 }
-                0x85..=0x93 => {
+                // i2l widens exactly; l2i keeps the low 32 bits. The float
+                // conversions stay neutralised except l2f/l2d, which have the
+                // existing `float:`/`double:` markers to land on.
+                0x85 => {
+                    let value = pop_int(&mut stack, class, method)?;
+                    stack.push(Value::Long(i64::from(value)));
+                }
+                0x88 => {
+                    let value = pop_long(&mut stack, class, method)?;
+                    stack.push(Value::Int(value as i32));
+                }
+                0x89 => {
+                    let value = pop_long(&mut stack, class, method)?;
+                    stack.push(float_value(value as f64));
+                }
+                0x8a => {
+                    let value = pop_long(&mut stack, class, method)?;
+                    stack.push(double_value(value as f64));
+                }
+                0x8c | 0x8f => {
+                    let value = pop(&mut stack, class, method)?;
+                    let value = boxed_number(&value).ok_or_else(|| NativeError::TypeMismatch {
+                        class: class.to_owned(),
+                        method: method.to_owned(),
+                        expected: "floating-point value",
+                    })?;
+                    stack.push(Value::Long(value as i64));
+                }
+                0x86 | 0x87 | 0x8b | 0x8d | 0x8e | 0x90 => {
+                    let value = pop_int(&mut stack, class, method)?;
+                    stack.push(Value::Int(value));
+                }
+                0x91..=0x93 => {
                     let value = pop_int(&mut stack, class, method)?;
                     let value = match op {
                         0x91 => (value as i8) as i32,
                         0x92 => (value as u8) as i32,
-                        0x93 => (value as i16) as i32,
-                        _ => value,
+                        _ => (value as i16) as i32,
                     };
                     stack.push(Value::Int(value));
                 }
-                0x94..=0x98 => {
+                0x94 => {
+                    let rhs = pop_long(&mut stack, class, method)?;
+                    let lhs = pop_long(&mut stack, class, method)?;
+                    stack.push(Value::Int(lhs.cmp(&rhs) as i32));
+                }
+                // fcmpl/fcmpg/dcmpl/dcmpg keep the neutralised integer model.
+                0x95..=0x98 => {
                     let rhs = pop_int(&mut stack, class, method)?;
                     let lhs = pop_int(&mut stack, class, method)?;
                     stack.push(Value::Int(lhs.cmp(&rhs) as i32));
@@ -9592,8 +9819,13 @@ impl<H: Host> Runtime<'_, H> {
                     let _ = pop(&mut stack, class, method)?;
                 }
                 0x58 => {
-                    let _ = pop(&mut stack, class, method)?;
-                    let _ = pop(&mut stack, class, method)?;
+                    // `pop2` removes one category-2 value (a `long`) or two
+                    // category-1 values, so a discarded long does not
+                    // underflow the stack.
+                    let value = pop(&mut stack, class, method)?;
+                    if !matches!(value, Value::Long(_)) {
+                        let _ = pop(&mut stack, class, method)?;
+                    }
                 }
                 0x59 => {
                     let v = stack
@@ -9610,33 +9842,56 @@ impl<H: Host> Runtime<'_, H> {
                 0x5b => {
                     let value1 = pop(&mut stack, class, method)?;
                     let value2 = pop(&mut stack, class, method)?;
-                    let value3 = pop(&mut stack, class, method)?;
-                    stack.extend([value1.clone(), value3, value2, value1]);
+                    if matches!(value2, Value::Long(_)) {
+                        stack.extend([value1.clone(), value2, value1]);
+                    } else {
+                        let value3 = pop(&mut stack, class, method)?;
+                        stack.extend([value1.clone(), value3, value2, value1]);
+                    }
                 }
                 0x5c => {
                     let value1 = pop(&mut stack, class, method)?;
-                    let value2 = pop(&mut stack, class, method)?;
-                    stack.extend([value2.clone(), value1.clone(), value2, value1]);
+                    if matches!(value1, Value::Long(_)) {
+                        stack.extend([value1.clone(), value1]);
+                    } else {
+                        let value2 = pop(&mut stack, class, method)?;
+                        stack.extend([value2.clone(), value1.clone(), value2, value1]);
+                    }
                 }
                 0x5d => {
                     let value1 = pop(&mut stack, class, method)?;
-                    let value2 = pop(&mut stack, class, method)?;
-                    let value3 = pop(&mut stack, class, method)?;
-                    stack.extend([value2.clone(), value1.clone(), value3, value2, value1]);
+                    if matches!(value1, Value::Long(_)) {
+                        let value2 = pop(&mut stack, class, method)?;
+                        stack.extend([value1.clone(), value2, value1]);
+                    } else {
+                        let value2 = pop(&mut stack, class, method)?;
+                        let value3 = pop(&mut stack, class, method)?;
+                        stack.extend([value1.clone(), value3, value2, value1]);
+                    }
                 }
                 0x5e => {
                     let value1 = pop(&mut stack, class, method)?;
-                    let value2 = pop(&mut stack, class, method)?;
-                    let value3 = pop(&mut stack, class, method)?;
-                    let value4 = pop(&mut stack, class, method)?;
-                    stack.extend([
-                        value2.clone(),
-                        value1.clone(),
-                        value4,
-                        value3,
-                        value2,
-                        value1,
-                    ]);
+                    if matches!(value1, Value::Long(_)) {
+                        let value2 = pop(&mut stack, class, method)?;
+                        if matches!(value2, Value::Long(_)) {
+                            stack.extend([value1.clone(), value2, value1]);
+                        } else {
+                            let value3 = pop(&mut stack, class, method)?;
+                            stack.extend([value1.clone(), value3, value2, value1]);
+                        }
+                    } else {
+                        let value2 = pop(&mut stack, class, method)?;
+                        let value3 = pop(&mut stack, class, method)?;
+                        let value4 = pop(&mut stack, class, method)?;
+                        stack.extend([
+                            value2.clone(),
+                            value1.clone(),
+                            value4,
+                            value3,
+                            value2,
+                            value1,
+                        ]);
+                    }
                 }
                 0x5f => {
                     let value1 = pop(&mut stack, class, method)?;
@@ -9748,8 +10003,14 @@ impl<H: Host> Runtime<'_, H> {
                         return Err(NativeError::InvalidClass("invalid newarray type"));
                     }
                     let marker = self.new_array(class, method);
-                    self.arrays
-                        .insert(marker.clone(), vec![Value::Int(0); length]);
+                    // T_LONG (11) elements default to an exact long zero so a
+                    // read-before-write still behaves like a `long`.
+                    let empty = if atype == 11 {
+                        Value::Long(0)
+                    } else {
+                        Value::Int(0)
+                    };
+                    self.arrays.insert(marker.clone(), vec![empty; length]);
                     stack.push(Value::Ref(Some(marker)));
                 }
                 0xbd => {
@@ -10043,6 +10304,17 @@ fn pop_int(stack: &mut Vec<Value>, class: &str, method: &str) -> Result<i32, Nat
     }
 }
 
+/// Pop a `long`, which is the exact 64-bit variant or an `int` widened by the
+/// value model (boxed `Long` markers included through [`boxed_long`]).
+fn pop_long(stack: &mut Vec<Value>, class: &str, method: &str) -> Result<i64, NativeError> {
+    let value = pop(stack, class, method)?;
+    boxed_long(&value).ok_or_else(|| NativeError::TypeMismatch {
+        class: class.to_owned(),
+        method: method.to_owned(),
+        expected: "long",
+    })
+}
+
 fn branch_target(
     code: &[u8],
     instruction: usize,
@@ -10223,9 +10495,20 @@ fn constant_value(pool: &[Cp], index: u16) -> Result<Value, NativeError> {
         },
         Some(Cp::Integer(v)) => Ok(Value::Int(*v)),
         Some(Cp::Float(v)) => Ok(Value::Int(*v as i32)),
-        Some(Cp::Long(v)) => Ok(Value::Int(
-            (*v).clamp(i32::MIN as i64, i32::MAX as i64) as i32
-        )),
+        Some(Cp::Long(v)) => Ok(Value::Long(*v)),
+        Some(Cp::Double) => Ok(Value::Int(0)),
+        x => Err(NativeError::InvalidConstant(index, format!("{x:?}"))),
+    }
+}
+
+/// `ldc2_w`: the two-slot `long`/`double` constant load.
+///
+/// A `long` keeps all 64 bits. A `double` still lands on the neutral integer
+/// placeholder the bounded value model uses for floating-point constants.
+fn constant_wide_value(pool: &[Cp], index: u16) -> Result<Value, NativeError> {
+    match pool.get(index as usize) {
+        Some(Cp::Long(v)) => Ok(Value::Long(*v)),
+        Some(Cp::Double) => Ok(Value::Int(0)),
         x => Err(NativeError::InvalidConstant(index, format!("{x:?}"))),
     }
 }
@@ -10757,10 +11040,11 @@ fn read_pool(r: &mut Reader<'_>) -> Result<Vec<Cp>, NativeError> {
                 Cp::Long(value)
             }
             6 => {
-                // Doubles use the same two-slot pool shape. The bounded
-                // value model keeps a neutral integer placeholder.
+                // Doubles use the same two-slot pool shape, but the bounded
+                // value model keeps them neutralised instead of widening a
+                // long, so `ldc2_w` never confuses one for a `long`.
                 r.skip(8)?;
-                Cp::Long(0)
+                Cp::Double
             }
             15 => {
                 let _ = r.u1()?;
@@ -11926,6 +12210,166 @@ mandatory = true
     }
 
     #[test]
+    fn long_opcodes_keep_full_64_bit_values() {
+        let long_method = |name: &str, descriptor: &str, locals: u16, code: Vec<u8>| Method {
+            name: name.into(),
+            descriptor: descriptor.into(),
+            access: 9,
+            code: Some(code),
+            max_locals: locals,
+            max_stack: 4,
+
+            annotations: Vec::new(),
+        };
+        let class = ClassFile {
+            name: "demo/LongMath".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty, Cp::Long(4_294_967_297)],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![
+                // ldc2_w is the only way to reach a long constant above the
+                // 32-bit range, so this proves the pool value is read whole.
+                long_method("constant", "()J", 0, vec![0x14, 0, 1, 0xad]),
+                long_method("maxMinusOne", "()J", 0, vec![0x14, 0, 1, 0x0a, 0x65, 0xad]),
+                long_method("negate", "(J)J", 2, vec![0x1e, 0x75, 0xad]),
+                long_method(
+                    "localRoundTrip",
+                    "(J)J",
+                    4,
+                    // lload_0; ldc2_w; lmul; lconst_1; ladd; lstore_2; lload_2
+                    vec![0x1e, 0x14, 0, 1, 0x69, 0x0a, 0x61, 0x41, 0x20, 0xad],
+                ),
+                long_method(
+                    "masks",
+                    "(J)J",
+                    2,
+                    // lload_0; ldc2_w; land; lload_0; lxor -> (v & 4294967297) ^ v
+                    vec![0x1e, 0x14, 0, 1, 0x7f, 0x1e, 0x83, 0xad],
+                ),
+                long_method(
+                    "shiftLeft",
+                    "(JI)J",
+                    3,
+                    // lload_0; iload_2; lshl
+                    vec![0x1e, 0x1c, 0x79, 0xad],
+                ),
+                long_method(
+                    "shiftRight",
+                    "(JI)J",
+                    3,
+                    // lload_0; iload_2; lshr
+                    vec![0x1e, 0x1c, 0x7b, 0xad],
+                ),
+                long_method(
+                    "unsignedShiftRight",
+                    "(JI)J",
+                    3,
+                    // lload_0; iload_2; lushr
+                    vec![0x1e, 0x1c, 0x7d, 0xad],
+                ),
+                long_method(
+                    "divideRemainder",
+                    "(JJ)J",
+                    4,
+                    // lload_0; lload_2; ldiv; lload_0; lload_2; lrem; ladd
+                    vec![0x1e, 0x20, 0x6d, 0x1e, 0x20, 0x71, 0x61, 0xad],
+                ),
+                // Second wide parameter: proves each long argument takes two
+                // local slots.
+                long_method("second", "(JJ)J", 4, vec![0x20, 0xad]),
+                long_method("compare", "(JJ)I", 4, vec![0x1e, 0x20, 0x94, 0xac]),
+                long_method("truncate", "(J)I", 2, vec![0x1e, 0x88, 0xac]),
+                long_method("widen", "(I)J", 1, vec![0x1a, 0x85, 0xad]),
+                long_method(
+                    "discardLong",
+                    "()J",
+                    0,
+                    // lconst_1; pop2; lconst_0
+                    vec![0x0a, 0x58, 0x09, 0xad],
+                ),
+            ],
+
+            annotations: Vec::new(),
+            raw: Vec::new(),
+        };
+        let jar = NativeJar::from_classes([class]);
+        let mut host = NullHost;
+        let mut call = |name: &str, descriptor: &str, args: &[Value]| {
+            jar.invoke_method_with_args("demo.LongMath", name, descriptor, None, args, &mut host)
+                .unwrap()
+        };
+        assert_eq!(call("constant", "()J", &[]), Value::Long(4_294_967_297));
+        assert_eq!(call("maxMinusOne", "()J", &[]), Value::Long(4_294_967_296));
+        assert_eq!(
+            call("negate", "(J)J", &[Value::Long(4_294_967_297)]),
+            Value::Long(-4_294_967_297)
+        );
+        assert_eq!(
+            call("localRoundTrip", "(J)J", &[Value::Long(1_000_000_001)]),
+            Value::Long(1_000_000_001 * 4_294_967_297 + 1)
+        );
+        assert_eq!(
+            call("masks", "(J)J", &[Value::Long(4_294_967_299)]),
+            Value::Long(4_294_967_299 & 4_294_967_297 ^ 4_294_967_299)
+        );
+        assert_eq!(
+            call("shiftLeft", "(JI)J", &[Value::Long(1), Value::Int(40)]),
+            Value::Long(1 << 40)
+        );
+        assert_eq!(
+            call(
+                "shiftRight",
+                "(JI)J",
+                &[Value::Long(-8_589_934_592), Value::Int(33)]
+            ),
+            Value::Long(-8_589_934_592 >> 33)
+        );
+        assert_eq!(
+            call(
+                "unsignedShiftRight",
+                "(JI)J",
+                &[Value::Long(-8_589_934_592), Value::Int(33)]
+            ),
+            Value::Long(((-8_589_934_592i64 as u64) >> 33) as i64)
+        );
+        assert_eq!(
+            call(
+                "divideRemainder",
+                "(JJ)J",
+                &[Value::Long(9_007_199_254_740_993), Value::Long(1_000)]
+            ),
+            Value::Long(9_007_199_254_740_993 / 1_000 + 9_007_199_254_740_993 % 1_000)
+        );
+        assert_eq!(
+            call(
+                "second",
+                "(JJ)J",
+                &[Value::Long(1_000_000_000_000), Value::Long(4_294_967_297)]
+            ),
+            Value::Long(4_294_967_297)
+        );
+        assert_eq!(
+            call("compare", "(JJ)I", &[Value::Long(-1), Value::Long(1)]),
+            Value::Int(-1)
+        );
+        assert_eq!(
+            call(
+                "compare",
+                "(JJ)I",
+                &[Value::Long(4_294_967_297), Value::Long(4_294_967_297)]
+            ),
+            Value::Int(0)
+        );
+        assert_eq!(
+            call("truncate", "(J)I", &[Value::Long(4_294_967_297)]),
+            Value::Int(1)
+        );
+        assert_eq!(call("widen", "(I)J", &[Value::Int(-7)]), Value::Long(-7));
+        assert_eq!(call("discardLong", "()J", &[]), Value::Long(0));
+    }
+
+    #[test]
     fn lookup_switch_branches_to_matching_case() {
         let class = ClassFile {
             name: "demo/Switch".into(),
@@ -12609,7 +13053,7 @@ mandatory = true
         let value = host
             .invoke(&parse, &[Value::Ref(Some("9223372036854775807".into()))])
             .unwrap();
-        assert_eq!(value, Value::Ref(Some("long:9223372036854775807".into())));
+        assert_eq!(value, Value::Long(9_223_372_036_854_775_807));
         assert_eq!(
             host.invoke(
                 &MethodRef {
@@ -12632,12 +13076,151 @@ mandatory = true
                 &[Value::Ref(Some("ff".into())), Value::Int(16)],
             )
             .unwrap(),
-            Value::Ref(Some("long:255".into()))
+            Value::Long(255)
         );
         assert!(
             host.invoke(&parse, &[Value::Ref(Some("oops".into()))])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn standard_host_prints_parses_and_boxes_exact_longs() {
+        let mut host = StdHost::new();
+        let method = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let max = 9_223_372_036_854_775_807i64;
+
+        // `Long.valueOf` is the boxing site javac emits for `Long b = v`.
+        let boxed = host
+            .invoke(
+                &method("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;"),
+                &[Value::Long(max)],
+            )
+            .unwrap();
+        assert_eq!(boxed, Value::Long(max));
+
+        assert_eq!(
+            host.invoke_instance(&method("java/lang/Long", "longValue", "()J"), &boxed, &[],)
+                .unwrap(),
+            Value::Long(max)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Long", "toString", "()Ljava/lang/String;"),
+                &boxed,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("9223372036854775807".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Long", "intValue", "()I"),
+                &Value::Long(4_294_967_297),
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Long", "compareTo", "(Ljava/lang/Long;)I"),
+                &Value::Long(-4_294_967_297),
+                &[Value::Long(0)],
+            )
+            .unwrap(),
+            Value::Int(-1)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Long", "equals", "(Ljava/lang/Object;)Z"),
+                &Value::Long(4_294_967_297),
+                &[Value::Long(4_294_967_297)],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &method("java/lang/Long", "equals", "(Ljava/lang/Object;)Z"),
+                &Value::Long(4_294_967_297),
+                &[Value::Long(4_294_967_298)],
+            )
+            .unwrap(),
+            Value::Int(0)
+        );
+
+        // `Long.hashCode(J)` is `(int) (v ^ (v >>> 32))`, so 2^32 + 1 is 0.
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/Long", "hashCode", "(J)I"),
+                &[Value::Long(4_294_967_297)],
+            )
+            .unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/Long", "sum", "(JJ)J"),
+                &[Value::Long(max), Value::Long(1)],
+            )
+            .unwrap(),
+            Value::Long(i64::MIN)
+        );
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/Long", "max", "(JJ)J"),
+                &[Value::Long(-2), Value::Long(3)],
+            )
+            .unwrap(),
+            Value::Long(3)
+        );
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/Long", "min", "(JJ)J"),
+                &[Value::Long(-2), Value::Long(3)],
+            )
+            .unwrap(),
+            Value::Long(-2)
+        );
+
+        // `String.valueOf`, `StringBuilder.append` and `String.format("%d")`
+        // must all print the exact long.
+        assert_eq!(
+            host.invoke(
+                &method("java/lang/String", "valueOf", "(J)Ljava/lang/String;"),
+                &[Value::Long(max)],
+            )
+            .unwrap(),
+            Value::Ref(Some("9223372036854775807".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/lang/StringBuilder".into(),
+                    name: "append".into(),
+                    descriptor: "(J)Ljava/lang/StringBuilder;".into(),
+                },
+                &Value::Ref(Some("string-builder/fixture".into())),
+                &[Value::Long(4_294_967_297)],
+            )
+            .unwrap(),
+            Value::Ref(Some("string-builder/fixture4294967297".into()))
+        );
+
+        assert_eq!(Value::default_for("J"), Value::Long(0));
+        assert_eq!(Value::default_for("()J"), Value::Long(0));
+    }
+
+    #[test]
+    fn long_value_markers_round_trip_for_callback_captures() {
+        let value = Value::Long(-4_294_967_297);
+        assert_eq!(value_marker(&value), "l-4294967297");
+        assert_eq!(parse_value_marker(&value_marker(&value)).unwrap(), value);
     }
 
     #[test]
@@ -13632,7 +14215,7 @@ mandatory = true
         };
         assert_eq!(
             host.invoke_instance(&long_get, &long, &[]).unwrap(),
-            Value::Ref(Some("long:9007199254740991".into()))
+            Value::Long(9_007_199_254_740_991)
         );
         assert_eq!(
             host.invoke_instance(
@@ -13641,7 +14224,7 @@ mandatory = true
                 &[Value::Ref(Some("long:7".into()))]
             )
             .unwrap(),
-            Value::Ref(Some("long:7".into()))
+            Value::Long(7)
         );
 
         let double_empty = MethodRef {
