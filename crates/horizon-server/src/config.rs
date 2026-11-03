@@ -662,6 +662,57 @@ mod tests {
     }
 
     #[test]
+    fn an_older_config_with_only_stable_sections_keeps_loading() {
+        // This is the shape written before optional sections were added. Stable config files
+        // intentionally gain defaults when they are read by a newer server.
+        let c = Config::parse(
+            "[server]\nmotd = \"Old world\"\nport = 25570\n\n[world]\nname = \"legacy\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.server.motd, "Old world");
+        assert_eq!(c.server.port, 25570);
+        assert_eq!(c.world.name, "legacy");
+        assert_eq!(c.engine, Engine::default());
+        assert_eq!(c.backups, Backups::default());
+        assert_eq!(c.panel, Panel::default());
+    }
+
+    #[test]
+    fn load_diagnostics_name_the_file_and_initialization_hint() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-server-config-missing-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let error = Config::load(&dir).unwrap_err();
+        assert!(
+            error.starts_with(&format!("{}: ", dir.join(FILE).display())),
+            "{error}"
+        );
+        assert!(error.contains("run `horizon-server init` first"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_diagnostics_preserve_the_file_for_invalid_compatibility_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-server-config-invalid-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FILE), "[server]\nunknown_setting = true\n").unwrap();
+        let error = Config::load(&dir).unwrap_err();
+        assert!(
+            error.starts_with(&format!("{}: ", dir.join(FILE).display())),
+            "{error}"
+        );
+        assert!(error.contains("unknown field `unknown_setting`"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn rejects_mistakes() {
         assert!(Config::parse("[world]\ngame_mode = \"creatve\"\n").is_err());
         assert!(Config::parse("[server]\nprot = 1\n").is_err());
