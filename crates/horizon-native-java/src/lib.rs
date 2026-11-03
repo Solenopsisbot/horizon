@@ -6964,13 +6964,21 @@ impl NativeJar {
     /// Plans that name a different owner, a different method, or a concrete
     /// descriptor that disagrees with the request are skipped; a descriptor-
     /// less plan matches any overload.  The result keeps discovery order and
-    /// lists HEAD plans before RETURN/TAIL plans before INVOKE plans.  An
+    /// lists HEAD plans before RETURN/TAIL plans before INVOKE plans.
+    ///
+    /// HEAD and RETURN/TAIL plans may name the same target: the HEAD callbacks
+    /// run before the body and the RETURN/TAIL callbacks after it, which is
+    /// what one woven method does.  INVOKE stays its own family, because its
+    /// callbacks run inside the body at a call site rather than around it, so a
+    /// target that mixes INVOKE with either other anchor is rejected.  An
     /// INVOKE plan with an unresolved selector is never executable, so it is
     /// left to [`Self::unresolved_invoke_plans`].
     ///
     /// A `cancellable` HEAD plan is accepted: the native `CallbackInfo` owns the
-    /// flag and the execution stops the target body when it is set.  A
-    /// RETURN/TAIL plan follows the target's shape: a non-void target needs a
+    /// flag and the execution stops the target body when it is set.  A HEAD
+    /// callback takes the plain `CallbackInfo`; a `CallbackInfoReturnable` is a
+    /// return-value override, which this runtime only models after the body.
+    /// A RETURN/TAIL plan follows the target's shape: a non-void target needs a
     /// trailing `CallbackInfoReturnable` and a void target must not declare one.
     /// An INVOKE callback mirrors the woven method's arguments and may add one
     /// trailing `CallbackInfo`.
@@ -6990,7 +6998,19 @@ impl NativeJar {
             }
             plan.target.descriptor = target.descriptor.clone();
             match plan.at.as_str() {
-                "HEAD" => before.push(plan),
+                "HEAD" => {
+                    if callback_takes_returnable(&plan.callback.descriptor) {
+                        return Err(NativeError::Metadata(format!(
+                            "native Mixin callback {}#{}{} takes a CallbackInfoReturnable at HEAD on {}#{}; a HEAD callback takes a CallbackInfo and a cancelled HEAD answers the target descriptor's default",
+                            plan.callback.owner,
+                            plan.callback.name,
+                            plan.callback.descriptor,
+                            target.owner,
+                            target.name
+                        )));
+                    }
+                    before.push(plan);
+                }
                 "INVOKE" => {
                     if plan.invoke_target.is_some() {
                         invoke.push(plan);
@@ -7038,12 +7058,6 @@ impl NativeJar {
                     )));
                 }
             }
-        }
-        if !before.is_empty() && !after.is_empty() {
-            return Err(NativeError::Metadata(format!(
-                "native Mixin target {}#{} mixes HEAD with RETURN/TAIL callbacks; native execution supports one anchor family per target",
-                target.owner, target.name
-            )));
         }
         if !invoke.is_empty() && (!before.is_empty() || !after.is_empty()) {
             return Err(NativeError::Metadata(format!(
@@ -7561,10 +7575,11 @@ impl NativeJar {
     /// A `cancellable` HEAD plan stops the chain where it is: the callbacks
     /// after it do not run, the target body is skipped, and the report carries
     /// the default value of the target's return descriptor. This entry point
-    /// keeps the void-only RETURN/TAIL shape: cancellable RETURN/TAIL plans,
-    /// non-void RETURN/TAIL targets, and mixed anchors stay on the JVM
-    /// fallback.  Return overrides go through [`Self::execute_mixin_at_return`]
-    /// and [`Self::execute_discovered_mixins`].
+    /// keeps the void-only RETURN/TAIL shape and one anchor family per chain:
+    /// cancellable RETURN/TAIL plans, non-void RETURN/TAIL targets, and mixed
+    /// anchors stay on the JVM fallback.  A target that needs HEAD and
+    /// RETURN/TAIL callbacks together, and return overrides, go through
+    /// [`Self::execute_mixin_at_return`] and [`Self::execute_discovered_mixins`].
     pub fn execute_mixin_chain<H: Host>(
         &self,
         plans: &[MixinInjectionPlan],
@@ -8085,15 +8100,16 @@ impl NativeJar {
     /// HEAD plans run in discovery order before the target body; RETURN/TAIL
     /// plans run after it.  The target is invoked exactly once and receives the
     /// caller's arguments unchanged.  A `cancellable` HEAD callback that calls
-    /// `ci.cancel()` stops the callbacks after it and skips the target body, so
-    /// `target_result` becomes the default value of the target's return
-    /// descriptor and `cancelled` is set.
+    /// `ci.cancel()` stops the callbacks after it, skips the target body and
+    /// skips every RETURN/TAIL callback, so `target_result` becomes the default
+    /// value of the target's return descriptor and `cancelled` is set.
     ///
     /// RETURN/TAIL plans run after the target and each callback receives the
-    /// runtime-owned `CallbackInfoReturnable` carrying the target's result; the
-    /// last `setReturnValue` becomes `target_result` and sets
-    /// `return_value_overridden`.  A non-void target requires that marker and a
-    /// void target refuses it, mirroring Mixin's callback shape.
+    /// runtime-owned `CallbackInfoReturnable` carrying the target's result (or
+    /// the previous callback's override); the last `setReturnValue` becomes
+    /// `target_result` and sets `return_value_overridden`.  A non-void target
+    /// requires that marker and a void target refuses it, mirroring Mixin's
+    /// callback shape.
     ///
     /// INVOKE plans run the target once with a bounded call-site hook table:
     /// each callback runs immediately before the call site its selector names,
@@ -8101,8 +8117,10 @@ impl NativeJar {
     /// `ci.cancel()`.  `matched_invoke_sites` counts the sites that ran.
     ///
     /// Unsupported anchors, malformed return-value shapes, and targets that mix
-    /// anchor families are rejected with a bounded `NativeError::Metadata`; they
-    /// stay on the JVM fallback rather than approximating two families at once.
+    /// INVOKE with HEAD/RETURN/TAIL callbacks are rejected with a bounded
+    /// `NativeError::Metadata`; they stay on the JVM fallback rather than
+    /// approximating a call-site hook and an around-the-body hook at once.
+    /// HEAD and RETURN/TAIL callbacks do run together, as in one woven method.
     pub fn execute_discovered_mixins<H: Host>(
         &self,
         target: &MethodRef,
@@ -19271,9 +19289,42 @@ mandatory = true
         );
     }
 
+    /// A static callback that calls `CallbackInfo.cancel()`, injected at HEAD.
+    fn cancel_head_mixin() -> ClassFile {
+        ClassFile {
+            name: "demo/ZCancelMixin".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![
+                Cp::Empty,
+                Cp::Utf8(CALLBACK_INFO_CLASS.into()),
+                Cp::Class(1),
+                Cp::Utf8("cancel".into()),
+                Cp::Utf8("()V".into()),
+                Cp::NameType {
+                    name: 3,
+                    descriptor: 4,
+                },
+                Cp::MethodRef { class: 2, nt: 5 },
+            ],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![test_method(
+                "onRun",
+                &format!("({CALLBACK_INFO_DESC})V"),
+                // aload_0; invokevirtual CallbackInfo.cancel; return
+                vec![0x2a, 0xb6, 0x00, 0x06, 0xb1],
+                vec![inject_annotation("run()V", "HEAD", true)],
+            )],
+            annotations: vec![Annotation {
+                descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
+                values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
+            }],
+        }
+    }
+
     #[test]
-    fn discovered_mixins_reject_cancellable_return_and_mixed_anchor_plans() {
-        let mixed = NativeJar::from_classes([
+    fn discovered_mixins_run_head_then_target_then_return() {
+        let jar = NativeJar::from_classes([
             target_class(),
             marker_mixin(
                 "demo/HeadMixin",
@@ -19292,13 +19343,64 @@ mandatory = true
                 "after",
             ),
         ]);
-        let error = run_discovered(&mixed, "run", &mut MarkerHost::default()).unwrap_err();
-        assert!(
-            matches!(&error, NativeError::Metadata(message)
-                if message.contains("mixes HEAD with RETURN/TAIL")),
-            "unexpected error: {error}"
+        let mut host = MarkerHost::default();
+        let report = run_discovered(&jar, "run", &mut host).unwrap();
+        assert!(!report.cancelled);
+        assert!(!report.return_value_overridden);
+        assert_eq!(report.target_result, Value::Void);
+        assert_eq!(report.callback_results, vec![Value::Void, Value::Void]);
+        assert_eq!(
+            host.markers,
+            vec!["demo/Probe#before", "demo/Probe#target", "demo/Probe#after"],
+            "HEAD runs before the single target body, RETURN after it"
         );
+    }
 
+    #[test]
+    fn a_cancelled_head_callback_skips_the_target_and_return_callbacks() {
+        let jar = NativeJar::from_classes([
+            target_class(),
+            marker_mixin(
+                "demo/HeadMixin",
+                "run()V",
+                "HEAD",
+                false,
+                "before",
+                "before",
+            ),
+            cancel_head_mixin(),
+            marker_mixin(
+                "demo/ReturnMixin",
+                "run()V",
+                "RETURN",
+                false,
+                "after",
+                "after",
+            ),
+        ]);
+        let mut host = MarkerHost::default();
+        let report = run_discovered(&jar, "run", &mut host).unwrap();
+        assert!(report.cancelled);
+        assert!(!report.return_value_overridden);
+        assert_eq!(
+            report.target_result,
+            Value::Void,
+            "a cancelled void target answers its descriptor default"
+        );
+        assert_eq!(
+            report.callback_results,
+            vec![Value::Void, Value::Void],
+            "the non-cancelling HEAD callback and the cancelling one both ran"
+        );
+        assert_eq!(
+            host.markers,
+            vec!["demo/Probe#before"],
+            "the target body and the RETURN callback never run"
+        );
+    }
+
+    #[test]
+    fn discovered_mixins_reject_cancellable_return_plans() {
         let cancellable_return = NativeJar::from_classes([
             target_class(),
             marker_mixin(
@@ -19315,6 +19417,64 @@ mandatory = true
         assert!(
             matches!(&error, NativeError::Metadata(message)
                 if message.contains("cancellable at RETURN")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn discovered_mixins_reject_a_head_callback_that_takes_a_returnable() {
+        let mixin = ClassFile {
+            name: "demo/HeadReturnableMixin".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![test_method(
+                "onRun",
+                &format!("({CALLBACK_INFO_RETURNABLE_DESC})V"),
+                vec![0xb1],
+                vec![inject_annotation("run()V", "HEAD", false)],
+            )],
+            annotations: vec![Annotation {
+                descriptor: "Lorg/spongepowered/asm/mixin/Mixin;".into(),
+                values: BTreeMap::from([("targets".into(), string_array(&["Ldemo/Target;"]))]),
+            }],
+        };
+        let jar = NativeJar::from_classes([target_class(), mixin]);
+        let error = run_discovered(&jar, "run", &mut MarkerHost::default()).unwrap_err();
+        assert!(
+            matches!(&error, NativeError::Metadata(message)
+                if message.contains("takes a CallbackInfoReturnable at HEAD")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn discovered_mixins_still_reject_mixed_invoke_plans() {
+        let jar = NativeJar::from_classes([
+            target_class(),
+            marker_mixin(
+                "demo/HeadMixin",
+                "run()V",
+                "HEAD",
+                false,
+                "before",
+                "before",
+            ),
+            marker_mixin(
+                "demo/ReturnMixin",
+                "run()V",
+                "RETURN",
+                false,
+                "after",
+                "after",
+            ),
+            invoke_mixin("demo/InvokeMixin", Some("Ldemo/Probe;target()V")),
+        ]);
+        let error = run_discovered(&jar, "run", &mut MarkerHost::default()).unwrap_err();
+        assert!(
+            matches!(&error, NativeError::Metadata(message)
+                if message.contains("mixes INVOKE with HEAD/RETURN/TAIL")),
             "unexpected error: {error}"
         );
     }

@@ -7,7 +7,7 @@
 //! call cross the host boundary, where `StdHost` records invocation order and
 //! the mirrored arguments.
 
-use horizon_native_java::{MethodRef, NativeError, NativeJar, StdHost, Value};
+use horizon_native_java::{MethodRef, NativeJar, StdHost, Value};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 use zip::write::SimpleFileOptions;
 
@@ -329,7 +329,7 @@ fn executes_discovered_return_callback_after_the_target() {
 }
 
 #[test]
-fn rejects_mixed_anchor_discovered_mixins() {
+fn executes_head_and_return_callbacks_on_one_target() {
     let (root, jar_path) = build_jar(
         "execution-rejected",
         fixture_sources(),
@@ -339,17 +339,28 @@ fn rejects_mixed_anchor_discovered_mixins() {
     );
     let jar = NativeJar::from_path(&jar_path).unwrap();
 
-    let error = jar
-        .execute_discovered_mixins(
-            &target("mixed", "(I)V"),
-            None,
-            &[Value::Int(1)],
-            &mut StdHost::new(),
-        )
-        .unwrap_err();
-    assert!(
-        matches!(&error, NativeError::Metadata(message) if message.contains("mixes HEAD with RETURN/TAIL")),
-        "unexpected error: {error}"
+    // HEAD and RETURN callbacks share one target: the HEAD runs before the
+    // single target body and the RETURN after it, as one woven method does.
+    let mut host = StdHost::new();
+    let report = jar
+        .execute_discovered_mixins(&target("mixed", "(I)V"), None, &[Value::Int(1)], &mut host)
+        .unwrap();
+    assert!(!report.cancelled);
+    assert!(!report.return_value_overridden);
+    assert_eq!(report.target_result, Value::Void);
+    assert_eq!(report.callback_results, vec![Value::Void, Value::Void]);
+    assert_eq!(
+        mark_order(&host),
+        vec!["mixed-before", "mixed-target", "mixed-after"],
+        "HEAD, then the target once, then RETURN"
+    );
+    assert_eq!(
+        mark_order(&host)
+            .iter()
+            .filter(|mark| *mark == "mixed-target")
+            .count(),
+        1,
+        "the target body runs exactly once"
     );
 
     // A cancellable HEAD plan is accepted; this callback never calls
