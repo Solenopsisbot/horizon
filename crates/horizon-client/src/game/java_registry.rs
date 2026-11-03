@@ -45,6 +45,7 @@ pub(super) struct JavaRegistrySnapshot {
     pub attachment_declarations: Vec<AttachmentDeclaration>,
 }
 
+#[allow(dead_code)]
 impl JavaRegistrySnapshot {
     pub(super) fn block_template(&self, id: &str) -> Option<&BlockTemplate> {
         self.block_templates
