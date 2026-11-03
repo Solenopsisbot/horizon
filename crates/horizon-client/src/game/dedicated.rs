@@ -7,7 +7,11 @@
 //! from server.properties, with the operator, whitelist and ban lists and a
 //! console on standard input.
 use super::{
-    Game, Options, execution_role::ExecutionRole, lan::LanSettings, world_loading::WorldRequest,
+    Game, Options,
+    execution_role::ExecutionRole,
+    lan::LanSettings,
+    mods::{JavaCompatibilityReport, JavaLoader},
+    world_loading::WorldRequest,
 };
 use horizon_client::{
     Result,
@@ -229,21 +233,167 @@ fn capture_log(f: impl FnOnce()) -> Vec<String> {
     CAPTURE.take().unwrap_or_default()
 }
 
+/// The prefix every Java compatibility line this role logs carries, so a
+/// server's log says which role read each jar.
+const JAVA_PREFIX: &str = "Horizon: dedicated Java compatibility: ";
+
+/// The compatibility reports of the jars `load_java_mods` started, for
+/// `server-status`'s `java` section (status.rs).
+static JAVA_REPORTS: Mutex<Vec<JavaCompatibilityReport>> = Mutex::new(Vec::new());
+
+/// The jars the dedicated loader accepted, in the order it read them.
+fn java_reports() -> Vec<JavaCompatibilityReport> {
+    JAVA_REPORTS.lock().unwrap().clone()
+}
+
+/// `JavaLoader`'s names as its summary lines print them. `JavaLoader::name` is
+/// private to `mods`; a test keeps this in step with those lines.
+fn loader_name(loader: JavaLoader) -> &'static str {
+    match loader {
+        JavaLoader::Fabric => "fabric",
+        JavaLoader::NeoForge => "neoforge",
+        JavaLoader::LegacyForge => "legacy-forge",
+    }
+}
+
+/// `ExecutionRole`'s names as `mods`' summary lines print them (`role_name`
+/// there is private to that module).
+fn role_name(role: ExecutionRole) -> &'static str {
+    match role {
+        ExecutionRole::Client => "client",
+        ExecutionRole::IntegratedServer => "integrated-server",
+        ExecutionRole::DedicatedServer => "dedicated-server",
+    }
+}
+
+/// Which metadata names a jar's loader. `JavaLoader::of` is private to `mods`;
+/// the precedence has to stay the same (Fabric first, then NeoForge, then the
+/// legacy `mods.toml`).
+fn loader_of(jar: &horizon_native_java::NativeJar) -> Option<JavaLoader> {
+    let declares = |name: &str| jar.resource_names().any(|resource| resource == name);
+    if jar.fabric_id.is_some() || !jar.fabric_entrypoints.is_empty() || declares("fabric.mod.json")
+    {
+        Some(JavaLoader::Fabric)
+    } else if declares("META-INF/neoforge.mods.toml") || !jar.neoforge_entrypoints.is_empty() {
+        Some(JavaLoader::NeoForge)
+    } else if declares("META-INF/mods.toml") {
+        Some(JavaLoader::LegacyForge)
+    } else if jar.neoforge_id.is_some() {
+        Some(JavaLoader::NeoForge)
+    } else {
+        None
+    }
+}
+
+/// The entrypoint kinds a jar declares, sorted (`mods::native_entrypoint_kinds`
+/// is private to that module).
+fn declared_entrypoints(jar: &horizon_native_java::NativeJar) -> Vec<String> {
+    let mut kinds: Vec<String> = jar.fabric_entrypoints.keys().cloned().collect();
+    if !jar.neoforge_entrypoints.is_empty() {
+        kinds.push("neoforge".to_owned());
+    }
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
+
+/// A jar the loader refused, in the shape of an accepted jar's report: the role
+/// that refused it, the entrypoint kinds it declares and whether its metadata
+/// says `clientSideOnly`. Nothing ran, so the counts are zero.
+fn refusal_report(
+    path: &std::path::Path,
+    jar: Option<&horizon_native_java::NativeJar>,
+) -> JavaCompatibilityReport {
+    let id = jar
+        .and_then(|jar| {
+            jar.native_id
+                .clone()
+                .or_else(|| jar.fabric_id.clone())
+                .or_else(|| jar.neoforge_id.clone())
+        })
+        .or_else(|| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        });
+    JavaCompatibilityReport {
+        jar: path.to_owned(),
+        id,
+        version: jar.and_then(|jar| {
+            jar.fabric_version
+                .clone()
+                .or_else(|| jar.neoforge_version.clone())
+        }),
+        loader: jar.and_then(loader_of),
+        declared_entrypoints: jar.map_or_else(Vec::new, declared_entrypoints),
+        entrypoint_kind: String::new(),
+        executed_entrypoints: 0,
+        host_calls: 0,
+        typed_registrations: 0,
+        opaque_registrations: Vec::new(),
+        promoted: Vec::new(),
+        payload_directions: Vec::new(),
+        listeners: 0,
+        client_side_only_rejected: jar.is_some_and(|jar| jar.client_side_only),
+        role: ExecutionRole::DedicatedServer,
+    }
+}
+
+/// The compatibility lines for a startup the loader refused. The loader's error
+/// starts with the jar it stopped at; that jar's report says why in the same
+/// shape an accepted one logs, and the error itself follows it unchanged.
+fn java_refusal_lines(paths: &[PathBuf], error: &str) -> Vec<String> {
+    let Some(path) = paths
+        .iter()
+        .find(|path| error.starts_with(&path.display().to_string()))
+    else {
+        return Vec::new();
+    };
+    let jar = horizon_native_java::NativeJar::from_path(path).ok();
+    let mut lines = refusal_report(path, jar.as_ref()).summary();
+    lines.push(format!("  refused: {error}"));
+    lines
+}
+
+/// Logs a report's lines under this role's prefix; an accepted jar at INFO, a
+/// refused one at ERROR.
+fn log_java_reports(reports: &[JavaCompatibilityReport], level: &str) {
+    for report in reports {
+        for line in report.summary() {
+            log(level, &format!("{JAVA_PREFIX}{line}"));
+        }
+    }
+}
+
 /// Load explicitly selected Java mods for the standalone dedicated role.
 ///
 /// Keeping this boundary in the dedicated server module makes the role visible in
 /// diagnostics and prevents a future startup path from accidentally using the
 /// client or integrated-server entrypoint selection.
-fn load_java_mod_paths(paths: &[PathBuf]) -> Result<Vec<horizon_client::mod_content::ContentMod>> {
-    super::mods::run_java_mods(paths, ExecutionRole::DedicatedServer)
-        .map_err(|error| format!("dedicated Java mod startup failed: {error}").into())
+fn load_java_mod_paths(
+    paths: &[PathBuf],
+) -> Result<(
+    Vec<horizon_client::mod_content::ContentMod>,
+    Vec<JavaCompatibilityReport>,
+)> {
+    super::mods::run_java_mods_with_report(paths, ExecutionRole::DedicatedServer).map_err(|error| {
+        // The loader stops before it can hand its reports back, so the
+        // refused jar's lines are rebuilt here: the console still names the
+        // role, and the error text stays the dedicated startup one.
+        for line in java_refusal_lines(paths, &error) {
+            log("ERROR", &format!("{JAVA_PREFIX}{line}"));
+        }
+        format!("dedicated Java mod startup failed: {error}").into()
+    })
 }
 
 pub(super) fn load_java_mods(options: &mut Options) -> Result<()> {
     if options.java_mods.is_empty() {
         return Ok(());
     }
-    options.java_content = Arc::new(load_java_mod_paths(&options.java_mods)?);
+    let (content, reports) = load_java_mod_paths(&options.java_mods)?;
+    log_java_reports(&reports, "INFO");
+    *JAVA_REPORTS.lock().unwrap() = reports;
+    options.java_content = Arc::new(content);
     Ok(())
 }
 
@@ -557,6 +707,8 @@ struct ServerState {
     op_level: i32,
     /// `horizon-report`: the ticks being recorded.
     report: Option<report::Recording>,
+    /// The Java jars the dedicated loader started, for `server-status`.
+    java: Vec<JavaCompatibilityReport>,
     /// View and simulation distance, and the player limit, for the report.
     view: (u32, u32),
     max_players: usize,
@@ -891,6 +1043,7 @@ impl Game<'_> {
             broadcast_console: props.broadcast_console_to_ops,
             op_level: props.op_permission_level,
             report: None,
+            java: java_reports(),
             view: (
                 props.view_distance.clamp(2, 32) as u32,
                 props.simulation_distance.clamp(2, 32) as u32,
@@ -1698,10 +1851,15 @@ fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_log, log, log_from};
+    use super::{
+        ExecutionRole, JAVA_PREFIX, JavaCompatibilityReport, JavaLoader, capture_log,
+        java_refusal_lines, loader_name, log, log_from, log_java_reports, refusal_report,
+        role_name,
+    };
     use std::{
         fs,
         io::{self, BufRead, BufReader, Read, Write},
+        path::PathBuf,
         process::{Command, Stdio},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1804,8 +1962,12 @@ mod tests {
 
     #[test]
     fn dedicated_java_loader_names_role_in_failure() {
-        let path = std::path::PathBuf::from("/tmp/horizon-missing-dedicated-java-mod.jar");
-        let error = super::load_java_mod_paths(&[path]).unwrap_err().to_string();
+        let path = PathBuf::from("/tmp/horizon-missing-dedicated-java-mod.jar");
+        let mut error = String::new();
+        let lines = capture_log(|| {
+            error = super::load_java_mod_paths(&[path]).unwrap_err().to_string();
+        });
+        // The error the startup was always refused with is unchanged.
         assert!(
             error.contains("dedicated Java mod startup failed"),
             "{error}"
@@ -1814,5 +1976,206 @@ mod tests {
             error.contains("horizon-missing-dedicated-java-mod.jar"),
             "{error}"
         );
+        // And the console still says which role refused the jar, in the shape an
+        // accepted jar logs.
+        let summary = lines.join("\n");
+        assert!(summary.contains("role=dedicated-server"), "{summary}");
+        assert!(
+            summary.contains("horizon-missing-dedicated-java-mod.jar"),
+            "{summary}"
+        );
+        assert!(summary.contains("refused: "), "{summary}");
+        assert!(
+            lines.iter().any(|line| line.starts_with(JAVA_PREFIX)),
+            "{lines:?}"
+        );
+    }
+
+    /// A compatibility report built in memory: the same fields the loader fills
+    /// in, so the log and the status are readable without compiling a jar.
+    fn java_report(
+        jar: &str,
+        loader: Option<JavaLoader>,
+        typed: usize,
+        opaque: &[&str],
+        payload: &[&str],
+    ) -> JavaCompatibilityReport {
+        JavaCompatibilityReport {
+            jar: PathBuf::from(jar),
+            id: Some("demo".into()),
+            version: Some("1.0".into()),
+            loader,
+            declared_entrypoints: vec!["main".into()],
+            entrypoint_kind: "main".into(),
+            executed_entrypoints: 1,
+            host_calls: 2,
+            typed_registrations: typed,
+            opaque_registrations: opaque.iter().map(|key| (*key).to_owned()).collect(),
+            promoted: Vec::new(),
+            payload_directions: payload.iter().map(|way| (*way).to_owned()).collect(),
+            listeners: 0,
+            client_side_only_rejected: false,
+            role: ExecutionRole::DedicatedServer,
+        }
+    }
+
+    #[test]
+    fn dedicated_java_logs_one_prefixed_block_per_jar() {
+        let reports = [
+            java_report(
+                "/mods/a-typed.jar",
+                Some(JavaLoader::Fabric),
+                2,
+                &[],
+                &["server->client"],
+            ),
+            java_report(
+                "/mods/b-opaque.jar",
+                Some(JavaLoader::NeoForge),
+                0,
+                &["minecraft:item/demo:token"],
+                &[],
+            ),
+        ];
+        let lines = capture_log(|| log_java_reports(&reports, "INFO"));
+        // A summary is four lines: the jar, its entrypoints, its registrations
+        // and its payloads.
+        assert_eq!(lines.len(), 8, "{lines:?}");
+        for line in &lines {
+            assert!(line.starts_with(JAVA_PREFIX), "{line}");
+        }
+        // The names match the ones the report's own summary prints, so a rename
+        // in mods fails here rather than drifting.
+        assert_eq!(
+            role_name(ExecutionRole::DedicatedServer),
+            "dedicated-server"
+        );
+        assert_eq!(loader_name(JavaLoader::Fabric), "fabric");
+        assert!(
+            lines[0].contains(&format!(
+                "role={} loader={} id=demo version=1.0",
+                role_name(reports[0].role),
+                loader_name(JavaLoader::Fabric)
+            )),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].contains("registrations: typed=2 opaque=[] promoted=[]"),
+            "{lines:?}"
+        );
+        assert!(lines[3].contains("payloads: [server->client]"), "{lines:?}");
+        assert!(
+            lines[6].contains("registrations: typed=0 opaque=[minecraft:item/demo:token]"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn dedicated_java_status_sorts_jars_and_counts_the_verdicts() {
+        let mut rejected = java_report(
+            "/mods/c-client-only.jar",
+            Some(JavaLoader::LegacyForge),
+            0,
+            &[],
+            &[],
+        );
+        rejected.client_side_only_rejected = true;
+        let reports = [
+            rejected,
+            java_report(
+                "/mods/b-opaque.jar",
+                Some(JavaLoader::NeoForge),
+                0,
+                &["minecraft:item/demo:token"],
+                &["server->client"],
+            ),
+            java_report(
+                "/mods/a-typed.jar",
+                Some(JavaLoader::Fabric),
+                2,
+                &[],
+                &["client->server"],
+            ),
+        ];
+        let section = super::status::java_section(&reports);
+        assert_eq!(section["jars"], 3);
+        assert_eq!(section["listed"], 3);
+        assert_eq!(section["rejected"], 1);
+        assert_eq!(section["typed"], 2);
+        assert_eq!(section["opaque"], 1);
+        assert_eq!(section["promoted"], 0);
+        // Sorted by jar path, whatever order the loader read them in.
+        let jars: Vec<&str> = section["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["jar"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            jars,
+            [
+                "/mods/a-typed.jar",
+                "/mods/b-opaque.jar",
+                "/mods/c-client-only.jar"
+            ]
+        );
+        assert_eq!(section["entries"][0]["role"], "dedicated-server");
+        assert_eq!(section["entries"][1]["loader"], "neoforge");
+        assert_eq!(
+            section["entries"][1]["payload"],
+            serde_json::json!(["server->client"])
+        );
+        assert_eq!(section["entries"][2]["loader"], "legacy-forge");
+        assert_eq!(section["entries"][2]["rejected"], true);
+        assert_eq!(section["entries"][2]["entrypoint"], "main");
+        let directions: Vec<&str> = section["payload_directions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|way| way.as_str().unwrap())
+            .collect();
+        assert_eq!(directions, ["client->server", "server->client"]);
+    }
+
+    #[test]
+    fn dedicated_java_refusal_names_the_role_and_declared_kinds() {
+        let path = std::path::Path::new("/horizon-absent-mods/client-only.jar");
+        let mut jar = horizon_native_java::NativeJar::default();
+        jar.fabric_id = Some("client-only".into());
+        jar.fabric_version = Some("1.0".into());
+        jar.fabric_entrypoints.insert("client".into(), Vec::new());
+        let summary = refusal_report(path, Some(&jar)).summary().join("\n");
+        assert!(
+            summary.contains("role=dedicated-server loader=fabric id=client-only version=1.0"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("declared=[client] selected=none executed=0"),
+            "{summary}"
+        );
+        jar.client_side_only = true;
+        let summary = refusal_report(path, Some(&jar)).summary().join("\n");
+        assert!(
+            summary.contains("rejected: clientSideOnly metadata for dedicated-server execution"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn dedicated_java_refusal_picks_the_jar_the_loader_stopped_at() {
+        let paths = [
+            PathBuf::from("/horizon-absent-mods/first.jar"),
+            PathBuf::from("/horizon-absent-mods/second.jar"),
+        ];
+        let error = "/horizon-absent-mods/second.jar: no native Fabric or NeoForge entrypoint \
+                     for server execution (available: client)";
+        let lines = java_refusal_lines(&paths, error);
+        let summary = lines.join("\n");
+        assert!(summary.contains("role=dedicated-server"), "{summary}");
+        assert!(summary.contains("second.jar"), "{summary}");
+        assert!(!summary.contains("first.jar"), "{summary}");
+        assert!(summary.contains(&format!("refused: {error}")), "{summary}");
+        // A loader error that names none of the jars logs nothing here.
+        assert!(java_refusal_lines(&paths, "metadata has no mod id").is_empty());
     }
 }

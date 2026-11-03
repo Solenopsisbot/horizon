@@ -1,16 +1,73 @@
 //! What `horizon-server` asks the dedicated server on its control endpoint (`--control-socket`, docs/server.md
-//! section 2): `server-status` answers with the tick rate, the tick times `/tick query` reports, the players
-//! and the loaded chunks; `console <line>` runs a console command and answers with the lines it logged.
-use super::{ServerState, capture_log};
+//! section 2): `server-status` answers with the tick rate, the tick times `/tick query` reports, the players,
+//! the loaded chunks and the Java jars the loader started; `console <line>` runs a console command and answers
+//! with the lines it logged.
+use super::{JavaCompatibilityReport, ServerState, capture_log, loader_name, role_name};
 use crate::game::Game;
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeSet,
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
 /// The window the tick rate is measured over.
 const TPS_WINDOW: Duration = Duration::from_secs(5);
+/// The most jars `server-status` lists one by one; the counts stay whole.
+const MAX_STATUS_JARS: usize = 8;
+/// The most payload directions one jar lists.
+const MAX_STATUS_ROWS: usize = 12;
+
+/// The `java` section of `server-status`: which explicitly selected jars the
+/// dedicated loader started, each one's loader, role and entrypoint kind, how
+/// its registrations landed, and whether any was refused. Sorted by jar path
+/// and bounded, so two servers that started the same jars answer the same.
+pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
+    let mut sorted: Vec<&JavaCompatibilityReport> = reports.iter().collect();
+    sorted.sort_by(|a, b| a.jar.cmp(&b.jar));
+    let mut directions: BTreeSet<&str> = BTreeSet::new();
+    for report in &sorted {
+        directions.extend(report.payload_directions.iter().map(String::as_str));
+    }
+    let count = |of: fn(&JavaCompatibilityReport) -> usize| {
+        sorted.iter().map(|report| of(report)).sum::<usize>()
+    };
+    let entries: Vec<Value> = sorted
+        .iter()
+        .take(MAX_STATUS_JARS)
+        .map(|report| {
+            json!({
+                "jar": report.jar.display().to_string(),
+                "loader": report.loader.map_or("unknown", loader_name),
+                "role": role_name(report.role),
+                "entrypoint": if report.entrypoint_kind.is_empty() {
+                    "none"
+                } else {
+                    &report.entrypoint_kind
+                },
+                "typed": report.typed_registrations,
+                "opaque": report.opaque_registrations.len(),
+                "promoted": report.promoted.len(),
+                "payload": report
+                    .payload_directions
+                    .iter()
+                    .take(MAX_STATUS_ROWS)
+                    .collect::<Vec<_>>(),
+                "rejected": report.client_side_only_rejected,
+            })
+        })
+        .collect();
+    json!({
+        "jars": sorted.len(),
+        "listed": entries.len(),
+        "rejected": sorted.iter().filter(|r| r.client_side_only_rejected).count(),
+        "typed": count(|r| r.typed_registrations),
+        "opaque": count(|r| r.opaque_registrations.len()),
+        "promoted": count(|r| r.promoted.len()),
+        "payload_directions": directions,
+        "entries": entries,
+    })
+}
 
 impl ServerState {
     /// One pass of the server loop ended.
@@ -95,6 +152,7 @@ impl Game<'_> {
             "max_players": max_players,
             "chunks": self.world.chunks.len(),
             "paused": state.paused,
+            "java": java_section(&state.java),
         })
     }
 }
