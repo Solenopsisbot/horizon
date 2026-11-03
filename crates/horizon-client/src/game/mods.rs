@@ -316,7 +316,7 @@ pub(super) fn run_java_mods(
 pub(super) fn register_mob_effects(mods: &[horizon_client::mod_content::ContentMod]) {
     let effects = horizon_client::mod_content::mob_effects(mods);
     let ids: Vec<String> = effects.iter().map(|e| e.id.clone()).collect();
-    let set = horizon_client::brewing::register_mod_effects(effect_rows(effects.into_iter()));
+    let set = horizon_client::brewing::register_mod_effects(effect_rows(effects));
     if !set
         && horizon_client::brewing::mod_effects()
             .iter()
