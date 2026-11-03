@@ -182,6 +182,32 @@ pub fn generate_many(
             .iter()
             .any(|r| fabric_client_holders.contains(&r.as_str()))
     });
+    // Fabric's client model-loading API is a library slice as well: the
+    // registry, its provider interfaces and the context a provider is handed.
+    // A target that only registers a provider selects it, so a jar that never
+    // touches models pays nothing.
+    let fabric_model_holders = [
+        FABRIC_MODEL_LOADING_REGISTRY,
+        FABRIC_MODEL_RESOURCE_PROVIDER,
+        FABRIC_MODEL_VARIANT_PROVIDER,
+        FABRIC_MODEL_APPENDER,
+        FABRIC_MODEL_PROVIDER_CONTEXT,
+    ];
+    let uses_fabric_models = target.iter().any(|class| {
+        class
+            .refs
+            .iter()
+            .any(|r| fabric_model_holders.contains(&r.as_str()))
+    });
+    // NeoForge's model events are nested classes of one library class, so the
+    // outer name selects the pair.
+    let uses_neoforge_models = uses_neoforge
+        && target.iter().any(|class| {
+            class
+                .refs
+                .iter()
+                .any(|r| r.split('$').next() == Some(NEOFORGE_MODEL_EVENT))
+        });
     // NeoForge's client event classes are library classes too. The loader
     // probe already guards the event bus they extend, so this only selects the
     // client slice (one extra file) for a target that names one of them.
@@ -355,6 +381,8 @@ pub fn generate_many(
         || uses_fabric_item_groups
         || uses_fabric_renderers
         || uses_neoforge_registration
+        || uses_fabric_models
+        || uses_neoforge_models
     {
         resolve_client_types(&game, &lib_names, &wanted)
     } else {
@@ -393,6 +421,12 @@ pub fn generate_many(
     }
     if uses_model_layers {
         needed_roles.extend(["model_layer_location", "textured_model_data"]);
+    }
+    if uses_fabric_models {
+        needed_roles.extend(["identifier", "unbaked_model", "baked_model", "model_loader"]);
+    }
+    if uses_neoforge_models {
+        needed_roles.extend(["model_key", "baked_model"]);
     }
     for (role, name) in &client {
         if needed_roles.contains(role) {
@@ -1027,6 +1061,53 @@ pub fn generate_many(
             })?;
         }
     }
+    // Fabric's client model-loading API is one unit: the registry names the
+    // provider interfaces, and a provider names the context. The host owns
+    // baking, so every class either lands whole or reports the roles this jar
+    // lacks, and a real API class is never shadowed.
+    if uses_fabric_models {
+        let mut model_types = client.clone();
+        // The context is the façade's own class, not a game role: a provider's
+        // signature names it, so it joins the fill-in map.
+        model_types.insert(
+            "model_provider_context",
+            FABRIC_MODEL_PROVIDER_CONTEXT.to_owned(),
+        );
+        let missing: Vec<&str> = ["identifier", "baked_model", "model_loader", "unbaked_model"]
+            .into_iter()
+            .filter(|role| !model_types.contains_key(role))
+            .collect();
+        if missing.is_empty() {
+            for (class, template) in [
+                (
+                    FABRIC_MODEL_PROVIDER_CONTEXT,
+                    FABRIC_MODEL_PROVIDER_CONTEXT_SOURCE,
+                ),
+                (
+                    FABRIC_MODEL_RESOURCE_PROVIDER,
+                    FABRIC_MODEL_RESOURCE_PROVIDER_SOURCE,
+                ),
+                (
+                    FABRIC_MODEL_VARIANT_PROVIDER,
+                    FABRIC_MODEL_VARIANT_PROVIDER_SOURCE,
+                ),
+                (FABRIC_MODEL_APPENDER, FABRIC_MODEL_APPENDER_SOURCE),
+                (
+                    FABRIC_MODEL_LOADING_REGISTRY,
+                    FABRIC_MODEL_LOADING_REGISTRY_SOURCE,
+                ),
+            ] {
+                if !available.contains(class) {
+                    write_shim(&mut files, &src, class, &fill_types(template, &model_types))?;
+                }
+            }
+        } else {
+            report.missing.push(format!(
+                "net/fabricmc/fabric/api/client/model/loading/v1 (needs {})",
+                missing.join(", ")
+            ));
+        }
+    }
     // Fabric's data-attachment API: one registration per attachment id, kept in
     // a deterministic map with its codec and initializer markers plus the
     // persistent and copy-on-death flags. `AttachmentType#id()` answers the
@@ -1592,6 +1673,19 @@ pub fn generate_many(
                     "entity_type",
                 ],
                 || fill_client(NEOFORGE_ENTITY_RENDERERS),
+            )?;
+        }
+        // NeoForge's model events: `RegisterAdditional` retains the model keys
+        // a listener asks for and `ModifyBakingResult` the baked models it hands
+        // back, both in call order. The host owns baking, so these stay bounded
+        // values it posts, never a live model registry.
+        if uses_neoforge_models {
+            client_shims.emit(
+                &mut files,
+                &mut report,
+                NEOFORGE_MODEL_EVENT,
+                &["model_key", "baked_model"],
+                || fill_client(NEOFORGE_MODEL_EVENT_SOURCE),
             )?;
         }
     }
@@ -2725,6 +2819,126 @@ public final class ColorProviderRegistry {
 }
 "#;
 
+/// Fabric's client model-loading API, as library classes. The registry, the
+/// three provider interfaces and the context a provider is handed are emitted
+/// only when the real API class is absent; the host owns baking, so every
+/// registration is retained as a value.
+const FABRIC_MODEL_LOADING_REGISTRY: &str =
+    "net/fabricmc/fabric/api/client/model/loading/v1/ModelLoadingRegistry";
+const FABRIC_MODEL_PROVIDER_CONTEXT: &str =
+    "net/fabricmc/fabric/api/client/model/loading/v1/ModelProviderContext";
+const FABRIC_MODEL_RESOURCE_PROVIDER: &str =
+    "net/fabricmc/fabric/api/client/model/loading/v1/ModelResourceProvider";
+const FABRIC_MODEL_VARIANT_PROVIDER: &str =
+    "net/fabricmc/fabric/api/client/model/loading/v1/ModelVariantProvider";
+const FABRIC_MODEL_APPENDER: &str = "net/fabricmc/fabric/api/client/model/loading/v1/ModelAppender";
+
+/// The context a model provider is handed: `loadModel` is a bounded marker
+/// that records the id it was asked for (in call order) and answers no model,
+/// because the façade has no baker. The overload with a loader delegates, so a
+/// provider's second call site links too. Ids live in one ordered list because
+/// an interface has no per-instance state; the host reads it back as a copy.
+const FABRIC_MODEL_PROVIDER_CONTEXT_SOURCE: &str = r#"package net.fabricmc.fabric.api.client.model.loading.v1;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import {baked_model};
+import {identifier};
+import {model_loader};
+
+public interface ModelProviderContext {
+    List<{identifier}> HORIZON_REQUESTED_MODELS = Collections.synchronizedList(new ArrayList<>());
+    default {baked_model} loadModel({identifier} id) {
+        if (id != null) HORIZON_REQUESTED_MODELS.add(id);
+        return null;
+    }
+    default {baked_model} loadModel({identifier} id, {model_loader} loader) {
+        return loadModel(id);
+    }
+    /** The ids a provider asked for, in call order. */
+    static List<{identifier}> horizonRequestedModels() {
+        return Collections.unmodifiableList(new ArrayList<>(HORIZON_REQUESTED_MODELS));
+    }
+}
+"#;
+
+/// A model resource provider: the id it was registered for and the context it
+/// may query. It answers no model here; retaining the provider is the slice.
+const FABRIC_MODEL_RESOURCE_PROVIDER_SOURCE: &str = r#"package net.fabricmc.fabric.api.client.model.loading.v1;
+
+import {identifier};
+import {unbaked_model};
+
+@FunctionalInterface
+public interface ModelResourceProvider {
+    {unbaked_model} loadModelResource({identifier} id, ModelProviderContext context);
+}
+"#;
+
+/// A model variant provider: the variant id it is asked about and the context.
+/// 26.3 keys a variant by its identifier, so this is the same shape as the
+/// resource provider without the registration id.
+const FABRIC_MODEL_VARIANT_PROVIDER_SOURCE: &str = r#"package net.fabricmc.fabric.api.client.model.loading.v1;
+
+import {identifier};
+import {unbaked_model};
+
+@FunctionalInterface
+public interface ModelVariantProvider {
+    {unbaked_model} loadModelVariant({identifier} id, ModelProviderContext context);
+}
+"#;
+
+/// A model appender: it adds ids to the consumer the host passes. The real API
+/// uses its own `ModelConsumer`; the bounded shape takes the JDK consumer for
+/// the ids, so no fourth API class has to be invented.
+const FABRIC_MODEL_APPENDER_SOURCE: &str = r#"package net.fabricmc.fabric.api.client.model.loading.v1;
+
+import java.util.function.Consumer;
+import {identifier};
+
+@FunctionalInterface
+public interface ModelAppender {
+    void appendAll(ModelProviderContext context, Consumer<{identifier}> consumer);
+}
+"#;
+
+/// The registry retaining what a mod registers: one ordered ledger of
+/// `{kind, id, provider}` triples, so a host reads registrations back in call
+/// order and by kind. Nothing is baked, discovered or appended by itself.
+const FABRIC_MODEL_LOADING_REGISTRY_SOURCE: &str = r#"package net.fabricmc.fabric.api.client.model.loading.v1;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import {identifier};
+
+public final class ModelLoadingRegistry {
+    private static final List<Object[]> HORIZON_REGISTRATIONS = new ArrayList<>();
+    private ModelLoadingRegistry() {}
+    public static void registerModelProvider({identifier} id, ModelResourceProvider provider) {
+        horizonAdd("model", id, provider);
+    }
+    public static void registerModelVariantProvider(ModelVariantProvider provider) {
+        horizonAdd("variant", null, provider);
+    }
+    public static void registerResourceProvider(ModelResourceProvider provider) {
+        horizonAdd("resource", null, provider);
+    }
+    public static void registerAppender(ModelAppender appender) {
+        horizonAdd("appender", null, appender);
+    }
+    private static void horizonAdd(String kind, {identifier} id, Object provider) {
+        if (provider != null) HORIZON_REGISTRATIONS.add(new Object[] { kind, id, provider });
+    }
+    /** `{kind, id, provider}` triples in registration order. */
+    public static List<Object[]> horizonRegistrations() {
+        return Collections.unmodifiableList(new ArrayList<>(HORIZON_REGISTRATIONS));
+    }
+}
+"#;
+
 /// Fabric API's data-attachment types and registry. A registration is only
 /// retained (id, codec and initializer markers, persistent and copy-on-death
 /// flags); the store itself lives on the `AttachmentTarget` interface that the
@@ -3289,6 +3503,47 @@ public class EntityRenderersEvent extends Event {
 }
 "#;
 
+/// NeoForge's `ModelEvent` and its two registration nested classes. The model
+/// event is a library class (emitted only when the real one is absent):
+/// `RegisterAdditional` retains the model keys a listener asks the bakery for,
+/// and `ModifyBakingResult` the baked models it hands back, both in call order.
+/// 26.3 keys a model by its `ModelState`; the role resolves the name the jar
+/// carries, so an older jar binds through `ModelResourceLocation`.
+const NEOFORGE_MODEL_EVENT: &str = "net/neoforged/neoforge/client/event/ModelEvent";
+const NEOFORGE_MODEL_EVENT_SOURCE: &str = r#"package net.neoforged.neoforge.client.event;
+
+import net.neoforged.bus.api.Event;
+import {baked_model};
+import {model_key};
+
+public class ModelEvent extends Event {
+    private ModelEvent() {}
+    public static class RegisterAdditional extends ModelEvent {
+        private final java.util.List<{model_key}> horizonModels = new java.util.ArrayList<>();
+        public RegisterAdditional() {}
+        public void register({model_key} location) {
+            if (location != null) horizonModels.add(location);
+        }
+        /** The registered model keys, in call order. */
+        public java.util.List<{model_key}> horizonModels() {
+            return java.util.Collections.unmodifiableList(new java.util.ArrayList<>(horizonModels));
+        }
+    }
+    public static class ModifyBakingResult extends ModelEvent {
+        private final java.util.Map<{model_key}, {baked_model}> horizonModels = new java.util.LinkedHashMap<>();
+        public ModifyBakingResult() {}
+        /** The baked models the host supplied, in insertion order. */
+        public java.util.Map<{model_key}, {baked_model}> getModels() {
+            return java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(horizonModels));
+        }
+
+        public void horizonRegister({model_key} location, {baked_model} model) {
+            if (location != null && model != null) horizonModels.put(location, model);
+        }
+    }
+}
+"#;
+
 /// NeoForge's attachment type: a library class, emitted only when the real
 /// `net.neoforged.neoforge.attachment.AttachmentType` is absent.
 const NEOFORGE_ATTACHMENT_TYPE: &str = "net/neoforged/neoforge/attachment/AttachmentType";
@@ -3476,6 +3731,36 @@ const CLIENT_TYPE_CANDIDATES: &[(&str, &[&str])] = &[
             "net/minecraft/client/model/geom/builders/TexturedModelData",
         ],
     ),
+    // The client model-loading slice's roles. 26.3 moved `ModelState` to the
+    // blockstate dispatch package and replaced `ModelResourceLocation` with it,
+    // so the names it replaced stay last and a jar built against them binds.
+    (
+        "identifier",
+        &[
+            "net/minecraft/resources/Identifier",
+            "net/minecraft/resources/ResourceLocation",
+        ],
+    ),
+    (
+        "unbaked_model",
+        &["net/minecraft/client/resources/model/UnbakedModel"],
+    ),
+    (
+        "baked_model",
+        &["net/minecraft/client/resources/model/BakedModel"],
+    ),
+    (
+        "model_loader",
+        &["net/minecraft/client/resources/model/ModelLoader"],
+    ),
+    (
+        "model_key",
+        &[
+            "net/minecraft/client/renderer/block/dispatch/ModelState",
+            "net/minecraft/client/resources/model/ModelState",
+            "net/minecraft/client/resources/model/ModelResourceLocation",
+        ],
+    ),
 ];
 
 /// Resolve the client roles this game jar carries. A type the mod itself names
@@ -3655,9 +3940,9 @@ impl ClientShims<'_> {
         class: &str,
         requires: &[&str],
         source: impl FnOnce() -> String,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if self.available.contains(class) {
-            return Ok(());
+            return Ok(false);
         }
         let missing: Vec<&str> = requires
             .iter()
@@ -3669,9 +3954,10 @@ impl ClientShims<'_> {
                 "{class} (needs client type {})",
                 missing.join(", ")
             ));
-            return Ok(());
+            return Ok(false);
         }
-        write_shim(files, self.src, class, &source())
+        write_shim(files, self.src, class, &source())?;
+        Ok(true)
     }
 }
 
@@ -3708,7 +3994,7 @@ fn emit_networking_shim(
 /// Emits one API-only shim whose signature names roles resolved from the game
 /// jar and the dependency jars (the attachment slice). A real API class is
 /// never shadowed, and a role this jar cannot resolve is reported instead of
-/// being emitted with an invented type.
+/// being emitted with an invented type. Answers whether a shim was written.
 fn emit_role_shim(
     files: &mut Vec<PathBuf>,
     report: &mut Report,
@@ -3718,9 +4004,9 @@ fn emit_role_shim(
     class: &str,
     requires: &[&str],
     source: impl FnOnce() -> String,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if available.contains(class) {
-        return Ok(());
+        return Ok(false);
     }
     let missing: Vec<&str> = requires
         .iter()
@@ -3731,9 +4017,10 @@ fn emit_role_shim(
         report
             .missing
             .push(format!("{class} (needs {})", missing.join(", ")));
-        return Ok(());
+        return Ok(false);
     }
-    write_shim(files, src, class, &source())
+    write_shim(files, src, class, &source())?;
+    Ok(true)
 }
 
 /// Writes one generated shim and records it for the `javac` source list.
@@ -14448,6 +14735,301 @@ mod tests {
         assert!(output.status.success(), "menu probe failed: {stderr}");
         assert!(
             stdout.contains("horizon menu facade ok"),
+            "probe output: {stdout}{stderr}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn model_loading_facade_shapes_match_the_api() {
+        // Exact descriptors: the provider interfaces are the lambda targets a
+        // mod compiles against, and the registry keeps a `{kind, id, provider}`
+        // ledger in call order.
+        for (template, fragment) in [
+            (
+                FABRIC_MODEL_PROVIDER_CONTEXT_SOURCE,
+                "default {baked_model} loadModel({identifier} id) {",
+            ),
+            (
+                FABRIC_MODEL_PROVIDER_CONTEXT_SOURCE,
+                "default {baked_model} loadModel({identifier} id, {model_loader} loader) {",
+            ),
+            (
+                FABRIC_MODEL_RESOURCE_PROVIDER_SOURCE,
+                "{unbaked_model} loadModelResource({identifier} id, ModelProviderContext context);",
+            ),
+            (
+                FABRIC_MODEL_VARIANT_PROVIDER_SOURCE,
+                "{unbaked_model} loadModelVariant({identifier} id, ModelProviderContext context);",
+            ),
+            (
+                FABRIC_MODEL_APPENDER_SOURCE,
+                "void appendAll(ModelProviderContext context, Consumer<{identifier}> consumer);",
+            ),
+            (
+                FABRIC_MODEL_LOADING_REGISTRY_SOURCE,
+                "HORIZON_REGISTRATIONS.add(new Object[] { kind, id, provider });",
+            ),
+            (
+                NEOFORGE_MODEL_EVENT_SOURCE,
+                "public static class RegisterAdditional extends ModelEvent {",
+            ),
+            (
+                NEOFORGE_MODEL_EVENT_SOURCE,
+                "public void horizonRegister({model_key} location, {baked_model} model) {",
+            ),
+        ] {
+            assert!(
+                template.contains(fragment),
+                "missing model fragment: {fragment}"
+            );
+            assert!(
+                !template.contains("net.minecraft."),
+                "hard-coded game type in a model template"
+            );
+        }
+        // The roles resolve against the game jar, 26.3's dispatch name first;
+        // the class it replaced still binds for an older jar.
+        let game = |names: &[&str]| -> BTreeMap<String, Class> {
+            names
+                .iter()
+                .map(|name| ((*name).to_owned(), Class::default()))
+                .collect()
+        };
+        let none = BTreeSet::new();
+        let modern = resolve_client_types(
+            &game(&[
+                "net/minecraft/resources/Identifier",
+                "net/minecraft/client/resources/model/BakedModel",
+                "net/minecraft/client/resources/model/UnbakedModel",
+                "net/minecraft/client/resources/model/ModelLoader",
+                "net/minecraft/client/renderer/block/dispatch/ModelState",
+            ]),
+            &none,
+            &none,
+        );
+        assert_eq!(
+            modern["model_key"],
+            "net/minecraft/client/renderer/block/dispatch/ModelState"
+        );
+        assert_eq!(modern["identifier"], "net/minecraft/resources/Identifier");
+        let legacy = resolve_client_types(
+            &game(&["net/minecraft/client/resources/model/ModelResourceLocation"]),
+            &none,
+            &none,
+        );
+        assert_eq!(
+            legacy["model_key"],
+            "net/minecraft/client/resources/model/ModelResourceLocation"
+        );
+        // A server-shaped jar resolves no model role: the slice reports the
+        // missing types instead of inventing one.
+        assert!(!resolve_client_types(&game(&[]), &none, &none).contains_key("model_key"));
+        // Emission is gated by the API class and by role resolution.
+        let source = include_str!("facade.rs");
+        for marker in [
+            "let uses_fabric_models = target",
+            "let uses_neoforge_models = uses_neoforge",
+            "if !available.contains(class) {",
+        ] {
+            assert!(source.contains(marker), "missing model guard: {marker}");
+        }
+        // A role the jar cannot resolve is reported, not invented; a real API
+        // class is never shadowed. This is the guard the NeoForge slice uses.
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-model-roles-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create model shim directory");
+        let empty = BTreeSet::new();
+        let types = BTreeMap::new();
+        let shims = ClientShims {
+            src: &root,
+            available: &empty,
+            types: &types,
+        };
+        let mut files = Vec::new();
+        let mut report = Report::default();
+        let written = shims
+            .emit(
+                &mut files,
+                &mut report,
+                FABRIC_MODEL_LOADING_REGISTRY,
+                &["model_key"],
+                String::new,
+            )
+            .expect("emit a model shim");
+        assert!(!written && files.is_empty());
+        assert_eq!(
+            report.missing,
+            vec![format!(
+                "{FABRIC_MODEL_LOADING_REGISTRY} (needs client type model_key)"
+            )]
+        );
+        let real = BTreeSet::from([FABRIC_MODEL_LOADING_REGISTRY.to_owned()]);
+        let shims = ClientShims {
+            src: &root,
+            available: &real,
+            types: &types,
+        };
+        let mut report = Report::default();
+        let written = shims
+            .emit(
+                &mut files,
+                &mut report,
+                FABRIC_MODEL_LOADING_REGISTRY,
+                &[],
+                String::new,
+            )
+            .expect("emit over a real API class");
+        assert!(!written && files.is_empty() && report.missing.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The Fabric model-loading registry is compiled and run for real: retained
+    /// providers, their order and the context's recorded ids are behaviour, not
+    /// a shape. Skipped cleanly when no JDK is installed.
+    #[test]
+    fn model_loading_facade_compiles_and_retains_providers() {
+        use std::{path::PathBuf, process::Command};
+        let types: BTreeMap<&'static str, String> = [
+            ("identifier", "net/minecraft/resources/Identifier"),
+            (
+                "unbaked_model",
+                "net/minecraft/client/resources/model/UnbakedModel",
+            ),
+            (
+                "baked_model",
+                "net/minecraft/client/resources/model/BakedModel",
+            ),
+            (
+                "model_loader",
+                "net/minecraft/client/resources/model/ModelLoader",
+            ),
+        ]
+        .into_iter()
+        .map(|(role, name)| (role, name.to_owned()))
+        .collect();
+        let mut model_types = types.clone();
+        model_types.insert(
+            "model_provider_context",
+            FABRIC_MODEL_PROVIDER_CONTEXT.to_owned(),
+        );
+        let probe = r#"import java.util.*;
+import net.minecraft.resources.Identifier;
+import net.minecraft.client.resources.model.UnbakedModel;
+import net.fabricmc.fabric.api.client.model.loading.v1.*;
+public class ModelProbe {
+    public static void main(String[] args) {
+        Identifier one = new Identifier("minecraft", "one");
+        Identifier two = new Identifier("minecraft", "two");
+        UnbakedModel model = new UnbakedModel();
+        ModelResourceProvider resource = (id, context) -> model;
+        ModelVariantProvider variant = (id, context) -> model;
+        List<Identifier> appended = new ArrayList<>();
+        ModelAppender appender = (context, consumer) -> { consumer.accept(one); consumer.accept(two); };
+        ModelLoadingRegistry.registerModelProvider(one, resource);
+        ModelLoadingRegistry.registerModelVariantProvider(variant);
+        ModelLoadingRegistry.registerResourceProvider(resource);
+        ModelLoadingRegistry.registerAppender(appender);
+        ModelLoadingRegistry.registerResourceProvider(null);
+        List<Object[]> registrations = ModelLoadingRegistry.horizonRegistrations();
+        if (registrations.size() != 4) throw new AssertionError("registrations " + registrations.size());
+        String[] kinds = { "model", "variant", "resource", "appender" };
+        for (int i = 0; i < kinds.length; i++) if (!kinds[i].equals(registrations.get(i)[0])) throw new AssertionError("kind " + i);
+        if (registrations.get(0)[1] != one || registrations.get(0)[2] != resource) throw new AssertionError("model registration");
+        if (registrations.get(1)[2] != variant) throw new AssertionError("variant registration");
+        if (registrations.get(3)[2] != appender) throw new AssertionError("appender registration");
+        ModelProviderContext context = new ModelProviderContext() {};
+        if (context.loadModel(one) != null) throw new AssertionError("no model is baked here");
+        context.loadModel(two, null);
+        context.loadModel(null);
+        if (!ModelProviderContext.horizonRequestedModels().equals(Arrays.asList(one, two))) throw new AssertionError("requested");
+        appender.appendAll(context, appended::add);
+        if (appended.size() != 2 || appended.get(0) != one || appended.get(1) != two) throw new AssertionError("appended");
+        System.out.println("horizon model facade ok");
+    }
+}
+"#;
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-model-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let mut files = Vec::new();
+        let mut write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write java shim");
+            files.push(file);
+        };
+        for (relative, source) in [
+            ("ModelProviderContext", FABRIC_MODEL_PROVIDER_CONTEXT_SOURCE),
+            (
+                "ModelResourceProvider",
+                FABRIC_MODEL_RESOURCE_PROVIDER_SOURCE,
+            ),
+            ("ModelVariantProvider", FABRIC_MODEL_VARIANT_PROVIDER_SOURCE),
+            ("ModelAppender", FABRIC_MODEL_APPENDER_SOURCE),
+            ("ModelLoadingRegistry", FABRIC_MODEL_LOADING_REGISTRY_SOURCE),
+        ] {
+            write(
+                &format!("net/fabricmc/fabric/api/client/model/loading/v1/{relative}.java"),
+                &fill_types(source, &model_types),
+            );
+        }
+        // The smallest game types the signatures name.
+        write(
+            "net/minecraft/resources/Identifier.java",
+            "package net.minecraft.resources; public class Identifier { public Identifier(String namespace, String path) {} }",
+        );
+        write(
+            "net/minecraft/client/resources/model/UnbakedModel.java",
+            "package net.minecraft.client.resources.model; public class UnbakedModel {}",
+        );
+        write(
+            "net/minecraft/client/resources/model/BakedModel.java",
+            "package net.minecraft.client.resources.model; public class BakedModel {}",
+        );
+        write(
+            "net/minecraft/client/resources/model/ModelLoader.java",
+            "package net.minecraft.client.resources.model; public class ModelLoader {}",
+        );
+        write("ModelProbe.java", probe);
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(javac_status) = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(
+            javac_status.success(),
+            "javac rejected the generated model façade"
+        );
+        let java = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("java"))
+            .unwrap_or_else(|| PathBuf::from("java"));
+        let output = Command::new(&java)
+            .arg("-cp")
+            .arg(&classes)
+            .arg("ModelProbe")
+            .output()
+            .expect("run the model probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "model probe failed: {stderr}");
+        assert!(
+            stdout.contains("horizon model facade ok"),
             "probe output: {stdout}{stderr}"
         );
         let _ = fs::remove_dir_all(&root);
