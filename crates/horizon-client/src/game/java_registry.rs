@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{OnceLock, RwLock};
 
+use horizon_client::text::Text;
 use horizon_mods::content::{BlockProperties, BlockShapes, Rarity};
 use horizon_mods::native::{
     AttachmentDeclaration, BlockEntityDeclaration, DataComponentDeclaration, EntityAttributes,
@@ -55,6 +56,41 @@ pub(super) struct JavaRegistrySnapshot {
     /// Rows folded away while coalescing duplicates, by table name. Sorted, so
     /// two batches that coalesce the same rows report the same map.
     pub coalesced: BTreeMap<String, usize>,
+}
+
+/// A declared menu a block opens, as a block use needs it: the definition id,
+/// the translation key its title resolves through, and its slot count. Copied
+/// out of the registry row, so the caller does not hold the snapshot lock; a
+/// validated [`MenuDeclaration`] bounds the id and title key to
+/// [`horizon_mods::native::MAX_NATIVE_TEXT`] bytes and the slots to
+/// [`horizon_mods::native::MAX_MENU_SLOTS`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MenuInfo {
+    pub id: String,
+    pub title_key: String,
+    pub slots: u32,
+}
+
+impl MenuInfo {
+    fn from_declaration(menu: &MenuDeclaration) -> Self {
+        Self {
+            id: menu.id.clone(),
+            title_key: menu.title_key.clone(),
+            slots: menu.slots,
+        }
+    }
+
+    /// The title to send with the menu (`Component.translatable(title_key)`).
+    pub(super) fn title(&self) -> Text {
+        Text::translate(&self.title_key, &[])
+    }
+}
+
+/// The chest rows a declared menu of `slots` slots needs: `ceil(slots / 9)`
+/// from one (`generic_9x1`) to six (`generic_9x6`), the sizes a server menu
+/// can show.
+pub(super) fn menu_rows(slots: u32) -> u8 {
+    slots.div_ceil(9).clamp(1, 6) as u8
 }
 
 #[allow(dead_code)]
@@ -111,6 +147,14 @@ impl JavaRegistrySnapshot {
             .collect();
         menus.sort_by(|a, b| a.id.cmp(&b.id));
         menus
+    }
+
+    /// The first declared menu `block` opens from, by id, when the snapshot
+    /// declares any: the menu a block use opens.
+    pub(super) fn declared_menu_for_block(&self, block: &str) -> Option<MenuInfo> {
+        self.menus_for_block(block)
+            .first()
+            .map(|menu| MenuInfo::from_declaration(menu))
     }
 
     /// The declared block → menu bindings as `(block, menu)` pairs, sorted and
@@ -243,6 +287,27 @@ static SNAPSHOT: OnceLock<RwLock<JavaRegistrySnapshot>> = OnceLock::new();
 
 fn state() -> &'static RwLock<JavaRegistrySnapshot> {
     SNAPSHOT.get_or_init(|| RwLock::new(JavaRegistrySnapshot::default()))
+}
+
+/// The first declared menu `block` opens from, by id: the published snapshot
+/// when it declares menus, else the loaded Java content mods (a window that
+/// never started a server thread has no snapshot yet). Every bound block is a
+/// declared block or an explicit `open_blocks` entry, so a vanilla block with
+/// no declared binding answers None.
+pub(super) fn declared_menu_for_block(
+    mods: &[horizon_client::mod_content::ContentMod],
+    block: &str,
+) -> Option<MenuInfo> {
+    let snapshot = state().read().expect("java registry lock poisoned");
+    if !snapshot.menus.is_empty() {
+        return snapshot.declared_menu_for_block(block);
+    }
+    drop(snapshot);
+    let menus = mods
+        .iter()
+        .flat_map(|m| m.content.menus_for_block(block))
+        .min_by(|a, b| a.id.cmp(&b.id))?;
+    Some(MenuInfo::from_declaration(menus))
 }
 
 /// Apply typed auxiliary declarations in deterministic id order.
@@ -762,6 +827,111 @@ mod tests {
                 ("ruby:crate_block".to_owned(), "ruby:crate".to_owned()),
                 ("ruby:crate_block".to_owned(), "ruby:zeta".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn menu_rows_round_up_and_stay_within_a_chest() {
+        assert_eq!(menu_rows(0), 1);
+        assert_eq!(menu_rows(1), 1);
+        assert_eq!(menu_rows(9), 1);
+        assert_eq!(menu_rows(10), 2);
+        assert_eq!(menu_rows(18), 2);
+        assert_eq!(menu_rows(27), 3);
+        assert_eq!(menu_rows(46), 6);
+        assert_eq!(menu_rows(54), 6);
+        assert_eq!(menu_rows(horizon_mods::native::MAX_MENU_SLOTS), 6);
+    }
+
+    #[test]
+    fn declared_menu_for_block_reads_the_snapshot() {
+        let _guard = test_guard();
+        let snapshot = synchronize(&[content_mod(
+            "ruby",
+            NativeDeclarations {
+                blocks: vec![block("ruby:crate_block")],
+                menus: vec![
+                    bound_menu("ruby:zeta", &["ruby:crate_block", "minecraft:barrel"]),
+                    bound_menu("ruby:crate", &["ruby:crate_block"]),
+                    menu("ruby:loose"),
+                ],
+                ..NativeDeclarations::default()
+            },
+        )]);
+        // The first binding by id wins; its title comes from its key.
+        let info = snapshot
+            .declared_menu_for_block("ruby:crate_block")
+            .unwrap();
+        assert_eq!(info.id, "ruby:crate");
+        assert_eq!(info.title_key, "container.ruby.crate");
+        assert_eq!(info.slots, 27);
+        assert_eq!(info.title().translation_key(), Some("container.ruby.crate"));
+        // An explicit binding of a vanilla block opens it too; an unbound
+        // block, vanilla or not, does not.
+        assert_eq!(
+            snapshot
+                .declared_menu_for_block("minecraft:barrel")
+                .unwrap()
+                .id,
+            "ruby:zeta"
+        );
+        assert!(snapshot.declared_menu_for_block("ruby:unbound").is_none());
+        assert!(
+            snapshot
+                .declared_menu_for_block("minecraft:chest")
+                .is_none()
+        );
+        assert!(snapshot.declared_menu_for_block("ruby:loose").is_none());
+    }
+
+    #[test]
+    fn declared_menu_for_block_falls_back_to_the_content_mods() {
+        let _guard = test_guard();
+        // No snapshot yet: the loaded content mods answer, first menu by id.
+        synchronize(&[]);
+        let mods = [
+            content_mod(
+                "ruby",
+                NativeDeclarations {
+                    blocks: vec![block("ruby:crate_block")],
+                    menus: vec![
+                        bound_menu("ruby:zeta", &["ruby:crate_block"]),
+                        bound_menu("ruby:crate", &["ruby:crate_block"]),
+                    ],
+                    ..NativeDeclarations::default()
+                },
+            ),
+            content_mod(
+                "other",
+                NativeDeclarations {
+                    blocks: vec![block("other:block")],
+                    menus: vec![bound_menu("other:menu", &["other:block"])],
+                    ..NativeDeclarations::default()
+                },
+            ),
+        ];
+        let info = declared_menu_for_block(&mods, "ruby:crate_block").unwrap();
+        assert_eq!(info.id, "ruby:crate");
+        assert_eq!(info.title_key, "container.ruby.crate");
+        assert_eq!(
+            declared_menu_for_block(&mods, "other:block").unwrap().id,
+            "other:menu"
+        );
+        assert!(declared_menu_for_block(&mods, "ruby:unbound").is_none());
+        assert!(declared_menu_for_block(&mods, "minecraft:chest").is_none());
+        // Once a snapshot declares menus, it answers instead of the mods.
+        synchronize(&[content_mod(
+            "third",
+            NativeDeclarations {
+                blocks: vec![block("third:block")],
+                menus: vec![bound_menu("third:menu", &["third:block"])],
+                ..NativeDeclarations::default()
+            },
+        )]);
+        assert!(declared_menu_for_block(&mods, "ruby:crate_block").is_none());
+        assert_eq!(
+            declared_menu_for_block(&mods, "third:block").unwrap().id,
+            "third:menu"
         );
     }
 

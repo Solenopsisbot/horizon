@@ -31,6 +31,7 @@ use horizon_protocol::{
     text::literal,
 };
 use horizon_world::entity_move::EntityMoveWorld;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use winit::keyboard::KeyCode;
 
 /// Per-guest state of the gameplay code that lives outside `Guest`.
@@ -256,6 +257,36 @@ fn direction(face: i32) -> [i32; 3] {
         4 => [-1, 0, 0],
         _ => [1, 0, 0],
     }
+}
+
+/// Declared Java menus opened through a block use, and the cap on their log
+/// lines: a mod that opens one in a loop cannot flood the log.
+static DECLARED_MENU_OPENS: AtomicUsize = AtomicUsize::new(0);
+const MAX_DECLARED_MENU_LOGS: usize = 16;
+
+/// Counts one declared Java menu open (`declared_menu_open`) and logs it, the
+/// first [`MAX_DECLARED_MENU_LOGS`] times.
+fn note_declared_menu_open(id: &str, block: &str) {
+    let opens = DECLARED_MENU_OPENS.fetch_add(1, Ordering::Relaxed);
+    if opens < MAX_DECLARED_MENU_LOGS {
+        log::info!("Horizon: opened Java menu {id} for {block}");
+    }
+}
+
+/// The stacks a declared Java menu of `slots` slots shows on the block whose
+/// block entity is `entity`: a vanilla-template block entity's inventory up
+/// to `slots`, or nothing when the block has none. A mod's own block entity
+/// keeps its items for its own menu, which the mod fills.
+fn declared_menu_items(entity: Option<&BlockEntity>, slots: u32) -> Vec<Option<ItemStack>> {
+    let Some(entity) = entity else {
+        return Vec::new();
+    };
+    if matches!(entity, BlockEntity::Mod(_)) {
+        return Vec::new();
+    }
+    let mut items = entity.slots().to_vec();
+    items.truncate(slots as usize);
+    items
 }
 
 impl Game<'_> {
@@ -928,6 +959,34 @@ impl Game<'_> {
     /// Hand a container the guest opened over (ServerPlayer.openMenu);
     /// false when it is not one a guest can open.
     fn lan_open_container(&mut self, host: &mut LanHost, conn: u32, pos: (i32, i32, i32)) -> bool {
+        // A declared menu bound to this block (a Java `MenuType`'s
+        // `open_blocks`) opens before the block's vanilla container: its own
+        // title and slot count, over the stacks the block entity already
+        // holds. A vanilla block with no declared binding never matches.
+        let declared = {
+            let block = &self
+                .res
+                .facts()
+                .get(self.world.block(pos.0, pos.1, pos.2))
+                .name;
+            super::java_registry::declared_menu_for_block(&self.options.java_content, block)
+        };
+        if let Some(menu) = declared {
+            let rows = super::java_registry::menu_rows(menu.slots);
+            let items = declared_menu_items(self.world.block_entities.get(&pos), menu.slots);
+            if self
+                .native_open_menu_on(host, conn, rows, menu.title(), items)
+                .is_some()
+            {
+                let block = &self
+                    .res
+                    .facts()
+                    .get(self.world.block(pos.0, pos.1, pos.2))
+                    .name;
+                note_declared_menu_open(&menu.id, block);
+                return true;
+            }
+        }
         let name = &self
             .res
             .facts()
@@ -4015,8 +4074,47 @@ fn eye_columns(at: [f64; 3], body: Dimensions) -> [std::ops::RangeInclusive<i32>
 
 #[cfg(test)]
 mod tests {
-    use super::eye_columns;
+    use super::{declared_menu_items, eye_columns};
     use horizon_client::pose::Pose;
+    use horizon_client::{containers::BlockEntity, items::ItemStack};
+
+    fn stack(item: &str, count: u32) -> ItemStack {
+        ItemStack {
+            item: item.into(),
+            count,
+            damage: 0,
+            extra: None,
+        }
+    }
+
+    /// A declared Java menu shows the block entity's stacks up to its own
+    /// slot count, and nothing when the block has no vanilla inventory.
+    #[test]
+    fn a_declared_menu_copies_a_vanilla_block_entity_inventory() {
+        let chest = BlockEntity::Chest(vec![
+            Some(stack("minecraft:diamond", 2)),
+            None,
+            Some(stack("minecraft:emerald", 1)),
+        ]);
+        assert_eq!(
+            declared_menu_items(Some(&chest), 9),
+            vec![
+                Some(stack("minecraft:diamond", 2)),
+                None,
+                Some(stack("minecraft:emerald", 1)),
+            ]
+        );
+        assert_eq!(
+            declared_menu_items(Some(&chest), 2),
+            vec![Some(stack("minecraft:diamond", 2)), None]
+        );
+        assert_eq!(declared_menu_items(Some(&chest), 0), Vec::new());
+        assert!(declared_menu_items(None, 27).is_empty());
+        // A block entity that holds no inventory.
+        assert!(declared_menu_items(Some(&BlockEntity::DaylightDetector), 27).is_empty());
+        // A mod's own entity is not a vanilla-template one.
+        assert!(declared_menu_items(Some(&BlockEntity::Mod(Box::default())), 27).is_empty());
+    }
 
     /// #3684: a player shrunk to `minecraft:scale` 0.1 who stands 0.05 from a
     /// wall has eyes 0.048 wide, which don't reach into it: they don't

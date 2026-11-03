@@ -8,6 +8,7 @@
 //! first, so a trade built on these menus never moves an item before both
 //! sides are settled.
 use super::Game;
+use super::lan::LanHost;
 use horizon_client::{
     items::ItemStack,
     lan::{data::component_nbt, menu::NativeMenuEvent},
@@ -130,6 +131,21 @@ impl Game<'_> {
     ) -> Option<i32> {
         let conn = self.native_conn(uuid)?;
         let host = self.lan.as_mut()?;
+        host.hub
+            .open_native_menu(conn, rows, component_nbt(&title.component()), items)
+    }
+    /// [`native_open_menu`](Self::native_open_menu) for a caller that already
+    /// holds the hub: the guest packet paths run with `self.lan` taken, so
+    /// their `LanHost` is passed beside (`lan_open_container`). The player is
+    /// the guest on that connection; the window id comes back.
+    pub(super) fn native_open_menu_on(
+        &mut self,
+        host: &mut LanHost,
+        conn: u32,
+        rows: u8,
+        title: Text,
+        items: Vec<Option<ItemStack>>,
+    ) -> Option<i32> {
         host.hub
             .open_native_menu(conn, rows, component_nbt(&title.component()), items)
     }
