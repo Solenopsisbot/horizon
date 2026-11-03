@@ -1014,6 +1014,21 @@ impl Game<'_> {
                 note_declared_menu_open(&menu.id, block);
                 return true;
             }
+            // A declared menu over a block with no inventory still opens, as
+            // the look-only native menu it was before: its slots are the
+            // mod's, not a block entity's.
+            if self
+                .native_open_menu_on(host, conn, rows, menu.title(), items)
+                .is_some()
+            {
+                let block = &self
+                    .res
+                    .facts()
+                    .get(self.world.block(pos.0, pos.1, pos.2))
+                    .name;
+                note_declared_menu_open(&menu.id, block);
+                return true;
+            }
         }
         let name = &self
             .res
