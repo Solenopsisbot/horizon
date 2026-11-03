@@ -173,6 +173,55 @@ impl MixinInjectionPlan {
     }
 }
 
+/// One bounded native translation for an `@Inject`/`@Redirect` whose `@At`
+/// names a `FIELD`, `NEW` or `JUMP` site, or a `@Redirect` at `HEAD`.
+///
+/// This sits beside [`MixinInjectionPlan`] rather than extending it: the
+/// injection plan is the executable HEAD/RETURN/TAIL/INVOKE contract other
+/// callers already build, while an anchor plan additionally carries the raw
+/// `@At` site, ordinal and slice bounds a call-site hook needs.  Discovery
+/// keeps a plan out of [`NativeJar::mixin_anchor_plans`] when its selector or
+/// callback shape is outside the bounded forms; the reason is reported by
+/// [`NativeJar::unresolved_anchor_plans`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixinAnchorPlan {
+    pub target: MethodRef,
+    pub callback: MethodRef,
+    /// `FIELD`, `NEW`, `JUMP`, `INVOKE` or `HEAD` (the last two for
+    /// `@Redirect` only).
+    pub at: String,
+    /// Raw `@At.target` selector, exactly as the annotation spelled it.
+    pub site: Option<String>,
+    /// Raw `@At.opcode` selector for a `JUMP`, bounded to the supported
+    /// conditional/unconditional jump opcodes.
+    pub opcode: Option<u8>,
+    pub cancellable: bool,
+    /// `@At.ordinal`, when present.  Negative values stay unresolved.
+    pub ordinal: Option<i32>,
+    /// `@Slice.from`'s anchor label, kept as written.
+    pub slice_from: Option<String>,
+    /// `@Slice.to`'s anchor label, kept as written.
+    pub slice_to: Option<String>,
+    /// True when the plan came from `@Redirect` rather than `@Inject`.
+    pub redirect: bool,
+}
+
+/// Counts of the anchor plans a jar declares.
+///
+/// This is the discovery-side summary: `plans` is the executable set
+/// [`NativeJar::mixin_anchor_plans`] returns and `unresolved` counts the
+/// report-only entries [`NativeJar::unresolved_anchor_plans`] explains.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MixinAnchorReport {
+    pub plans: usize,
+    pub field: usize,
+    pub new: usize,
+    pub jump: usize,
+    pub invoke: usize,
+    pub redirects: usize,
+    pub unresolved: usize,
+}
+
 /// Results from executing one supported native Mixin translation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MixinExecutionReport {
@@ -216,6 +265,15 @@ pub struct MixinExecutionReport {
     /// answered a cancellable callback's `ci.cancel()` still counts the site:
     /// the callback ran, the call did not.
     pub matched_invoke_sites: usize,
+    /// Distinct `FIELD`/`NEW`/`JUMP` bytecode sites that ran at least one
+    /// anchor callback.
+    ///
+    /// A site is counted by `(class, method, bytecode offset)`, so a field
+    /// access inside a loop counts once while two sibling accesses count
+    /// twice.  Zero for the HEAD/RETURN/TAIL/INVOKE entry points and for a
+    /// `@Redirect` at `HEAD`, which replaces the whole body rather than
+    /// hooking a site.
+    pub matched_anchor_sites: usize,
 }
 
 /// Runtime state for the `CallbackInfo` objects one native Mixin execution
@@ -420,6 +478,115 @@ impl InvokeHooks {
             .iter()
             .filter_map(|&index| self.entries.get(index).cloned())
             .collect()
+    }
+}
+
+/// One anchor callback bound to one `FIELD`/`NEW`/`JUMP`/`@Redirect` site.
+#[derive(Debug, Clone)]
+struct AnchorHookEntry {
+    callback: MethodRef,
+    /// The receiver the callback runs with; `None` for a static callback.
+    receiver: Option<Value>,
+    /// The woven method's arguments, resolved once per execution.  A field
+    /// write appends the written value; a trailing `CallbackInfo` is appended
+    /// at dispatch when the callback declares one.
+    base_args: Vec<Value>,
+    /// The woven method's argument descriptors, used to validate a field
+    /// write's extra argument before the callback runs.
+    base_descriptors: Vec<String>,
+    cancellable: bool,
+    redirect: bool,
+    /// The return descriptor an `INVOKE`/`HEAD` redirect must produce.  A
+    /// `FIELD` redirect derives it from the field and read/write direction.
+    redirect_return: Option<String>,
+    /// `@At.ordinal`; the runtime counts first hits of the target body, so a
+    /// site executed in a loop still has a deterministic ordinal.
+    ordinal: Option<usize>,
+    hits: usize,
+    matcher: AnchorMatcher,
+}
+
+/// The bounded call-site shape an anchor hook matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnchorMatcher {
+    Field(FieldSelector),
+    New(String),
+    Jump {
+        opcode: Option<u8>,
+        offset: Option<usize>,
+    },
+    Invoke(MethodRef),
+}
+
+impl AnchorMatcher {
+    fn matches_invoke(&self, site: &MethodRef) -> bool {
+        match self {
+            Self::Invoke(target) => {
+                target.owner == site.owner
+                    && target.name == site.name
+                    && (target.descriptor.is_empty() || target.descriptor == site.descriptor)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What running an anchor's callbacks decided about the original operation.
+#[derive(Debug, Clone, PartialEq)]
+enum AnchorOutcome {
+    /// No hook bound to the site, or every callback left the operation alone.
+    Normal,
+    /// A cancellable `@Inject` callback called `ci.cancel()`.
+    Suppress,
+    /// A `@Redirect` callback produced this value in place of the operation.
+    Replace(Value),
+}
+
+/// Bounded anchor table for one woven method.
+///
+/// The interpreter consults it before a field access, a `new`, a bounded jump
+/// or a redirected invoke.  Like [`InvokeHooks`], it keeps one `CallbackInfo`
+/// per woven method, resets it per dispatch, and never recurses into itself
+/// while a callback runs.
+#[derive(Debug, Default)]
+struct AnchorHooks {
+    /// The one method this table is installed for; a call into another method
+    /// leaves the table alone.
+    target: Option<MethodRef>,
+    entries: Vec<AnchorHookEntry>,
+    marker: String,
+    matched_sites: BTreeSet<(String, String, usize)>,
+    results: Vec<Value>,
+    cancelled: bool,
+    dispatching: bool,
+}
+
+impl AnchorHooks {
+    fn applies(&self, class: &str, method: &str, descriptor: &str) -> bool {
+        self.target.as_ref().is_some_and(|target| {
+            target.owner == class && target.name == method && target.descriptor == descriptor
+        })
+    }
+
+    fn insert(&mut self, entry: AnchorHookEntry) -> Result<(), NativeError> {
+        if self.entries.len() >= MAX_INVOKE_HOOKS {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin execution reached the bound of {MAX_INVOKE_HOOKS} anchor hooks"
+            )));
+        }
+        if entry.redirect
+            && self
+                .entries
+                .iter()
+                .any(|existing| existing.redirect && existing.matcher == entry.matcher)
+        {
+            return Err(NativeError::Metadata(
+                "@Redirect has more than one handler for the same anchor site; competing redirects stay report-only"
+                    .into(),
+            ));
+        }
+        self.entries.push(entry);
+        Ok(())
     }
 }
 
@@ -7577,6 +7744,164 @@ impl NativeJar {
         (plans, unresolved)
     }
 
+    /// Discover native `FIELD`/`NEW`/`JUMP` and `@Redirect` anchor plans from
+    /// runtime-visible annotations.
+    ///
+    /// The plans are a translation plan, not weaving: each carries the raw
+    /// `@At` site plus the bounded selector this runtime resolved from it.
+    /// A selector, callback shape or `@At` anchor outside the accepted forms
+    /// stays out of this executable set and is reported by
+    /// [`Self::unresolved_anchor_plans`].  Sorted and deduplicated like
+    /// [`Self::mixin_injection_plans`].
+    pub fn mixin_anchor_plans(&self) -> Vec<MixinAnchorPlan> {
+        self.mixin_anchor_scan().0
+    }
+
+    /// Anchor plans whose selector or callback shape this bounded runtime
+    /// cannot model, with a precise reason.
+    ///
+    /// These are diagnostics, not executable plans.  Discovery never guesses
+    /// a site: `@Redirect` at `NEW`, a redirect on a target the jar does not
+    /// contain, an unbounded jump selector and a callback that does not match
+    /// the anchor's contract all land here.
+    pub fn unresolved_anchor_plans(&self) -> Vec<(MixinAnchorPlan, String)> {
+        self.mixin_anchor_scan().1
+    }
+
+    /// Counts of the anchor plans this jar declares, for the Mixin report.
+    pub fn mixin_anchor_report(&self) -> MixinAnchorReport {
+        let (plans, unresolved) = self.mixin_anchor_scan();
+        let mut report = MixinAnchorReport {
+            plans: plans.len(),
+            unresolved: unresolved.len(),
+            ..MixinAnchorReport::default()
+        };
+        for plan in &plans {
+            match plan.at.as_str() {
+                "FIELD" => report.field += 1,
+                "NEW" => report.new += 1,
+                "JUMP" => report.jump += 1,
+                "INVOKE" => report.invoke += 1,
+                _ => {}
+            }
+            if plan.redirect {
+                report.redirects += 1;
+            }
+        }
+        report
+    }
+
+    fn mixin_anchor_scan(&self) -> (Vec<MixinAnchorPlan>, Vec<(MixinAnchorPlan, String)>) {
+        const MIXIN: &str = "Lorg/spongepowered/asm/mixin/Mixin;";
+        const INJECT: &str = "Lorg/spongepowered/asm/mixin/injection/Inject;";
+        const REDIRECT: &str = "Lorg/spongepowered/asm/mixin/injection/Redirect;";
+        let mut plans = Vec::new();
+        let mut unresolved = Vec::new();
+        for class in self.classes.values() {
+            let Some(mixin) = class
+                .annotations
+                .iter()
+                .find(|annotation| annotation.descriptor == MIXIN)
+            else {
+                continue;
+            };
+            let mut targets: Vec<String> = Vec::new();
+            for key in ["targets", "value"] {
+                let Some(value) = mixin.values.get(key) else {
+                    continue;
+                };
+                for descriptor in annotation_strings(value) {
+                    let Some(owner) = annotation_class_owner(&descriptor) else {
+                        continue;
+                    };
+                    if !targets.contains(&owner) {
+                        targets.push(owner);
+                    }
+                }
+            }
+            for method in &class.methods {
+                for (annotation, redirect) in method.annotations.iter().filter_map(|annotation| {
+                    match annotation.descriptor.as_str() {
+                        INJECT => Some((annotation, false)),
+                        REDIRECT => Some((annotation, true)),
+                        _ => None,
+                    }
+                }) {
+                    let cancellable = matches!(
+                        annotation.values.get("cancellable"),
+                        Some(AnnotationValue::Bool(true))
+                    );
+                    let method_specs = annotation
+                        .values
+                        .get("method")
+                        .map(annotation_strings)
+                        .unwrap_or_default();
+                    let anchors = annotation
+                        .values
+                        .get("at")
+                        .map(annotation_anchor_selectors)
+                        .unwrap_or_default();
+                    for target_owner in &targets {
+                        for method_spec in &method_specs {
+                            if split_injection_method(method_spec).is_none() {
+                                continue;
+                            }
+                            for anchor in &anchors {
+                                let supported = if redirect {
+                                    matches!(
+                                        anchor.anchor.as_str(),
+                                        "HEAD" | "INVOKE" | "FIELD" | "NEW" | "JUMP"
+                                    )
+                                } else {
+                                    matches!(anchor.anchor.as_str(), "FIELD" | "NEW" | "JUMP")
+                                };
+                                if !supported {
+                                    // An @Inject RETURN/TAIL belongs to the
+                                    // injection plan set; another unsupported
+                                    // anchor is reported precisely.
+                                    if redirect {
+                                        unresolved.push((
+                                            anchor_plan(&class.name, method, method_spec, target_owner, anchor, redirect, cancellable),
+                                            format!(
+                                                "@Redirect anchor {} is not executed natively; native redirects support HEAD, INVOKE and FIELD",
+                                                anchor.anchor
+                                            ),
+                                        ));
+                                    }
+                                    continue;
+                                }
+                                let plan = anchor_plan(
+                                    &class.name,
+                                    method,
+                                    method_spec,
+                                    target_owner,
+                                    anchor,
+                                    redirect,
+                                    cancellable,
+                                );
+                                match resolve_anchor_site(&plan)
+                                    .and_then(|site| validate_anchor_plan(self, &plan, &site))
+                                {
+                                    Ok(()) => plans.push(plan),
+                                    Err(reason) => unresolved.push((plan, reason)),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        plans.sort_by(|a, b| mixin_anchor_sort_key(a).cmp(&mixin_anchor_sort_key(b)));
+        plans.dedup();
+        unresolved.sort_by(|a, b| {
+            mixin_anchor_sort_key(&a.0)
+                .cmp(&mixin_anchor_sort_key(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        unresolved.dedup();
+        (plans, unresolved)
+    }
+
     /// Enumerate the target methods this jar would weave, sorted and
     /// deduplicated.
     ///
@@ -8003,6 +8328,8 @@ impl NativeJar {
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
+            anchor_hooks: None,
+            pending_skipped_new: Vec::new(),
         };
         if !runtime.classes.contains_key(&class_name) {
             return Err(NativeError::MissingMethod(format!("class {class}")));
@@ -8096,11 +8423,38 @@ impl NativeJar {
             host,
             callback_infos,
             None,
+            None,
         )
     }
 
     /// Invoke one jar method with the runtime-owned callback table and, for an
-    /// `@At("INVOKE")` execution, the call-site hook table.
+    /// anchor execution, the `FIELD`/`NEW`/`JUMP`/`@Redirect` hook table.
+    fn invoke_with_anchor_hooks<H: Host>(
+        &self,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+        callback_infos: &mut CallbackInfos,
+        anchor_hooks: &mut AnchorHooks,
+    ) -> Result<Value, NativeError> {
+        self.invoke_with_hooks(
+            class,
+            method,
+            descriptor,
+            receiver,
+            args,
+            host,
+            callback_infos,
+            None,
+            Some(anchor_hooks),
+        )
+    }
+
+    /// Invoke one jar method with the runtime-owned callback table and, for an
+    /// `@At("INVOKE")` or anchor execution, the call-site hook table.
     fn invoke_with_hooks<H: Host>(
         &self,
         class: &str,
@@ -8111,6 +8465,7 @@ impl NativeJar {
         host: &mut H,
         callback_infos: &mut CallbackInfos,
         invoke_hooks: Option<&mut InvokeHooks>,
+        anchor_hooks: Option<&mut AnchorHooks>,
     ) -> Result<Value, NativeError> {
         let class_name = class.replace('.', "/");
         let mut runtime = Runtime {
@@ -8130,6 +8485,8 @@ impl NativeJar {
             next_annotation: 0,
             callback_infos,
             invoke_hooks,
+            anchor_hooks,
+            pending_skipped_new: Vec::new(),
         };
         runtime.invoke(&class_name, method, descriptor, receiver, args)
     }
@@ -8267,6 +8624,7 @@ impl NativeJar {
             cancelled,
             return_value_overridden: false,
             matched_invoke_sites: 0,
+            matched_anchor_sites: 0,
         })
     }
 
@@ -8406,6 +8764,7 @@ impl NativeJar {
             cancelled,
             return_value_overridden: false,
             matched_invoke_sites: 0,
+            matched_anchor_sites: 0,
         })
     }
 
@@ -8664,6 +9023,7 @@ impl NativeJar {
             cancelled: false,
             return_value_overridden: override_value.is_some(),
             matched_invoke_sites: 0,
+            matched_anchor_sites: 0,
         })
     }
 
@@ -8786,6 +9146,7 @@ impl NativeJar {
             host,
             &mut callback_infos,
             Some(&mut hooks),
+            None,
         )?;
         Ok(MixinExecutionReport {
             callback_result: hooks.results.last().cloned().unwrap_or(Value::Void),
@@ -8794,6 +9155,7 @@ impl NativeJar {
             cancelled: hooks.cancelled,
             return_value_overridden: false,
             matched_invoke_sites: hooks.matched_sites.len(),
+            matched_anchor_sites: 0,
         })
     }
 
@@ -8929,6 +9291,260 @@ impl NativeJar {
             cancelled,
             return_value_overridden: overridden.is_some(),
             matched_invoke_sites: 0,
+            matched_anchor_sites: 0,
+        })
+    }
+
+    /// Execute every `FIELD`/`NEW`/`JUMP` `@Inject` and `@Redirect` anchor
+    /// plan this jar declares for one target method.
+    ///
+    /// The target runs once with a bounded anchor table:
+    ///
+    /// * a `FIELD` `@Inject` callback runs before each matching field access
+    ///   with the woven method's arguments, plus the written value for a
+    ///   write, plus a `CallbackInfo` when the callback declares one.  A
+    ///   cancellable write is suppressed; a cancelled read leaves the field
+    ///   descriptor's default on the stack.
+    /// * a `NEW` `@Inject` callback runs before the allocation with the woven
+    ///   method's arguments.  Cancellation leaves a null reference and skips
+    ///   the matching `<init>`, so the construction has no side effect.
+    /// * a `JUMP` `@Inject` callback runs before each matching conditional or
+    ///   unconditional jump; cancellation falls through instead of branching.
+    /// * a `@Redirect` at `INVOKE` replaces the matched call with the
+    ///   callback's return value, and a `@Redirect` at `FIELD` replaces the
+    ///   read or write.  A `@Redirect` at `HEAD` replaces the whole body.
+    ///
+    /// Plans whose selectors or callback shapes are outside these bounded
+    /// forms are not in [`Self::mixin_anchor_plans`]; they stay report-only in
+    /// [`Self::unresolved_anchor_plans`].  A target mixing a `HEAD` redirect
+    /// with call-site anchors, or two redirects on one site, is rejected with a
+    /// bounded `NativeError::Metadata` rather than approximated.
+    pub fn execute_discovered_anchors<H: Host>(
+        &self,
+        target: &MethodRef,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        let plans = self
+            .mixin_anchor_plans()
+            .into_iter()
+            .filter(|plan| {
+                plan.target.owner == target.owner
+                    && plan.target.name == target.name
+                    && (plan.target.descriptor.is_empty()
+                        || plan.target.descriptor == target.descriptor)
+            })
+            .collect::<Vec<_>>();
+        let Some(head_redirect) = plans.iter().find(|plan| plan.redirect && plan.at == "HEAD")
+        else {
+            return self.execute_anchor_hooks(target, &plans, receiver, args, host);
+        };
+        if plans.len() != 1 {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin target {}#{}{} mixes a HEAD @Redirect with call-site anchors; one bounded anchor family per target",
+                target.owner, target.name, target.descriptor
+            )));
+        }
+        self.execute_anchor_head_redirect(head_redirect, receiver, args, host)
+    }
+
+    fn execute_anchor_head_redirect<H: Host>(
+        &self,
+        plan: &MixinAnchorPlan,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        let target_class = self.classes.get(&plan.target.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                plan.target.owner, plan.target.name, plan.target.descriptor
+            ))
+        })?;
+        if target_class
+            .method(&plan.target.name, &plan.target.descriptor)
+            .is_none()
+        {
+            return Err(NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                plan.target.owner, plan.target.name, plan.target.descriptor
+            )));
+        }
+        if args.len() != arg_count(&plan.target.descriptor) {
+            return Err(NativeError::Metadata(format!(
+                "Mixin target {}#{}{} expected {} arguments, got {}",
+                plan.target.owner,
+                plan.target.name,
+                plan.target.descriptor,
+                arg_count(&plan.target.descriptor),
+                args.len()
+            )));
+        }
+        if plan.callback.descriptor != plan.target.descriptor {
+            return Err(NativeError::Metadata(format!(
+                "@Redirect at HEAD needs callback {}#{}{} to match target {}#{}{}",
+                plan.callback.owner,
+                plan.callback.name,
+                plan.callback.descriptor,
+                plan.target.owner,
+                plan.target.name,
+                plan.target.descriptor
+            )));
+        }
+        let callback_class = self.classes.get(&plan.callback.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                plan.callback.owner, plan.callback.name, plan.callback.descriptor
+            ))
+        })?;
+        let callback_method = callback_class
+            .method(&plan.callback.name, &plan.callback.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                ))
+            })?;
+        let callback_receiver = (!callback_method.is_static()).then(|| {
+            receiver
+                .clone()
+                .unwrap_or_else(|| Value::Ref(Some(plan.target.owner.clone())))
+        });
+        let replacement = self.invoke_method_with_args(
+            &plan.callback.owner,
+            &plan.callback.name,
+            &plan.callback.descriptor,
+            callback_receiver,
+            args,
+            host,
+        )?;
+        Ok(MixinExecutionReport {
+            callback_result: replacement.clone(),
+            target_result: replacement.clone(),
+            callback_results: vec![replacement],
+            cancelled: false,
+            return_value_overridden: false,
+            matched_invoke_sites: 0,
+            matched_anchor_sites: 0,
+        })
+    }
+
+    fn execute_anchor_hooks<H: Host>(
+        &self,
+        target: &MethodRef,
+        plans: &[MixinAnchorPlan],
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        if plans.is_empty() {
+            return Err(NativeError::Metadata(format!(
+                "no executable native Mixin anchor plans for {}#{}{}",
+                target.owner, target.name, target.descriptor
+            )));
+        }
+        let target_class = self.classes.get(&target.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                target.owner, target.name, target.descriptor
+            ))
+        })?;
+        let target_method = target_class
+            .method(&target.name, &target.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    target.owner, target.name, target.descriptor
+                ))
+            })?;
+        if args.len() != arg_count(&target.descriptor) {
+            return Err(NativeError::Metadata(format!(
+                "Mixin target {}#{}{} expected {} arguments, got {}",
+                target.owner,
+                target.name,
+                target.descriptor,
+                arg_count(&target.descriptor),
+                args.len()
+            )));
+        }
+        let mut hooks = AnchorHooks {
+            target: Some(target.clone()),
+            marker: callback_info_marker(target),
+            ..AnchorHooks::default()
+        };
+        for plan in plans {
+            let site = resolve_anchor_site(plan).map_err(NativeError::Metadata)?;
+            let callback_class = self.classes.get(&plan.callback.owner).ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                ))
+            })?;
+            let callback_method = callback_class
+                .method(&plan.callback.name, &plan.callback.descriptor)
+                .ok_or_else(|| {
+                    NativeError::MissingMethod(format!(
+                        "{}#{}{}",
+                        plan.callback.owner, plan.callback.name, plan.callback.descriptor
+                    ))
+                })?;
+            let callback_receiver = (!callback_method.is_static()).then(|| {
+                receiver
+                    .clone()
+                    .unwrap_or_else(|| Value::Ref(Some(plan.callback.owner.clone())))
+            });
+            let (matcher, redirect_return) = match site {
+                ResolvedAnchor::Field(selector) => (AnchorMatcher::Field(selector), None),
+                ResolvedAnchor::New(class) => (AnchorMatcher::New(class), None),
+                ResolvedAnchor::Jump { opcode, offset } => {
+                    (AnchorMatcher::Jump { opcode, offset }, None)
+                }
+                ResolvedAnchor::Invoke(invoke) => {
+                    let expected = return_desc(&invoke.descriptor).to_owned();
+                    (AnchorMatcher::Invoke(invoke), Some(expected))
+                }
+                ResolvedAnchor::Head => continue,
+            };
+            hooks.insert(AnchorHookEntry {
+                callback: plan.callback.clone(),
+                receiver: callback_receiver,
+                base_args: args.to_vec(),
+                base_descriptors: descriptor_arguments(&target.descriptor),
+                cancellable: plan.cancellable,
+                redirect: plan.redirect,
+                redirect_return,
+                ordinal: plan
+                    .ordinal
+                    .and_then(|ordinal| usize::try_from(ordinal).ok()),
+                hits: 0,
+                matcher,
+            })?;
+        }
+        let target_receiver = (!target_method.is_static()).then(|| {
+            receiver
+                .clone()
+                .unwrap_or_else(|| Value::Ref(Some(target.owner.clone())))
+        });
+        let mut callback_infos = CallbackInfos::new();
+        let target_result = self.invoke_with_anchor_hooks(
+            &target.owner,
+            &target.name,
+            &target.descriptor,
+            target_receiver,
+            args,
+            host,
+            &mut callback_infos,
+            &mut hooks,
+        )?;
+        Ok(MixinExecutionReport {
+            callback_result: hooks.results.last().cloned().unwrap_or(Value::Void),
+            target_result,
+            callback_results: hooks.results,
+            cancelled: hooks.cancelled,
+            return_value_overridden: false,
+            matched_invoke_sites: 0,
+            matched_anchor_sites: hooks.matched_sites.len(),
         })
     }
 
@@ -9029,6 +9645,7 @@ impl NativeJar {
             cancelled: false,
             return_value_overridden: false,
             matched_invoke_sites: 0,
+            matched_anchor_sites: 0,
         })
     }
 
@@ -9252,6 +9869,13 @@ struct Runtime<'a, H> {
     callback_infos: &'a mut CallbackInfos,
     /// The `@At("INVOKE")` call-site table this execution installed, if any.
     invoke_hooks: Option<&'a mut InvokeHooks>,
+    /// The `FIELD`/`NEW`/`JUMP`/`@Redirect` anchor table this execution
+    /// installed, if any.
+    anchor_hooks: Option<&'a mut AnchorHooks>,
+    /// Classes whose cancelled `new` site must skip the matching constructor
+    /// call.  LIFO, because a constructor argument may itself construct an
+    /// object before the outer `<init>` runs.
+    pending_skipped_new: Vec<String>,
 }
 impl<H: Host> Runtime<'_, H> {
     fn static_field_key(field: &MethodRef) -> String {
@@ -9398,6 +10022,314 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         Ok(false)
+    }
+
+    /// Collect and count the anchor entries bound to one site.
+    ///
+    /// `ordinal` is evaluated against first hits of the target body, so a site
+    /// inside a loop still has a deterministic ordinal.  The returned entries
+    /// are clones: the caller invokes callbacks while the table stays borrowed
+    /// only for bookkeeping.
+    fn take_anchor_entries(
+        &mut self,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+        matches: &dyn Fn(&AnchorMatcher) -> bool,
+    ) -> Vec<AnchorHookEntry> {
+        let Some(hooks) = self.anchor_hooks.as_deref_mut() else {
+            return Vec::new();
+        };
+        if hooks.dispatching || !hooks.applies(class, method, descriptor) {
+            return Vec::new();
+        }
+        let mut matched = Vec::new();
+        for entry in &mut hooks.entries {
+            if !matches(&entry.matcher) {
+                continue;
+            }
+            let hit = entry.hits;
+            entry.hits = entry.hits.saturating_add(1);
+            if entry.ordinal.is_none_or(|ordinal| ordinal == hit) {
+                matched.push(entry.clone());
+            }
+        }
+        matched
+    }
+
+    fn anchor_marker(&self) -> String {
+        self.anchor_hooks
+            .as_deref()
+            .map(|hooks| hooks.marker.clone())
+            .unwrap_or_default()
+    }
+
+    fn set_anchor_dispatching(&mut self, value: bool) {
+        if let Some(hooks) = self.anchor_hooks.as_deref_mut() {
+            hooks.dispatching = value;
+        }
+    }
+
+    fn record_anchor_site(
+        &mut self,
+        class: &str,
+        method: &str,
+        pc: usize,
+        outcome: &AnchorOutcome,
+    ) {
+        if let Some(hooks) = self.anchor_hooks.as_deref_mut() {
+            hooks
+                .matched_sites
+                .insert((class.to_owned(), method.to_owned(), pc));
+            if *outcome == AnchorOutcome::Suppress {
+                hooks.cancelled = true;
+            }
+        }
+    }
+
+    /// Validate a callback against one anchor's expected parameter and return
+    /// shape, appending the runtime `CallbackInfo` marker when it asks for it.
+    fn anchor_callback_values(
+        &self,
+        callback: &MethodRef,
+        base_descriptors: &[String],
+        expected_return: &str,
+        base_args: &[Value],
+        marker: &str,
+    ) -> Result<(bool, Vec<Value>), NativeError> {
+        let callback_class = self.classes.get(&callback.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                callback.owner, callback.name, callback.descriptor
+            ))
+        })?;
+        let callback_method = callback_class
+            .method(&callback.name, &callback.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    callback.owner, callback.name, callback.descriptor
+                ))
+            })?;
+        let actual_return = return_desc(&callback.descriptor);
+        if actual_return != expected_return {
+            return Err(NativeError::Metadata(format!(
+                "native Mixin anchor callback {}#{}{} returns {actual_return}, but the anchored operation needs {expected_return}",
+                callback.owner, callback.name, callback.descriptor
+            )));
+        }
+        let callback_args = descriptor_arguments(&callback.descriptor);
+        let mut values = base_args.to_vec();
+        if callback_args != base_descriptors {
+            if callback_args.len() == base_descriptors.len() + 1
+                && callback_args
+                    .last()
+                    .is_some_and(|arg| is_callback_info_descriptor(arg))
+                && callback_args[..base_descriptors.len()] == base_descriptors[..]
+            {
+                values.push(Value::Ref(Some(marker.to_owned())));
+            } else {
+                return Err(NativeError::Metadata(format!(
+                    "native Mixin anchor callback {}#{}{} must mirror the anchored operation's arguments and may add one trailing CallbackInfo",
+                    callback.owner, callback.name, callback.descriptor
+                )));
+            }
+        }
+        Ok((!callback_method.is_static(), values))
+    }
+
+    /// Run every callback bound to one anchor site.
+    fn run_anchor_callbacks(
+        &mut self,
+        entries: &[AnchorHookEntry],
+        marker: &str,
+        field: Option<&MethodRef>,
+        is_write: bool,
+        value: Option<&Value>,
+    ) -> Result<AnchorOutcome, NativeError> {
+        for entry in entries {
+            // One object per dispatch: a cancel() at another site must not
+            // suppress this one.
+            self.callback_infos.reset(marker)?;
+            let (expected_return, call_args, base_descriptors) =
+                match (&entry.matcher, entry.redirect, field) {
+                    (AnchorMatcher::Field(_), redirect, Some(field)) => {
+                        let mut args = entry.base_args.clone();
+                        let mut descriptors = entry.base_descriptors.clone();
+                        if is_write {
+                            args.push(value.cloned().unwrap_or(Value::Ref(None)));
+                            descriptors.push(field.descriptor.clone());
+                        }
+                        let expected = if redirect {
+                            if is_write {
+                                "V".to_owned()
+                            } else {
+                                field.descriptor.clone()
+                            }
+                        } else {
+                            "V".to_owned()
+                        };
+                        (expected, args, descriptors)
+                    }
+                    (AnchorMatcher::Invoke(_), true, _) => (
+                        entry
+                            .redirect_return
+                            .clone()
+                            .unwrap_or_else(|| "V".to_owned()),
+                        entry.base_args.clone(),
+                        entry.base_descriptors.clone(),
+                    ),
+                    _ => (
+                        "V".to_owned(),
+                        entry.base_args.clone(),
+                        entry.base_descriptors.clone(),
+                    ),
+                };
+            let (is_static, values) = self.anchor_callback_values(
+                &entry.callback,
+                &base_descriptors,
+                &expected_return,
+                &call_args,
+                marker,
+            )?;
+            let receiver = (!is_static).then(|| {
+                entry
+                    .receiver
+                    .clone()
+                    .unwrap_or_else(|| Value::Ref(Some(entry.callback.owner.clone())))
+            });
+            let result = self.invoke(
+                &entry.callback.owner,
+                &entry.callback.name,
+                &entry.callback.descriptor,
+                receiver,
+                &values,
+            )?;
+            if let Some(hooks) = self.anchor_hooks.as_deref_mut() {
+                hooks.results.push(result.clone());
+            }
+            if entry.redirect {
+                return Ok(AnchorOutcome::Replace(declared_value(
+                    &expected_return,
+                    result,
+                )));
+            }
+            if entry.cancellable && self.callback_infos.flag(marker)? {
+                return Ok(AnchorOutcome::Suppress);
+            }
+        }
+        Ok(AnchorOutcome::Normal)
+    }
+
+    /// Run the anchor callbacks bound to one field access.
+    fn dispatch_field_anchor(
+        &mut self,
+        field: &MethodRef,
+        is_write: bool,
+        value: Option<&Value>,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+        pc: usize,
+    ) -> Result<AnchorOutcome, NativeError> {
+        let entries = self.take_anchor_entries(
+            class,
+            method,
+            descriptor,
+            &|matcher| matches!(matcher, AnchorMatcher::Field(selector) if selector.matches(field)),
+        );
+        if entries.is_empty() {
+            return Ok(AnchorOutcome::Normal);
+        }
+        let marker = self.anchor_marker();
+        self.set_anchor_dispatching(true);
+        let outcome = self.run_anchor_callbacks(&entries, &marker, Some(field), is_write, value);
+        self.set_anchor_dispatching(false);
+        let outcome = outcome?;
+        self.record_anchor_site(class, method, pc, &outcome);
+        Ok(outcome)
+    }
+
+    /// Run the anchor callbacks bound to one `new` site.
+    fn dispatch_new_anchor(
+        &mut self,
+        class_name: &str,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+        pc: usize,
+    ) -> Result<AnchorOutcome, NativeError> {
+        let entries = self.take_anchor_entries(
+            class,
+            method,
+            descriptor,
+            &|matcher| matches!(matcher, AnchorMatcher::New(target) if target == class_name),
+        );
+        if entries.is_empty() {
+            return Ok(AnchorOutcome::Normal);
+        }
+        let marker = self.anchor_marker();
+        self.set_anchor_dispatching(true);
+        let outcome = self.run_anchor_callbacks(&entries, &marker, None, false, None);
+        self.set_anchor_dispatching(false);
+        let outcome = outcome?;
+        self.record_anchor_site(class, method, pc, &outcome);
+        Ok(outcome)
+    }
+
+    /// Run the anchor callbacks bound to one conditional/unconditional jump.
+    fn dispatch_jump_anchor(
+        &mut self,
+        opcode: u8,
+        at: usize,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+    ) -> Result<AnchorOutcome, NativeError> {
+        let entries = self.take_anchor_entries(class, method, descriptor, &|matcher| {
+            matches!(
+                matcher,
+                AnchorMatcher::Jump {
+                    opcode: wanted,
+                    offset,
+                } if wanted.is_none_or(|wanted| wanted == opcode)
+                    && offset.is_none_or(|offset| offset == at)
+            )
+        });
+        if entries.is_empty() {
+            return Ok(AnchorOutcome::Normal);
+        }
+        let marker = self.anchor_marker();
+        self.set_anchor_dispatching(true);
+        let outcome = self.run_anchor_callbacks(&entries, &marker, None, false, None);
+        self.set_anchor_dispatching(false);
+        let outcome = outcome?;
+        self.record_anchor_site(class, method, at, &outcome);
+        Ok(outcome)
+    }
+
+    /// Run the `@Redirect` callback bound to one invoke site.
+    fn dispatch_invoke_anchor(
+        &mut self,
+        site: &MethodRef,
+        class: &str,
+        method: &str,
+        descriptor: &str,
+        pc: usize,
+    ) -> Result<AnchorOutcome, NativeError> {
+        let entries = self.take_anchor_entries(class, method, descriptor, &|matcher| {
+            matcher.matches_invoke(site)
+        });
+        if entries.is_empty() {
+            return Ok(AnchorOutcome::Normal);
+        }
+        let marker = self.anchor_marker();
+        self.set_anchor_dispatching(true);
+        let outcome = self.run_anchor_callbacks(&entries, &marker, None, false, None);
+        self.set_anchor_dispatching(false);
+        let outcome = outcome?;
+        self.record_anchor_site(class, method, pc, &outcome);
+        Ok(outcome)
     }
 
     /// Resolve a captured invokedynamic marker when its target is in this
@@ -10959,7 +11891,9 @@ impl<H: Host> Runtime<'_, H> {
                         _ => value <= 0,
                     };
                     let offset = read_i16(code, &mut pc)?;
-                    if take {
+                    let suppressed = self.dispatch_jump_anchor(op, at, class, method, desc)?
+                        == AnchorOutcome::Suppress;
+                    if take && !suppressed {
                         pc = branch_target(code, at, offset, class, method)?;
                     }
                 }
@@ -10975,7 +11909,9 @@ impl<H: Host> Runtime<'_, H> {
                         _ => lhs <= rhs,
                     };
                     let offset = read_i16(code, &mut pc)?;
-                    if take {
+                    let suppressed = self.dispatch_jump_anchor(op, at, class, method, desc)?
+                        == AnchorOutcome::Suppress;
+                    if take && !suppressed {
                         pc = branch_target(code, at, offset, class, method)?;
                     }
                 }
@@ -10984,13 +11920,19 @@ impl<H: Host> Runtime<'_, H> {
                     let lhs = pop(&mut stack, class, method)?;
                     let take = if op == 0xa5 { lhs == rhs } else { lhs != rhs };
                     let offset = read_i16(code, &mut pc)?;
-                    if take {
+                    let suppressed = self.dispatch_jump_anchor(op, at, class, method, desc)?
+                        == AnchorOutcome::Suppress;
+                    if take && !suppressed {
                         pc = branch_target(code, at, offset, class, method)?;
                     }
                 }
                 0xa7 => {
                     let offset = read_i16(code, &mut pc)?;
-                    pc = branch_target(code, at, offset, class, method)?;
+                    let suppressed = self.dispatch_jump_anchor(op, at, class, method, desc)?
+                        == AnchorOutcome::Suppress;
+                    if !suppressed {
+                        pc = branch_target(code, at, offset, class, method)?;
+                    }
                 }
                 0xaa | 0xab => {
                     let padding = (4 - (pc % 4)) % 4;
@@ -11036,13 +11978,26 @@ impl<H: Host> Runtime<'_, H> {
                     let is_null = matches!(value, Value::Ref(None));
                     let take = if op == 0xc6 { is_null } else { !is_null };
                     let offset = read_i16(code, &mut pc)?;
-                    if take {
+                    let suppressed = self.dispatch_jump_anchor(op, at, class, method, desc)?
+                        == AnchorOutcome::Suppress;
+                    if take && !suppressed {
                         pc = branch_target(code, at, offset, class, method)?;
                     }
                 }
                 0xbb => {
                     let i = read_u16(code, &mut pc)?;
-                    stack.push(self.new_object(&class_name(&file.pool, i)?));
+                    let created = class_name(&file.pool, i)?;
+                    let outcome = self.dispatch_new_anchor(&created, class, method, desc, at)?;
+                    match outcome {
+                        AnchorOutcome::Normal => stack.push(self.new_object(&created)),
+                        // A cancelled NEW leaves the reference descriptor's
+                        // default (null) and makes the matching `<init>` skip.
+                        AnchorOutcome::Suppress => {
+                            stack.push(Value::Ref(None));
+                            self.pending_skipped_new.push(created);
+                        }
+                        AnchorOutcome::Replace(value) => stack.push(value),
+                    }
                 }
                 0xbc => {
                     let atype = *code.get(pc).ok_or(NativeError::Truncated)?;
@@ -11123,9 +12078,17 @@ impl<H: Host> Runtime<'_, H> {
                 0xb2 => {
                     let i = read_u16(code, &mut pc)?;
                     let field = file.field_ref(i)?;
-                    let value = match self.static_fields.get(&Self::static_field_key(&field)) {
-                        Some(value) => value.clone(),
-                        None => self.host.get_static(&field)?,
+                    let outcome =
+                        self.dispatch_field_anchor(&field, false, None, class, method, desc, at)?;
+                    let value = match outcome {
+                        AnchorOutcome::Normal => {
+                            match self.static_fields.get(&Self::static_field_key(&field)) {
+                                Some(value) => value.clone(),
+                                None => self.host.get_static(&field)?,
+                            }
+                        }
+                        AnchorOutcome::Suppress => Value::default_for(&field.descriptor),
+                        AnchorOutcome::Replace(value) => value,
                     };
                     stack.push(if value == Value::Ref(None) {
                         Value::default_for(&field.descriptor)
@@ -11137,18 +12100,37 @@ impl<H: Host> Runtime<'_, H> {
                     let i = read_u16(code, &mut pc)?;
                     let field = file.field_ref(i)?;
                     let value = pop(&mut stack, class, method)?;
-                    self.static_fields
-                        .insert(Self::static_field_key(&field), value);
+                    let outcome = self.dispatch_field_anchor(
+                        &field,
+                        true,
+                        Some(&value),
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?;
+                    if outcome == AnchorOutcome::Normal {
+                        self.static_fields
+                            .insert(Self::static_field_key(&field), value);
+                    }
                 }
                 0xb4 => {
                     let i = read_u16(code, &mut pc)?;
                     let r = file.field_ref(i)?;
                     let receiver = pop(&mut stack, class, method)?;
-                    let value = match instance_field_key(&receiver, &r)
-                        .and_then(|key| self.fields.get(&key).cloned())
-                    {
-                        Some(value) => value,
-                        None => self.host.get_static(&r)?,
+                    let outcome =
+                        self.dispatch_field_anchor(&r, false, None, class, method, desc, at)?;
+                    let value = match outcome {
+                        AnchorOutcome::Normal => {
+                            match instance_field_key(&receiver, &r)
+                                .and_then(|key| self.fields.get(&key).cloned())
+                            {
+                                Some(value) => value,
+                                None => self.host.get_static(&r)?,
+                            }
+                        }
+                        AnchorOutcome::Suppress => Value::default_for(&r.descriptor),
+                        AnchorOutcome::Replace(value) => value,
                     };
                     stack.push(if value == Value::Ref(None) {
                         Value::default_for(&r.descriptor)
@@ -11161,8 +12143,19 @@ impl<H: Host> Runtime<'_, H> {
                     let r = file.field_ref(i)?;
                     let value = pop(&mut stack, class, method)?;
                     let receiver = pop(&mut stack, class, method)?;
-                    if let Some(key) = instance_field_key(&receiver, &r) {
-                        self.fields.insert(key, value);
+                    let outcome = self.dispatch_field_anchor(
+                        &r,
+                        true,
+                        Some(&value),
+                        class,
+                        method,
+                        desc,
+                        at,
+                    )?;
+                    if outcome == AnchorOutcome::Normal {
+                        if let Some(key) = instance_field_key(&receiver, &r) {
+                            self.fields.insert(key, value);
+                        }
                     }
                 }
                 0xb6..=0xb9 => {
@@ -11191,13 +12184,35 @@ impl<H: Host> Runtime<'_, H> {
                     } else {
                         Some(pop(&mut stack, class, method)?)
                     };
-                    self.calls += 1;
-                    // An `@At("INVOKE")` callback runs just before the call;
-                    // a cancelled one replaces it with the invoked
-                    // descriptor's default value.
-                    let value = if let Some(value) =
-                        self.dispatch_invoke_hooks(&r, class, method, at)?
+                    // A cancelled `new` left a null reference behind; its
+                    // matching `<init>` is skipped so the construction has no
+                    // side effect.  The LIFO check keeps a constructor
+                    // argument's own `new`/`<init>` untouched.
+                    if op == 0xb7
+                        && r.name == "<init>"
+                        && self
+                            .pending_skipped_new
+                            .last()
+                            .is_some_and(|pending| pending == &r.owner)
+                        && matches!(receiver, Some(Value::Ref(None)))
                     {
+                        self.pending_skipped_new.pop();
+                        continue;
+                    }
+                    self.calls += 1;
+                    // An anchor `@Redirect` replaces the call; otherwise an
+                    // `@At("INVOKE")` callback runs just before it and a
+                    // cancelled one replaces it with the invoked descriptor's
+                    // default value.
+                    let anchor_replacement =
+                        match self.dispatch_invoke_anchor(&r, class, method, desc, at)? {
+                            AnchorOutcome::Replace(value) => Some(value),
+                            AnchorOutcome::Suppress => Some(Value::default_for(&r.descriptor)),
+                            AnchorOutcome::Normal => None,
+                        };
+                    let value = if let Some(value) = anchor_replacement {
+                        value
+                    } else if let Some(value) = self.dispatch_invoke_hooks(&r, class, method, at)? {
                         value
                     } else if r.owner == "java/lang/String"
                         && r.name == "format"
@@ -12564,41 +13579,137 @@ fn annotation_strings(value: &AnnotationValue) -> Vec<String> {
     }
 }
 
-/// One `@At` selector: its anchor name and, for `INVOKE`, its target string.
+/// One `@At` selector: its anchor name, its raw `target`/`opcode`/`ordinal`
+/// settings, and the anchors of a nested `@Slice`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AtSelector {
     anchor: String,
     target: Option<String>,
+    opcode: Option<u8>,
+    ordinal: Option<i32>,
+    slice_from: Option<String>,
+    slice_to: Option<String>,
 }
 
-/// Collect the anchors this bounded runtime supports from an `@At` array,
-/// dropping the ones it cannot execute.
-fn annotation_at_selectors(value: &AnnotationValue) -> Vec<AtSelector> {
+/// The first string of an annotation element, if it is a string or an array
+/// of strings.
+fn annotation_first_string(value: &AnnotationValue) -> Option<String> {
+    annotation_strings(value).into_iter().next()
+}
+
+/// The anchor label of one `@At`, as `ANCHOR` or `ANCHOR:target`.
+fn annotation_at_label(annotation: &Annotation) -> String {
+    let anchor = annotation
+        .values
+        .get("value")
+        .and_then(annotation_first_string)
+        .unwrap_or_default();
+    match annotation
+        .values
+        .get("target")
+        .and_then(annotation_first_string)
+    {
+        Some(target) if !target.is_empty() => format!("{anchor}:{target}"),
+        _ => anchor,
+    }
+}
+
+/// The `from`/`to` labels of an `@At`'s nested `@Slice`, kept as written.
+fn annotation_slice_bounds(annotation: &Annotation) -> (Option<String>, Option<String>) {
+    let Some(AnnotationValue::Annotation(slice)) = annotation.values.get("slice") else {
+        return (None, None);
+    };
+    let bound = |key: &str| match slice.values.get(key) {
+        Some(AnnotationValue::Annotation(at)) => Some(annotation_at_label(at)),
+        _ => None,
+    };
+    (bound("from"), bound("to"))
+}
+
+/// Collect `@At` entries whose anchor `keep` accepts, recursing into arrays.
+fn annotation_at_selectors_filtered(
+    value: &AnnotationValue,
+    keep: &dyn Fn(&str) -> bool,
+) -> Vec<AtSelector> {
     match value {
         AnnotationValue::Annotation(annotation) => {
             let anchor = annotation
                 .values
                 .get("value")
-                .map(annotation_strings)
-                .unwrap_or_default()
-                .into_iter()
-                .next()
+                .and_then(annotation_first_string)
                 .unwrap_or_default();
-            if !matches!(anchor.as_str(), "HEAD" | "RETURN" | "TAIL" | "INVOKE") {
+            if !keep(&anchor) {
                 return Vec::new();
             }
             let target = annotation
                 .values
                 .get("target")
-                .map(annotation_strings)
-                .unwrap_or_default()
-                .into_iter()
-                .next();
-            vec![AtSelector { anchor, target }]
+                .and_then(annotation_first_string);
+            let opcode = match annotation.values.get("opcode") {
+                Some(AnnotationValue::Int(value)) => u8::try_from(*value).ok(),
+                _ => None,
+            };
+            let ordinal = match annotation.values.get("ordinal") {
+                Some(AnnotationValue::Int(value)) => Some(*value),
+                _ => None,
+            };
+            let (slice_from, slice_to) = annotation_slice_bounds(annotation);
+            vec![AtSelector {
+                anchor,
+                target,
+                opcode,
+                ordinal,
+                slice_from,
+                slice_to,
+            }]
         }
-        AnnotationValue::Array(items) => items.iter().flat_map(annotation_at_selectors).collect(),
+        AnnotationValue::Array(items) => items
+            .iter()
+            .flat_map(|item| annotation_at_selectors_filtered(item, keep))
+            .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Collect the around-the-body/call-site anchors the injection executor
+/// supports from an `@At` array, dropping the ones it cannot execute.
+fn annotation_at_selectors(value: &AnnotationValue) -> Vec<AtSelector> {
+    annotation_at_selectors_filtered(value, &|anchor| {
+        matches!(anchor, "HEAD" | "RETURN" | "TAIL" | "INVOKE")
+    })
+}
+
+/// Collect every anchor [`MixinAnchorPlan`] discovery can model from an
+/// `@At` array.  The anchor scan filters the per-annotation family itself.
+fn annotation_anchor_selectors(value: &AnnotationValue) -> Vec<AtSelector> {
+    annotation_at_selectors_filtered(value, &|_| true)
+}
+
+/// Sort key shared by anchor discovery and its unresolved report.
+fn mixin_anchor_sort_key(
+    plan: &MixinAnchorPlan,
+) -> (
+    &str,
+    &str,
+    &str,
+    &str,
+    Option<&str>,
+    Option<u8>,
+    &str,
+    &str,
+    &str,
+) {
+    (
+        &plan.target.owner,
+        &plan.target.name,
+        &plan.target.descriptor,
+        &plan.at,
+        plan.site.as_deref(),
+        plan.opcode,
+        &plan.callback.owner,
+        &plan.callback.name,
+        &plan.callback.descriptor,
+    )
 }
 
 /// Sort key shared by discovery and the unresolved report.
@@ -12630,6 +13741,403 @@ fn mixin_plan_sort_key(
         &plan.callback.name,
         &plan.callback.descriptor,
     )
+}
+
+/// Build one raw anchor plan from an `@Inject`/`@Redirect` annotation.
+fn anchor_plan(
+    mixin: &str,
+    method: &Method,
+    method_spec: &str,
+    target_owner: &str,
+    anchor: &AtSelector,
+    redirect: bool,
+    cancellable: bool,
+) -> MixinAnchorPlan {
+    let (target_name, target_descriptor) =
+        split_injection_method(method_spec).unwrap_or((method_spec, ""));
+    MixinAnchorPlan {
+        target: MethodRef {
+            owner: target_owner.to_owned(),
+            name: target_name.to_owned(),
+            descriptor: target_descriptor.to_owned(),
+        },
+        callback: MethodRef {
+            owner: mixin.to_owned(),
+            name: method.name.clone(),
+            descriptor: method.descriptor.clone(),
+        },
+        at: anchor.anchor.clone(),
+        site: anchor.target.clone(),
+        opcode: anchor.opcode,
+        cancellable,
+        ordinal: anchor.ordinal,
+        slice_from: anchor.slice_from.clone(),
+        slice_to: anchor.slice_to.clone(),
+        redirect,
+    }
+}
+
+/// One `@At("FIELD")` selector as the bounded runtime reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FieldSelector {
+    /// Omitted when the selector wrote only `name`/`name:desc`.
+    owner: Option<String>,
+    name: String,
+    descriptor: Option<String>,
+}
+
+impl FieldSelector {
+    fn matches(&self, field: &MethodRef) -> bool {
+        self.owner
+            .as_deref()
+            .is_none_or(|owner| owner == field.owner)
+            && self.name == field.name
+            && self
+                .descriptor
+                .as_deref()
+                .is_none_or(|descriptor| descriptor == field.descriptor)
+    }
+}
+
+/// The call-site shape an anchor plan resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedAnchor {
+    Field(FieldSelector),
+    New(String),
+    Jump {
+        opcode: Option<u8>,
+        offset: Option<usize>,
+    },
+    Invoke(MethodRef),
+    Head,
+}
+
+/// Parse `@At("FIELD")`'s selector.
+///
+/// Accepted forms, matching what Mixin configs and mods write:
+///
+/// * `Lowner/Type;name:desc`, `owner/Type#name:desc`, `owner.Type.name:desc`
+/// * any of the above without an owner (`name`, `name:desc`, `#name`)
+/// * any of the above without a descriptor (matches every field of that name)
+fn parse_field_selector(spec: &str) -> Option<FieldSelector> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.contains(char::is_whitespace) {
+        return None;
+    }
+    let (head, descriptor) = match spec.rfind(':') {
+        Some(at) => {
+            let descriptor = spec.get(at + 1..)?;
+            if !valid_field_descriptor(descriptor) {
+                return None;
+            }
+            (spec.get(..at)?, Some(descriptor.to_owned()))
+        }
+        None => (spec, None),
+    };
+    let (owner, name): (Option<String>, &str) = if let Some((owner, name)) = head.split_once('#') {
+        // `#name` is the owner-less form; `owner#name` keeps the owner.
+        ((!owner.is_empty()).then(|| owner.to_owned()), name)
+    } else if head.starts_with('L') && head.contains(';') {
+        let (owner, name) = head.strip_prefix('L')?.split_once(';')?;
+        if owner.is_empty() {
+            return None;
+        }
+        (Some(owner.to_owned()), name)
+    } else if let Some(at) = head.rfind('.') {
+        let owner = head.get(..at)?;
+        let name = head.get(at + 1..)?;
+        if owner.is_empty() {
+            return None;
+        }
+        (Some(owner.to_owned()), name)
+    } else {
+        (None, head)
+    };
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+    {
+        return None;
+    }
+    let owner = owner.map(|owner| owner.replace('.', "/"));
+    if owner
+        .as_deref()
+        .is_some_and(|owner| owner.is_empty() || owner.starts_with('/') || owner.ends_with('/'))
+        || !owner
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '$'))
+    {
+        return None;
+    }
+    Some(FieldSelector {
+        owner,
+        name: name.to_owned(),
+        descriptor,
+    })
+}
+
+/// Parse `@At("NEW")`'s internal class name.
+fn parse_new_selector(spec: &str) -> Option<String> {
+    let spec = spec.trim();
+    let inner = spec
+        .strip_prefix('L')
+        .and_then(|spec| spec.strip_suffix(';'))
+        .unwrap_or(spec);
+    if inner.is_empty()
+        || inner.contains(char::is_whitespace)
+        || !inner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '$'))
+    {
+        return None;
+    }
+    let inner = inner.replace('.', "/");
+    (!inner.is_empty() && !inner.starts_with('/') && !inner.ends_with('/')).then_some(inner)
+}
+
+/// The jump opcodes a `@At("JUMP")` plan may bound.
+fn is_bounded_jump_opcode(opcode: u8) -> bool {
+    matches!(opcode, 0x99..=0xa7 | 0xc6 | 0xc7)
+}
+
+/// Resolve one anchor plan's raw selector to the bounded site it names.
+fn resolve_anchor_site(plan: &MixinAnchorPlan) -> Result<ResolvedAnchor, String> {
+    if plan.ordinal.is_some_and(|ordinal| ordinal < 0) {
+        return Err(format!(
+            "@At.ordinal {} is negative; native anchors use a non-negative site ordinal",
+            plan.ordinal.unwrap_or_default()
+        ));
+    }
+    if plan.redirect && plan.cancellable {
+        return Err("@Redirect is not cancellable in native execution".into());
+    }
+    match plan.at.as_str() {
+        "HEAD" if plan.redirect => Ok(ResolvedAnchor::Head),
+        "FIELD" => {
+            let Some(spec) = plan.site.as_deref() else {
+                return Err("@At(\"FIELD\") has no target selector; native field hooks need owner/name/descriptor".into());
+            };
+            parse_field_selector(spec).map(ResolvedAnchor::Field).ok_or_else(|| {
+                format!("@At(\"FIELD\") selector {spec:?} is not one of the bounded owner/name/descriptor forms")
+            })
+        }
+        "NEW" if plan.redirect => Err(
+            "@Redirect at NEW is not executed natively; redirects support HEAD, INVOKE and FIELD"
+                .into(),
+        ),
+        "NEW" => {
+            let Some(spec) = plan.site.as_deref() else {
+                return Err("@At(\"NEW\") has no target class; native construction hooks need a class descriptor".into());
+            };
+            parse_new_selector(spec)
+                .map(ResolvedAnchor::New)
+                .ok_or_else(|| {
+                    format!("@At(\"NEW\") selector {spec:?} is not a bounded internal class name")
+                })
+        }
+        "JUMP" if plan.redirect => Err(
+            "@Redirect at JUMP is not executed natively; redirects support HEAD, INVOKE and FIELD"
+                .into(),
+        ),
+        "JUMP" => {
+            if plan
+                .opcode
+                .is_some_and(|opcode| !is_bounded_jump_opcode(opcode))
+            {
+                return Err(format!(
+                    "@At(\"JUMP\") opcode {} is not a bounded conditional/unconditional jump",
+                    plan.opcode.unwrap_or_default()
+                ));
+            }
+            let offset = match plan.site.as_deref() {
+                None => None,
+                Some(spec) => {
+                    let numeric = spec
+                        .rsplit_once(':')
+                        .map_or(spec, |(_, offset)| offset)
+                        .trim();
+                    Some(numeric.parse::<usize>().map_err(|_| {
+                        format!("@At(\"JUMP\") selector {spec:?} is not a numeric bytecode offset")
+                    })?)
+                }
+            };
+            Ok(ResolvedAnchor::Jump {
+                opcode: plan.opcode,
+                offset,
+            })
+        }
+        "INVOKE" if plan.redirect => {
+            let Some(spec) = plan.site.as_deref() else {
+                return Err("@Redirect at INVOKE has no target selector".into());
+            };
+            let site = parse_invoke_selector(spec).ok_or_else(|| {
+                format!(
+                    "@Redirect INVOKE selector {spec:?} is not one of the bounded call-site forms"
+                )
+            })?;
+            if site.descriptor.is_empty() {
+                return Err(format!(
+                    "@Redirect INVOKE selector {spec:?} omits the call descriptor; a redirect needs the invoked return type"
+                ));
+            }
+            Ok(ResolvedAnchor::Invoke(site))
+        }
+        other => Err(format!(
+            "native anchor execution does not support anchor {other}"
+        )),
+    }
+}
+
+/// Whether a callback's parameter list is `base`, or `base` plus one trailing
+/// `CallbackInfo`/`CallbackInfoReturnable`.
+fn callback_arguments_fit(callback_args: &[String], base: &[String]) -> bool {
+    callback_args == base
+        || (callback_args.len() == base.len() + 1
+            && callback_args
+                .last()
+                .is_some_and(|arg| is_callback_info_descriptor(arg))
+            && callback_args[..base.len()] == base[..])
+}
+
+/// Validate one resolved anchor plan against the target method and callback
+/// shapes this runtime can execute.
+///
+/// The check is best-effort at discovery time: when the target class is not in
+/// the jar (the common case for a mod that mixes into the game), the bounded
+/// runtime has no target descriptor to compare against and accepts the plan
+/// for execution-time validation.  A callback shape that is already
+/// decidable is either accepted or reported with the reason it stays
+/// report-only.
+fn validate_anchor_plan(
+    jar: &NativeJar,
+    plan: &MixinAnchorPlan,
+    site: &ResolvedAnchor,
+) -> Result<(), String> {
+    let Some(callback_class) = jar.classes.get(&plan.callback.owner) else {
+        return Err(format!(
+            "callback class {} is not in the jar",
+            plan.callback.owner
+        ));
+    };
+    if callback_class
+        .method(&plan.callback.name, &plan.callback.descriptor)
+        .is_none()
+    {
+        return Err(format!(
+            "callback {}#{}{} is not in the jar",
+            plan.callback.owner, plan.callback.name, plan.callback.descriptor
+        ));
+    }
+    if matches!(site, ResolvedAnchor::Head) {
+        if plan.target.descriptor.is_empty() {
+            return Ok(());
+        }
+        if plan.callback.descriptor != plan.target.descriptor {
+            return Err(format!(
+                "@Redirect at HEAD needs callback {}#{}{} to match target {}#{}{}",
+                plan.callback.owner,
+                plan.callback.name,
+                plan.callback.descriptor,
+                plan.target.owner,
+                plan.target.name,
+                plan.target.descriptor
+            ));
+        }
+        return Ok(());
+    }
+    if plan.target.descriptor.is_empty() {
+        return Ok(());
+    }
+    let Some(target_class) = jar.classes.get(&plan.target.owner) else {
+        return Ok(());
+    };
+    if target_class
+        .method(&plan.target.name, &plan.target.descriptor)
+        .is_none()
+    {
+        return Ok(());
+    }
+    let target_args = descriptor_arguments(&plan.target.descriptor);
+    let callback_args = descriptor_arguments(&plan.callback.descriptor);
+    let callback_return = return_desc(&plan.callback.descriptor);
+    let callback_label = format!(
+        "{}#{}{}",
+        plan.callback.owner, plan.callback.name, plan.callback.descriptor
+    );
+    let argument_reason = |shape: &str| {
+        format!(
+            "callback {callback_label} does not take the {shape} shape for anchor {}",
+            plan.at
+        )
+    };
+    match site {
+        ResolvedAnchor::Field(field) => {
+            let field_descriptor = field.descriptor.as_deref();
+            if plan.redirect {
+                let get_fits = field_descriptor == Some(callback_return)
+                    && callback_arguments_fit(&callback_args, &target_args);
+                let put_fits = callback_return == "V"
+                    && field_descriptor.is_some_and(|descriptor| {
+                        let mut base = target_args.clone();
+                        base.push(descriptor.to_owned());
+                        callback_arguments_fit(&callback_args, &base)
+                    });
+                if !get_fits && !put_fits {
+                    return Err(format!(
+                        "callback {callback_label} does not fit a FIELD redirect; a read redirect returns the field type and a write redirect returns void with the field value after the target arguments"
+                    ));
+                }
+            } else {
+                if callback_return != "V" {
+                    return Err(format!(
+                        "callback {callback_label} must return void for an @Inject FIELD anchor"
+                    ));
+                }
+                let get_fits = callback_arguments_fit(&callback_args, &target_args);
+                let put_fits = field_descriptor.is_some_and(|descriptor| {
+                    let mut base = target_args.clone();
+                    base.push(descriptor.to_owned());
+                    callback_arguments_fit(&callback_args, &base)
+                });
+                if !get_fits && !put_fits {
+                    return Err(argument_reason(
+                        "target arguments, plus the field value for a write",
+                    ));
+                }
+            }
+        }
+        ResolvedAnchor::New(_) | ResolvedAnchor::Jump { .. } => {
+            if plan.redirect {
+                return Err(format!("@Redirect at {} is not executed natively", plan.at));
+            }
+            if callback_return != "V" {
+                return Err(format!(
+                    "callback {callback_label} must return void for an @Inject {} anchor",
+                    plan.at
+                ));
+            }
+            if !callback_arguments_fit(&callback_args, &target_args) {
+                return Err(argument_reason("target argument"));
+            }
+        }
+        ResolvedAnchor::Invoke(invoke) => {
+            let expected = return_desc(&invoke.descriptor);
+            if callback_return != expected {
+                return Err(format!(
+                    "callback {callback_label} returns {callback_return} but redirecting {}#{}{} needs {expected}",
+                    invoke.owner, invoke.name, invoke.descriptor
+                ));
+            }
+            if !callback_arguments_fit(&callback_args, &target_args) {
+                return Err(argument_reason("target argument"));
+            }
+        }
+        ResolvedAnchor::Head => unreachable!("HEAD is handled before the target lookup"),
+    }
+    Ok(())
 }
 
 /// Parse one `@At(value = "INVOKE", target = ...)` selector.
@@ -12964,6 +14472,8 @@ mod tests {
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
+            anchor_hooks: None,
+            pending_skipped_new: Vec::new(),
         };
         let method = MethodRef {
             owner: "java/lang/String".into(),
@@ -13002,6 +14512,8 @@ mod tests {
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
+            anchor_hooks: None,
+            pending_skipped_new: Vec::new(),
         };
         let method = MethodRef {
             owner: "java/lang/String".into(),
@@ -18782,6 +20294,8 @@ mandatory = true
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
+            anchor_hooks: None,
+            pending_skipped_new: Vec::new(),
         };
         let first = runtime.new_object("demo/Fields");
         let second = runtime.new_object("demo/Fields");
@@ -18925,6 +20439,8 @@ mandatory = true
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
+            anchor_hooks: None,
+            pending_skipped_new: Vec::new(),
         };
         let new_instance = MethodRef {
             owner: "java/lang/reflect/Array".into(),
@@ -19121,6 +20637,8 @@ mandatory = true
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
+            anchor_hooks: None,
+            pending_skipped_new: Vec::new(),
         };
         let stream = runtime
             .invoke_stream(
@@ -19421,6 +20939,8 @@ mandatory = true
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
+            anchor_hooks: None,
+            pending_skipped_new: Vec::new(),
         };
         let lookup = MethodRef {
             owner: "java/lang/Class".into(),
@@ -19641,6 +21161,8 @@ mandatory = true
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
+            anchor_hooks: None,
+            pending_skipped_new: Vec::new(),
         };
         let class = Value::Ref(Some("demo/ReflectiveFields".into()));
         let declared_fields = runtime
@@ -20856,6 +22378,74 @@ mandatory = true
             read_annotations(&mut truncated, &pool),
             Err(NativeError::InvalidClass(_))
         ));
+    }
+
+    #[test]
+    fn field_selectors_accept_the_bounded_owner_forms() {
+        let full = parse_field_selector("Ldemo/Target;count:I").expect("descriptor form");
+        assert_eq!(full.owner.as_deref(), Some("demo/Target"));
+        assert_eq!(full.name, "count");
+        assert_eq!(full.descriptor.as_deref(), Some("I"));
+
+        let binary = parse_field_selector("demo.Target#count:I").expect("binary owner");
+        assert_eq!(binary.owner.as_deref(), Some("demo/Target"));
+        let slashed = parse_field_selector("demo/Target#count").expect("slashed owner");
+        assert_eq!(slashed.owner.as_deref(), Some("demo/Target"));
+        assert_eq!(slashed.descriptor, None);
+        let ownerless = parse_field_selector("#count").expect("ownerless");
+        assert_eq!(ownerless.owner, None);
+        assert_eq!(ownerless.name, "count");
+        let name_and_descriptor = parse_field_selector("count:J").expect("name and descriptor");
+        assert_eq!(name_and_descriptor.owner, None);
+        assert_eq!(name_and_descriptor.descriptor.as_deref(), Some("J"));
+
+        assert!(parse_field_selector("Ldemo/Target;count:NotADescriptor").is_none());
+        assert!(parse_field_selector("has spaces").is_none());
+    }
+
+    #[test]
+    fn anchor_sites_resolve_new_and_jump_shapes() {
+        let plan = |at: &str, site: Option<&str>, opcode: Option<u8>| MixinAnchorPlan {
+            target: MethodRef {
+                owner: "demo/Target".into(),
+                name: "run".into(),
+                descriptor: "()V".into(),
+            },
+            callback: MethodRef {
+                owner: "demo/Mixin".into(),
+                name: "hook".into(),
+                descriptor: "()V".into(),
+            },
+            at: at.into(),
+            site: site.map(str::to_owned),
+            opcode,
+            cancellable: false,
+            ordinal: None,
+            slice_from: None,
+            slice_to: None,
+            redirect: false,
+        };
+
+        assert_eq!(
+            resolve_anchor_site(&plan("NEW", Some("Ldemo/Made;"), None)).unwrap(),
+            ResolvedAnchor::New("demo/Made".into())
+        );
+        assert_eq!(
+            resolve_anchor_site(&plan("JUMP", None, None)).unwrap(),
+            ResolvedAnchor::Jump {
+                opcode: None,
+                offset: None
+            }
+        );
+        assert_eq!(
+            resolve_anchor_site(&plan("JUMP", Some("demo/Target;run()V:42"), Some(154))).unwrap(),
+            ResolvedAnchor::Jump {
+                opcode: Some(154),
+                offset: Some(42)
+            }
+        );
+        assert!(resolve_anchor_site(&plan("JUMP", Some("not-an-offset"), None)).is_err());
+        assert!(resolve_anchor_site(&plan("JUMP", None, Some(0x2a))).is_err());
     }
 
     #[test]
