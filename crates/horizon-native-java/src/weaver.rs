@@ -184,6 +184,27 @@
 //! is outside the bounded subset.  A jar that already declares the class keeps
 //! its own copy.
 //!
+//! # Selector modifiers
+//!
+//! [`weave_invoke_at`], [`weave_invoke_selected`] and [`weave_invoke_shifted`]
+//! model Mixin's `ordinal`, `slice`, `shift` and `by` on an `@At("INVOKE")`
+//! anchor; [`weave_returns_selected`] and [`weave_head_selected`] model the
+//! ordinal on `RETURN`/`TAIL`/`HEAD`.  [`InvokeSelector`] names a call by owner,
+//! name and descriptor (an empty descriptor matches every overload), keeps the
+//! matches inside an optional [`SliceBounds`], and then the `ordinal`-th one -
+//! 0-based, negative from the end (`-1` is the last).  A slice boundary is
+//! another [`SiteSelector`]: `HEAD`, the first `RETURN`, the last `TAIL`, or one
+//! call instruction.  A boundary that names more than one instruction, a slice
+//! that ends before it starts, and an ordinal outside the matches are reasons,
+//! not guesses.  [`InvokeShift`] moves the insert `by` instruction boundaries
+//! (bounded to `0..=8`) before or after the selected site; an insert that would
+//! land inside an exception range is a reason, and a cancellable insert cannot
+//! be shifted because its cancellation branch has to sit on the call.
+//! [`weave_returns_selected`] takes `non_void` to say the callback observes the
+//! result through `CallbackInfoReturnable`, which the target's descriptor has to
+//! confirm; the plain callback shape it otherwise emits is stack-neutral, so a
+//! non-void return accepts it too.
+//!
 //! # `CONSTANT_Dynamic`
 //!
 //! A class whose constant pool already uses `CONSTANT_Dynamic` (condy) is
@@ -252,6 +273,108 @@ impl ReturnMode {
             Self::Tail => "TAIL",
         }
     }
+}
+
+/// Instructions an [`InvokeShift`] may move an insert by.  The bound keeps the
+/// shifted site a few instructions from the selected one instead of a scan.
+const MAX_SHIFT_BY: u8 = 8;
+
+/// One bounded instruction selector: what a [`SliceBounds`] boundary names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiteSelector {
+    /// A call instruction by owner, name and descriptor.  An empty descriptor
+    /// matches every overload of the name, like [`InvokeSelector`].
+    Invoke {
+        owner: String,
+        name: String,
+        descriptor: String,
+    },
+    /// The method's first instruction.
+    Head,
+    /// The method's first return-family instruction.
+    Return,
+    /// The method's last return-family instruction.
+    Tail,
+}
+
+impl SiteSelector {
+    fn describe(&self) -> String {
+        match self {
+            Self::Invoke {
+                owner,
+                name,
+                descriptor,
+            } => format!("INVOKE {owner}.{name}{descriptor}"),
+            Self::Head => "HEAD".to_owned(),
+            Self::Return => "RETURN".to_owned(),
+            Self::Tail => "TAIL".to_owned(),
+        }
+    }
+}
+
+/// The bounded slice an ordinal counts inside: `from` is inclusive and `to` is
+/// exclusive, the way Mixin's `slice = @Slice(from = ..., to = ...)` reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceBounds {
+    pub from: SiteSelector,
+    pub to: SiteSelector,
+}
+
+/// A bounded `@At(value = "INVOKE", ordinal = ..., slice = ...)` selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvokeSelector {
+    pub owner: String,
+    pub name: String,
+    /// Empty matches every overload of `name`.
+    pub descriptor: String,
+    /// `None` keeps every matching site; `Some(n)` keeps the 0-based `n`-th,
+    /// negative from the end (`-1` is the last).
+    pub ordinal: Option<i32>,
+    /// Which of the method's call sites are counted.
+    pub slice: Option<SliceBounds>,
+}
+
+/// Which side of the selected site an [`InvokeShift`] moves the insert to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shift {
+    /// Before the `by`-th instruction in front of the selected site.
+    Before,
+    /// After the `by`-th instruction after the selected site.
+    After,
+}
+
+/// A bounded `@At(shift = ..., by = ...)`: how far from the selected call site
+/// the callback runs, in instruction boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvokeShift {
+    pub direction: Shift,
+    pub by: u8,
+}
+
+impl InvokeShift {
+    /// `0` names the instruction next to the site; more than [`MAX_SHIFT_BY`] is
+    /// a reason instead of a walk.
+    fn distance(self, label: &str) -> Result<usize, String> {
+        if self.by > MAX_SHIFT_BY {
+            return Err(format!(
+                "{label}: shift by {} is outside the bounded shift of 0..={MAX_SHIFT_BY} instruction(s)",
+                self.by
+            ));
+        }
+        Ok(self.by as usize)
+    }
+}
+
+/// The bounded site selector [`weave_returns_selected`] uses.
+#[derive(Debug, Clone)]
+pub struct ReturnSelector {
+    /// `RETURN` counts every return inside the slice; `TAIL` keeps the last one.
+    pub mode: ReturnMode,
+    /// `None` keeps every site the mode selects; `Some(n)` keeps the 0-based
+    /// `n`-th, negative from the end (`-1` is the last).
+    pub ordinal: Option<i32>,
+    /// The return instructions the ordinal counts inside.
+    pub slice: Option<SliceBounds>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4563,6 +4686,133 @@ fn returnable_call(
     })
 }
 
+/// Resolve a bounded ordinal against an ordered site list.
+///
+/// `Some(n)` is 0-based, and a negative ordinal counts from the end (`-1` is
+/// the last); anything outside the list is a reason that names the count.
+fn ordinal_index(label: &str, anchor: &str, count: usize, ordinal: i32) -> Result<usize, String> {
+    let index = i64::from(ordinal);
+    let index = if index < 0 {
+        (count as i64)
+            .checked_add(index)
+            .ok_or_else(|| ordinal_out_of_range(label, anchor, count, ordinal))?
+    } else {
+        index
+    };
+    if index < 0 || index >= count as i64 {
+        return Err(ordinal_out_of_range(label, anchor, count, ordinal));
+    }
+    Ok(index as usize)
+}
+
+fn ordinal_out_of_range(label: &str, anchor: &str, count: usize, ordinal: i32) -> String {
+    format!(
+        "{label}: {anchor} weaving ordinal {ordinal} is outside the {count} matching site(s); an ordinal is 0-based and a negative one counts from the end (-1 is the last)"
+    )
+}
+
+/// Every instruction offset one slice boundary names.
+fn selector_offsets(
+    label: &str,
+    target: &Target<'_>,
+    code: &CodeLayout<'_>,
+    scan: &CodeScan,
+    selector: &SiteSelector,
+) -> Result<Vec<usize>, String> {
+    Ok(match selector {
+        SiteSelector::Head => {
+            if scan.instructions.is_empty() {
+                return Err(format!(
+                    "{label}: the method has no instruction for a HEAD boundary"
+                ));
+            }
+            vec![0]
+        }
+        SiteSelector::Return | SiteSelector::Tail => {
+            let at = match selector {
+                SiteSelector::Return => scan.returns.first(),
+                _ => scan.returns.last(),
+            };
+            vec![at.copied().ok_or_else(|| {
+                format!(
+                    "{label}: the {} slice boundary needs a return instruction, but the method has none",
+                    selector.describe()
+                )
+            })?]
+        }
+        SiteSelector::Invoke {
+            owner,
+            name,
+            descriptor,
+        } => {
+            let mut offsets = Vec::new();
+            for instruction in &scan.instructions {
+                let opcode = code_u1(code.code, instruction.at)?;
+                if !matches!(opcode, 0xb6..=0xb9) {
+                    continue;
+                }
+                let index = code_u2(code.code, instruction.at + 1)?;
+                let Some((call_owner, call_name, call_descriptor)) =
+                    invoke_method_ref(target.pool, index)
+                else {
+                    continue;
+                };
+                if call_owner == owner
+                    && call_name == name
+                    && (descriptor.is_empty() || call_descriptor == descriptor)
+                {
+                    offsets.push(instruction.at);
+                }
+            }
+            if offsets.is_empty() {
+                return Err(format!(
+                    "{label}: the {} slice boundary matches no instruction",
+                    selector.describe()
+                ));
+            }
+            offsets
+        }
+    })
+}
+
+/// Resolve one slice to the half-open instruction range `[from, to)`.
+fn resolve_slice(
+    label: &str,
+    target: &Target<'_>,
+    code: &CodeLayout<'_>,
+    scan: &CodeScan,
+    slice: &SliceBounds,
+) -> Result<(usize, usize), String> {
+    let boundary = |selector: &SiteSelector, which: &str| -> Result<usize, String> {
+        let offsets = selector_offsets(label, target, code, scan, selector)?;
+        match offsets.as_slice() {
+            [at] => Ok(*at),
+            many => Err(format!(
+                "{label}: the slice {which} boundary {} matches {} instructions, so it does not name one; a slice boundary has to select exactly one instruction",
+                selector.describe(),
+                many.len()
+            )),
+        }
+    };
+    let from = boundary(&slice.from, "from")?;
+    let to = boundary(&slice.to, "to")?;
+    if from > to {
+        return Err(format!(
+            "{label}: the slice from {} ({from}) to {} ({to}) ends before it starts",
+            slice.from.describe(),
+            slice.to.describe()
+        ));
+    }
+    if from == to {
+        return Err(format!(
+            "{label}: the slice from {} to {} contains no instruction",
+            slice.from.describe(),
+            slice.to.describe()
+        ));
+    }
+    Ok((from, to))
+}
+
 /// Insert a `HEAD` callback at offset 0 of `target`.
 ///
 /// `class` must be the class that declares `target` (`target.owner` must equal
@@ -4640,6 +4890,29 @@ pub fn weave_head(
     )
 }
 
+/// Insert the `HEAD` callback only when `ordinal` names the method's single
+/// `HEAD` site, which is offset 0.
+///
+/// `None`, `0` and `-1` all select it; any other ordinal is a reason, because a
+/// slice cannot put a second `HEAD` site in the method.  The rewrite itself is
+/// [`weave_head`]: same callback shape, same relocation, same rejections.
+pub fn weave_head_selected(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    ordinal: Option<i32>,
+) -> Result<Vec<u8>, String> {
+    if let Some(ordinal) = ordinal {
+        ordinal_index(
+            &format!("{}.{}", target.owner, target.name),
+            "HEAD",
+            1,
+            ordinal,
+        )?;
+    }
+    weave_head(class, target, callback)
+}
+
 /// Insert a callback immediately before the target's `return` instructions.
 ///
 /// [`ReturnMode::Return`] inserts before every return-family instruction in
@@ -4674,17 +4947,73 @@ pub fn weave_return(
     callback: &MethodRef,
     mode: ReturnMode,
 ) -> Result<Vec<u8>, String> {
+    weave_return_shape(class, target, callback, mode, None, None)
+}
+
+/// Insert a callback before the one return site a [`ReturnSelector`] names.
+///
+/// `non_void` says the callback observes the target's result through the
+/// trailing `CallbackInfoReturnable`, which the target's descriptor has to
+/// confirm: a `void` target has no result, so the two disagree.  With
+/// `non_void == false` the insert is the stack-neutral plain callback a `void`
+/// target uses; a non-void target accepts it too, because the insert leaves the
+/// result on the operand stack untouched, but then the callback cannot observe
+/// or replace it - that is what `non_void == true` is for.
+///
+/// The selector counts the return instructions inside its slice, 0-based, with
+/// a negative ordinal counted from the end (`-1` is the last).  [`ReturnMode`]
+/// decides whether every counted return is an insertion site ([`ReturnMode::Return`])
+/// or only the last one ([`ReturnMode::Tail`]); an ordinal then picks one of
+/// them.  An ordinal outside the counted sites, a slice that names no single
+/// boundary, and a slice that holds no return are reasons, not guesses.
+pub fn weave_returns_selected(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    non_void: bool,
+    selector: &ReturnSelector,
+) -> Result<Vec<u8>, String> {
+    weave_return_shape(
+        class,
+        target,
+        callback,
+        selector.mode,
+        Some(selector),
+        Some(non_void),
+    )
+}
+
+/// The shared body of [`weave_return`] and [`weave_returns_selected`].
+fn weave_return_shape(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    mode: ReturnMode,
+    selector: Option<&ReturnSelector>,
+    observed_non_void: Option<bool>,
+) -> Result<Vec<u8>, String> {
     let target = prepare_target(class, target)?;
     let label = target.label();
     let anchor = mode.anchor();
     let returns_value = crate::return_desc(&target.descriptor) != "V";
+    // `non_void` only decides the shape: `true` asks the insert to carry the
+    // result, which needs a value-returning target; `false` keeps the plain,
+    // stack-neutral callback a `void` target uses, which a value-returning
+    // target accepts too.
+    let observes_result = observed_non_void.unwrap_or(returns_value);
+    if observes_result && !returns_value {
+        return Err(format!(
+            "{label}: non_void says the callback observes the result through a CallbackInfoReturnable, but the target's descriptor {} answers void",
+            target.descriptor
+        ));
+    }
     let takes_receiver = callback_arguments(
         &target.class_name,
         target.is_static,
         &target.descriptor,
         &callback.descriptor,
         anchor,
-        if returns_value {
+        if observes_result {
             Injected::Returnable
         } else {
             Injected::None
@@ -4693,10 +5022,25 @@ pub fn weave_return(
 
     let code = target.code()?;
     let scan = scan_code(&label, code.code)?;
-    let sites: Vec<usize> = match mode {
-        ReturnMode::Return => scan.returns.clone(),
-        ReturnMode::Tail => scan.returns.last().copied().into_iter().collect(),
-    };
+    let mut sites: Vec<usize> = scan.returns.clone();
+    if let Some(slice) = selector.and_then(|selector| selector.slice.as_ref()) {
+        let (from, to) = resolve_slice(&label, &target, code, &scan, slice)?;
+        sites.retain(|at| *at >= from && *at < to);
+        if sites.is_empty() {
+            return Err(format!(
+                "{label}: {anchor} weaving found no return instruction inside the slice from {} to {}",
+                slice.from.describe(),
+                slice.to.describe()
+            ));
+        }
+    }
+    if mode == ReturnMode::Tail {
+        sites = sites.last().copied().into_iter().collect();
+    }
+    if let Some(ordinal) = selector.and_then(|selector| selector.ordinal) {
+        let index = ordinal_index(&label, anchor, sites.len(), ordinal)?;
+        sites = vec![sites[index]];
+    }
     if sites.is_empty() {
         return Err(format!(
             "{label}: {anchor} weaving found no return instruction"
@@ -4704,9 +5048,10 @@ pub fn weave_return(
     }
 
     let mut pool = PoolBuilder::new(&class.pool);
-    // A non-void insert keeps the boxed result in a fresh local past every one
-    // the method declares, so it can never shadow an argument or a local.
-    let (call, frame_sites) = if returns_value {
+    // A result-observing insert keeps the boxed value in a fresh local past
+    // every one the method declares, so it can never shadow an argument or a
+    // local.
+    let (call, frame_sites) = if observes_result {
         let slot = code.max_locals.max(argument_slots(&target)?);
         let call = returnable_call(&target, callback, takes_receiver, slot, &mut pool)?;
         let sites = FrameSites::InsertOnly;
@@ -4946,15 +5291,17 @@ struct InvokeSite {
     descriptor: String,
     /// Whether the call pushes a receiver (`invokevirtual`/`invokeinterface`).
     receiver: bool,
+    /// `invokespecial`, which the bounded weaver reports instead of matching.
+    special: bool,
 }
 
 /// The call sites of `call_site` in one method.
 ///
 /// A selector with an empty descriptor matches every overload of the name.
-/// `invokespecial` is reported rather than matched: rewriting a constructor or
-/// private call is outside the bounded shape.
-fn invoke_sites(
-    label: &str,
+/// `invokespecial` is collected rather than matched: rewriting a constructor or
+/// private call is outside the bounded shape, and the caller reports it after
+/// the slice has picked the sites that are actually selected.
+fn invoke_candidates(
     target: &Target<'_>,
     code: &CodeLayout<'_>,
     scan: &CodeScan,
@@ -4976,20 +5323,122 @@ fn invoke_sites(
         {
             continue;
         }
-        if opcode == 0xb7 {
-            return Err(format!(
-                "{label}: INVOKE weaving cannot rewrite the invokespecial {owner}.{name}{descriptor} call site at {}; only invokevirtual, invokestatic and invokeinterface are bounded",
-                instruction.at
-            ));
-        }
         sites.push(InvokeSite {
             at: instruction.at,
             size: instruction.size,
             descriptor: descriptor.to_owned(),
             receiver: opcode != 0xb8,
+            special: opcode == 0xb7,
         });
     }
     Ok(sites)
+}
+
+/// The call sites one bounded [`InvokeSelector`] names, in file order.
+///
+/// The slice is applied before the ordinal, so an `invokespecial` outside the
+/// slice does not make a selector inside it fail.  An empty result, an
+/// `invokespecial` that was selected, and an ordinal outside the matches are
+/// reasons that name the selector.
+fn selected_invoke_sites(
+    label: &str,
+    target: &Target<'_>,
+    code: &CodeLayout<'_>,
+    scan: &CodeScan,
+    selector: &InvokeSelector,
+) -> Result<Vec<InvokeSite>, String> {
+    let call_site = MethodRef {
+        owner: selector.owner.clone(),
+        name: selector.name.clone(),
+        descriptor: selector.descriptor.clone(),
+    };
+    let mut sites = invoke_candidates(target, code, scan, &call_site)?;
+    if sites.is_empty() {
+        return Err(format!(
+            "{label}: INVOKE weaving found no {}{} call site; the selector matches invokevirtual, invokestatic and invokeinterface instructions by owner, name and descriptor",
+            selector.owner, selector.name
+        ));
+    }
+    if let Some(slice) = &selector.slice {
+        let (from, to) = resolve_slice(label, target, code, scan, slice)?;
+        sites.retain(|site| site.at >= from && site.at < to);
+        if sites.is_empty() {
+            return Err(format!(
+                "{label}: INVOKE weaving found no {}{} call site inside the slice from {} to {}",
+                selector.owner,
+                selector.name,
+                slice.from.describe(),
+                slice.to.describe()
+            ));
+        }
+    }
+    if let Some(site) = sites.iter().find(|site| site.special) {
+        return Err(format!(
+            "{label}: INVOKE weaving cannot rewrite the invokespecial {}.{}{} call site at {}; only invokevirtual, invokestatic and invokeinterface are bounded",
+            selector.owner, selector.name, site.descriptor, site.at
+        ));
+    }
+    if let Some(ordinal) = selector.ordinal {
+        let index = ordinal_index(label, "INVOKE", sites.len(), ordinal)?;
+        sites = vec![sites.remove(index)];
+    }
+    Ok(sites)
+}
+
+/// The insertion offset a shift puts the callback at.
+///
+/// `by == 0` names the instruction next to the selected site: the site itself
+/// for [`Shift::Before`], the instruction after the call for [`Shift::After`].
+/// The offset is an instruction boundary by construction, because it is read
+/// off the scan.  A shift that runs past either end of the method, and one that
+/// would put the insert strictly inside an exception range (where the target's
+/// own handler would catch the callback), are reasons.
+fn shifted_offset(
+    label: &str,
+    code: &CodeLayout<'_>,
+    scan: &CodeScan,
+    site: &InvokeSite,
+    direction: Shift,
+    by: usize,
+) -> Result<usize, String> {
+    let index = scan
+        .instructions
+        .iter()
+        .position(|instruction| instruction.at == site.at)
+        .ok_or_else(|| {
+            format!(
+                "{label}: the call site at {} is not an instruction boundary",
+                site.at
+            )
+        })?;
+    let target = match direction {
+        Shift::Before => index.checked_sub(by).ok_or_else(|| {
+            format!(
+                "{label}: shift Before by {by} from the call at {} runs past the method's first instruction",
+                site.at
+            )
+        })?,
+        Shift::After => index
+            .checked_add(by)
+            .and_then(|index| index.checked_add(1))
+            .filter(|index| *index < scan.instructions.len())
+            .ok_or_else(|| {
+                format!(
+                    "{label}: shift After by {by} from the call at {} runs past the method's last instruction",
+                    site.at
+                )
+            })?,
+    };
+    let at = scan.instructions[target].at;
+    for handler in &code.exception_table {
+        if usize::from(handler.start_pc) < at && at < usize::from(handler.end_pc) {
+            return Err(format!(
+                "{label}: shifting the insert off the call at {} to {at} would put it inside the exception range [{}, {}), so the target's own handler would catch it",
+                site.at, handler.start_pc, handler.end_pc
+            ));
+        }
+    }
+    Ok(at)
 }
 
 /// The `pop`/`pop2` opcode that removes one call argument of this descriptor.
@@ -5116,6 +5565,10 @@ fn push_goto(out: &mut Vec<u8>) {
 /// `StackMapTable` exactly as [`weave_head`] does.  A cancellable insert adds
 /// the two verifier frames its branches need (the call and the instruction
 /// after it), derived from the method's own frames instead of guessed.
+///
+/// This entry point keeps every matching site, the way it always has; for
+/// Mixin's `ordinal`, `slice`, `shift` and `by` see [`weave_invoke_at`],
+/// [`weave_invoke_selected`] and [`weave_invoke_shifted`].
 pub fn weave_invoke(
     class: &ClassFile,
     target: &MethodRef,
@@ -5123,8 +5576,106 @@ pub fn weave_invoke(
     call_site: &MethodRef,
     cancellable: bool,
 ) -> Result<Vec<u8>, String> {
+    weave_invoke_shape(
+        class,
+        target,
+        callback,
+        &InvokeSelector {
+            owner: call_site.owner.clone(),
+            name: call_site.name.clone(),
+            descriptor: call_site.descriptor.clone(),
+            ordinal: None,
+            slice: None,
+        },
+        None,
+        cancellable,
+    )
+}
+
+/// Insert a callback at the call site `ordinal` selects.
+///
+/// This is [`weave_invoke`] with one bounded ordinal: `None` keeps every
+/// matching site (the [`weave_invoke`] shape), `Some(n)` keeps the 0-based
+/// `n`-th match in file order, and a negative ordinal counts from the end
+/// (`-1` is the last).  An ordinal outside the matches is a reason that names
+/// the count instead of falling back to the first site.
+pub fn weave_invoke_at(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    invoke_target: &MethodRef,
+    ordinal: Option<i32>,
+    cancellable: bool,
+) -> Result<Vec<u8>, String> {
+    weave_invoke_shape(
+        class,
+        target,
+        callback,
+        &InvokeSelector {
+            owner: invoke_target.owner.clone(),
+            name: invoke_target.name.clone(),
+            descriptor: invoke_target.descriptor.clone(),
+            ordinal,
+            slice: None,
+        },
+        None,
+        cancellable,
+    )
+}
+
+/// Insert a callback at the call site an [`InvokeSelector`] names.
+///
+/// The selector is [`weave_invoke_at`] plus a [`SliceBounds`]: the slice is
+/// resolved to the half-open instruction range `[from, to)`, the call sites
+/// inside it are counted, and the ordinal picks one of them.  `None` as the
+/// ordinal keeps every site inside the slice.
+pub fn weave_invoke_selected(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    selector: &InvokeSelector,
+    cancellable: bool,
+) -> Result<Vec<u8>, String> {
+    weave_invoke_shape(class, target, callback, selector, None, cancellable)
+}
+
+/// Insert a callback `shift.by` instruction boundaries from the selected call
+/// site, in the direction `shift.direction` names.
+///
+/// `by == 0` is the site itself for [`Shift::Before`] and the instruction after
+/// the call for [`Shift::After`].  The bound is `0..=8`, the offset is always an
+/// instruction boundary, and an insert that would land strictly inside an
+/// exception range is rejected because the target's own handler would catch it.
+/// The callback is still inserted with [`TargetEntry::Enter`], so a branch that
+/// named the shifted instruction runs it first.  A cancellable insert cannot be
+/// shifted: its cancellation branch has to sit on the call to skip it.
+pub fn weave_invoke_shifted(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    selector: &InvokeSelector,
+    shift: InvokeShift,
+    cancellable: bool,
+) -> Result<Vec<u8>, String> {
+    weave_invoke_shape(class, target, callback, selector, Some(shift), cancellable)
+}
+
+/// The shared body of every `INVOKE` entry point.
+fn weave_invoke_shape(
+    class: &ClassFile,
+    target: &MethodRef,
+    callback: &MethodRef,
+    selector: &InvokeSelector,
+    shift: Option<InvokeShift>,
+    cancellable: bool,
+) -> Result<Vec<u8>, String> {
     let target = prepare_target(class, target)?;
     let label = target.label();
+    if cancellable && shift.is_some() {
+        return Err(format!(
+            "{label}: a cancellable INVOKE insert cannot be shifted; its cancellation branch has to sit on the call it skips"
+        ));
+    }
     let takes_receiver = callback_arguments(
         &target.class_name,
         target.is_static,
@@ -5139,13 +5690,7 @@ pub fn weave_invoke(
     )?;
     let code = target.code()?;
     let scan = scan_code(&label, code.code)?;
-    let sites = invoke_sites(&label, &target, code, &scan, call_site)?;
-    if sites.is_empty() {
-        return Err(format!(
-            "{label}: INVOKE weaving found no {}{} call site; the selector matches invokevirtual, invokestatic and invokeinterface instructions by owner, name and descriptor",
-            call_site.owner, call_site.name
-        ));
-    }
+    let sites = selected_invoke_sites(&label, &target, code, &scan, selector)?;
     if cancellable {
         let [site] = sites.as_slice() else {
             return Err(format!(
@@ -5156,9 +5701,20 @@ pub fn weave_invoke(
         return weave_cancellable_invoke(&target, callback, takes_receiver, site, code, &scan);
     }
 
+    let offsets = match shift {
+        Some(shift) => {
+            let by = shift.distance(&label)?;
+            sites
+                .iter()
+                .map(|site| shifted_offset(&label, code, &scan, site, shift.direction, by))
+                .collect::<Result<Vec<_>, String>>()?
+        }
+        None => sites.iter().map(|site| site.at).collect(),
+    };
+
     let mut pool = PoolBuilder::new(&class.pool);
     let call = callback_call(&target, callback, takes_receiver, &mut pool)?;
-    if code.code.len() + call.bytes.len() * sites.len() > MAX_CODE_LENGTH {
+    if code.code.len() + call.bytes.len() * offsets.len() > MAX_CODE_LENGTH {
         return Err(format!(
             "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
         ));
@@ -5169,9 +5725,9 @@ pub fn weave_invoke(
         .and_then(|value| u16::try_from(value).ok())
         .ok_or_else(|| format!("{label}: woven max_stack overflows u16"))?;
     let max_locals = code.max_locals.max(call.local_slots);
-    let insertions = sites
+    let insertions = offsets
         .iter()
-        .map(|site| (site.at, call.bytes.len()))
+        .map(|at| (*at, call.bytes.len()))
         .collect::<Vec<_>>();
     let patch = relocate(
         &label,
