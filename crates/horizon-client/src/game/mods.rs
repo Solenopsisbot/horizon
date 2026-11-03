@@ -95,6 +95,10 @@ pub(super) fn content_root(
 /// log stays readable whatever a jar registers.
 const MAX_REPORT_ROWS: usize = 12;
 
+/// How much of a panic's message an isolation report keeps. A malformed mod
+/// must not be able to flood the startup log with its own panic text.
+const MAX_ISOLATION_MESSAGE: usize = 160;
+
 /// The loader metadata a jar declares. All three run through the same bounded
 /// interpreter; the kind only names which metadata the native path read, so a
 /// server operator can tell a Fabric jar from a NeoForge one in the log.
@@ -223,6 +227,9 @@ pub(super) struct JavaCompatibilityReport {
     /// True only for the diagnostics a server role logs when it refuses a jar
     /// marked `clientSideOnly`; an accepted jar is never rejected.
     pub(super) client_side_only_rejected: bool,
+    /// The bounded message of a panic isolated while this jar's entrypoints
+    /// ran. `None` for a jar that ran or was refused.
+    pub(super) isolation_failure: Option<String>,
     pub(super) role: ExecutionRole,
 }
 
@@ -289,6 +296,7 @@ impl JavaCompatibilityReport {
             mixin_configs: mixin.configs,
             mixin_config_errors: mixin.config_errors,
             client_side_only_rejected: facts.rejected,
+            isolation_failure: None,
             role,
         }
     }
@@ -346,6 +354,9 @@ impl JavaCompatibilityReport {
                 "  rejected: clientSideOnly metadata for {} execution",
                 role_name(self.role)
             ));
+        }
+        if let Some(failure) = &self.isolation_failure {
+            lines.push(format!("  isolated: {failure}"));
         }
         lines
     }
@@ -601,6 +612,103 @@ fn aggregate_line(reports: &[JavaCompatibilityReport], summary: &DeclarationSumm
     )
 }
 
+/// The startup line naming the jars whose native execution was isolated: one
+/// bounded list, sorted so the window, its server thread and the dedicated
+/// server log the same line. `None` when nothing was isolated.
+fn isolation_summary(reports: &[JavaCompatibilityReport]) -> Option<String> {
+    let mut jars: Vec<String> = reports
+        .iter()
+        .filter(|report| report.isolation_failure.is_some())
+        .map(|report| report.jar.display().to_string())
+        .collect();
+    if jars.is_empty() {
+        return None;
+    }
+    jars.sort();
+    let (total, extra) = (jars.len(), jars.len().saturating_sub(MAX_REPORT_ROWS));
+    jars.truncate(MAX_REPORT_ROWS);
+    let extra = if extra > 0 {
+        format!(" (+{extra} more)")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Horizon: Java compatibility: java isolation: {total} jar(s) failed: [{}]{extra}",
+        jars.join(", ")
+    ))
+}
+
+/// `HORIZON_JAVA_STRICT=1` asks for the first isolated jar to stop startup once
+/// every jar has been attempted; the default logs and keeps going.
+fn strict_isolation_enabled() -> bool {
+    std::env::var("HORIZON_JAVA_STRICT").is_ok_and(|value| value == "1")
+}
+
+/// The startup error a strict run returns after every jar was attempted: the
+/// first isolated failure in input order, with its jar and bounded message.
+fn isolation_startup_error(reports: &[JavaCompatibilityReport], strict: bool) -> Option<String> {
+    if !strict {
+        return None;
+    }
+    let report = reports
+        .iter()
+        .find(|report| report.isolation_failure.is_some())?;
+    Some(format!(
+        "{}: isolated native Java panic: {}",
+        report.jar.display(),
+        report
+            .isolation_failure
+            .as_deref()
+            .unwrap_or("non-string panic payload"),
+    ))
+}
+
+/// Runs one jar's native execution, turning a panic into its bounded message
+/// instead of unwinding the game or the server thread.
+fn isolate_jar<T>(run: impl FnOnce() -> T) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .map_err(|payload| panic_payload_message(payload.as_ref()))
+}
+
+/// The message a caught panic carries: `&str` and `String` payloads are read,
+/// anything else keeps a fixed text rather than a debug dump.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+/// One line, flattened and at most [`MAX_ISOLATION_MESSAGE`] characters: a
+/// mod's panic message must not be able to flood the startup log.
+fn bounded_isolation_message(message: &str) -> String {
+    let mut bounded = String::new();
+    let mut truncated = false;
+    for character in message.chars() {
+        if bounded.chars().count() == MAX_ISOLATION_MESSAGE {
+            truncated = true;
+            break;
+        }
+        bounded.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    let bounded = bounded.trim();
+    if bounded.is_empty() {
+        return "empty panic message".to_owned();
+    }
+    if truncated {
+        format!("{bounded}...")
+    } else {
+        bounded.to_owned()
+    }
+}
+
 /// The opt-in real-loader preflight (`fml.rs`), logged once under the Java
 /// compatibility prefix and run before the native path below. It is skipped
 /// unless `HORIZON_NEOFORGE_SERVER` and `HORIZON_JVM_BIN` are set, and its
@@ -715,16 +823,47 @@ pub(super) fn run_java_mods_with_report(
                 path.display()
             ));
         }
-        let mut host = seeded_native_host(&jar, path, role);
-        let mut calls = 0;
-        for entry in &entrypoints {
-            let report = jar
-                .execute(&entry.class, entry.method.as_deref(), kind, &mut host)
-                .map_err(|error| {
-                    format!("{} ({kind}, {}): {error}", path.display(), entry.class)
-                })?;
-            calls += report.calls;
-        }
+        // The interpreter and the host callbacks it reaches are mod code: a
+        // panic in them fails this jar, not the game or the server thread.
+        let execution = isolate_jar(|| {
+            let mut host = seeded_native_host(&jar, path, role);
+            let mut calls = 0;
+            for entry in &entrypoints {
+                let report = jar
+                    .execute(&entry.class, entry.method.as_deref(), kind, &mut host)
+                    .map_err(|error| {
+                        format!("{} ({kind}, {}): {error}", path.display(), entry.class)
+                    })?;
+                calls += report.calls;
+            }
+            Ok::<(usize, horizon_native_java::StdHost), String>((calls, host))
+        });
+        let (calls, mut host) = match execution {
+            Ok(Ok(run)) => run,
+            // A refused entrypoint stays the startup error it always was.
+            Ok(Err(error)) => return Err(error),
+            Err(message) => {
+                let mut report = JavaCompatibilityReport::new(
+                    &jar,
+                    path,
+                    role,
+                    NativeRunFacts {
+                        kind,
+                        ..NativeRunFacts::default()
+                    },
+                );
+                report.isolation_failure = Some(bounded_isolation_message(&message));
+                for line in report.summary() {
+                    log::warn!("{line}");
+                }
+                log::warn!(
+                    "Horizon: native Java {} was isolated after a panic; later jars still run",
+                    path.display()
+                );
+                reports.push(report);
+                continue;
+            }
+        };
         for (id, direction, codec) in host.payload_channels() {
             match horizon_mods::payloads::PayloadDirection::parse(&direction) {
                 Ok(direction) => {
@@ -840,8 +979,16 @@ pub(super) fn run_java_mods_with_report(
         log::info!("{line}");
     }
     log::info!("{}", aggregate_line(&reports, &summary));
+    if let Some(line) = isolation_summary(&reports) {
+        log::warn!("{line}");
+    }
     if let Err(error) = horizon_client::lan::payloads::store_declared(payload_declarations) {
         log::warn!("Horizon: Java payload channels were not registered: {error}");
+    }
+    // Every jar has been attempted: the strict opt-in stops here, naming the
+    // first isolated failure instead of carrying on with the rest.
+    if let Some(error) = isolation_startup_error(&reports, strict_isolation_enabled()) {
+        return Err(error);
     }
     Ok((native_content, reports))
 }
@@ -1991,5 +2138,107 @@ clientSideOnly = true
             "Horizon: Java compatibility: 1 jar(s), 0 typed registrations, 0 opaque, \
              0 payload directions, 0 mixin plan(s), 0 unresolved, 1 other declared row(s)"
         );
+    }
+
+    /// A report for a jar whose native execution was isolated.
+    fn isolated_report(path: &str, role: ExecutionRole, message: &str) -> JavaCompatibilityReport {
+        let mut report = JavaCompatibilityReport::new(
+            &horizon_native_java::NativeJar::default(),
+            std::path::Path::new(path),
+            role,
+            NativeRunFacts {
+                kind: "main",
+                ..NativeRunFacts::default()
+            },
+        );
+        report.isolation_failure = Some(bounded_isolation_message(message));
+        report
+    }
+
+    /// A panic in a jar's native execution is caught at the helper boundary:
+    /// the next run is unaffected, so a malformed mod fails only itself.
+    #[test]
+    fn native_java_panic_isolation_keeps_later_jars_running() {
+        assert_eq!(isolate_jar(|| 7), Ok(7));
+        assert_eq!(
+            isolate_jar(|| panic!("demo mod exploded")).unwrap_err(),
+            "demo mod exploded"
+        );
+        assert_eq!(
+            isolate_jar(|| std::panic::panic_any(7u8)).unwrap_err(),
+            "non-string panic payload"
+        );
+        // Nothing survives the caught run: the following jar still executes.
+        assert_eq!(isolate_jar(|| "later jar"), Ok("later jar"));
+
+        // The recorded message is one bounded, flattened line.
+        let long = "x".repeat(MAX_ISOLATION_MESSAGE * 4);
+        let bounded = bounded_isolation_message(&long);
+        assert_eq!(bounded.chars().count(), MAX_ISOLATION_MESSAGE + 3);
+        assert!(bounded.ends_with("..."));
+        assert_eq!(
+            bounded_isolation_message("line one\nline two\r\n\tthree"),
+            "line one line two   three"
+        );
+        assert_eq!(bounded_isolation_message("  \n "), "empty panic message");
+    }
+
+    /// An isolated jar keeps its metadata and role, its line is the bounded
+    /// panic message rather than a stack, and the run summary sorts the jars.
+    #[test]
+    fn java_compatibility_summary_reports_isolated_panics() {
+        let report = isolated_report("/mods/bad.jar", ExecutionRole::DedicatedServer, "boom");
+        let summary = report.summary();
+        assert!(
+            summary[0].contains("role=dedicated-server loader=unknown"),
+            "{summary:?}"
+        );
+        assert_eq!(summary.last().map(String::as_str), Some("  isolated: boom"));
+        assert_eq!(summary, report.summary());
+
+        let quiet = JavaCompatibilityReport::new(
+            &horizon_native_java::NativeJar::default(),
+            std::path::Path::new("/mods/good.jar"),
+            ExecutionRole::Client,
+            NativeRunFacts::default(),
+        );
+        assert!(quiet.isolation_failure.is_none());
+        let reports = [
+            isolated_report("/mods/z.jar", ExecutionRole::Client, "boom"),
+            isolated_report("/mods/a.jar", ExecutionRole::Client, "boom"),
+            quiet,
+        ];
+        assert_eq!(
+            isolation_summary(&reports).as_deref(),
+            Some(
+                "Horizon: Java compatibility: java isolation: 2 jar(s) failed: \
+                 [/mods/a.jar, /mods/z.jar]"
+            )
+        );
+        assert_eq!(isolation_summary(&[]), None);
+    }
+
+    #[test]
+    fn java_isolation_strict_mode_stops_after_all_jars() {
+        let reports = [
+            isolated_report("/mods/z.jar", ExecutionRole::Client, "boom"),
+            isolated_report("/mods/a.jar", ExecutionRole::Client, "boom"),
+        ];
+        // Default: log-and-continue.
+        assert_eq!(isolation_startup_error(&reports, false), None);
+        // Strict: the first failure in input order, not the sorted one.
+        let error = isolation_startup_error(&reports, true).unwrap();
+        assert!(
+            error.starts_with("/mods/z.jar: isolated native Java panic: boom"),
+            "{error}"
+        );
+        // Nothing isolated leaves strict startup with nothing to stop.
+        let quiet = [JavaCompatibilityReport::new(
+            &horizon_native_java::NativeJar::default(),
+            std::path::Path::new("/mods/good.jar"),
+            ExecutionRole::Client,
+            NativeRunFacts::default(),
+        )];
+        assert_eq!(isolation_startup_error(&quiet, true), None);
     }
 }

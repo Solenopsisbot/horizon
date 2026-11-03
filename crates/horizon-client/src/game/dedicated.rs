@@ -340,6 +340,7 @@ fn refusal_report(
         mixin_configs: mixin.configs,
         mixin_config_errors: mixin.config_errors,
         client_side_only_rejected: jar.is_some_and(|jar| jar.client_side_only),
+        isolation_failure: None,
         role: ExecutionRole::DedicatedServer,
     }
 }
@@ -2052,6 +2053,7 @@ mod tests {
             mixin_configs: 0,
             mixin_config_errors: 0,
             client_side_only_rejected: false,
+            isolation_failure: None,
             role: ExecutionRole::DedicatedServer,
         }
     }
