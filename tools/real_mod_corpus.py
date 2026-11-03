@@ -4,6 +4,8 @@
     real_mod_corpus.py --fabric-jars DIR [--fabric-jars DIR]...
                        [--neoforge-jars DIR]... [--server DIR]
                        [--limit N] [--timeout S] [--bin-dir DIR] [--json] [--self-test]
+                       [--nested|--no-nested] [--nested-limit N] [--nested-depth N]
+                       [--nested-size-cap-mib N]
 
 Reads every jar's loader metadata (`fabric.mod.json`, `META-INF/neoforge.mods.toml` or its older
 `META-INF/mods.toml`), then runs one short probe per jar and classifies it:
@@ -20,8 +22,14 @@ duplicate is reported and skipped. Jars above the size cap are skipped without h
 the hash budget or the `--limit` is reported as deferred. Probes run `cargo run --quiet` against this
 checkout with a per-probe timeout (60 s by default), in their own process group, with captured output
 capped at 256 KiB per stream. `--bin-dir` skips the build and runs prebuilt
-`horizon-native-java`/`horizon-jvm` binaries instead. Nothing is extracted: metadata is read straight
-from the zip, and no game jar or asset directory is touched.
+`horizon-native-java`/`horizon-jvm` binaries instead.
+
+Nested jars (Fabric `META-INF/jars/*.jar`, NeoForge `META-INF/jarjar/*.jar`, plus paths named by the
+outer metadata) are extracted into a fresh temporary directory and probed with the same tools, then the
+outer verdict folds them in. Extraction is bounded: `--nested-limit` jars per outer (8), 32 in total
+across the run, `--nested-depth` levels (1), and `--nested-size-cap-mib` MiB each (16); duplicates are
+skipped by sha256. `--no-nested` restores the outer-only report. The temporary directory is removed
+after each outer jar, and no game jar or asset directory is touched.
 
 The report (human table, or `--json`) is deterministic for the same roots: jars are ordered by source
 and relative path, and reasons carry no timings or process ids.
@@ -55,6 +63,10 @@ DEFAULT_TIMEOUT = 60.0
 DEFAULT_BUILD_TIMEOUT = 900.0
 DEFAULT_SIZE_CAP_MIB = 64
 DEFAULT_HASH_BUDGET_MIB = 1024
+DEFAULT_NESTED_LIMIT = 8
+DEFAULT_NESTED_DEPTH = 1
+DEFAULT_NESTED_SIZE_CAP_MIB = 16
+NESTED_TOTAL_LIMIT = 32
 METADATA_CAP = 1 << 20
 OUTPUT_CAP = 256 << 10
 TAIL = 240
@@ -161,6 +173,13 @@ def mixin_name(name: str) -> bool:
     return "/" not in name and name.endswith(".mixin.json")
 
 
+def nested_member(name: str) -> bool:
+    """A jar entry in the Fabric JiJ or NeoForge JarJar directory."""
+    return name.endswith(".jar") and (
+        name.startswith("META-INF/jars/") or name.startswith("META-INF/jarjar/")
+    )
+
+
 def json_names(value: Any) -> list[str]:
     """Names from a Fabric metadata field that is a string, a list, or an object."""
     if isinstance(value, str):
@@ -205,6 +224,7 @@ def parse_fabric(data: bytes, root_mixins: list[str], nested: int) -> dict[str, 
     mixins = set(json_names(value.get("mixins")))
     mixins.update(root_mixins)
     jars = json_names(value.get("jars"))
+    nested_refs = sorted({ref for ref in jars if ref.endswith(".jar")})
     depends = value.get("depends")
     minecraft = None
     if isinstance(depends, dict):
@@ -225,6 +245,7 @@ def parse_fabric(data: bytes, root_mixins: list[str], nested: int) -> dict[str, 
         "jij": bool(jars or nested),
         "jij_jars": nested,
         "jij_declared": len(jars),
+        "nested_refs": nested_refs,
         "metadata": "fabric.mod.json",
     }
 
@@ -294,6 +315,7 @@ def parse_neoforge(data: bytes, root_mixins: list[str], nested: int) -> dict[str
             if minecraft:
                 break
     jij = value.get("jarJar") or value.get("jars") or []
+    nested_refs = sorted({ref for ref in json_names(jij) if ref.endswith(".jar")})
     return {
         "loader": "neoforge",
         "id": version_string(first.get("modId")),
@@ -309,6 +331,7 @@ def parse_neoforge(data: bytes, root_mixins: list[str], nested: int) -> dict[str
         "jij": bool(jij or nested),
         "jij_jars": nested,
         "jij_declared": len(jij) if isinstance(jij, list) else 0,
+        "nested_refs": nested_refs,
         "metadata": "META-INF/neoforge.mods.toml",
     }
 
@@ -329,6 +352,7 @@ def unknown_metadata() -> dict[str, Any]:
         "jij": False,
         "jij_jars": 0,
         "jij_declared": 0,
+        "nested_refs": [],
         "metadata": None,
     }
 
@@ -345,12 +369,10 @@ def read_metadata(path: Path, source: str) -> tuple[dict[str, Any], str | None]:
             )
             neo_data = read_member(archive, neo_name) if neo_name else None
             root_mixins = sorted({name for name in names if mixin_name(name)})
-            nested_fabric = sum(
-                1 for name in names if name.startswith("META-INF/jars/") and name.endswith(".jar")
-            )
-            nested_neo = sum(
-                1 for name in names if name.startswith("META-INF/jarjar/") and name.endswith(".jar")
-            )
+            all_entries = set(names)
+            nested_entries = {name for name in all_entries if nested_member(name)}
+            nested_fabric = sum(1 for name in nested_entries if name.startswith("META-INF/jars/"))
+            nested_neo = sum(1 for name in nested_entries if name.startswith("META-INF/jarjar/"))
     except (zipfile.BadZipFile, OSError, ValueError) as error:
         return unknown_metadata(), f"not a readable jar: {error}"
 
@@ -366,10 +388,16 @@ def read_metadata(path: Path, source: str) -> tuple[dict[str, Any], str | None]:
     loader, data, nested = preferred
     try:
         if loader == "fabric":
-            return parse_fabric(data, root_mixins, nested), None
-        return parse_neoforge(data, root_mixins, nested), None
+            meta = parse_fabric(data, root_mixins, nested)
+        else:
+            meta = parse_neoforge(data, root_mixins, nested)
     except (ValueError, UnicodeError, TypeError) as error:
         return unknown_metadata(), f"invalid {loader} metadata: {error}"
+    # Nested jars live in the well-known directories; metadata may also name a jar explicitly.
+    named = {ref.lstrip("/") for ref in meta.get("nested_refs") or [] if ref.lstrip("/") in all_entries}
+    meta["nested_refs"] = sorted(nested_entries | named)
+    meta["jij"] = meta["jij"] or bool(meta["nested_refs"])
+    return meta, None
 
 
 def drain(stream: Any, sink: list[bytes], cap: int) -> None:
@@ -494,6 +522,27 @@ class ProbeToolchain:
 
     def build(self) -> tuple[bool, str | None]:
         return build_probes(self.build_timeout, self.bin_dir)
+
+
+class NestedState:
+    """The bounded nested-jar budget plus the toolchain to probe with, shared across outer jars."""
+
+    def __init__(self, args: argparse.Namespace, toolchain: ProbeToolchain, server: Path | None,
+                 available: bool, reason: str | None, selected: list[JarFile]):
+        self.toolchain = toolchain
+        self.server = server
+        self.available = available
+        self.reason = reason
+        self.limit = args.nested_limit
+        self.total = NESTED_TOTAL_LIMIT
+        self.depth = args.nested_depth
+        self.size_cap = args.nested_size_cap_mib << 20
+        self.seen: dict[str, str] = {jar.sha256: jar.file for jar in selected}
+        self.used = 0
+        self.outer_used = 0
+
+    def begin_outer(self) -> None:
+        self.outer_used = 0
 
 
 def list_entrypoints(probe: Probe) -> dict[str, int]:
@@ -736,8 +785,13 @@ def collect_jars(roots: list[tuple[str, Path]], limit: int, size_cap: int, hash_
     return selected, skipped, duplicates, deferred
 
 
-def classify(jar: JarFile, server: Path | None, toolchain: ProbeToolchain, available: bool,
-             reason: str | None) -> dict[str, Any]:
+def scrub_paths(text: str, target: Path, name: str, temp: Path) -> str:
+    """Keep a nested probe reason free of the random temporary directory."""
+    return text.replace(str(target), name).replace(str(temp), "<nested>")
+
+
+def classify_jar(jar: JarFile, server: Path | None, toolchain: ProbeToolchain, available: bool,
+                 reason: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
     meta, error = read_metadata(jar.path, jar.source)
     row: dict[str, Any] = {
         "file": jar.file,
@@ -773,6 +827,120 @@ def classify(jar: JarFile, server: Path | None, toolchain: ProbeToolchain, avail
     row["verdict"] = verdict
     row["reason"] = why
     row["probes"] = [probe.report() for probe in probes]
+    return row, meta
+
+
+def nested_summary(rows: list[dict[str, Any]], skipped: list[dict[str, Any]]) -> str:
+    counts = {verdict: 0 for verdict in VERDICTS}
+    for row in rows:
+        counts[row["verdict"]] += 1
+    text = ", ".join(f"{counts[verdict]} {verdict}" for verdict in VERDICTS if counts[verdict])
+    return f"{len(rows)} nested jar(s): {text or 'none readable'}; {len(skipped)} skipped"
+
+
+def fold_nested(row: dict[str, Any], rows: list[dict[str, Any]],
+                skipped: list[dict[str, Any]]) -> None:
+    """An outer jar with any successful nested jar is ok; readable nested jars otherwise fallback."""
+    if not rows:
+        if skipped and row["verdict"] == "fallback":
+            row["reason"] = f"{row['reason']}; {len(skipped)} nested jar(s) skipped"
+        return
+    counts = {verdict: 0 for verdict in VERDICTS}
+    for nested in rows:
+        counts[nested["verdict"]] += 1
+    summary = nested_summary(rows, skipped)
+    if counts["ok"]:
+        if row["verdict"] == "ok":
+            row["reason"] = f"{row['reason']}; nested: {summary}"
+        else:
+            row["reason"] = f"nested jar(s) ran: {summary}"
+        row["verdict"] = "ok"
+    elif any(nested["loader"] != "unknown" for nested in rows):
+        row["verdict"] = "fallback"
+        row["reason"] = f"nested jars probed, none ok ({summary})"
+
+
+def probe_nested(parent: Path, meta: dict[str, Any], depth: int,
+                 state: NestedState) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Extract and probe `meta`'s nested jars, recursively up to `state.depth`, inside a temp dir."""
+    rows: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    candidates = meta.get("nested_refs") or []
+    if depth > state.depth or not candidates:
+        return rows, skipped
+    try:
+        archive = zipfile.ZipFile(parent)
+    except (zipfile.BadZipFile, OSError):
+        return rows, skipped
+    with archive, tempfile.TemporaryDirectory(prefix="horizon-nested-") as tmp:
+        temp = Path(tmp)
+        infos = {info.filename: info for info in archive.infolist()}
+        for name in candidates:
+            if state.outer_used >= state.limit:
+                skipped.append({"name": name, "depth": depth,
+                                "reason": f"per-jar nested limit {state.limit}"})
+                break
+            if state.used >= state.total:
+                skipped.append({"name": name, "depth": depth,
+                                "reason": f"total nested limit {state.total}"})
+                break
+            info = infos.get(name)
+            if info is None:
+                continue
+            state.outer_used += 1
+            state.used += 1
+            try:
+                with archive.open(info) as member:
+                    data = member.read(state.size_cap + 1)
+            except (KeyError, OSError, RuntimeError, zipfile.BadZipFile) as error:
+                skipped.append({"name": name, "depth": depth,
+                                "reason": f"cannot read nested jar: {error}"})
+                continue
+            if len(data) > state.size_cap:
+                skipped.append({"name": name, "depth": depth,
+                                "reason": f"{len(data)}+ bytes is past the "
+                                          f"{state.size_cap}-byte nested cap"})
+                continue
+            digest = hashlib.sha256(data).hexdigest()
+            if digest in state.seen:
+                skipped.append({"name": name, "depth": depth,
+                                "reason": f"duplicate of {state.seen[digest]} "
+                                          f"(sha256 {digest[:12]})"})
+                continue
+            state.seen[digest] = name
+            target = temp / f"nested-{depth}-{state.used:03d}.jar"
+            target.write_bytes(data)
+            source = meta["loader"] if meta["loader"] in ("fabric", "neoforge") else "nested"
+            nested = JarFile(source, temp, name, target, len(data), digest)
+            row, child_meta = classify_jar(
+                nested, state.server, state.toolchain, state.available, state.reason
+            )
+            reason = scrub_paths(row["reason"], target, name, temp)
+            rows.append({
+                "name": name,
+                "loader": row["loader"],
+                "id": row["id"],
+                "version": row["version"],
+                "verdict": row["verdict"],
+                "reason": reason,
+                "depth": depth,
+            })
+            if depth < state.depth:
+                child_rows, child_skipped = probe_nested(target, child_meta, depth + 1, state)
+                rows.extend(child_rows)
+                skipped.extend(child_skipped)
+    return rows, skipped
+
+
+def classify(jar: JarFile, server: Path | None, toolchain: ProbeToolchain, available: bool,
+             reason: str | None, nested: NestedState | None = None) -> dict[str, Any]:
+    row, meta = classify_jar(jar, server, toolchain, available, reason)
+    if nested is not None:
+        nested.begin_outer()
+        rows, skipped = probe_nested(jar.path, meta, 1, nested)
+        row["nested"] = rows
+        row["nested_skipped"] = skipped
+        fold_nested(row, rows, skipped)
     return row
 
 
@@ -791,6 +959,13 @@ def build_report(args: argparse.Namespace,
         "probe_timeout_s": args.timeout,
         "build_timeout_s": args.build_timeout,
     }
+    if args.nested:
+        limits["nested"] = {
+            "per_jar": args.nested_limit,
+            "total": NESTED_TOTAL_LIMIT,
+            "depth": args.nested_depth,
+            "size_cap_bytes": args.nested_size_cap_mib << 20,
+        }
     if args.server is not None and not is_installed_server(args.server):
         raise HarnessError(f"{args.server} is not an installed NeoForge server (no unix_args.txt under libraries)")
     roots: list[tuple[str, Path]] = [
@@ -845,8 +1020,11 @@ def build_report(args: argparse.Namespace,
         toolchain = ProbeToolchain(args.timeout, args.build_timeout, args.bin_dir)
     available, reason = toolchain.build()
     report["probe_toolchain"]["build"] = "ok" if available else reason
+    nested = None
+    if args.nested:
+        nested = NestedState(args, toolchain, args.server, available, reason, selected)
     rows = [
-        classify(jar, args.server, toolchain, available, reason)
+        classify(jar, args.server, toolchain, available, reason, nested)
         for jar in selected
     ]
 
@@ -886,6 +1064,16 @@ def print_human(report: dict[str, Any]) -> None:
             f"  {row['verdict']:<14} {flags} {row['file']}  "
             f"{identity} {version}  {reason}"
         )
+        for nested in row.get("nested") or []:
+            why = nested["reason"]
+            if len(why) > 160:
+                why = why[:157] + "..."
+            print(
+                f"      nested d{nested['depth']} {nested['verdict']:<14} {nested['name']}  "
+                f"{nested['id'] or '-'} {nested['version'] or '-'}  {why}"
+            )
+        for item in row.get("nested_skipped") or []:
+            print(f"      nested-skip d{item['depth']} {item['name']}: {item['reason']}")
     for item in report["skipped_jars"]:
         print(f"  skipped        {item['source']}/{item['file']}: {item['reason']}")
     for item in report["duplicates"]:
@@ -970,6 +1158,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--hash-budget-mib", type=int, default=DEFAULT_HASH_BUDGET_MIB,
                         help="stop hashing after this many MiB and defer the rest "
                              f"(default {DEFAULT_HASH_BUDGET_MIB})")
+    parser.add_argument("--nested", action=argparse.BooleanOptionalAction, default=True,
+                        help="probe nested Fabric JiJ / NeoForge JarJar jars (default: on)")
+    parser.add_argument("--nested-limit", type=int, default=DEFAULT_NESTED_LIMIT,
+                        help="maximum nested jars to probe per outer jar "
+                             f"(default {DEFAULT_NESTED_LIMIT})")
+    parser.add_argument("--nested-depth", type=int, default=DEFAULT_NESTED_DEPTH,
+                        help=f"maximum nested-jar depth to recurse (default {DEFAULT_NESTED_DEPTH})")
+    parser.add_argument("--nested-size-cap-mib", type=int, default=DEFAULT_NESTED_SIZE_CAP_MIB,
+                        help="skip nested jars larger than this many MiB "
+                             f"(default {DEFAULT_NESTED_SIZE_CAP_MIB})")
     parser.add_argument("--json", action="store_true", help="print the report as JSON only")
     parser.add_argument("--self-test", action="store_true",
                         help="probe a synthetic in-memory corpus (no JVM, no jars) and exit")
@@ -982,6 +1180,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--size-cap-mib must be at least 1")
     if args.hash_budget_mib < 1:
         parser.error("--hash-budget-mib must be at least 1")
+    if args.nested_limit < 1:
+        parser.error("--nested-limit must be at least 1")
+    if args.nested_depth < 0:
+        parser.error("--nested-depth must not be negative")
+    if args.nested_size_cap_mib < 1:
+        parser.error("--nested-size-cap-mib must be at least 1")
     for path in [*args.fabric_jars, *args.neoforge_jars]:
         if not Path(path).is_dir():
             parser.error(f"{path} is not a directory")

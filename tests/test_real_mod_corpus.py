@@ -52,6 +52,41 @@ class NeverBuiltToolchain:
         raise AssertionError(f"unexpected probe: {tool} {mode}")
 
 
+def nested_jar_bytes(metadata, extra=None):
+    """A jar written in memory, used as a nested member of another jar."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("fabric.mod.json", json.dumps(metadata))
+        for name, data in (extra or {}).items():
+            archive.writestr(name, data)
+    return buffer.getvalue()
+
+
+class MetadataToolchain:
+    """Answers from each jar's own metadata, so an outer bundle and its nested jars differ."""
+
+    timeout = 1.0
+
+    def __init__(self):
+        self.calls = []
+
+    def build(self):
+        return True, None
+
+    def probe(self, tool, mode, args):
+        path = Path(next(arg for arg in args if arg.endswith(".jar")))
+        meta, _ = corpus.read_metadata(path, "fabric")
+        kinds = meta["entrypoint_kinds"]
+        self.calls.append((mode, path.name))
+        if mode == "list-entrypoints":
+            return response(stdout="".join(f"{kind}\tx\n" for kind in kinds))
+        if mode == "mixin-plans":
+            return response({"plans": [], "configs": []})
+        if "main" in kinds:
+            return response(OK_MAIN | {"mixin_configs": 0})
+        return response(DISCOVER)
+
+
 class CorpusTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -178,6 +213,160 @@ class CorpusTest(unittest.TestCase):
         self.assertEqual(report["jars"], [])
         self.assertIn("no jar left to probe: 1 skipped, 0 deferred", report["skipped"])
         self.assertIn("past the 1048576-byte cap", report["skipped_jars"][0]["reason"])
+
+    def bundle_jar(self, name, nested, *, refs=None):
+        members = {
+            "fabric.mod.json": json.dumps({
+                "schemaVersion": 1, "id": "bundle", "version": "1.0",
+                "jars": refs if refs is not None else [{"file": member} for member in nested],
+            }),
+        }
+        members.update(nested)
+        return self.jar(self.fabric, name, members)
+
+    def test_nested_main_entrypoint_folds_outer_to_ok(self):
+        inner = nested_jar_bytes({
+            "schemaVersion": 1, "id": "inner", "version": "2.0",
+            "entrypoints": {"main": ["com.example.Inner"]},
+        })
+        self.bundle_jar("bundle.jar", {"META-INF/jars/inner.jar": inner})
+        row = self.report(MetadataToolchain())["jars"][0]
+        self.assertEqual(row["verdict"], "ok")
+        self.assertEqual(row["reason"], "nested jar(s) ran: 1 nested jar(s): 1 ok; 0 skipped")
+        self.assertTrue(row["jij"])
+        self.assertEqual(row["nested_skipped"], [])
+        self.assertEqual(len(row["nested"]), 1)
+        nested = row["nested"][0]
+        self.assertEqual(
+            (nested["name"], nested["loader"], nested["id"], nested["version"],
+             nested["verdict"], nested["depth"]),
+            ("META-INF/jars/inner.jar", "fabric", "inner", "2.0", "ok", 1),
+        )
+        self.assertIn("native main entrypoint ran", nested["reason"])
+
+    def test_nested_referenced_outside_well_known_dirs_is_probed(self):
+        inner = nested_jar_bytes({
+            "schemaVersion": 1, "id": "inner", "version": "1.0",
+            "entrypoints": {"main": ["com.example.Inner"]},
+        })
+        self.bundle_jar("bundle.jar", {"libs/inner.jar": inner}, refs=[{"file": "libs/inner.jar"}])
+        row = self.report(MetadataToolchain())["jars"][0]
+        self.assertEqual((row["verdict"], row["nested"][0]["id"]), ("ok", "inner"))
+
+    def test_nested_fallback_keeps_outer_fallback(self):
+        inner = nested_jar_bytes({
+            "schemaVersion": 1, "id": "inner-client", "version": "1.0",
+            "entrypoints": {"client": ["com.example.Client"]},
+        })
+        self.bundle_jar("bundle.jar", {"META-INF/jars/inner.jar": inner})
+        row = self.report(MetadataToolchain())["jars"][0]
+        self.assertEqual(row["verdict"], "fallback")
+        self.assertEqual(
+            row["reason"],
+            "nested jars probed, none ok (1 nested jar(s): 1 fallback; 0 skipped)",
+        )
+        self.assertEqual(row["nested"][0]["verdict"], "fallback")
+
+    def test_nested_duplicate_is_probed_once(self):
+        inner = nested_jar_bytes({
+            "schemaVersion": 1, "id": "inner", "version": "1.0",
+            "entrypoints": {"main": ["com.example.Inner"]},
+        })
+        self.bundle_jar("bundle.jar", {
+            "META-INF/jars/inner-a.jar": inner,
+            "META-INF/jars/inner-b.jar": inner,
+        })
+        toolchain = MetadataToolchain()
+        row = self.report(toolchain)["jars"][0]
+        self.assertEqual([nested["id"] for nested in row["nested"]], ["inner"])
+        self.assertEqual(len(row["nested_skipped"]), 1)
+        self.assertIn("duplicate of META-INF/jars/inner-a.jar", row["nested_skipped"][0]["reason"])
+        self.assertEqual(sum(1 for mode, _ in toolchain.calls if mode == "main"), 2)
+
+    def test_nested_limit_caps_rows(self):
+        nested = {
+            f"META-INF/jars/inner-{index:02d}.jar": nested_jar_bytes({
+                "schemaVersion": 1, "id": f"inner-{index}", "version": "1.0",
+                "entrypoints": {"main": ["com.example.Inner"]},
+            })
+            for index in range(5)
+        }
+        self.bundle_jar("bundle.jar", nested)
+        args = self.parse("--fabric-jars", str(self.fabric), "--nested-limit", "3")
+        row = corpus.build_report(args, MetadataToolchain())["jars"][0]
+        self.assertEqual([item["id"] for item in row["nested"]],
+                         ["inner-0", "inner-1", "inner-2"])
+        self.assertEqual(len(row["nested_skipped"]), 1)
+        self.assertIn("per-jar nested limit 3", row["nested_skipped"][0]["reason"])
+        self.assertEqual(row["verdict"], "ok")
+
+    def test_nested_depth_bounds_recursion(self):
+        leaf = nested_jar_bytes({
+            "schemaVersion": 1, "id": "leaf", "version": "1.0",
+            "entrypoints": {"main": ["com.example.Leaf"]},
+        })
+        middle = nested_jar_bytes({
+            "schemaVersion": 1, "id": "middle", "version": "1.0",
+            "jars": [{"file": "META-INF/jars/leaf.jar"}],
+        }, {"META-INF/jars/leaf.jar": leaf})
+        self.bundle_jar("bundle.jar", {"META-INF/jars/middle.jar": middle})
+
+        shallow = corpus.build_report(
+            self.parse("--fabric-jars", str(self.fabric)), MetadataToolchain()
+        )["jars"][0]
+        self.assertEqual([item["id"] for item in shallow["nested"]], ["middle"])
+        self.assertEqual(shallow["verdict"], "fallback")
+
+        deep = corpus.build_report(
+            self.parse("--fabric-jars", str(self.fabric), "--nested-depth", "2"),
+            MetadataToolchain(),
+        )["jars"][0]
+        self.assertEqual([item["id"] for item in deep["nested"]], ["middle", "leaf"])
+        self.assertEqual([item["depth"] for item in deep["nested"]], [1, 2])
+        self.assertEqual(deep["verdict"], "ok")
+
+    def test_nested_size_cap_skips_without_probing(self):
+        big = nested_jar_bytes(
+            {"schemaVersion": 1, "id": "big", "version": "1.0"},
+            {"blob.bin": b"\0" * (1 << 20)},
+        )
+        self.bundle_jar("bundle.jar", {"META-INF/jars/big.jar": big})
+        args = self.parse("--fabric-jars", str(self.fabric), "--nested-size-cap-mib", "1")
+        row = corpus.build_report(args, MetadataToolchain())["jars"][0]
+        self.assertEqual(row["nested"], [])
+        self.assertEqual(len(row["nested_skipped"]), 1)
+        self.assertIn("past the 1048576-byte nested cap", row["nested_skipped"][0]["reason"])
+        self.assertEqual(row["verdict"], "fallback")
+
+    def test_no_nested_keeps_old_output_shape(self):
+        inner = nested_jar_bytes({
+            "schemaVersion": 1, "id": "inner", "version": "1.0",
+            "entrypoints": {"main": ["com.example.Inner"]},
+        })
+        self.bundle_jar("bundle.jar", {"META-INF/jars/inner.jar": inner})
+        toolchain = MetadataToolchain()
+        report = corpus.build_report(
+            self.parse("--fabric-jars", str(self.fabric), "--no-nested"), toolchain
+        )
+        row = report["jars"][0]
+        self.assertNotIn("nested", row)
+        self.assertNotIn("nested_skipped", row)
+        self.assertNotIn("nested", report["limits"])
+        self.assertEqual(row["verdict"], "fallback")
+        self.assertIn("probe the nested jars", row["reason"])
+        self.assertFalse(any(name.startswith("nested-") for _, name in toolchain.calls))
+
+    def test_nested_report_is_deterministic_json(self):
+        inner = nested_jar_bytes({
+            "schemaVersion": 1, "id": "inner", "version": "1.0",
+            "entrypoints": {"main": ["com.example.Inner"]},
+        })
+        self.bundle_jar("bundle.jar", {"META-INF/jars/inner.jar": inner})
+        reports = [corpus.build_report(
+            self.parse("--fabric-jars", str(self.fabric)), MetadataToolchain()
+        ) for _ in range(2)]
+        first, second = (json.dumps(report, sort_keys=True) for report in reports)
+        self.assertEqual(first, second)
 
     def test_cli_parsing(self):
         args = self.parse("--fabric-jars", str(self.fabric), "--limit", "2", "--json")
