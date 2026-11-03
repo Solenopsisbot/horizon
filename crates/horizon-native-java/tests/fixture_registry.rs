@@ -1,4 +1,6 @@
-use horizon_native_java::{Host, MethodRef, NativeJar, RegistryEntry, StdHost, TypedRegistrySink, Value};
+use horizon_native_java::{
+    Host, MethodRef, NativeJar, RegistryEntry, StdHost, TypedRegistrySink, Value,
+};
 use std::{fs, io::Write};
 use zip::write::SimpleFileOptions;
 

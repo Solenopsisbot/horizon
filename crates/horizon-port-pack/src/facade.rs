@@ -1159,6 +1159,18 @@ fn render(
             "    protected String horizonText = \"\";\n    protected String horizonKey = \"\";"
         );
     }
+    if class.name == "net/minecraft/world/item/Item$Properties" {
+        let _ = writeln!(
+            out,
+            "    protected int horizonMaxStackSize = 64;\n    protected int horizonMaxDamage;\n    protected net.minecraft.world.item.Item horizonCraftRemainder;\n    protected boolean horizonFireResistant;"
+        );
+    }
+    if class.name == "net/minecraft/world/item/Item" {
+        let _ = writeln!(
+            out,
+            "    protected int horizonMaxStackSize = 64;\n    protected int horizonMaxDamage;\n    protected net.minecraft.world.item.Item horizonCraftRemainder;\n    protected boolean horizonFireResistant;"
+        );
+    }
     if class.name == "net/minecraft/world/phys/AABB" {
         let _ = writeln!(
             out,
@@ -1390,6 +1402,10 @@ fn render(
                 }
                 _ => "",
             }
+        } else if class.name == "net/minecraft/world/item/Item"
+            && method.descriptor == "(Lnet/minecraft/world/item/Item$Properties;)V"
+        {
+            "if (p0 != null) { this.horizonMaxStackSize = p0.horizonMaxStackSize; this.horizonMaxDamage = p0.horizonMaxDamage; this.horizonCraftRemainder = p0.horizonCraftRemainder; this.horizonFireResistant = p0.horizonFireResistant; }"
         } else if class.name == "net/minecraft/world/effect/MobEffectInstance" {
             match method.descriptor.as_str() {
                 "(Lnet/minecraft/world/effect/MobEffect;I)V" => {
@@ -1579,6 +1595,27 @@ fn render(
             }
             let body = runtime_body_with_descriptor(&class.name, name, ret, descriptor);
             let _ = writeln!(out, "    public {ret} {name}({params}) {{ {body} }}");
+            methods += 1;
+        }
+    }
+    if class.name == "net/minecraft/world/item/Item" {
+        let required = [
+            ("getMaxStackSize", "()I", "int"),
+            ("getMaxDamage", "()I", "int"),
+            ("isDamageable", "()Z", "boolean"),
+            (
+                "getCraftingRemainingItem",
+                "()Lnet/minecraft/world/item/Item;",
+                "net.minecraft.world.item.Item",
+            ),
+            ("isFireResistant", "()Z", "boolean"),
+        ];
+        for (name, descriptor, ret) in required {
+            if !seen.insert((name.to_owned(), String::new())) {
+                continue;
+            }
+            let body = runtime_body_with_descriptor(&class.name, name, ret, descriptor);
+            let _ = writeln!(out, "    public {ret} {name}() {{ {body} }}");
             methods += 1;
         }
     }
@@ -2718,7 +2755,42 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     if class == "net/minecraft/world/item/Item$Properties"
         && ret == "net.minecraft.world.item.Item.Properties"
     {
-        return "return this;".to_owned();
+        match (method, descriptor) {
+            ("stacksTo", "(I)Lnet/minecraft/world/item/Item$Properties;") => {
+                return "horizonMaxStackSize = Math.max(1, Math.min(99, p0)); return this;"
+                    .to_owned();
+            }
+            ("durability", "(I)Lnet/minecraft/world/item/Item$Properties;") => {
+                return "horizonMaxDamage = Math.max(0, p0); horizonMaxStackSize = 1; return this;"
+                    .to_owned();
+            }
+            (
+                "craftRemainder",
+                "(Lnet/minecraft/world/item/Item;)Lnet/minecraft/world/item/Item$Properties;",
+            ) => {
+                return "horizonCraftRemainder = p0; return this;".to_owned();
+            }
+            ("fireResistant", "()Lnet/minecraft/world/item/Item$Properties;") => {
+                return "horizonFireResistant = true; return this;".to_owned();
+            }
+            _ => return "return this;".to_owned(),
+        }
+    }
+    if class == "net/minecraft/world/item/Item" {
+        match (method, ret, descriptor) {
+            ("getMaxStackSize", "int", "()I") => return "return horizonMaxStackSize;".to_owned(),
+            ("getMaxDamage", "int", "()I") => return "return horizonMaxDamage;".to_owned(),
+            ("isDamageable", "boolean", "()Z") => return "return horizonMaxDamage > 0;".to_owned(),
+            (
+                "getCraftingRemainingItem",
+                "net.minecraft.world.item.Item",
+                "()Lnet/minecraft/world/item/Item;",
+            ) => return "return horizonCraftRemainder;".to_owned(),
+            ("isFireResistant", "boolean", "()Z") => {
+                return "return horizonFireResistant;".to_owned();
+            }
+            _ => {}
+        }
     }
     if class == "net/minecraft/world/item/Item"
         && method == "getDefaultInstance"
@@ -2741,13 +2813,20 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             {
                 return "return java.util.stream.Stream.empty();".to_owned();
             }
-            ("getMaxStackSize", "int") => return "return 64;".to_owned(),
+            ("getMaxStackSize", "int") => {
+                return "return horizonItem == null ? 64 : horizonItem.getMaxStackSize();"
+                    .to_owned();
+            }
             ("hasFoil", "boolean") => return "return false;".to_owned(),
             ("isDamaged", "boolean") => return "return horizonDamage > 0;".to_owned(),
             ("getDamageValue", "int") => return "return horizonDamage;".to_owned(),
             ("setDamageValue", "void") => return "horizonDamage = Math.max(0, p0);".to_owned(),
-            ("getMaxDamage", "int") => return "return 0;".to_owned(),
-            ("isDamageable", "boolean") => return "return false;".to_owned(),
+            ("getMaxDamage", "int") => {
+                return "return horizonItem == null ? 0 : horizonItem.getMaxDamage();".to_owned();
+            }
+            ("isDamageable", "boolean") => {
+                return "return horizonItem != null && horizonItem.isDamageable();".to_owned();
+            }
             ("isEnchanted", "boolean") => return "return false;".to_owned(),
             ("getUseDuration", "int") => return "return 0;".to_owned(),
             ("getUseAnimation", "net.minecraft.world.item.UseAnim") => {
@@ -4464,7 +4543,7 @@ mod tests {
                 "getMaxStackSize",
                 "int"
             ),
-            "return 64;"
+            "return horizonItem == null ? 64 : horizonItem.getMaxStackSize();"
         );
         assert_eq!(
             runtime_body(
@@ -4472,7 +4551,7 @@ mod tests {
                 "isDamageable",
                 "boolean"
             ),
-            "return false;"
+            "return horizonItem != null && horizonItem.isDamageable();"
         );
         assert_eq!(
             runtime_body("net/minecraft/world/item/ItemStack", "hasFoil", "boolean"),
@@ -5070,6 +5149,64 @@ mod tests {
                 &format!("({component})Z"),
             ),
             "return horizonComponents.containsKey(p0);"
+        );
+    }
+
+    #[test]
+    fn item_properties_preserve_stack_and_durability_contract() {
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/item/Item$Properties",
+                "stacksTo",
+                "net.minecraft.world.item.Item.Properties",
+                "(I)Lnet/minecraft/world/item/Item$Properties;",
+            ),
+            "horizonMaxStackSize = Math.max(1, Math.min(99, p0)); return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/item/Item$Properties",
+                "durability",
+                "net.minecraft.world.item.Item.Properties",
+                "(I)Lnet/minecraft/world/item/Item$Properties;",
+            ),
+            "horizonMaxDamage = Math.max(0, p0); horizonMaxStackSize = 1; return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/item/Item$Properties",
+                "craftRemainder",
+                "net.minecraft.world.item.Item.Properties",
+                "(Lnet/minecraft/world/item/Item;)Lnet/minecraft/world/item/Item$Properties;",
+            ),
+            "horizonCraftRemainder = p0; return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/item/Item$Properties",
+                "fireResistant",
+                "net.minecraft.world.item.Item.Properties",
+                "()Lnet/minecraft/world/item/Item$Properties;",
+            ),
+            "horizonFireResistant = true; return this;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/item/Item",
+                "getMaxDamage",
+                "int",
+                "()I",
+            ),
+            "return horizonMaxDamage;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/item/Item",
+                "isDamageable",
+                "boolean",
+                "()Z",
+            ),
+            "return horizonMaxDamage > 0;"
         );
     }
 
