@@ -1,4 +1,4 @@
-use horizon_native_java::{NativeJar, RegistryEntry, StdHost, TypedRegistrySink, Value};
+use horizon_native_java::{Host, MethodRef, NativeJar, RegistryEntry, StdHost, TypedRegistrySink, Value};
 use std::{fs, io::Write};
 use zip::write::SimpleFileOptions;
 
@@ -72,8 +72,9 @@ fn fabric_fixture_runs_entrypoint_and_carries_resource_and_registry_declaration(
         ]
     );
 
-    let mut host =
-        StdHost::new().with_resource("assets/fixture-registry/config.json", "fixture-config");
+    let mut host = jar
+        .seed_host(StdHost::new())
+        .with_resource("assets/fixture-registry/config.json", "fixture-config");
     let report = jar
         .execute(&entry.class, entry.method.as_deref(), "main", &mut host)
         .unwrap();
@@ -82,6 +83,52 @@ fn fabric_fixture_runs_entrypoint_and_carries_resource_and_registry_declaration(
         host.resource("assets/fixture-registry/config.json"),
         Some("fixture-config")
     ));
+    let container = host
+        .invoke_instance(
+            &MethodRef {
+                owner: "net/fabricmc/loader/api/FabricLoader".into(),
+                name: "getModContainer".into(),
+                descriptor: "(Ljava/lang/String;)Ljava/util/Optional;".into(),
+            },
+            &Value::Ref(Some("fabric-loader".into())),
+            &[Value::Ref(Some("fixture-registry".into()))],
+        )
+        .unwrap();
+    let metadata = host
+        .invoke_instance(
+            &MethodRef {
+                owner: "net/fabricmc/loader/api/ModContainer".into(),
+                name: "getMetadata".into(),
+                descriptor: "()Lnet/fabricmc/loader/api/metadata/ModMetadata;".into(),
+            },
+            &container,
+            &[],
+        )
+        .unwrap();
+    let authors = host
+        .invoke_instance(
+            &MethodRef {
+                owner: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
+                name: "getAuthors".into(),
+                descriptor: "()Ljava/util/Collection;".into(),
+            },
+            &metadata,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        host.invoke_instance(
+            &MethodRef {
+                owner: "java/util/Collection".into(),
+                name: "size".into(),
+                descriptor: "()I".into(),
+            },
+            &authors,
+            &[],
+        )
+        .unwrap(),
+        Value::Int(0)
+    );
     let mut sink = Recording(Vec::new());
     for declaration in &jar.native_declarations {
         sink.register_typed(declaration).unwrap();
