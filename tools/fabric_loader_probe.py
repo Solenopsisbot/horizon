@@ -145,6 +145,8 @@ def main() -> int:
             "cargo",
             "run",
             "--quiet",
+            "--manifest-path",
+            str(ROOT / "Cargo.toml"),
             "-p",
             "horizon-jvm",
             "--",
@@ -157,7 +159,8 @@ def main() -> int:
             str(libraries),
             str(mod),
         ]
-        result = run(command)
+        # Run beside the fixture so the loader's log lands in the temp dir.
+        result = run(command, cwd=root)
         output = f"{result.stderr}{result.stdout}"
         if result.returncode != 0:
             print(f"fabric loader probe failed ({result.returncode}):\n{output}", file=sys.stderr)
