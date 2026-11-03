@@ -496,11 +496,7 @@ fn access_widener_entry(line: &str, number: usize) -> Result<AccessWidenerEntry,
             kind.label()
         ));
     };
-    if name.len() > 256
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '<' | '>'))
-    {
+    if !is_member_name(name) {
         return Err(format!("line {number}: `{name}` is not a member name"));
     }
     entry.name = name.to_owned();
@@ -619,6 +615,306 @@ fn widen(access: &mut u16, widening: AccessWidenerAccess) -> bool {
         *access &= !ACC_FINAL;
     }
     *access != before
+}
+
+/// A Forge/NeoForge access transformer (`META-INF/accesstransformer.cfg`),
+/// parsed but not yet applied: `<access> <class> [member [descriptor]]` per
+/// line, class names in dots, like a widener matched against the names the
+/// classes carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessTransformer {
+    /// In file order, duplicates kept: applying an entry twice changes nothing.
+    pub entries: Vec<AccessTransformerEntry>,
+}
+
+/// One access transformer line: a class, or one of its members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessTransformerEntry {
+    pub access: AccessTransformerAccess,
+    /// An internal name: `net/minecraft/world/level/Level`.
+    pub owner: String,
+    /// The member's name, empty for a class entry.
+    pub name: String,
+    /// `()V` for a method, `I`/`Ljava/lang/String;` for a field. `None` matches
+    /// every declared member of `name`, constructors included.
+    pub descriptor: Option<String>,
+}
+
+/// What a line sets. The `-f` forms also drop `final`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AccessTransformerAccess {
+    Public,
+    Protected,
+    Private,
+    PublicNoFinal,
+    ProtectedNoFinal,
+    PrivateNoFinal,
+}
+
+/// The most text and entries read. A 1 MiB file holds more than 64k of the
+/// shortest line (`public a`), so both guards can fire; 64k is far past real
+/// transformers.
+const ACCESS_TRANSFORMER_TEXT_MAX: usize = 1024 * 1024;
+const ACCESS_TRANSFORMER_ENTRIES_MAX: usize = 64 * 1024;
+
+/// Reads a transformer's `.cfg` text. `#` starts a comment, blank lines are
+/// skipped, and a member token may carry its descriptor (`run(I)V`) or take it
+/// from the next token (`run (I)V`); a descriptor without parentheses is a
+/// field's. A member with no descriptor matches every member of that name.
+pub fn parse_access_transformer(text: &str) -> Result<AccessTransformer, String> {
+    if text.len() > ACCESS_TRANSFORMER_TEXT_MAX {
+        return Err(format!(
+            "access transformer is {} bytes, the limit is {ACCESS_TRANSFORMER_TEXT_MAX}",
+            text.len()
+        ));
+    }
+    let mut entries = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let number = index + 1;
+        let line = raw.split_once('#').map_or(raw, |(before, _)| before).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if entries.len() >= ACCESS_TRANSFORMER_ENTRIES_MAX {
+            return Err(format!(
+                "line {number}: more than {ACCESS_TRANSFORMER_ENTRIES_MAX} entries"
+            ));
+        }
+        entries.push(access_transformer_entry(line, number)?);
+    }
+    Ok(AccessTransformer { entries })
+}
+
+fn access_transformer_entry(line: &str, number: usize) -> Result<AccessTransformerEntry, String> {
+    let mut fields = line.split_whitespace();
+    let Some(word) = fields.next() else {
+        return Err(format!("line {number}: empty entry"));
+    };
+    let access = match word {
+        "public" => AccessTransformerAccess::Public,
+        "protected" => AccessTransformerAccess::Protected,
+        "private" => AccessTransformerAccess::Private,
+        "public-f" => AccessTransformerAccess::PublicNoFinal,
+        "protected-f" => AccessTransformerAccess::ProtectedNoFinal,
+        "private-f" => AccessTransformerAccess::PrivateNoFinal,
+        _ => return Err(format!("line {number}: `{word}` is not an access value")),
+    };
+    let Some(class) = fields.next() else {
+        return Err(format!("line {number}: the entry names no class"));
+    };
+    let Some(owner) = access_transformer_class(class) else {
+        return Err(format!("line {number}: `{class}` is not a class name"));
+    };
+    let Some(member) = fields.next() else {
+        return Ok(AccessTransformerEntry {
+            access,
+            owner,
+            name: String::new(),
+            descriptor: None,
+        });
+    };
+    // `name(desc)` carries the method descriptor inside the member token.
+    let (name, inline) = match member.split_once('(') {
+        Some((name, rest)) => (name, Some(format!("({rest}"))),
+        None => (member, None),
+    };
+    if !is_member_name(name) {
+        return Err(format!("line {number}: `{name}` is not a member name"));
+    }
+    let descriptor = match inline.or_else(|| fields.next().map(str::to_owned)) {
+        None => None,
+        Some(descriptor) => {
+            let valid = if descriptor.starts_with('(') {
+                is_method_descriptor(&descriptor)
+            } else {
+                is_field_descriptor(&descriptor)
+            };
+            if !valid {
+                return Err(format!("line {number}: `{descriptor}` is not a descriptor"));
+            }
+            if fields.next().is_some() {
+                return Err(format!("line {number}: text after the descriptor"));
+            }
+            Some(descriptor)
+        }
+    };
+    Ok(AccessTransformerEntry {
+        access,
+        owner,
+        name: name.to_owned(),
+        descriptor,
+    })
+}
+
+/// A bounded member name, as the class file writes it: `run`, `<init>`.
+fn is_member_name(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 256
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '<' | '>'))
+}
+
+/// Converts an access transformer class name's dots to the JVM's `/`
+/// (`net.minecraft.world.level.Level`), rejecting tokens that are not a
+/// bounded class name.
+fn access_transformer_class(name: &str) -> Option<String> {
+    if name.is_empty()
+        || name.len() > 512
+        || name.starts_with('.')
+        || name.ends_with('.')
+        || name.contains("..")
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.'))
+    {
+        return None;
+    }
+    Some(name.replace('.', "/"))
+}
+
+/// A JVM field descriptor: a primitive, an array of one, or `L...;`.
+fn is_field_descriptor(text: &str) -> bool {
+    let base = text.trim_start_matches('[');
+    text.len() <= 1024
+        && match base.as_bytes().first() {
+            Some(b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z') => base.len() == 1,
+            Some(b'L') => {
+                base.len() > 2 && base.ends_with(';') && is_internal_name(&base[1..base.len() - 1])
+            }
+            _ => false,
+        }
+}
+
+/// A JVM method descriptor: `(` parameters `)` return, `V` allowed as return.
+fn is_method_descriptor(text: &str) -> bool {
+    let Some((arguments, returns)) = text.strip_prefix('(').and_then(|r| r.split_once(')')) else {
+        return false;
+    };
+    text.len() <= 1024
+        && is_descriptor(arguments)
+        && (returns == "V" || is_field_descriptor(returns))
+}
+
+/// Applies a transformer to parsed classes, returning how many declarations'
+/// flags changed (a class entry as one, each changed member as one). A target
+/// no class or member matches is an error naming it, in file order, like the
+/// widener: a transformer that silently changed nothing must not read as
+/// applied. A member with no descriptor matches every member of the name,
+/// constructors included; a descriptor narrows it to one kind.
+pub fn apply_access_transformer(
+    classes: &mut [Class],
+    transformer: &AccessTransformer,
+) -> Result<usize, String> {
+    let mut changed = 0;
+    for entry in &transformer.entries {
+        let Some(class) = classes.iter_mut().find(|class| class.name == entry.owner) else {
+            return Err(format!("{}: no class of that name was read", entry.owner));
+        };
+        if entry.name.is_empty() {
+            if transform(&mut class.access, entry.access) {
+                changed += 1;
+            }
+            continue;
+        }
+        let mut matched = 0;
+        for declared in &mut class.declared {
+            if declared.name != entry.name {
+                continue;
+            }
+            if let Some(descriptor) = &entry.descriptor {
+                let kind = descriptor_kind(descriptor);
+                if declared.descriptor != *descriptor || !kind_matches(declared, kind) {
+                    continue;
+                }
+            }
+            matched += 1;
+            if transform(&mut declared.access, entry.access) {
+                changed += 1;
+            }
+        }
+        if matched == 0 {
+            return Err(match &entry.descriptor {
+                Some(descriptor) => format!(
+                    "{}#{} {descriptor}: no such {} declared",
+                    entry.owner,
+                    entry.name,
+                    descriptor_kind(descriptor).label()
+                ),
+                None => format!("{}#{}: no such member declared", entry.owner, entry.name),
+            });
+        }
+    }
+    Ok(changed)
+}
+
+/// The kind a descriptor's shape names: `(...)T` is a method, anything else a
+/// field.
+fn descriptor_kind(descriptor: &str) -> AccessWidenerKind {
+    if descriptor.starts_with('(') {
+        AccessWidenerKind::Method
+    } else {
+        AccessWidenerKind::Field
+    }
+}
+
+/// Sets a declaration's visibility and, for the `-f` forms, drops `final`.
+/// Unlike widening this may narrow access. Returns whether anything changed,
+/// so a second application counts nothing.
+fn transform(access: &mut u16, change: AccessTransformerAccess) -> bool {
+    let before = *access;
+    *access &= !(ACC_PUBLIC | ACC_PRIVATE | ACC_PROTECTED);
+    *access |= match change {
+        AccessTransformerAccess::Public | AccessTransformerAccess::PublicNoFinal => ACC_PUBLIC,
+        AccessTransformerAccess::Protected | AccessTransformerAccess::ProtectedNoFinal => {
+            ACC_PROTECTED
+        }
+        AccessTransformerAccess::Private | AccessTransformerAccess::PrivateNoFinal => ACC_PRIVATE,
+    };
+    if matches!(
+        change,
+        AccessTransformerAccess::PublicNoFinal
+            | AccessTransformerAccess::ProtectedNoFinal
+            | AccessTransformerAccess::PrivateNoFinal
+    ) {
+        *access &= !ACC_FINAL;
+    }
+    *access != before
+}
+
+/// Forge's canonical access-transformer path, and the folder beside it.
+const ACCESS_TRANSFORMER_PATH: &str = "META-INF/accesstransformer.cfg";
+const ACCESS_TRANSFORMER_DIR: &str = "META-INF/accesstransformer/";
+
+/// The jar's access-transformer files: `META-INF/accesstransformer.cfg` and
+/// every `META-INF/accesstransformer/*.cfg` beside it. The canonical path is a
+/// candidate even when `names` omits it, and a path already present is not
+/// repeated; sorted, so the order does not depend on the jar's listing.
+pub fn access_transformer_names(names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = names
+        .iter()
+        .filter(|name| is_access_transformer_path(name))
+        .cloned()
+        .collect();
+    if !out
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(ACCESS_TRANSFORMER_PATH))
+    {
+        out.push(ACCESS_TRANSFORMER_PATH.to_owned());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn is_access_transformer_path(name: &str) -> bool {
+    if name.eq_ignore_ascii_case(ACCESS_TRANSFORMER_PATH) {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix(ACCESS_TRANSFORMER_DIR) else {
+        return false;
+    };
+    !rest.is_empty() && !rest.contains('/') && rest.to_ascii_lowercase().ends_with(".cfg")
 }
 
 /// The constant pool, with the entries a class file's members and
@@ -2353,6 +2649,209 @@ accessible class c/C
                 .collect::<Vec<_>>(),
             ["a/A", "b/B", "c/C"],
             "classes keep the order they were read in"
+        );
+    }
+
+    fn apply_transformer(classes: &mut [Class], text: &str) -> Result<usize, String> {
+        apply_access_transformer(classes, &parse_access_transformer(text)?)
+    }
+
+    #[test]
+    fn parses_access_transformer_lines_comments_and_blanks() {
+        let text = "\
+# a mod's transformer
+public net.minecraft.world.level.Level field_1
+protected net.minecraft.world.level.Level method_1 ()V  # an overload
+private-f net.minecraft.world.level.Level method_2(I)V
+public net.minecraft.world.Block f I
+private net.minecraft.Shape
+public-f net.minecraft.Alpha
+protected-f net.minecraft.Beta
+";
+        let transformer = parse_access_transformer(text).expect("the fixture is a transformer");
+        assert_eq!(
+            transformer.entries[0],
+            AccessTransformerEntry {
+                access: AccessTransformerAccess::Public,
+                owner: "net/minecraft/world/level/Level".to_owned(),
+                name: "field_1".to_owned(),
+                descriptor: None,
+            }
+        );
+        assert_eq!(transformer.entries[1].descriptor.as_deref(), Some("()V"));
+        assert_eq!(transformer.entries[2].descriptor.as_deref(), Some("(I)V"));
+        // A bare descriptor is a field's; a class entry names no member.
+        assert_eq!(transformer.entries[3].descriptor.as_deref(), Some("I"));
+        assert_eq!(transformer.entries[4].owner, "net/minecraft/Shape");
+        assert!(transformer.entries[4].name.is_empty());
+        // All six access forms, in file order.
+        assert_eq!(
+            transformer
+                .entries
+                .iter()
+                .map(|entry| entry.access)
+                .collect::<Vec<_>>(),
+            [
+                AccessTransformerAccess::Public,
+                AccessTransformerAccess::Protected,
+                AccessTransformerAccess::PrivateNoFinal,
+                AccessTransformerAccess::Public,
+                AccessTransformerAccess::Private,
+                AccessTransformerAccess::PublicNoFinal,
+                AccessTransformerAccess::ProtectedNoFinal,
+            ]
+        );
+    }
+
+    #[test]
+    fn applies_access_transformer_classes_and_members() {
+        let mut classes = [widened(
+            "net/minecraft/world/level/Level",
+            ACC_PUBLIC | ACC_FINAL,
+            vec![
+                member(MemberKind::Field, "field_1", "I", ACC_PRIVATE | ACC_FINAL),
+                member(MemberKind::Method, "method_1", "()V", ACC_PROTECTED),
+            ],
+        )];
+        let text = "\
+public-f net.minecraft.world.level.Level
+private-f net.minecraft.world.level.Level field_1
+public-f net.minecraft.world.level.Level method_1 ()V
+";
+        assert_eq!(apply_transformer(&mut classes, text), Ok(3));
+        assert_eq!(classes[0].access, ACC_PUBLIC);
+        // `-f` clears the field's `final`; it is private now.
+        assert_eq!(classes[0].declared[0].access, ACC_PRIVATE);
+        assert_eq!(classes[0].declared[1].access, ACC_PUBLIC);
+        assert_eq!(apply_transformer(&mut classes, text), Ok(0), "idempotent");
+    }
+
+    #[test]
+    fn access_transformer_descriptors_pick_one_overload_by_shape() {
+        let mut classes = [widened(
+            "a/B",
+            ACC_PUBLIC,
+            vec![
+                member(MemberKind::Method, "get", "()V", ACC_PRIVATE),
+                member(MemberKind::Method, "get", "(I)V", ACC_PRIVATE),
+                member(MemberKind::Field, "get", "I", ACC_PRIVATE),
+                member(MemberKind::Method, "<init>", "(I)V", ACC_PRIVATE),
+                member(MemberKind::Field, "other", "J", ACC_PRIVATE),
+            ],
+        )];
+        // A method descriptor picks one overload; a field descriptor one field.
+        assert_eq!(
+            apply_transformer(&mut classes, "public a.B get (I)V\n"),
+            Ok(1)
+        );
+        assert_eq!(classes[0].declared[0].access, ACC_PRIVATE);
+        assert_eq!(classes[0].declared[1].access, ACC_PUBLIC);
+        assert_eq!(
+            apply_transformer(&mut classes, "protected a.B get I\n"),
+            Ok(1)
+        );
+        assert_eq!(classes[0].declared[2].access, ACC_PROTECTED);
+        // No descriptor matches every member of the name, both kinds.
+        assert_eq!(apply_transformer(&mut classes, "public a.B get\n"), Ok(2));
+        assert_eq!(classes[0].declared[0].access, ACC_PUBLIC);
+        assert_eq!(classes[0].declared[1].access, ACC_PUBLIC);
+        assert_eq!(classes[0].declared[2].access, ACC_PUBLIC);
+        assert_eq!(classes[0].declared[4].access, ACC_PRIVATE);
+        // A constructor stays declared and is matched by its descriptor.
+        assert_eq!(
+            apply_transformer(&mut classes, "public a.B <init> (I)V\n"),
+            Ok(1)
+        );
+        assert_eq!(classes[0].declared.len(), 5);
+        assert_eq!(classes[0].declared[3].access, ACC_PUBLIC);
+    }
+
+    #[test]
+    fn reports_missing_malformed_and_oversized_access_transformer_input() {
+        let mut classes = [widened(
+            "a/B",
+            ACC_PUBLIC,
+            vec![member(MemberKind::Field, "f", "I", ACC_PRIVATE)],
+        )];
+        for (text, needle) in [
+            ("public a.Gone\n", "a/Gone"),
+            ("public a.B g I\n", "a/B#g I"),
+            // A descriptor of the wrong shape is its own miss, not a guess.
+            ("public a.B f ()V\n", "a/B#f ()V"),
+        ] {
+            let message = apply_transformer(&mut classes, text).unwrap_err();
+            assert!(message.contains(needle), "{message}");
+        }
+        assert_eq!(
+            classes[0].declared[0].access, ACC_PRIVATE,
+            "nothing applied"
+        );
+
+        let error = |text: &str| parse_access_transformer(text).unwrap_err();
+        assert!(error("mutable a.B\n").contains("line 1"));
+        assert!(error("public\n").contains("no class"));
+        assert!(error("public ../B\n").contains("class name"));
+        assert!(error("public a..B\n").contains("class name"));
+        assert!(error("public a.B bad-name\n").contains("member name"));
+        assert!(error("public a.B run (\n").contains("descriptor"));
+        assert!(error("public a.B run ()V extra\n").contains("after the descriptor"));
+        assert!(error("public a.B f !\n").contains("not a descriptor"));
+        assert!(error("public a.B f [V\n").contains("not a descriptor"));
+        assert!(
+            parse_access_transformer("# nothing\n\n")
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+
+        let big = format!("public a.B\n#{}", "x".repeat(ACCESS_TRANSFORMER_TEXT_MAX));
+        assert!(
+            parse_access_transformer(&big)
+                .unwrap_err()
+                .contains("limit")
+        );
+        let mut many = String::new();
+        for _ in 0..=ACCESS_TRANSFORMER_ENTRIES_MAX {
+            many.push_str("public a.B\n");
+        }
+        assert!(
+            parse_access_transformer(&many)
+                .unwrap_err()
+                .contains("more than 65536 entries")
+        );
+    }
+
+    #[test]
+    fn discovers_access_transformer_files() {
+        let names: Vec<String> = [
+            "META-INF/accesstransformer.cfg",
+            "META-INF/accesstransformer/extra.cfg",
+            "META-INF/accesstransformer/nested/deep.cfg",
+            "META-INF/accesstransformer/readme.txt",
+            "META-INF/MANIFEST.MF",
+        ]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+        assert_eq!(
+            access_transformer_names(&names),
+            [
+                "META-INF/accesstransformer.cfg",
+                "META-INF/accesstransformer/extra.cfg"
+            ]
+        );
+        // The canonical path is a candidate even when the listing omits it,
+        // and is not repeated when present.
+        assert_eq!(
+            access_transformer_names(&[]),
+            ["META-INF/accesstransformer.cfg"]
+        );
+        assert_eq!(
+            access_transformer_names(&[
+                "META-INF/accesstransformer.cfg".to_owned(),
+                "META-INF/accesstransformer.cfg".to_owned()
+            ]),
+            ["META-INF/accesstransformer.cfg"]
         );
     }
 }
