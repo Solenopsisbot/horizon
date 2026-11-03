@@ -233,12 +233,39 @@ public final class Callbacks {
     let first_marker = Value::Ref(Some("first".into()));
     let target_marker = Value::Ref(Some("target".into()));
     let second_marker = Value::Ref(Some("second".into()));
-    assert_eq!(markers.iter().filter(|marker| **marker == first_marker).count(), 1);
-    assert_eq!(markers.iter().filter(|marker| **marker == target_marker).count(), 1);
-    assert_eq!(markers.iter().filter(|marker| **marker == second_marker).count(), 1);
-    let first_index = markers.iter().position(|marker| *marker == first_marker).unwrap();
-    let second_index = markers.iter().position(|marker| *marker == second_marker).unwrap();
-    assert!(first_index < second_index, "callbacks must run in declaration order");
+    assert_eq!(
+        markers
+            .iter()
+            .filter(|marker| **marker == first_marker)
+            .count(),
+        1
+    );
+    assert_eq!(
+        markers
+            .iter()
+            .filter(|marker| **marker == target_marker)
+            .count(),
+        1
+    );
+    assert_eq!(
+        markers
+            .iter()
+            .filter(|marker| **marker == second_marker)
+            .count(),
+        1
+    );
+    let first_index = markers
+        .iter()
+        .position(|marker| *marker == first_marker)
+        .unwrap();
+    let second_index = markers
+        .iter()
+        .position(|marker| *marker == second_marker)
+        .unwrap();
+    assert!(
+        first_index < second_index,
+        "callbacks must run in declaration order"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
