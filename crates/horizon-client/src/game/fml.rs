@@ -20,6 +20,7 @@ use std::{
     io::Read,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::{OnceLock, RwLock},
     time::{Duration, Instant},
 };
 
@@ -156,15 +157,15 @@ impl FmlProbeOutput {
 /// One role's preflight, as its log lines and `server-status` report it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FmlReport {
-    pub(super) role: ExecutionRole,
+    pub(in crate::game) role: ExecutionRole,
     /// How many explicit jars were offered to the probe.
-    pub(super) jars: usize,
+    pub(in crate::game) jars: usize,
     /// FML's own count; absent when the probe did not print one.
-    pub(super) mods: Option<usize>,
+    pub(in crate::game) mods: Option<usize>,
     /// The mod ids FML listed, sorted and bounded.
-    pub(super) mod_ids: Vec<String>,
+    pub(in crate::game) mod_ids: Vec<String>,
     /// Why the probe failed; `None` when it completed.
-    pub(super) failure: Option<String>,
+    pub(in crate::game) failure: Option<String>,
 }
 
 impl FmlReport {
@@ -234,24 +235,55 @@ impl FmlOutcome {
     }
 }
 
+/// The last report a preflight in this process produced, for `server-status`'s
+/// `fml` section. `None` means no preflight ran yet: a skip is not a failure,
+/// and a later startup overwrites an earlier report.
+static LAST_REPORT: OnceLock<RwLock<Option<FmlReport>>> = OnceLock::new();
+
+fn last_reports() -> &'static RwLock<Option<FmlReport>> {
+    LAST_REPORT.get_or_init(|| RwLock::new(None))
+}
+
+/// The last preflight's report, or `None` when none ran in this process.
+pub(in crate::game) fn last_report() -> Option<FmlReport> {
+    last_reports().read().unwrap().clone()
+}
+
+/// Records what a preflight found, replacing whatever was there before.
+fn store(report: Option<FmlReport>) {
+    *last_reports().write().unwrap() = report;
+}
+
+/// Whether `HORIZON_NEOFORGE_STRICT` asked a failure to stop startup. Read
+/// again for `server-status`, because [`FmlReport`] does not carry it.
+pub(in crate::game) fn strict_requested() -> bool {
+    std::env::var(STRICT_ENV).is_ok_and(|value| env_flag(&value))
+}
+
 /// Runs the preflight when the environment asks for it and this role is a
 /// server. `None` means it was skipped, which is the normal startup; a failure
 /// is a report here, and only [`FmlOutcome::strict_error`] makes it fatal.
 pub(crate) fn preflight(role: ExecutionRole, jars: &[PathBuf]) -> Option<FmlOutcome> {
-    let config = FmlConfig::from_env(role, jars)?;
+    Some(preflight_with(FmlConfig::from_env(role, jars)?))
+}
+
+/// One configured preflight, kept for `server-status` whatever it found: a
+/// missing `libraries` folder is a report too, never a silent skip.
+fn preflight_with(config: FmlConfig) -> FmlOutcome {
     let report = if config.libraries().is_dir() {
         run(&config)
     } else {
         FmlReport::failed(
-            role,
-            jars.len(),
+            config.role,
+            config.jars.len(),
             format!("{} has no libraries folder", config.server.display()),
         )
     };
-    Some(FmlOutcome {
+    store(Some(report.clone()));
+    FmlOutcome {
         report,
         strict: config.strict,
-    })
+    }
 }
 
 /// Runs the child process, bounded in time and output, and turns what it said
@@ -532,6 +564,64 @@ mod tests {
     fn a_failure_reason_keeps_only_the_last_output_line() {
         assert_eq!(last_line("a\n\n  b  \n").as_deref(), Some("b"));
         assert_eq!(last_line(" \n"), None);
+    }
+
+    /// The tests below share the process-wide report.
+    static LAST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn report(jars: usize) -> FmlReport {
+        FmlReport {
+            role: ExecutionRole::DedicatedServer,
+            jars,
+            mods: Some(jars),
+            mod_ids: Vec::new(),
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn the_last_report_is_idempotent_and_last_write_wins() {
+        let _guard = LAST.lock().unwrap();
+        store(None);
+        assert_eq!(last_report(), None);
+        let first = report(1);
+        store(Some(first.clone()));
+        assert_eq!(last_report(), Some(first.clone()));
+        // Storing the same report again changes nothing.
+        store(Some(first.clone()));
+        assert_eq!(last_report(), Some(first.clone()));
+        // A later preflight replaces it instead of adding to it.
+        let second = report(2);
+        store(Some(second.clone()));
+        assert_eq!(last_report(), Some(second));
+        store(None);
+        assert_eq!(last_report(), None);
+    }
+
+    /// A missing server folder is a report, not a skip: `server-status` has to
+    /// say the preflight ran and failed, and nothing is spawned to find out.
+    #[test]
+    fn a_missing_libraries_folder_is_recorded_as_failed() {
+        let _guard = LAST.lock().unwrap();
+        store(None);
+        let config = FmlConfig {
+            server: PathBuf::from("/horizon-absent-neoforge"),
+            strict: true,
+            jars: vec![PathBuf::from("/mods/a.jar")],
+            ..config(&[])
+        };
+        let outcome = preflight_with(config);
+        assert!(!outcome.report.succeeded());
+        assert!(outcome.strict);
+        let recorded = last_report().expect("the failure is kept for server-status");
+        assert_eq!(recorded, outcome.report);
+        assert!(
+            recorded
+                .failure
+                .as_deref()
+                .is_some_and(|why| why.contains("no libraries folder"))
+        );
+        assert_eq!(recorded.jars, 1);
     }
 
     /// A fake `horizon-jvm` proves the process path without a JVM: the report
