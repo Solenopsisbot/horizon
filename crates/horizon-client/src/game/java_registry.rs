@@ -438,6 +438,7 @@ mod tests {
             id: id.into(),
             title_key: "container.ruby.crate".into(),
             slots: 27,
+            open_blocks: Vec::new(),
         }
     }
 

@@ -24,6 +24,7 @@ use std::{
     fmt, fs,
     ops::Range,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 /// A content mod to put in the root: its id and content.
@@ -39,6 +40,118 @@ pub fn mob_effects(mods: &[ContentMod]) -> Vec<&MobEffect> {
     let mut effects: Vec<&MobEffect> = mods.iter().flat_map(|m| &m.content.effects).collect();
     effects.sort_by(|a, b| a.id.cmp(&b.id));
     effects
+}
+
+/// Ids [`declared_ids`] keeps per registry; a pack cannot make a command
+/// registry grow past it.
+pub const MAX_DECLARED_IDS: usize = 4096;
+
+/// The ids content mods declare, registry by registry: what the command
+/// registries merge after vanilla's own (`Game::build_registries`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeclaredIds {
+    /// The declared blocks.
+    pub blocks: Vec<String>,
+    /// The item registry's additions: declared items and the item of every
+    /// block that adds one, as [`DeclarationSummary::items`] counts them.
+    pub items: Vec<String>,
+    pub effects: Vec<String>,
+    /// The `minecraft:entity_type` declarations: `/summon` and the selector
+    /// `type=` read them, and they are summonable as well.
+    pub entity_types: Vec<String>,
+    pub menus: Vec<String>,
+    pub block_entity_types: Vec<String>,
+}
+
+impl DeclaredIds {
+    /// The declared ids of `registry` (`minecraft:entity_type`, ...), sorted
+    /// and without repeats; empty for a registry content mods do not add to.
+    pub fn get(&self, registry: &str) -> &[String] {
+        match registry {
+            "minecraft:block" => &self.blocks,
+            "minecraft:item" => &self.items,
+            "minecraft:mob_effect" => &self.effects,
+            "minecraft:entity_type" => &self.entity_types,
+            "minecraft:menu" => &self.menus,
+            "minecraft:block_entity_type" => &self.block_entity_types,
+            _ => &[],
+        }
+    }
+
+    /// No declaration at all: a mod with files or code only.
+    pub fn is_empty(&self) -> bool {
+        [
+            &self.blocks,
+            &self.items,
+            &self.effects,
+            &self.entity_types,
+            &self.menus,
+            &self.block_entity_types,
+        ]
+        .iter()
+        .all(|ids| ids.is_empty())
+    }
+}
+
+/// What `mods` declare in the command registries, from their typed tables
+/// only (no file parsed), sorted and deduplicated, at most
+/// [`MAX_DECLARED_IDS`] per registry: the same mods give the same ids
+/// whatever order they are passed in.
+pub fn declared_ids(mods: &[ContentMod]) -> DeclaredIds {
+    let mut blocks: BTreeSet<String> = BTreeSet::new();
+    let mut items: BTreeSet<String> = BTreeSet::new();
+    let mut effects: BTreeSet<String> = BTreeSet::new();
+    let mut entities: BTreeSet<String> = BTreeSet::new();
+    let mut menus: BTreeSet<String> = BTreeSet::new();
+    let mut block_entities: BTreeSet<String> = BTreeSet::new();
+    for m in mods {
+        let content = &m.content;
+        blocks.extend(content.blocks.iter().map(|b| b.id.clone()));
+        items.extend(
+            content
+                .blocks
+                .iter()
+                .filter(|b| b.item)
+                .map(|b| b.id.clone()),
+        );
+        items.extend(content.items.iter().map(|i| i.id.clone()));
+        effects.extend(content.effects.iter().map(|e| e.id.clone()));
+        entities.extend(content.entities.iter().map(|e| e.id.clone()));
+        menus.extend(content.menus.iter().map(|m| m.id.clone()));
+        block_entities.extend(content.block_entities.iter().map(|b| b.id.clone()));
+    }
+    let take =
+        |set: BTreeSet<String>| -> Vec<String> { set.into_iter().take(MAX_DECLARED_IDS).collect() };
+    DeclaredIds {
+        blocks: take(blocks),
+        items: take(items),
+        effects: take(effects),
+        entity_types: take(entities),
+        menus: take(menus),
+        block_entity_types: take(block_entities),
+    }
+}
+
+/// The last [`store_declared_ids`], for a world opening that no longer has
+/// the mods at hand.
+static DECLARED_IDS: Mutex<Option<DeclaredIds>> = Mutex::new(None);
+
+/// Remember what a content root was built from: [`resource_root`] keeps the
+/// mods' declared ids here, so `build_registries` can merge them into the
+/// command registries of a world opened later. Passing no mods clears them.
+pub fn store_declared_ids(mods: &[ContentMod]) {
+    let declared = declared_ids(mods);
+    *DECLARED_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(declared);
+}
+
+/// What the last [`store_declared_ids`] recorded, cloned so a world opening
+/// holds it only as long as the merge. Empty until a content root is built.
+pub fn stored_declared_ids() -> DeclaredIds {
+    DECLARED_IDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
 }
 
 /// Ids [`DeclarationSummary`] keeps; the rest are only counted.
@@ -1820,6 +1933,7 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
 /// 25 s and peaks above 3 GB, more than everything the game keeps.
 pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<PathBuf> {
     if mods.iter().all(|m| m.content.is_empty()) {
+        store_declared_ids(&[]);
         return Ok(base.to_owned());
     }
     let out = cache.join("mod-content");
@@ -1828,12 +1942,14 @@ pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<P
         // A reused root warns as the build did.
         let warnings = fs::read_to_string(out.join(WARNINGS)).unwrap_or_default();
         warnings.lines().for_each(|w| log::warn!("Horizon: {w}"));
+        store_declared_ids(mods);
         return Ok(out);
     }
     for warning in build(base, mods, &out)? {
         log::warn!("Horizon: {warning}");
     }
     fs::write(out.join(STAMP), stamp)?;
+    store_declared_ids(mods);
     Ok(out)
 }
 
@@ -1897,6 +2013,130 @@ fn stamp(base: &Path, mods: &[ContentMod]) -> Result<String> {
         hasher.update(part.as_bytes());
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The declared command-registry ids: every kind of a typed content mod, in
+/// its registry, and the bound a huge one cannot pass.
+#[cfg(test)]
+mod declared_ids_tests {
+    use super::*;
+    use horizon_mods::content::{EffectCategory, Item};
+    use horizon_mods::native::{
+        BlockEntityDeclaration, EntityDeclaration, MenuDeclaration, NativeDeclarations,
+    };
+
+    /// A declared block on a vanilla template.
+    fn block(id: &str, item: bool) -> Block {
+        Block {
+            id: id.to_owned(),
+            template: "minecraft:stone".into(),
+            properties: Default::default(),
+            shapes: None,
+            default_state: BTreeMap::new(),
+            item,
+            components: BTreeMap::new(),
+        }
+    }
+
+    /// A content mod declaring one row of every kind, built the way a native
+    /// Java adapter builds one.
+    fn ruby() -> ContentMod {
+        let properties = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect()
+        };
+        let declarations = NativeDeclarations {
+            blocks: vec![block("ruby:block", true), block("ruby:ore", false)],
+            items: vec![Item {
+                id: "ruby:gem".into(),
+                template: "minecraft:diamond".into(),
+                max_stack_size: None,
+                rarity: None,
+                components: BTreeMap::new(),
+                crafting_remainder: None,
+            }],
+            effects: vec![MobEffect {
+                id: "ruby:glow".into(),
+                category: EffectCategory::Beneficial,
+                color: 0x00ff00,
+            }],
+            entities: vec![EntityDeclaration {
+                id: "ruby:beast".into(),
+                template: "minecraft:pig".into(),
+                ..Default::default()
+            }],
+            menus: vec![
+                MenuDeclaration::from_registry_properties(
+                    "ruby:crate",
+                    &properties(&[("title_key", "container.ruby.crate"), ("slots", "27")]),
+                )
+                .unwrap(),
+            ],
+            block_entities: vec![
+                BlockEntityDeclaration::from_registry_properties(
+                    "ruby:crate_entity",
+                    &properties(&[
+                        ("template", "minecraft:barrel"),
+                        ("valid_blocks", "ruby:ore"),
+                    ]),
+                )
+                .unwrap(),
+            ],
+            ..Default::default()
+        };
+        ContentMod {
+            id: "ruby".into(),
+            content: Content::from_native("ruby", declarations).unwrap(),
+        }
+    }
+
+    #[test]
+    fn declared_ids_name_every_kind_in_its_registry() {
+        let declared = declared_ids(&[ruby()]);
+        let ids = |registry: &str| -> Vec<&str> {
+            declared.get(registry).iter().map(String::as_str).collect()
+        };
+        assert_eq!(ids("minecraft:block"), ["ruby:block", "ruby:ore"]);
+        // The block item joins the declared item, as the item registry counts.
+        assert_eq!(ids("minecraft:item"), ["ruby:block", "ruby:gem"]);
+        assert_eq!(ids("minecraft:mob_effect"), ["ruby:glow"]);
+        assert_eq!(ids("minecraft:entity_type"), ["ruby:beast"]);
+        assert_eq!(ids("minecraft:menu"), ["ruby:crate"]);
+        assert_eq!(ids("minecraft:block_entity_type"), ["ruby:crate_entity"]);
+        // A registry content mods do not add to stays empty.
+        assert!(declared.get("minecraft:enchantment").is_empty());
+        assert!(!declared.is_empty());
+        assert!(declared_ids(&[]).is_empty());
+    }
+
+    #[test]
+    fn declared_ids_stop_at_the_bound() {
+        let declarations = NativeDeclarations {
+            entities: (0..=MAX_DECLARED_IDS)
+                .map(|i| EntityDeclaration {
+                    id: format!("ruby:mob{i}"),
+                    template: "minecraft:pig".into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let content = Content::from_native("ruby", declarations).unwrap();
+        let declared = declared_ids(&[ContentMod {
+            id: "ruby".into(),
+            content,
+        }]);
+        assert_eq!(declared.entity_types.len(), MAX_DECLARED_IDS);
+        assert!(
+            declared
+                .entity_types
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "sorted and without repeats"
+        );
+    }
 }
 
 #[cfg(test)]

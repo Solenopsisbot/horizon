@@ -9,6 +9,7 @@ use horizon_client::{
     command::Registries,
     gamerules::GameRules,
     hud::HudBatch,
+    mod_content::{self, DeclaredIds},
     screen_draw::Measure,
     text::{ClickEvent, Style, Text},
 };
@@ -283,6 +284,71 @@ fn ids_in(root: &Path, extension: &str, namespace: &str) -> Vec<String> {
     out
 }
 
+/// The registries [`merge_declared`] adds the content mods' ids to: the six
+/// content kinds a command can name.
+const DECLARED_REGISTRIES: [&str; 6] = [
+    "minecraft:entity_type",
+    "minecraft:item",
+    "minecraft:block",
+    "minecraft:mob_effect",
+    "minecraft:menu",
+    "minecraft:block_entity_type",
+];
+
+/// `ids` with `declared` added, sorted and without repeats: the registry is
+/// deterministic whatever order the mods came in.
+fn merge_ids(ids: &mut Vec<String>, declared: &[String]) {
+    if declared.is_empty() {
+        return;
+    }
+    ids.extend(declared.iter().cloned());
+    ids.sort();
+    ids.dedup();
+}
+
+/// One registry's ids with `declared` added. A registry the export did not
+/// supply still gets an entry, so `Registries::ids` finds the declared ones;
+/// it starts from the flat list `ids` would have read, so the declared ids do
+/// not hide vanilla's own.
+fn merge_registry_ids(reg: &mut Registries, registry: &str, declared: &[String]) {
+    if declared.is_empty() {
+        return;
+    }
+    if let Some(entry) = reg.by_registry.get_mut(registry) {
+        merge_ids(&mut entry.ids, declared);
+        return;
+    }
+    let mut ids = match registry {
+        "minecraft:item" => reg.items.clone(),
+        "minecraft:entity_type" => reg.entity_types.clone(),
+        "minecraft:mob_effect" => reg.effects.clone(),
+        _ => Vec::new(),
+    };
+    merge_ids(&mut ids, declared);
+    reg.by_registry.insert(
+        registry.to_owned(),
+        horizon_client::command::args::RegistryIds {
+            ids,
+            tags: Vec::new(),
+        },
+    );
+}
+
+/// Add what the content mods declared to the command registries, after
+/// vanilla's own: `/summon` and `@e[type=]` need the entity types, `/give`
+/// the items, `/setblock` the blocks, `/effect` the mob effects, and the
+/// arguments that name menus and block entity types those. A declared entity
+/// type is also summonable. Running it twice changes nothing.
+fn merge_declared(reg: &mut Registries, declared: &DeclaredIds) {
+    for registry in DECLARED_REGISTRIES {
+        merge_registry_ids(reg, registry, declared.get(registry));
+    }
+    merge_ids(&mut reg.summonable, &declared.entity_types);
+    merge_ids(&mut reg.entity_types, &declared.entity_types);
+    merge_ids(&mut reg.items, &declared.items);
+    merge_ids(&mut reg.effects, &declared.effects);
+}
+
 impl Game<'_> {
     /// `PlayerList.isOp` for the single-player owner: the world's Allow Commands.
     pub(super) fn allow_commands(&self) -> bool {
@@ -494,6 +560,10 @@ impl Game<'_> {
                 break;
             }
         }
+        // The content mods' declarations join after vanilla's own (the root
+        // they were built from remembered them): the arguments check and
+        // complete against what the game actually has.
+        merge_declared(&mut self.ui.registries, &mod_content::stored_declared_ids());
         let reg = &mut self.ui.registries;
         reg.timelines = self.ui.timelines.keys().cloned().collect();
         reg.time_markers = self
@@ -1474,6 +1544,72 @@ mod tests {
         std::fs::write(recipe.join("c.json"), "{}").unwrap();
         assert!(Arc::ptr_eq(&first, &resource_ids(&root)));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Declared content joins the command registries after vanilla's, each
+    /// sorted without repeats, and declared entity types are summonable.
+    #[test]
+    fn declared_content_joins_the_command_registries() {
+        use horizon_client::command::args::RegistryIds;
+        let ids = |reg: &Registries, registry: &str| -> Vec<String> { reg.ids(registry).to_vec() };
+        let mut reg = Registries::default();
+        reg.by_registry.insert(
+            "minecraft:entity_type".into(),
+            RegistryIds {
+                ids: vec!["minecraft:pig".into()],
+                tags: Vec::new(),
+            },
+        );
+        reg.summonable = vec!["minecraft:pig".into()];
+        reg.entity_types = vec!["minecraft:pig".into()];
+        reg.items = vec!["minecraft:stone".into()];
+        reg.effects = vec!["minecraft:speed".into()];
+        let declared = DeclaredIds {
+            blocks: vec!["ruby:block".into()],
+            items: vec!["ruby:block".into(), "ruby:gem".into()],
+            effects: vec!["ruby:glow".into()],
+            entity_types: vec!["ruby:beast".into()],
+            menus: vec!["ruby:crate".into()],
+            block_entity_types: vec!["ruby:crate_entity".into()],
+        };
+        merge_declared(&mut reg, &declared);
+        assert_eq!(
+            ids(&reg, "minecraft:entity_type"),
+            ["minecraft:pig", "ruby:beast"]
+        );
+        // A registry the export did not supply starts from the flat list the
+        // declared ids must not hide.
+        assert_eq!(
+            ids(&reg, "minecraft:item"),
+            ["minecraft:stone", "ruby:block", "ruby:gem"]
+        );
+        assert_eq!(
+            ids(&reg, "minecraft:mob_effect"),
+            ["minecraft:speed", "ruby:glow"]
+        );
+        assert_eq!(ids(&reg, "minecraft:block"), ["ruby:block"]);
+        assert_eq!(ids(&reg, "minecraft:menu"), ["ruby:crate"]);
+        assert_eq!(
+            ids(&reg, "minecraft:block_entity_type"),
+            ["ruby:crate_entity"]
+        );
+        // The flat lists `/give`, `/effect` and `/summon` suggest from.
+        assert_eq!(reg.items, ["minecraft:stone", "ruby:block", "ruby:gem"]);
+        assert_eq!(reg.effects, ["minecraft:speed", "ruby:glow"]);
+        assert_eq!(reg.summonable, ["minecraft:pig", "ruby:beast"]);
+        assert_eq!(reg.entity_types, ["minecraft:pig", "ruby:beast"]);
+        // A second merge changes nothing, and no declarations leave the
+        // vanilla ids alone.
+        let before = reg.clone();
+        merge_declared(&mut reg, &declared);
+        assert_eq!(
+            ids(&reg, "minecraft:entity_type"),
+            ids(&before, "minecraft:entity_type")
+        );
+        assert_eq!(reg.summonable, before.summonable);
+        merge_declared(&mut reg, &DeclaredIds::default());
+        assert_eq!(reg.summonable, before.summonable);
+        assert_eq!(reg.items, before.items);
     }
 
     /// The export is read once per folder; a folder without one stays without.

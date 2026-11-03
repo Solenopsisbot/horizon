@@ -76,6 +76,17 @@ pub(in crate::game) struct OtherEntity {
 pub(super) fn err(key: &str, args: &[&dyn std::fmt::Display]) -> CommandError {
     CommandError::tr(key, args)
 }
+/// A resource id as its registry spells it: the parser has already namespaced
+/// the text (`ResourceLocation.parse` adds `minecraft:` to a bare id), and a
+/// declared mod id keeps the namespace its mod registered under. An id no
+/// registry holds comes back normalized, as vanilla reads it.
+fn registry_id(ids: &[String], id: &str) -> String {
+    let id = horizon_client::command::args::normalize(id);
+    ids.iter()
+        .find(|known| **known == id)
+        .cloned()
+        .unwrap_or(id)
+}
 fn texts(args: &[Text]) -> Vec<Text> {
     args.to_vec()
 }
@@ -1247,6 +1258,9 @@ impl Game<'_> {
         let Some(Arg::Item(ItemInput { id, components, .. })) = ctx.get("item").cloned() else {
             return Ok(0);
         };
+        // The id the item registry holds, so a declared item keeps its
+        // namespace and a vanilla one keeps `minecraft:`.
+        let id = registry_id(self.ui.registries.ids("minecraft:item"), &id);
         let (damage, extra) = match components
             .as_deref()
             .map(horizon_client::item_data::command_components)
@@ -2004,12 +2018,14 @@ impl Game<'_> {
         // their own names, and an id nothing declares still reads as vanilla's
         // (`tnt` -> `minecraft:tnt`).
         let resolved = horizon_client::mobs::resolve_type(self.res.mob_types(), &kind).cloned();
+        // A declared type is the running game's registry id; a vanilla one
+        // keeps the `minecraft:` namespace the registry holds.
         let type_id = resolved.as_ref().map_or_else(
-            || horizon_client::command::args::normalize(&kind),
+            || registry_id(self.ui.registries.ids("minecraft:entity_type"), &kind),
             |t| t.id.clone(),
         );
         let name_key = format!("entity.{}", type_id.replace(':', "."));
-        let short = kind.trim_start_matches("minecraft:").to_owned();
+        let short = type_id.trim_start_matches("minecraft:").to_owned();
         if let Some(Arg::Str(nbt)) = ctx.get("nbt").cloned() {
             // With an NBT argument the entity is built from it, unfinalized.
             if self.ui.difficulty == 0 && resolved.as_ref().is_some_and(|t| t.category == "monster")
@@ -2116,7 +2132,9 @@ impl Game<'_> {
     /// BlockStateArgument -> registry state.
     pub(super) fn block_state(&self, b: &BlockInput) -> R<BlockStateId> {
         let state = horizon_world::chunk::BlockState {
-            name: b.id.clone(),
+            // The id the block registry holds: a declared block keeps its
+            // namespace, a vanilla one keeps `minecraft:`.
+            name: registry_id(self.ui.registries.ids("minecraft:block"), &b.id),
             properties: b.properties.iter().cloned().collect(),
         };
         self.pack
@@ -3500,6 +3518,26 @@ fn split_top_level(s: &str, sep: char) -> Vec<&str> {
     }
     out.push(&s[start..]);
     out
+}
+
+#[cfg(test)]
+mod registry_id_tests {
+    use super::registry_id;
+
+    /// A declared id keeps its namespace; a bare vanilla id gets
+    /// `minecraft:`, as `ResourceLocation.parse` gives it, whether or not the
+    /// registry holds it.
+    #[test]
+    fn registry_ids_keep_their_namespace() {
+        let ids = vec!["minecraft:stone".to_owned(), "ruby:gem".to_owned()];
+        assert_eq!(registry_id(&ids, "stone"), "minecraft:stone");
+        assert_eq!(registry_id(&ids, "minecraft:stone"), "minecraft:stone");
+        assert_eq!(registry_id(&ids, "ruby:gem"), "ruby:gem");
+        // A registry with no entry for the id still names it as vanilla does.
+        assert_eq!(registry_id(&ids, "dirt"), "minecraft:dirt");
+        assert_eq!(registry_id(&[], "ruby:gem"), "ruby:gem");
+        assert_eq!(registry_id(&[], "stone"), "minecraft:stone");
+    }
 }
 
 #[cfg(test)]

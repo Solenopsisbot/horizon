@@ -1569,6 +1569,7 @@ fn every_kind() -> horizon_mods::native::NativeDeclarations {
             id: "ruby:crate".into(),
             title_key: "container.ruby.crate".into(),
             slots: 27,
+            open_blocks: vec!["ruby:block".into()],
         }],
         block_entities: vec![BlockEntityDeclaration {
             id: "ruby:crate_entity".into(),
@@ -1733,6 +1734,7 @@ fn native_menu_and_block_entity_rows_reach_the_built_root() {
                     id: "ruby:crate".into(),
                     title_key: "container.ruby.crate".into(),
                     slots: 27,
+                    open_blocks: vec!["ruby:crate_block".into()],
                 }],
                 block_entities: vec![BlockEntityDeclaration {
                     id: "ruby:crate".into(),
