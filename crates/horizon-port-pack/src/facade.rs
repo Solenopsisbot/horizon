@@ -151,6 +151,55 @@ pub fn generate_many(
             .iter()
             .any(|r| r.starts_with("net/fabricmc/loader/api/"))
     });
+    // Fabric's item-group registration and its client renderer registries are
+    // library classes as well. Each is emitted only when the real API class is
+    // absent (see `ClientShims::emit`), and only when the game types its
+    // signature names resolve on this game jar.
+    let fabric_item_group_holders = [
+        "net/fabricmc/fabric/api/itemgroup/v1/ItemGroupEvents",
+        "net/fabricmc/fabric/api/itemgroup/v1/FabricItemGroupEntries",
+    ];
+    let uses_fabric_item_groups = target.iter().any(|class| {
+        class
+            .refs
+            .iter()
+            .any(|r| fabric_item_group_holders.contains(&r.as_str()))
+    });
+    // A mod names the nested provider interfaces (`ModelLayerRegistry$
+    // TexturedModelDataProvider`), so match the outer name as well.
+    let fabric_renderer_holders = [
+        "net/fabricmc/fabric/api/client/rendering/v1/EntityRendererRegistry",
+        "net/fabricmc/fabric/api/client/rendering/v1/BlockEntityRendererRegistry",
+        "net/fabricmc/fabric/api/client/rendering/v1/ModelLayerRegistry",
+        "net/fabricmc/fabric/api/client/rendering/v1/ColorProviderRegistry",
+    ];
+    let uses_fabric_renderers = target.iter().any(|class| {
+        class
+            .refs
+            .iter()
+            .any(|r| fabric_renderer_holders.contains(&r.split('$').next().unwrap_or(r)))
+    });
+    // Model-layer registration is its own holder: its geometry roles are seeded
+    // only when a mod names it, not for every renderer registry.
+    let uses_model_layers = target.iter().any(|class| {
+        class.refs.iter().any(|r| {
+            r.split('$').next()
+                == Some("net/fabricmc/fabric/api/client/rendering/v1/ModelLayerRegistry")
+        })
+    });
+    // NeoForge's registration events: the creative-tab contents event and the
+    // renderer registration event (a nested class, hence the `$` split).
+    let neoforge_registration_holders = [
+        "net/neoforged/neoforge/event/BuildCreativeModeTabContentsEvent",
+        "net/neoforged/neoforge/client/event/EntityRenderersEvent",
+    ];
+    let uses_neoforge_registration = uses_neoforge
+        && target.iter().any(|class| {
+            class
+                .refs
+                .iter()
+                .any(|r| neoforge_registration_holders.contains(&r.split('$').next().unwrap_or(r)))
+        });
     let own: BTreeSet<&str> = target.iter().map(|c| c.name.as_str()).collect();
     // Shapes from dependency jars are real classes on javac/the probe
     // classpaths. Keep their names available when deciding whether a game
@@ -206,20 +255,61 @@ pub fn generate_many(
             }
         }
     }
-    // The client shims name game types in their callback signatures, and a mod
-    // that writes `EVENT.register((context, ticks) -> {})` carries no reference
-    // to them. Resolve each role against the game jar (26.3 renamed
+    // The client and registration shims name game types in their signatures, and
+    // a mod that writes `EVENT.register((context, ticks) -> {})` carries no
+    // reference to them. Resolve each role against the game jar (26.3 renamed
     // `GuiGraphics` to `GuiGraphicsExtractor`, so the first candidate present
     // wins) and seed the real class so the shim compiles against it. A
     // server-shaped jar resolves nothing and the shims that need it are skipped
     // below, rather than fabricating client types a mod would then call into.
-    let client = if uses_fabric_client || uses_neoforge_client {
+    let client = if uses_fabric_client
+        || uses_neoforge_client
+        || uses_fabric_item_groups
+        || uses_fabric_renderers
+        || uses_neoforge_registration
+    {
         resolve_client_types(&game, &lib_names, &wanted)
     } else {
         BTreeMap::new()
     };
-    for name in client.values() {
-        wanted.insert(name.clone());
+    // Only the roles an emitted shim actually names are seeded into the façade:
+    // an item-group-only target must not drag every client GUI type in.
+    let mut needed_roles: BTreeSet<&str> = BTreeSet::new();
+    if uses_fabric_client || uses_neoforge_client {
+        needed_roles.extend([
+            "gui",
+            "ticks",
+            "minecraft",
+            "key_mapping",
+            "item_stack",
+            "tooltip_context",
+            "tooltip_type",
+            "component",
+        ]);
+    }
+    if uses_fabric_item_groups || uses_neoforge_registration {
+        needed_roles.extend([
+            "creative_mode_tab",
+            "feature_flag_set",
+            "item_stack",
+            "resource_key",
+        ]);
+    }
+    if uses_fabric_renderers || uses_neoforge_registration {
+        needed_roles.extend([
+            "block_entity_renderer_provider",
+            "block_entity_type",
+            "entity_renderer_provider",
+            "entity_type",
+        ]);
+    }
+    if uses_model_layers {
+        needed_roles.extend(["model_layer_location", "textured_model_data"]);
+    }
+    for (role, name) in &client {
+        if needed_roles.contains(role) {
+            wanted.insert(name.clone());
+        }
     }
     let mut used: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
     for class in &target {
@@ -641,6 +731,70 @@ pub fn generate_many(
                 &["item_stack", "tooltip_context", "tooltip_type", "component"],
                 || fill_client(FABRIC_ITEM_TOOLTIP_CALLBACK),
             )?;
+        }
+    }
+    // Fabric API's item-group registration: the same bounded `Event` shape as
+    // the client holders (registration order, `invoker()` walks them), one per
+    // tab, plus the ordered entry list a listener edits. Emitted only for an
+    // absent API class whose game types resolved on this jar.
+    if uses_fabric_item_groups {
+        let event_base = "net/fabricmc/fabric/api/event/Event";
+        if available.contains(event_base) {
+            report.missing.push(format!(
+                "net/fabricmc/fabric/api/itemgroup/v1/ItemGroupEvents (needs {event_base} absent)"
+            ));
+        } else {
+            // `Event.horizon` is this slice's factory, and the client slice
+            // above writes it only for its own flags; write it here unless it
+            // is already in the source list.
+            let event_file = format!("{event_base}.java");
+            if !files.iter().any(|file| file.ends_with(&event_file)) {
+                write_shim(&mut files, &src, event_base, FABRIC_EVENT)?;
+            }
+            client_shims.emit(
+                &mut files,
+                &mut report,
+                "net/fabricmc/fabric/api/itemgroup/v1/ItemGroupEvents",
+                &["creative_mode_tab", "feature_flag_set", "resource_key"],
+                || fill_client(FABRIC_ITEM_GROUP_EVENTS),
+            )?;
+            client_shims.emit(
+                &mut files,
+                &mut report,
+                "net/fabricmc/fabric/api/itemgroup/v1/FabricItemGroupEntries",
+                &["item_stack"],
+                || fill_client(FABRIC_ITEM_GROUP_ENTRIES),
+            )?;
+        }
+    }
+    // Fabric's client renderer registries retain what a mod registers; the host
+    // owns rendering, so these are lists, not renderers.
+    if uses_fabric_renderers {
+        for (class, roles, template) in [
+            (
+                "net/fabricmc/fabric/api/client/rendering/v1/EntityRendererRegistry",
+                &["entity_type", "entity_renderer_provider"][..],
+                FABRIC_ENTITY_RENDERER_REGISTRY,
+            ),
+            (
+                "net/fabricmc/fabric/api/client/rendering/v1/BlockEntityRendererRegistry",
+                &["block_entity_type", "block_entity_renderer_provider"][..],
+                FABRIC_BLOCK_ENTITY_RENDERER_REGISTRY,
+            ),
+            (
+                "net/fabricmc/fabric/api/client/rendering/v1/ModelLayerRegistry",
+                &["model_layer_location", "textured_model_data"][..],
+                FABRIC_MODEL_LAYER_REGISTRY,
+            ),
+            (
+                "net/fabricmc/fabric/api/client/rendering/v1/ColorProviderRegistry",
+                &[][..],
+                FABRIC_COLOR_PROVIDER_REGISTRY,
+            ),
+        ] {
+            client_shims.emit(&mut files, &mut report, class, roles, || {
+                fill_client(template)
+            })?;
         }
     }
     // The loader slice is one unit: the bounded containers name each other, so
@@ -1134,6 +1288,30 @@ pub fn generate_many(
             client_shims.emit(&mut files, &mut report, render, &["gui"], || {
                 fill_client(NEOFORGE_RENDER_GUI_EVENT)
             })?;
+        }
+        // NeoForge's registration events: the creative-tab contents event keeps
+        // the stacks a listener accepts, and the renderer registration event
+        // keeps the pairs it is handed. Both stay bounded values the host posts.
+        if uses_neoforge_registration {
+            client_shims.emit(
+                &mut files,
+                &mut report,
+                "net/neoforged/neoforge/event/BuildCreativeModeTabContentsEvent",
+                &["creative_mode_tab", "item_stack"],
+                || fill_client(NEOFORGE_BUILD_CREATIVE_MODE_TAB_CONTENTS),
+            )?;
+            client_shims.emit(
+                &mut files,
+                &mut report,
+                "net/neoforged/neoforge/client/event/EntityRenderersEvent",
+                &[
+                    "block_entity_renderer_provider",
+                    "block_entity_type",
+                    "entity_renderer_provider",
+                    "entity_type",
+                ],
+                || fill_client(NEOFORGE_ENTITY_RENDERERS),
+            )?;
         }
     }
     if files.is_empty() {
@@ -1781,6 +1959,209 @@ public final class KeyBindingHelper {
 }
 "#;
 
+/// Fabric API's item-group registration: one bounded `Event` per creative tab,
+/// in first-use order, whose listeners append to the tab's entry list in
+/// registration order. 26.3's own API renamed this holder
+/// (`CreativeModeTabEvents#modifyOutputEvent`/`ModifyOutput`); the older
+/// `ItemGroupEvents` name is kept because that is the class a ported jar names.
+const FABRIC_ITEM_GROUP_EVENTS: &str = r#"package net.fabricmc.fabric.api.itemgroup.v1;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import net.fabricmc.fabric.api.event.Event;
+import {creative_mode_tab};
+import {feature_flag_set};
+import {resource_key};
+
+public final class ItemGroupEvents {
+    private static final Map<{resource_key}, Event<ModifyEntries>> HORIZON_EVENTS = new LinkedHashMap<>();
+
+    private ItemGroupEvents() {}
+
+    public static Event<ModifyEntries> modifyEntriesEvent({resource_key} tab) {
+        Event<ModifyEntries> existing = HORIZON_EVENTS.get(tab);
+        if (existing != null) return existing;
+        java.util.function.Function<List<ModifyEntries>, ModifyEntries> dispatch =
+            horizonListeners -> (entries, enabledFeatures) -> {
+                for (ModifyEntries horizonListener : horizonListeners) {
+                    horizonListener.modifyEntries(entries, enabledFeatures);
+                }
+            };
+        Event<ModifyEntries> event = Event.horizon(dispatch);
+        HORIZON_EVENTS.put(tab, event);
+        return event;
+    }
+
+    /** The tabs whose event was created, in first-use order. */
+    public static List<{resource_key}> horizonTabs() {
+        return Collections.unmodifiableList(new ArrayList<>(HORIZON_EVENTS.keySet()));
+    }
+
+    @FunctionalInterface
+    public interface ModifyEntries {
+        void modifyEntries(FabricItemGroupEntries entries, {feature_flag_set} enabledFeatures);
+    }
+}
+"#;
+
+/// The tab's entry list as the mod-visible value: `add`/`accept` append,
+/// `addAfter`/`addBefore` insert relative to a stack already in the list (and
+/// append when the anchor is absent, so the outcome stays deterministic), and
+/// the accessors hand back unmodifiable views in that order.
+const FABRIC_ITEM_GROUP_ENTRIES: &str = r#"package net.fabricmc.fabric.api.itemgroup.v1;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import {item_stack};
+
+public final class FabricItemGroupEntries {
+    private final List<{item_stack}> horizonStacks = new ArrayList<>();
+
+    public FabricItemGroupEntries() {}
+
+    public void add({item_stack} stack) {
+        if (stack != null) horizonStacks.add(stack);
+    }
+
+    public void accept({item_stack} stack) {
+        add(stack);
+    }
+
+    public void addAfter({item_stack} anchor, {item_stack}... stacks) {
+        int at = horizonStacks.indexOf(anchor);
+        at = at < 0 ? horizonStacks.size() : at + 1;
+        for ({item_stack} stack : stacks) {
+            if (stack != null) horizonStacks.add(at++, stack);
+        }
+    }
+
+    public void addBefore({item_stack} anchor, {item_stack}... stacks) {
+        int at = horizonStacks.indexOf(anchor);
+        at = at < 0 ? horizonStacks.size() : at;
+        for ({item_stack} stack : stacks) {
+            if (stack != null) horizonStacks.add(at++, stack);
+        }
+    }
+
+    public List<{item_stack}> getDisplayStacks() {
+        return Collections.unmodifiableList(horizonStacks);
+    }
+
+    public List<{item_stack}> getSearchTabStacks() {
+        return getDisplayStacks();
+    }
+}
+"#;
+
+/// Fabric's entity renderer registry: `{type, provider}` pairs are retained in
+/// registration order for the host, which owns every renderer. Nothing draws.
+const FABRIC_ENTITY_RENDERER_REGISTRY: &str = r#"package net.fabricmc.fabric.api.client.rendering.v1;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import {entity_renderer_provider};
+import {entity_type};
+
+public final class EntityRendererRegistry {
+    private static final List<Object[]> HORIZON_RENDERERS = new ArrayList<>();
+
+    private EntityRendererRegistry() {}
+    public static void register({entity_type} type, {entity_renderer_provider} provider) {
+        if (type != null && provider != null) HORIZON_RENDERERS.add(new Object[] { type, provider });
+    }
+    /** `{type, provider}` pairs in registration order. */
+    public static List<Object[]> horizonRenderers() {
+        return Collections.unmodifiableList(new ArrayList<>(HORIZON_RENDERERS));
+    }
+}
+"#;
+
+/// Fabric's block-entity renderer registry: the same retention list as the
+/// entity one, keyed by the block-entity type.
+const FABRIC_BLOCK_ENTITY_RENDERER_REGISTRY: &str = r#"package net.fabricmc.fabric.api.client.rendering.v1;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import {block_entity_renderer_provider};
+import {block_entity_type};
+
+public final class BlockEntityRendererRegistry {
+    private static final List<Object[]> HORIZON_RENDERERS = new ArrayList<>();
+
+    private BlockEntityRendererRegistry() {}
+    public static void register({block_entity_type} type, {block_entity_renderer_provider} provider) {
+        if (type != null && provider != null) HORIZON_RENDERERS.add(new Object[] { type, provider });
+    }
+    /** `{type, provider}` pairs in registration order. */
+    public static List<Object[]> horizonRenderers() {
+        return Collections.unmodifiableList(new ArrayList<>(HORIZON_RENDERERS));
+    }
+}
+"#;
+
+/// Fabric's model-layer registry: the location/provider pairs are retained; the
+/// provider stays a lambda target so a constructor reference from mod bytecode
+/// still links.
+const FABRIC_MODEL_LAYER_REGISTRY: &str = r#"package net.fabricmc.fabric.api.client.rendering.v1;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import {model_layer_location};
+import {textured_model_data};
+
+public final class ModelLayerRegistry {
+    private static final List<Object[]> HORIZON_LAYERS = new ArrayList<>();
+
+    private ModelLayerRegistry() {}
+    @FunctionalInterface
+    public interface TexturedModelDataProvider {
+        {textured_model_data} createTexturedModelData();
+    }
+    public static void registerModelLayer({model_layer_location} location, TexturedModelDataProvider provider) {
+        if (location != null && provider != null) HORIZON_LAYERS.add(new Object[] { location, provider });
+    }
+    /** `{location, provider}` pairs in registration order. */
+    public static List<Object[]> horizonModelLayers() {
+        return Collections.unmodifiableList(new ArrayList<>(HORIZON_LAYERS));
+    }
+}
+"#;
+
+/// Fabric's colour-provider registry as a marker: `register` keeps the provider
+/// and hands it back, because computing a tint is the host's work. `BLOCK` and
+/// `ITEM` are the two registries a mod names.
+const FABRIC_COLOR_PROVIDER_REGISTRY: &str = r#"package net.fabricmc.fabric.api.client.rendering.v1;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public final class ColorProviderRegistry {
+    public interface ColorProvider {}
+
+    public static final ColorProviderRegistry BLOCK = new ColorProviderRegistry();
+    public static final ColorProviderRegistry ITEM = new ColorProviderRegistry();
+
+    private static final List<ColorProvider> HORIZON_PROVIDERS = new ArrayList<>();
+
+    private ColorProviderRegistry() {}
+    public ColorProvider register(Object target, ColorProvider provider) {
+        if (provider != null) HORIZON_PROVIDERS.add(provider);
+        return provider;
+    }
+    public static List<ColorProvider> horizonColorProviders() {
+        return Collections.unmodifiableList(new ArrayList<>(HORIZON_PROVIDERS));
+    }
+}
+"#;
+
 /// Bounded loader bootstrap values. They answer the queries entrypoint code
 /// makes during startup (`getModContainer`, `getAllMods`, `getObjectShare`,
 /// `isModLoaded`) without claiming to be the Fabric loader's registry: the
@@ -1985,6 +2366,72 @@ public class RenderGuiEvent extends Event {
 }
 "#;
 
+/// NeoForge's creative-tab contents event: the tab it is posted for and the
+/// stacks a listener accepts, in call order. The real event also implements
+/// `CreativeModeTab.Output`; the bounded shape keeps only `accept`/`getTab`,
+/// which is what bootstrap code calls during registration.
+const NEOFORGE_BUILD_CREATIVE_MODE_TAB_CONTENTS: &str = r#"package net.neoforged.neoforge.event;
+
+import net.neoforged.bus.api.Event;
+import {creative_mode_tab};
+import {item_stack};
+
+public class BuildCreativeModeTabContentsEvent extends Event {
+    private final {creative_mode_tab} horizonTab;
+    private final java.util.List<{item_stack}> horizonEntries = new java.util.ArrayList<>();
+
+    public BuildCreativeModeTabContentsEvent({creative_mode_tab} tab) { this.horizonTab = tab; }
+
+    public {creative_mode_tab} getTab() { return horizonTab; }
+
+    public void accept({item_stack} stack) {
+        if (stack != null) horizonEntries.add(stack);
+    }
+    public java.util.List<{item_stack}> horizonEntries() {
+        return java.util.Collections.unmodifiableList(horizonEntries);
+    }
+}
+"#;
+
+/// NeoForge's `EntityRenderersEvent$RegisterRenderers`: the nested class a
+/// `@SubscribeEvent` method takes, retaining what it registers. Rendering is
+/// the host's work, so there is no renderer value here — only the pairs.
+const NEOFORGE_ENTITY_RENDERERS: &str = r#"package net.neoforged.neoforge.client.event;
+
+import net.neoforged.bus.api.Event;
+import {block_entity_renderer_provider};
+import {block_entity_type};
+import {entity_renderer_provider};
+import {entity_type};
+
+public class EntityRenderersEvent extends Event {
+    private EntityRenderersEvent() {}
+
+    public static final class RegisterRenderers extends EntityRenderersEvent {
+        private final java.util.List<Object[]> horizonEntityRenderers = new java.util.ArrayList<>();
+        private final java.util.List<Object[]> horizonBlockEntityRenderers = new java.util.ArrayList<>();
+
+        public RegisterRenderers() {}
+        public void registerEntityRenderer({entity_type} type, {entity_renderer_provider} provider) {
+            if (type != null && provider != null) horizonEntityRenderers.add(new Object[] { type, provider });
+        }
+
+        public void registerBlockEntityRenderer({block_entity_type} type, {block_entity_renderer_provider} provider) {
+            if (type != null && provider != null) horizonBlockEntityRenderers.add(new Object[] { type, provider });
+        }
+
+        /** `{type, provider}` pairs in registration order. */
+        public java.util.List<Object[]> horizonEntityRenderers() {
+            return java.util.Collections.unmodifiableList(new java.util.ArrayList<>(horizonEntityRenderers));
+        }
+
+        public java.util.List<Object[]> horizonBlockEntityRenderers() {
+            return java.util.Collections.unmodifiableList(new java.util.ArrayList<>(horizonBlockEntityRenderers));
+        }
+    }
+}
+"#;
+
 /// Legacy Forge keeps the same result/cancellation surface in its own package.
 const FORGE_EVENT: &str = r#"package net.minecraftforge.eventbus.api;
 
@@ -2003,10 +2450,12 @@ public class Event {
 }
 "#;
 
-/// The client game types the client-only shim signatures name, in 26.3
-/// preference order (26.3 renamed `GuiGraphics` to `GuiGraphicsExtractor`).
-/// The first candidate the game jar carries wins; a server-shaped jar carries
-/// none of them, and the shims that need a role are then skipped.
+/// The game types the shim signatures name (client HUD/tick/tooltip and the
+/// item-group/renderer registration façades), in 26.3 preference order (26.3
+/// renamed `GuiGraphics` to `GuiGraphicsExtractor` and `TexturedModelData` to
+/// `LayerDefinition`). The first candidate the game jar carries wins; a
+/// server-shaped jar carries none of the client ones, and the shims that need a
+/// role are then skipped.
 const CLIENT_TYPE_CANDIDATES: &[(&str, &[&str])] = &[
     (
         "gui",
@@ -2062,6 +2511,41 @@ const CLIENT_TYPE_CANDIDATES: &[(&str, &[&str])] = &[
             "net/minecraft/text/Text",
         ],
     ),
+    (
+        "creative_mode_tab",
+        &["net/minecraft/world/item/CreativeModeTab"],
+    ),
+    (
+        "feature_flag_set",
+        &["net/minecraft/world/flag/FeatureFlagSet"],
+    ),
+    ("resource_key", &["net/minecraft/resources/ResourceKey"]),
+    ("entity_type", &["net/minecraft/world/entity/EntityType"]),
+    (
+        "block_entity_type",
+        &["net/minecraft/world/level/block/entity/BlockEntityType"],
+    ),
+    (
+        "entity_renderer_provider",
+        &["net/minecraft/client/renderer/entity/EntityRendererProvider"],
+    ),
+    (
+        "block_entity_renderer_provider",
+        &["net/minecraft/client/renderer/blockentity/BlockEntityRendererProvider"],
+    ),
+    (
+        "model_layer_location",
+        &["net/minecraft/client/model/geom/ModelLayerLocation"],
+    ),
+    // 26.3 renamed `TexturedModelData`; the old name stays as the fallback so a
+    // jar compiled against it still resolves.
+    (
+        "textured_model_data",
+        &[
+            "net/minecraft/client/model/geom/builders/LayerDefinition",
+            "net/minecraft/client/model/geom/builders/TexturedModelData",
+        ],
+    ),
 ];
 
 /// Resolve the client roles this game jar carries. A type the mod itself names
@@ -2098,9 +2582,9 @@ fn fill_client_types(template: &str, types: &BTreeMap<&'static str, String>) -> 
         })
 }
 
-/// Writes the client shims: a real API class is never shadowed, and a shim
-/// whose signature names a client role this game jar cannot resolve is
-/// reported instead of emitted.
+/// Writes the API-only shims: a real API class is never shadowed, and a shim
+/// whose signature names a game role this jar cannot resolve is reported
+/// instead of emitted.
 struct ClientShims<'a> {
     src: &'a Path,
     available: &'a BTreeSet<String>,
@@ -2210,7 +2694,15 @@ fn tree(
 /// an abstract method to bind. `SpawnPlacements.register` takes one such
 /// predicate, so it is the one the bounded entity façade keeps abstract.
 fn functional_interface(name: &str) -> bool {
-    name == "net/minecraft/world/entity/SpawnPlacements$SpawnPredicate"
+    matches!(
+        name,
+        // `SpawnPlacements.register` takes this predicate.
+        "net/minecraft/world/entity/SpawnPlacements$SpawnPredicate"
+        // A renderer registry hands a constructor reference to one of these,
+        // so the provider stays a single abstract method in the façade.
+        | "net/minecraft/client/renderer/entity/EntityRendererProvider"
+        | "net/minecraft/client/renderer/blockentity/BlockEntityRendererProvider"
+    )
 }
 
 /// Bounded value classes that a generated body constructs. They have to travel
@@ -11484,6 +11976,284 @@ mod tests {
         assert!(output.status.success(), "client probe failed: {stderr}");
         assert!(
             stdout.contains("horizon client facade ok"),
+            "probe output: {stdout}{stderr}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registration_facade_shapes_are_bounded_and_guarded() {
+        // Every registration template is only its API shape: game types are
+        // `{role}` placeholders, never a frozen 26.3 name.
+        for (template, fragments) in [
+            (
+                FABRIC_ITEM_GROUP_EVENTS,
+                &[
+                    "public static Event<ModifyEntries> modifyEntriesEvent({resource_key} tab) {",
+                    "void modifyEntries(FabricItemGroupEntries entries, {feature_flag_set} enabledFeatures);",
+                ][..],
+            ),
+            (
+                FABRIC_ITEM_GROUP_ENTRIES,
+                &[
+                    "public void add({item_stack} stack) {",
+                    "public void accept({item_stack} stack) {",
+                    "public void addAfter({item_stack} anchor, {item_stack}... stacks) {",
+                    "public void addBefore({item_stack} anchor, {item_stack}... stacks) {",
+                    "public List<{item_stack}> getDisplayStacks() {",
+                ][..],
+            ),
+            (
+                FABRIC_ENTITY_RENDERER_REGISTRY,
+                &[
+                    "public static void register({entity_type} type, {entity_renderer_provider} provider) {",
+                ][..],
+            ),
+            (
+                FABRIC_BLOCK_ENTITY_RENDERER_REGISTRY,
+                &[
+                    "public static void register({block_entity_type} type, {block_entity_renderer_provider} provider) {",
+                ][..],
+            ),
+            (
+                FABRIC_MODEL_LAYER_REGISTRY,
+                &["{textured_model_data} createTexturedModelData();"][..],
+            ),
+            (
+                FABRIC_COLOR_PROVIDER_REGISTRY,
+                &["public ColorProvider register(Object target, ColorProvider provider) {"][..],
+            ),
+            (
+                NEOFORGE_BUILD_CREATIVE_MODE_TAB_CONTENTS,
+                &["public {creative_mode_tab} getTab() { return horizonTab; }"][..],
+            ),
+            (
+                NEOFORGE_ENTITY_RENDERERS,
+                &[
+                    "public void registerEntityRenderer({entity_type} type, {entity_renderer_provider} provider) {",
+                ][..],
+            ),
+        ] {
+            for fragment in fragments {
+                assert!(
+                    template.contains(fragment),
+                    "missing façade fragment: {fragment}"
+                );
+            }
+            assert!(
+                !template.contains("net.minecraft."),
+                "hard-coded game type in a registration template"
+            );
+        }
+        // A mod passes `MyRenderer::new` to both registries, so the provider
+        // interfaces stay lambda targets in the generated game façade.
+        assert!(functional_interface(
+            "net/minecraft/client/renderer/entity/EntityRendererProvider"
+        ));
+        assert!(functional_interface(
+            "net/minecraft/client/renderer/blockentity/BlockEntityRendererProvider"
+        ));
+        // Emission is gated by the API class and by role resolution.
+        let source = include_str!("facade.rs");
+        for marker in [
+            "let uses_fabric_item_groups = target",
+            "let uses_fabric_renderers = target",
+            "let uses_neoforge_registration = uses_neoforge",
+            "needed_roles.extend_from_slice",
+        ] {
+            assert!(source.contains(marker), "missing detection: {marker}");
+        }
+        for class in [
+            "net/fabricmc/fabric/api/itemgroup/v1/ItemGroupEvents",
+            "net/fabricmc/fabric/api/itemgroup/v1/FabricItemGroupEntries",
+            "net/fabricmc/fabric/api/client/rendering/v1/EntityRendererRegistry",
+            "net/fabricmc/fabric/api/client/rendering/v1/BlockEntityRendererRegistry",
+            "net/fabricmc/fabric/api/client/rendering/v1/ModelLayerRegistry",
+            "net/fabricmc/fabric/api/client/rendering/v1/ColorProviderRegistry",
+            "net/neoforged/neoforge/event/BuildCreativeModeTabContentsEvent",
+            "net/neoforged/neoforge/client/event/EntityRenderersEvent",
+        ] {
+            assert!(
+                source.contains(&format!("\"{class}\"")),
+                "registration shim not registered: {class}"
+            );
+        }
+        for role in [
+            "creative_mode_tab",
+            "feature_flag_set",
+            "resource_key",
+            "entity_type",
+            "block_entity_type",
+            "entity_renderer_provider",
+            "block_entity_renderer_provider",
+            "model_layer_location",
+            "textured_model_data",
+        ] {
+            assert!(
+                CLIENT_TYPE_CANDIDATES.iter().any(|(name, _)| *name == role),
+                "missing game role: {role}"
+            );
+        }
+        // 26.3's `LayerDefinition` comes first; the name it replaced still
+        // resolves for a jar compiled against it.
+        let textured = CLIENT_TYPE_CANDIDATES
+            .iter()
+            .find(|(role, _)| *role == "textured_model_data")
+            .map(|(_, names)| *names)
+            .expect("textured model data role");
+        assert_eq!(
+            textured[0],
+            "net/minecraft/client/model/geom/builders/LayerDefinition"
+        );
+        assert!(textured.contains(&"net/minecraft/client/model/geom/builders/TexturedModelData"));
+    }
+
+    #[test]
+    fn item_group_facade_compiles_and_keeps_order() {
+        use std::{path::PathBuf, process::Command};
+        let types: BTreeMap<&'static str, String> = BTreeMap::from([
+            (
+                "creative_mode_tab",
+                "net/minecraft/world/item/CreativeModeTab".to_owned(),
+            ),
+            (
+                "feature_flag_set",
+                "net/minecraft/world/flag/FeatureFlagSet".to_owned(),
+            ),
+            (
+                "resource_key",
+                "net/minecraft/resources/ResourceKey".to_owned(),
+            ),
+            (
+                "item_stack",
+                "net/minecraft/world/item/ItemStack".to_owned(),
+            ),
+        ]);
+        let probe = r#"public class ItemGroupProbe {
+    private static String names(java.util.List<net.minecraft.world.item.ItemStack> stacks) {
+        StringBuilder out = new StringBuilder();
+        for (net.minecraft.world.item.ItemStack stack : stacks) {
+            if (out.length() > 0) out.append(',');
+            out.append(stack.name);
+        }
+        return out.toString();
+    }
+
+    public static void main(String[] args) {
+        net.minecraft.resources.ResourceKey tab = new net.minecraft.resources.ResourceKey();
+        net.fabricmc.fabric.api.event.Event<net.fabricmc.fabric.api.itemgroup.v1.ItemGroupEvents.ModifyEntries> event =
+            net.fabricmc.fabric.api.itemgroup.v1.ItemGroupEvents.modifyEntriesEvent(tab);
+        if (net.fabricmc.fabric.api.itemgroup.v1.ItemGroupEvents.modifyEntriesEvent(tab) != event) throw new AssertionError("one event per tab");
+        if (net.fabricmc.fabric.api.itemgroup.v1.ItemGroupEvents.horizonTabs().size() != 1) throw new AssertionError("tabs");
+
+        net.minecraft.world.item.ItemStack a = new net.minecraft.world.item.ItemStack("a");
+        net.minecraft.world.item.ItemStack b = new net.minecraft.world.item.ItemStack("b");
+        net.minecraft.world.item.ItemStack c = new net.minecraft.world.item.ItemStack("c");
+        event.register((entries, flags) -> entries.add(a));
+        event.register((entries, flags) -> { entries.add(c); entries.addAfter(c, b); });
+        net.fabricmc.fabric.api.itemgroup.v1.FabricItemGroupEntries entries =
+            new net.fabricmc.fabric.api.itemgroup.v1.FabricItemGroupEntries();
+        event.invoker().modifyEntries(entries, net.minecraft.world.flag.FeatureFlagSet.of());
+        if (!names(entries.getDisplayStacks()).equals("a,c,b")) throw new AssertionError("dispatch order " + names(entries.getDisplayStacks()));
+
+        entries.addBefore(b, a);
+        if (!names(entries.getDisplayStacks()).equals("a,c,a,b")) throw new AssertionError("addBefore " + names(entries.getDisplayStacks()));
+        entries.addAfter(new net.minecraft.world.item.ItemStack("missing"), c);
+        if (!names(entries.getDisplayStacks()).equals("a,c,a,b,c")) throw new AssertionError("missing anchor " + names(entries.getDisplayStacks()));
+        entries.accept(b);
+        entries.add(null);
+        if (!names(entries.getDisplayStacks()).equals("a,c,a,b,c,b")) throw new AssertionError("accept " + names(entries.getDisplayStacks()));
+        if (!names(entries.getSearchTabStacks()).equals("a,c,a,b,c,b")) throw new AssertionError("search stacks");
+        try {
+            entries.getDisplayStacks().clear();
+            throw new AssertionError("display stacks are mutable");
+        } catch (UnsupportedOperationException expected) {}
+        System.out.println("horizon item group facade ok");
+    }
+}
+"#;
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-itemgroup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let mut files = Vec::new();
+        let mut write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write java shim");
+            files.push(file);
+        };
+        write("net/fabricmc/fabric/api/event/Event.java", FABRIC_EVENT);
+        for (relative, template) in [
+            (
+                "net/fabricmc/fabric/api/itemgroup/v1/ItemGroupEvents.java",
+                FABRIC_ITEM_GROUP_EVENTS,
+            ),
+            (
+                "net/fabricmc/fabric/api/itemgroup/v1/FabricItemGroupEntries.java",
+                FABRIC_ITEM_GROUP_ENTRIES,
+            ),
+        ] {
+            write(relative, &fill_client_types(template, &types));
+        }
+        // The smallest game types the registration signatures name.
+        for (relative, source) in [
+            (
+                "net/minecraft/world/item/ItemStack.java",
+                "package net.minecraft.world.item;\npublic class ItemStack { public String name = \"\"; public ItemStack() {} public ItemStack(String name) { this.name = name; } }\n",
+            ),
+            (
+                "net/minecraft/world/item/CreativeModeTab.java",
+                "package net.minecraft.world.item;\npublic class CreativeModeTab {}\n",
+            ),
+            (
+                "net/minecraft/world/flag/FeatureFlagSet.java",
+                "package net.minecraft.world.flag;\npublic class FeatureFlagSet { public static FeatureFlagSet of() { return new FeatureFlagSet(); } }\n",
+            ),
+            (
+                "net/minecraft/resources/ResourceKey.java",
+                "package net.minecraft.resources;\npublic class ResourceKey { public ResourceKey() {} }\n",
+            ),
+        ] {
+            write(relative, source);
+        }
+        write("ItemGroupProbe.java", probe);
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(javac_status) = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(
+            javac_status.success(),
+            "javac rejected the generated item-group façade"
+        );
+        let java = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("java"))
+            .unwrap_or_else(|| PathBuf::from("java"));
+        let output = Command::new(&java)
+            .arg("-cp")
+            .arg(&classes)
+            .arg("ItemGroupProbe")
+            .output()
+            .expect("run the item-group probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "item-group probe failed: {stderr}");
+        assert!(
+            stdout.contains("horizon item group facade ok"),
             "probe output: {stdout}{stderr}"
         );
         let _ = fs::remove_dir_all(&root);
