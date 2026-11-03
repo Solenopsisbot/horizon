@@ -155,6 +155,8 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let list_entrypoints_only = args.iter().any(|arg| arg == "--list-entrypoints");
+    args.retain(|arg| arg != "--list-entrypoints");
     let entry = take(&mut args, "--entry");
     let entry_kind = take(&mut args, "--entry-kind").unwrap_or_else(|| "main".to_owned());
     let stubs = take(&mut args, "--stubs").map(PathBuf::from);
@@ -162,26 +164,31 @@ fn run() -> Result<(), String> {
     let libs = take(&mut args, "--libs").map(PathBuf::from);
     let heap = take(&mut args, "--heap").unwrap_or_else(|| "-Xmx1g".to_owned());
     if args.is_empty() {
-        return Err("usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|neoforge>] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...".to_owned());
+        return Err("usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge>] [--list-entrypoints] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...".to_owned());
     }
-    let entry_specs = match entry {
-        Some(entry) => vec![entry],
+    if list_entrypoints_only {
+        return list_entrypoints(&args);
+    }
+    let (entry_specs, pre_launch) = match entry {
+        Some(entry) => (vec![entry], Vec::new()),
         None => {
             let jar = Path::new(&args[0]);
+            let metadata = metadata_path(jar)?;
             let entries = discover_entries(jar, &entry_kind)?;
             if entries.is_empty() {
                 let declared = declared_entrypoint_kinds(jar)?;
-                let declared = if declared.is_empty() {
-                    String::new()
-                } else {
-                    format!("; declared kinds: {}", declared.join(", "))
-                };
-                return Err(format!(
-                    "no {entry_kind} entrypoint found in {}{declared}; pass --entry <class>",
-                    args[0]
+                return Err(missing_entry_message(
+                    &args[0],
+                    &entry_kind,
+                    metadata,
+                    &declared,
                 ));
             }
-            entries
+            if metadata.is_none() {
+                report_neoforge_metadata(jar);
+            }
+            let pre_launch = pre_launch_entries(jar, &entry_kind, metadata)?;
+            (entries, pre_launch)
         }
     };
 
@@ -237,22 +244,36 @@ fn run() -> Result<(), String> {
         entry_kind,
         entry_specs.len()
     );
-    for entry_spec in &entry_specs {
+    if !pre_launch.is_empty() {
+        println!("{} preLaunch entrypoint(s)", pre_launch.len());
+    }
+    // Fabric runs loader-level `preLaunch` callbacks before the selected
+    // environment's entrypoints; NeoForge has none and stays constructor-only.
+    let mut work: Vec<(&str, &str)> = pre_launch
+        .iter()
+        .map(|spec| ("preLaunch", spec.as_str()))
+        .collect();
+    work.extend(
+        entry_specs
+            .iter()
+            .map(|spec| (entry_kind.as_str(), spec.as_str())),
+    );
+    for (entry_kind, entry_spec) in work {
         let (entry, explicit_initializer) = split_entrypoint(entry_spec);
         let has_explicit_initializer = explicit_initializer.is_some();
         let (initializer, initializer_label) = if let Some(method) = explicit_initializer {
             (method.to_owned(), method.to_owned())
-        } else if constructor_only_entry_kind(&entry_kind) {
+        } else if constructor_only_entry_kind(entry_kind) {
             (String::new(), "constructor".to_owned())
         } else {
-            let (method, label) = initializer_for_kind(&entry_kind)?;
+            let (method, label) = initializer_for_kind(entry_kind)?;
             (method.to_owned(), label.to_owned())
         };
         let class = match env.find_class(entry.replace('.', "/")) {
             Ok(class) => class,
             Err(e) => return describe(env, "find_class", entry, e),
         };
-        if constructor_only_entry_kind(&entry_kind) && !has_explicit_initializer {
+        if constructor_only_entry_kind(entry_kind) && !has_explicit_initializer {
             let object = match env.new_object(&class, "()V", &[]) {
                 Ok(object) => object,
                 Err(e) => return describe(env, "new", entry, e),
@@ -264,7 +285,8 @@ fn run() -> Result<(), String> {
         // Fabric invokes a mod's common initializer before a `Class::method`
         // client/server entrypoint when both are declared on the same class. A
         // number of real mods use that method to publish their singleton state.
-        if has_explicit_initializer && initializer != "onInitialize" {
+        // `preLaunch` is a loader-level callback, so it skips that bootstrap.
+        if has_explicit_initializer && initializer != "onInitialize" && entry_kind != "preLaunch" {
             if env.get_method_id(&class, "onInitialize", "()V").is_ok() {
                 let common = match env.new_object(&class, "()V", &[]) {
                     Ok(object) => object,
@@ -497,8 +519,9 @@ fn initializer_for_kind(kind: &str) -> Result<(&'static str, &'static str), Stri
         "main" | "init" => Ok(("onInitialize", "onInitialize")),
         "client" | "client_init" => Ok(("onInitializeClient", "onInitializeClient")),
         "server" | "server_init" => Ok(("onInitializeServer", "onInitializeServer")),
+        "preLaunch" | "prelaunch" => Ok(("onPreLaunch", "onPreLaunch")),
         other => Err(format!(
-            "invalid --entry-kind {other}; expected main, client, server, or neoforge"
+            "invalid --entry-kind {other}; expected main, client, server, preLaunch, or neoforge"
         )),
     }
 }
@@ -552,7 +575,7 @@ fn exception_fallback(env: &mut JNIEnv) -> Option<String> {
 
 fn fallback_label(class: &str, detail: Option<&str>) -> Option<String> {
     match class {
-        "java.lang.UnsupportedOperationException" => Some(format!(
+        "java.lang.UnsupportedOperationException" | "java.lang.SecurityException" => Some(format!(
             "JVM fallback selected for unsupported native call{}",
             detail.map_or_else(String::new, |value| format!(": {value}"))
         )),
@@ -569,7 +592,7 @@ fn fallback_label(class: &str, detail: Option<&str>) -> Option<String> {
             "JVM fallback selected for missing façade member{}",
             detail.map_or_else(String::new, |value| format!(": {value}"))
         )),
-        "java.lang.ExceptionInInitializerError" => Some(format!(
+        "java.lang.ExceptionInInitializerError" | "java.lang.LinkageError" => Some(format!(
             "JVM fallback selected for static initialization failure{}",
             detail.map_or_else(String::new, |value| format!(": {value}"))
         )),
@@ -603,25 +626,47 @@ fn take(args: &mut Vec<String>, name: &str) -> Option<String> {
 /// carry `@Mod`. The runner executes the returned entries in metadata order;
 /// callers that need a different environment select it with `--entry-kind`.
 fn discover_entries(jar: &Path, kind: &str) -> Result<Vec<String>, String> {
+    if let Some((metadata_name, text)) = fabric_metadata_text(jar)? {
+        let metadata_kind = quilt_entrypoint_kind(metadata_name, kind);
+        return entrypoints_from_metadata(metadata_name, &text, Some(metadata_kind))
+            .map(|entries| entries.into_iter().map(|entry| entry.value).collect());
+    }
+    neoforge_mod_classes(jar)
+}
+
+/// The Fabric/Quilt metadata file a jar carries, if any. Quilt is checked
+/// second because a jar built for both uses the Fabric keys.
+fn fabric_metadata_text(jar: &Path) -> Result<Option<(&'static str, String)>, String> {
     let file = File::open(jar).map_err(|e| format!("{}: {e}", jar.display()))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", jar.display()))?;
-    let metadata_name = if archive.by_name("fabric.mod.json").is_ok() {
-        Some("fabric.mod.json")
-    } else if archive.by_name("quilt.mod.json").is_ok() {
-        Some("quilt.mod.json")
-    } else {
-        None
+    let Some(metadata_name) = metadata_file_name(&mut archive) else {
+        return Ok(None);
     };
-    if let Some(metadata_name) = metadata_name {
-        let mut metadata = archive
-            .by_name(metadata_name)
-            .map_err(|e| format!("{}: {metadata_name}: {e}", jar.display()))?;
-        let mut text = String::new();
-        std::io::Read::read_to_string(&mut metadata, &mut text)
-            .map_err(|e| format!("{}: {metadata_name}: {e}", jar.display()))?;
-        let metadata_kind = quilt_entrypoint_kind(metadata_name, kind);
-        return fabric_entries(&text, metadata_kind);
-    }
+    let mut metadata = archive
+        .by_name(metadata_name)
+        .map_err(|e| format!("{}: {metadata_name}: {e}", jar.display()))?;
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut metadata, &mut text)
+        .map_err(|e| format!("{}: {metadata_name}: {e}", jar.display()))?;
+    Ok(Some((metadata_name, text)))
+}
+
+fn metadata_file_name(archive: &mut zip::ZipArchive<File>) -> Option<&'static str> {
+    ["fabric.mod.json", "quilt.mod.json"]
+        .into_iter()
+        .find(|name| archive.by_name(name).is_ok())
+}
+
+/// The metadata path `discover_entries` reads, for wrong-side diagnostics.
+fn metadata_path(jar: &Path) -> Result<Option<&'static str>, String> {
+    Ok(fabric_metadata_text(jar)?.map(|(metadata_name, _)| metadata_name))
+}
+
+/// `@Mod`-annotated top-level classes, in sorted order. NeoForge's
+/// `neoforge.mods.toml` does not name its mod class, so this stays a scan.
+fn neoforge_mod_classes(jar: &Path) -> Result<Vec<String>, String> {
+    let file = File::open(jar).map_err(|e| format!("{}: {e}", jar.display()))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", jar.display()))?;
     let mut out = Vec::new();
     for index in 0..archive.len() {
         let mut entry = archive
@@ -707,28 +752,299 @@ fn declared_entrypoint_kinds(jar: &Path) -> Result<Vec<String>, String> {
     })
 }
 
+/// One `entrypoints.<kind>` declaration with the adapter Fabric would use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entrypoint {
+    kind: String,
+    value: String,
+    adapter: String,
+}
+
+/// Adapters whose declarations the static/constructor dispatch can reach.
+/// Anything else needs a language adapter this runner does not ship, so
+/// discovery rejects it before a JVM starts instead of failing in clinit.
+const KNOWN_ENTRYPOINT_ADAPTERS: [&str; 2] = ["default", "kotlin"];
+
+/// Class names for one lifecycle kind, in metadata order. Runtime discovery
+/// reads [`entrypoints_from_metadata`] so adapters are validated first; this
+/// class-only view stays as the shape the existing tests assert.
+#[cfg(test)]
 fn fabric_entries(text: &str, kind: &str) -> Result<Vec<String>, String> {
+    entrypoints_from_metadata("fabric.mod.json", text, Some(kind))
+        .map(|entries| entries.into_iter().map(|entry| entry.value).collect())
+}
+
+/// Fabric and Quilt entry containers may nest strings, `{value, adapter}`
+/// objects and arrays in any combination; flattening keeps declaration order.
+/// A `None` kind collects every lifecycle key for `--list-entrypoints`.
+fn entrypoints_from_metadata(
+    metadata_name: &str,
+    text: &str,
+    kind: Option<&str>,
+) -> Result<Vec<Entrypoint>, String> {
     let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| format!("fabric.mod.json: {e}"))?;
-    let Some(group) = value.get("entrypoints").and_then(|v| v.get(kind)) else {
+        serde_json::from_str(text).map_err(|e| format!("{metadata_name}: {e}"))?;
+    let Some(groups) = value
+        .get("entrypoints")
+        .and_then(serde_json::Value::as_object)
+    else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    let mut add = |value: &serde_json::Value| {
-        let class = match value {
-            serde_json::Value::String(class) => Some(class.as_str()),
-            serde_json::Value::Object(object) => object.get("value").and_then(|v| v.as_str()),
-            _ => None,
-        };
-        if let Some(class) = class.filter(|class| !class.is_empty()) {
-            out.push(class.to_owned());
+    for (group_kind, group) in groups {
+        if kind.is_none_or(|kind| kind == group_kind) {
+            flatten_entrypoint(metadata_name, group_kind, group, &mut out)?;
         }
-    };
-    match group {
-        serde_json::Value::Array(values) => values.iter().for_each(&mut add),
-        value => add(value),
     }
     Ok(out)
+}
+
+fn flatten_entrypoint(
+    metadata_name: &str,
+    kind: &str,
+    value: &serde_json::Value,
+    out: &mut Vec<Entrypoint>,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                flatten_entrypoint(metadata_name, kind, value, out)?;
+            }
+        }
+        serde_json::Value::String(class) => push_entrypoint(kind, class, "default", out),
+        serde_json::Value::Object(object) => {
+            let adapter = object
+                .get("adapter")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("default");
+            let class = object
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if !KNOWN_ENTRYPOINT_ADAPTERS.contains(&adapter) {
+                return Err(format!(
+                    "{metadata_name}: entrypoint {} declares unsupported adapter {adapter:?}; expected one of {}",
+                    if class.is_empty() {
+                        "(missing value)"
+                    } else {
+                        class
+                    },
+                    KNOWN_ENTRYPOINT_ADAPTERS.join(", ")
+                ));
+            }
+            push_entrypoint(kind, class, adapter, out);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn push_entrypoint(kind: &str, value: &str, adapter: &str, out: &mut Vec<Entrypoint>) {
+    if value.is_empty() {
+        return;
+    }
+    out.push(Entrypoint {
+        kind: kind.to_owned(),
+        value: value.to_owned(),
+        adapter: adapter.to_owned(),
+    });
+}
+
+/// Every declaration in one jar, for `--list-entrypoints`.
+fn all_entrypoints(jar: &Path) -> Result<Vec<Entrypoint>, String> {
+    let Some((metadata_name, text)) = fabric_metadata_text(jar)? else {
+        return Ok(neoforge_mod_classes(jar)?
+            .into_iter()
+            .map(|value| Entrypoint {
+                kind: "neoforge".to_owned(),
+                value,
+                adapter: "default".to_owned(),
+            })
+            .collect());
+    };
+    entrypoints_from_metadata(metadata_name, &text, None)
+}
+
+/// One `kind<TAB>entrypoint` line per declaration. The sort is stable, so
+/// declarations of one kind keep metadata order (including across jars).
+fn format_entrypoints(entries: &[Entrypoint]) -> String {
+    let mut sorted: Vec<&Entrypoint> = entries.iter().collect();
+    sorted.sort_by(|a, b| a.kind.cmp(&b.kind));
+    sorted
+        .iter()
+        .map(|entry| format!("{}\t{}\n", entry.kind, entry.value))
+        .collect()
+}
+
+fn list_entrypoints(jars: &[String]) -> Result<(), String> {
+    let mut entries = Vec::new();
+    for jar in jars {
+        let path = Path::new(jar);
+        entries.extend(all_entrypoints(path)?);
+        if metadata_path(path)?.is_none() {
+            report_neoforge_metadata(path);
+        }
+    }
+    print!("{}", format_entrypoints(&entries));
+    Ok(())
+}
+
+/// The wrong-side error is most useful when it names the metadata it read and
+/// the side the jar was actually built for.
+fn missing_entry_message(
+    jar: &str,
+    kind: &str,
+    metadata: Option<&str>,
+    declared: &[String],
+) -> String {
+    let metadata = metadata.map_or_else(String::new, |name| format!(" ({name})"));
+    let declared_note = if declared.is_empty() {
+        String::new()
+    } else {
+        format!("; declared kinds: {}", declared.join(", "))
+    };
+    let client_only = kind != "client"
+        && !declared.is_empty()
+        && declared
+            .iter()
+            .all(|declared_kind| matches!(declared_kind.as_str(), "client" | "client_init"));
+    let hint = if client_only {
+        "; this jar declares client entrypoints only, so select --entry-kind client (or pass --entry <class>)"
+    } else {
+        "; pass --entry <class>"
+    };
+    format!("no {kind} entrypoint found in {jar}{metadata}{declared_note}{hint}")
+}
+
+/// NeoForge's `mods.toml` carries loader, mod id and mixin markers but no mod
+/// class. These fields are diagnostics only: the `@Mod` class scan decides
+/// what runs, keeping NeoForge constructor-only semantics.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NeoForgeMetadata {
+    path: Option<String>,
+    mod_loader: Option<String>,
+    mod_ids: Vec<String>,
+    jar_jars: usize,
+    mixin_configs: Vec<String>,
+}
+
+impl NeoForgeMetadata {
+    fn diagnostic(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(loader) = &self.mod_loader {
+            parts.push(format!("modLoader {loader}"));
+        }
+        if !self.mod_ids.is_empty() {
+            parts.push(format!("mod ids {}", self.mod_ids.join(", ")));
+        }
+        if self.jar_jars > 0 {
+            parts.push(format!("{} nested jarJar jar(s)", self.jar_jars));
+        }
+        if !self.mixin_configs.is_empty() {
+            parts.push(format!("{} mixin config(s)", self.mixin_configs.len()));
+        }
+        (!parts.is_empty()).then(|| {
+            format!(
+                "{} (diagnostics only): {}",
+                self.path.as_deref().unwrap_or("NeoForge metadata"),
+                parts.join("; ")
+            )
+        })
+    }
+}
+
+/// Hand parser: only the top-level `modLoader`, `[[mods]] modId` and
+/// `[[mixins]] config` keys matter, and no TOML dependency is worth adding.
+fn parse_neoforge_toml(text: &str) -> NeoForgeMetadata {
+    let mut metadata = NeoForgeMetadata::default();
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            section = line.to_owned();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        if value.is_empty() {
+            continue;
+        }
+        match (section.as_str(), key.trim()) {
+            ("", "modLoader") => metadata.mod_loader = Some(value.to_owned()),
+            ("[[mods]]", "modId") => push_unique(&mut metadata.mod_ids, value),
+            ("[[mixins]]", "config") => push_unique(&mut metadata.mixin_configs, value),
+            _ => {}
+        }
+    }
+    metadata
+}
+
+fn neoforge_metadata(jar: &Path) -> Result<NeoForgeMetadata, String> {
+    let file = File::open(jar).map_err(|e| format!("{}: {e}", jar.display()))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", jar.display()))?;
+    let mut metadata = NeoForgeMetadata::default();
+    for name in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
+        let Ok(mut entry) = archive.by_name(name) else {
+            continue;
+        };
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut text)
+            .map_err(|e| format!("{}: {name}: {e}", jar.display()))?;
+        metadata = parse_neoforge_toml(&text);
+        metadata.path = Some(name.to_owned());
+        break;
+    }
+    for index in 0..archive.len() {
+        let Ok(entry) = archive.by_index(index) else {
+            continue;
+        };
+        let name = entry.name().to_owned();
+        if let Some(nested) = name.strip_prefix("META-INF/jarjar/") {
+            if nested.ends_with(".jar") {
+                metadata.jar_jars += 1;
+            }
+        } else if is_mixin_config_name(&name) {
+            push_unique(&mut metadata.mixin_configs, &name);
+        }
+    }
+    Ok(metadata)
+}
+
+fn is_mixin_config_name(name: &str) -> bool {
+    name.ends_with(".mixins.json") || (!name.contains('/') && name.contains("mixins"))
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_owned());
+    }
+}
+
+/// Fabric runs `preLaunch` before the selected environment. NeoForge has no
+/// such list, so its `@Mod` scan must not masquerade as one; an explicit
+/// `--entry` bypasses discovery and preLaunch with it.
+fn pre_launch_entries(
+    jar: &Path,
+    kind: &str,
+    metadata: Option<&str>,
+) -> Result<Vec<String>, String> {
+    if metadata.is_none() || kind == "neoforge" {
+        return Ok(Vec::new());
+    }
+    discover_entries(jar, "preLaunch")
+}
+
+/// NeoForge markers for a jar without Fabric metadata; diagnostics only.
+fn neoforge_diagnostic(jar: &Path) -> Option<String> {
+    neoforge_metadata(jar).ok()?.diagnostic()
+}
+
+fn report_neoforge_metadata(jar: &Path) {
+    if let Some(line) = neoforge_diagnostic(jar) {
+        eprintln!("horizon-jvm: {line}");
+    }
 }
 
 /// Every jar under a folder, for `--libs`.
@@ -836,9 +1152,11 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        constructor_only_entry_kind, declared_entrypoint_kinds, discover_entries, fabric_entries,
-        fabric_metadata, fallback_label, is_minecraft_class, nested_jar_name,
-        quilt_entrypoint_kind, split_entrypoint,
+        Entrypoint, constructor_only_entry_kind, declared_entrypoint_kinds, discover_entries,
+        entrypoints_from_metadata, fabric_entries, fabric_metadata, fallback_label,
+        format_entrypoints, initializer_for_kind, is_minecraft_class, missing_entry_message,
+        neoforge_metadata, nested_jar_name, pre_launch_entries, quilt_entrypoint_kind,
+        split_entrypoint,
     };
     use std::{fs::File, io::Write};
     use zip::write::SimpleFileOptions;
@@ -877,6 +1195,171 @@ mod tests {
             fabric_entries(json, "server").unwrap(),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn flattens_nested_entrypoint_containers_with_adapter_metadata() {
+        let json = r#"{"entrypoints":{"main":[["a.First",["b.Second"]],{"value":"c.Third","adapter":"kotlin"}]}}"#;
+        let entries = entrypoints_from_metadata("fabric.mod.json", json, Some("main")).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (
+                    entry.kind.as_str(),
+                    entry.value.as_str(),
+                    entry.adapter.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("main", "a.First", "default"),
+                ("main", "b.Second", "default"),
+                ("main", "c.Third", "kotlin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_entrypoint_adapters_before_jvm_start() {
+        let json = r#"{"entrypoints":{"main":{"value":"dev.example.Main","adapter":"scala"}}}"#;
+        let error = entrypoints_from_metadata("fabric.mod.json", json, Some("main")).unwrap_err();
+        assert!(error.contains("fabric.mod.json"));
+        assert!(error.contains("dev.example.Main"));
+        assert!(error.contains("\"scala\""));
+        assert!(error.contains("expected one of default, kotlin"));
+    }
+
+    #[test]
+    fn discovers_client_server_and_pre_launch_kinds() {
+        let json = r#"{"entrypoints":{"client":"a.Client","server":["a.Server"],"preLaunch":{"value":"a.PreLaunch"}}}"#;
+        assert_eq!(fabric_entries(json, "client").unwrap(), vec!["a.Client"]);
+        assert_eq!(fabric_entries(json, "server").unwrap(), vec!["a.Server"]);
+        assert_eq!(
+            fabric_entries(json, "preLaunch").unwrap(),
+            vec!["a.PreLaunch"]
+        );
+        assert_eq!(
+            initializer_for_kind("preLaunch").unwrap(),
+            ("onPreLaunch", "onPreLaunch")
+        );
+    }
+
+    #[test]
+    fn formats_listed_entrypoints_by_kind_then_metadata_order() {
+        let entry = |kind: &str, value: &str| Entrypoint {
+            kind: kind.to_owned(),
+            value: value.to_owned(),
+            adapter: "default".to_owned(),
+        };
+        let listed = format_entrypoints(&[
+            entry("main", "a.Second"),
+            entry("client", "a.Client"),
+            entry("main", "a.First"),
+        ]);
+        assert_eq!(listed, "client\ta.Client\nmain\ta.Second\nmain\ta.First\n");
+    }
+
+    #[test]
+    fn missing_entrypoint_error_names_metadata_and_client_only_jar() {
+        let declared = vec!["client".to_owned()];
+        let error = missing_entry_message(
+            "mods/example.jar",
+            "main",
+            Some("fabric.mod.json"),
+            &declared,
+        );
+        assert!(
+            error.starts_with("no main entrypoint found in mods/example.jar (fabric.mod.json)")
+        );
+        assert!(error.contains("declared kinds: client"));
+        assert!(error.contains("client entrypoints only"));
+        assert!(error.contains("--entry-kind client"));
+        assert!(error.contains("--entry <class>"));
+
+        let declared = vec!["client_init".to_owned()];
+        let error = missing_entry_message(
+            "mods/example.jar",
+            "server",
+            Some("quilt.mod.json"),
+            &declared,
+        );
+        assert!(
+            error.starts_with("no server entrypoint found in mods/example.jar (quilt.mod.json)")
+        );
+        assert!(error.contains("client entrypoints only"));
+        assert!(error.contains("--entry-kind client"));
+    }
+
+    #[test]
+    fn labels_static_initialization_and_security_fallbacks() {
+        assert_eq!(
+            fallback_label("java.lang.LinkageError", Some("dev.mod.Bootstrap")),
+            Some(
+                "JVM fallback selected for static initialization failure: dev.mod.Bootstrap"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            fallback_label(
+                "java.lang.SecurityException",
+                Some("sun.misc.Unsafe#allocateInstance")
+            ),
+            Some(
+                "JVM fallback selected for unsupported native call: sun.misc.Unsafe#allocateInstance"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            fallback_label("java.lang.SecurityException", None),
+            Some("JVM fallback selected for unsupported native call".to_owned())
+        );
+    }
+
+    #[test]
+    fn keeps_neoforge_discovery_constructor_only_with_manifest_markers() {
+        let path = std::env::temp_dir().join(format!(
+            "horizon-jvm-neoforge-manifest-{}-{}.jar",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = File::create(&path).unwrap();
+        let mut jar = zip::ZipWriter::new(file);
+        for (name, bytes) in [
+            (
+                "META-INF/neoforge.mods.toml",
+                &br#"modLoader="javafml"
+[[mods]]
+modId="example"
+[[mixins]]
+config="example.mixins.json""#[..],
+            ),
+            (
+                "dev/example/ExampleMod.class",
+                b"CAFEBABE Lnet/neoforged/fml/common/Mod;",
+            ),
+            ("META-INF/jarjar/nested.jar", b"PK"),
+            ("example.mixins.json", b"{}"),
+        ] {
+            jar.start_file(name, SimpleFileOptions::default()).unwrap();
+            jar.write_all(bytes).unwrap();
+        }
+        jar.finish().unwrap();
+        assert_eq!(
+            discover_entries(&path, "main").unwrap(),
+            vec!["dev.example.ExampleMod"]
+        );
+        let metadata = neoforge_metadata(&path).unwrap();
+        assert_eq!(metadata.mod_loader.as_deref(), Some("javafml"));
+        assert_eq!(metadata.mod_ids, ["example"]);
+        assert_eq!(metadata.jar_jars, 1);
+        assert_eq!(metadata.mixin_configs, ["example.mixins.json"]);
+        assert!(metadata.diagnostic().unwrap().contains("diagnostics only"));
+        // A NeoForge jar has no `preLaunch` list: the `@Mod` classes must not
+        // be re-run as preLaunch callbacks before the constructor-only pass.
+        assert!(pre_launch_entries(&path, "main", None).unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
