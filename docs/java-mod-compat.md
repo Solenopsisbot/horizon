@@ -985,9 +985,8 @@ and leaves arbitrary weaving, reflection and unmodelled cancellation to `horizon
 The native probe now has executable boundaries for the common void-only injector shapes: `NativeJar`
 runs `@Inject(at = HEAD)` before its target and `RETURN`/`TAIL` after it, mirroring target arguments and
 using deterministic `CallbackInfo` markers when requested. Non-void return-value callbacks, cancellation,
-and unsupported anchors remain on the JVM fallback. Return/Tail, cancellation, and callback bytecode that changes the
-target result still use the JVM fallback; the census and translation plan keep
-those cases visible until their native contracts are implemented.
+and unsupported anchors remain on the JVM fallback; the census and translation plan keep those cases visible
+until their native contracts are implemented.
 
 The rule that keeps this honest: **a method that receives many mixins becomes mod-owned at that point.**
 Rust stops deciding and calls Java there — the same move as a named hook, but chosen by data rather than
