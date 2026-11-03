@@ -51,8 +51,11 @@ impl Drop for NestedJars {
 }
 
 const LOADER_BRIDGE_SOURCE: &str = r#"
+import java.io.*;
 import java.lang.reflect.*;
+import java.nio.file.*;
 import java.util.*;
+import java.util.stream.Collectors;
 
 /** Small reflection-only bridge used by the embedded Fabric probe. */
 @SuppressWarnings({"unchecked", "rawtypes"})
@@ -113,6 +116,127 @@ public final class HorizonLoaderBridge {
     modsField.setAccessible(true);
     ((List) modsField.get(loader)).add(container);
   }
+
+  /** Drive the real Fabric loader: launcher, game provider, load and freeze. */
+  public static int bootstrap() throws Exception {
+    Class<?> base = Class.forName("net.fabricmc.loader.impl.launch.FabricLauncherBase");
+    Class<?> launcherIface = Class.forName("net.fabricmc.loader.impl.launch.FabricLauncher");
+    Object launcher = Proxy.newProxyInstance(launcherIface.getClassLoader(), new Class<?>[]{launcherIface}, (p, m, a) -> {
+      switch (m.getName()) {
+        case "getClassPath":
+          return Arrays.stream(System.getProperty("java.class.path").split(File.pathSeparator))
+              .map(Paths::get).collect(Collectors.toList());
+        case "getTargetClassLoader": return ClassLoader.getSystemClassLoader();
+        case "getResourceAsStream": return ClassLoader.getSystemResourceAsStream((String) a[0]);
+        case "getClassByteArray": {
+          String name = (String) a[0];
+          try (InputStream in = ClassLoader.getSystemResourceAsStream(name.replace('.', '/') + ".class")) {
+            if (in == null) throw new IOException(name);
+            return in.readAllBytes();
+          }
+        }
+        case "getEnvironmentType":
+          return Enum.valueOf((Class) Class.forName("net.fabricmc.api.EnvType"), "SERVER");
+        case "isDevelopment": return true;
+        case "getEntrypoint": return "net.fabricmc.loader.impl.launch.knot.KnotClient";
+        case "getManifest": return null;
+        case "getMappingConfiguration": return mappingConfiguration();
+        case "isClassLoaded": return false;
+        case "loadIntoTarget": throw new ClassNotFoundException((String) a[0]);
+        default: return defaultValue(m.getReturnType());
+      }
+    });
+    base.getMethod("setLauncher", launcherIface).invoke(null, launcher);
+    Field properties = base.getDeclaredField("properties");
+    properties.setAccessible(true);
+    properties.set(null, new HashMap<String, Object>());
+    Class<?> providerIface = Class.forName("net.fabricmc.loader.impl.game.GameProvider");
+    Object provider = Proxy.newProxyInstance(providerIface.getClassLoader(), new Class<?>[]{providerIface}, (p, m, a) -> {
+      switch (m.getName()) {
+        case "getGameId": return "minecraft";
+        case "getGameName": return "Horizon";
+        case "getRawGameVersion": case "getNormalizedGameVersion": return "26.3";
+        case "getBuiltinMods": return Collections.emptyList();
+        case "getEntrypoint": return "net.fabricmc.loader.impl.launch.knot.KnotClient";
+        case "getLaunchDirectory": return Paths.get(".");
+        case "requiresUrlClassLoader": case "isEnabled": case "locateGame":
+        case "hasAwtSupport": case "canOpenErrorGui": return true;
+        case "getBuiltinTransforms": return Collections.emptySet();
+        case "initialize": case "unlockClassPath": case "launch": return null;
+        case "getEntrypointTransformer": return null;
+        case "getArguments":
+          return Class.forName("net.fabricmc.loader.impl.util.Arguments").getConstructor().newInstance();
+        case "getLaunchArguments": return new String[0];
+        default: return defaultValue(m.getReturnType());
+      }
+    });
+    Class<?> impl = Class.forName("net.fabricmc.loader.impl.FabricLoaderImpl");
+    Object loader = impl.getField("INSTANCE").get(null);
+    impl.getMethod("setGameProvider", providerIface).invoke(loader, provider);
+    impl.getMethod("load").invoke(loader);
+    try {
+      impl.getMethod("freeze").invoke(loader);
+    } catch (Throwable ignored) {
+      // A loader without freeze still exposes the containers.
+    }
+    return ((Collection<?>) impl.getMethod("getAllMods").invoke(loader)).size();
+  }
+
+  /** Invoke the loader's entrypoint containers for one lifecycle kind. */
+  public static int run(String kind) throws Exception {
+    Class<?> impl = Class.forName("net.fabricmc.loader.impl.FabricLoaderImpl");
+    Object loader = impl.getField("INSTANCE").get(null);
+    String iface = switch (kind) {
+      case "client" -> "net.fabricmc.api.ClientModInitializer";
+      case "server" -> "net.fabricmc.api.DedicatedServerModInitializer";
+      default -> "net.fabricmc.api.ModInitializer";
+    };
+    String method = switch (kind) {
+      case "client" -> "onInitializeClient";
+      case "server" -> "onInitializeServer";
+      default -> "onInitialize";
+    };
+    Class<?> type = Class.forName(iface);
+    List<?> containers = (List<?>) impl
+        .getMethod("getEntrypointContainers", String.class, Class.class)
+        .invoke(loader, kind, type);
+    for (Object container : containers) {
+      Object entrypoint = container.getClass().getMethod("getEntrypoint").invoke(container);
+      entrypoint.getClass().getMethod(method).invoke(entrypoint);
+    }
+    return containers.size();
+  }
+
+  private static Object mappingConfiguration() throws Exception {
+    Class<?> type = Class.forName("net.fabricmc.loader.impl.launch.MappingConfiguration");
+    Object config = type.getConstructor().newInstance();
+    setField(type, config, "namespace", "named");
+    setField(type, config, "gameId", "minecraft");
+    setField(type, config, "gameVersion", "26.3");
+    setField(type, config, "mappingName", "none");
+    setField(type, config, "namespaces", Arrays.asList("official", "intermediary", "named"));
+    setField(type, config, "initializedMetadata", true);
+    setField(type, config, "initializedMappings", true);
+    return config;
+  }
+
+  private static void setField(Class<?> type, Object target, String name, Object value) throws Exception {
+    Field field = type.getDeclaredField(name);
+    field.setAccessible(true);
+    field.set(target, value);
+  }
+
+  private static Object defaultValue(Class<?> type) {
+    if (!type.isPrimitive()) return null;
+    if (type == boolean.class) return false;
+    if (type == char.class) return (char) 0;
+    if (type == byte.class) return (byte) 0;
+    if (type == short.class) return (short) 0;
+    if (type == int.class) return 0;
+    if (type == long.class) return 0L;
+    if (type == float.class) return 0f;
+    return 0d;
+  }
 }
 "#;
 
@@ -158,7 +282,7 @@ fn main() -> ExitCode {
 }
 
 /// The usage line, kept as data so a test can check the kinds it names.
-const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...";
+const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...";
 
 fn run() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -170,6 +294,9 @@ fn run() -> Result<(), String> {
     // production default, and the flag never reaches the jar list.
     let fabric_development = args.iter().any(|arg| arg == "--fabric-development");
     args.retain(|arg| arg != "--fabric-development");
+    // Run the real Fabric loader instead of this probe's own entrypoint scan.
+    let real_loader = args.iter().any(|arg| arg == "--real-loader");
+    args.retain(|arg| arg != "--real-loader");
     let mixin_config_args = take_all(&mut args, "--mixin-config");
     let entry = take(&mut args, "--entry");
     let entry_kind = take(&mut args, "--entry-kind").unwrap_or_else(|| "main".to_owned());
@@ -189,32 +316,36 @@ fn run() -> Result<(), String> {
     if list_entrypoints_only {
         return list_entrypoints(&args);
     }
-    let (entry_specs, pre_launch) = match entry {
-        Some(entry) => (vec![entry], Vec::new()),
-        None => {
-            let jar = Path::new(&args[0]);
-            let metadata = metadata_path(jar)?;
-            let entries = discover_entries(jar, &entry_kind)?;
-            if entries.is_empty() {
-                let declared = declared_entrypoint_kinds(jar)?;
-                return Err(missing_entry_message(
-                    &args[0],
-                    &entry_kind,
-                    metadata,
-                    &declared,
-                ));
+    let (entry_specs, pre_launch) = if real_loader {
+        (Vec::new(), Vec::new())
+    } else {
+        match entry {
+            Some(entry) => (vec![entry], Vec::new()),
+            None => {
+                let jar = Path::new(&args[0]);
+                let metadata = metadata_path(jar)?;
+                let entries = discover_entries(jar, &entry_kind)?;
+                if entries.is_empty() {
+                    let declared = declared_entrypoint_kinds(jar)?;
+                    return Err(missing_entry_message(
+                        &args[0],
+                        &entry_kind,
+                        metadata,
+                        &declared,
+                    ));
+                }
+                if metadata.is_none() {
+                    report_neoforge_metadata(jar);
+                }
+                // Datagen is a build step of its own: loader-level `preLaunch`
+                // callbacks do not run, so neither does any other lifecycle group.
+                let pre_launch = if is_datagen_kind(&entry_kind) {
+                    Vec::new()
+                } else {
+                    pre_launch_entries(jar, &entry_kind, metadata)?
+                };
+                (entries, pre_launch)
             }
-            if metadata.is_none() {
-                report_neoforge_metadata(jar);
-            }
-            // Datagen is a build step of its own: loader-level `preLaunch`
-            // callbacks do not run, so neither does any other lifecycle group.
-            let pre_launch = if is_datagen_kind(&entry_kind) {
-                Vec::new()
-            } else {
-                pre_launch_entries(jar, &entry_kind, metadata)?
-            };
-            (entries, pre_launch)
         }
     };
     let datagen_mod = is_datagen_kind(&entry_kind)
@@ -305,6 +436,37 @@ fn run() -> Result<(), String> {
         .attach_current_thread()
         .map_err(|e| format!("attach: {e}"))?;
     let env = &mut *guard;
+
+    if real_loader {
+        let bridge = match env.find_class("HorizonLoaderBridge") {
+            Ok(class) => class,
+            Err(_) => {
+                let _ = env.exception_clear();
+                return Err(
+                    "real Fabric loader requested but HorizonLoaderBridge did not compile".into(),
+                );
+            }
+        };
+        let mods = env
+            .call_static_method(&bridge, "bootstrap", "()I", &[])
+            .and_then(|value| value.i())
+            .map_err(|error| format!("Fabric loader bootstrap: {error}"))?;
+        let kind = entry_kind.clone();
+        let kind = env
+            .new_string(kind)
+            .map_err(|error| format!("loader kind: {error}"))?;
+        let entrypoints = env
+            .call_static_method(
+                &bridge,
+                "run",
+                "(Ljava/lang/String;)I",
+                &[JValue::Object(&JObject::from(kind))],
+            )
+            .and_then(|value| value.i())
+            .map_err(|error| format!("Fabric loader entrypoints: {error}"))?;
+        println!("real loader: {mods} mod(s), {entrypoints} {entry_kind} entrypoint(s)");
+        return Ok(());
+    }
 
     prepare_fabric_loader(env, &nested.root)?;
     seed_fabric_metadata(env, &classpath)?;
@@ -4730,5 +4892,28 @@ config="demo.mixins.json""#,
             datagen_provider_line(1, "demo", "en_us", "language"),
             "datagen provider 2: demo/en_us (language)"
         );
+    }
+}
+
+/// The real-loader bridge is the Java half of `--real-loader`; keep its entry
+/// points and the flag documented by the usage line.
+#[cfg(test)]
+mod real_loader_tests {
+    use super::{LOADER_BRIDGE_SOURCE, USAGE};
+
+    #[test]
+    fn the_bridge_drives_fabric_loader_and_its_entrypoints() {
+        for needed in [
+            "public static int bootstrap()",
+            "net.fabricmc.loader.impl.FabricLoaderImpl",
+            "setGameProvider",
+            "getEntrypointContainers",
+            "setLauncher",
+            "public static int run(String kind)",
+            "onInitializeClient",
+        ] {
+            assert!(LOADER_BRIDGE_SOURCE.contains(needed), "missing {needed}");
+        }
+        assert!(USAGE.contains("--real-loader"));
     }
 }
