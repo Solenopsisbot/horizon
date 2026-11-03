@@ -395,9 +395,13 @@ mixed-anchor or non-void-callback plans before executing any of them. A cancella
 runtime-owned `CallbackInfo`; `cancel()` stops the remaining HEAD callbacks and the target body and returns
 the target's default value, and the report says `cancelled`. RETURN/TAIL callbacks receive a
 `CallbackInfoReturnable` seeded with the real result; `setReturnValue` overrides it, and a non-void target
-requires the returnable marker. `--mixin-plans` reports the same plans without running an entrypoint. This is
-planning and bounded native invocation, not bytecode weaving: no class is rewritten, and `@Redirect`,
-`@ModifyArg`/`@ModifyVariable`, slices, and injection-point matching remain on the JVM fallback.
+requires the returnable marker. `@At(value = "INVOKE", target = ...)` plans resolve descriptor,
+`owner.method(...)` and `owner#name` selectors; the interpreter runs their hooks before the matched call, and a
+cancellable hook suppresses that call and returns the descriptor default. Unparseable selectors stay
+report-only. `--mixin-plans` reports the same plans without running an entrypoint. This is planning and
+bounded native invocation, not bytecode weaving: no class is rewritten, and `@Redirect`,
+`@ModifyArg`/`@ModifyVariable`, `FIELD`/`NEW`/`JUMP`, slices, and ordinal selectors remain on the JVM
+fallback.
 
 Reproduce:
 
