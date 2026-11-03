@@ -1502,6 +1502,216 @@ fn native_declaration_changes_invalidate_content_stamp() {
     fs::remove_dir_all(base).unwrap();
 }
 
+/// A content mod built the way a native Java adapter builds one.
+fn native_mod(id: &str, declarations: horizon_mods::native::NativeDeclarations) -> ContentMod {
+    ContentMod {
+        id: id.to_owned(),
+        content: Content::from_native(id, declarations).unwrap(),
+    }
+}
+
+fn block(id: &str, item: bool) -> horizon_mods::content::Block {
+    horizon_mods::content::Block {
+        id: id.to_owned(),
+        template: "minecraft:stone".into(),
+        properties: Default::default(),
+        shapes: None,
+        default_state: Default::default(),
+        item,
+        components: Default::default(),
+    }
+}
+
+fn item(id: &str) -> horizon_mods::content::Item {
+    horizon_mods::content::Item {
+        id: id.to_owned(),
+        template: "minecraft:diamond".into(),
+        max_stack_size: None,
+        rarity: None,
+        components: Default::default(),
+        crafting_remainder: None,
+    }
+}
+
+/// One declaration of every kind a native adapter can emit.
+fn every_kind() -> horizon_mods::native::NativeDeclarations {
+    use horizon_mods::content::{EffectCategory, MobEffect};
+    use horizon_mods::native::{
+        AttachmentDeclaration, BlockEntityDeclaration, DataComponentDeclaration, EntityDeclaration,
+        IngredientDeclaration, MenuDeclaration, NativeDeclarations, RecipeDeclaration,
+    };
+    NativeDeclarations {
+        blocks: vec![block("ruby:block", true)],
+        items: vec![item("ruby:gem")],
+        effects: vec![MobEffect {
+            id: "ruby:glow".into(),
+            category: EffectCategory::Beneficial,
+            color: 0x00ff00,
+        }],
+        entities: vec![EntityDeclaration {
+            id: "ruby:beast".into(),
+            template: "minecraft:pig".into(),
+            ..Default::default()
+        }],
+        data_components: vec![DataComponentDeclaration {
+            id: "ruby:charge".into(),
+            codec: "ruby:charge".into(),
+            persistent: true,
+            network_synced: false,
+        }],
+        attachments: vec![AttachmentDeclaration {
+            id: "ruby:owner".into(),
+            codec: "ruby:owner".into(),
+            default_value: "null".into(),
+            copy_on_death: false,
+        }],
+        menus: vec![MenuDeclaration {
+            id: "ruby:crate".into(),
+            title_key: "container.ruby.crate".into(),
+            slots: 27,
+        }],
+        block_entities: vec![BlockEntityDeclaration {
+            id: "ruby:crate_entity".into(),
+            template: "minecraft:barrel".into(),
+            ticker: true,
+            valid_blocks: vec!["ruby:block".into()],
+        }],
+        recipes: vec![RecipeDeclaration {
+            id: "ruby:crate_recipe".into(),
+            json: b"{}".to_vec(),
+        }],
+        ingredients: vec![IngredientDeclaration {
+            id: "ruby:gem_ingredient".into(),
+            json: b"{}".to_vec(),
+        }],
+        custom: Vec::new(),
+    }
+}
+
+/// Every kind is counted, a block's item joins the item count under the
+/// block's id, and the namespaces and ids are sorted.
+#[test]
+fn native_declarations_summarise_by_kind() {
+    let summary = declaration_summary(&[native_mod("ruby", every_kind())]);
+    assert_eq!(summary.blocks, 1);
+    assert_eq!(summary.items, 2, "the declared item and the block's");
+    assert_eq!(summary.effects, 1);
+    assert_eq!(summary.entities, 1);
+    assert_eq!(summary.data_components, 1);
+    assert_eq!(summary.attachments, 1);
+    assert_eq!(summary.menus, 1);
+    assert_eq!(summary.block_entities, 1);
+    assert_eq!(summary.recipes, 1);
+    assert_eq!(summary.ingredients, 1);
+    assert!(!summary.is_empty());
+    assert_eq!(summary.namespaces, vec!["ruby".to_owned()]);
+    assert_eq!(summary.ids.len(), 10, "the block and its item count once");
+    assert!(!summary.ids_truncated);
+}
+
+/// The log lines name each count that is not zero, then the namespaces and
+/// the ids, and the same summary always gives the same lines.
+#[test]
+fn declaration_summary_lines_are_deterministic() {
+    let summary = declaration_summary(&[native_mod("ruby", every_kind())]);
+    let expected = vec![
+        "1 block, 2 items, 1 mob effect, 1 entity, 1 data component, 1 attachment, 1 menu, \
+         1 block entity, 1 recipe, 1 ingredient"
+            .to_owned(),
+        "namespaces: ruby".to_owned(),
+        "ids: ruby:beast, ruby:block, ruby:charge, ruby:crate, ruby:crate_entity, \
+         ruby:crate_recipe, ruby:gem, ruby:gem_ingredient, ruby:glow, ruby:owner"
+            .to_owned(),
+    ];
+    let first = summary.lines();
+    assert_eq!(first, expected);
+    assert_eq!(summary.lines(), first);
+    assert_eq!(
+        declaration_summary(&[native_mod("ruby", every_kind())]),
+        summary
+    );
+}
+
+/// Two mods merge into one summary, an id declared twice counts once, and the
+/// order the mods are passed in changes nothing.
+#[test]
+fn mods_merge_and_dedupe_declarations() {
+    let ruby = native_mod(
+        "ruby",
+        horizon_mods::native::NativeDeclarations {
+            blocks: vec![block("ruby:block", true)],
+            items: vec![item("ruby:gem")],
+            ..Default::default()
+        },
+    );
+    let amber = native_mod(
+        "amber",
+        horizon_mods::native::NativeDeclarations {
+            items: vec![item("amber:resin")],
+            entities: vec![horizon_mods::native::EntityDeclaration {
+                id: "amber:beetle".into(),
+                template: "minecraft:silverfish".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    let both = declaration_summary(&[ruby.clone(), amber.clone()]);
+    assert_eq!((both.blocks, both.items, both.entities), (1, 3, 1));
+    assert_eq!(both.namespaces, vec!["amber".to_owned(), "ruby".to_owned()]);
+    assert_eq!(
+        both.ids,
+        ["amber:beetle", "amber:resin", "ruby:block", "ruby:gem"].map(str::to_owned)
+    );
+    assert_eq!(declaration_summary(&[amber, ruby.clone()]), both);
+    // The same mod passed twice declares nothing twice.
+    assert_eq!(
+        declaration_summary(&[ruby.clone(), ruby.clone()]),
+        declaration_summary(&[ruby])
+    );
+}
+
+/// A mod with no declarations, and no mods at all, summarise to nothing.
+#[test]
+fn empty_mods_have_an_empty_summary() {
+    let none = declaration_summary(&[]);
+    assert_eq!(none, DeclarationSummary::default());
+    assert!(none.is_empty());
+    assert!(none.lines().is_empty());
+
+    let mods = [native_mod(
+        "ruby",
+        horizon_mods::native::NativeDeclarations::default(),
+    )];
+    let empty = declaration_summary(&mods);
+    assert!(empty.is_empty(), "a namespace alone is no declaration");
+    assert!(empty.lines().is_empty());
+}
+
+/// The ids stay bounded: the first 64 sorted, with the rest only counted.
+#[test]
+fn declaration_summary_bounds_its_ids() {
+    let items = (0..MAX_SUMMARY_IDS + 6)
+        .map(|i| item(&format!("ruby:item_{i}")))
+        .collect();
+    let summary = declaration_summary(&[native_mod(
+        "ruby",
+        horizon_mods::native::NativeDeclarations {
+            items,
+            ..Default::default()
+        },
+    )]);
+    assert_eq!(summary.items, MAX_SUMMARY_IDS + 6);
+    assert!(summary.ids_truncated);
+    let mut expected: Vec<String> = (0..MAX_SUMMARY_IDS + 6)
+        .map(|i| format!("ruby:item_{i}"))
+        .collect();
+    expected.sort();
+    expected.truncate(MAX_SUMMARY_IDS);
+    assert_eq!(summary.ids, expected);
+    assert!(summary.lines()[2].ends_with(", ..."));
+}
+
 #[test]
 fn native_menu_and_block_entity_rows_reach_the_built_root() {
     use horizon_mods::native::{BlockEntityDeclaration, MenuDeclaration, NativeDeclarations};

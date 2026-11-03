@@ -41,6 +41,170 @@ pub fn mob_effects(mods: &[ContentMod]) -> Vec<&MobEffect> {
     effects
 }
 
+/// Ids [`DeclarationSummary`] keeps; the rest are only counted.
+pub const MAX_SUMMARY_IDS: usize = 64;
+
+/// What content mods declare, counted by kind, for the log and the Mods page:
+/// each mod's typed tables and the native recipe and ingredient files, with
+/// no file parsed. Namespaces and ids are sorted, so the same mods give the
+/// same summary whatever order they are passed in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeclarationSummary {
+    pub blocks: usize,
+    /// The item registry's additions: declared items and the item of every
+    /// block that adds one, counted once per id.
+    pub items: usize,
+    pub effects: usize,
+    pub entities: usize,
+    pub data_components: usize,
+    pub attachments: usize,
+    pub menus: usize,
+    pub block_entities: usize,
+    /// Native `data/<ns>/recipe/*.json` files.
+    pub recipes: usize,
+    /// Native `data/<ns>/ingredient/*.json` files.
+    pub ingredients: usize,
+    /// The namespaces the mods own, sorted, without repeats.
+    pub namespaces: Vec<String>,
+    /// The declaration ids, sorted, at most [`MAX_SUMMARY_IDS`].
+    pub ids: Vec<String>,
+    /// Whether `ids` left some out.
+    pub ids_truncated: bool,
+}
+
+/// A native recipe or ingredient file's id: `data/<ns>/<kind>/<path>.json` is
+/// `<ns>:<path>`.
+fn native_file_id(file: &str, kind: &str) -> Option<String> {
+    let marker = format!("/{kind}/");
+    let (ns, path) = file.strip_prefix("data/")?.split_once(marker.as_str())?;
+    Some(format!("{ns}:{}", path.strip_suffix(".json")?))
+}
+
+/// What `mods` declare, counted once per id whatever order they are in.
+pub fn declaration_summary(mods: &[ContentMod]) -> DeclarationSummary {
+    let mut blocks: BTreeSet<String> = BTreeSet::new();
+    let mut items: BTreeSet<String> = BTreeSet::new();
+    let mut effects: BTreeSet<String> = BTreeSet::new();
+    let mut entities: BTreeSet<String> = BTreeSet::new();
+    let mut data_components: BTreeSet<String> = BTreeSet::new();
+    let mut attachments: BTreeSet<String> = BTreeSet::new();
+    let mut menus: BTreeSet<String> = BTreeSet::new();
+    let mut block_entities: BTreeSet<String> = BTreeSet::new();
+    let mut recipes: BTreeSet<String> = BTreeSet::new();
+    let mut ingredients: BTreeSet<String> = BTreeSet::new();
+    let mut namespaces: BTreeSet<String> = BTreeSet::new();
+    for m in mods {
+        let content = &m.content;
+        namespaces.extend(content.namespaces.iter().cloned());
+        blocks.extend(content.blocks.iter().map(|b| b.id.clone()));
+        items.extend(
+            content
+                .blocks
+                .iter()
+                .filter(|b| b.item)
+                .map(|b| b.id.clone()),
+        );
+        items.extend(content.items.iter().map(|i| i.id.clone()));
+        effects.extend(content.effects.iter().map(|e| e.id.clone()));
+        entities.extend(content.entities.iter().map(|e| e.id.clone()));
+        data_components.extend(content.data_components.iter().map(|c| c.id.clone()));
+        attachments.extend(content.attachments.iter().map(|a| a.id.clone()));
+        menus.extend(content.menus.iter().map(|m| m.id.clone()));
+        block_entities.extend(content.block_entities.iter().map(|b| b.id.clone()));
+        for file in content.native_files.keys() {
+            if let Some(id) = native_file_id(file, "recipe") {
+                recipes.insert(id);
+            } else if let Some(id) = native_file_id(file, "ingredient") {
+                ingredients.insert(id);
+            }
+        }
+    }
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    for set in [
+        &blocks,
+        &items,
+        &effects,
+        &entities,
+        &data_components,
+        &attachments,
+        &menus,
+        &block_entities,
+        &recipes,
+        &ingredients,
+    ] {
+        ids.extend(set.iter().cloned());
+    }
+    let ids_truncated = ids.len() > MAX_SUMMARY_IDS;
+    DeclarationSummary {
+        blocks: blocks.len(),
+        items: items.len(),
+        effects: effects.len(),
+        entities: entities.len(),
+        data_components: data_components.len(),
+        attachments: attachments.len(),
+        menus: menus.len(),
+        block_entities: block_entities.len(),
+        recipes: recipes.len(),
+        ingredients: ingredients.len(),
+        namespaces: namespaces.into_iter().collect(),
+        ids: ids.into_iter().take(MAX_SUMMARY_IDS).collect(),
+        ids_truncated,
+    }
+}
+
+impl DeclarationSummary {
+    /// No declaration at all: a mod with files or code only. Its namespace
+    /// alone is not a declaration.
+    pub fn is_empty(&self) -> bool {
+        self.blocks == 0
+            && self.items == 0
+            && self.effects == 0
+            && self.entities == 0
+            && self.data_components == 0
+            && self.attachments == 0
+            && self.menus == 0
+            && self.block_entities == 0
+            && self.recipes == 0
+            && self.ingredients == 0
+    }
+
+    /// The summary as lines for the log and the Mods page: the counts, then
+    /// the namespaces and the ids (bounded, so a big mod stays one line).
+    pub fn lines(&self) -> Vec<String> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let counts: Vec<String> = [
+            (self.blocks, "block", "blocks"),
+            (self.items, "item", "items"),
+            (self.effects, "mob effect", "mob effects"),
+            (self.entities, "entity", "entities"),
+            (self.data_components, "data component", "data components"),
+            (self.attachments, "attachment", "attachments"),
+            (self.menus, "menu", "menus"),
+            (self.block_entities, "block entity", "block entities"),
+            (self.recipes, "recipe", "recipes"),
+            (self.ingredients, "ingredient", "ingredients"),
+        ]
+        .into_iter()
+        .filter(|(n, _, _)| *n > 0)
+        .map(|(n, one, many)| format!("{n} {}", if n == 1 { one } else { many }))
+        .collect();
+        let mut lines = vec![counts.join(", ")];
+        if !self.namespaces.is_empty() {
+            lines.push(format!("namespaces: {}", self.namespaces.join(", ")));
+        }
+        if !self.ids.is_empty() {
+            lines.push(format!(
+                "ids: {}{}",
+                self.ids.join(", "),
+                if self.ids_truncated { ", ..." } else { "" }
+            ));
+        }
+        lines
+    }
+}
+
 /// JSON with its object keys in file order, so a rewritten table differs
 /// from the original only by what was added.
 #[derive(Clone, Debug, PartialEq)]
