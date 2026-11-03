@@ -1316,7 +1316,9 @@ fn tableswitch_len(code: &[u8], at: usize, class: &str, method: &str) -> Result<
     let low = i4_be(code, body + 4).ok_or_else(past)?;
     let high = i4_be(code, body + 8).ok_or_else(past)?;
     let count = i64::from(high) - i64::from(low) + 1;
-    if count < 0 {
+    // `high` must not be below `low`: a high of `low - 1` is an empty table,
+    // which the JVM's verifier rejects as well.
+    if count < 1 {
         return Err(body_error(class, method, at, "tableswitch high below low"));
     }
     let len = 1 + switch_padding(at) + 12 + count as usize * 4;
@@ -2262,6 +2264,161 @@ pub(crate) mod tests_support {
         class_with(name, superclass, &[], &[], false)
     }
 
+    /// A constant pool under construction, for the class files whose method
+    /// bodies the scanner tests walk: each method returns the 1-based index a
+    /// code array refers to, in the order a class file writes the entries.
+    #[derive(Default)]
+    pub struct PoolBuilder {
+        entries: Vec<Vec<u8>>,
+        bootstrap: Vec<(u16, Vec<u16>)>,
+    }
+
+    impl PoolBuilder {
+        /// Appends one entry and returns its 1-based index.
+        fn add(&mut self, tag: u8, payload: &[u8]) -> u16 {
+            let mut entry = vec![tag];
+            entry.extend(payload);
+            self.entries.push(entry);
+            self.entries.len() as u16
+        }
+
+        pub fn utf8(&mut self, text: &str) -> u16 {
+            let mut payload = (text.len() as u16).to_be_bytes().to_vec();
+            payload.extend(text.as_bytes());
+            self.add(1, &payload)
+        }
+
+        pub fn class(&mut self, name: &str) -> u16 {
+            let name = self.utf8(name);
+            self.add(7, &name.to_be_bytes())
+        }
+
+        pub fn integer(&mut self, value: i32) -> u16 {
+            self.add(3, &value.to_be_bytes())
+        }
+
+        fn name_and_type(&mut self, name: &str, descriptor: &str) -> u16 {
+            let name = self.utf8(name);
+            let descriptor = self.utf8(descriptor);
+            let mut payload = name.to_be_bytes().to_vec();
+            payload.extend(descriptor.to_be_bytes());
+            self.add(12, &payload)
+        }
+
+        fn member(&mut self, tag: u8, owner: &str, name: &str, descriptor: &str) -> u16 {
+            let owner = self.class(owner);
+            let pair = self.name_and_type(name, descriptor);
+            let mut payload = owner.to_be_bytes().to_vec();
+            payload.extend(pair.to_be_bytes());
+            self.add(tag, &payload)
+        }
+
+        /// A `CONSTANT_Fieldref`.
+        pub fn field(&mut self, owner: &str, name: &str, descriptor: &str) -> u16 {
+            self.member(9, owner, name, descriptor)
+        }
+
+        /// A `CONSTANT_Methodref`.
+        pub fn method(&mut self, owner: &str, name: &str, descriptor: &str) -> u16 {
+            self.member(10, owner, name, descriptor)
+        }
+
+        /// A `CONSTANT_InterfaceMethodref`.
+        pub fn interface_method(&mut self, owner: &str, name: &str, descriptor: &str) -> u16 {
+            self.member(11, owner, name, descriptor)
+        }
+
+        /// A `CONSTANT_MethodHandle` of `kind` over `reference`.
+        pub fn handle(&mut self, kind: u8, reference: u16) -> u16 {
+            let mut payload = vec![kind];
+            payload.extend(reference.to_be_bytes());
+            self.add(15, &payload)
+        }
+
+        /// An `invokedynamic` constant over a fresh bootstrap entry: its
+        /// method handle and arguments.
+        pub fn dynamic(
+            &mut self,
+            name: &str,
+            descriptor: &str,
+            handle: u16,
+            arguments: &[u16],
+        ) -> u16 {
+            let bootstrap = self.bootstrap.len() as u16;
+            self.bootstrap.push((handle, arguments.to_vec()));
+            let pair = self.name_and_type(name, descriptor);
+            let mut payload = bootstrap.to_be_bytes().to_vec();
+            payload.extend(pair.to_be_bytes());
+            self.add(18, &payload)
+        }
+
+        /// The class file: `name` extending `superclass`, one public static
+        /// `()V` method per `(name, code)` with a `Code` attribute around
+        /// `code`, and the `BootstrapMethods` its dynamics need.
+        pub fn build(
+            &mut self,
+            name: &str,
+            superclass: &str,
+            methods: &[(&str, &[u8])],
+        ) -> Vec<u8> {
+            let this = self.class(name);
+            let sup = self.class(superclass);
+            let code_attribute = self.utf8("Code");
+            let descriptor = self.utf8("()V");
+            let names: Vec<u16> = methods
+                .iter()
+                .map(|(method, _)| self.utf8(method))
+                .collect();
+            let bootstrap_attribute = if self.bootstrap.is_empty() {
+                None
+            } else {
+                Some(self.utf8("BootstrapMethods"))
+            };
+            let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 65];
+            out.extend(((self.entries.len() + 1) as u16).to_be_bytes());
+            for entry in &self.entries {
+                out.extend(entry);
+            }
+            out.extend([0, 0x21]);
+            out.extend(this.to_be_bytes());
+            out.extend(sup.to_be_bytes());
+            out.extend([0, 0, 0, 0]); // interfaces, fields
+            out.extend((methods.len() as u16).to_be_bytes());
+            for ((_, code), name) in methods.iter().zip(&names) {
+                out.extend([0, 0x09]); // public static
+                out.extend(name.to_be_bytes());
+                out.extend(descriptor.to_be_bytes());
+                let mut attribute = vec![0, 0, 0, 1]; // max_stack, max_locals
+                attribute.extend((code.len() as u32).to_be_bytes());
+                attribute.extend(*code);
+                attribute.extend([0, 0]); // exception table
+                attribute.extend([0, 0]); // code attributes
+                out.extend([0, 1]);
+                out.extend(code_attribute.to_be_bytes());
+                out.extend((attribute.len() as u32).to_be_bytes());
+                out.extend(attribute);
+            }
+            match bootstrap_attribute {
+                Some(name) => {
+                    out.extend([0, 1]);
+                    out.extend(name.to_be_bytes());
+                    let mut attribute = (self.bootstrap.len() as u16).to_be_bytes().to_vec();
+                    for (handle, arguments) in &self.bootstrap {
+                        attribute.extend(handle.to_be_bytes());
+                        attribute.extend((arguments.len() as u16).to_be_bytes());
+                        for argument in arguments {
+                            attribute.extend(argument.to_be_bytes());
+                        }
+                    }
+                    out.extend((attribute.len() as u32).to_be_bytes());
+                    out.extend(attribute);
+                }
+                None => out.extend([0, 0]),
+            }
+            out
+        }
+    }
+
     /// A tiny class carrying a real `@Mixin(targets=...)` and method
     /// `@Inject(method=..., at=@At(...))` annotation payload. Used by the
     /// census fixture to exercise class-file annotation decoding.
@@ -2379,7 +2536,7 @@ pub(crate) mod tests_support {
 
 #[cfg(test)]
 mod tests {
-    use super::tests_support::class_with as class_file;
+    use super::tests_support::{PoolBuilder, class_with as class_file};
     use super::*;
 
     const AT: &str = "Lorg/spongepowered/asm/mixin/injection/At;";
@@ -3295,6 +3452,373 @@ public-f net.minecraft.world.level.Level method_1 ()V
                 "META-INF/accesstransformer.cfg".to_owned()
             ]),
             ["META-INF/accesstransformer.cfg"]
+        );
+    }
+
+    /// One instruction that names a pool index: a call, a field access or an
+    /// `ldc_w`.
+    fn indexed(op: u8, index: u16) -> Vec<u8> {
+        let mut out = vec![op];
+        out.extend(index.to_be_bytes());
+        out
+    }
+
+    fn target(kind: CallKind, owner: &str, name: &str, descriptor: &str) -> CallTarget {
+        CallTarget {
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+            descriptor: descriptor.to_owned(),
+            kind,
+        }
+    }
+
+    /// Parses the class `a/Caller` with one method `run` whose body is `code`.
+    fn scanned(pool: &mut PoolBuilder, code: &[u8]) -> Class {
+        let bytes = pool.build("a/Caller", "java/lang/Object", &[("run", code)]);
+        parse(&bytes).expect("the fixture is a class file")
+    }
+
+    /// The error scanning `code` as `a/Caller#run` produces, if any.
+    fn failure(code: &[u8]) -> Option<String> {
+        scanned(&mut PoolBuilder::default(), code).body_error
+    }
+
+    #[test]
+    fn body_scan_keeps_call_kinds_and_overloads_apart() {
+        let mut pool = PoolBuilder::default();
+        let int_add = pool.method("a/Math", "add", "(I)I");
+        let pair_add = pool.method("a/Math", "add", "(II)I");
+        let clamp = pool.method("a/Math", "clamp", "(I)I");
+        let init = pool.method("a/Math", "<init>", "()V");
+        let size = pool.interface_method("java/util/List", "size", "()I");
+        let mut code = indexed(0xb6, int_add);
+        code.extend(indexed(0xb6, pair_add));
+        code.extend(indexed(0xb8, clamp));
+        code.extend(indexed(0xb7, init));
+        // invokeinterface: opcode, index, count, zero.
+        code.extend([0xb9]);
+        code.extend(size.to_be_bytes());
+        code.extend([2, 0]);
+        code.push(0xb1);
+        let class = scanned(&mut pool, &code);
+        assert_eq!(class.body_error, None);
+        assert_eq!(
+            class.body_refs,
+            [
+                target(CallKind::Virtual, "a/Math", "add", "(I)I"),
+                target(CallKind::Virtual, "a/Math", "add", "(II)I"),
+                target(CallKind::Static, "a/Math", "clamp", "(I)I"),
+                target(CallKind::Special, "a/Math", "<init>", "()V"),
+                target(CallKind::Interface, "java/util/List", "size", "()I"),
+            ]
+        );
+        // Overloads stay distinct, and the map is sorted by key, not by the
+        // order the call sites appear in.
+        let calls = class.calls();
+        assert_eq!(
+            calls.keys().cloned().collect::<Vec<_>>(),
+            [
+                "a/Math#<init>(()V)",
+                "a/Math#add((I)I)",
+                "a/Math#add((II)I)",
+                "a/Math#clamp((I)I)",
+                "java/util/List#size(()I)",
+            ]
+        );
+        assert!(calls.values().all(|sites| *sites == 1), "{calls:?}");
+        assert!(class.field_refs().is_empty());
+    }
+
+    #[test]
+    fn body_scan_reads_fields_literals_and_handles() {
+        let mut pool = PoolBuilder::default();
+        let count = pool.field("a/State", "count", "I");
+        let long = pool.field("a/State", "count", "J");
+        let held = pool.field("a/State", "name", "Ljava/lang/String;");
+        let mut code = indexed(0xb2, count); // getstatic, twice
+        code.extend(indexed(0xb2, count));
+        code.extend(indexed(0xb3, long)); // putstatic
+        code.extend(indexed(0xb4, held)); // getfield
+        code.extend(indexed(0xb5, held)); // putfield
+        code.push(0xb1);
+        let fields = scanned(&mut pool, &code);
+        assert_eq!(fields.body_error, None);
+        assert!(fields.body_refs.iter().all(CallTarget::is_field));
+        assert_eq!(
+            fields.field_refs(),
+            BTreeMap::from([
+                ("a/State#count(I)".to_owned(), 2),
+                ("a/State#count(J)".to_owned(), 1),
+                ("a/State#name(Ljava/lang/String;)".to_owned(), 2),
+            ])
+        );
+        assert!(fields.calls().is_empty(), "a field access is not a call");
+
+        // `ldc`/`ldc_w` of a class names it, of a method handle the member
+        // behind it; other constants are not references.
+        let item = pool.class("net/minecraft/world/item/Item");
+        let array = pool.class("[I");
+        let number = pool.integer(7);
+        let tick = pool.method("a/Lamp", "tick", "()V");
+        let handle = pool.handle(6, tick);
+        let mut code = vec![0x12, item as u8];
+        code.extend(indexed(0x13, item));
+        code.extend([0x12, array as u8]);
+        code.extend([0x12, number as u8]);
+        code.extend(indexed(0x13, handle));
+        code.push(0xb1);
+        let class = scanned(&mut pool, &code);
+        assert_eq!(class.body_error, None);
+        assert_eq!(
+            class.body_refs,
+            [
+                target(CallKind::Class, "net/minecraft/world/item/Item", "", ""),
+                target(CallKind::Class, "net/minecraft/world/item/Item", "", ""),
+                target(CallKind::MethodHandle, "a/Lamp", "tick", "()V"),
+            ]
+        );
+        assert_eq!(class.body_refs[0].key(), "net/minecraft/world/item/Item");
+        assert_eq!(class.body_refs[2].key(), "a/Lamp#tick(()V)");
+        assert_eq!(
+            class.calls(),
+            BTreeMap::from([("a/Lamp#tick(()V)".to_owned(), 1)])
+        );
+    }
+
+    /// `at` nops, one `tableswitch`/`lookupswitch` there, then a `getstatic`.
+    fn switch_then_field(op: u8, at: usize, field: u16) -> Vec<u8> {
+        let mut code = vec![0x00; at];
+        code.push(op);
+        code.extend(vec![0xee; (4 - (at + 1) % 4) % 4]); // padding
+        code.extend([0, 0, 0, 0]); // default
+        if op == 0xaa {
+            code.extend(3i32.to_be_bytes()); // low
+            code.extend(5i32.to_be_bytes()); // high: three targets
+            code.extend(vec![0; 3 * 4]);
+        } else {
+            code.extend(2i32.to_be_bytes()); // two match/offset pairs
+            code.extend(vec![0; 2 * 8]);
+        }
+        code.extend(indexed(0xb2, field));
+        code.push(0xb1);
+        code
+    }
+
+    #[test]
+    fn body_scan_lands_after_variable_length_operands() {
+        // The count byte of an `invokeinterface` is not an opcode, and the
+        // fixed-length operands behind it are two to six bytes long.
+        let mut pool = PoolBuilder::default();
+        let size = pool.interface_method("java/util/List", "size", "()I");
+        let array = pool.class("[I");
+        let count = pool.field("a/State", "count", "I");
+        let mut code = vec![0xb9];
+        code.extend(size.to_be_bytes());
+        code.extend([0x12, 0x00]); // the count reads as `ldc` if misread
+        code.extend([0x84, 0x01, 0x02]); // iinc: three bytes
+        code.extend([0xc5]); // multianewarray: four
+        code.extend(array.to_be_bytes());
+        code.push(2);
+        code.extend([0xc4, 0x15, 0x01, 0x00]); // wide iload: four
+        code.extend([0xc4, 0x84, 0x01, 0x00, 0x00, 0x07]); // wide iinc: six
+        code.extend(indexed(0xb2, count));
+        code.push(0xb1);
+        let class = scanned(&mut pool, &code);
+        assert_eq!(class.body_error, None);
+        assert_eq!(
+            class.body_refs,
+            [
+                target(CallKind::Interface, "java/util/List", "size", "()I"),
+                target(CallKind::GetStatic, "a/State", "count", "I"),
+            ]
+        );
+
+        // A switch pads to the next 4-byte boundary from the start of the
+        // code array: every offset and both tables are tried.
+        for op in [0xaa, 0xab] {
+            for at in 0..4 {
+                let mut pool = PoolBuilder::default();
+                let count = pool.field("a/State", "count", "I");
+                let class = scanned(&mut pool, &switch_then_field(op, at, count));
+                assert_eq!(class.body_error, None, "switch {op:#04x} at {at}");
+                assert_eq!(
+                    class.body_refs,
+                    [target(CallKind::GetStatic, "a/State", "count", "I")],
+                    "switch {op:#04x} at {at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn body_scan_reads_invocations_dynamics_bootstrap_and_arguments() {
+        let mut pool = PoolBuilder::default();
+        let metafactory = pool.method(
+            "java/lang/invoke/LambdaMetafactory",
+            "metafactory",
+            "()Ljava/lang/invoke/CallSite;",
+        );
+        let bootstrap = pool.handle(6, metafactory);
+        let tick = pool.method("a/Lamp", "tick", "()V");
+        let tick = pool.handle(5, tick);
+        let indy = pool.dynamic("run", "()Ljava/lang/Runnable;", bootstrap, &[tick]);
+        // invokedynamic is five bytes: opcode, index, then two zero bytes.
+        let mut code = indexed(0xba, indy);
+        code.extend([0, 0]);
+        code.push(0xb1);
+        let class = scanned(&mut pool, &code);
+        assert_eq!(class.body_error, None);
+        assert_eq!(
+            class.body_refs,
+            [
+                target(
+                    CallKind::MethodHandle,
+                    "java/lang/invoke/LambdaMetafactory",
+                    "metafactory",
+                    "()Ljava/lang/invoke/CallSite;"
+                ),
+                target(CallKind::MethodHandle, "a/Lamp", "tick", "()V"),
+            ]
+        );
+        assert_eq!(class.calls().len(), 2, "a lambda's body is a call site");
+    }
+
+    #[test]
+    fn body_scan_keeps_earlier_refs_and_names_the_failing_offset() {
+        let mut pool = PoolBuilder::default();
+        let count = pool.field("a/State", "count", "I");
+        let name = pool.field("a/State", "name", "Ljava/lang/String;");
+        let mut broken = indexed(0xb2, count);
+        broken.push(0xff); // not an opcode
+        let mut later = indexed(0xb2, name);
+        later.push(0xb1);
+        let bytes = pool.build(
+            "a/Caller",
+            "java/lang/Object",
+            &[("first", &broken), ("later", &later)],
+        );
+        let class = parse(&bytes).expect("the fixture is a class file");
+        assert_eq!(
+            class.body_refs,
+            [target(CallKind::GetStatic, "a/State", "count", "I")],
+            "the references read before the failure are kept"
+        );
+        assert_eq!(
+            class.body_error.as_deref(),
+            Some("a/Caller#first at offset 3: unknown opcode 0xff")
+        );
+        // The rest of the class is still read; only the body scan stopped.
+        assert!(class.refs.contains("a/State"));
+        assert_eq!(class.methods, ["first", "later"]);
+
+        // An operand, a wide and both switches fail at their own offset.
+        assert_eq!(
+            failure(&[0x00, 0xb6, 0x00]).as_deref(),
+            Some("a/Caller#run at offset 1: operand runs past the code")
+        );
+        assert_eq!(
+            failure(&[0x00, 0xc4, 0x00, 0x00, 0x00]).as_deref(),
+            Some("a/Caller#run at offset 1: wide of opcode 0x00")
+        );
+        let mut table = vec![0xaa, 0, 0, 0, 0, 0, 0, 0]; // padding, default
+        table.extend(5i32.to_be_bytes()); // low
+        table.extend(4i32.to_be_bytes()); // high, below low
+        assert_eq!(
+            failure(&table).as_deref(),
+            Some("a/Caller#run at offset 0: tableswitch high below low")
+        );
+        let mut lookup = vec![0xab, 0, 0, 0, 0, 0, 0, 0]; // padding, default
+        lookup.extend((-1i32).to_be_bytes()); // pairs
+        assert_eq!(
+            failure(&lookup).as_deref(),
+            Some("a/Caller#run at offset 0: lookupswitch pairs below zero")
+        );
+
+        // A Code attribute that cannot even be walked names the class at 0.
+        let mut out = Vec::new();
+        for (attribute, needle) in [
+            (&[0u8, 0][..], "truncated Code attribute"),
+            (
+                &[0, 0, 0, 1, 0, 0, 0, 10, 0x00][..],
+                "code runs past the attribute",
+            ),
+            (&[0, 0, 0, 1, 0, 1, 0, 1][..], "the limit is 65536"),
+        ] {
+            let error = scan_method_code(attribute, &Pool::default(), "a/C", "run", &mut out)
+                .expect_err("the attribute is malformed");
+            assert!(error.starts_with("a/C#run at offset 0: "), "{error}");
+            assert!(error.contains(needle), "{error}");
+        }
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn body_scan_caps_a_class_and_sums_references_per_site() {
+        // 21845 `invokestatic`s fill the JVM's 64 KiB limit on one method;
+        // five of them pass the per-class cap of 100000 references.
+        let mut pool = PoolBuilder::default();
+        let count = pool.method("a/State", "count", "()I");
+        let mut full = Vec::with_capacity(65_535);
+        while full.len() < 65_535 {
+            full.extend(indexed(0xb8, count));
+        }
+        let slice = full.as_slice();
+        let bytes = pool.build(
+            "a/Big",
+            "java/lang/Object",
+            &[
+                ("a", slice),
+                ("b", slice),
+                ("c", slice),
+                ("d", slice),
+                ("e", slice),
+            ],
+        );
+        let class = parse(&bytes).expect("the fixture is a class file");
+        assert_eq!(class.body_error, None, "the cap is not an error");
+        assert_eq!(
+            class.body_refs.len(),
+            BODY_REFS_MAX,
+            "the scan stops at the per-class cap"
+        );
+        assert_eq!(
+            class.calls(),
+            BTreeMap::from([("a/State#count(()I)".to_owned(), BODY_REFS_MAX)])
+        );
+
+        // `method_references`/`field_references` sum the same key across
+        // classes, still sorted.
+        let mut pool = PoolBuilder::default();
+        let call = pool.method("a/Math", "add", "(I)I");
+        let other = pool.method("a/Math", "clamp", "(I)I");
+        let field = pool.field("a/State", "count", "I");
+        let mut code = indexed(0xb2, field);
+        code.extend(indexed(0xb3, field));
+        code.extend(indexed(0xb6, call));
+        code.extend(indexed(0xb6, call));
+        code.extend(indexed(0xb8, other));
+        code.push(0xb1);
+        let classes = [
+            parse(&pool.build("a/One", "java/lang/Object", &[("run", &code)])).unwrap(),
+            parse(&pool.build("a/Two", "java/lang/Object", &[("run", &code)])).unwrap(),
+        ];
+        assert_eq!(
+            method_references(&classes),
+            BTreeMap::from([
+                ("a/Math#add((I)I)".to_owned(), 4),
+                ("a/Math#clamp((I)I)".to_owned(), 2),
+            ])
+        );
+        assert_eq!(
+            method_references(&classes)
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["a/Math#add((I)I)", "a/Math#clamp((I)I)"]
+        );
+        assert_eq!(
+            field_references(&classes),
+            BTreeMap::from([("a/State#count(I)".to_owned(), 4)])
         );
     }
 }
