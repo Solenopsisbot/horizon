@@ -707,9 +707,8 @@ impl Census {
             // or call-site selector to translate. Emit it as a direct method
             // replacement operation; the runtime can bind the mod body to the
             // named native hook without interpreting bytecode at the target.
-            let executable_overwrite = point.kind == "overwrite"
-                && point.at.is_empty()
-                && point.hooks.len() == 1;
+            let executable_overwrite =
+                point.kind == "overwrite" && point.at.is_empty() && point.hooks.len() == 1;
             let (status, reason) = if executable_overwrite {
                 (
                     "executable".to_owned(),
