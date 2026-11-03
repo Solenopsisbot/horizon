@@ -214,6 +214,13 @@ pub struct Totals {
     /// `@Accessor`, `@Invoker` and `@Shadow` points that need a member shape,
     /// but no Rust call-site hook.
     pub member_only_points: usize,
+    /// Nested jars across every jar, by loader folder (`fabric`, `neoforge`,
+    /// `unknown`). Identity only: the nested classes stay in the archive.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub nested_jar_kinds: BTreeMap<String, usize>,
+    /// Nested entries whose own metadata could not be read.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub nested_jar_errors: usize,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -245,6 +252,17 @@ pub struct JarCensus {
     pub mixin_config_values: BTreeMap<String, BTreeMap<String, String>>,
     /// Jars nested under `META-INF/jars/` that were read too.
     pub nested: usize,
+    /// This jar's nested jars, identity only, sorted by entry. The classes,
+    /// data and assets of a nested jar stay in the archive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_jars: Vec<jar::NestedJar>,
+    /// Nested jars per loader folder (`fabric`, `neoforge`, `unknown`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub nested_jar_kinds: BTreeMap<String, usize>,
+    /// Bounded `(entry, reason)` for nested entries whose metadata was
+    /// malformed or unreadable. Report only: the entry is still listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_jar_errors: Vec<(String, String)>,
     pub references: usize,
     pub members: usize,
     pub mixins: usize,
@@ -513,6 +531,9 @@ impl Census {
             .count();
         // Fabric's and NeoForge's jars-in-a-jar (JiJ): a bundler's classes are
         // its nested jars'.
+        let nested_jars = sorted_nested_jars(&info.nested_jars);
+        let nested_jar_kinds = nested_kind_counts(&nested_jars);
+        let nested_jar_errors = bounded_nested_errors(&info.nested_jar_errors);
         let parsed = classes::read_jar(path)?;
         let mut entrypoints = info.entrypoints.clone();
         if loader == "neoforge" {
@@ -540,6 +561,9 @@ impl Census {
             mixin_config_fields: mixin_config_fields(&mut zip, &names),
             mixin_config_values: mixin_config_values(&mut zip, &names),
             nested,
+            nested_jars,
+            nested_jar_kinds,
+            nested_jar_errors,
             error,
             ..JarCensus::default()
         };
@@ -684,6 +708,7 @@ impl Census {
         self.totals.mixins += jar.mixins;
         self.totals.injections += jar.injections;
         self.totals.static_jars += usize::from(jar.static_code);
+        merge_nested_totals(&mut self.totals, &jar);
         self.jars.push(jar);
         Ok(())
     }
@@ -694,6 +719,13 @@ impl Census {
         self.totals.points_covered = 0;
         self.totals.points_report_only = 0;
         self.totals.member_only_points = 0;
+        // Nested-jar totals are recomputed from the jars rather than
+        // incremented, so a second `join` cannot double-count them.
+        self.totals.nested_jar_kinds.clear();
+        self.totals.nested_jar_errors = 0;
+        for jar in &self.jars {
+            merge_nested_totals(&mut self.totals, jar);
+        }
         for point in &mut self.points {
             if !NEEDS_HOOK.contains(&point.kind.as_str()) {
                 self.totals.member_only_points += point.count;
@@ -816,6 +848,21 @@ impl Census {
         if broken > 0 {
             out.push_str(&format!("{broken} jars with unreadable metadata\n"));
         }
+        let mut nested = self
+            .totals
+            .nested_jar_kinds
+            .iter()
+            .map(|(kind, count)| format!("{count} {kind}"))
+            .collect::<Vec<_>>();
+        if self.totals.nested_jar_errors > 0 {
+            nested.push(format!("{} metadata errors", self.totals.nested_jar_errors));
+        }
+        if !nested.is_empty() {
+            out.push_str(&format!(
+                "nested jars: {} (report-only; nested classes stay in the archive)\n",
+                nested.join(", ")
+            ));
+        }
         let widener_targets: usize = self.access_widener_targets.values().sum();
         let transformer_targets: usize = self.access_transformer_targets.values().sum();
         if widener_targets > 0 || transformer_targets > 0 {
@@ -918,6 +965,72 @@ impl Census {
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         fs::write(path, json).map_err(|e| format!("{}: {e}", path.display()))
     }
+}
+
+/// One reported nested error stays one bounded line, and only the first rows
+/// are kept: a bundler cannot grow the report without limit.
+const MAX_NESTED_ERRORS: usize = 64;
+const MAX_NESTED_TEXT: usize = 160;
+
+/// A nested jar's loader folder as the census writes it. Nested metadata is
+/// report only: nothing is loaded, resolved or remapped from it.
+fn nested_kind_label(kind: jar::NestedJarKind) -> &'static str {
+    match kind {
+        jar::NestedJarKind::Fabric => "fabric",
+        jar::NestedJarKind::NeoForge => "neoforge",
+        jar::NestedJarKind::Unknown => "unknown",
+    }
+}
+
+/// Sorted by entry (then identity), so the report does not depend on archive
+/// order.
+fn sorted_nested_jars(jars: &[jar::NestedJar]) -> Vec<jar::NestedJar> {
+    let mut out = jars.to_vec();
+    out.sort_by(|a, b| {
+        a.entry
+            .cmp(&b.entry)
+            .then_with(|| nested_kind_label(a.kind).cmp(nested_kind_label(b.kind)))
+            .then_with(|| a.id.cmp(&b.id))
+            .then_with(|| a.version.cmp(&b.version))
+    });
+    out.dedup();
+    out
+}
+
+fn nested_kind_counts(jars: &[jar::NestedJar]) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    for nested in jars {
+        *out.entry(nested_kind_label(nested.kind).to_owned())
+            .or_default() += 1;
+    }
+    out
+}
+
+/// Folds one jar's nested counts into the run's totals. `Census::join`
+/// replays this over every jar, so the fold is idempotent.
+fn merge_nested_totals(totals: &mut Totals, jar: &JarCensus) {
+    for (kind, count) in &jar.nested_jar_kinds {
+        *totals.nested_jar_kinds.entry(kind.clone()).or_default() += count;
+    }
+    totals.nested_jar_errors += jar.nested_jar_errors.len();
+}
+
+fn bounded_nested_errors(errors: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = errors
+        .iter()
+        .take(MAX_NESTED_ERRORS)
+        .map(|(entry, reason)| (bounded_text(entry), bounded_text(reason)))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn bounded_text(text: &str) -> String {
+    text.replace(['\r', '\n'], " ")
+        .chars()
+        .take(MAX_NESTED_TEXT)
+        .collect()
 }
 
 fn member_shape(member: &classes::Member) -> String {
@@ -1383,6 +1496,10 @@ fn translation_mode(kind: &str) -> &'static str {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Mixin's `method` element can be a scalar or an array. The class reader
@@ -2390,5 +2507,163 @@ mod tests {
         let json = serde_json::to_value(&point).unwrap();
         assert!(json.get("slice").is_none());
         assert!(json.get("cancellable").is_none());
+    }
+
+    /// A jar built from `entries`, in memory: enough for the census, whose
+    /// nested reads are bounded to entry names and loader metadata.
+    fn jar_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, body) in entries {
+            zip.start_file(*name, options).unwrap();
+            std::io::Write::write_all(&mut zip, body).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn nested_jars_fold_into_per_jar_and_aggregate_counts() {
+        let dir = std::env::temp_dir().join("horizon-census-nested");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bundle.jar");
+        let fabric = |id: &str| {
+            jar_bytes(&[(
+                "fabric.mod.json",
+                format!(r#"{{"id":"{id}","version":"1.0"}}"#).as_bytes(),
+            )])
+        };
+        let neo = jar_bytes(&[(
+            "META-INF/neoforge.mods.toml",
+            b"[[mods]]\nmodId = \"neo-a\"\nversion = \"3.0\"\n".as_slice(),
+        )]);
+        // A multi-release entry with malformed Fabric metadata: it is still
+        // listed as a nested jar, and its read failure is one bounded error.
+        let broken = jar_bytes(&[("fabric.mod.json", b"{not json".as_slice())]);
+        let fabric_b = fabric("fabric-b");
+        let fabric_a = fabric("fabric-a");
+        std::fs::write(
+            &path,
+            jar_bytes(&[
+                ("fabric.mod.json", br#"{"id":"bundle"}"#.as_slice()),
+                ("META-INF/jars/fabric-b.jar", fabric_b.as_slice()),
+                ("META-INF/jars/fabric-a.jar", fabric_a.as_slice()),
+                ("META-INF/jarjar/neo-a.jar", neo.as_slice()),
+                ("META-INF/versions/9/extra.jar", broken.as_slice()),
+            ]),
+        )
+        .unwrap();
+
+        let census = read(&path).unwrap();
+        let jar = &census.jars[0];
+        assert_eq!(jar.nested, 2);
+        assert_eq!(
+            jar.nested_jars
+                .iter()
+                .map(|n| n.entry.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "META-INF/jarjar/neo-a.jar",
+                "META-INF/jars/fabric-a.jar",
+                "META-INF/jars/fabric-b.jar",
+                "META-INF/versions/9/extra.jar",
+            ]
+        );
+        assert_eq!(jar.nested_jars[1].id.as_deref(), Some("fabric-a"));
+        assert_eq!(jar.nested_jars[0].kind, jar::NestedJarKind::NeoForge);
+        assert_eq!(jar.nested_jars[3].kind, jar::NestedJarKind::Unknown);
+        assert_eq!(jar.nested_jars[3].id, None);
+        assert_eq!(
+            jar.nested_jar_kinds,
+            BTreeMap::from([
+                ("fabric".to_owned(), 2),
+                ("neoforge".to_owned(), 1),
+                ("unknown".to_owned(), 1),
+            ])
+        );
+        assert_eq!(jar.nested_jar_errors.len(), 1);
+        assert_eq!(jar.nested_jar_errors[0].0, "META-INF/versions/9/extra.jar");
+        assert_eq!(
+            census.totals.nested_jar_kinds,
+            BTreeMap::from([
+                ("fabric".to_owned(), 2),
+                ("neoforge".to_owned(), 1),
+                ("unknown".to_owned(), 1),
+            ])
+        );
+        assert_eq!(census.totals.nested_jar_errors, 1);
+        assert!(census.summary(5).contains(
+            "nested jars: 2 fabric, 1 neoforge, 1 unknown, 1 metadata errors (report-only; nested classes stay in the archive)"
+        ));
+    }
+
+    #[test]
+    fn nested_totals_are_folded_and_bounded_across_jars() {
+        let jar = |file: &str, kinds: &[(&str, usize)], errors: usize| JarCensus {
+            file: file.to_owned(),
+            nested_jar_kinds: kinds
+                .iter()
+                .map(|(kind, count)| ((*kind).to_owned(), *count))
+                .collect(),
+            nested_jar_errors: (0..errors)
+                .map(|i| (format!("{file}#{i}"), "nested jar is unreadable".to_owned()))
+                .collect(),
+            ..JarCensus::default()
+        };
+        let mut census = Census {
+            jars: vec![
+                jar("a.jar", &[("fabric", 2)], 1),
+                jar("b.jar", &[("neoforge", 1)], 0),
+            ],
+            ..Census::default()
+        };
+        // `join` recomputes from the jars, so a second join must not double.
+        census.join(&HookIndex::default());
+        census.join(&HookIndex::default());
+        assert_eq!(
+            census.totals.nested_jar_kinds,
+            BTreeMap::from([("fabric".to_owned(), 2), ("neoforge".to_owned(), 1)])
+        );
+        assert_eq!(census.totals.nested_jar_errors, 1);
+
+        // Report rows stay bounded when a census file is read back unbounded.
+        let many: Vec<(String, String)> = (0..(MAX_NESTED_ERRORS + 8))
+            .map(|i| (format!("e{i}.jar"), "x".repeat(MAX_NESTED_TEXT * 2)))
+            .collect();
+        let bounded = bounded_nested_errors(&many);
+        assert_eq!(bounded.len(), MAX_NESTED_ERRORS);
+        assert!(bounded.iter().all(|(entry, reason)| {
+            reason.chars().count() == MAX_NESTED_TEXT && !entry.contains('\n')
+        }));
+    }
+
+    #[test]
+    fn older_census_json_without_nested_metadata_still_deserializes() {
+        let json = serde_json::json!({
+            "totals": {
+                "jars": 1, "classes": 2, "references": 0, "members": 0,
+                "mixins": 0, "injections": 0, "static_jars": 1,
+                "points_needing_hooks": 0, "points_covered": 0,
+                "member_only_points": 0
+            },
+            "jars": [{
+                "file": "a.jar", "mod_id": "a", "name": "A", "version": "1",
+                "loader": "fabric", "minecraft": "26.3", "classes": 2,
+                "nested": 3, "references": 0, "members": 0, "mixins": 0,
+                "injections": 0, "static_code": true, "dynamic": []
+            }],
+            "classes": {}, "members": {}, "mixin_targets": {},
+            "injections": {}, "at": {}, "points": []
+        });
+        let census: Census = serde_json::from_value(json).unwrap();
+        assert_eq!(census.jars[0].nested, 3);
+        assert!(census.jars[0].nested_jars.is_empty());
+        assert!(census.jars[0].nested_jar_kinds.is_empty());
+        assert!(census.jars[0].nested_jar_errors.is_empty());
+        assert!(census.totals.nested_jar_kinds.is_empty());
+        assert_eq!(census.totals.nested_jar_errors, 0);
+        let json = serde_json::to_value(&census).unwrap();
+        assert!(json["jars"][0].get("nested_jars").is_none());
+        assert!(json["totals"].get("nested_jar_errors").is_none());
+        assert!(!census.summary(5).contains("nested jars"));
     }
 }
