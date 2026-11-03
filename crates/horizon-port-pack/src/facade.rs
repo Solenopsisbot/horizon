@@ -203,6 +203,13 @@ pub fn generate_many(
                 });
         }
     }
+    // Bounded entity values that the generated bodies construct have to exist
+    // in the same façade, or javac rejects the compilation unit before a mod
+    // can run: `EntityType.getDimensions()` returns an `EntityDimensions`,
+    // whose box is an `AABB` at a `Vec3`, and `SpawnPlacements` keeps its
+    // registrations keyed by the placement and heightmap types. The closure
+    // below injects them for every class it reaches, so a class that only
+    // enters the set through another member's descriptor is covered too.
     // A stub cannot compile without the types it extends and names: close the
     // set over superclasses, interfaces and the descriptors of the members
     // that will be emitted.
@@ -274,6 +281,11 @@ pub fn generate_many(
                 for ty in descriptor_types(descriptor) {
                     add(&ty);
                 }
+            }
+        }
+        for support in support_types(&name) {
+            if game.contains_key(*support) {
+                add(support);
             }
         }
     }
@@ -1037,6 +1049,37 @@ fn tree(
     }
 }
 
+/// Interfaces that a mod passes a lambda to. `render` otherwise gives every
+/// interface method a `default` body, which leaves `LambdaMetafactory` without
+/// an abstract method to bind. `SpawnPlacements.register` takes one such
+/// predicate, so it is the one the bounded entity façade keeps abstract.
+fn functional_interface(name: &str) -> bool {
+    name == "net/minecraft/world/entity/SpawnPlacements$SpawnPredicate"
+}
+
+/// Bounded value classes that a generated body constructs. They have to travel
+/// with the class that names them, or `javac` stops on a symbol the façade
+/// never emitted. The closure in `generate_many` re-queues each entry, so a
+/// support class can pull in its own support.
+fn support_types(name: &str) -> &'static [&'static str] {
+    match name {
+        "net/minecraft/world/entity/EntityType"
+        | "net/minecraft/world/entity/EntityType$Builder" => {
+            &["net/minecraft/world/entity/EntityDimensions"]
+        }
+        "net/minecraft/world/entity/EntityDimensions" => &[
+            "net/minecraft/world/phys/AABB",
+            "net/minecraft/world/phys/Vec3",
+        ],
+        "net/minecraft/world/entity/SpawnPlacements" => &[
+            "net/minecraft/world/entity/SpawnPlacementType",
+            "net/minecraft/world/entity/SpawnPlacementTypes",
+            "net/minecraft/world/level/levelgen/Heightmap$Types",
+        ],
+        _ => &[],
+    }
+}
+
 fn render(
     class: &Class,
     used: Option<&BTreeSet<(String, String)>>,
@@ -1073,6 +1116,47 @@ fn render(
         && !nested
     {
         let _ = writeln!(out, "package {};", package.replace('/', "."));
+    }
+    // `EntityDimensions` is a small immutable value in 26.3 (the parity oracles
+    // call its `scalable`/`fixed`/`makeBoundingBox` factories and its `width`
+    // component). The façade needs the value, not the component plumbing: a
+    // width/height/eye-height triple that builds a box the same way `Entity`
+    // does, so `EntityType.getDimensions()` can hand mod code a usable object
+    // without any world state. It is written by hand because a record cannot
+    // carry the extra accessors and backing fields that snapshotted mod code
+    // names.
+    if class.name == "net/minecraft/world/entity/EntityDimensions" {
+        out.push_str(concat!(
+            "public class EntityDimensions {\n",
+            "    protected float width;\n",
+            "    protected float height;\n",
+            "    protected float eyeHeight;\n",
+            "    protected boolean fixed;\n",
+            "    public EntityDimensions() { this(0.6f, 1.8f, 1.62f, false); }\n",
+            "    public EntityDimensions(float width, float height) { this(width, height, height * 0.85f, false); }\n",
+            "    public EntityDimensions(float width, float height, float eyeHeight) { this(width, height, eyeHeight, false); }\n",
+            "    public EntityDimensions(float width, float height, float eyeHeight, boolean fixed) { this.width = width; this.height = height; this.eyeHeight = eyeHeight; this.fixed = fixed; }\n",
+            "    public static net.minecraft.world.entity.EntityDimensions scalable(float width, float height) { return new net.minecraft.world.entity.EntityDimensions(width, height, height * 0.85f, false); }\n",
+            "    public static net.minecraft.world.entity.EntityDimensions fixed(float width, float height) { return new net.minecraft.world.entity.EntityDimensions(width, height, height * 0.85f, true); }\n",
+            "    public net.minecraft.world.entity.EntityDimensions scale(float factor) { return scale(factor, factor); }\n",
+            "    public net.minecraft.world.entity.EntityDimensions scale(float widthFactor, float heightFactor) { return new net.minecraft.world.entity.EntityDimensions(width * widthFactor, height * heightFactor, eyeHeight * heightFactor, fixed); }\n",
+            "    public net.minecraft.world.entity.EntityDimensions withEyeHeight(float eyeHeight) { return new net.minecraft.world.entity.EntityDimensions(width, height, eyeHeight, fixed); }\n",
+            "    public net.minecraft.world.phys.AABB makeBoundingBox(double x, double y, double z) { double half = (double) (width / 2.0f); return new net.minecraft.world.phys.AABB(x - half, y, z - half, x + half, y + (double) height, z + half); }\n",
+            "    public net.minecraft.world.phys.AABB makeBoundingBox(net.minecraft.world.phys.Vec3 pos) { /* bounded: Vec3 components are not read in the façade, so this is the zero-sized box at the origin */ return new net.minecraft.world.phys.AABB(0.0, 0.0, 0.0, 0.0, 0.0, 0.0); }\n",
+            "    public float width() { return width; }\n",
+            "    public float height() { return height; }\n",
+            "    public float eyeHeight() { return eyeHeight; }\n",
+            "    public boolean fixed() { return fixed; }\n",
+            "    public float getWidth() { return width; }\n",
+            "    public float getHeight() { return height; }\n",
+            "    public float getEyeHeight() { return eyeHeight; }\n",
+            "}\n",
+        ));
+        report.classes += 1;
+        report.fields += 4;
+        // Four constructors and fourteen value methods.
+        report.methods += 18;
+        return out;
     }
     if is_annotation {
         let _ = writeln!(out, "{modifier} @interface {simple} {{}}");
@@ -1371,13 +1455,25 @@ fn render(
     if class.name == "net/minecraft/world/entity/EntityType$Builder" {
         let _ = writeln!(
             out,
-            "    protected float horizonWidth = 0.6f;\n    protected float horizonHeight = 1.8f;\n    protected int horizonTrackingRange = 5;\n    protected int horizonUpdateInterval = 3;\n    protected boolean horizonFireImmune;\n    protected net.minecraft.world.entity.MobCategory horizonCategory = net.minecraft.world.entity.MobCategory.MISC;"
+            "    protected float horizonWidth = 0.6f;\n    protected float horizonHeight = 1.8f;\n    protected int horizonTrackingRange = 5;\n    protected int horizonUpdateInterval = 3;\n    protected boolean horizonFireImmune;\n    protected boolean horizonCanSpawnFarFromPlayer;\n    protected boolean horizonCanSummon = true;\n    protected boolean horizonSaves = true;\n    protected net.minecraft.world.entity.MobCategory horizonCategory = net.minecraft.world.entity.MobCategory.MISC;"
         );
     }
     if class.name == "net/minecraft/world/entity/EntityType" {
         let _ = writeln!(
             out,
-            "    protected float horizonWidth = 0.6f;\n    protected float horizonHeight = 1.8f;\n    protected int horizonTrackingRange = 5;\n    protected int horizonUpdateInterval = 3;\n    protected boolean horizonFireImmune;\n    protected net.minecraft.world.entity.MobCategory horizonCategory = net.minecraft.world.entity.MobCategory.MISC;\n    public EntityType() {{}}\n    public EntityType(float width, float height, int trackingRange, int updateInterval, boolean fireImmune) {{ this(width, height, trackingRange, updateInterval, fireImmune, net.minecraft.world.entity.MobCategory.MISC); }}\n    public EntityType(float width, float height, int trackingRange, int updateInterval, boolean fireImmune, net.minecraft.world.entity.MobCategory category) {{ this.horizonWidth = width; this.horizonHeight = height; this.horizonTrackingRange = trackingRange; this.horizonUpdateInterval = updateInterval; this.horizonFireImmune = fireImmune; this.horizonCategory = category == null ? net.minecraft.world.entity.MobCategory.MISC : category; }}"
+            "    protected float horizonWidth = 0.6f;\n    protected float horizonHeight = 1.8f;\n    protected int horizonTrackingRange = 5;\n    protected int horizonUpdateInterval = 3;\n    protected boolean horizonFireImmune;\n    protected boolean horizonCanSpawnFarFromPlayer;\n    protected boolean horizonCanSummon = true;\n    protected boolean horizonSaves = true;\n    protected String horizonDescriptionId = \"entity.minecraft.unknown\";\n    protected net.minecraft.world.entity.MobCategory horizonCategory = net.minecraft.world.entity.MobCategory.MISC;\n    public EntityType() {{}}\n    public EntityType(float width, float height, int trackingRange, int updateInterval, boolean fireImmune) {{ this(width, height, trackingRange, updateInterval, fireImmune, net.minecraft.world.entity.MobCategory.MISC); }}\n    public EntityType(float width, float height, int trackingRange, int updateInterval, boolean fireImmune, net.minecraft.world.entity.MobCategory category) {{ this.horizonWidth = width; this.horizonHeight = height; this.horizonTrackingRange = trackingRange; this.horizonUpdateInterval = updateInterval; this.horizonFireImmune = fireImmune; this.horizonCategory = category == null ? net.minecraft.world.entity.MobCategory.MISC : category; }}"
+        );
+    }
+    if class.name == "net/minecraft/world/entity/SpawnPlacements" {
+        // Registration is real state, so a mod's `register`/`getPlacementType`
+        // pair is self-consistent. Keys are the `EntityType` values the mod
+        // registers (identity, like the game's own table). The 26.3 names come
+        // from Horizon's own spawn model and `VanillaSpawnRulesOracle`
+        // (`SpawnPlacementTypes`, `getPlacementType`, `getHeightmapType`,
+        // `Heightmap.Types`); no decompiled 26.3 sources were present here.
+        let _ = writeln!(
+            out,
+            "    protected static final java.util.Map<Object, net.minecraft.world.entity.SpawnPlacementType> horizonPlacements = new java.util.LinkedHashMap<>();\n    protected static final java.util.Map<Object, net.minecraft.world.level.levelgen.Heightmap.Types> horizonHeightmaps = new java.util.LinkedHashMap<>();\n    protected static final java.util.Map<Object, Boolean> horizonSpawnRules = new java.util.LinkedHashMap<>();"
         );
     }
     if class.name == "net/minecraft/world/entity/Mob" {
@@ -1666,11 +1762,18 @@ fn render(
         };
         let body =
             runtime_body_with_descriptor(&class.name, &method.name, &ret, &method.descriptor);
-        let _ = writeln!(
-            out,
-            "    {visibility}{keyword}{ret} {}({params}) {{ {body} }}",
-            method.name
-        );
+        // A functional interface a mod hands a lambda to keeps exactly one
+        // abstract method: `default` would leave no lambda target at all, and
+        // an abstract method may not carry a body.
+        if is_interface && functional_interface(&class.name) && !method.is_static() {
+            let _ = writeln!(out, "    {visibility}{ret} {}({params});", method.name);
+        } else {
+            let _ = writeln!(
+                out,
+                "    {visibility}{keyword}{ret} {}({params}) {{ {body} }}",
+                method.name
+            );
+        }
         methods += 1;
     }
     // The NeoForge item-handler shim is compiled beside the generated game
@@ -3413,6 +3516,14 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         }
     }
     if class == "net/minecraft/world/entity/EntityType$Builder" {
+        if method == "sized"
+            && ret == "net.minecraft.world.entity.EntityType.Builder"
+            && descriptor.contains("Lnet/minecraft/world/entity/EntityDimensions;")
+        {
+            // The value overload: carry the triple's width and height into the
+            // same fields the two-float overload sets.
+            return "if (p0 != null) { horizonWidth = p0.getWidth(); horizonHeight = p0.getHeight(); } return this;".to_owned();
+        }
         if method == "sized" && ret == "net.minecraft.world.entity.EntityType.Builder" {
             return "horizonWidth = p0; horizonHeight = p1; return this;".to_owned();
         }
@@ -3426,6 +3537,24 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         if method == "fireImmune" && ret == "net.minecraft.world.entity.EntityType.Builder" {
             return "horizonFireImmune = true; return this;".to_owned();
         }
+        if method == "noSummon" && ret == "net.minecraft.world.entity.EntityType.Builder" {
+            return "horizonCanSummon = false; return this;".to_owned();
+        }
+        if method == "noSave" && ret == "net.minecraft.world.entity.EntityType.Builder" {
+            return "horizonSaves = false; return this;".to_owned();
+        }
+        if method == "canSpawnFarFromPlayer"
+            && ret == "net.minecraft.world.entity.EntityType.Builder"
+        {
+            return "horizonCanSpawnFarFromPlayer = true; return this;".to_owned();
+        }
+        if matches!(method, "immuneTo" | "requiredFeatures")
+            && ret == "net.minecraft.world.entity.EntityType.Builder"
+        {
+            // Bounded: the extra block tag / feature set is not recorded yet,
+            // so the chain stays alive without pretending to filter spawns.
+            return "return this;".to_owned();
+        }
         if method == "of" && ret == "net.minecraft.world.entity.EntityType.Builder" {
             if descriptor.contains("Lnet/minecraft/world/entity/MobCategory;") {
                 return "EntityType.Builder builder = new EntityType.Builder(); builder.horizonCategory = p1; return builder;".to_owned();
@@ -3436,7 +3565,10 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             return "return this;".to_owned();
         }
         if method == "build" && ret == "net.minecraft.world.entity.EntityType" {
-            return "return new net.minecraft.world.entity.EntityType(horizonWidth, horizonHeight, horizonTrackingRange, horizonUpdateInterval, horizonFireImmune, horizonCategory);".to_owned();
+            // Both the `String` and the `ResourceKey` overload name a type; the
+            // bounded value carries the flags the builder set, so a mod reading
+            // `canSummon()`/`canSpawnFarFromPlayer()` after `build` sees them.
+            return "net.minecraft.world.entity.EntityType value = new net.minecraft.world.entity.EntityType(horizonWidth, horizonHeight, horizonTrackingRange, horizonUpdateInterval, horizonFireImmune, horizonCategory); value.horizonCanSpawnFarFromPlayer = horizonCanSpawnFarFromPlayer; value.horizonCanSummon = horizonCanSummon; value.horizonSaves = horizonSaves; return value;".to_owned();
         }
     }
     if class == "net/minecraft/world/entity/EntityType" {
@@ -3446,7 +3578,41 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("getTrackingRange", "int") => return "return horizonTrackingRange;".to_owned(),
             ("getUpdateInterval", "int") => return "return horizonUpdateInterval;".to_owned(),
             ("fireImmune", "boolean") => return "return horizonFireImmune;".to_owned(),
+            ("canSpawnFarFromPlayer", "boolean") => {
+                return "return horizonCanSpawnFarFromPlayer;".to_owned();
+            }
+            ("canSummon", "boolean") => return "return horizonCanSummon;".to_owned(),
+            ("getDescriptionId", "java.lang.String") => {
+                return "return horizonDescriptionId;".to_owned();
+            }
+            ("getDimensions", "net.minecraft.world.entity.EntityDimensions") => {
+                return "return net.minecraft.world.entity.EntityDimensions.scalable(horizonWidth, horizonHeight);".to_owned();
+            }
+            ("getDescription", "net.minecraft.network.chat.Component") => {
+                return "return net.minecraft.network.chat.Component.literal(horizonDescriptionId);"
+                    .to_owned();
+            }
+            // 26.3 keys entity types through `BuiltInRegistries.ENTITY_TYPE`;
+            // these two are bounded placeholders for a snapshot whose mapping
+            // still named them on the type itself.
+            ("getDefaultLootTable", "java.lang.String") => {
+                return "return \"minecraft:empty\";".to_owned();
+            }
+            ("getDefaultLootTable", "net.minecraft.resources.ResourceKey") => {
+                return "return new net.minecraft.resources.ResourceKey();".to_owned();
+            }
+            ("getRegistryName", "net.minecraft.resources.Identifier") => {
+                return "return new net.minecraft.resources.Identifier(\"minecraft\", \"unknown\");"
+                    .to_owned();
+            }
             _ => {}
+        }
+        if method == "isEnabled"
+            && ret == "boolean"
+            && descriptor.contains("Lnet/minecraft/world/flag/FeatureFlagSet;")
+        {
+            // Feature flags gate vanilla content, not a mod's own registration.
+            return "return true;".to_owned();
         }
     }
     if class == "net/minecraft/world/entity/EntityType"
@@ -3454,6 +3620,47 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         && ret == "net.minecraft.world.entity.MobCategory"
     {
         return "return horizonCategory;".to_owned();
+    }
+    if class == "net/minecraft/world/entity/SpawnPlacements" {
+        if method == "register" && ret == "void" {
+            // Only write a slot the descriptor actually carries, so a snapshot
+            // that adds a height window still compiles.
+            let params = descriptor_types(descriptor);
+            let index = |ty: &str| params.iter().position(|param| param == ty);
+            if let (Some(entity), Some(placement), Some(heightmap)) = (
+                index("net/minecraft/world/entity/EntityType"),
+                index("net/minecraft/world/entity/SpawnPlacementType"),
+                index("net/minecraft/world/level/levelgen/Heightmap$Types"),
+            ) {
+                return format!(
+                    "if (p{entity} != null) {{ horizonPlacements.put(p{entity}, p{placement}); horizonHeightmaps.put(p{entity}, p{heightmap}); horizonSpawnRules.put(p{entity}, Boolean.TRUE); }}"
+                );
+            }
+            return "if (p0 != null) { horizonSpawnRules.put(p0, Boolean.TRUE); }".to_owned();
+        }
+        if method == "getPlacementType" && ret == "net.minecraft.world.entity.SpawnPlacementType" {
+            return "net.minecraft.world.entity.SpawnPlacementType value = horizonPlacements.get(p0); return value == null ? net.minecraft.world.entity.SpawnPlacementTypes.NO_RESTRICTIONS : value;".to_owned();
+        }
+        if method == "getHeightmapType"
+            && ret == "net.minecraft.world.level.levelgen.Heightmap.Types"
+        {
+            return "net.minecraft.world.level.levelgen.Heightmap.Types value = horizonHeightmaps.get(p0); return value == null ? net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES : value;".to_owned();
+        }
+        if method == "isSpawnPositionOk"
+            && ret == "boolean"
+            && descriptor.contains("LevelReader")
+            && descriptor.contains("BlockPos")
+        {
+            return "net.minecraft.world.entity.SpawnPlacementType value = horizonPlacements.get(p0); return value == null || value.isSpawnPositionOk(p1, p2, p0);".to_owned();
+        }
+        if method == "checkSpawnRules" && ret == "boolean" {
+            return "return horizonSpawnRules.getOrDefault(p0, Boolean.TRUE);".to_owned();
+        }
+        if method == "checkSpawnObstruction" && ret == "boolean" {
+            // Obstruction is a world-shape question; a shape-only façade
+            // answers "not obstructed" so a mod's own checks still run.
+            return "return true;".to_owned();
+        }
     }
     if class == "net/minecraft/world/entity/MobCategory" {
         match (method, ret) {
@@ -3471,6 +3678,16 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             }
             ("getDespawnDistance", "int") => {
                 return "return name().equals(\"WATER_AMBIENT\") ? 64 : 128;".to_owned();
+            }
+            ("getNoDespawnDistance", "int") => {
+                // Vanilla's `MobCategory.MAX_NO_DESPAWN_DISTANCE`: a mob inside
+                // this block radius of a player is never removed by distance.
+                return "return 32;".to_owned();
+            }
+            ("byName", "net.minecraft.world.entity.MobCategory") => {
+                // Vanilla answers `null` for an unknown name; the bounded value
+                // falls back to MISC so a mod's lookup never NPEs.
+                return "if (p0 == null) return net.minecraft.world.entity.MobCategory.MISC; if (p0.equals(\"monster\")) return net.minecraft.world.entity.MobCategory.MONSTER; if (p0.equals(\"creature\")) return net.minecraft.world.entity.MobCategory.CREATURE; if (p0.equals(\"ambient\")) return net.minecraft.world.entity.MobCategory.AMBIENT; if (p0.equals(\"axolotls\")) return net.minecraft.world.entity.MobCategory.AXOLOTLS; if (p0.equals(\"underground_water_creature\")) return net.minecraft.world.entity.MobCategory.UNDERGROUND_WATER_CREATURE; if (p0.equals(\"water_creature\")) return net.minecraft.world.entity.MobCategory.WATER_CREATURE; if (p0.equals(\"water_ambient\")) return net.minecraft.world.entity.MobCategory.WATER_AMBIENT; return net.minecraft.world.entity.MobCategory.MISC;".to_owned();
             }
             _ => {}
         }
@@ -5529,7 +5746,7 @@ mod tests {
                 "build",
                 "net.minecraft.world.entity.EntityType"
             ),
-            "return new net.minecraft.world.entity.EntityType(horizonWidth, horizonHeight, horizonTrackingRange, horizonUpdateInterval, horizonFireImmune, horizonCategory);"
+            "net.minecraft.world.entity.EntityType value = new net.minecraft.world.entity.EntityType(horizonWidth, horizonHeight, horizonTrackingRange, horizonUpdateInterval, horizonFireImmune, horizonCategory); value.horizonCanSpawnFarFromPlayer = horizonCanSpawnFarFromPlayer; value.horizonCanSummon = horizonCanSummon; value.horizonSaves = horizonSaves; return value;"
         );
         assert_eq!(
             runtime_body(
@@ -7684,6 +7901,323 @@ mod tests {
             ),
             "EntityType.Builder builder = new EntityType.Builder(); builder.horizonCategory = p1; return builder;"
         );
+    }
+
+    #[test]
+    fn entity_type_builder_carries_bounded_spawn_flags() {
+        let class = "net/minecraft/world/entity/EntityType$Builder";
+        let builder = "net.minecraft.world.entity.EntityType.Builder";
+        let fluent = "()Lnet/minecraft/world/entity/EntityType$Builder;";
+        for (method, expected) in [
+            ("noSummon", "horizonCanSummon = false; return this;"),
+            ("noSave", "horizonSaves = false; return this;"),
+            (
+                "canSpawnFarFromPlayer",
+                "horizonCanSpawnFarFromPlayer = true; return this;",
+            ),
+            // No-op fluent setters keep the chain alive.
+            ("immuneTo", "return this;"),
+            ("requiredFeatures", "return this;"),
+        ] {
+            assert_eq!(
+                runtime_body_with_descriptor(class, method, builder, fluent),
+                expected
+            );
+        }
+        assert_eq!(
+            runtime_body_with_descriptor(
+                class,
+                "sized",
+                builder,
+                "(Lnet/minecraft/world/entity/EntityDimensions;)Lnet/minecraft/world/entity/EntityType$Builder;",
+            ),
+            "if (p0 != null) { horizonWidth = p0.getWidth(); horizonHeight = p0.getHeight(); } return this;"
+        );
+        // Both `build` overloads (a name, a key) produce the bounded value with
+        // the flags the builder recorded.
+        let build = "net.minecraft.world.entity.EntityType value = new net.minecraft.world.entity.EntityType(horizonWidth, horizonHeight, horizonTrackingRange, horizonUpdateInterval, horizonFireImmune, horizonCategory); value.horizonCanSpawnFarFromPlayer = horizonCanSpawnFarFromPlayer; value.horizonCanSummon = horizonCanSummon; value.horizonSaves = horizonSaves; return value;";
+        for descriptor in [
+            "(Ljava/lang/String;)Lnet/minecraft/world/entity/EntityType;",
+            "(Lnet/minecraft/resources/ResourceKey;)Lnet/minecraft/world/entity/EntityType;",
+        ] {
+            assert_eq!(
+                runtime_body_with_descriptor(
+                    class,
+                    "build",
+                    "net.minecraft.world.entity.EntityType",
+                    descriptor,
+                ),
+                build
+            );
+        }
+        let shape = Class {
+            name: class.to_owned(),
+            ..Class::default()
+        };
+        let source = render(
+            &shape,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut Report::default(),
+            true,
+            &[],
+        );
+        assert!(source.contains("public static class Builder {"));
+        for field in [
+            "protected boolean horizonCanSpawnFarFromPlayer;",
+            "protected boolean horizonCanSummon = true;",
+            "protected boolean horizonSaves = true;",
+        ] {
+            assert!(source.contains(field), "Builder is missing {field}");
+        }
+    }
+
+    #[test]
+    fn entity_type_exposes_bounded_identity_and_dimensions() {
+        let class = "net/minecraft/world/entity/EntityType";
+        for (method, ret, descriptor, expected) in [
+            (
+                "getDimensions",
+                "net.minecraft.world.entity.EntityDimensions",
+                "()Lnet/minecraft/world/entity/EntityDimensions;",
+                "return net.minecraft.world.entity.EntityDimensions.scalable(horizonWidth, horizonHeight);",
+            ),
+            (
+                "getDescriptionId",
+                "java.lang.String",
+                "()Ljava/lang/String;",
+                "return horizonDescriptionId;",
+            ),
+            (
+                "canSpawnFarFromPlayer",
+                "boolean",
+                "()Z",
+                "return horizonCanSpawnFarFromPlayer;",
+            ),
+            ("canSummon", "boolean", "()Z", "return horizonCanSummon;"),
+            (
+                "isEnabled",
+                "boolean",
+                "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z",
+                "return true;",
+            ),
+            (
+                "getDescription",
+                "net.minecraft.network.chat.Component",
+                "()Lnet/minecraft/network/chat/Component;",
+                "return net.minecraft.network.chat.Component.literal(horizonDescriptionId);",
+            ),
+            (
+                "getDefaultLootTable",
+                "java.lang.String",
+                "()Ljava/lang/String;",
+                "return \"minecraft:empty\";",
+            ),
+            (
+                "getDefaultLootTable",
+                "net.minecraft.resources.ResourceKey",
+                "()Lnet/minecraft/resources/ResourceKey;",
+                "return new net.minecraft.resources.ResourceKey();",
+            ),
+            (
+                "getRegistryName",
+                "net.minecraft.resources.Identifier",
+                "()Lnet/minecraft/resources/Identifier;",
+                "return new net.minecraft.resources.Identifier(\"minecraft\", \"unknown\");",
+            ),
+        ] {
+            assert_eq!(
+                runtime_body_with_descriptor(class, method, ret, descriptor),
+                expected
+            );
+        }
+        let shape = Class {
+            name: class.to_owned(),
+            ..Class::default()
+        };
+        let source = render(
+            &shape,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut Report::default(),
+            false,
+            &[],
+        );
+        for field in [
+            "protected boolean horizonCanSpawnFarFromPlayer;",
+            "protected boolean horizonCanSummon = true;",
+            "protected boolean horizonSaves = true;",
+            "protected String horizonDescriptionId = \"entity.minecraft.unknown\";",
+        ] {
+            assert!(source.contains(field), "EntityType is missing {field}");
+        }
+    }
+
+    #[test]
+    fn mob_category_and_entity_dimensions_are_bounded_values() {
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/MobCategory",
+                "getNoDespawnDistance",
+                "int"
+            ),
+            "return 32;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/MobCategory",
+                "byName",
+                "net.minecraft.world.entity.MobCategory",
+                "(Ljava/lang/String;)Lnet/minecraft/world/entity/MobCategory;",
+            ),
+            "if (p0 == null) return net.minecraft.world.entity.MobCategory.MISC; if (p0.equals(\"monster\")) return net.minecraft.world.entity.MobCategory.MONSTER; if (p0.equals(\"creature\")) return net.minecraft.world.entity.MobCategory.CREATURE; if (p0.equals(\"ambient\")) return net.minecraft.world.entity.MobCategory.AMBIENT; if (p0.equals(\"axolotls\")) return net.minecraft.world.entity.MobCategory.AXOLOTLS; if (p0.equals(\"underground_water_creature\")) return net.minecraft.world.entity.MobCategory.UNDERGROUND_WATER_CREATURE; if (p0.equals(\"water_creature\")) return net.minecraft.world.entity.MobCategory.WATER_CREATURE; if (p0.equals(\"water_ambient\")) return net.minecraft.world.entity.MobCategory.WATER_AMBIENT; return net.minecraft.world.entity.MobCategory.MISC;"
+        );
+        // The real class is a record; the façade overrides the shape so the value
+        // keeps the accessors and backing fields a snapshotted mod names.
+        let mut report = Report::default();
+        let shape = Class {
+            name: "net/minecraft/world/entity/EntityDimensions".to_owned(),
+            superclass: "java/lang/Record".to_owned(),
+            ..Class::default()
+        };
+        let source = render(
+            &shape,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut report,
+            false,
+            &[],
+        );
+        assert!(source.starts_with("package net.minecraft.world.entity;"));
+        assert!(source.contains("public class EntityDimensions {"));
+        for fragment in [
+            "protected float width;",
+            "protected float height;",
+            "protected float eyeHeight;",
+            "public static net.minecraft.world.entity.EntityDimensions scalable(float width, float height)",
+            "public static net.minecraft.world.entity.EntityDimensions fixed(float width, float height)",
+            "public net.minecraft.world.entity.EntityDimensions scale(float factor)",
+            "public net.minecraft.world.entity.EntityDimensions withEyeHeight(float eyeHeight)",
+            "public net.minecraft.world.phys.AABB makeBoundingBox(double x, double y, double z)",
+            "public net.minecraft.world.phys.AABB makeBoundingBox(net.minecraft.world.phys.Vec3 pos)",
+            "public float width() {",
+            "public float height() {",
+            "public float eyeHeight() {",
+            "public float getWidth() {",
+            "public float getHeight() {",
+            "public float getEyeHeight() {",
+        ] {
+            assert!(
+                source.contains(fragment),
+                "EntityDimensions is missing {fragment}"
+            );
+        }
+        assert_eq!(report.fields, 4);
+    }
+
+    #[test]
+    fn spawn_placements_share_bounded_registration_state() {
+        let class = "net/minecraft/world/entity/SpawnPlacements";
+        let register = "if (p0 != null) { horizonPlacements.put(p0, p1); horizonHeightmaps.put(p0, p2); horizonSpawnRules.put(p0, Boolean.TRUE); }";
+        for descriptor in [
+            "(Lnet/minecraft/world/entity/EntityType;Lnet/minecraft/world/entity/SpawnPlacementType;Lnet/minecraft/world/level/levelgen/Heightmap$Types;Lnet/minecraft/world/entity/SpawnPlacements$SpawnPredicate;)V",
+            // A snapshot with a height window still maps the descriptor's slots.
+            "(Lnet/minecraft/world/entity/EntityType;Lnet/minecraft/world/entity/SpawnPlacementType;Lnet/minecraft/world/level/levelgen/Heightmap$Types;IILnet/minecraft/world/entity/SpawnPlacements$SpawnPredicate;)V",
+        ] {
+            assert_eq!(
+                runtime_body_with_descriptor(class, "register", "void", descriptor),
+                register
+            );
+        }
+        for (method, ret, descriptor, expected) in [
+            (
+                "getPlacementType",
+                "net.minecraft.world.entity.SpawnPlacementType",
+                "(Lnet/minecraft/world/entity/EntityType;)Lnet/minecraft/world/entity/SpawnPlacementType;",
+                "net.minecraft.world.entity.SpawnPlacementType value = horizonPlacements.get(p0); return value == null ? net.minecraft.world.entity.SpawnPlacementTypes.NO_RESTRICTIONS : value;",
+            ),
+            (
+                "getHeightmapType",
+                "net.minecraft.world.level.levelgen.Heightmap.Types",
+                "(Lnet/minecraft/world/entity/EntityType;)Lnet/minecraft/world/level/levelgen/Heightmap$Types;",
+                "net.minecraft.world.level.levelgen.Heightmap.Types value = horizonHeightmaps.get(p0); return value == null ? net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES : value;",
+            ),
+            (
+                "isSpawnPositionOk",
+                "boolean",
+                "(Lnet/minecraft/world/entity/EntityType;Lnet/minecraft/world/level/LevelReader;Lnet/minecraft/core/BlockPos;)Z",
+                "net.minecraft.world.entity.SpawnPlacementType value = horizonPlacements.get(p0); return value == null || value.isSpawnPositionOk(p1, p2, p0);",
+            ),
+            (
+                "checkSpawnRules",
+                "boolean",
+                "(Lnet/minecraft/world/entity/EntityType;Lnet/minecraft/world/level/LevelAccessor;Lnet/minecraft/world/entity/EntitySpawnReason;Lnet/minecraft/core/BlockPos;Lnet/minecraft/util/RandomSource;)Z",
+                "return horizonSpawnRules.getOrDefault(p0, Boolean.TRUE);",
+            ),
+            (
+                "checkSpawnObstruction",
+                "boolean",
+                "(Lnet/minecraft/world/level/LevelReader;Lnet/minecraft/world/entity/Entity;)Z",
+                "return true;",
+            ),
+        ] {
+            assert_eq!(
+                runtime_body_with_descriptor(class, method, ret, descriptor),
+                expected
+            );
+        }
+        let mut report = Report::default();
+        let source = render(
+            &Class {
+                name: class.to_owned(),
+                ..Class::default()
+            },
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut report,
+            false,
+            &[],
+        );
+        for map in [
+            "protected static final java.util.Map<Object, net.minecraft.world.entity.SpawnPlacementType> horizonPlacements",
+            "protected static final java.util.Map<Object, net.minecraft.world.level.levelgen.Heightmap.Types> horizonHeightmaps",
+            "protected static final java.util.Map<Object, Boolean> horizonSpawnRules",
+        ] {
+            assert!(source.contains(map), "SpawnPlacements is missing {map}");
+        }
+        // The registration predicate stays a SAM interface, or a mod's lambda
+        // has no abstract method to bind at runtime.
+        let predicate = Class {
+            name: "net/minecraft/world/entity/SpawnPlacements$SpawnPredicate".to_owned(),
+            access: 0x0201,
+            declared: vec![Declared {
+                name: "test".to_owned(),
+                descriptor: "(Lnet/minecraft/world/entity/EntityType;Lnet/minecraft/world/level/LevelReader;Lnet/minecraft/world/entity/EntitySpawnReason;Lnet/minecraft/core/BlockPos;Lnet/minecraft/util/RandomSource;)Z".to_owned(),
+                access: 0x0401,
+                kind: MemberKind::Method,
+            }],
+            ..Class::default()
+        };
+        let predicate = render(
+            &predicate,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut report,
+            true,
+            &[],
+        );
+        assert!(predicate.contains("public static interface SpawnPredicate"));
+        assert!(predicate.contains("public boolean test(net.minecraft.world.entity.EntityType p0, net.minecraft.world.level.LevelReader p1, net.minecraft.world.entity.EntitySpawnReason p2, net.minecraft.core.BlockPos p3, net.minecraft.util.RandomSource p4);"));
     }
 
     #[test]
