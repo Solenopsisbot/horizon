@@ -1,10 +1,11 @@
 //! Reflection, record and enum fixtures compiled from real Java at test time.
 //!
 //! The interpreter advertises a *bounded* reflection surface: `Class.forName` for classes in the
-//! current jar, field/method enumeration markers, `java.lang.reflect.Array`, and annotations
-//! parsed from the class file.  These fixtures pin down exactly how much of that a real mod sees
-//! today, so the passing suite never claims more than the interpreter does.  Every gap gets its
-//! own `#[ignore]`d test with the expectation a JVM would satisfy.
+//! current jar, field/method/constructor enumeration markers, `java.lang.reflect.Array`, annotations
+//! parsed from the class file, `Field.get`/`set`, primitive-constant unboxing in `Method.invoke`,
+//! enum identity for constants a jar's own `<clinit>` built, and a record's generated object methods.
+//! These fixtures pin down exactly what a real mod sees, so the suite never claims more than the
+//! interpreter does.
 
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{
@@ -44,6 +45,14 @@ final class Model {
 }
 
 record Point(int x, int y) { public int sum() { return x + y; } }
+
+/** Instance and static fields a reflective write can reach. */
+final class Counter {
+    public static int TOTAL = 0;
+    private int value = 0;
+    public int value() { return value; }
+    public static int total() { return TOTAL; }
+}
 
 enum Color { RED, GREEN, BLUE }
 
@@ -124,6 +133,26 @@ final class Probe {
         return (String) field.get(new Model("read", 4));
     }
 
+    /** A reflective write lands on the instance's field and on a static field. */
+    public static String fieldWrite() throws Exception {
+        Class<?> type = Class.forName("demo.Counter");
+        Counter counter = new Counter();
+        Field value = type.getDeclaredField("value");
+        value.set(counter, Integer.valueOf(7));
+        Field total = type.getDeclaredField("TOTAL");
+        total.set(type, Integer.valueOf(5));
+        return new StringBuilder().append(counter.value()).append('|')
+            .append(Counter.total()).append('|')
+            .append(((Integer) value.get(counter)).intValue()).append('|')
+            .append(((Integer) total.get(type)).intValue()).toString();
+    }
+
+    /** `annotationType()` names the runtime annotation the lookup returned. */
+    public static String annotationTypeName() throws Exception {
+        Marker found = Class.forName("demo.Model").getAnnotation(Marker.class);
+        return found == null ? "absent" : found.annotationType().getName();
+    }
+
     public static String reflectedConstructorLabel() throws Exception {
         Constructor<?> constructor = Class.forName("demo.Model").getDeclaredConstructor(new Class[0]);
         return ((Model) constructor.newInstance(new Object[0])).label();
@@ -158,6 +187,12 @@ final class Probe {
     public static String methodAnnotation() throws Exception {
         Method method = Class.forName("demo.Model").getMethod("label", new Class[0]);
         Marker found = method.getAnnotation(Marker.class);
+        return found == null ? "absent" : found.value();
+    }
+
+    /** A class without `@Marker` must keep Java's `null`, not an empty proxy. */
+    public static String missingClassAnnotation() throws Exception {
+        Marker found = Class.forName("demo.Probe").getAnnotation(Marker.class);
         return found == null ? "absent" : found.value();
     }
 
@@ -358,58 +393,13 @@ fn record_accessors_and_explicit_methods_run_as_bytecode() {
 }
 
 #[test]
-fn record_generated_object_methods_return_opaque_markers_today() {
-    let fixture = Fixture::build("record-object");
-    let to_string = fixture.text("recordToString");
-    assert!(
-        to_string.starts_with("@indy:demo/Point#toString:")
-            && to_string.contains("java/lang/runtime/ObjectMethods#bootstrap"),
-        "unexpected record toString: {to_string}"
-    );
-    let equals = fixture.call("recordEquals", "()Z").unwrap();
-    assert!(
-        matches!(&equals, Value::Ref(Some(marker)) if marker.starts_with("@indy:demo/Point#equals:")),
-        "record equals did not fall through to an invokedynamic marker: {equals:?}"
-    );
-    let hash = fixture.call("recordHash", "()I").unwrap();
-    assert!(
-        matches!(&hash, Value::Ref(Some(marker)) if marker.starts_with("@indy:demo/Point#hashCode:")),
-        "record hashCode did not fall through to an invokedynamic marker: {hash:?}"
-    );
-}
-
-#[test]
-fn enum_supertype_name_and_ordinal_are_bounded() {
+fn enum_supertype_name_and_ordinal_follow_the_declaration() {
     let fixture = Fixture::build("enum");
-    // `Enum<?>` receivers reach the modelled `java.lang.Enum` surface.
+    // `Enum<?>` receivers reach the modelled `java.lang.Enum` surface, which now
+    // answers the declared name and position of the constants `<clinit>` built.
     assert_eq!(fixture.text("enumValueOfName"), "GREEN");
-    // `ordinal()` is only modelled for Fabric's `EnvType`; every other enum reports 0.
-    assert_eq!(fixture.number("enumSupertypeOrdinal"), 0);
-    // Enum constants built by `<clinit>` are plain object markers, so `name()` echoes the marker.
-    let name = fixture.text("enumConstantName");
-    assert!(
-        name.starts_with("Color#"),
-        "unexpected enum constant name: {name}"
-    );
-}
-
-#[test]
-fn enum_concrete_type_loses_inherited_members_today() {
-    let fixture = Fixture::build("enum-concrete");
-    // A concrete enum receiver is dispatched only against its own class file, so `name()` and
-    // `ordinal()` (declared on `java.lang.Enum`) do not resolve.
-    let name = fixture
-        .call("enumConcreteName", "()Ljava/lang/String;")
-        .unwrap_err();
-    assert!(
-        matches!(&name, NativeError::MissingMethod(member) if member == "demo/Color#name()Ljava/lang/String;"),
-        "unexpected name() diagnostic: {name}"
-    );
-    let ordinal = fixture.call("enumConcreteOrdinal", "()I").unwrap_err();
-    assert!(
-        matches!(&ordinal, NativeError::MissingMethod(member) if member == "demo/Color#ordinal()I"),
-        "unexpected ordinal() diagnostic: {ordinal}"
-    );
+    assert_eq!(fixture.number("enumSupertypeOrdinal"), 2);
+    assert_eq!(fixture.text("enumConstantName"), "RED");
 }
 
 #[test]
@@ -418,20 +408,11 @@ fn reflective_arrays_round_trip_ints_and_strings() {
 }
 
 #[test]
-fn annotation_lookup_constructor_and_field_reads_report_absence_today() {
+fn annotation_lookup_reports_absence_for_a_class_without_the_annotation() {
     let fixture = Fixture::build("absence");
-    assert_eq!(fixture.text("classAnnotation"), "absent");
-    assert_eq!(fixture.text("methodAnnotation"), "absent");
-    assert_eq!(
-        fixture
-            .call("reflectedConstructorLabel", "()Ljava/lang/String;")
-            .unwrap(),
-        Value::Ref(None)
-    );
-    assert_eq!(
-        fixture.call("fieldValue", "()Ljava/lang/String;").unwrap(),
-        Value::Ref(None)
-    );
+    // `Probe` declares no `@Marker`, so the query keeps Java's `null` instead of
+    // handing out an invented proxy.
+    assert_eq!(fixture.text("missingClassAnnotation"), "absent");
 }
 
 #[test]
@@ -450,7 +431,6 @@ fn unknown_reflective_member_fails_with_a_bounded_diagnostic() {
 }
 
 #[test]
-#[ignore = "unsupported: record equals/hashCode/toString are invokedynamic ObjectMethods bootstraps"]
 fn record_generated_object_methods_match_java() {
     let fixture = Fixture::build("record-java");
     assert_eq!(fixture.text("recordToString"), "Point[x=3, y=4]");
@@ -460,7 +440,6 @@ fn record_generated_object_methods_match_java() {
 }
 
 #[test]
-#[ignore = "unsupported: ordinal() is only modelled for Fabric EnvType, every other enum returns 0"]
 fn enum_ordinal_reports_the_declared_position() {
     assert_eq!(
         Fixture::build("enum-ordinal").number("enumSupertypeOrdinal"),
@@ -469,7 +448,6 @@ fn enum_ordinal_reports_the_declared_position() {
 }
 
 #[test]
-#[ignore = "unsupported: dispatch does not walk superclasses, so name()/ordinal() on a concrete enum is MissingMethod"]
 fn enum_inherited_members_resolve_through_the_supertype() {
     let fixture = Fixture::build("enum-inherited");
     assert_eq!(fixture.text("enumConcreteName"), "GREEN");
@@ -477,27 +455,31 @@ fn enum_inherited_members_resolve_through_the_supertype() {
 }
 
 #[test]
-#[ignore = "unsupported: enum constants created by <clinit> are object markers, so name() echoes the marker"]
 fn enum_constant_name_is_the_declared_name() {
     assert_eq!(Fixture::build("enum-name").text("enumConstantName"), "RED");
 }
 
 #[test]
-#[ignore = "unsupported: enum values() clones the $VALUES array and array clone is not modelled"]
 fn enum_values_returns_the_declared_constants() {
     assert_eq!(Fixture::build("enum-values").number("enumValuesLength"), 3);
 }
 
 #[test]
-#[ignore = "unsupported: Class.getAnnotation/Method.getAnnotation return null (annotations are parsed but not queryable)"]
 fn annotations_are_visible_to_the_mod() {
     let fixture = Fixture::build("annotations");
     assert_eq!(fixture.text("classAnnotation"), "model");
     assert_eq!(fixture.text("methodAnnotation"), "label");
+    // The proxy answers its own type, so `annotationType().getName()` is the
+    // interface the class file declared.
+    assert_eq!(fixture.text("annotationTypeName"), "demo.Marker");
 }
 
 #[test]
-#[ignore = "unsupported: Class.getDeclaredConstructor and Constructor.newInstance are not modelled"]
+fn field_write_answers_instance_and_static_fields() {
+    assert_eq!(Fixture::build("field-write").text("fieldWrite"), "7|5|7|5");
+}
+
+#[test]
 fn reflected_constructor_creates_an_instance() {
     assert_eq!(
         Fixture::build("constructor").text("reflectedConstructorLabel"),
@@ -506,13 +488,11 @@ fn reflected_constructor_creates_an_instance() {
 }
 
 #[test]
-#[ignore = "unsupported: Field.get is not modelled and silently yields null"]
 fn field_read_returns_the_declared_value() {
     assert_eq!(Fixture::build("field-read").text("fieldValue"), "read");
 }
 
 #[test]
-#[ignore = "unsupported: primitive class literals (Integer.TYPE) resolve to null, so the signature is lost"]
 fn method_lookup_keeps_the_primitive_parameter() {
     assert_eq!(
         Fixture::build("primitive-lookup").number("primitiveLookupParamCount"),
@@ -521,7 +501,6 @@ fn method_lookup_keeps_the_primitive_parameter() {
 }
 
 #[test]
-#[ignore = "unsupported: reflective Method.invoke passes boxed Integer arguments through without unboxing"]
 fn method_invoke_unboxes_primitive_arguments() {
     assert_eq!(Fixture::build("boxed-invoke").number("invokeBump"), 8);
 }

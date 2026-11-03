@@ -714,6 +714,10 @@ const MAX_CALLBACK_INFOS: usize = 64;
 /// Mixin weaves one callback per matched call; the bound keeps a jar from
 /// growing the interpreter's dispatch table without limit.
 const MAX_INVOKE_HOOKS: usize = 128;
+/// Superclasses one member call may walk before the chain is treated as
+/// malformed.  A jar's own hierarchy is a handful of classes; the bound only
+/// stops a class file whose `super_class` chain loops.
+const MAX_SUPERCLASS_WALK: usize = 32;
 
 /// Deterministic, game-independent mappings for the small standard-library
 /// surface commonly reached during mod bootstrap.
@@ -1431,6 +1435,36 @@ impl Host for StdHost {
             ("java/lang/Boolean", "FALSE", "Ljava/lang/Boolean;") => {
                 Ok(Value::Ref(Some("false".into())))
             }
+            // `int.class` and its siblings compile to a `TYPE` read on the
+            // wrapper, so the primitive's `Class` marker is the primitive name.
+            // Without it a `getMethod(name, new Class[]{int.class})` call sees
+            // null and loses the signature it is selecting on.
+            (
+                "java/lang/Boolean"
+                | "java/lang/Byte"
+                | "java/lang/Character"
+                | "java/lang/Short"
+                | "java/lang/Integer"
+                | "java/lang/Long"
+                | "java/lang/Float"
+                | "java/lang/Double"
+                | "java/lang/Void",
+                "TYPE",
+                "Ljava/lang/Class;",
+            ) => Ok(Value::Ref(Some(
+                match r.owner.as_str() {
+                    "java/lang/Boolean" => "boolean",
+                    "java/lang/Byte" => "byte",
+                    "java/lang/Character" => "char",
+                    "java/lang/Short" => "short",
+                    "java/lang/Integer" => "int",
+                    "java/lang/Long" => "long",
+                    "java/lang/Float" => "float",
+                    "java/lang/Double" => "double",
+                    _ => "void",
+                }
+                .into(),
+            ))),
             // `Long.MAX_VALUE`/`MIN_VALUE` are the long bounds a mod compares
             // timers and ids against; a neutral `0` would silently truncate
             // every comparison to "less than max".
@@ -5735,6 +5769,63 @@ fn stable_hash(value: &str) -> i32 {
     })
 }
 
+/// How a record's generated `toString` prints one component value.
+///
+/// Java prints a `boolean` as `true`/`false` and a `char` as the character,
+/// while both are `Value::Int` here; a `float` component prints its `f32`
+/// digits and a `double` its `f64` digits.
+fn java_value_text(value: &Value, desc: &str) -> String {
+    match value {
+        Value::Int(value) if desc == "Z" => (*value != 0).to_string(),
+        Value::Int(value) if desc == "C" => {
+            char::from_u32(*value as u32).map_or_else(|| value.to_string(), String::from)
+        }
+        Value::Int(value) => value.to_string(),
+        Value::Long(value) => value.to_string(),
+        Value::Float(value) if desc == "F" => format_java_float32(*value),
+        Value::Float(value) => format_java_float(*value),
+        Value::Ref(Some(value)) => value.clone(),
+        Value::Ref(None) => "null".to_owned(),
+        Value::Void => String::new(),
+    }
+}
+
+/// Java's component hash for a record's generated `hashCode`.
+///
+/// `Boolean.hashCode` is 1231/1237, a `char` is its code unit, a `long` folds
+/// its halves, a `float`/`double` uses the bit pattern `Float`/`Double` hash
+/// with, and a reference is the value's own `hashCode` — a string marker keeps
+/// `String.hashCode`, an object marker its identity text.
+fn java_value_hash(value: &Value, desc: &str) -> i32 {
+    match (value, desc) {
+        (Value::Int(value), "Z") => {
+            if *value != 0 {
+                1231
+            } else {
+                1237
+            }
+        }
+        (Value::Int(value), _) => *value,
+        (Value::Long(value), _) => (*value ^ ((*value as u64) >> 32) as i64) as i32,
+        (Value::Float(value), "F") => java_float_bits(*value) as i32,
+        (Value::Float(value), _) => java_double_bits(*value) as i32,
+        (Value::Ref(Some(value)), _) => stable_hash(value),
+        _ => 0,
+    }
+}
+
+/// Value equality for a record's generated `equals`: references compare by
+/// their marker (identity for objects, text for strings) and `NaN` compares
+/// equal to `NaN` as `Double.equals` does.
+fn java_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Float(left), Value::Float(right)) => {
+            java_double_bits(*left) == java_double_bits(*right)
+        }
+        _ => left == right,
+    }
+}
+
 fn utf16_index_of(haystack: &str, needle: &str, from: i32) -> i32 {
     let haystack = haystack.encode_utf16().collect::<Vec<_>>();
     let needle = needle.encode_utf16().collect::<Vec<_>>();
@@ -6772,6 +6863,22 @@ fn instance_field_key(receiver: &Value, field: &MethodRef) -> Option<String> {
     })
 }
 
+/// Split the `name:descriptor:access` text one reflective `Field` marker keeps.
+///
+/// A lookup that found no declared field keeps only the name, so the
+/// descriptor and the access flags are optional here.
+fn parse_field_marker(member: &str) -> (&str, Option<(&str, u16)>) {
+    let mut parts = member.split(':');
+    let name = parts.next().unwrap_or(member);
+    let descriptor = parts.next();
+    let access = parts.next().and_then(|access| access.parse().ok());
+    match (descriptor, access) {
+        (Some(descriptor), Some(access)) => (name, Some((descriptor, access))),
+        (Some(descriptor), None) => (name, Some((descriptor, 0))),
+        _ => (name, None),
+    }
+}
+
 fn expect_array_marker(value: &Value) -> Result<&str, NativeError> {
     match value {
         Value::Ref(Some(marker)) if marker.starts_with("array/") => Ok(marker),
@@ -6925,6 +7032,48 @@ impl ClassFile {
             other => return Err(NativeError::InvalidConstant(index, format!("{other:?}"))),
         };
         Ok(name_type(&self.pool, nt)?.1)
+    }
+
+    /// The call-site name of one `invokedynamic` entry (`toString`, `equals`,
+    /// `hashCode` for a record's generated methods).
+    fn invoke_dynamic_name(&self, index: u16) -> Result<String, NativeError> {
+        let nt = match self.pool.get(index as usize) {
+            Some(Cp::InvokeDynamic { nt, .. }) => *nt,
+            other => return Err(NativeError::InvalidConstant(index, format!("{other:?}"))),
+        };
+        Ok(name_type(&self.pool, nt)?.0)
+    }
+
+    /// The component names a record's `ObjectMethods.bootstrap` call site
+    /// carries, in declaration order.
+    ///
+    /// The bootstrap's second static argument is the `;`-separated component
+    /// list javac wrote for the record, so a call site that does not name
+    /// `java/lang/runtime/ObjectMethods.bootstrap` — or whose argument is not a
+    /// string — answers `None`.
+    fn record_component_names(&self, index: u16) -> Option<Vec<String>> {
+        let bootstrap = match self.pool.get(index as usize) {
+            Some(Cp::InvokeDynamic { bootstrap, .. }) => {
+                self.bootstrap_methods.get(*bootstrap as usize)?
+            }
+            _ => return None,
+        };
+        let handle = match self.pool.get(bootstrap.method_ref as usize) {
+            Some(Cp::MethodHandle { reference_index }) => *reference_index,
+            _ => return None,
+        };
+        let target = self.method_ref(handle).ok()?;
+        if target.owner != "java/lang/runtime/ObjectMethods" || target.name != "bootstrap" {
+            return None;
+        }
+        let names = match self.pool.get(*bootstrap.arguments.get(1)? as usize) {
+            Some(Cp::String(text)) => match self.pool.get(*text as usize) {
+                Some(Cp::Utf8(text)) => text,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(names.split(';').map(str::to_owned).collect::<Vec<_>>())
     }
 
     fn invoke_dynamic_target(&self, index: u16) -> Result<Option<MethodRef>, NativeError> {
@@ -7703,6 +7852,9 @@ impl NativeJar {
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            enum_constants: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
         };
@@ -7827,6 +7979,9 @@ impl NativeJar {
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            enum_constants: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            next_annotation: 0,
             callback_infos,
             invoke_hooks,
         };
@@ -8937,6 +9092,14 @@ struct Runtime<'a, H> {
     next_object: usize,
     streams: BTreeMap<String, Vec<Value>>,
     next_stream: usize,
+    /// Enum constants this invocation's `<clinit>` built, keyed by the object's
+    /// marker: the declared name and ordinal its `java.lang.Enum` constructor
+    /// received.
+    enum_constants: BTreeMap<String, (String, i32)>,
+    /// Annotation values `Class#getAnnotation`/`Method#getAnnotation` handed
+    /// out, keyed by the proxy marker a member query answers from.
+    annotations: BTreeMap<String, Annotation>,
+    next_annotation: usize,
     /// The `CallbackInfo` objects this execution owns.  `cancel()` on a marker
     /// this table does not hold is a diagnostic, so a callback can only flag the
     /// object a plan actually handed it.
@@ -9374,6 +9537,14 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        // An annotation the lookup handed out answers its own members, so
+        // `found.value()` reads the class file's value instead of dispatching
+        // into an interface that has no code.
+        if let Some(marker) = receiver.and_then(expect_ref)
+            && let Some(annotation) = self.annotations.get(marker).cloned()
+        {
+            return Ok(Some(self.annotation_member(&annotation, r)?));
+        }
         if r.owner == "java/lang/Class"
             && matches!(r.name.as_str(), "getFields" | "getDeclaredFields")
             && r.descriptor == "()[Ljava/lang/reflect/Field;"
@@ -9455,100 +9626,521 @@ impl<H: Host> Runtime<'_, H> {
         {
             let class = expect_string(receiver.unwrap_or(&Value::Ref(None)));
             let name = expect_string(StdHost::argument(r, args, 0)?);
-            let parameter_types = args
-                .get(1)
-                .and_then(|value| self.array(value).ok())
+            let parameter_types = self.parameter_types(args);
+            let marker = self
+                .reflected_descriptor(class, name, &parameter_types)
+                .map_or_else(
+                    || format!("reflect-method/{class}#{name}"),
+                    |descriptor| format!("reflect-method/{class}#{name}{descriptor}"),
+                );
+            return Ok(Some(Value::Ref(Some(marker))));
+        }
+        if r.owner == "java/lang/Class"
+            && matches!(r.name.as_str(), "getConstructor" | "getDeclaredConstructor")
+            && r.descriptor.ends_with(")Ljava/lang/reflect/Constructor;")
+        {
+            let class = expect_string(receiver.unwrap_or(&Value::Ref(None)));
+            let parameter_types = self.parameter_types(args);
+            let marker = self
+                .reflected_descriptor(class, "<init>", &parameter_types)
+                .map_or_else(
+                    || format!("reflect-constructor/{class}#"),
+                    |descriptor| format!("reflect-constructor/{class}#{descriptor}"),
+                );
+            return Ok(Some(Value::Ref(Some(marker))));
+        }
+        if r.owner == "java/lang/Class"
+            && r.name == "getAnnotation"
+            && r.descriptor == "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
+        {
+            let class = expect_string(receiver.unwrap_or(&Value::Ref(None)));
+            let wanted = expect_string(StdHost::argument(r, args, 0)?);
+            let found = self.classes.get(class).and_then(|file| {
+                file.annotations
+                    .iter()
+                    .find(|annotation| annotation_is(annotation, wanted))
+                    .cloned()
+            });
+            return Ok(Some(self.annotation_proxy(found)));
+        }
+        if r.owner == "java/lang/reflect/Method"
+            && r.name == "getAnnotation"
+            && r.descriptor == "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
+        {
+            let marker = expect_string(receiver.unwrap_or(&Value::Ref(None)));
+            let wanted = expect_string(StdHost::argument(r, args, 0)?);
+            let found = marker
+                .strip_prefix("reflect-method/")
+                .and_then(|marker| marker.split_once('#'))
+                .and_then(|(class, member)| {
+                    let (name, descriptor) = member
+                        .find('(')
+                        .map_or((member, None), |at| (&member[..at], Some(&member[at..])));
+                    let file = self.classes.get(class)?;
+                    let method = file.methods.iter().find(|candidate| {
+                        candidate.name == name
+                            && descriptor
+                                .is_none_or(|descriptor| candidate.descriptor == descriptor)
+                    })?;
+                    method
+                        .annotations
+                        .iter()
+                        .find(|annotation| annotation_is(annotation, wanted))
+                        .cloned()
+                });
+            return Ok(Some(self.annotation_proxy(found)));
+        }
+        if r.owner == "java/lang/reflect/Field" && matches!(r.name.as_str(), "get" | "set") {
+            let marker = expect_ref(receiver.unwrap_or(&Value::Ref(None))).ok_or_else(|| {
+                NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
+            })?;
+            let (class, member) = marker
+                .strip_prefix("reflect-field/")
+                .and_then(|marker| marker.split_once('#'))
+                .ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
+                })?;
+            let (name, declared) = parse_field_marker(member);
+            let declared = declared
+                .map(|(descriptor, access)| (descriptor.to_owned(), access))
+                .or_else(|| {
+                    self.classes.get(class).and_then(|file| {
+                        file.fields
+                            .iter()
+                            .find(|field| field.name == name)
+                            .map(|field| (field.descriptor.clone(), field.access))
+                    })
+                });
+            let (descriptor, access) =
+                declared.ok_or_else(|| NativeError::MissingMethod(format!("{class}#{name}")))?;
+            let key = if access & 8 != 0 {
+                format!("{class}#{name}{descriptor}")
+            } else {
+                // An instance field lives under the receiver's marker, so the
+                // object `get`/`set` names must be one this invocation owns.
+                let target = expect_ref(StdHost::argument(r, args, 0)?).ok_or_else(|| {
+                    NativeError::Metadata(format!(
+                        "java/lang/reflect/Field.{0} needs an instance for {class}#{name}",
+                        r.name
+                    ))
+                })?;
+                format!("{target}|{class}#{name}{descriptor}")
+            };
+            return Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
+                ("get", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
+                    // An unset field answers its type's default, exactly as a
+                    // JVM field does before the constructor assigns it.
+                    let value = self
+                        .fields
+                        .get(&key)
+                        .or_else(|| self.static_fields.get(&key))
+                        .cloned()
+                        .unwrap_or_else(|| Value::default_for(&descriptor));
+                    declared_value(&descriptor, value)
+                }
+                ("set", "(Ljava/lang/Object;Ljava/lang/Object;)V") => {
+                    let value = StdHost::argument(r, args, 1)?.clone();
+                    let value = coerce_argument(&descriptor, &value).unwrap_or(value);
+                    let value = declared_value(&descriptor, value);
+                    if access & 8 != 0 {
+                        self.static_fields.insert(key, value);
+                    } else {
+                        self.fields.insert(key, value);
+                    }
+                    Value::Void
+                }
+                _ => return Ok(None),
+            }));
+        }
+        if r.owner == "java/lang/reflect/Constructor" {
+            let marker = expect_ref(receiver.unwrap_or(&Value::Ref(None))).ok_or_else(|| {
+                NativeError::Metadata("malformed java/lang/reflect/Constructor marker".into())
+            })?;
+            let (class, descriptor) = marker
+                .strip_prefix("reflect-constructor/")
+                .and_then(|marker| marker.split_once('#'))
+                .ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/reflect/Constructor marker".into())
+                })?;
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getName", "()Ljava/lang/String;") => {
+                    return Ok(Some(Value::Ref(Some(class.replace('/', ".")))));
+                }
+                ("getParameterCount", "()I") => {
+                    return Ok(Some(Value::Int(arg_count(descriptor) as i32)));
+                }
+                ("newInstance", "([Ljava/lang/Object;)Ljava/lang/Object;") => {
+                    if !self.classes.contains_key(class) {
+                        return Err(NativeError::MissingMethod(format!(
+                            "{class}#<init>{descriptor}"
+                        )));
+                    }
+                    let arguments = StdHost::argument(r, args, 0)?;
+                    let arguments = if matches!(arguments, Value::Ref(None)) {
+                        Vec::new()
+                    } else {
+                        self.array(arguments)?.clone()
+                    };
+                    let arguments = coerce_arguments(descriptor, &arguments);
+                    // The constructor runs on the object the `new` opcode would
+                    // have made, so `this` and every `putfield` share the marker.
+                    let instance = self.new_object(class);
+                    self.invoke(
+                        class,
+                        "<init>",
+                        descriptor,
+                        Some(instance.clone()),
+                        &arguments,
+                    )?;
+                    return Ok(Some(instance));
+                }
+                _ => return Ok(None),
+            }
+        }
+        if r.owner == "java/lang/reflect/Method" && r.name == "invoke" {
+            let marker = expect_string(receiver.unwrap_or(&Value::Ref(None)));
+            let marker = marker.strip_prefix("reflect-method/").ok_or_else(|| {
+                NativeError::Metadata("malformed java/lang/reflect/Method marker".into())
+            })?;
+            let (owner, member) = marker.split_once('#').ok_or_else(|| {
+                NativeError::Metadata("reflective method marker has no name separator".into())
+            })?;
+            let (name, descriptor) = member
+                .find('(')
+                .map_or((member, None), |at| (&member[..at], Some(&member[at..])));
+            let invocation_args = StdHost::argument(r, args, 1)?;
+            let invocation_args = if matches!(invocation_args, Value::Ref(None)) {
+                Vec::new()
+            } else {
+                self.array(invocation_args)?.clone()
+            };
+            let class_file = self
+                .classes
+                .get(owner)
+                .ok_or_else(|| NativeError::MissingMethod(format!("{owner}#{name}")))?;
+            let target = class_file
+                .methods
+                .iter()
+                .find(|candidate| {
+                    candidate.name == name
+                        && descriptor.is_none_or(|descriptor| candidate.descriptor == descriptor)
+                        && arg_count(&candidate.descriptor) == invocation_args.len()
+                })
                 .cloned()
-                .unwrap_or_default();
-            let descriptor = if parameter_types.is_empty() {
-                self.classes.get(class).and_then(|file| {
+                .ok_or_else(|| NativeError::MissingMethod(format!("{owner}#{name}")))?;
+            let target_receiver = if target.is_static() {
+                None
+            } else {
+                Some(StdHost::argument(r, args, 0)?.clone())
+            };
+            // `Object[]` hands boxed values to a primitive parameter, so unbox
+            // against the target's own descriptor before the body reads it.
+            let invocation_args = coerce_arguments(&target.descriptor, &invocation_args);
+            return Ok(Some(self.invoke(
+                owner,
+                &target.name,
+                &target.descriptor,
+                target_receiver,
+                &invocation_args,
+            )?));
+        }
+        Ok(None)
+    }
+
+    /// The `Class[]` parameter list a reflective lookup passes as its second
+    /// argument. A null or absent array selects the zero-argument member.
+    fn parameter_types(&self, args: &[Value]) -> Vec<Value> {
+        args.get(1)
+            .and_then(|value| self.array(value).ok())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The descriptor a `Class` lookup selects with a `Class[]` parameter list:
+    /// the jar's exact match when the class declares one, and otherwise the
+    /// descriptor the parameter types spell out. `None` when a class argument
+    /// cannot name a type, which keeps the marker descriptor-less instead of
+    /// inventing a signature.
+    fn reflected_descriptor(
+        &self,
+        class: &str,
+        name: &str,
+        parameters: &[Value],
+    ) -> Option<String> {
+        if parameters.is_empty() {
+            return self.classes.get(class).and_then(|file| {
+                file.methods
+                    .iter()
+                    .find(|candidate| {
+                        candidate.name == name && arg_count(&candidate.descriptor) == 0
+                    })
+                    .map(|candidate| candidate.descriptor.clone())
+            });
+        }
+        let mut descriptor = String::from("(");
+        for parameter in parameters {
+            descriptor.push_str(&class_descriptor(parameter)?);
+        }
+        descriptor.push(')');
+        Some(
+            self.classes
+                .get(class)
+                .and_then(|file| {
                     file.methods
                         .iter()
                         .find(|candidate| {
-                            candidate.name == name && arg_count(&candidate.descriptor) == 0
+                            candidate.name == name && candidate.descriptor.starts_with(&descriptor)
                         })
                         .map(|candidate| candidate.descriptor.clone())
                 })
-            } else {
-                let mut descriptor = String::from("(");
-                let mut supported = true;
-                for parameter in &parameter_types {
-                    if let Some(value) = class_descriptor(parameter) {
-                        descriptor.push_str(&value);
-                    } else {
-                        supported = false;
-                        break;
-                    }
-                }
-                if supported {
-                    descriptor.push(')');
-                    self.classes
-                        .get(class)
-                        .and_then(|file| {
-                            file.methods
-                                .iter()
-                                .find(|candidate| {
-                                    candidate.name == name
-                                        && candidate.descriptor.starts_with(&descriptor)
-                                })
-                                .map(|candidate| candidate.descriptor.clone())
-                        })
-                        .or(Some(descriptor))
-                } else {
-                    None
-                }
-            };
-            let marker = descriptor.map_or_else(
-                || format!("reflect-method/{class}#{name}"),
-                |descriptor| format!("reflect-method/{class}#{name}{descriptor}"),
-            );
-            return Ok(Some(Value::Ref(Some(marker))));
+                .unwrap_or(descriptor),
+        )
+    }
+
+    /// Hand out one runtime annotation a class or method already declares.
+    /// Absence is Java's `null`, never an invented empty annotation.
+    fn annotation_proxy(&mut self, annotation: Option<Annotation>) -> Value {
+        let Some(annotation) = annotation else {
+            return Value::Ref(None);
+        };
+        let marker = format!(
+            "annotation/{}/{}",
+            annotation.descriptor, self.next_annotation
+        );
+        self.next_annotation = self.next_annotation.saturating_add(1);
+        self.annotations.insert(marker.clone(), annotation);
+        Value::Ref(Some(marker))
+    }
+
+    /// One member query on an annotation value. Only the shapes the class-file
+    /// parser keeps are answerable: `annotationType`, strings, ints and
+    /// booleans. Everything else is a bounded diagnostic, not a made-up value.
+    fn annotation_member(
+        &self,
+        annotation: &Annotation,
+        r: &MethodRef,
+    ) -> Result<Value, NativeError> {
+        if r.name == "annotationType" && r.descriptor == "()Ljava/lang/Class;" {
+            let name = annotation
+                .descriptor
+                .strip_prefix('L')
+                .and_then(|descriptor| descriptor.strip_suffix(';'))
+                .unwrap_or(&annotation.descriptor);
+            return Ok(Value::Ref(Some(name.to_owned())));
         }
-        if r.owner != "java/lang/reflect/Method" || r.name != "invoke" {
+        let value = annotation.values.get(&r.name).ok_or_else(|| {
+            NativeError::Metadata(format!(
+                "annotation {} has no member {}",
+                annotation.descriptor, r.name
+            ))
+        })?;
+        match value {
+            AnnotationValue::String(value) => Ok(Value::Ref(Some(value.clone()))),
+            AnnotationValue::Bool(value) => Ok(Value::Int(i32::from(*value))),
+            AnnotationValue::Int(value) => Ok(Value::Int(*value)),
+            _ => Err(NativeError::Metadata(format!(
+                "annotation {}#{}{} is outside the bounded annotation value model",
+                annotation.descriptor, r.name, r.descriptor
+            ))),
+        }
+    }
+
+    /// Answer `java.lang.Enum` members for the constants this invocation built.
+    ///
+    /// A jar's enum constants are ordinary objects its `<clinit>` constructed,
+    /// so the declared name and ordinal are recorded where the `(String, int)`
+    /// super constructor receives them. A receiver the runtime did not build
+    /// (an `enum/<class>/<name>` marker, or Fabric's `EnvType`) keeps the host
+    /// answer unchanged.
+    fn invoke_enum_member(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != "java/lang/Enum" {
             return Ok(None);
         }
-        let marker = expect_string(receiver.unwrap_or(&Value::Ref(None)));
-        let marker = marker.strip_prefix("reflect-method/").ok_or_else(|| {
-            NativeError::Metadata("malformed java/lang/reflect/Method marker".into())
-        })?;
-        let (owner, member) = marker.split_once('#').ok_or_else(|| {
-            NativeError::Metadata("reflective method marker has no name separator".into())
-        })?;
-        let (name, descriptor) = member
-            .find('(')
-            .map_or((member, None), |at| (&member[..at], Some(&member[at..])));
-        let invocation_args = StdHost::argument(r, args, 1)?;
-        let invocation_args = if matches!(invocation_args, Value::Ref(None)) {
-            Vec::new()
-        } else {
-            self.array(invocation_args)?.clone()
+        if r.name == "<init>" && r.descriptor == "(Ljava/lang/String;I)V" {
+            let marker = expect_ref(receiver.unwrap_or(&Value::Ref(None))).ok_or_else(|| {
+                NativeError::Metadata("java/lang/Enum.<init> needs the constant object".into())
+            })?;
+            let name = expect_string(StdHost::argument(r, args, 0)?);
+            let ordinal = expect_int(r, StdHost::argument(r, args, 1)?)?;
+            self.enum_constants
+                .insert(marker.to_owned(), (name.to_owned(), ordinal));
+            return Ok(Some(Value::Void));
+        }
+        let marker = expect_ref(receiver.unwrap_or(&Value::Ref(None)));
+        let recorded = marker.and_then(|marker| self.enum_constants.get(marker).cloned());
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("name", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;") => {
+                Ok(recorded.map(|(name, _)| Value::Ref(Some(name))))
+            }
+            ("ordinal", "()I") => match recorded {
+                Some((_, ordinal)) => Ok(Some(Value::Int(ordinal))),
+                None => Ok(match marker {
+                    Some(marker) => self.declared_enum_ordinal(marker)?,
+                    None => None,
+                }),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// The ordinal of one `enum/<class>/<name>` marker: its position in the
+    /// `$VALUES` array the class initializer built.
+    ///
+    /// The marker carries only the declared name, so the array order the
+    /// constants were declared in supplies the position. A receiver that is not
+    /// such a marker, or a class this invocation never initialized, stays with
+    /// the host's answer.
+    fn declared_enum_ordinal(&mut self, marker: &str) -> Result<Option<Value>, NativeError> {
+        let Some((class, name)) = marker
+            .strip_prefix("enum/")
+            .and_then(|rest| rest.rsplit_once('/'))
+        else {
+            return Ok(None);
         };
-        let class_file = self
-            .classes
-            .get(owner)
-            .ok_or_else(|| NativeError::MissingMethod(format!("{owner}#{name}")))?;
-        let target = class_file
+        self.ensure_initialized(class)?;
+        let key = format!("{class}#$VALUES[L{class};");
+        let Some(values) = self.static_fields.get(&key).cloned() else {
+            return Ok(None);
+        };
+        let Some(array) = expect_ref(&values).and_then(|marker| self.arrays.get(marker)) else {
+            return Ok(None);
+        };
+        Ok(array
+            .iter()
+            .position(|value| {
+                expect_ref(value)
+                    .and_then(|marker| self.enum_constants.get(marker))
+                    .is_some_and(|(declared, _)| declared == name)
+            })
+            .map(|ordinal| Value::Int(ordinal as i32)))
+    }
+
+    /// Answer a record's generated `toString`/`equals`/`hashCode` call site.
+    ///
+    /// `java.lang.runtime.ObjectMethods.bootstrap` is the invokedynamic
+    /// bootstrap javac emits for a record's three object methods. The
+    /// interpreter cannot run a bootstrap, so it answers the pattern the
+    /// components were declared with: `Record[x=.., y=..]`, component-wise
+    /// equality and the JVM's 31-based hash.
+    fn invoke_record_object_method(
+        &mut self,
+        file: &ClassFile,
+        index: u16,
+        class: &str,
+        name: &str,
+        captured: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(components) = file.record_component_names(index) else {
+            return Ok(None);
+        };
+        let Some(receiver) = captured.first() else {
+            return Ok(None);
+        };
+        match (name, captured.len()) {
+            ("toString", 1) => {
+                let mut text = String::new();
+                text.push_str(class.rsplit('/').next().unwrap_or(class));
+                text.push('[');
+                for (position, component) in components.iter().enumerate() {
+                    if position > 0 {
+                        text.push_str(", ");
+                    }
+                    let (descriptor, value) =
+                        self.record_component(file, class, component, receiver)?;
+                    text.push_str(component);
+                    text.push('=');
+                    text.push_str(&java_value_text(&value, &descriptor));
+                }
+                text.push(']');
+                Ok(Some(Value::Ref(Some(text))))
+            }
+            ("hashCode", 1) => {
+                let mut hash = 1_i32;
+                for component in &components {
+                    let (descriptor, value) =
+                        self.record_component(file, class, component, receiver)?;
+                    hash = hash
+                        .wrapping_mul(31)
+                        .wrapping_add(java_value_hash(&value, &descriptor));
+                }
+                Ok(Some(Value::Int(hash)))
+            }
+            ("equals", 2) => {
+                let other = captured.get(1).cloned().unwrap_or(Value::Ref(None));
+                let same_record = expect_ref(&other)
+                    .and_then(|marker| marker.split_once('#'))
+                    .is_some_and(|(owner, _)| owner == class);
+                if !same_record {
+                    return Ok(Some(Value::Int(0)));
+                }
+                for component in &components {
+                    let (_, left) = self.record_component(file, class, component, receiver)?;
+                    let (_, right) = self.record_component(file, class, component, &other)?;
+                    if !java_values_equal(&left, &right) {
+                        return Ok(Some(Value::Int(0)));
+                    }
+                }
+                Ok(Some(Value::Int(1)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// One record component's value and declared descriptor, read through the
+    /// accessor javac generated for it.
+    fn record_component(
+        &mut self,
+        file: &ClassFile,
+        class: &str,
+        component: &str,
+        receiver: &Value,
+    ) -> Result<(String, Value), NativeError> {
+        let descriptor = file
             .methods
             .iter()
-            .find(|candidate| {
-                candidate.name == name
-                    && descriptor.is_none_or(|descriptor| candidate.descriptor == descriptor)
-                    && arg_count(&candidate.descriptor) == invocation_args.len()
-            })
-            .cloned()
-            .ok_or_else(|| NativeError::MissingMethod(format!("{owner}#{name}")))?;
-        let target_receiver = if target.is_static() {
-            None
-        } else {
-            Some(StdHost::argument(r, args, 0)?.clone())
-        };
-        Ok(Some(self.invoke(
-            owner,
-            &target.name,
-            &target.descriptor,
-            target_receiver,
-            &invocation_args,
-        )?))
+            .find(|method| method.name == component && arg_count(&method.descriptor) == 0)
+            .map(|method| method.descriptor.clone())
+            .unwrap_or_else(|| "Ljava/lang/Object;".into());
+        let value = self.invoke(class, component, &descriptor, Some(receiver.clone()), &[])?;
+        Ok((descriptor, value))
+    }
+
+    /// `Object.clone` on a runtime-owned array.
+    ///
+    /// `Enum.values()` is the visible caller: it clones the `$VALUES` array
+    /// before handing it out, so an unmodelled clone would turn a declared
+    /// constant array into a host default.
+    fn invoke_array_clone(&mut self, r: &MethodRef, receiver: Option<&Value>) -> Option<Value> {
+        if r.name != "clone" || !r.descriptor.ends_with(")Ljava/lang/Object;") {
+            return None;
+        }
+        let marker = expect_array_marker(receiver?).ok()?;
+        let values = self.arrays.get(marker)?.clone();
+        let clone = self.new_array("java/lang/Object", "clone");
+        self.arrays.insert(clone.clone(), values);
+        Some(Value::Ref(Some(clone)))
+    }
+
+    /// Where one member call dispatches: the nearest class in the jar's
+    /// superclass chain that declares it, or the first class the jar does not
+    /// own, which the host answers like any inherited JDK method would.
+    fn member_owner(&self, class: &str, name: &str, descriptor: &str) -> Option<(String, bool)> {
+        let mut current = class.to_owned();
+        for _ in 0..MAX_SUPERCLASS_WALK {
+            let Some(file) = self.classes.get(&current) else {
+                return Some((current, false));
+            };
+            if file.method(name, descriptor).is_some() {
+                return Some((current, true));
+            }
+            current = file.super_name.clone();
+        }
+        None
     }
 
     fn array(&self, value: &Value) -> Result<&Vec<Value>, NativeError> {
@@ -10490,40 +11082,69 @@ impl<H: Host> Runtime<'_, H> {
                         && r.descriptor.ends_with(")Ljava/lang/Class;")
                     {
                         self.class_for_name(&args)?
-                    } else if self.classes.contains_key(&r.owner) {
-                        self.invoke(&r.owner, &r.name, &r.descriptor, receiver, &args)?
-                    } else {
-                        let optional = receiver
-                            .as_ref()
-                            .map(|receiver| self.invoke_optional(&r, receiver, &args))
-                            .transpose()?
-                            .flatten();
-                        if let Some(value) = optional {
+                    } else if let Some(value) = self.invoke_array_clone(&r, receiver.as_ref()) {
+                        value
+                    } else if let Some((owner, jar_owned)) =
+                        self.member_owner(&r.owner, &r.name, &r.descriptor)
+                    {
+                        let resolved = MethodRef {
+                            owner,
+                            name: r.name.clone(),
+                            descriptor: r.descriptor.clone(),
+                        };
+                        if let Some(value) =
+                            self.invoke_enum_member(&resolved, receiver.as_ref(), &args)?
+                        {
                             value
-                        } else if matches!(
-                            r.owner.as_str(),
-                            "java/util/function/Function"
-                                | "java/util/function/UnaryOperator"
-                                | "java/util/function/Consumer"
-                                | "java/util/function/Predicate"
-                                | "java/util/function/BiConsumer"
-                                | "java/util/function/BiFunction"
-                                | "java/util/function/Supplier"
-                        ) {
-                            if let Some(receiver) = receiver.as_ref() {
-                                if let Some(value) = self.invoke_callback(receiver, &args)? {
-                                    value
-                                } else {
-                                    self.host.invoke_instance(&r, receiver, &args)?
-                                }
-                            } else {
-                                self.host.invoke(&r, &args)?
-                            }
-                        } else if let Some(receiver) = receiver.as_ref() {
-                            self.host.invoke_instance(&r, receiver, &args)?
+                        } else if jar_owned {
+                            self.invoke(
+                                &resolved.owner,
+                                &resolved.name,
+                                &resolved.descriptor,
+                                receiver,
+                                &args,
+                            )?
                         } else {
-                            self.host.invoke(&r, &args)?
+                            // A superclass outside the jar answers an inherited
+                            // member, so the host keeps the contract it always
+                            // had for the original owner.
+                            let optional = receiver
+                                .as_ref()
+                                .map(|receiver| self.invoke_optional(&resolved, receiver, &args))
+                                .transpose()?
+                                .flatten();
+                            if let Some(value) = optional {
+                                value
+                            } else if matches!(
+                                resolved.owner.as_str(),
+                                "java/util/function/Function"
+                                    | "java/util/function/UnaryOperator"
+                                    | "java/util/function/Consumer"
+                                    | "java/util/function/Predicate"
+                                    | "java/util/function/BiConsumer"
+                                    | "java/util/function/BiFunction"
+                                    | "java/util/function/Supplier"
+                            ) {
+                                if let Some(receiver) = receiver.as_ref() {
+                                    if let Some(value) = self.invoke_callback(receiver, &args)? {
+                                        value
+                                    } else {
+                                        self.host.invoke_instance(&resolved, receiver, &args)?
+                                    }
+                                } else {
+                                    self.host.invoke(&resolved, &args)?
+                                }
+                            } else if let Some(receiver) = receiver.as_ref() {
+                                self.host.invoke_instance(&resolved, receiver, &args)?
+                            } else {
+                                self.host.invoke(&resolved, &args)?
+                            }
                         }
+                    } else {
+                        return Err(NativeError::Metadata(format!(
+                            "native dispatch for {}#{}{} exceeded {MAX_SUPERCLASS_WALK} superclasses",
+                            r.owner, r.name, r.descriptor
+                        )));
                     };
                     if value != Value::Void {
                         stack.push(value);
@@ -10547,6 +11168,15 @@ impl<H: Host> Runtime<'_, H> {
                         .map(|_| pop(&mut stack, class, method))
                         .collect::<Result<Vec<_>, _>>()?;
                     captured.reverse();
+                    let site_name = file.invoke_dynamic_name(index)?;
+                    if let Some(value) =
+                        self.invoke_record_object_method(file, index, class, &site_name, &captured)?
+                    {
+                        if return_desc(&descriptor) != "V" {
+                            stack.push(value);
+                        }
+                        continue;
+                    }
                     let target = file.invoke_dynamic_target(index)?.map(|target| {
                         format!("{}#{}{}", target.owner, target.name, target.descriptor)
                     });
@@ -10841,6 +11471,70 @@ fn descriptor_arguments(desc: &str) -> Vec<String> {
         arguments.push(desc[start..at].to_owned());
     }
     arguments
+}
+
+/// Adapt the `Object[]` arguments of a reflective call to the parameter types
+/// the target member declares.
+///
+/// `Method.invoke` and `Constructor.newInstance` receive boxed values, so
+/// `integer:3` stands for the `int` a primitive parameter declares and the
+/// interpreter has to unbox it before the bytecode reads the local. A reference
+/// parameter keeps its value unchanged; a value that does not fit stays as it
+/// is, so the mismatch is reported where that value is used instead of being
+/// guessed at here.
+fn coerce_arguments(descriptor: &str, args: &[Value]) -> Vec<Value> {
+    let parameters = descriptor_arguments(descriptor);
+    args.iter()
+        .enumerate()
+        .map(|(index, value)| {
+            parameters
+                .get(index)
+                .and_then(|parameter| coerce_argument(parameter, value))
+                .unwrap_or_else(|| value.clone())
+        })
+        .collect()
+}
+
+/// Unbox one reflective argument for exactly `desc`; `None` keeps it unchanged.
+fn coerce_argument(desc: &str, value: &Value) -> Option<Value> {
+    match desc {
+        "Z" => boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
+        "B" => number_byte_value(value).map(Value::Int),
+        "S" => number_short_value(value).map(Value::Int),
+        "C" => boxed_character(value).map(Value::Int),
+        "I" => number_int_value(value).map(Value::Int),
+        "J" => number_long_value(value).map(Value::Long),
+        "F" => boxed_number(value).map(|value| Value::Float(float32(value))),
+        "D" => boxed_number(value).map(Value::Float),
+        _ => None,
+    }
+}
+
+/// A member's declared return in the interpreter's value model.
+///
+/// A reflected call answers a primitive in its own variant so the caller's
+/// arithmetic keeps the declared width; a reference stays as it is.
+fn declared_value(desc: &str, value: Value) -> Value {
+    match desc {
+        "V" => Value::Void,
+        "Z" | "B" | "C" | "S" | "I" => match number_int_value(&value) {
+            Some(value) => Value::Int(value),
+            None => value,
+        },
+        "J" => match number_long_value(&value) {
+            Some(value) => Value::Long(value),
+            None => value,
+        },
+        "F" => match boxed_number(&value) {
+            Some(value) => Value::Float(float32(value)),
+            None => value,
+        },
+        "D" => match boxed_number(&value) {
+            Some(value) => Value::Float(value),
+            None => value,
+        },
+        _ => value,
+    }
 }
 
 fn is_callback_info_descriptor(desc: &str) -> bool {
@@ -11701,6 +12395,20 @@ fn int_constant(pool: &[Cp], index: u16) -> Result<i32, NativeError> {
     }
 }
 
+/// Whether an annotation's descriptor names the `Class` marker a query passes.
+///
+/// `Class.getAnnotation(Marker.class)` hands over the internal binary name
+/// (`demo/Marker`), while the class file keeps the field descriptor
+/// (`Ldemo/Marker;`), so both spellings match.
+fn annotation_is(annotation: &Annotation, wanted: &str) -> bool {
+    annotation.descriptor == wanted
+        || annotation
+            .descriptor
+            .strip_prefix('L')
+            .and_then(|descriptor| descriptor.strip_suffix(';'))
+            == Some(wanted)
+}
+
 /// Flatten a string or array-of-strings annotation value.
 fn annotation_strings(value: &AnnotationValue) -> Vec<String> {
     match value {
@@ -11970,6 +12678,9 @@ mod tests {
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            enum_constants: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
         };
@@ -12005,6 +12716,9 @@ mod tests {
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            enum_constants: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
         };
@@ -17782,6 +18496,9 @@ mandatory = true
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            enum_constants: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
         };
@@ -17922,6 +18639,9 @@ mandatory = true
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            enum_constants: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
         };
@@ -18115,6 +18835,9 @@ mandatory = true
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            enum_constants: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
         };
@@ -18412,6 +19135,9 @@ mandatory = true
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            enum_constants: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
         };
@@ -18629,6 +19355,9 @@ mandatory = true
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            enum_constants: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
             invoke_hooks: None,
         };
