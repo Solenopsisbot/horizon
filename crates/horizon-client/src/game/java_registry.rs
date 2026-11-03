@@ -217,6 +217,7 @@ mod tests {
                 id: "ruby:zombie".into(),
                 template: "minecraft:zombie".into(),
                 properties: BTreeMap::new(),
+                ..EntityDeclaration::default()
             }],
             data_components: vec![DataComponentDeclaration {
                 id: "ruby:power".into(),
