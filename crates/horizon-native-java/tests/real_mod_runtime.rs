@@ -153,3 +153,105 @@ version = "1.0"
         .unwrap();
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn runtime_built_mixin_fixture_executes_bounded_injectors() {
+    use horizon_native_java::{MethodRef, MixinInjectionPlan, Value};
+
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "demo/Target.java",
+        r#"package demo;
+public final class Target {
+    public static void run(int value) {
+        int marker = value + 1;
+    }
+    public static int value(int value) {
+        int marker = value + 1;
+        return marker;
+    }
+}
+"#,
+    );
+    sources.insert(
+        "demo/Callbacks.java",
+        r#"package demo;
+public final class Callbacks {
+    public static void before(int value) {
+        int marker = value + 10;
+    }
+    public static void after(int value) {
+        int marker = value + 100;
+    }
+}
+"#,
+    );
+    let (root, jar_path) = build_jar(
+        "mixin",
+        sources,
+        "fabric.mod.json",
+        br#"{"id":"mixin-fixture","version":"1.0"}"#,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let target = MethodRef {
+        owner: "demo/Target".into(),
+        name: "run".into(),
+        descriptor: "(I)V".into(),
+    };
+    let callback = MethodRef {
+        owner: "demo/Callbacks".into(),
+        name: "before".into(),
+        descriptor: "(I)V".into(),
+    };
+
+    let mut head_host = StdHost::new();
+    let head_report = jar
+        .execute_mixin_at_head(
+            &MixinInjectionPlan::inject_at_head(target.clone(), callback.clone()),
+            None,
+            &[Value::Int(7)],
+            &mut head_host,
+        )
+        .unwrap();
+    assert_eq!(head_report.callback_result, Value::Void);
+    assert_eq!(head_report.target_result, Value::Void);
+    assert!(head_host.calls().is_empty());
+
+    let mut return_host = StdHost::new();
+    let return_plan = MixinInjectionPlan {
+        target: target.clone(),
+        callback: MethodRef {
+            name: "after".into(),
+            ..callback.clone()
+        },
+        at: "RETURN".into(),
+        cancellable: false,
+    };
+    let return_report = jar
+        .execute_mixin_at_return(&return_plan, None, &[Value::Int(7)], &mut return_host)
+        .unwrap();
+    assert_eq!(return_report.target_result, Value::Void);
+    assert_eq!(return_report.callback_result, Value::Void);
+    assert!(return_host.calls().is_empty());
+
+    let tail_plan = MixinInjectionPlan {
+        at: "TAIL".into(),
+        ..return_plan.clone()
+    };
+    jar.execute_mixin_at_return(&tail_plan, None, &[Value::Int(7)], &mut StdHost::new())
+        .unwrap();
+
+    let non_void_plan = MixinInjectionPlan {
+        target: MethodRef {
+            name: "value".into(),
+            descriptor: "(I)I".into(),
+            ..target
+        },
+        ..return_plan
+    };
+    let error = jar
+        .execute_mixin_at_return(&non_void_plan, None, &[Value::Int(7)], &mut StdHost::new())
+        .unwrap_err();
+    assert!(error.to_string().contains("return-value callbacks"));
+    let _ = fs::remove_dir_all(root);
+}
