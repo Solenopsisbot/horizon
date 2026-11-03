@@ -596,6 +596,24 @@ pub use horizon_items::item_nbt::{
 /// The block entity type ID for the block it sits in (a chest-like container
 /// is a chest, trapped chest or barrel).
 fn block_entity_id(e: &crate::containers::BlockEntity, block: &str) -> String {
+    block_entity_id_with(
+        &crate::mod_content::stored_declared_block_entities(),
+        e,
+        block,
+    )
+}
+
+/// [`block_entity_id`] against an explicit declaration map: a declared block
+/// saves under its declared id, so a reload can restore it as the template
+/// entity it behaves as.
+fn block_entity_id_with(
+    declared: &std::collections::BTreeMap<String, crate::mod_content::DeclaredBlockEntity>,
+    e: &crate::containers::BlockEntity,
+    block: &str,
+) -> String {
+    if let Some(row) = declared.get(block) {
+        return row.id.clone();
+    }
     match (e, block) {
         (
             crate::containers::BlockEntity::Chest(_),
@@ -867,9 +885,21 @@ fn decode_mod_block_entity(id: String, tag: &Tag) -> Option<crate::containers::M
     })
 }
 pub fn decode_block_entity(tag: &Tag) -> Option<((i32, i32, i32), crate::containers::BlockEntity)> {
+    decode_block_entity_with(&crate::mod_content::stored_declared_block_entities(), tag)
+}
+
+/// [`decode_block_entity`] against an explicit declaration map: a declared id
+/// decodes as its vanilla template, so the classed entity is not mistaken for
+/// an opaque native-mod entity.
+fn decode_block_entity_with(
+    declared: &std::collections::BTreeMap<String, crate::mod_content::DeclaredBlockEntity>,
+    tag: &Tag,
+) -> Option<((i32, i32, i32), crate::containers::BlockEntity)> {
     use crate::containers::BlockEntity;
     let int = |k: &str| number(tag.get(k)).map(|v| v as i32);
-    let id = text(tag.get("id"))?;
+    let saved_id = text(tag.get("id"))?;
+    let mapped = declared.values().find(|row| row.id == saved_id);
+    let id = mapped.map_or(saved_id, |row| row.template.clone());
     let pos = (int("x")?, int("y")?, int("z")?);
     if id.contains(':') && !id.starts_with("minecraft:") {
         return Some((
@@ -6567,5 +6597,51 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// A declared block entity saves under its declared id and loads as the
+/// vanilla template entity it behaves as.
+#[cfg(test)]
+mod declared_block_entity_save_tests {
+    use super::*;
+
+    fn declared() -> std::collections::BTreeMap<String, crate::mod_content::DeclaredBlockEntity> {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "ruby:crate".to_owned(),
+            crate::mod_content::DeclaredBlockEntity {
+                id: "ruby:crate_entity".into(),
+                template: "minecraft:barrel".into(),
+                ticker: false,
+                valid_blocks: vec!["ruby:crate".into()],
+            },
+        );
+        map
+    }
+
+    #[test]
+    fn declared_block_entities_save_and_load_under_their_id() {
+        let map = declared();
+        let chest = crate::containers::BlockEntity::Chest(vec![None; 27]);
+        assert_eq!(
+            block_entity_id_with(&map, &chest, "ruby:crate"),
+            "ruby:crate_entity"
+        );
+        assert_eq!(
+            block_entity_id_with(&map, &chest, "minecraft:barrel"),
+            "minecraft:barrel"
+        );
+        let tag = Tag::compound([
+            ("id", Tag::String("ruby:crate_entity".into())),
+            ("x", Tag::Int(1)),
+            ("y", Tag::Int(2)),
+            ("z", Tag::Int(3)),
+        ]);
+        let ((x, y, z), entity) = decode_block_entity_with(&map, &tag).expect("declared id loads");
+        assert_eq!((x, y, z), (1, 2, 3));
+        assert!(
+            matches!(entity, crate::containers::BlockEntity::Chest(items) if items.len() == 27)
+        );
     }
 }

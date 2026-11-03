@@ -31,6 +31,21 @@ const ENTITY: u8 = 4;
 
 /// The vanilla block entity type of a block (BlockEntityType.validBlocks).
 pub fn block_entity_type(name: &str) -> Option<&'static str> {
+    block_entity_type_with(&crate::mod_content::stored_declared_block_entities(), name)
+}
+
+/// [`block_entity_type`] against an explicit declaration map: a declared
+/// block answers its vanilla template's type, so chunks, saves and worldgen
+/// treat the mod block as the entity it behaves as.
+pub fn block_entity_type_with(
+    declared: &std::collections::BTreeMap<String, crate::mod_content::DeclaredBlockEntity>,
+    name: &str,
+) -> Option<&'static str> {
+    if let Some(row) = declared.get(name)
+        && row.template != name
+    {
+        return block_entity_type_with(declared, &row.template);
+    }
     let n = name.strip_prefix("minecraft:")?;
     Some(match n {
         "chest" => "minecraft:chest",
@@ -1271,6 +1286,30 @@ mod tests {
             Some("minecraft:shulker_box")
         );
         assert_eq!(block_entity_type("minecraft:stone"), None);
+    }
+
+    #[test]
+    fn declared_blocks_answer_their_template_block_entity_type() {
+        let mut declared = std::collections::BTreeMap::new();
+        declared.insert(
+            "ruby:crate".to_owned(),
+            crate::mod_content::DeclaredBlockEntity {
+                id: "ruby:crate_entity".into(),
+                template: "minecraft:barrel".into(),
+                ticker: false,
+                valid_blocks: vec!["ruby:crate".into()],
+            },
+        );
+        assert_eq!(
+            block_entity_type_with(&declared, "ruby:crate"),
+            Some("minecraft:barrel")
+        );
+        // An undeclared mod block stays unknown, and vanilla is unchanged.
+        assert_eq!(block_entity_type_with(&declared, "ruby:stone"), None);
+        assert_eq!(
+            block_entity_type_with(&declared, "minecraft:barrel"),
+            Some("minecraft:barrel")
+        );
     }
 
     #[test]

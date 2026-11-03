@@ -154,6 +154,98 @@ pub fn stored_declared_ids() -> DeclaredIds {
         .unwrap_or_default()
 }
 
+/// A block-entity declaration keyed by every block that carries it. The
+/// template is a vanilla block id, so the block behaves and saves as that
+/// vanilla block entity while keeping the declared id in its own metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclaredBlockEntity {
+    pub id: String,
+    pub template: String,
+    pub ticker: bool,
+    pub valid_blocks: Vec<String>,
+}
+
+/// Every declared block entity, keyed by each block id in `valid_blocks`.
+/// When two declarations name one block the lower declaration id wins, so
+/// content order cannot change which entity is built.
+pub fn declared_block_entity_map(
+    mods: &[ContentMod],
+) -> std::collections::BTreeMap<String, DeclaredBlockEntity> {
+    let mut out: std::collections::BTreeMap<String, DeclaredBlockEntity> =
+        std::collections::BTreeMap::new();
+    for m in mods {
+        for row in &m.content.block_entities {
+            let declared = DeclaredBlockEntity {
+                id: row.id.clone(),
+                template: row.template.clone(),
+                ticker: row.ticker,
+                valid_blocks: row.valid_blocks.clone(),
+            };
+            for block in &row.valid_blocks {
+                match out.get_mut(block) {
+                    Some(existing) if existing.id <= declared.id => {}
+                    Some(existing) => *existing = declared.clone(),
+                    None => {
+                        out.insert(block.clone(), declared.clone());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The last [`declared_block_entity_map`], for world load, save and chunk
+/// encoding, which no longer have the mods at hand.
+static DECLARED_BLOCK_ENTITIES: Mutex<
+    Option<std::collections::BTreeMap<String, DeclaredBlockEntity>>,
+> = Mutex::new(None);
+
+/// Remember the block-entity declarations of a built content root; empty
+/// mods clear them.
+pub fn store_declared_block_entities(mods: &[ContentMod]) {
+    let declared = declared_block_entity_map(mods);
+    *DECLARED_BLOCK_ENTITIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(declared);
+}
+
+/// The declarations the last content root held, keyed by block.
+pub fn stored_declared_block_entities() -> std::collections::BTreeMap<String, DeclaredBlockEntity> {
+    DECLARED_BLOCK_ENTITIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
+/// The declaration for a block, if the last content root had one.
+pub fn declared_block_entity_for(block: &str) -> Option<DeclaredBlockEntity> {
+    stored_declared_block_entities().remove(block)
+}
+
+/// The vanilla template a declared block behaves as, if any.
+pub fn declared_block_entity_template(block: &str) -> Option<String> {
+    declared_block_entity_for(block).map(|row| row.template)
+}
+
+/// The declared block-entity id for a block, if any.
+pub fn declared_block_entity_id(block: &str) -> Option<String> {
+    declared_block_entity_for(block).map(|row| row.id)
+}
+
+/// The declaration whose id is `id`, if any.
+pub fn declared_block_entity_by_id(id: &str) -> Option<DeclaredBlockEntity> {
+    stored_declared_block_entities()
+        .into_values()
+        .find(|row| row.id == id)
+}
+
+/// `block == template` or the block is declared with that vanilla template.
+pub fn block_is_template(block: &str, template: &str) -> bool {
+    block == template || declared_block_entity_template(block).as_deref() == Some(template)
+}
+
 /// Ids [`DeclarationSummary`] keeps; the rest are only counted.
 pub const MAX_SUMMARY_IDS: usize = 64;
 
@@ -1934,6 +2026,7 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
 pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<PathBuf> {
     if mods.iter().all(|m| m.content.is_empty()) {
         store_declared_ids(&[]);
+        store_declared_block_entities(&[]);
         return Ok(base.to_owned());
     }
     let out = cache.join("mod-content");
@@ -1943,6 +2036,7 @@ pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<P
         let warnings = fs::read_to_string(out.join(WARNINGS)).unwrap_or_default();
         warnings.lines().for_each(|w| log::warn!("Horizon: {w}"));
         store_declared_ids(mods);
+        store_declared_block_entities(mods);
         return Ok(out);
     }
     for warning in build(base, mods, &out)? {
@@ -1950,6 +2044,7 @@ pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<P
     }
     fs::write(out.join(STAMP), stamp)?;
     store_declared_ids(mods);
+    store_declared_block_entities(mods);
     Ok(out)
 }
 
@@ -2136,6 +2231,16 @@ mod declared_ids_tests {
                 .all(|pair| pair[0] < pair[1]),
             "sorted and without repeats"
         );
+    }
+
+    #[test]
+    fn declared_block_entities_key_blocks_to_their_template() {
+        let map = declared_block_entity_map(&[ruby()]);
+        let row = map.get("ruby:ore").expect("ruby:ore carries the entity");
+        assert_eq!(row.id, "ruby:crate_entity");
+        assert_eq!(row.template, "minecraft:barrel");
+        assert_eq!(row.valid_blocks, ["ruby:ore"]);
+        assert!(declared_block_entity_map(&[]).is_empty());
     }
 }
 

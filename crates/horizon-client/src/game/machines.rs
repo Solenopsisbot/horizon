@@ -653,13 +653,13 @@ impl Game<'_> {
         }
         // Most ticks only advance the cooldown: the block is checked when the
         // hopper is about to move, not on every tick it waits.
-        let hopper = self
+        let name = self
             .res
             .facts()
             .get(self.world.block(pos.0, pos.1, pos.2))
             .name
-            .as_ref()
-            == "minecraft:hopper";
+            .clone();
+        let hopper = horizon_client::mod_content::block_is_template(&name, "minecraft:hopper");
         if !hopper {
             self.hoppers.remove(&pos);
             return;

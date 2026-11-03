@@ -101,7 +101,15 @@ impl Game<'_> {
             .map(|i| {
                 let state = BlockStateId(i as u32);
                 let name: &str = &self.res.facts().get(state).name;
-                match name {
+                let declared = horizon_client::mod_content::declared_block_entity_for(name);
+                // A declared block entity behaves as its vanilla template, so
+                // its ticker is the template's; a declaration may also ask
+                // for a ticker of its own.
+                if let Some(ticking) = declared_ticking(declared.as_ref()) {
+                    return ticking;
+                }
+                let template = template_or_name(declared.as_ref(), name);
+                match template {
                     "minecraft:hopper"
                     | "minecraft:crafter"
                     | "minecraft:beacon"
@@ -132,7 +140,9 @@ impl Game<'_> {
                         if record { Ticking::Yes } else { Ticking::Idle }
                     }
                     n if FurnaceKind::from_block(n).is_some() => Ticking::Yes,
-                    n if !n.starts_with("minecraft:") && self.native_ticks(n) => Ticking::Yes,
+                    _ if !name.starts_with("minecraft:") && self.native_ticks(name) => {
+                        Ticking::Yes
+                    }
                     _ => Ticking::No,
                 }
             })
@@ -178,5 +188,48 @@ impl Game<'_> {
             }
         }
         Ok(())
+    }
+}
+
+/// A declared block entity's own ticker flag: `Some(Yes)` when the declaration
+/// asks for one, `None` when the template decides.
+pub(crate) fn declared_ticking(
+    declared: Option<&horizon_client::mod_content::DeclaredBlockEntity>,
+) -> Option<Ticking> {
+    declared.filter(|row| row.ticker).map(|_| Ticking::Yes)
+}
+
+/// The block's vanilla template when declared, else its own name.
+pub(crate) fn template_or_name<'a>(
+    declared: Option<&'a horizon_client::mod_content::DeclaredBlockEntity>,
+    name: &'a str,
+) -> &'a str {
+    declared.map_or(name, |row| row.template.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use horizon_client::mod_content::DeclaredBlockEntity;
+
+    fn declared(ticker: bool) -> DeclaredBlockEntity {
+        DeclaredBlockEntity {
+            id: "ruby:crate_entity".into(),
+            template: "minecraft:barrel".into(),
+            ticker,
+            valid_blocks: vec!["ruby:crate".into()],
+        }
+    }
+
+    #[test]
+    fn declared_ticker_and_template_decide_the_state() {
+        assert_eq!(declared_ticking(Some(&declared(true))), Some(Ticking::Yes));
+        assert_eq!(declared_ticking(Some(&declared(false))), None);
+        assert_eq!(declared_ticking(None), None);
+        assert_eq!(
+            template_or_name(Some(&declared(false)), "ruby:crate"),
+            "minecraft:barrel"
+        );
+        assert_eq!(template_or_name(None, "ruby:crate"), "ruby:crate");
     }
 }
