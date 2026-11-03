@@ -16708,9 +16708,9 @@ const MAX_DECLARED_ENTITY_BYTES: u64 = 1 << 20;
 const MAX_DECLARED_ENTITY_WARNINGS: usize = 8;
 
 /// One declared mod entity (`data/<namespace>/horizon/entity/<path>.json`) as
-/// an alias of the vanilla type it copies. Only `template` and the numbers
-/// the game reads are parsed; `spawn`, components and goals belong to the
-/// systems that own them.
+/// an alias of the vanilla type it copies. The template, the numbers the game
+/// reads, the `MobCategory` overlay and the spawn restriction are parsed;
+/// components and goals belong to the systems that own them.
 fn parse_entity_alias(
     id: &str,
     bytes: &[u8],
@@ -16732,11 +16732,51 @@ fn parse_entity_alias(
         _ => None,
     };
     let property = |key: &str| properties.and_then(|p| p.get(key)).and_then(number);
+    let text = |key: &str| properties.and_then(|p| p.get(key)).and_then(|v| v.as_str());
     let attribute = |key: &str, property_key: &str| {
         attributes
             .and_then(|a| a.get(key))
             .and_then(number)
             .or_else(|| property(property_key))
+    };
+    // A spawn restriction is the writer's typed `spawn` object or the
+    // adapter's flat `spawn_*` properties; either may be absent.
+    let spawn = value.get("spawn").and_then(|v| v.as_object());
+    let spawn_text = |typed_key: &str, flat_key: &str| {
+        spawn
+            .and_then(|s| s.get(typed_key))
+            .and_then(|v| v.as_str())
+            .or_else(|| text(flat_key))
+    };
+    let integer = |value: &serde_json::Value| match value {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    };
+    let spawn_height =
+        |typed_key: &str, flat_key: &str| -> std::result::Result<Option<i32>, String> {
+            let value = spawn
+                .and_then(|s| s.get(typed_key))
+                .or_else(|| properties.and_then(|p| p.get(flat_key)));
+            let Some(value) = value else { return Ok(None) };
+            let value = integer(value).ok_or_else(|| format!("{flat_key} is not an integer"))?;
+            i32::try_from(value)
+                .map(Some)
+                .map_err(|_| format!("{flat_key} {value} is out of range"))
+        };
+    let spawn_category = spawn_text("category", "spawn_category");
+    let spawn_heightmap = spawn_text("heightmap", "spawn_heightmap");
+    let min_height = spawn_height("min_height", "spawn_min_height")?;
+    let max_height = spawn_height("max_height", "spawn_max_height")?;
+    let spawn = match (spawn_category, spawn_heightmap) {
+        (None, None) if min_height.is_none() && max_height.is_none() => None,
+        (Some(category), Some(heightmap)) => Some(horizon_client::mobs::MobSpawnRestriction {
+            category: category.to_owned(),
+            heightmap: heightmap.to_owned(),
+            min_height,
+            max_height,
+        }),
+        _ => return Err("spawn restriction needs spawn_category and spawn_heightmap".into()),
     };
     let alias = horizon_client::mobs::MobEntityAlias {
         id: id.to_owned(),
@@ -16748,6 +16788,8 @@ fn parse_entity_alias(
         speed: attribute("speed", "speed"),
         attack_damage: attribute("attack_damage", "attack_damage").map(|v| v as f32),
         follow_range: attribute("follow_range", "follow_range"),
+        category: text("category").map(str::to_owned),
+        spawn,
     };
     alias.validate()?;
     Ok(alias)
@@ -16855,7 +16897,7 @@ fn load_world_rest(
     let threads = resources.threads();
     let registry_owner = assets;
     progress.set(6);
-    let mob_data = horizon_client::mobs::MobData::load(root, facts);
+    let mut mob_data = horizon_client::mobs::MobData::load(root, facts);
     horizon_client::mobs::trial_spawner::load_registry(root);
 
     let items = Items::load(
@@ -16919,7 +16961,23 @@ fn load_world_rest(
             }
             for alias in &aliases {
                 match types.add_alias(alias) {
-                    Ok(()) => declared += 1,
+                    Ok(()) => {
+                        declared += 1;
+                        // The natural spawner reads each type's placement and
+                        // heightmap from `MobData`; a declared restriction
+                        // overrides the template's there, so an unknown
+                        // name keeps vanilla's registration.
+                        if let Some(spawn) = types.spawn_restriction(&alias.id)
+                            && let Some(id) = types.resolve(&alias.id).map(|t| t.id.clone())
+                        {
+                            if let Some(placement) =
+                                horizon_client::mobs::spawning::restriction_placement(spawn)
+                            {
+                                mob_data.placements.insert(id.clone(), placement);
+                            }
+                            mob_data.heightmaps.insert(id, spawn.heightmap.clone());
+                        }
+                    }
                     Err(error) => warnings.push(format!("{}: {error}", alias.id)),
                 }
             }
@@ -18075,7 +18133,9 @@ mod declared_entity_tests {
             "data/alpha/horizon/entity/monster/goblin.json",
             r#"{
                 "template": "zombie",
-                "properties": {"height": "1.95", "max_health": "30"}
+                "properties": {"height": "1.95", "max_health": "30", "category": "MONSTER"},
+                "spawn": {"category": "ON_GROUND", "heightmap": "MOTION_BLOCKING",
+                          "min_height": 60, "max_height": 80}
             }"#,
         );
         // Not an entity: the `horizon` folder holds other kinds beside it.
@@ -18094,6 +18154,12 @@ mod declared_entity_tests {
         assert_eq!(goblin.template, "zombie");
         assert_eq!(goblin.height, Some(1.95));
         assert_eq!(goblin.max_health, Some(30.0));
+        assert_eq!(goblin.category.as_deref(), Some("MONSTER"));
+        let spawn = goblin.spawn.as_ref().expect("spawn restriction");
+        assert_eq!(spawn.category, "ON_GROUND");
+        assert_eq!(spawn.heightmap, "MOTION_BLOCKING");
+        assert_eq!(spawn.min_height, Some(60));
+        assert_eq!(spawn.max_height, Some(80));
         let bird = &aliases[1];
         assert_eq!(bird.id, "ruby:bird");
         assert_eq!(bird.template, "minecraft:chicken");
@@ -18101,6 +18167,39 @@ mod declared_entity_tests {
         assert_eq!(bird.max_health, Some(4.0));
         assert_eq!(bird.speed, Some(0.25));
         assert_eq!(bird.attack_damage, None);
+        assert!(bird.spawn.is_none());
+    }
+
+    /// The spawn restriction the adapter records as flat strings reads the
+    /// same as the writer's typed `spawn` object.
+    #[test]
+    fn spawn_restrictions_read_the_adapters_flat_keys() {
+        let root = temp_root("spawn-flat");
+        write(
+            &root,
+            "data/ruby/horizon/entity/guard.json",
+            r#"{
+                "template": "iron_golem",
+                "properties": {
+                    "category": "creature",
+                    "spawn_category": "in_water",
+                    "spawn_heightmap": "ocean_floor",
+                    "spawn_min_height": "-64",
+                    "spawn_max_height": "320"
+                }
+            }"#,
+        );
+        let (aliases, rejected) = declared_entity_aliases(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(aliases.len(), 1);
+        let guard = &aliases[0];
+        assert_eq!(guard.category.as_deref(), Some("creature"));
+        let spawn = guard.spawn.as_ref().expect("spawn restriction");
+        assert_eq!(spawn.category, "in_water");
+        assert_eq!(spawn.heightmap, "ocean_floor");
+        assert_eq!(spawn.min_height, Some(-64));
+        assert_eq!(spawn.max_height, Some(320));
     }
 
     /// A file the game cannot use is reported with its path, one by one, so a
@@ -18115,10 +18214,27 @@ mod declared_entity_tests {
             "data/ruby/horizon/entity/huge.json",
             r#"{"template": "cow", "properties": {"width": "-1"}}"#,
         );
+        write(
+            &root,
+            "data/ruby/horizon/entity/unknown_spawn.json",
+            r#"{"template": "cow", "properties": {"spawn_category": "ON_CEILING",
+                "spawn_heightmap": "WORLD_SURFACE"}}"#,
+        );
+        write(
+            &root,
+            "data/ruby/horizon/entity/unknown_category.json",
+            r#"{"template": "cow", "properties": {"category": "boss"}}"#,
+        );
+        write(
+            &root,
+            "data/ruby/horizon/entity/over_height.json",
+            r#"{"template": "cow", "properties": {"spawn_category": "ON_GROUND",
+                "spawn_heightmap": "WORLD_SURFACE", "spawn_min_height": "99999999999999"}}"#,
+        );
         let (aliases, rejected) = declared_entity_aliases(&root);
         let _ = std::fs::remove_dir_all(&root);
         assert!(aliases.is_empty());
-        assert_eq!(rejected.len(), 3);
+        assert_eq!(rejected.len(), 6);
         for (path, error) in &rejected {
             assert!(path.starts_with(&root), "{}", path.display());
             assert!(!error.is_empty());

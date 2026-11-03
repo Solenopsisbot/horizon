@@ -104,7 +104,12 @@ use horizon_core::{
 };
 use horizon_world::block_collision::BlockCollisionRegistry;
 use serde_json::Value;
-use std::{collections::HashMap, fs, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+    path::Path,
+    sync::Arc,
+};
 
 #[derive(Clone, Debug)]
 pub struct Polygon {
@@ -395,11 +400,85 @@ const MAX_MOB_ALIAS_ID: usize = 256;
 const MAX_MOB_ALIAS_SIZE: f64 = 64.0;
 /// A declared entity attribute's value (`horizon_mods::native::MAX_ENTITY_ATTRIBUTE`).
 const MAX_MOB_ALIAS_ATTRIBUTE: f64 = 1.0e6;
+/// A declared entity's `MobCategory` name is bounded like its id.
+const MAX_MOB_ALIAS_CATEGORY: usize = 64;
+/// The `SpawnPlacementTypes` a declared spawn restriction may name
+/// (`horizon_mods::native`'s list is private; these are vanilla's four).
+const MOB_ALIAS_SPAWN_PLACEMENTS: [&str; 4] =
+    ["IN_LAVA", "IN_WATER", "NO_RESTRICTIONS", "ON_GROUND"];
+/// The `Heightmap.Types` `SpawnPlacements.register` accepts.
+const MOB_ALIAS_SPAWN_HEIGHTMAPS: [&str; 4] = [
+    "MOTION_BLOCKING",
+    "MOTION_BLOCKING_NO_LEAVES",
+    "OCEAN_FLOOR",
+    "WORLD_SURFACE",
+];
+/// A spawn restriction's height window is an `i32` inside the build range.
+const MAX_MOB_ALIAS_SPAWN_HEIGHT: i32 = horizon_mods::native::MAX_SPAWN_HEIGHT;
+
+/// The spawn placement a declared entity may pin: the placement type's
+/// `isSpawnPositionOk` vocabulary, the heightmap its position is read from,
+/// and an inclusive height window. Every field is bounded: names are
+/// canonicalised to the upper case vanilla spells them and heights stay
+/// inside the build range.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MobSpawnRestriction {
+    /// A `SpawnPlacementTypes` name (`ON_GROUND`, `IN_WATER`, ...).
+    pub category: String,
+    /// A `Heightmap.Types` name (`MOTION_BLOCKING`, ...).
+    pub heightmap: String,
+    /// Inclusive; absent keeps the placement type's own.
+    pub min_height: Option<i32>,
+    pub max_height: Option<i32>,
+}
+impl MobSpawnRestriction {
+    fn validate(&self) -> Result<(), String> {
+        let category = self.category.to_ascii_uppercase();
+        if !MOB_ALIAS_SPAWN_PLACEMENTS.contains(&category.as_str()) {
+            return Err(format!(
+                "spawn category {:?} is not one of {}",
+                self.category,
+                MOB_ALIAS_SPAWN_PLACEMENTS.join(", ")
+            ));
+        }
+        let heightmap = self.heightmap.to_ascii_uppercase();
+        if !MOB_ALIAS_SPAWN_HEIGHTMAPS.contains(&heightmap.as_str()) {
+            return Err(format!(
+                "spawn heightmap {:?} is not one of {}",
+                self.heightmap,
+                MOB_ALIAS_SPAWN_HEIGHTMAPS.join(", ")
+            ));
+        }
+        for (name, value) in [
+            ("spawn_min_height", self.min_height),
+            ("spawn_max_height", self.max_height),
+        ] {
+            if let Some(v) = value
+                && !(-MAX_MOB_ALIAS_SPAWN_HEIGHT..=MAX_MOB_ALIAS_SPAWN_HEIGHT).contains(&v)
+            {
+                return Err(format!(
+                    "{name} {v} is not -{MAX_MOB_ALIAS_SPAWN_HEIGHT} to {MAX_MOB_ALIAS_SPAWN_HEIGHT}"
+                ));
+            }
+        }
+        if let (Some(min), Some(max)) = (self.min_height, self.max_height)
+            && min > max
+        {
+            return Err(format!("spawn height window {min}..{max} is reversed"));
+        }
+        Ok(())
+    }
+    fn canonicalize(&mut self) {
+        self.category.make_ascii_uppercase();
+        self.heightmap.make_ascii_uppercase();
+    }
+}
 /// A declared mod entity (`data/<namespace>/horizon/entity/<path>.json`): a
 /// type of its own that copies a vanilla template, every number it leaves
-/// `None` staying the template's. The declaration's spawn placement,
-/// components and goals belong to the systems that own them; the mob this
-/// aliases is the template's model, sounds, brain and goals.
+/// `None` staying the template's. Its `category` and `spawn` restriction
+/// override the template's; components and goals belong to the systems that
+/// own them. The mob this aliases is the template's model, sounds, brain and
+/// goals.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MobEntityAlias {
     /// The declared id (`ruby:goblin`), never a vanilla one.
@@ -413,14 +492,34 @@ pub struct MobEntityAlias {
     pub speed: Option<f64>,
     pub attack_damage: Option<f32>,
     pub follow_range: Option<f64>,
+    /// A `MobCategory` name (`monster`, `creature`, ...) over the template's.
+    pub category: Option<String>,
+    /// The type's `SpawnPlacements` registration over the template's.
+    pub spawn: Option<MobSpawnRestriction>,
 }
 impl MobEntityAlias {
     /// The fences an alias passes whether a content file or a caller built
-    /// it: a bounded template and finite numbers inside the bounds the native
-    /// declarations use, with health above zero.
+    /// it: a bounded template and category, finite numbers inside the bounds
+    /// the native declarations use, with health above zero, and known spawn
+    /// placement and heightmap names.
     pub fn validate(&self) -> Result<(), String> {
         if self.template.is_empty() || self.template.len() > MAX_MOB_ALIAS_ID {
             return Err("template is empty or too long".into());
+        }
+        if let Some(category) = &self.category {
+            if category.len() > MAX_MOB_ALIAS_CATEGORY {
+                return Err("category is too long".into());
+            }
+            let canonical = category.to_ascii_lowercase();
+            if !spawn_selection::Category::ALL
+                .iter()
+                .any(|c| c.name() == canonical.as_str())
+            {
+                return Err(format!("category {category:?} is not a MobCategory"));
+            }
+        }
+        if let Some(spawn) = &self.spawn {
+            spawn.validate()?;
         }
         fn bounded(name: &str, value: Option<f64>, max: f64) -> Result<(), String> {
             match value {
@@ -476,6 +575,8 @@ pub struct MobTypes {
     /// The declared entities [`MobTypes::add_alias`] added, by id: a second
     /// declaration of an id must agree with the first.
     aliases: HashMap<String, MobEntityAlias>,
+    /// The declared spawn restriction of each alias that has one, by id.
+    spawn: BTreeMap<String, MobSpawnRestriction>,
 }
 impl MobTypes {
     pub fn load(root: &Path) -> crate::Result<Self> {
@@ -580,6 +681,7 @@ impl MobTypes {
         Ok(Self {
             types: out,
             aliases: HashMap::new(),
+            spawn: BTreeMap::new(),
         })
     }
     /// The type an id names: its exact key, then its `minecraft:`-normalized
@@ -604,6 +706,12 @@ impl MobTypes {
         }
         let mut alias = alias.clone();
         alias.id = id.clone();
+        if let Some(category) = alias.category.as_mut() {
+            category.make_ascii_lowercase();
+        }
+        if let Some(spawn) = alias.spawn.as_mut() {
+            spawn.canonicalize();
+        }
         if let Some(previous) = self.aliases.get(&id) {
             return if *previous == alias {
                 Ok(())
@@ -626,6 +734,9 @@ impl MobTypes {
                 )
             })?;
         kind.id = id.clone();
+        if let Some(v) = &alias.category {
+            kind.category = v.clone();
+        }
         if let Some(v) = alias.width {
             kind.width = v;
         }
@@ -648,8 +759,28 @@ impl MobTypes {
             kind.follow_range = v;
         }
         self.types.insert(id.clone(), kind);
+        if let Some(spawn) = &alias.spawn {
+            self.spawn.insert(id.clone(), spawn.clone());
+        }
         self.aliases.insert(id, alias);
         Ok(())
+    }
+    /// The spawn restriction a declared entity asked for, when it declared
+    /// one. Absent (a vanilla type, or an alias that named none) leaves the
+    /// placement vanilla registered.
+    pub fn spawn_restriction(&self, id: &str) -> Option<&MobSpawnRestriction> {
+        self.spawn.get(&self.alias(id)?.id)
+    }
+    /// The vanilla template a declared entity copies. A vanilla type has
+    /// none, so a caller keeps its own table.
+    pub fn template_of(&self, id: &str) -> Option<&str> {
+        Some(&self.alias(id)?.template)
+    }
+    fn alias(&self, id: &str) -> Option<&MobEntityAlias> {
+        self.aliases.get(id).or_else(|| {
+            let normalized = horizon_client_core::identifier::normalize_id(id)?;
+            self.aliases.get(&normalized)
+        })
     }
     /// The type a declaration copies: the exact id, then vanilla's id for the
     /// last segment (`zombie` and `ruby:zombie` both mean `minecraft:zombie`).
@@ -3870,6 +4001,7 @@ mod alias_tests {
                 ("minecraft:pig".to_owned(), pig),
             ]),
             aliases: HashMap::new(),
+            spawn: BTreeMap::new(),
         }
     }
     fn alias(id: &str, template: &str) -> MobEntityAlias {
@@ -3898,6 +4030,7 @@ mod alias_tests {
                 speed: Some(0.3),
                 attack_damage: Some(4.0),
                 follow_range: Some(24.0),
+                ..Default::default()
             })
             .unwrap();
         let t = types.resolve("ruby:goblin").expect("declared");
@@ -3990,6 +4123,123 @@ mod alias_tests {
             .add_alias(&alias("ruby:one_too_many", "cow"))
             .unwrap_err();
         assert!(error.contains("declared entities"), "{error}");
+    }
+    /// A declared `MobCategory` over the template's is canonicalised, and the
+    /// hostile/peaceful decisions read it like a vanilla type's.
+    #[test]
+    fn a_declared_category_overrides_the_templates() {
+        let mut types = types();
+        types
+            .add_alias(&MobEntityAlias {
+                category: Some("MONSTER".into()),
+                ..alias("ruby:goblin", "cow")
+            })
+            .unwrap();
+        types
+            .add_alias(&MobEntityAlias {
+                category: Some("creature".into()),
+                ..alias("ruby:calf", "cow")
+            })
+            .unwrap();
+        assert_eq!(types.resolve("ruby:goblin").unwrap().category, "monster");
+        assert_eq!(types.resolve("ruby:calf").unwrap().category, "creature");
+        let mob = |id: &str| {
+            Mob::new(
+                1,
+                Arc::new(types.resolve(id).unwrap().clone()),
+                horizon_core::geometry::Vec3::ZERO,
+                0.0,
+            )
+        };
+        assert!(mob("ruby:goblin").hostile());
+        assert!(!mob("ruby:calf").hostile());
+        assert!(!mob("minecraft:cow").hostile());
+        let bad = MobEntityAlias {
+            category: Some("boss".into()),
+            ..alias("ruby:boss", "cow")
+        };
+        assert!(types.add_alias(&bad).is_err());
+    }
+    /// A declared spawn restriction is carried beside the type, canonicalised
+    /// and with its height window checked; a vanilla type has none.
+    #[test]
+    fn a_declared_spawn_restriction_is_carried_and_bounded() {
+        let mut types = types();
+        let spawn = MobSpawnRestriction {
+            category: "on_ground".into(),
+            heightmap: "motion_blocking".into(),
+            min_height: Some(-64),
+            max_height: Some(320),
+        };
+        types
+            .add_alias(&MobEntityAlias {
+                spawn: Some(spawn.clone()),
+                ..alias("ruby:goblin", "cow")
+            })
+            .unwrap();
+        let stored = types.spawn_restriction("ruby:goblin").unwrap();
+        assert_eq!(stored.category, "ON_GROUND");
+        assert_eq!(stored.heightmap, "MOTION_BLOCKING");
+        assert_eq!(stored.min_height, Some(-64));
+        assert_eq!(stored.max_height, Some(320));
+        assert_eq!(
+            stored,
+            &MobSpawnRestriction {
+                category: "ON_GROUND".into(),
+                heightmap: "MOTION_BLOCKING".into(),
+                ..spawn
+            }
+        );
+        assert_eq!(
+            types.spawn_restriction("minecraft:goblin"),
+            None,
+            "a bare id does not invent a declaration"
+        );
+        assert!(types.spawn_restriction("minecraft:cow").is_none());
+        for (id, bad) in [
+            (
+                "ruby:sea",
+                MobSpawnRestriction {
+                    category: "ON_GROUND".into(),
+                    heightmap: "SEA_LEVEL".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "ruby:ceiling",
+                MobSpawnRestriction {
+                    category: "ON_CEILING".into(),
+                    heightmap: "WORLD_SURFACE".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "ruby:reversed",
+                MobSpawnRestriction {
+                    category: "ON_GROUND".into(),
+                    heightmap: "WORLD_SURFACE".into(),
+                    min_height: Some(10),
+                    max_height: Some(9),
+                },
+            ),
+        ] {
+            let error = types
+                .add_alias(&MobEntityAlias {
+                    spawn: Some(bad),
+                    ..alias(id, "cow")
+                })
+                .unwrap_err();
+            assert!(!error.is_empty());
+        }
+    }
+    /// A declared entity names the template it copies; a vanilla one has none.
+    #[test]
+    fn template_of_names_only_a_declared_template() {
+        let mut types = types();
+        types.add_alias(&alias("ruby:goblin", "cow")).unwrap();
+        assert_eq!(types.template_of("ruby:goblin"), Some("cow"));
+        assert_eq!(types.template_of("minecraft:cow"), None);
+        assert_eq!(types.template_of("ruby:hobgoblin"), None);
     }
 }
 

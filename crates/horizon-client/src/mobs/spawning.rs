@@ -2,7 +2,8 @@
 //! species' spawn predicate (`checkAnimalSpawnRules`, `checkMonsterSpawnRules`,
 //! water animals, bats...), and `finalizeSpawn` (variants, colours, babies,
 //! equipment).
-use super::{Mob, MobWorld, Species, farm::Climate};
+use super::spawn_selection::Heightmap;
+use super::{Mob, MobSpawnRestriction, MobWorld, Species, data, farm::Climate};
 use horizon_core::random::RandomSource;
 
 /// Biome facts finalizeSpawn and the spawn rules read.
@@ -31,6 +32,48 @@ pub struct BiomeFacts {
 /// `SpawnPlacements.isSpawnPositionOk` for the species.
 pub fn placement_ok(species: Species, w: &MobWorld, x: i32, y: i32, z: i32) -> bool {
     super::spawn_rules::is_spawn_position_ok(species, w, x, y, z)
+}
+
+/// The placement type (`SpawnPlacementTypes`) a declared spawn restriction
+/// names. `None` keeps the type's vanilla registration.
+pub fn restriction_placement(restriction: &MobSpawnRestriction) -> Option<data::Placement> {
+    match restriction.category.as_str() {
+        "ON_GROUND" => Some(data::Placement::OnGround),
+        "IN_WATER" => Some(data::Placement::InWater),
+        "IN_LAVA" => Some(data::Placement::InLava),
+        "NO_RESTRICTIONS" => Some(data::Placement::NoRestrictions),
+        _ => None,
+    }
+}
+/// The `Heightmap.Types` a declared spawn restriction names, which replaces
+/// the one the type registered. `None` keeps vanilla's.
+pub fn restriction_heightmap(restriction: &MobSpawnRestriction) -> Option<Heightmap> {
+    match restriction.heightmap.as_str() {
+        "WORLD_SURFACE" => Some(Heightmap::WorldSurface),
+        "OCEAN_FLOOR" => Some(Heightmap::OceanFloor),
+        "MOTION_BLOCKING" => Some(Heightmap::MotionBlocking),
+        "MOTION_BLOCKING_NO_LEAVES" => Some(Heightmap::MotionBlockingNoLeaves),
+        _ => None,
+    }
+}
+/// Whether `y` is inside the restriction's inclusive height window; a window
+/// left open accepts any height.
+pub fn restriction_height_ok(restriction: &MobSpawnRestriction, y: i32) -> bool {
+    restriction.min_height.is_none_or(|min| y >= min)
+        && restriction.max_height.is_none_or(|max| y <= max)
+}
+/// A declared restriction's answer for one candidate. `Some(false)` refuses
+/// it (another placement type, or outside its height window), `Some(true)`
+/// accepts it, and `None` means the restriction names nothing this game
+/// knows, so vanilla's own rule stands.
+pub fn restriction_allows(
+    restriction: Option<&MobSpawnRestriction>,
+    placement: data::Placement,
+    y: i32,
+) -> Option<bool> {
+    let restriction = restriction?;
+    let wanted = restriction_placement(restriction)?;
+    Some(wanted == placement && restriction_height_ok(restriction, y))
 }
 /// Mob.finalizeSpawn for natural, chunk-generation and summoned mobs.
 /// `DifficultyInstance`: the local difficulty at a position.
@@ -449,5 +492,66 @@ mod tests {
             Attr::FollowRange,
             "minecraft:random_spawn_bonus"
         ));
+    }
+    /// A declared spawn restriction decides the placement, heightmap and
+    /// height window it names; one that names nothing this game knows is no
+    /// opinion, so vanilla's rule stands.
+    #[test]
+    fn a_declared_spawn_restriction_decides_only_what_it_names() {
+        use crate::mobs::data::Placement;
+        let restriction = MobSpawnRestriction {
+            category: "ON_GROUND".into(),
+            heightmap: "MOTION_BLOCKING".into(),
+            min_height: Some(60),
+            max_height: Some(80),
+        };
+        assert_eq!(
+            restriction_placement(&restriction),
+            Some(Placement::OnGround)
+        );
+        assert_eq!(
+            restriction_heightmap(&restriction),
+            Some(Heightmap::MotionBlocking)
+        );
+        assert!(restriction_height_ok(&restriction, 60));
+        assert!(restriction_height_ok(&restriction, 80));
+        assert!(!restriction_height_ok(&restriction, 59));
+        assert!(!restriction_height_ok(&restriction, 81));
+        let allows =
+            |r: &MobSpawnRestriction, placement, y| restriction_allows(Some(r), placement, y);
+        assert_eq!(allows(&restriction, Placement::OnGround, 70), Some(true));
+        assert_eq!(allows(&restriction, Placement::OnGround, 59), Some(false));
+        assert_eq!(allows(&restriction, Placement::InWater, 70), Some(false));
+        assert_eq!(restriction_allows(None, Placement::OnGround, 70), None);
+        // An open window accepts any height.
+        let open = MobSpawnRestriction {
+            min_height: None,
+            max_height: None,
+            ..restriction.clone()
+        };
+        assert_eq!(allows(&open, Placement::OnGround, i32::MIN), Some(true));
+        // Unknown names are no opinion, never a silent refusal.
+        let unknown = MobSpawnRestriction {
+            category: "ON_CEILING".into(),
+            heightmap: "SEA_LEVEL".into(),
+            ..restriction
+        };
+        assert_eq!(restriction_placement(&unknown), None);
+        assert_eq!(restriction_heightmap(&unknown), None);
+        assert_eq!(allows(&unknown, Placement::OnGround, 70), None);
+        assert_eq!(
+            restriction_placement(&MobSpawnRestriction {
+                category: "IN_LAVA".into(),
+                ..Default::default()
+            }),
+            Some(Placement::InLava)
+        );
+        assert_eq!(
+            restriction_placement(&MobSpawnRestriction {
+                category: "NO_RESTRICTIONS".into(),
+                ..Default::default()
+            }),
+            Some(Placement::NoRestrictions)
+        );
     }
 }
