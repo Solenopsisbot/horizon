@@ -1037,7 +1037,9 @@ fn run_server_java_mods(options: &mut Options) -> Result<()> {
     super::mods::register_mob_effects(content);
     let registry = super::java_registry::synchronize(content);
     log::info!(
-        "Horizon: synchronized Java auxiliary registries ({} entities, {} data components, {} attachments)",
+        "Horizon: synchronized Java registries ({} blocks, {} items, {} entities, {} data components, {} attachments)",
+        registry.blocks.len(),
+        registry.items.len(),
         registry.entities.len(),
         registry.data_components.len(),
         registry.attachments.len(),

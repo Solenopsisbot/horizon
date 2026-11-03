@@ -8,6 +8,8 @@ use std::sync::{OnceLock, RwLock};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct JavaRegistrySnapshot {
+    pub blocks: Vec<String>,
+    pub items: Vec<String>,
     pub entities: Vec<String>,
     pub data_components: Vec<String>,
     pub attachments: Vec<String>,
@@ -28,6 +30,14 @@ pub(super) fn synchronize(
     mods: &[horizon_client::mod_content::ContentMod],
 ) -> JavaRegistrySnapshot {
     let mut next = JavaRegistrySnapshot {
+        blocks: mods
+            .iter()
+            .flat_map(|m| m.content.blocks.iter().map(|row| row.id.clone()))
+            .collect(),
+        items: mods
+            .iter()
+            .flat_map(|m| m.content.items.iter().map(|row| row.id.clone()))
+            .collect(),
         entities: mods
             .iter()
             .flat_map(|m| m.content.entities.iter().map(|row| row.id.clone()))
@@ -41,6 +51,10 @@ pub(super) fn synchronize(
             .flat_map(|m| m.content.attachments.iter().map(|row| row.id.clone()))
             .collect(),
     };
+    next.blocks.sort();
+    next.blocks.dedup();
+    next.items.sort();
+    next.items.dedup();
     next.entities.sort();
     next.entities.dedup();
     next.data_components.sort();
@@ -63,6 +77,23 @@ mod tests {
     #[test]
     fn auxiliary_rows_are_sorted_deduplicated_and_atomic() {
         let declarations = NativeDeclarations {
+            blocks: vec![horizon_mods::content::Block {
+                id: "ruby:stone".into(),
+                template: "minecraft:stone".into(),
+                properties: Default::default(),
+                shapes: None,
+                default_state: Default::default(),
+                item: true,
+                components: Default::default(),
+            }],
+            items: vec![horizon_mods::content::Item {
+                id: "ruby:shard".into(),
+                template: "minecraft:stone".into(),
+                max_stack_size: None,
+                rarity: None,
+                components: Default::default(),
+                crafting_remainder: None,
+            }],
             entities: vec![EntityDeclaration {
                 id: "ruby:zombie".into(),
                 template: "minecraft:zombie".into(),
@@ -93,6 +124,8 @@ mod tests {
                 content,
             },
         ]);
+        assert_eq!(snapshot.blocks, ["ruby:stone"]);
+        assert_eq!(snapshot.items, ["ruby:pickaxe"]);
         assert_eq!(snapshot.entities, ["ruby:zombie"]);
         assert_eq!(snapshot.data_components, ["ruby:power"]);
         assert_eq!(snapshot.attachments, ["ruby:power"]);
