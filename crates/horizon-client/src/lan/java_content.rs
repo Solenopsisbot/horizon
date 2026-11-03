@@ -7,16 +7,21 @@
 //! deduplicated, explicit counts and lengths, and trailing bytes reject.
 
 use crate::mod_content::{
-    self, BlockEntityRow, DeclaredExtraIds, DeclaredIds, MAX_DECLARED_BLOCK_ENTITIES,
-    MAX_DECLARED_IDS,
+    self, BlockEntityRow, DeclaredExtraIds, DeclaredIds, EntityRow, MAX_DECLARED_BLOCK_ENTITIES,
+    MAX_DECLARED_ENTITIES, MAX_DECLARED_IDS, MAX_DECLARED_MENUS, MAX_DECLARED_OPEN_BLOCKS,
+    MAX_DECLARED_TEXT, MenuRow,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The channel the login manifest travels on.
 pub const CHANNEL: &str = "horizon:java_content";
 
-/// The manifest version this build writes and accepts.
-pub const VERSION: u16 = 1;
+/// The manifest version this build writes: ids and block-entity rows, then
+/// bounded menu and entity template sections.
+pub const VERSION: u16 = 2;
+
+/// The first manifest version, still decoded: ids and block-entity rows only.
+pub const VERSION_V1: u16 = 1;
 
 /// The largest manifest frame, the custom-payload limit.
 pub const MAX_FRAME: usize = 1024 * 1024;
@@ -27,12 +32,29 @@ pub const MAX_IDS: usize = MAX_DECLARED_IDS;
 /// The most block-entity rows one manifest may carry.
 pub const MAX_BLOCK_ENTITIES: usize = MAX_DECLARED_BLOCK_ENTITIES;
 
+/// The most menu rows, entity rows and open blocks one section may carry.
+pub const MAX_MENUS: usize = MAX_DECLARED_MENUS;
+pub const MAX_ENTITIES: usize = MAX_DECLARED_ENTITIES;
+pub const MAX_OPEN_BLOCKS: usize = MAX_DECLARED_OPEN_BLOCKS;
+
 /// The longest id or resource location one entry may name.
 pub const MAX_TEXT: usize = 1024;
+
+/// The longest text one v2 section row may carry.
+pub const MAX_SECTION_TEXT: usize = MAX_DECLARED_TEXT;
 
 /// The registries in wire order: blocks, items, effects, entity types, data
 /// components, attachments, menus and block entity types.
 const REGISTRIES: usize = 8;
+
+/// The v2 sections, in wire order. A section is a `u8` kind and a `u16` count;
+/// kinds must strictly ascend, so every manifest has one canonical byte order.
+/// Kind 3 stays reserved for block and item templates: `mod_content` keeps
+/// their declared ids but no stored template row, and this build does not
+/// invent one, so the section is never written.
+const SECTION_MENUS: u8 = 1;
+const SECTION_ENTITIES: u8 = 2;
+const SECTIONS: usize = 2;
 
 /// Everything a content root declares, ready to travel. Ids are stored as
 /// declared; [`encode`](Self::encode) sorts and deduplicates them, so the
@@ -48,6 +70,10 @@ pub struct JavaContentManifest {
     pub menus: Vec<String>,
     pub block_entity_types: Vec<String>,
     pub block_entities: Vec<BlockEntityRow>,
+    /// v2 menu templates: the bounded title text, slots and open blocks.
+    pub menu_rows: Vec<MenuRow>,
+    /// v2 entity templates: vanilla template, category and spawn flags.
+    pub entity_rows: Vec<EntityRow>,
 }
 
 impl JavaContentManifest {
@@ -75,12 +101,19 @@ impl JavaContentManifest {
             menus: ids.menus,
             block_entity_types: ids.block_entity_types,
             block_entities,
+            menu_rows: mod_content::stored_declared_menus().into_values().collect(),
+            entity_rows: mod_content::stored_declared_entities()
+                .into_values()
+                .collect(),
         }
     }
 
     /// No declaration to send; the host skips the packet.
     pub fn is_empty(&self) -> bool {
-        self.ids().iter().all(|ids| ids.is_empty()) && self.block_entities.is_empty()
+        self.ids().iter().all(|ids| ids.is_empty())
+            && self.block_entities.is_empty()
+            && self.menu_rows.is_empty()
+            && self.entity_rows.is_empty()
     }
 
     fn ids(&self) -> [&[String]; REGISTRIES] {
@@ -96,12 +129,70 @@ impl JavaContentManifest {
         ]
     }
 
-    /// The frame: `u16` version, then per registry a `u16` count and its ids
-    /// (`u16` length, UTF-8 bytes), then a `u16` row count and per row the
-    /// block, declared id and template, and a `u8` ticker flag.
+    /// The frame: `u16` version 2, the v1 body (per registry a `u16` count and
+    /// its ids, then a `u16` row count and per row the block, declared id and
+    /// template, and a `u8` ticker flag), then a `u16` section count and the
+    /// menu and entity sections in kind order.
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         let mut writer = Writer::default();
         writer.u16(VERSION)?;
+        self.encode_body(&mut writer)?;
+
+        let mut menus = self.menu_rows.clone();
+        sort_unique_menus(&mut menus)?;
+        if menus.len() > MAX_MENUS {
+            return Err(format!("declared menus {} exceed {MAX_MENUS}", menus.len()));
+        }
+        let mut entities = self.entity_rows.clone();
+        sort_unique_entities(&mut entities)?;
+        if entities.len() > MAX_ENTITIES {
+            return Err(format!(
+                "declared entities {} exceed {MAX_ENTITIES}",
+                entities.len()
+            ));
+        }
+        writer.count(SECTIONS)?;
+        writer.u8(SECTION_MENUS)?;
+        writer.count(menus.len())?;
+        for row in &menus {
+            writer.section_text(&row.id)?;
+            writer.section_text(&row.title)?;
+            writer.u16(row.slots)?;
+            let mut blocks = row.open_blocks.clone();
+            blocks.sort();
+            blocks.dedup();
+            if blocks.len() > MAX_OPEN_BLOCKS {
+                return Err(format!(
+                    "declared menu {} has {} open blocks (max {MAX_OPEN_BLOCKS})",
+                    row.id,
+                    blocks.len()
+                ));
+            }
+            writer.count(blocks.len())?;
+            for block in &blocks {
+                writer.section_text(block)?;
+            }
+        }
+        writer.u8(SECTION_ENTITIES)?;
+        writer.count(entities.len())?;
+        for row in &entities {
+            writer.section_text(&row.id)?;
+            writer.section_text(&row.template)?;
+            writer.section_text(&row.category)?;
+            if row.flags & !mod_content::ENTITY_FLAG_MASK != 0 {
+                return Err(format!(
+                    "declared entity {} flags {:#04x} are not bounded spawn flags",
+                    row.id, row.flags
+                ));
+            }
+            writer.u8(row.flags)?;
+        }
+        Ok(writer.bytes)
+    }
+
+    /// The v1 body, shared by both versions: the eight registries and the
+    /// block-entity rows.
+    fn encode_body(&self, writer: &mut Writer) -> Result<(), String> {
         for ids in self.ids() {
             let mut sorted: Vec<&String> = ids.iter().collect();
             sorted.sort();
@@ -130,13 +221,14 @@ impl JavaContentManifest {
             writer.text(&row.template)?;
             writer.u8(u8::from(row.ticker))?;
         }
-        Ok(writer.bytes)
+        Ok(())
     }
 
-    /// Decode one frame. Every count and length is checked against its cap,
-    /// text is validated as UTF-8, the ticker flag must be 0 or 1, and any
-    /// byte after the last row rejects. Ids and rows come back sorted and
-    /// deduplicated.
+    /// Decode one frame, v1 or v2. Every count and length is checked against
+    /// its cap, text is validated as UTF-8, the ticker flag must be 0 or 1,
+    /// section kinds must ascend without repeats (an unknown kind rejects),
+    /// and any byte after the last row rejects. Ids and rows come back sorted
+    /// and deduplicated; a v1 frame has no templates.
     pub fn decode(data: &[u8]) -> Result<Self, String> {
         if data.len() > MAX_FRAME {
             return Err(format!(
@@ -146,23 +238,37 @@ impl JavaContentManifest {
         }
         let mut reader = Reader { bytes: data, at: 0 };
         let version = reader.u16()?;
-        if version != VERSION {
+        if version != VERSION && version != VERSION_V1 {
             return Err(format!(
-                "declared Java content version {version} is not {VERSION}"
+                "declared Java content version {version} is not {VERSION} or {VERSION_V1}"
             ));
         }
         let mut manifest = Self::default();
-        let mut fields = [
-            &mut manifest.blocks,
-            &mut manifest.items,
-            &mut manifest.effects,
-            &mut manifest.entity_types,
-            &mut manifest.data_components,
-            &mut manifest.attachments,
-            &mut manifest.menus,
-            &mut manifest.block_entity_types,
+        manifest.decode_body(&mut reader)?;
+        if version == VERSION {
+            manifest.decode_sections(&mut reader)?;
+        }
+        if reader.at != data.len() {
+            return Err(format!(
+                "declared Java content carries {} trailing bytes",
+                data.len() - reader.at
+            ));
+        }
+        Ok(manifest)
+    }
+
+    fn decode_body(&mut self, reader: &mut Reader) -> Result<(), String> {
+        let fields = [
+            &mut self.blocks,
+            &mut self.items,
+            &mut self.effects,
+            &mut self.entity_types,
+            &mut self.data_components,
+            &mut self.attachments,
+            &mut self.menus,
+            &mut self.block_entity_types,
         ];
-        for field in &mut fields {
+        for field in fields {
             let count = reader.count(MAX_IDS, "ids")?;
             let mut ids = Vec::with_capacity(count);
             for _ in 0..count {
@@ -170,7 +276,7 @@ impl JavaContentManifest {
             }
             ids.sort();
             ids.dedup();
-            **field = ids;
+            *field = ids;
         }
         let count = reader.count(MAX_BLOCK_ENTITIES, "block entity rows")?;
         let mut rows = Vec::with_capacity(count);
@@ -196,14 +302,73 @@ impl JavaContentManifest {
         }
         rows.sort();
         rows.dedup();
-        manifest.block_entities = rows;
-        if reader.at != data.len() {
-            return Err(format!(
-                "declared Java content carries {} trailing bytes",
-                data.len() - reader.at
-            ));
+        self.block_entities = rows;
+        Ok(())
+    }
+
+    fn decode_sections(&mut self, reader: &mut Reader) -> Result<(), String> {
+        let sections = reader.count(SECTIONS, "sections")?;
+        let mut last = 0u8;
+        for _ in 0..sections {
+            let kind = reader.u8()?;
+            if kind <= last {
+                return Err(format!(
+                    "declared Java content section {kind} is out of order"
+                ));
+            }
+            last = kind;
+            match kind {
+                SECTION_MENUS => {
+                    let count = reader.count(MAX_MENUS, "menus")?;
+                    let mut rows = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let id = reader.section_text()?;
+                        let title = reader.section_text()?;
+                        let slots = reader.u16()?;
+                        let blocks = reader.count(MAX_OPEN_BLOCKS, "menu open blocks")?;
+                        let mut open_blocks = Vec::with_capacity(blocks);
+                        for _ in 0..blocks {
+                            open_blocks.push(reader.section_text()?);
+                        }
+                        rows.push(MenuRow {
+                            id,
+                            title,
+                            slots,
+                            open_blocks,
+                        });
+                    }
+                    sort_unique_menus(&mut rows)?;
+                    self.menu_rows = rows;
+                }
+                SECTION_ENTITIES => {
+                    let count = reader.count(MAX_ENTITIES, "entities")?;
+                    let mut rows = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let id = reader.section_text()?;
+                        let template = reader.section_text()?;
+                        let category = reader.section_text()?;
+                        let flags = reader.u8()?;
+                        if flags & !mod_content::ENTITY_FLAG_MASK != 0 {
+                            return Err(format!(
+                                "declared entity {id} flags {flags:#04x} are not bounded spawn flags"
+                            ));
+                        }
+                        rows.push(EntityRow {
+                            id,
+                            template,
+                            category,
+                            flags,
+                        });
+                    }
+                    sort_unique_entities(&mut rows)?;
+                    self.entity_rows = rows;
+                }
+                other => {
+                    return Err(format!("declared Java content has unknown section {other}"));
+                }
+            }
         }
-        Ok(manifest)
+        Ok(())
     }
 
     /// Store this manifest into the process's declaration stores, returning
@@ -224,8 +389,34 @@ impl JavaContentManifest {
                 attachments: self.attachments.clone(),
             },
             self.block_entities.clone(),
+            self.menu_rows.clone(),
+            self.entity_rows.clone(),
         )
     }
+}
+
+/// Sort rows by id and drop exact repeats; a second, different row for one id
+/// is ambiguous and rejects rather than picking a winner.
+fn sort_unique_menus(rows: &mut Vec<MenuRow>) -> Result<(), String> {
+    for row in rows.iter_mut() {
+        row.open_blocks.sort();
+        row.open_blocks.dedup();
+    }
+    rows.sort();
+    rows.dedup();
+    if let Some(pair) = rows.windows(2).find(|pair| pair[0].id == pair[1].id) {
+        return Err(format!("declared menu {} is listed twice", pair[0].id));
+    }
+    Ok(())
+}
+
+fn sort_unique_entities(rows: &mut Vec<EntityRow>) -> Result<(), String> {
+    rows.sort();
+    rows.dedup();
+    if let Some(pair) = rows.windows(2).find(|pair| pair[0].id == pair[1].id) {
+        return Err(format!("declared entity {} is listed twice", pair[0].id));
+    }
+    Ok(())
 }
 
 /// Decode one received frame and store it; the client's whole handler.
@@ -275,10 +466,18 @@ impl Writer {
     }
 
     fn text(&mut self, text: &str) -> Result<(), String> {
+        self.text_max(text, MAX_TEXT)
+    }
+
+    fn section_text(&mut self, text: &str) -> Result<(), String> {
+        self.text_max(text, MAX_SECTION_TEXT)
+    }
+
+    fn text_max(&mut self, text: &str, max: usize) -> Result<(), String> {
         let len = text.len();
-        if len > MAX_TEXT {
+        if len > max {
             return Err(format!(
-                "declared Java content text is {len} bytes (max {MAX_TEXT})"
+                "declared Java content text is {len} bytes (max {max})"
             ));
         }
         self.count(len)?;
@@ -320,10 +519,18 @@ impl Reader<'_> {
     }
 
     fn text(&mut self) -> Result<String, String> {
+        self.text_max(MAX_TEXT)
+    }
+
+    fn section_text(&mut self) -> Result<String, String> {
+        self.text_max(MAX_SECTION_TEXT)
+    }
+
+    fn text_max(&mut self, max: usize) -> Result<String, String> {
         let len = self.u16()? as usize;
-        if len > MAX_TEXT {
+        if len > max {
             return Err(format!(
-                "declared Java content text is {len} bytes (max {MAX_TEXT})"
+                "declared Java content text is {len} bytes (max {max})"
             ));
         }
         let end = self
@@ -372,6 +579,18 @@ mod tests {
                     ticker: true,
                 },
             ],
+            menu_rows: vec![MenuRow {
+                id: "ruby:crate".into(),
+                title: "container.ruby.crate".into(),
+                slots: 27,
+                open_blocks: vec!["ruby:box".into(), "ruby:crate".into()],
+            }],
+            entity_rows: vec![EntityRow {
+                id: "ruby:beast".into(),
+                template: "minecraft:pig".into(),
+                category: "creature".into(),
+                flags: mod_content::ENTITY_FLAG_SPAWN | mod_content::ENTITY_FLAG_FIRE_IMMUNE,
+            }],
         }
     }
 
@@ -400,6 +619,26 @@ mod tests {
         assert_eq!(decoded.menus, ["ruby:crate"]);
         assert_eq!(decoded.block_entity_types, ["ruby:crate_entity"]);
         assert_eq!(decoded.block_entities.len(), 2);
+        // The v2 template sections came back too.
+        assert_eq!(decoded.menu_rows.len(), 1);
+        assert_eq!(decoded.menu_rows[0].title, "container.ruby.crate");
+        assert_eq!(decoded.menu_rows[0].slots, 27);
+        assert_eq!(decoded.entity_rows[0].template, "minecraft:pig");
+        assert_eq!(decoded.entity_rows[0].category, "creature");
+    }
+
+    /// A v1 frame still decodes: ids and block-entity rows, no templates.
+    #[test]
+    fn v1_frames_decode_without_templates() {
+        let source = manifest();
+        let mut writer = Writer::default();
+        writer.u16(VERSION_V1).unwrap();
+        source.encode_body(&mut writer).unwrap();
+        let decoded = JavaContentManifest::decode(&writer.bytes).unwrap();
+        assert_eq!(decoded.blocks, ["ruby:block"]);
+        assert_eq!(decoded.block_entities.len(), 2);
+        assert!(decoded.menu_rows.is_empty());
+        assert!(decoded.entity_rows.is_empty());
     }
 
     #[test]
@@ -416,6 +655,9 @@ mod tests {
         let mut shuffled = manifest();
         shuffled.items = vec!["ruby:gem".into(), "ruby:block".into(), "ruby:gem".into()];
         shuffled.block_entities.reverse();
+        shuffled.menu_rows[0].open_blocks.reverse();
+        shuffled.menu_rows.push(shuffled.menu_rows[0].clone());
+        shuffled.entity_rows.push(shuffled.entity_rows[0].clone());
         assert_eq!(
             manifest().encode().unwrap(),
             shuffled.encode().unwrap(),
@@ -449,12 +691,12 @@ mod tests {
 
         // A hand-built frame may lie about a count or length.
         let mut frame = Vec::new();
-        frame.extend_from_slice(&VERSION.to_be_bytes());
+        frame.extend_from_slice(&VERSION_V1.to_be_bytes());
         frame.extend_from_slice(&(u16::try_from(MAX_IDS + 1).unwrap()).to_be_bytes());
         assert!(JavaContentManifest::decode(&frame).is_err());
 
         let mut frame = Vec::new();
-        frame.extend_from_slice(&VERSION.to_be_bytes());
+        frame.extend_from_slice(&VERSION_V1.to_be_bytes());
         frame.extend_from_slice(&0u16.to_be_bytes()); // blocks
         frame.extend_from_slice(&1u16.to_be_bytes()); // items
         frame.extend_from_slice(&(u16::try_from(MAX_TEXT + 1).unwrap()).to_be_bytes());
@@ -468,7 +710,7 @@ mod tests {
         assert!(JavaContentManifest::decode(&frame).is_err());
 
         let mut frame = Vec::new();
-        frame.extend_from_slice(&VERSION.to_be_bytes());
+        frame.extend_from_slice(&VERSION_V1.to_be_bytes());
         for _ in 0..REGISTRIES {
             frame.extend_from_slice(&0u16.to_be_bytes());
         }
@@ -483,7 +725,7 @@ mod tests {
         assert!(JavaContentManifest::decode(&frame).is_err());
 
         let mut frame = Vec::new();
-        frame.extend_from_slice(&VERSION.to_be_bytes());
+        frame.extend_from_slice(&VERSION_V1.to_be_bytes());
         for _ in 0..REGISTRIES {
             frame.extend_from_slice(&0u16.to_be_bytes());
         }
@@ -494,6 +736,59 @@ mod tests {
         }
         frame.push(2); // not a boolean
         assert!(JavaContentManifest::decode(&frame).is_err());
+    }
+
+    #[test]
+    fn v2_sections_are_bounded_and_reject_bad_frames() {
+        let source = manifest();
+        // Text, open blocks and flags are capped.
+        let mut long = source.clone();
+        long.menu_rows[0].title = "x".repeat(MAX_SECTION_TEXT + 1);
+        assert!(long.encode().is_err());
+        let mut many = source.clone();
+        many.menu_rows[0].open_blocks = (0..=MAX_OPEN_BLOCKS)
+            .map(|i| format!("ruby:b{i}"))
+            .collect();
+        assert!(many.encode().is_err());
+        let mut bad_flags = source.clone();
+        bad_flags.entity_rows[0].flags = 0xff;
+        assert!(bad_flags.encode().is_err());
+        // Two different rows for one id are ambiguous.
+        let mut twice = source.clone();
+        let mut other = twice.menu_rows[0].clone();
+        other.title = "container.ruby.other".into();
+        twice.menu_rows.push(other);
+        assert!(twice.encode().is_err());
+
+        // Unknown, repeated and out-of-order section kinds reject.
+        let body = |writer: &mut Writer| {
+            writer.u16(VERSION).unwrap();
+            source.encode_body(writer).unwrap();
+        };
+        let mut frame = Writer::default();
+        body(&mut frame);
+        frame.count(1).unwrap();
+        frame.u8(9).unwrap();
+        assert!(JavaContentManifest::decode(&frame.bytes).is_err());
+        let mut frame = Writer::default();
+        body(&mut frame);
+        frame.count(2).unwrap();
+        frame.u8(SECTION_ENTITIES).unwrap();
+        frame.count(0).unwrap();
+        frame.u8(SECTION_MENUS).unwrap();
+        frame.count(0).unwrap();
+        assert!(JavaContentManifest::decode(&frame.bytes).is_err());
+        let mut frame = Writer::default();
+        body(&mut frame);
+        frame.count(1).unwrap();
+        frame.u8(SECTION_MENUS).unwrap();
+        frame.count(1).unwrap();
+        frame.count(1).unwrap();
+        frame.u8(0xff).unwrap(); // not UTF-8
+        assert!(JavaContentManifest::decode(&frame.bytes).is_err());
+        // A v2 frame cut before its sections is truncated.
+        let bytes = source.encode().unwrap();
+        assert!(JavaContentManifest::decode(&bytes[..bytes.len() - 1]).is_err());
     }
 
     #[test]
@@ -518,6 +813,16 @@ mod tests {
             entities["ruby:crate"].valid_blocks,
             ["ruby:box", "ruby:crate"]
         );
+        let menus = mod_content::stored_declared_menus();
+        assert_eq!(menus["ruby:crate"].title, "container.ruby.crate");
+        assert_eq!(menus["ruby:crate"].slots, 27);
+        let entity_rows = mod_content::stored_declared_entities();
+        assert_eq!(entity_rows["ruby:beast"].template, "minecraft:pig");
+        assert_eq!(entity_rows["ruby:beast"].category, "creature");
+        // The host rebuilds the same v2 sections from the stores.
+        let stored = JavaContentManifest::from_stored();
+        assert_eq!(stored.menu_rows, manifest.menu_rows);
+        assert_eq!(stored.entity_rows, manifest.entity_rows);
         // The same manifest again is idempotent.
         assert_eq!(manifest.apply().unwrap(), count);
         // A different non-empty manifest conflicts and leaves the stores.
@@ -535,7 +840,8 @@ mod tests {
             blocks: vec!["ruby:local".into()],
             ..Default::default()
         };
-        mod_content::apply_declared_java_content(local, DeclaredExtraIds::default(), []).unwrap();
+        mod_content::apply_declared_java_content(local, DeclaredExtraIds::default(), [], [], [])
+            .unwrap();
         assert!(manifest().apply().is_err());
         // An empty incoming manifest is not a conflict and changes nothing.
         let empty = JavaContentManifest::default();

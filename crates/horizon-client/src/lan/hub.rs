@@ -3467,7 +3467,33 @@ mod tests {
                     java_content::JavaContentManifest::decode(&payload.data).unwrap(),
                     manifest
                 );
+                assert_eq!(
+                    u16::from_be_bytes([payload.data[0], payload.data[1]]),
+                    java_content::VERSION
+                );
             }
+            _ => panic!("expected a custom payload"),
+        }
+        // A template-only manifest is content too.
+        let mut templates = java_content::JavaContentManifest::default();
+        templates.menu_rows.push(crate::mod_content::MenuRow {
+            id: "ruby:crate".into(),
+            title: "container.ruby.crate".into(),
+            slots: 27,
+            open_blocks: vec!["ruby:crate".into()],
+        });
+        templates.entity_rows.push(crate::mod_content::EntityRow {
+            id: "ruby:beast".into(),
+            template: "minecraft:pig".into(),
+            category: "creature".into(),
+            flags: crate::mod_content::ENTITY_FLAG_SPAWN,
+        });
+        let packet = Hub::java_content_packet(&templates).expect("templates are sent");
+        match packet {
+            C::CustomPayload(payload) => assert_eq!(
+                java_content::JavaContentManifest::decode(&payload.data).unwrap(),
+                templates
+            ),
             _ => panic!("expected a custom payload"),
         }
     }

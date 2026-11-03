@@ -49,6 +49,27 @@ pub const MAX_DECLARED_IDS: usize = 4096;
 /// Block-entity rows [`declared_block_entity_map`] keeps.
 pub const MAX_DECLARED_BLOCK_ENTITIES: usize = 4096;
 
+/// Menu rows [`declared_menu_rows`] and [`declared_menus_from_rows`] keep.
+pub const MAX_DECLARED_MENUS: usize = 1024;
+
+/// Entity template rows [`declared_entity_rows`] and
+/// [`declared_entities_from_rows`] keep.
+pub const MAX_DECLARED_ENTITIES: usize = 1024;
+
+/// The longest text one menu or entity row carries on the wire.
+pub const MAX_DECLARED_TEXT: usize = 64;
+
+/// The most blocks a menu row may bind to.
+pub const MAX_DECLARED_OPEN_BLOCKS: usize = 64;
+
+/// The entity row's bounded spawn flags: a spawn placement, fire immunity and
+/// typed attribute defaults. Everything else stays in the host's declaration.
+pub const ENTITY_FLAG_SPAWN: u8 = 1;
+pub const ENTITY_FLAG_FIRE_IMMUNE: u8 = 2;
+pub const ENTITY_FLAG_ATTRIBUTES: u8 = 4;
+pub const ENTITY_FLAG_MASK: u8 =
+    ENTITY_FLAG_SPAWN | ENTITY_FLAG_FIRE_IMMUNE | ENTITY_FLAG_ATTRIBUTES;
+
 /// The ids content mods declare, registry by registry: what the command
 /// registries merge after vanilla's own (`Game::build_registries`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -295,6 +316,154 @@ pub fn stored_declared_block_entities() -> std::collections::BTreeMap<String, De
         .unwrap_or_default()
 }
 
+/// A declared menu as a remote manifest lists it: the bounded title text (the
+/// declaration's translation key, which the client resolves), its slot count
+/// and the blocks that open it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MenuRow {
+    pub id: String,
+    pub title: String,
+    pub slots: u16,
+    pub open_blocks: Vec<String>,
+}
+
+/// A declared entity type as a remote manifest lists it: the vanilla template
+/// it behaves as, its `MobCategory` and the bounded spawn flags
+/// ([`ENTITY_FLAG_SPAWN`], [`ENTITY_FLAG_FIRE_IMMUNE`],
+/// [`ENTITY_FLAG_ATTRIBUTES`]).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EntityRow {
+    pub id: String,
+    pub template: String,
+    pub category: String,
+    pub flags: u8,
+}
+
+/// The menu rows a content root declares, keyed by menu id. Duplicate ids keep
+/// the lower row, and rows whose text would not fit [`MAX_DECLARED_TEXT`] are
+/// left out: the wire section is bounded, and the v1 id set still names them.
+pub fn declared_menu_rows(mods: &[ContentMod]) -> BTreeMap<String, MenuRow> {
+    let mut out: BTreeMap<String, MenuRow> = BTreeMap::new();
+    for m in mods {
+        for menu in &m.content.menus {
+            let row = MenuRow {
+                id: menu.id.clone(),
+                title: menu.title_key.clone(),
+                slots: u16::try_from(menu.slots).unwrap_or(u16::MAX),
+                open_blocks: menu.open_blocks.clone(),
+            };
+            if !menu_row_fits(&row) {
+                continue;
+            }
+            match out.get_mut(&row.id) {
+                Some(existing) if *existing <= row => {}
+                Some(existing) => *existing = row,
+                None => {
+                    out.insert(row.id.clone(), row);
+                }
+            }
+        }
+    }
+    out.into_iter().take(MAX_DECLARED_MENUS).collect()
+}
+
+/// The entity rows a content root declares, keyed by entity id, derived from
+/// the typed declaration's template, `category` property and spawn/attribute
+/// presence. Bounded like [`declared_menu_rows`].
+pub fn declared_entity_rows(mods: &[ContentMod]) -> BTreeMap<String, EntityRow> {
+    let mut out: BTreeMap<String, EntityRow> = BTreeMap::new();
+    for m in mods {
+        for entity in &m.content.entities {
+            let mut flags = 0;
+            if entity.spawn.is_some() {
+                flags |= ENTITY_FLAG_SPAWN;
+            }
+            if entity
+                .properties
+                .get("fire_immune")
+                .is_some_and(|v| v == "true")
+            {
+                flags |= ENTITY_FLAG_FIRE_IMMUNE;
+            }
+            if entity.attributes.is_some() {
+                flags |= ENTITY_FLAG_ATTRIBUTES;
+            }
+            let row = EntityRow {
+                id: entity.id.clone(),
+                template: entity.template.clone(),
+                category: entity
+                    .properties
+                    .get("category")
+                    .cloned()
+                    .unwrap_or_default(),
+                flags,
+            };
+            if !entity_row_fits(&row) {
+                continue;
+            }
+            match out.get_mut(&row.id) {
+                Some(existing) if *existing <= row => {}
+                Some(existing) => *existing = row,
+                None => {
+                    out.insert(row.id.clone(), row);
+                }
+            }
+        }
+    }
+    out.into_iter().take(MAX_DECLARED_ENTITIES).collect()
+}
+
+fn text_fits(text: &str) -> bool {
+    text.len() <= MAX_DECLARED_TEXT
+}
+
+fn menu_row_fits(row: &MenuRow) -> bool {
+    text_fits(&row.id)
+        && text_fits(&row.title)
+        && row.open_blocks.len() <= MAX_DECLARED_OPEN_BLOCKS
+        && row.open_blocks.iter().all(|block| text_fits(block))
+}
+
+fn entity_row_fits(row: &EntityRow) -> bool {
+    text_fits(&row.id) && text_fits(&row.template) && text_fits(&row.category)
+}
+
+/// The last [`declared_menu_rows`], for a guest whose host sent them.
+static DECLARED_MENUS: Mutex<Option<BTreeMap<String, MenuRow>>> = Mutex::new(None);
+
+/// Remember the menu rows of a built content root; empty mods clear them.
+pub fn store_declared_menus(mods: &[ContentMod]) {
+    let declared = declared_menu_rows(mods);
+    *DECLARED_MENUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(declared);
+}
+
+/// The menu rows the last content root held, cloned.
+pub fn stored_declared_menus() -> BTreeMap<String, MenuRow> {
+    DECLARED_MENUS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
+/// The last [`declared_entity_rows`], for a guest whose host sent them.
+static DECLARED_ENTITIES: Mutex<Option<BTreeMap<String, EntityRow>>> = Mutex::new(None);
+
+/// Remember the entity rows of a built content root; empty mods clear them.
+pub fn store_declared_entities(mods: &[ContentMod]) {
+    let declared = declared_entity_rows(mods);
+    *DECLARED_ENTITIES.lock().unwrap_or_else(|e| e.into_inner()) = Some(declared);
+}
+
+/// The entity rows the last content root held, cloned.
+pub fn stored_declared_entities() -> BTreeMap<String, EntityRow> {
+    DECLARED_ENTITIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
 /// A declared block entity as a remote manifest lists it: one row per block,
 /// with the vanilla template it behaves and saves as.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -306,21 +475,29 @@ pub struct BlockEntityRow {
 }
 
 /// The declaration set a remote host's manifest replaces: the command
-/// registries, the extra registries, and the block entities keyed by block.
+/// registries, the extra registries, the block entities keyed by block, and
+/// the bounded menu and entity templates.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeclaredJavaContent {
     pub ids: DeclaredIds,
     pub extra: DeclaredExtraIds,
-    pub block_entities: std::collections::BTreeMap<String, DeclaredBlockEntity>,
+    pub block_entities: BTreeMap<String, DeclaredBlockEntity>,
+    pub menus: BTreeMap<String, MenuRow>,
+    pub entities: BTreeMap<String, EntityRow>,
 }
 
 impl DeclaredJavaContent {
     /// Nothing to resolve: the host has no declared content.
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty() && self.extra.is_empty() && self.block_entities.is_empty()
+        self.ids.is_empty()
+            && self.extra.is_empty()
+            && self.block_entities.is_empty()
+            && self.menus.is_empty()
+            && self.entities.is_empty()
     }
 
-    /// How many declarations travel: ids, extra ids and block-entity rows.
+    /// How many declarations travel: ids, extra ids, block-entity rows and
+    /// template rows.
     pub fn count(&self) -> usize {
         let ids: usize = [
             &self.ids.blocks,
@@ -336,6 +513,8 @@ impl DeclaredJavaContent {
         ids + self.extra.data_components.len()
             + self.extra.attachments.len()
             + self.block_entities.len()
+            + self.menus.len()
+            + self.entities.len()
     }
 }
 
@@ -383,6 +562,100 @@ pub fn declared_block_entity_map_from_rows(
     Ok(out)
 }
 
+fn bounded_declared_text(text: String, what: &str) -> std::result::Result<String, String> {
+    if text.len() > MAX_DECLARED_TEXT {
+        return Err(format!(
+            "declared {what} is {} bytes (max {MAX_DECLARED_TEXT})",
+            text.len()
+        ));
+    }
+    Ok(text)
+}
+
+fn normalize_menu_row(mut row: MenuRow) -> std::result::Result<MenuRow, String> {
+    row.id = bounded_declared_text(row.id, "menu id")?;
+    row.title = bounded_declared_text(row.title, "menu title")?;
+    row.open_blocks = row
+        .open_blocks
+        .into_iter()
+        .map(|block| bounded_declared_text(block, "menu open block"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    row.open_blocks.sort();
+    row.open_blocks.dedup();
+    if row.open_blocks.len() > MAX_DECLARED_OPEN_BLOCKS {
+        return Err(format!(
+            "declared menu {} has {} open blocks (max {MAX_DECLARED_OPEN_BLOCKS})",
+            row.id,
+            row.open_blocks.len()
+        ));
+    }
+    Ok(row)
+}
+
+fn normalize_entity_row(mut row: EntityRow) -> std::result::Result<EntityRow, String> {
+    row.id = bounded_declared_text(row.id, "entity id")?;
+    row.template = bounded_declared_text(row.template, "entity template")?;
+    row.category = bounded_declared_text(row.category, "entity category")?;
+    if row.flags & !ENTITY_FLAG_MASK != 0 {
+        return Err(format!(
+            "declared entity {} flags {:#04x} are not bounded spawn flags",
+            row.id, row.flags
+        ));
+    }
+    Ok(row)
+}
+
+/// Rebuild the menu map from wire rows, normalizing text, sorting and
+/// deduplicating each row's open blocks and bounding the map. Two different
+/// rows for one id are a broken manifest, not a last-one-wins.
+pub fn declared_menus_from_rows(
+    rows: impl IntoIterator<Item = MenuRow>,
+) -> std::result::Result<BTreeMap<String, MenuRow>, String> {
+    let mut out: BTreeMap<String, MenuRow> = BTreeMap::new();
+    for row in rows {
+        let row = normalize_menu_row(row)?;
+        if let Some(existing) = out.get(&row.id) {
+            if existing != &row {
+                return Err(format!("declared menu {} is listed twice", row.id));
+            }
+            continue;
+        }
+        out.insert(row.id.clone(), row);
+    }
+    if out.len() > MAX_DECLARED_MENUS {
+        return Err(format!(
+            "declared menus {} exceed {MAX_DECLARED_MENUS}",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+/// Rebuild the entity map from wire rows, bounded and conflict-checked like
+/// [`declared_menus_from_rows`].
+pub fn declared_entities_from_rows(
+    rows: impl IntoIterator<Item = EntityRow>,
+) -> std::result::Result<BTreeMap<String, EntityRow>, String> {
+    let mut out: BTreeMap<String, EntityRow> = BTreeMap::new();
+    for row in rows {
+        let row = normalize_entity_row(row)?;
+        if let Some(existing) = out.get(&row.id) {
+            if existing != &row {
+                return Err(format!("declared entity {} is listed twice", row.id));
+            }
+            continue;
+        }
+        out.insert(row.id.clone(), row);
+    }
+    if out.len() > MAX_DECLARED_ENTITIES {
+        return Err(format!(
+            "declared entities {} exceed {MAX_DECLARED_ENTITIES}",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
 fn normalize_declared_ids(ids: DeclaredIds) -> std::result::Result<DeclaredIds, String> {
     Ok(DeclaredIds {
         blocks: bounded_ids(ids.blocks)?,
@@ -404,11 +677,15 @@ pub fn merge_declared_java_content(
     ids: DeclaredIds,
     extra: DeclaredExtraIds,
     rows: impl IntoIterator<Item = BlockEntityRow>,
+    menus: impl IntoIterator<Item = MenuRow>,
+    entities: impl IntoIterator<Item = EntityRow>,
 ) -> std::result::Result<DeclaredJavaContent, String> {
     let incoming = DeclaredJavaContent {
         ids: normalize_declared_ids(ids)?,
         extra: extra.normalize()?,
         block_entities: declared_block_entity_map_from_rows(rows)?,
+        menus: declared_menus_from_rows(menus)?,
+        entities: declared_entities_from_rows(entities)?,
     };
     if incoming.is_empty() {
         return Ok(current.clone());
@@ -419,31 +696,37 @@ pub fn merge_declared_java_content(
     Err("declared Java content conflicts with the content already loaded".to_owned())
 }
 
-/// Store the declared Java content a remote host sent, all three sets or
-/// none: merge first, then write [`DECLARED_IDS`], [`DECLARED_EXTRA_IDS`] and
-/// [`DECLARED_BLOCK_ENTITIES`]. Returns how many declarations were applied.
+/// Store the declared Java content a remote host sent, all five sets or
+/// none: merge first, then write the id, block-entity, menu and entity stores.
+/// Returns how many declarations were applied.
 pub fn apply_declared_java_content(
     ids: DeclaredIds,
     extra: DeclaredExtraIds,
     rows: impl IntoIterator<Item = BlockEntityRow>,
+    menus: impl IntoIterator<Item = MenuRow>,
+    entities: impl IntoIterator<Item = EntityRow>,
 ) -> std::result::Result<usize, String> {
     let current = DeclaredJavaContent {
         ids: stored_declared_ids(),
         extra: stored_declared_extra_ids(),
         block_entities: stored_declared_block_entities(),
+        menus: stored_declared_menus(),
+        entities: stored_declared_entities(),
     };
-    let merged = merge_declared_java_content(&current, ids, extra, rows)?;
+    let merged = merge_declared_java_content(&current, ids, extra, rows, menus, entities)?;
     let count = merged.count();
     *DECLARED_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged.ids);
     *DECLARED_EXTRA_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged.extra);
     *DECLARED_BLOCK_ENTITIES
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(merged.block_entities);
+    *DECLARED_MENUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged.menus);
+    *DECLARED_ENTITIES.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged.entities);
     Ok(count)
 }
 
-/// Reset all three stores to no declarations; tests that write the
-/// process-wide stores start from here.
+/// Reset every declaration store; tests that write the process-wide stores
+/// start from here.
 #[cfg(test)]
 pub(crate) fn clear_declared_java_content() {
     *DECLARED_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(DeclaredIds::default());
@@ -452,6 +735,8 @@ pub(crate) fn clear_declared_java_content() {
     *DECLARED_BLOCK_ENTITIES
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(Default::default());
+    *DECLARED_MENUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(Default::default());
+    *DECLARED_ENTITIES.lock().unwrap_or_else(|e| e.into_inner()) = Some(Default::default());
 }
 
 /// The declaration for a block, if the last content root had one.
@@ -2263,6 +2548,8 @@ pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<P
         store_declared_ids(&[]);
         store_declared_extra_ids(&[]);
         store_declared_block_entities(&[]);
+        store_declared_menus(&[]);
+        store_declared_entities(&[]);
         return Ok(base.to_owned());
     }
     let out = cache.join("mod-content");
@@ -2274,6 +2561,8 @@ pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<P
         store_declared_ids(mods);
         store_declared_extra_ids(mods);
         store_declared_block_entities(mods);
+        store_declared_menus(mods);
+        store_declared_entities(mods);
         return Ok(out);
     }
     for warning in build(base, mods, &out)? {
@@ -2283,6 +2572,8 @@ pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<P
     store_declared_ids(mods);
     store_declared_extra_ids(mods);
     store_declared_block_entities(mods);
+    store_declared_menus(mods);
+    store_declared_entities(mods);
     Ok(out)
 }
 
@@ -2472,6 +2763,19 @@ mod declared_ids_tests {
     }
 
     #[test]
+    fn declared_menu_and_entity_rows_carry_templates() {
+        let menus = declared_menu_rows(&[ruby()]);
+        let menu = &menus["ruby:crate"];
+        assert_eq!(menu.title, "container.ruby.crate");
+        assert_eq!(menu.slots, 27);
+        let entities = declared_entity_rows(&[ruby()]);
+        let entity = &entities["ruby:beast"];
+        assert_eq!(entity.template, "minecraft:pig");
+        assert!(declared_menu_rows(&[]).is_empty());
+        assert!(declared_entity_rows(&[]).is_empty());
+    }
+
+    #[test]
     fn declared_block_entities_key_blocks_to_their_template() {
         let map = declared_block_entity_map(&[ruby()]);
         let row = map.get("ruby:ore").expect("ruby:ore carries the entity");
@@ -2547,6 +2851,8 @@ mod declared_java_content_tests {
                 &current,
                 DeclaredIds::default(),
                 DeclaredExtraIds::default(),
+                [],
+                [],
                 []
             )
             .unwrap(),
@@ -2554,8 +2860,15 @@ mod declared_java_content_tests {
         );
         // The same set in another order is a no-op, not a conflict.
         assert_eq!(
-            merge_declared_java_content(&current, same.clone(), DeclaredExtraIds::default(), [])
-                .unwrap(),
+            merge_declared_java_content(
+                &current,
+                same.clone(),
+                DeclaredExtraIds::default(),
+                [],
+                [],
+                []
+            )
+            .unwrap(),
             current
         );
         // A different non-empty set cannot replace local mods.
@@ -2564,8 +2877,15 @@ mod declared_java_content_tests {
             ..Default::default()
         };
         assert!(
-            merge_declared_java_content(&current, other.clone(), DeclaredExtraIds::default(), [])
-                .is_err()
+            merge_declared_java_content(
+                &current,
+                other.clone(),
+                DeclaredExtraIds::default(),
+                [],
+                [],
+                []
+            )
+            .is_err()
         );
         // An empty current takes the incoming set.
         assert_eq!(
@@ -2573,11 +2893,59 @@ mod declared_java_content_tests {
                 &DeclaredJavaContent::default(),
                 same,
                 DeclaredExtraIds::default(),
+                [],
+                [],
                 []
             )
             .unwrap(),
             current
         );
+    }
+
+    fn menu(id: &str, title: &str) -> MenuRow {
+        MenuRow {
+            id: id.into(),
+            title: title.into(),
+            slots: 27,
+            open_blocks: vec![],
+        }
+    }
+
+    #[test]
+    fn menu_and_entity_rows_are_normalized_bounded_and_conflict_checked() {
+        let mut row = menu("ruby:crate", "container.ruby.crate");
+        row.open_blocks = ids(&["ruby:b", "ruby:a", "ruby:a"]);
+        let menus = declared_menus_from_rows([row.clone(), row]).unwrap();
+        assert_eq!(menus["ruby:crate"].open_blocks, ["ruby:a", "ruby:b"]);
+        // One id with two different rows is broken, not last-one-wins.
+        assert!(
+            declared_menus_from_rows([menu("ruby:crate", "a"), menu("ruby:crate", "b")]).is_err()
+        );
+        // Text, open blocks and flags are capped.
+        let long = "x".repeat(MAX_DECLARED_TEXT + 1);
+        assert!(declared_menus_from_rows([menu("ruby:crate", &long)]).is_err());
+        let mut many = menu("ruby:crate", "container.ruby.crate");
+        many.open_blocks = (0..=MAX_DECLARED_OPEN_BLOCKS)
+            .map(|i| format!("ruby:b{i}"))
+            .collect();
+        assert!(declared_menus_from_rows([many]).is_err());
+        let entity = EntityRow {
+            id: "ruby:beast".into(),
+            template: "minecraft:pig".into(),
+            category: "creature".into(),
+            flags: 0xff,
+        };
+        assert!(declared_entities_from_rows([entity]).is_err());
+        // Counts are capped.
+        let too_many = (0..=MAX_DECLARED_MENUS).map(|i| menu(&format!("ruby:m{i}"), "t"));
+        assert!(declared_menus_from_rows(too_many).is_err());
+        let too_many = (0..=MAX_DECLARED_ENTITIES).map(|i| EntityRow {
+            id: format!("ruby:e{i}"),
+            template: "minecraft:pig".into(),
+            category: String::new(),
+            flags: 0,
+        });
+        assert!(declared_entities_from_rows(too_many).is_err());
     }
 
     #[test]

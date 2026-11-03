@@ -8720,9 +8720,10 @@ fn snapshot_value(s: &play::AttributeSnapshot) -> f64 {
     value
 }
 
-/// The client's handler for the host's login manifest: decode it, then store
-/// it for the menu, item and block-entity paths. A malformed or conflicting
-/// manifest changes nothing.
+/// The client's handler for the host's login manifest: decode it (v1 ids and
+/// block entities, or v2 with the bounded menu and entity templates), then
+/// store it for the menu, item, entity and block-entity paths. A malformed or
+/// conflicting manifest changes nothing.
 fn receive_java_content(data: &[u8]) -> std::result::Result<usize, String> {
     java_content::apply(data)
 }
