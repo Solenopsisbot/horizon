@@ -119,41 +119,104 @@ public final class HorizonLoaderBridge {
     ((List) modsField.get(loader)).add(container);
   }
 
-  /** Drive the real Fabric loader: launcher, game provider, load and freeze. */
+  /** Drive the real Fabric loader with the bounded test provider. */
   public static int bootstrap() throws Exception {
-    Class<?> base = Class.forName("net.fabricmc.loader.impl.launch.FabricLauncherBase");
+    installLauncher(makeLauncher(ClassLoader.getSystemClassLoader(), false, new String[0], "26.3"));
+    return finishBootstrap(testProvider());
+  }
+
+  /**
+   * Enter Fabric's real Minecraft game provider against user-supplied game
+   * jars. Returns "minecraft<TAB><mods>" on success and
+   * "test<TAB><mods><TAB><reason>" after falling back to the test provider, so
+   * the caller always reports a bounded outcome instead of a stack trace.
+   */
+  public static String bootstrapProduction(String[] gameJars, String gameVersion, String side) throws Exception {
+    if (gameJars == null || gameJars.length == 0) return "test\t0\tno game jar supplied";
+    boolean client = "client".equals(side);
+    try {
+      java.net.URL[] urls = new java.net.URL[gameJars.length];
+      for (int i = 0; i < gameJars.length; i++) urls[i] = Paths.get(gameJars[i]).toUri().toURL();
+      ClassLoader gameLoader = new java.net.URLClassLoader(urls, HorizonLoaderBridge.class.getClassLoader());
+      System.setProperty("fabric.gameVersion", gameVersion);
+      System.setProperty("fabric.gameJarPath", gameJars[0]);
+      System.setProperty(client ? "fabric.gameJarPath.client" : "fabric.gameJarPath.server", gameJars[0]);
+      Class<?> launcherIface = Class.forName("net.fabricmc.loader.impl.launch.FabricLauncher");
+      Object launcher = makeLauncher(gameLoader, client, gameJars, gameVersion);
+      installLauncher(launcher);
+      Class<?> providerClass = Class.forName("net.fabricmc.loader.impl.game.minecraft.MinecraftGameProvider");
+      Object provider = providerClass.getConstructor().newInstance();
+      if (!(Boolean) providerClass.getMethod("isEnabled").invoke(provider)) {
+        throw new IllegalStateException("fabric.skipMcProvider disabled the Minecraft game provider");
+      }
+      Object located = providerClass.getMethod("locateGame", launcherIface, String[].class)
+          .invoke(provider, launcher, new String[0]);
+      if (!(Boolean) located) {
+        throw new IllegalStateException("MinecraftGameProvider.locateGame returned false");
+      }
+      Class<?> providerIface = Class.forName("net.fabricmc.loader.impl.game.GameProvider");
+      Class<?> impl = Class.forName("net.fabricmc.loader.impl.FabricLoaderImpl");
+      Object loader = impl.getField("INSTANCE").get(null);
+      impl.getMethod("setGameProvider", providerIface).invoke(loader, provider);
+      providerClass.getMethod("initialize", launcherIface).invoke(provider, launcher);
+      impl.getMethod("load").invoke(loader);
+      try {
+        impl.getMethod("freeze").invoke(loader);
+      } catch (Throwable ignored) {
+        // A loader without freeze still exposes the containers.
+      }
+      return "minecraft\t" + ((Collection<?>) impl.getMethod("getAllMods").invoke(loader)).size();
+    } catch (Throwable failure) {
+      String reason = summarize(failure);
+      try {
+        return "test\t" + bootstrap() + "\t" + reason;
+      } catch (Throwable fallbackFailure) {
+        throw new RuntimeException("production provider failed: " + reason
+            + "; test provider failed: " + summarize(fallbackFailure));
+      }
+    }
+  }
+
+  /** The launcher Fabric's provider sees: the supplied classpath plus game jars. */
+  private static Object makeLauncher(ClassLoader target, boolean client, String[] gameJars,
+      String gameVersion) throws Exception {
     Class<?> launcherIface = Class.forName("net.fabricmc.loader.impl.launch.FabricLauncher");
-    Object launcher = Proxy.newProxyInstance(launcherIface.getClassLoader(), new Class<?>[]{launcherIface}, (p, m, a) -> {
+    return Proxy.newProxyInstance(launcherIface.getClassLoader(), new Class<?>[]{launcherIface}, (p, m, a) -> {
       switch (m.getName()) {
-        case "getClassPath":
-          return Arrays.stream(System.getProperty("java.class.path").split(File.pathSeparator))
+        case "getClassPath": {
+          List<Path> paths = Arrays.stream(System.getProperty("java.class.path").split(File.pathSeparator))
               .map(Paths::get).collect(Collectors.toList());
-        case "getTargetClassLoader": return ClassLoader.getSystemClassLoader();
-        case "getResourceAsStream": return ClassLoader.getSystemResourceAsStream((String) a[0]);
+          for (String jar : gameJars) paths.add(Paths.get(jar));
+          return paths;
+        }
+        case "getTargetClassLoader": return target;
+        case "getResourceAsStream": return target.getResourceAsStream((String) a[0]);
         case "getClassByteArray": {
           String name = (String) a[0];
-          try (InputStream in = ClassLoader.getSystemResourceAsStream(name.replace('.', '/') + ".class")) {
+          try (InputStream in = target.getResourceAsStream(name.replace('.', '/') + ".class")) {
             if (in == null) throw new IOException(name);
             return in.readAllBytes();
           }
         }
         case "getEnvironmentType":
-          return Enum.valueOf((Class) Class.forName("net.fabricmc.api.EnvType"), "SERVER");
+          return Enum.valueOf((Class) Class.forName("net.fabricmc.api.EnvType"), client ? "CLIENT" : "SERVER");
         case "isDevelopment": return true;
-        case "getEntrypoint": return "net.fabricmc.loader.impl.launch.knot.KnotClient";
+        case "getEntrypoint":
+          return client ? "net.fabricmc.loader.impl.launch.knot.KnotClient"
+              : "net.fabricmc.loader.impl.launch.knot.KnotServer";
         case "getManifest": return null;
-        case "getMappingConfiguration": return mappingConfiguration();
+        case "getMappingConfiguration": return mappingConfiguration(gameVersion);
         case "isClassLoaded": return false;
         case "loadIntoTarget": throw new ClassNotFoundException((String) a[0]);
         default: return defaultValue(m.getReturnType());
       }
     });
-    base.getMethod("setLauncher", launcherIface).invoke(null, launcher);
-    Field properties = base.getDeclaredField("properties");
-    properties.setAccessible(true);
-    properties.set(null, new HashMap<String, Object>());
+  }
+
+  /** The bounded reflection provider this probe has always used. */
+  private static Object testProvider() throws Exception {
     Class<?> providerIface = Class.forName("net.fabricmc.loader.impl.game.GameProvider");
-    Object provider = Proxy.newProxyInstance(providerIface.getClassLoader(), new Class<?>[]{providerIface}, (p, m, a) -> {
+    return Proxy.newProxyInstance(providerIface.getClassLoader(), new Class<?>[]{providerIface}, (p, m, a) -> {
       switch (m.getName()) {
         case "getGameId": return "minecraft";
         case "getGameName": return "Horizon";
@@ -172,6 +235,19 @@ public final class HorizonLoaderBridge {
         default: return defaultValue(m.getReturnType());
       }
     });
+  }
+
+  private static void installLauncher(Object launcher) throws Exception {
+    Class<?> base = Class.forName("net.fabricmc.loader.impl.launch.FabricLauncherBase");
+    Class<?> launcherIface = Class.forName("net.fabricmc.loader.impl.launch.FabricLauncher");
+    base.getMethod("setLauncher", launcherIface).invoke(null, launcher);
+    Field properties = base.getDeclaredField("properties");
+    properties.setAccessible(true);
+    properties.set(null, new HashMap<String, Object>());
+  }
+
+  private static int finishBootstrap(Object provider) throws Exception {
+    Class<?> providerIface = Class.forName("net.fabricmc.loader.impl.game.GameProvider");
     Class<?> impl = Class.forName("net.fabricmc.loader.impl.FabricLoaderImpl");
     Object loader = impl.getField("INSTANCE").get(null);
     impl.getMethod("setGameProvider", providerIface).invoke(loader, provider);
@@ -182,6 +258,25 @@ public final class HorizonLoaderBridge {
       // A loader without freeze still exposes the containers.
     }
     return ((Collection<?>) impl.getMethod("getAllMods").invoke(loader)).size();
+  }
+
+  /** One bounded line naming the failure chain, without a stack trace. */
+  private static String summarize(Throwable failure) {
+    StringBuilder out = new StringBuilder();
+    Throwable current = failure;
+    for (int depth = 0; current != null && depth < 4; depth++) {
+      if (out.length() > 0) out.append(" <- ");
+      out.append(current.getClass().getName());
+      String message = current.getMessage();
+      if (message != null && !message.isEmpty()) {
+        message = message.replaceAll("\\s+", " ");
+        if (message.length() > 200) message = message.substring(0, 200);
+        out.append(": ").append(message);
+      }
+      current = current.getCause();
+    }
+    String text = out.length() == 0 ? failure.getClass().getName() : out.toString();
+    return text.length() > 300 ? text.substring(0, 300) : text;
   }
 
   /** Invoke the loader's entrypoint containers for one lifecycle kind. */
@@ -209,12 +304,12 @@ public final class HorizonLoaderBridge {
     return containers.size();
   }
 
-  private static Object mappingConfiguration() throws Exception {
+  private static Object mappingConfiguration(String gameVersion) throws Exception {
     Class<?> type = Class.forName("net.fabricmc.loader.impl.launch.MappingConfiguration");
     Object config = type.getConstructor().newInstance();
     setField(type, config, "namespace", "named");
     setField(type, config, "gameId", "minecraft");
-    setField(type, config, "gameVersion", "26.3");
+    setField(type, config, "gameVersion", gameVersion);
     setField(type, config, "mappingName", "none");
     setField(type, config, "namespaces", Arrays.asList("official", "intermediary", "named"));
     setField(type, config, "initializedMetadata", true);
@@ -284,7 +379,7 @@ fn main() -> ExitCode {
 }
 
 /// The usage line, kept as data so a test can check the kinds it names.
-const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...";
+const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...";
 
 /// The FML listing/report flags, removed from the jar list before anything is
 /// resolved. `--fml-list` is the short spelling of `--list-fml-mods`.
@@ -319,8 +414,13 @@ fn run() -> Result<(), String> {
     let fabric_development = args.iter().any(|arg| arg == "--fabric-development");
     args.retain(|arg| arg != "--fabric-development");
     // Run the real Fabric or NeoForge loader instead of this probe's own scan.
-    let real_loader = args.iter().any(|arg| arg == "--real-loader");
+    // A supplied Minecraft jar opts into the production provider, which only
+    // the real-loader path can run; a report-only invocation still only reports
+    // the selection, so it does not start a JVM for it.
+    let real_loader_flag = args.iter().any(|arg| arg == "--real-loader");
     args.retain(|arg| arg != "--real-loader");
+    let game_provider = take_game_provider_args(&mut args)?;
+    let provider_report = take_flag(&mut args, &["--provider-report"]);
     let fml_flags = take_fml_flags(&mut args);
     let mixin_config_args = take_all(&mut args, "--mixin-config");
     let entry = take(&mut args, "--entry");
@@ -330,16 +430,40 @@ fn run() -> Result<(), String> {
     let loader = take(&mut args, "--loader").map(PathBuf::from);
     let libs = take(&mut args, "--libs").map(PathBuf::from);
     let heap = take(&mut args, "--heap").unwrap_or_else(|| "-Xmx1g".to_owned());
+    let real_loader = real_loader_flag || (!game_provider.jars.is_empty() && !args.is_empty());
+    // A report with no run behind it is still useful: it names the provider
+    // the flags select and says that nothing was attempted.
+    if provider_report && args.is_empty() && !real_loader && !fml_flags.list && !fml_flags.report {
+        print_provider_report(
+            &ProviderReport::not_run(&game_provider.jars, &game_provider.version),
+            fml_flags.json,
+        );
+        return Ok(());
+    }
     // Listing mixin configs is meaningful with only `--mixin-config` values,
     // so it runs before the classpath requirement.
     if list_mixin_configs_only {
-        return list_mixin_configs(&args, &mixin_config_args);
+        list_mixin_configs(&args, &mixin_config_args)?;
+        if provider_report {
+            print_provider_report(
+                &ProviderReport::not_run(&game_provider.jars, &game_provider.version),
+                fml_flags.json,
+            );
+        }
+        return Ok(());
     }
     if args.is_empty() && !fml_flags.list && !fml_flags.report {
         return Err(USAGE.to_owned());
     }
     if list_entrypoints_only {
-        return list_entrypoints(&args);
+        list_entrypoints(&args)?;
+        if provider_report {
+            print_provider_report(
+                &ProviderReport::not_run(&game_provider.jars, &game_provider.version),
+                fml_flags.json,
+            );
+        }
+        return Ok(());
     }
     // The FML path starts its own Java process with the loader's exact
     // classpath; an embedded JVM changes how FML's in-dev locator sees it.
@@ -411,6 +535,12 @@ fn run() -> Result<(), String> {
             );
         }
     }
+    // User-supplied game jars are the production provider's input, never
+    // copied or discovered from the machine. They join the classpath so the
+    // mods the loader instantiates can resolve the game they were built for.
+    for jar in &game_provider.jars {
+        classpath.push(jar.clone());
+    }
     for arg in &args {
         classpath.push(PathBuf::from(arg));
     }
@@ -472,6 +602,15 @@ fn run() -> Result<(), String> {
     for option in fabric_jvm_options(fabric_mods.as_deref(), fabric_development, skip_mc_provider) {
         init = init.option(option);
     }
+    // The real game provider reads these before `locateGame`, so they belong in
+    // the JVM options rather than being set after `JavaVM::new`.
+    for option in game_provider_jvm_options(
+        &game_provider.jars,
+        &game_provider.version,
+        client_side(&entry_kind),
+    ) {
+        init = init.option(option);
+    }
     let init = init.build().map_err(|e| format!("JVM options: {e}"))?;
     let jvm = JavaVM::new(init)
         .map_err(|e| format!("could not start a JVM ({e}); set JAVA_HOME to a JDK with libjvm"))?;
@@ -490,10 +629,47 @@ fn run() -> Result<(), String> {
                 );
             }
         };
-        let mods = env
-            .call_static_method(&bridge, "bootstrap", "()I", &[])
-            .and_then(|value| value.i())
-            .map_err(|error| format!("Fabric loader bootstrap: {error}"))?;
+        let outcome = if game_provider.jars.is_empty() {
+            let mods = env
+                .call_static_method(&bridge, "bootstrap", "()I", &[])
+                .and_then(|value| value.i())
+                .map_err(|error| format!("Fabric loader bootstrap: {error}"))?;
+            let mods = usize::try_from(mods).unwrap_or(0);
+            ProviderOutcome::Test { mods }
+        } else {
+            let jar_paths: Vec<String> = game_provider
+                .jars
+                .iter()
+                .map(|jar| jar.to_string_lossy().into_owned())
+                .collect();
+            let jars = java_string_array(env, &jar_paths)?;
+            let version = env
+                .new_string(&game_provider.version)
+                .map_err(|error| format!("game version: {error}"))?;
+            let side = env
+                .new_string(if client_side(&entry_kind) {
+                    "client"
+                } else {
+                    "server"
+                })
+                .map_err(|error| format!("game side: {error}"))?;
+            let result = env
+                .call_static_method(
+                    &bridge,
+                    "bootstrapProduction",
+                    "([Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                    &[
+                        JValue::Object(&jars),
+                        JValue::Object(&JObject::from(version)),
+                        JValue::Object(&JObject::from(side)),
+                    ],
+                )
+                .and_then(|value| value.l())
+                .map_err(|error| format!("Fabric production provider: {error}"))?;
+            let text = java_string_value(env, &result)?;
+            parse_provider_outcome(&text)?
+        };
+        let mods = outcome.mods();
         let kind = entry_kind.clone();
         let kind = env
             .new_string(kind)
@@ -508,6 +684,27 @@ fn run() -> Result<(), String> {
             .and_then(|value| value.i())
             .map_err(|error| format!("Fabric loader entrypoints: {error}"))?;
         println!("real loader: {mods} mod(s), {entrypoints} {entry_kind} entrypoint(s)");
+        match &outcome {
+            ProviderOutcome::Production { .. } => {
+                println!("real loader: entered production game provider");
+            }
+            ProviderOutcome::Fallback { reason, .. } => {
+                println!(
+                    "real loader: production game provider unavailable ({reason}); using test provider"
+                );
+            }
+            ProviderOutcome::Test { .. } => {}
+        }
+        if provider_report {
+            print_provider_report(
+                &ProviderReport::from_outcome(
+                    &outcome,
+                    game_provider.jars.len(),
+                    &game_provider.version,
+                ),
+                fml_flags.json,
+            );
+        }
         return Ok(());
     }
 
@@ -1525,6 +1722,281 @@ fn fabric_jvm_options(
         options.push(format!("-D{}=true", FABRIC_SKIP_MC_PROVIDER));
     }
     options
+}
+
+/// The production provider's default game version: Horizon's pinned vanilla
+/// version. `--game-version` overrides it for a differently built game jar.
+const DEFAULT_GAME_VERSION: &str = "26.3";
+
+/// The Fabric properties a real Minecraft game provider reads before
+/// `locateGame`. `fabric.gameJarPath` is the common jar; the side property is
+/// what `GameProviderHelper.getEnvGameJar` consults.
+const FABRIC_GAME_JAR_PATH: &str = "fabric.gameJarPath";
+const FABRIC_GAME_JAR_PATH_CLIENT: &str = "fabric.gameJarPath.client";
+const FABRIC_GAME_JAR_PATH_SERVER: &str = "fabric.gameJarPath.server";
+const FABRIC_GAME_VERSION: &str = "fabric.gameVersion";
+
+/// Upper bound for `--provider-report`, matching the FML report's bound.
+const MAX_PROVIDER_REPORT_BYTES: usize = 64 * 1024;
+const MAX_PROVIDER_REASON_CHARS: usize = 400;
+
+/// The production-provider flags, removed from the jar list before anything is
+/// resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GameProviderArgs {
+    jars: Vec<PathBuf>,
+    version: String,
+}
+
+fn take_game_provider_args(args: &mut Vec<String>) -> Result<GameProviderArgs, String> {
+    let jars = take_all(args, "--game-jar")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let version = take(args, "--game-version").unwrap_or_else(|| DEFAULT_GAME_VERSION.to_owned());
+    if version.trim().is_empty() {
+        return Err("--game-version must not be empty".to_owned());
+    }
+    Ok(GameProviderArgs { jars, version })
+}
+
+/// The environment a provider run models: `--entry-kind client` is Fabric's
+/// client side, everything else (including `main`) is the dedicated side.
+fn client_side(entry_kind: &str) -> bool {
+    matches!(entry_kind, "client" | "client_init")
+}
+
+/// The provider a run uses: the real Minecraft provider when a game jar is
+/// supplied, otherwise the bounded reflection provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderKind {
+    Minecraft,
+    Test,
+}
+
+impl ProviderKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Minecraft => "minecraft",
+            Self::Test => "test",
+        }
+    }
+
+    fn for_jars(jars: &[PathBuf]) -> Self {
+        Self::for_count(jars.len())
+    }
+
+    fn for_count(count: usize) -> Self {
+        if count == 0 {
+            Self::Test
+        } else {
+            Self::Minecraft
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderStatus {
+    Ok,
+    Fallback,
+    NotRun,
+}
+
+impl ProviderStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Fallback => "fallback",
+            Self::NotRun => "not-run",
+        }
+    }
+}
+
+/// What the bridge reported after a real-loader bootstrap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProviderOutcome {
+    Production { mods: usize },
+    Fallback { mods: usize, reason: String },
+    Test { mods: usize },
+}
+
+impl ProviderOutcome {
+    fn mods(&self) -> usize {
+        match self {
+            Self::Production { mods } | Self::Fallback { mods, .. } | Self::Test { mods } => *mods,
+        }
+    }
+}
+
+/// The `--provider-report` view: provider kind, supplied game jars, version,
+/// status and (only on a fallback) the bounded reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderReport {
+    kind: ProviderKind,
+    game_jars: usize,
+    game_version: String,
+    status: ProviderStatus,
+    fallback_reason: Option<String>,
+}
+
+impl ProviderReport {
+    fn not_run(jars: &[PathBuf], game_version: &str) -> Self {
+        Self {
+            kind: ProviderKind::for_jars(jars),
+            game_jars: jars.len(),
+            game_version: game_version.to_owned(),
+            status: ProviderStatus::NotRun,
+            fallback_reason: None,
+        }
+    }
+
+    fn from_outcome(outcome: &ProviderOutcome, game_jars: usize, game_version: &str) -> Self {
+        match outcome {
+            ProviderOutcome::Production { .. } => Self {
+                kind: ProviderKind::Minecraft,
+                game_jars,
+                game_version: game_version.to_owned(),
+                status: ProviderStatus::Ok,
+                fallback_reason: None,
+            },
+            ProviderOutcome::Fallback { reason, .. } => Self {
+                kind: ProviderKind::Test,
+                game_jars,
+                game_version: game_version.to_owned(),
+                status: ProviderStatus::Fallback,
+                fallback_reason: Some(reason.clone()),
+            },
+            ProviderOutcome::Test { .. } => Self {
+                kind: ProviderKind::Test,
+                game_jars,
+                game_version: game_version.to_owned(),
+                status: ProviderStatus::Ok,
+                fallback_reason: None,
+            },
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut lines = vec![
+            format!("provider: {}", self.kind.label()),
+            format!("game jars: {}", self.game_jars),
+            format!("game version: {}", self.game_version),
+            format!("status: {}", self.status.label()),
+        ];
+        if let Some(reason) = &self.fallback_reason {
+            lines.push(format!("fallback: {reason}"));
+        }
+        bound_text(&(lines.join("\n") + "\n"), MAX_PROVIDER_REPORT_BYTES)
+    }
+
+    fn json(&self) -> String {
+        let text = serde_json::json!({
+            "provider": self.kind.label(),
+            "gameJars": self.game_jars,
+            "gameVersion": self.game_version,
+            "status": self.status.label(),
+            "fallback": self.fallback_reason,
+        })
+        .to_string();
+        if text.len() <= MAX_PROVIDER_REPORT_BYTES {
+            return text;
+        }
+        serde_json::json!({
+            "provider": self.kind.label(),
+            "gameJars": self.game_jars,
+            "gameVersion": "",
+            "status": self.status.label(),
+            "fallback": "report truncated",
+        })
+        .to_string()
+    }
+}
+
+fn print_provider_report(report: &ProviderReport, json: bool) {
+    if json {
+        println!("{}", report.json());
+    } else {
+        print!("{}", report.text());
+    }
+}
+
+/// The properties a production provider reads, in a stable order. Only the
+/// first supplied jar can be a game jar to Fabric; every supplied jar still
+/// reaches the classpath and the URLClassLoader in the bridge.
+fn game_provider_jvm_options(jars: &[PathBuf], version: &str, client: bool) -> Vec<String> {
+    let Some(first) = jars.first() else {
+        return Vec::new();
+    };
+    let env_property = if client {
+        FABRIC_GAME_JAR_PATH_CLIENT
+    } else {
+        FABRIC_GAME_JAR_PATH_SERVER
+    };
+    vec![
+        format!("-D{}={}", FABRIC_GAME_JAR_PATH, first.display()),
+        format!("-D{}={}", env_property, first.display()),
+        format!("-D{}={}", FABRIC_GAME_VERSION, version),
+    ]
+}
+
+/// One line for a provider failure: whitespace collapsed, capped, and never
+/// empty, so a report always names something.
+fn bounded_provider_reason(reason: &str) -> String {
+    let collapsed = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "unknown production provider failure".to_owned();
+    }
+    collapsed.chars().take(MAX_PROVIDER_REASON_CHARS).collect()
+}
+
+/// The bridge returns `minecraft<TAB><mods>` on success and
+/// `test<TAB><mods><TAB><reason>` after falling back.
+fn parse_provider_outcome(text: &str) -> Result<ProviderOutcome, String> {
+    let mut parts = text.splitn(3, '\t');
+    let kind = parts.next().unwrap_or_default();
+    let mods = parts
+        .next()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    match kind {
+        "minecraft" => Ok(ProviderOutcome::Production { mods }),
+        "test" => Ok(ProviderOutcome::Fallback {
+            mods,
+            reason: bounded_provider_reason(parts.next().unwrap_or("")),
+        }),
+        other => Err(format!(
+            "production game provider returned an unknown result: {other}"
+        )),
+    }
+}
+
+/// A Java `String[]` from paths the user supplied.
+fn java_string_array<'local>(
+    env: &mut JNIEnv<'local>,
+    values: &[String],
+) -> Result<JObjectArray<'local>, String> {
+    let length = i32::try_from(values.len()).map_err(|_| "too many game jars".to_owned())?;
+    let array = env
+        .new_object_array(length, "java/lang/String", JObject::null())
+        .map_err(|error| format!("game jars: {error}"))?;
+    for (index, value) in values.iter().enumerate() {
+        let text = env
+            .new_string(value)
+            .map_err(|error| format!("game jar path: {error}"))?;
+        env.set_object_array_element(&array, index as i32, JObject::from(text))
+            .map_err(|error| format!("game jar path: {error}"))?;
+    }
+    Ok(array)
+}
+
+fn java_string_value(env: &mut JNIEnv, value: &JObject) -> Result<String, String> {
+    if value.is_null() {
+        return Err("production game provider returned null".to_owned());
+    }
+    let text = env
+        .get_string((value).into())
+        .map_err(|error| format!("production game provider result: {error}"))?;
+    Ok(text.to_string_lossy().into_owned())
 }
 
 /// The launcher-side JVM option strings the environment already carries. Those
@@ -3864,24 +4336,28 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DATAGEN_GENERATOR_CLASS, Entrypoint, MAX_FABRIC_ADD_MODS, MAX_FABRIC_ADD_MODS_BYTES,
-        MAX_MIXIN_CONFIG_PROPERTY_BYTES, MixinBootstrap, MixinConfigRef, MixinEnvironment,
+        DATAGEN_GENERATOR_CLASS, DEFAULT_GAME_VERSION, Entrypoint, MAX_FABRIC_ADD_MODS,
+        MAX_FABRIC_ADD_MODS_BYTES, MAX_MIXIN_CONFIG_PROPERTY_BYTES, MAX_PROVIDER_REASON_CHARS,
+        MAX_PROVIDER_REPORT_BYTES, MixinBootstrap, MixinConfigRef, MixinEnvironment,
         MixinPhaseDriver, MixinRegistrar, MixinSide, MixinStage, NO_ARG_CONSTRUCTOR, NeoforgeArg,
-        PhaseOutcome, USAGE, classpath_separator, constructor_only_entry_kind, datagen_jvm_options,
-        datagen_provider_line, datagen_providers_line, datagen_shim_unavailable,
-        declared_entrypoint_kinds, discover_entries, discover_mixin_configs,
-        entrypoints_from_metadata, fabric_add_mods, fabric_add_mods_count, fabric_add_mods_line,
-        fabric_entries, fabric_jvm_options, fabric_metadata, fabric_mixin_configs, fallback_label,
-        format_entrypoints, format_mixin_config_property, format_mixin_configs,
-        initializer_for_kind, is_datagen_kind, is_minecraft_class, link_failure,
-        missing_entry_message, mixin_bootstrap_line, mixin_config_names, mixin_config_property,
-        mixin_configs_line, mixin_jvm_options, mixin_registered_count, mixin_stages,
-        neoforge_constructor, neoforge_constructor_args, neoforge_constructor_descriptor,
-        neoforge_ctor_fallback_line, neoforge_ctor_line, neoforge_dist, neoforge_dist_fields,
-        neoforge_metadata, nested_jar_name, parse_constructors, parse_mixin_config,
+        PhaseOutcome, ProviderKind, ProviderOutcome, ProviderReport, ProviderStatus, USAGE,
+        bounded_provider_reason, classpath_separator, client_side, constructor_only_entry_kind,
+        datagen_jvm_options, datagen_provider_line, datagen_providers_line,
+        datagen_shim_unavailable, declared_entrypoint_kinds, discover_entries,
+        discover_mixin_configs, entrypoints_from_metadata, fabric_add_mods, fabric_add_mods_count,
+        fabric_add_mods_line, fabric_entries, fabric_jvm_options, fabric_metadata,
+        fabric_mixin_configs, fallback_label, format_entrypoints, format_mixin_config_property,
+        format_mixin_configs, game_provider_jvm_options, initializer_for_kind, is_datagen_kind,
+        is_minecraft_class, is_minecraft_runtime_jar, link_failure, missing_entry_message,
+        mixin_bootstrap_line, mixin_config_names, mixin_config_property, mixin_configs_line,
+        mixin_jvm_options, mixin_registered_count, mixin_stages, neoforge_constructor,
+        neoforge_constructor_args, neoforge_constructor_descriptor, neoforge_ctor_fallback_line,
+        neoforge_ctor_line, neoforge_dist, neoforge_dist_fields, neoforge_metadata,
+        nested_jar_name, parse_constructors, parse_mixin_config, parse_provider_outcome,
         pre_launch_entries, quilt_entrypoint_kind, quilt_mixin_configs, register_mixin_configs,
         report_mixin_configs, run_mixin_phase, select_mixin_configs, should_retry_no_arg,
         skip_mc_provider_requested, skipped_mixin_configs, split_entrypoint,
+        take_game_provider_args,
     };
     use std::{
         fs::File,
@@ -4677,6 +5153,199 @@ config="demo.mixins.json""#,
     }
 
     #[test]
+    fn parses_game_provider_arguments() {
+        let mut args = vec![
+            "--game-jar".to_owned(),
+            "mc/server.jar".to_owned(),
+            "mods/mod.jar".to_owned(),
+            "--game-version".to_owned(),
+            "26.2".to_owned(),
+            "--game-jar".to_owned(),
+            "mc/extra.jar".to_owned(),
+        ];
+        let parsed = take_game_provider_args(&mut args).unwrap();
+        assert_eq!(
+            parsed.jars,
+            [
+                PathBuf::from("mc/server.jar"),
+                PathBuf::from("mc/extra.jar")
+            ]
+        );
+        assert_eq!(parsed.version, "26.2");
+        assert_eq!(args, ["mods/mod.jar"]);
+
+        // No flag keeps the default version and no production jars.
+        let mut args = vec!["mods/mod.jar".to_owned()];
+        let parsed = take_game_provider_args(&mut args).unwrap();
+        assert!(parsed.jars.is_empty());
+        assert_eq!(parsed.version, DEFAULT_GAME_VERSION);
+
+        // An empty version is rejected before a JVM starts.
+        let mut args = vec![
+            "--game-version".to_owned(),
+            "  ".to_owned(),
+            "mods/mod.jar".to_owned(),
+        ];
+        assert!(take_game_provider_args(&mut args).is_err());
+    }
+
+    #[test]
+    fn assembles_the_production_provider_properties() {
+        assert!(game_provider_jvm_options(&[], "26.3", false).is_empty());
+        let jars = [
+            PathBuf::from("mc/server.jar"),
+            PathBuf::from("mc/extra.jar"),
+        ];
+        // Only the first jar is Fabric's game jar; all of them reach the
+        // classpath, but the property can name one.
+        assert_eq!(
+            game_provider_jvm_options(&jars, "26.3", false),
+            vec![
+                "-Dfabric.gameJarPath=mc/server.jar".to_owned(),
+                "-Dfabric.gameJarPath.server=mc/server.jar".to_owned(),
+                "-Dfabric.gameVersion=26.3".to_owned(),
+            ]
+        );
+        assert_eq!(
+            game_provider_jvm_options(&jars[..1], "26.2", true),
+            vec![
+                "-Dfabric.gameJarPath=mc/server.jar".to_owned(),
+                "-Dfabric.gameJarPath.client=mc/server.jar".to_owned(),
+                "-Dfabric.gameVersion=26.2".to_owned(),
+            ]
+        );
+        // The entry kind chooses the side Fabric sees.
+        assert!(client_side("client"));
+        assert!(client_side("client_init"));
+        assert!(!client_side("main"));
+        assert!(!client_side("server"));
+    }
+
+    #[test]
+    fn selects_the_provider_kind_from_the_game_jars() {
+        assert_eq!(ProviderKind::for_jars(&[]), ProviderKind::Test);
+        assert_eq!(
+            ProviderKind::for_jars(&[PathBuf::from("mc/server.jar")]),
+            ProviderKind::Minecraft
+        );
+        assert_eq!(ProviderKind::Test.label(), "test");
+        assert_eq!(ProviderKind::Minecraft.label(), "minecraft");
+    }
+
+    #[test]
+    fn parses_production_provider_outcomes_and_bounds_fallback_reasons() {
+        assert_eq!(
+            parse_provider_outcome("minecraft\t12").unwrap(),
+            ProviderOutcome::Production { mods: 12 }
+        );
+        assert_eq!(
+            parse_provider_outcome("test\t3\tlocateGame returned false").unwrap(),
+            ProviderOutcome::Fallback {
+                mods: 3,
+                reason: "locateGame returned false".to_owned(),
+            }
+        );
+        // An empty or whitespace-only reason still names a failure.
+        assert_eq!(
+            parse_provider_outcome("test\t0\t").unwrap(),
+            ProviderOutcome::Fallback {
+                mods: 0,
+                reason: "unknown production provider failure".to_owned(),
+            }
+        );
+        assert!(parse_provider_outcome("nonsense").is_err());
+        assert_eq!(parse_provider_outcome("minecraft\t12").unwrap().mods(), 12);
+
+        let reason = bounded_provider_reason(&format!(" line one\n{}\t", "x".repeat(1000)));
+        assert!(reason.starts_with("line one "));
+        assert!(!reason.contains('\n'));
+        assert!(!reason.contains('\t'));
+        assert!(reason.chars().count() <= MAX_PROVIDER_REASON_CHARS);
+        assert_eq!(
+            bounded_provider_reason(" \n\t "),
+            "unknown production provider failure"
+        );
+    }
+
+    #[test]
+    fn formats_the_provider_report_as_text_and_json() {
+        let report =
+            ProviderReport::from_outcome(&ProviderOutcome::Production { mods: 4 }, 1, "26.3");
+        assert_eq!(
+            report.text(),
+            "provider: minecraft\ngame jars: 1\ngame version: 26.3\nstatus: ok\n"
+        );
+        let value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
+        assert_eq!(value["provider"], "minecraft");
+        assert_eq!(value["gameJars"], 1);
+        assert_eq!(value["status"], "ok");
+        assert!(value["fallback"].is_null());
+
+        let fallback = ProviderReport::from_outcome(
+            &ProviderOutcome::Fallback {
+                mods: 2,
+                reason: "locateGame returned false".to_owned(),
+            },
+            2,
+            "26.3",
+        );
+        assert_eq!(
+            fallback.text(),
+            "provider: test\ngame jars: 2\ngame version: 26.3\nstatus: fallback\nfallback: locateGame returned false\n"
+        );
+        let value: serde_json::Value = serde_json::from_str(&fallback.json()).unwrap();
+        assert_eq!(value["provider"], "test");
+        assert_eq!(value["status"], "fallback");
+        assert_eq!(value["fallback"], "locateGame returned false");
+
+        let not_run = ProviderReport::not_run(&[PathBuf::from("mc/server.jar")], "26.3");
+        assert_eq!(not_run.status, ProviderStatus::NotRun);
+        assert!(not_run.text().contains("status: not-run"));
+        assert!(!not_run.text().contains("fallback:"));
+    }
+
+    #[test]
+    fn bounds_the_provider_report() {
+        let report = ProviderReport {
+            kind: ProviderKind::Minecraft,
+            game_jars: 1,
+            game_version: "x".repeat(MAX_PROVIDER_REPORT_BYTES * 2),
+            status: ProviderStatus::Ok,
+            fallback_reason: Some("y".repeat(MAX_PROVIDER_REPORT_BYTES)),
+        };
+        assert!(report.text().len() <= MAX_PROVIDER_REPORT_BYTES);
+        assert!(report.json().len() <= MAX_PROVIDER_REPORT_BYTES);
+        assert!(report.text().contains("...(truncated)"));
+        let value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
+        assert_eq!(value["fallback"], "report truncated");
+    }
+
+    #[test]
+    fn recognizes_a_supplied_minecraft_jar_when_available() {
+        let Some(jar) = std::env::var_os("HORIZON_MINECRAFT_JAR") else {
+            eprintln!("skipping: HORIZON_MINECRAFT_JAR is not set");
+            return;
+        };
+        let jar = PathBuf::from(jar);
+        assert!(
+            is_minecraft_runtime_jar(&jar),
+            "{} is not a Minecraft jar",
+            jar.display()
+        );
+        assert_eq!(
+            ProviderKind::for_jars(std::slice::from_ref(&jar)),
+            ProviderKind::Minecraft
+        );
+        let options =
+            game_provider_jvm_options(std::slice::from_ref(&jar), DEFAULT_GAME_VERSION, false);
+        assert!(
+            options.iter().any(|option| {
+                option == &format!("-Dfabric.gameJarPath.server={}", jar.display())
+            })
+        );
+    }
+
+    #[test]
     fn reports_fabric_add_mods_from_the_started_jvm() {
         let separator = classpath_separator();
         // An absent property is a run with no supplied mod jar, not a failure.
@@ -5444,22 +6113,51 @@ config="demo.mixins.json""#,
 /// points and the flag documented by the usage line.
 #[cfg(test)]
 mod real_loader_tests {
-    use super::{LOADER_BRIDGE_SOURCE, USAGE};
+    use super::{LOADER_BRIDGE_SOURCE, NestedJars, USAGE};
 
     #[test]
     fn the_bridge_drives_fabric_loader_and_its_entrypoints() {
         for needed in [
             "public static int bootstrap()",
+            "public static String bootstrapProduction(",
             "net.fabricmc.loader.impl.FabricLoaderImpl",
+            "net.fabricmc.loader.impl.game.minecraft.MinecraftGameProvider",
             "setGameProvider",
             "getEntrypointContainers",
             "setLauncher",
             "public static int run(String kind)",
             "onInitializeClient",
+            "new java.net.URLClassLoader",
+            "fabric.gameJarPath",
+            "fabric.gameVersion",
         ] {
             assert!(LOADER_BRIDGE_SOURCE.contains(needed), "missing {needed}");
         }
         assert!(USAGE.contains("--real-loader"));
+        assert!(USAGE.contains("--game-jar"));
+        assert!(USAGE.contains("--game-version"));
+        assert!(USAGE.contains("--provider-report"));
+    }
+
+    #[test]
+    fn the_bridge_source_compiles_when_javac_is_available() {
+        let javac = std::env::var_os("JAVA_HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join("bin").join("javac"))
+            .unwrap_or_else(|| "javac".into());
+        if std::process::Command::new(&javac)
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: javac is not available");
+            return;
+        }
+        let nested = NestedJars::new().unwrap();
+        assert!(
+            nested.compile_loader_bridge().is_some(),
+            "javac rejected the loader bridge source"
+        );
     }
 }
 
