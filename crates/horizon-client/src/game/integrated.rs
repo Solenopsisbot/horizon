@@ -1035,6 +1035,13 @@ fn run_server_java_mods(options: &mut Options) -> Result<()> {
     // loaded, even though the broader content/resource tables still rebuild
     // on the next resource reload.
     super::mods::register_mob_effects(content);
+    let registry = super::java_registry::synchronize(content);
+    log::info!(
+        "Horizon: synchronized Java auxiliary registries ({} entities, {} data components, {} attachments)",
+        registry.entities.len(),
+        registry.data_components.len(),
+        registry.attachments.len(),
+    );
     Ok(())
 }
 

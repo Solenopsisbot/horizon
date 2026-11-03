@@ -126,6 +126,7 @@ mod integrated;
 mod interactions;
 mod item_draw;
 mod item_particles;
+mod java_registry;
 mod jigsaw_blocks;
 mod jigsaw_edit;
 mod jukebox;
