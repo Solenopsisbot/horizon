@@ -50,6 +50,23 @@ This gives simple utility mods a no-JVM path without claiming that the subset is
   definition a JVM. The carve-out is explicit and narrow: the JVM starts only when a jar mod is turned on,
   and the Rust game is byte-for-byte the same when none is.
 
+## Native-first strategy and tiers
+
+Compatibility is selected per jar and Horizon build, in this order:
+
+1. Keep data and asset content on the existing native carry path; it never needs Java execution.
+2. Run bounded entrypoints and API calls through `horizon-native-java`, whose callbacks cross an explicit Rust
+   host boundary and produce typed declarations for Horizon's registries and content planner.
+3. When the native interpreter or a required hook cannot model a call, select the embedded JVM path
+   (`horizon-jvm`) and report the reason. The JVM path preserves Java execution; it is not a native Rust port.
+4. For a mod that needs deeper integration, use the existing port pipeline (Tier 3). Only profiled hot methods
+   of a bridged mod may later receive the optional Tier 5 native compilation mark; the rest remains on the JVM.
+
+The tier is a compatibility result, not a performance promise: Tier 0–2 means the jar still executes as Java,
+Tier 3 means an authored native Rust port replaces it, and Tier 4 means the jar is refused with a named reason.
+Native probe success therefore proves only the bounded native surface exercised by its fixture; it does not claim
+that the whole jar has become Rust or that JVM fallback coverage is complete.
+
 ## Why a JVM, and not "translate any jar to Rust"
 
 A jar is bytecode for the JVM. Two ways to make it run here:
