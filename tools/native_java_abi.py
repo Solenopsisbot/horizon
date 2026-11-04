@@ -25,6 +25,7 @@ FAMILIES = {"net/minecraftforge": "forge", "net/minecraft": "minecraft",
             "net/fabricmc": "fabric", "net/neoforged": "neoforge"}
 DEFAULT_TOP = 15
 TIMEOUT = 900
+PROFILE_ORDER = ("data-only", "native-safe", "native-fallback", "report-only")
 
 
 class ToolError(Exception): pass
@@ -138,6 +139,54 @@ def rank(mapping: dict, top: int) -> list[tuple[str, int]]:
                   key=lambda row: (-row[1], row[0]))[:top]
 
 
+def profile_jar(jar: dict) -> dict:
+    """Classify one jar using only bounded census evidence.
+
+    This is deliberately conservative: a native-safe result means that the
+    census found no dynamic loading, body-scan failure, or report-only Mixin
+    declaration.  It does not claim that every call is implemented by the
+    runtime.  The profile is a routing hint for the launcher, not a support
+    guarantee.
+    """
+    file = str(jar.get("file", ""))
+    mod_id = str(jar.get("mod_id", ""))
+    reasons: list[str] = []
+    if jar.get("error"):
+        reasons.append(f"metadata: {jar['error']}")
+        tier = "report-only"
+    elif int(jar.get("classes", 0)) == 0:
+        tier = "data-only"
+        if jar.get("nested_jars"):
+            reasons.append("no outer classes; nested jars are carried separately")
+        else:
+            reasons.append("no class files")
+    else:
+        dynamic = [str(reason) for reason in jar.get("dynamic", []) if str(reason)]
+        if dynamic:
+            reasons.extend(f"dynamic: {reason}" for reason in dynamic)
+        body_errors = int(jar.get("body_errors", 0) or 0)
+        if body_errors:
+            reasons.append(f"body scan errors: {body_errors}")
+        config_targets = [str(target) for target in jar.get("mixin_config_targets", [])]
+        if config_targets:
+            reasons.append(f"Mixin config targets report-only: {len(config_targets)}")
+        if dynamic or body_errors or config_targets or not bool(jar.get("static_code", False)):
+            tier = "native-fallback"
+            if not jar.get("static_code", False) and not dynamic:
+                reasons.append("census did not mark code static")
+        else:
+            tier = "native-safe"
+            reasons.append("static code with no bounded census gaps")
+    return {"file": file, "mod_id": mod_id, "tier": tier, "reasons": sorted(set(reasons))}
+
+
+def profiles(jars: list[dict]) -> dict:
+    rows = sorted((profile_jar(jar) for jar in jars),
+                  key=lambda row: (row["tier"], row["mod_id"], row["file"]))
+    counts = {tier: sum(row["tier"] == tier for row in rows) for tier in PROFILE_ORDER}
+    return {"counts": counts, "jars": rows}
+
+
 def family(member: str) -> str | None:
     owner = member.split("#", 1)[0]
     for prefix, name in FAMILIES.items():
@@ -193,6 +242,7 @@ def summarise(census: dict, calls: list[Path], top: int | None) -> dict:
         "body_errors": {"total": int(totals.get("body_errors", 0)), "by_jar": [
             {"file": jar.get("file", ""), "errors": int(jar.get("body_errors", 0))}
             for jar in jars if int(jar.get("body_errors", 0))]},
+        "profiles": profiles(jars),
         "metadata_errors": [{"file": jar.get("file", ""), "error": jar["error"]}
                             for jar in jars if jar.get("error")],
     }
@@ -224,6 +274,15 @@ def render(summary: dict) -> str:
     ) or "    (none)"
     families = ", ".join(f"{name}={count}" for name, count in compat["families"].items())
     kinds = ", ".join(f"{name}={count}" for name, count in summary["nested_jars"]["kinds"].items())
+    profile_counts = ", ".join(
+        f"{tier}={summary['profiles']['counts'][tier]}" for tier in PROFILE_ORDER
+        if summary["profiles"]["counts"].get(tier)
+    ) or "none"
+    profile_rows = "\n".join(
+        f"    {row['tier']:15} {row['mod_id'] or '-':24} {row['file']}"
+        + (f" ({'; '.join(row['reasons'])})" if row["reasons"] else "")
+        for row in summary["profiles"]["jars"]
+    ) or "    (none)"
     out = [
         f"native Java ABI: {len(summary['inputs'])} input(s), {totals.get('jars', 0)} jars, "
         f"{totals.get('classes', 0)} classes",
@@ -249,6 +308,7 @@ def render(summary: dict) -> str:
         "\nbody errors per jar\n" + ("\n".join(
             f"    {row['errors']:7} {row['file']}" for row in summary["body_errors"]["by_jar"]
         ) or "    (none)"),
+        f"\ncompatibility profiles: {profile_counts}\n{profile_rows}",
     ]
     if summary["nested_jars"]["errors"]:
         out.append("\nnested jar metadata errors\n" + "\n".join(
