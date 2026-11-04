@@ -564,6 +564,38 @@ impl NativeDeclarations {
         Ok(())
     }
 
+    /// Return a detached declaration snapshot with the data-component table
+    /// in its canonical live-registry order.
+    ///
+    /// Registration callbacks may arrive in entrypoint order, which is not a
+    /// stable source of network or resource ids. A snapshot is detached from
+    /// the declaration set and sorted by id so callers can publish it or
+    /// compare it without observing callback timing.
+    pub fn snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.data_components.sort_by(|a, b| a.id.cmp(&b.id));
+        snapshot
+    }
+
+    /// Return only the canonical data-component table from [`Self::snapshot`].
+    pub fn data_components_snapshot(&self) -> Vec<DataComponentDeclaration> {
+        self.snapshot().data_components
+    }
+
+    /// Merge one live data-component snapshot transactionally. Equal ids with
+    /// equal declarations coalesce; a different row for an existing id is a
+    /// conflict and leaves this declaration set untouched.
+    pub fn merge_data_components<I>(&mut self, incoming: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = DataComponentDeclaration>,
+    {
+        let incoming = NativeDeclarations {
+            data_components: incoming.into_iter().collect(),
+            ..NativeDeclarations::default()
+        };
+        self.merge(incoming)
+    }
+
     fn check_count(&self) -> Result<(), String> {
         let count = self.blocks.len()
             + self.items.len()
@@ -1664,6 +1696,49 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("conflicting native entity"), "{error}");
         assert_eq!(declarations.entities[0].template, "minecraft:chicken");
+    }
+
+    #[test]
+    fn data_component_snapshots_are_sorted_and_merge_transactionally() {
+        let mana = DataComponentDeclaration {
+            id: "ruby:mana".into(),
+            codec: "ruby:mana".into(),
+            persistent: true,
+            network_synced: true,
+        };
+        let charge = DataComponentDeclaration {
+            id: "ruby:charge".into(),
+            codec: "ruby:charge".into(),
+            persistent: true,
+            network_synced: false,
+        };
+        let mut declarations = NativeDeclarations {
+            data_components: vec![mana.clone(), charge.clone()],
+            ..NativeDeclarations::default()
+        };
+        assert_eq!(
+            declarations
+                .data_components_snapshot()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ruby:charge", "ruby:mana"]
+        );
+
+        declarations
+            .merge_data_components([mana.clone(), charge.clone()])
+            .unwrap();
+        assert_eq!(
+            declarations.data_components_snapshot(),
+            [charge.clone(), mana.clone()]
+        );
+
+        let mut conflicting = mana;
+        conflicting.codec = "ruby:other_codec".into();
+        assert!(declarations.merge_data_components([conflicting]).is_err());
+        let after_conflict = declarations.data_components_snapshot();
+        assert_eq!(after_conflict[0], charge);
+        assert_eq!(after_conflict[1].codec, "ruby:mana");
     }
 
     #[test]

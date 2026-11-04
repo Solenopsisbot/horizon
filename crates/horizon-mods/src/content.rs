@@ -465,6 +465,10 @@ impl Content {
         declarations: crate::native::NativeDeclarations,
     ) -> Result<Self, String> {
         let id = id.into();
+        // Data-component ids become live registry ids. Keep their resource
+        // files and the returned table in one deterministic order regardless
+        // of Java entrypoint callback order.
+        let data_components = declarations.snapshot().data_components;
         let check_id = |kind: &str, value: &str| {
             native_id(value).then_some(()).ok_or_else(|| {
                 format!("native {kind} declaration {value:?} is outside a mod namespace")
@@ -577,7 +581,7 @@ impl Content {
                     format!("native {kind} codec {value:?} is not a namespaced codec id")
                 })
         };
-        for component in &declarations.data_components {
+        for component in &data_components {
             check_codec("data component", &component.codec)?;
         }
         for attachment in &declarations.attachments {
@@ -886,7 +890,7 @@ impl Content {
             items: declarations.items,
             effects: declarations.effects,
             entities: declarations.entities,
-            data_components: declarations.data_components,
+            data_components,
             attachments: declarations.attachments,
             menus: declarations.menus,
             block_entities: declarations.block_entities,
