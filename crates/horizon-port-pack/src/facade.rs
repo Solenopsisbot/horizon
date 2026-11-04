@@ -655,6 +655,29 @@ pub fn generate_many(
             wanted.insert(root.to_owned());
         }
     }
+    // `ByteBufCodecs` is a catalogue: a mod names the constants it writes a
+    // field with, and its payload codecs reach the rest through the façade's
+    // own factory bodies. Every static factory is kept when the mod's code
+    // touches the class at all, so a codec built inside the façade links the
+    // buffer calls it makes on the mod's behalf.
+    if let Some(factories) = game.get("net/minecraft/network/codec/ByteBufCodecs")
+        && target.iter().any(|class| {
+            class
+                .refs
+                .contains("net/minecraft/network/codec/ByteBufCodecs")
+                && class.name != "net/minecraft/network/codec/ByteBufCodecs"
+                && !own.contains(class.name.as_str())
+        })
+    {
+        for member in &factories.declared {
+            if member.kind == MemberKind::Method && member.is_static() {
+                wanted.insert("net/minecraft/network/codec/ByteBufCodecs".to_owned());
+                used.entry("net/minecraft/network/codec/ByteBufCodecs".to_owned())
+                    .or_default()
+                    .insert((member.name.clone(), member.descriptor.clone()));
+            }
+        }
+    }
     let mut queue: Vec<String> = wanted.iter().cloned().collect();
     while let Some(name) = queue.pop() {
         let Some(class) = game.get(&name) else {
@@ -830,6 +853,44 @@ pub fn generate_many(
         )
         .map_err(|e| format!("{}: {e}", model_layers_shim.display()))?;
         files.push(model_layers_shim);
+    }
+    // The callback interfaces `StreamCodec.of` takes, and the operation
+    // `apply` takes. They are written whenever this classpath does not carry
+    // them: the façade's own codec names them in its signatures, and a real
+    // game classpath's copies come first at runtime.
+    if let Some(stream_codec) = game.get("net/minecraft/network/codec/StreamCodec") {
+        for (class, source) in [
+            ("net/minecraft/network/codec/StreamEncoder", STREAM_ENCODER),
+            ("net/minecraft/network/codec/StreamDecoder", STREAM_DECODER),
+            (
+                "net/minecraft/network/codec/StreamMemberEncoder",
+                STREAM_MEMBER_ENCODER,
+            ),
+        ] {
+            if !available.contains(class) {
+                write_shim(&mut files, &src, class, source)?;
+            }
+        }
+        // `StreamCodec.CodecOperation` is nested in the game's interface, which
+        // the façade writes with `default` bodies; a nested abstract member
+        // would shadow the name a mod writes (`codec -> ...` needs a target),
+        // so the bounded slice carries it as a top-level file.
+        if !available.contains(STREAM_CODEC_OPERATION_TYPE)
+            && !game.contains_key(STREAM_CODEC_OPERATION_TYPE)
+            && stream_codec
+                .declared
+                .iter()
+                .any(|member| member.kind == MemberKind::Method && member.name == "apply")
+        {
+            // The file is named after the type `javac` finds in it: a public
+            // top-level type cannot carry the `$` of the game's nested shape.
+            write_shim(
+                &mut files,
+                &src,
+                STREAM_CODEC_OPERATION_TYPE_FILE,
+                STREAM_CODEC_OPERATION,
+            )?;
+        }
     }
     // Fabric API's `PayloadTypeRegistry` is a library class: when the API jar
     // is part of the target's classpath it stays real, and this bounded marker
@@ -2256,6 +2317,171 @@ const FRIENDLY_BYTE_BUF_STATE: &str = r#"    protected java.util.List<Object> ho
         for (int i = 0; i < length; i++) data[i] = (byte) horizonGet();
         return data;
     }
+"#;
+
+/// The generated `StreamCodec`'s wire state: the value a codec carries and the
+/// callbacks Vanilla's factories (`of`, `unit`, `map`, `dispatch`, `recursive`,
+/// `composite`) keep, so `encode`/`decode` really walk the shape the mod built.
+///
+/// `horizonKind` says which factory built the codec: 0 an `of` or a mod's own
+/// anonymous codec (or a `unit`, when `horizonValue` is set), 1 `map`, 2
+/// `dispatch`, 3 `recursive`, 4 `composite`. A composite's members and their
+/// getters each have their own field, because the encode and decode halves
+/// visit them in wire order.
+///
+/// The bodies live in `stream_codec_body` and, for the two shared halves,
+/// `ENCODE_CODEC`/`DECODE_CODEC`; every one of them calls into these helpers.
+const STREAM_CODEC_STATE: &str = r#"    private static final int HORIZON_MAP = 1;
+    private static final int HORIZON_DISPATCH = 2;
+    private static final int HORIZON_RECURSIVE = 3;
+    private static final int HORIZON_COMPOSITE = 4;
+    protected Object horizonValue;
+    protected int horizonKind;
+    protected java.util.function.Function horizonFirst;
+    protected java.util.function.Function horizonSecond;
+    protected Object horizonConstructor;
+    protected java.util.function.Function horizonGetters1;
+    protected java.util.function.Function horizonGetters2;
+    protected java.util.function.Function horizonGetters3;
+    protected java.util.function.Function horizonGetters4;
+    protected java.util.function.Function horizonGetters5;
+    protected java.util.function.Function horizonGetters6;
+    protected java.util.function.Function horizonGetters7;
+    protected java.util.function.Function horizonGetters8;
+    protected net.minecraft.network.codec.StreamCodec horizonMember1;
+    protected net.minecraft.network.codec.StreamCodec horizonMember2;
+    protected net.minecraft.network.codec.StreamCodec horizonMember3;
+    protected net.minecraft.network.codec.StreamCodec horizonMember4;
+    protected net.minecraft.network.codec.StreamCodec horizonMember5;
+    protected net.minecraft.network.codec.StreamCodec horizonMember6;
+    protected net.minecraft.network.codec.StreamCodec horizonMember7;
+    protected net.minecraft.network.codec.StreamCodec horizonMember8;
+    protected net.minecraft.network.codec.StreamCodec horizonRecursiveCodec;
+    /** The `StreamCodec.of` pair: the encoder is a `Function`-shaped
+     *  `StreamEncoder` (its buffer pair travels as one argument), the decoder
+     *  is a `StreamDecoder` with the buffer as its only one. A `unit` codec
+     *  keeps `horizonValue`; an `of` codec never sets it, since its value
+     *  comes from the decoder. */
+    protected net.minecraft.network.codec.StreamCodec horizonOf(Object encoder, Object decoder) {
+        horizonFirst = horizonEncoder(encoder);
+        horizonSecond = horizonDecoder(decoder);
+        return this;
+    }
+    /** The encoder `of` was handed, as a one-argument call: the buffer pair
+     *  travels in an `Object[]`, because a lambda's erased signature is the
+     *  one its functional interface declares and `StreamEncoder`'s takes two. */
+    protected static java.util.function.Function horizonEncoder(Object encoder) {
+        if (encoder instanceof java.util.function.Function) return (java.util.function.Function) encoder;
+        if (!(encoder instanceof net.minecraft.network.codec.StreamEncoder)) return null;
+        net.minecraft.network.codec.StreamEncoder target = (net.minecraft.network.codec.StreamEncoder) encoder;
+        return pair -> { Object[] argv = (Object[]) pair; target.encode((net.minecraft.network.FriendlyByteBuf) argv[0], argv[1]); return null; };
+    }
+    /** The decoder `of` was handed: a `StreamDecoder` is called with the buffer
+     *  alone, which is the same shape as a `Function`'s one argument. */
+    protected static java.util.function.Function horizonDecoder(Object decoder) {
+        if (decoder instanceof java.util.function.Function) return (java.util.function.Function) decoder;
+        if (!(decoder instanceof net.minecraft.network.codec.StreamDecoder)) return null;
+        net.minecraft.network.codec.StreamDecoder target = (net.minecraft.network.codec.StreamDecoder) decoder;
+        return buffer -> target.decode(buffer);
+    }
+    /** The member codecs in wire order, so `composite` can walk them without
+     *  spelling out eight fields at every call site. */
+    protected net.minecraft.network.codec.StreamCodec[] horizonMembers() {
+        java.util.List<net.minecraft.network.codec.StreamCodec> members = new java.util.ArrayList<>();
+        for (int i = 1; i <= 8; i++) { net.minecraft.network.codec.StreamCodec member = horizonMemberAt(i); if (member == null) break; members.add(member); }
+        return members.toArray(new net.minecraft.network.codec.StreamCodec[0]);
+    }
+    /** The codec a dispatch table answers for one type head. */
+    protected net.minecraft.network.codec.StreamCodec horizonDispatched(Object type) {
+        return (net.minecraft.network.codec.StreamCodec) horizonSecond.apply(type);
+    }
+    /** A composite's value: the mod's constructor function over the decoded
+     *  members, in the order it was handed them.
+     *
+     *  Vanilla's `composite` takes a `Function` for one member, a
+     *  `BiFunction` for two and `Function3`… for more; the constructor is one
+     *  of them, so the arity decides how it is called. */
+    protected Object horizonConstruct(java.util.List values) {
+        Object constructor = horizonConstructor;
+        int count = values.size();
+        if (constructor == null) throw new java.lang.IllegalStateException("horizon StreamCodec composite: no constructor function");
+        if (constructor instanceof java.util.function.Function && count == 1) {
+            return ((java.util.function.Function) constructor).apply(values.get(0));
+        }
+        if (constructor instanceof java.util.function.BiFunction && count == 2) {
+            return ((java.util.function.BiFunction) constructor).apply(values.get(0), values.get(1));
+        }
+        // `Function3`..`Function12` name no common supertype: the lambda's own
+        // `apply` is called reflectively.
+        try {
+            Class<?>[] types = new Class<?>[count];
+            for (int i = 0; i < count; i++) types[i] = Object.class;
+            java.lang.reflect.Method method = constructor.getClass().getMethod("apply", types);
+            method.setAccessible(true);
+            return method.invoke(constructor, values.toArray());
+        } catch (java.lang.ReflectiveOperationException e) {
+            throw new java.lang.IllegalStateException("horizon StreamCodec composite: the constructor function did not take " + count + " members", e);
+        }
+    }
+    protected net.minecraft.network.codec.StreamCodec horizonMemberAt(int index) {
+        return index == 1 ? horizonMember1 : index == 2 ? horizonMember2 : index == 3 ? horizonMember3 : index == 4 ? horizonMember4 : index == 5 ? horizonMember5 : index == 6 ? horizonMember6 : index == 7 ? horizonMember7 : index == 8 ? horizonMember8 : null;
+    }
+    /** A recursive codec's delegate, built once from the mod's factory. */
+    protected net.minecraft.network.codec.StreamCodec horizonRecursive(net.minecraft.network.codec.StreamCodec self) {
+        return (net.minecraft.network.codec.StreamCodec) ((java.util.function.UnaryOperator) horizonFirst).apply(self);
+    }
+    /** A composite's members decoded in order, which is the list the
+     *  constructor function rebuilds the value from. */
+    protected java.util.List horizonDecodeMembers(net.minecraft.network.FriendlyByteBuf buffer) {
+        java.util.List<Object> values = new java.util.ArrayList<>();
+        for (net.minecraft.network.codec.StreamCodec member : horizonMembers()) values.add(member.decode(buffer));
+        return values;
+    }
+    protected java.util.function.Function horizonGetterAt(int index) {
+        return index == 1 ? horizonGetters1 : index == 2 ? horizonGetters2 : index == 3 ? horizonGetters3 : index == 4 ? horizonGetters4 : index == 5 ? horizonGetters5 : index == 6 ? horizonGetters6 : index == 7 ? horizonGetters7 : index == 8 ? horizonGetters8 : null;
+    }
+"#;
+
+/// `StreamEncoder`: the callback `StreamCodec.of` takes for its `encode` half.
+const STREAM_ENCODER: &str = r#"package net.minecraft.network.codec;
+
+public interface StreamEncoder<B, V> {
+    void encode(B buffer, V value);
+}
+"#;
+
+/// `StreamDecoder`: the callback `StreamCodec.of` takes for its `decode` half.
+const STREAM_DECODER: &str = r#"package net.minecraft.network.codec;
+
+public interface StreamDecoder<B, V> {
+    V decode(B buffer);
+}
+"#;
+
+/// `StreamMemberEncoder`: the buffer-then-member form `ofMember` takes.
+const STREAM_MEMBER_ENCODER: &str = r#"package net.minecraft.network.codec;
+
+public interface StreamMemberEncoder<B, V> {
+    void encode(V member, B buffer);
+}
+"#;
+
+/// The file the operation shim is written to, without `.java`.
+const STREAM_CODEC_OPERATION_TYPE_FILE: &str = "net/minecraft/network/codec/StreamCodecOperation";
+
+/// The operation type the generated `StreamCodec` interface's `apply` names.
+const STREAM_CODEC_OPERATION_TYPE: &str = "net/minecraft/network/codec/StreamCodec$CodecOperation";
+
+/// Vanilla's `StreamCodec.CodecOperation`, the functional interface `apply`
+/// takes. It is a top-level file here, never nested: the façade writes the
+/// game's interfaces with `default` bodies, so a nested abstract member would
+/// shadow the name a mod writes (`codec -> ...` needs a target) and the codec's
+/// own `apply` would resolve to itself.
+const STREAM_CODEC_OPERATION: &str = r#"package net.minecraft.network.codec;
+
+public interface StreamCodecOperation<B, S, T> {
+    net.minecraft.network.codec.StreamCodec apply(net.minecraft.network.codec.StreamCodec codec);
+}
 "#;
 
 /// Bounded stand-in for NeoForge's payload registrar. Every play/configuration
@@ -4743,6 +4969,14 @@ fn support_types(name: &str) -> &'static [&'static str] {
             "net/minecraft/world/entity/SpawnPlacementTypes",
             "net/minecraft/world/level/levelgen/Heightmap$Types",
         ],
+        // The codec's state names the two callbacks `of` takes and the buffer
+        // its encoder writes into, none of which a mod that only passes a
+        // lambda to `of` has to mention itself.
+        "net/minecraft/network/codec/StreamCodec" => &[
+            "net/minecraft/network/codec/StreamEncoder",
+            "net/minecraft/network/codec/StreamDecoder",
+            "net/minecraft/network/FriendlyByteBuf",
+        ],
         _ => &[],
     }
 }
@@ -5018,6 +5252,32 @@ fn render(
         let _ = writeln!(
             out,
             "    protected String horizonText = \"\";\n    protected String horizonKey = \"\";"
+        );
+    }
+    if class.name == "net/minecraft/network/codec/StreamCodec" && !is_interface {
+        let _ = write!(out, "{STREAM_CODEC_STATE}");
+        // The game's codec inherits these two from `StreamEncoder` and
+        // `StreamDecoder`; the façade's stub does not model those parents, so
+        // the pair is written here with the bodies below.
+        let _ = writeln!(
+            out,
+            "    public void encode(net.minecraft.network.FriendlyByteBuf p0, Object p1) {{ {ENCODE_CODEC} }}"
+        );
+        let _ = writeln!(
+            out,
+            "    public Object decode(net.minecraft.network.FriendlyByteBuf p0) {{ {DECODE_CODEC} }}"
+        );
+        // The factories that take callbacks: declared generically over the
+        // same type parameters as the game's, so a mod's lambda (and a
+        // `ByteBufCodecs` factory's) infers its parameter types from the
+        // buffer it is handed rather than from `Object`.
+        let _ = writeln!(
+            out,
+            "    public static <B, V> net.minecraft.network.codec.StreamCodec of(net.minecraft.network.codec.StreamEncoder<B, V> p0, net.minecraft.network.codec.StreamDecoder<B, V> p1) {{ net.minecraft.network.codec.StreamCodec codec = new net.minecraft.network.codec.StreamCodec(); return codec.horizonOf(p0, p1); }}"
+        );
+        let _ = writeln!(
+            out,
+            "    public static <B, V> net.minecraft.network.codec.StreamCodec ofMember(net.minecraft.network.codec.StreamMemberEncoder<B, V> p0, net.minecraft.network.codec.StreamDecoder<B, V> p1) {{ net.minecraft.network.codec.StreamCodec codec = new net.minecraft.network.codec.StreamCodec(); return codec.horizonOf(null, p1); }}"
         );
     }
     if class.name == "net/minecraft/world/item/Item$Properties" {
@@ -6495,17 +6755,29 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             _ => {}
         }
     }
-    if class == "net/minecraft/network/codec/StreamCodec"
-        && ret == "net.minecraft.network.codec.StreamCodec"
+    if class == "net/minecraft/network/codec/StreamCodec" {
+        if let Some(body) = stream_codec_body(method, descriptor) {
+            return body;
+        }
+    }
+    // `ByteBufCodecs`' factories build real codecs over the bounded
+    // `FriendlyByteBuf`: a payload that writes its fields through a primitive
+    // codec, a list or an optional round-trips them on the game side.
+    if class == "net/minecraft/network/codec/ByteBufCodecs"
+        && let Some(factory) = byte_buf_codec_factory(method, descriptor)
+    {
+        return factory;
+    }
+    // Buffer-wrapping calls answer the bounded buffer itself.
+    if ret == "net.minecraft.network.FriendlyByteBuf"
         && matches!(
-            method,
-            "map" | "mapStream" | "dispatch" | "apply" | "optional" | "nullable" | "cast" | "tuple"
+            class,
+            "net/minecraft/network/FriendlyByteBuf"
+                | "net/minecraft/network/VarInt"
+                | "net/minecraft/network/codec/ByteBufCodecs"
         )
     {
-        return "return this;".to_owned();
-    }
-    if ret == "net.minecraft.network.codec.StreamCodec" {
-        return "return new net.minecraft.network.codec.StreamCodec() {};".to_owned();
+        return "return p0;".to_owned();
     }
     // Codec values are used while Minecraft registers codecs in static
     // initializers.  The real datafixerupper classes are on the probe's
@@ -8014,6 +8286,245 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     format!("throw new UnsupportedOperationException(\"horizon stub: {class}#{method}\");")
 }
 
+/// The generated `StreamCodec`'s bodies: the wire form of a codec, not a
+/// placeholder object.
+///
+/// A codec built by `of` keeps the mod's encoder and decoder, `unit` writes
+/// nothing, and `map`, `dispatch`, `composite` and `recursive` keep their
+/// members so `encode`/`decode` descend into them in order. A composite
+/// encodes each member through the getter it was given and rebuilds the value
+/// from the members' own decode results, so it never has to call the record's
+/// constructor reflectively: a decoded member pair that a constructor would
+/// canonicalise (a defensive copy, a clamp) differs from what vanilla's
+/// `composite` returns too, since vanilla's own constructor call is the same
+/// kind of conversion done once on each side of the wire.
+///
+/// `None` means the method has no bounded body here, and the façade keeps the
+/// shape-only default.
+fn stream_codec_body(method: &str, descriptor: &str) -> Option<String> {
+    const CODEC: &str = "net.minecraft.network.codec.StreamCodec";
+    match (method, descriptor) {
+        // `new StreamCodec<>() { public V decode(B b) {...} public void
+        // encode(B b, V v) {...} }`: an anonymous body's two callbacks are not
+        // recovered from the class file yet, so this codec writes nothing and
+        // answers null. `StreamCodec.of(...)` and `unit` keep working.
+        ("<init>", "(Lio/netty/buffer/ByteBuf;)V" | "()V") => Some(String::new()),
+        (
+            "of",
+            "(Lnet/minecraft/network/codec/StreamEncoder;Lnet/minecraft/network/codec/StreamDecoder;)Lnet/minecraft/network/codec/StreamCodec;",
+        ) => Some(format!(
+            "{CODEC} codec = new {CODEC}(); return codec.horizonOf(p0, p1);"
+        )),
+        // `ofMember` is the same pair with the receiver's value in front of the
+        // encoder's argument, which the bounded buffer pair does not carry.
+        (
+            "ofMember",
+            "(Lnet/minecraft/network/codec/StreamMemberEncoder;Lnet/minecraft/network/codec/StreamDecoder;)Lnet/minecraft/network/codec/StreamCodec;",
+        ) => Some(format!(
+            "{CODEC} codec = new {CODEC}(); return codec.horizonOf(null, p1);"
+        )),
+        // Nothing is written, and decoding answers the same instance.
+        ("unit", _) => Some(format!(
+            "{CODEC} codec = new {CODEC}(); codec.horizonValue = p0; return codec;"
+        )),
+        // `apply` hands the mod's `CodecOperation` the receiver, which builds a
+        // real codec of its own. The rest take values the bounded buffer does
+        // not model (a retyped buffer, a null-flag wrapper), so the receiver
+        // keeps answering for the value it already holds.
+        ("apply", _) if descriptor.ends_with("Lnet/minecraft/network/codec/StreamCodec;") => {
+            Some("return p0 == null ? null : p0.apply(this);".to_owned())
+        }
+        ("mapStream" | "cast" | "optional" | "nullable" | "tuple", _)
+            if descriptor.ends_with("Lnet/minecraft/network/codec/StreamCodec;") =>
+        {
+            Some("return this;".to_owned())
+        }
+        (
+            "map",
+            "(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;",
+        ) => Some(format!(
+            // Vanilla's `map(to, from)`: `to` turns the decoded value into the
+            // codec's value, `from` turns the codec's value back for encoding.
+            "{CODEC} codec = new {CODEC}(); codec.horizonKind = HORIZON_MAP; codec.horizonMember1 = this; codec.horizonFirst = p1; codec.horizonSecond = p0; return codec;"
+        )),
+        (
+            "dispatch",
+            "(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;",
+        ) => Some(format!(
+            "{CODEC} codec = new {CODEC}(); codec.horizonKind = HORIZON_DISPATCH; codec.horizonMember1 = this; codec.horizonFirst = p0; codec.horizonSecond = p1; return codec;"
+        )),
+        (
+            "recursive",
+            "(Ljava/util/function/UnaryOperator;)Lnet/minecraft/network/codec/StreamCodec;",
+        ) => Some(format!(
+            "{CODEC} codec = new {CODEC}(); codec.horizonKind = HORIZON_RECURSIVE; codec.horizonFirst = p0; return codec;"
+        )),
+        ("composite", _) if descriptor.ends_with("Lnet/minecraft/network/codec/StreamCodec;") => {
+            Some(stream_composite_body(descriptor))
+        }
+        ("encode", _) => Some(ENCODE_CODEC.to_owned()),
+        ("decode", _) => Some(DECODE_CODEC.to_owned()),
+        _ if descriptor.ends_with("Lnet/minecraft/network/codec/StreamCodec;") => {
+            Some(format!("{CODEC} codec = new {CODEC}(); return codec;"))
+        }
+        _ => None,
+    }
+}
+
+/// `StreamCodec#encode`, in every form the factories build. The heads are in
+/// the same order `decode` reads them back.
+const ENCODE_CODEC: &str = r#"if (horizonKind == HORIZON_MAP) { horizonMember1.encode(p0, horizonFirst.apply(p1)); return; }
+        if (horizonKind == HORIZON_DISPATCH) { Object type = horizonFirst.apply(p1); horizonMember1.encode(p0, type); (horizonDispatched(type)).encode(p0, p1); return; }
+        if (horizonKind == HORIZON_RECURSIVE) { if (horizonRecursiveCodec == null) horizonRecursiveCodec = horizonRecursive(this); horizonRecursiveCodec.encode(p0, p1); return; }
+        if (horizonKind == HORIZON_COMPOSITE) { for (int i = 1; i <= 8; i++) { net.minecraft.network.codec.StreamCodec member = horizonMemberAt(i); if (member == null) break; member.encode(p0, horizonGetterAt(i).apply(p1)); } return; }
+        if (horizonValue != null) return;
+        if (horizonFirst != null) { horizonFirst.apply(new Object[] { p0, p1 }); return; }"#;
+
+/// `StreamCodec#decode`, reading the heads `ENCODE_CODEC` wrote.
+const DECODE_CODEC: &str = r#"if (horizonKind == HORIZON_MAP) return horizonSecond.apply(horizonMember1.decode(p0));
+        if (horizonKind == HORIZON_DISPATCH) { Object type = horizonMember1.decode(p0); return (horizonDispatched(type)).decode(p0); }
+        if (horizonKind == HORIZON_RECURSIVE) { if (horizonRecursiveCodec == null) horizonRecursiveCodec = horizonRecursive(this); return horizonRecursiveCodec.decode(p0); }
+        if (horizonKind == HORIZON_COMPOSITE) return horizonConstruct(horizonDecodeMembers(p0));
+        if (horizonValue != null) return horizonValue;
+        if (horizonSecond != null && p0 != null) return horizonSecond.apply(p0);
+        return null;"#;
+
+/// `StreamCodec.composite`'s body: the members in wire order, each with the
+/// getter that reads its value off the composite.
+///
+/// Vanilla writes member 1, then member 2, and so on; the façade keeps the
+/// same order.
+fn stream_composite_body(descriptor: &str) -> String {
+    const CODEC: &str = "net.minecraft.network.codec.StreamCodec";
+    // (StreamCodec, Function) repeated, then the constructor function.
+    let args = descriptor_parameters(descriptor);
+    let pairs = args.len() / 2;
+    let mut body = format!("{CODEC} codec = new {CODEC}(); codec.horizonKind = HORIZON_COMPOSITE;");
+    for member in 0..pairs.min(8) {
+        body.push_str(&format!(
+            " codec.horizonMember{} = p{};",
+            member + 1,
+            member * 2
+        ));
+        body.push_str(&format!(
+            " codec.{} = p{};",
+            stream_composite_getter(member + 1),
+            member * 2 + 1
+        ));
+    }
+    body.push_str(&format!(
+        " codec.horizonConstructor = p{}; return codec;",
+        pairs * 2
+    ));
+    body
+}
+
+/// The field a composite member's getter is kept in.
+fn stream_composite_getter(index: usize) -> &'static str {
+    const FIELDS: [&str; 8] = [
+        "horizonGetters1",
+        "horizonGetters2",
+        "horizonGetters3",
+        "horizonGetters4",
+        "horizonGetters5",
+        "horizonGetters6",
+        "horizonGetters7",
+        "horizonGetters8",
+    ];
+    FIELDS[index - 1]
+}
+
+/// The parameter descriptors of a method descriptor, in order.
+fn descriptor_parameters(descriptor: &str) -> Vec<String> {
+    let Some(end) = descriptor.find(')') else {
+        return Vec::new();
+    };
+    let args = &descriptor[1..end];
+    let bytes = args.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let start = at;
+        while at < bytes.len() && bytes[at] == b'[' {
+            at += 1;
+        }
+        if at >= bytes.len() {
+            break;
+        }
+        if bytes[at] == b'L' {
+            while at < bytes.len() && bytes[at] != b';' {
+                at += 1;
+            }
+            at += 1;
+        } else {
+            at += 1;
+        }
+        out.push(args[start..at].to_owned());
+    }
+    out
+}
+
+/// `ByteBufCodecs`' factories as real codecs over the bounded
+/// `FriendlyByteBuf`: the primitive pairs, a length-prefixed list (count as a
+/// varint, then element after element), an optional (a presence byte), and the
+/// buffer-time factory constant that runs a mod's own function.
+///
+/// A factory this slice does not model returns None, and the façade keeps a
+/// shape-only codec for that call, so a payload that needs one still links.
+fn byte_buf_codec_factory(method: &str, descriptor: &str) -> Option<String> {
+    const CODEC: &str = "net.minecraft.network.codec.StreamCodec";
+    // (wire type, read call, write call): the pairs the buffer already
+    // implements, so the codec is a direct `of(...)` over them.
+    // (boxed value type, read call, write call): the pair the buffer already
+    // implements. Reads answer the boxed value; writes take the boxed one and
+    // unbox it.
+    let pair = match method {
+        "BOOL" => Some(("java.lang.Boolean", "readBoolean", "writeBoolean")),
+        "BYTE" => Some(("java.lang.Byte", "readByte", "writeByte")),
+        "SHORT" => Some(("java.lang.Short", "readShort", "writeShort")),
+        "UNSIGNED_SHORT" => Some(("java.lang.Integer", "readUnsignedShort", "writeShort")),
+        "INT" | "VAR_INT" => Some(("java.lang.Integer", "readVarInt", "writeVarInt")),
+        "LONG" | "VAR_LONG" => Some(("java.lang.Long", "readVarLong", "writeVarLong")),
+        "FLOAT" => Some(("java.lang.Float", "readFloat", "writeFloat")),
+        "DOUBLE" => Some(("java.lang.Double", "readDouble", "writeDouble")),
+        "BYTE_ARRAY" => Some(("byte[]", "readByteArray", "writeByteArray")),
+        "STRING_UTF8" => Some(("java.lang.String", "readUtf", "writeUtf")),
+        "IDENTIFIER" => Some((
+            "net.minecraft.resources.Identifier",
+            "readIdentifier",
+            "writeIdentifier",
+        )),
+        _ => None,
+    };
+    if let Some((value, read, write)) = pair {
+        // Explicit types on both callbacks: the façade's `ByteBufCodecs` is
+        // raw, so a lambda's parameters would infer `Object` from `of`'s type
+        // variables and neither the buffer call nor the unboxing would resolve.
+        return Some(format!(
+            "return {CODEC}.of((net.minecraft.network.FriendlyByteBuf buffer, {value} value) -> buffer.{write}(value), (net.minecraft.network.FriendlyByteBuf buffer) -> ({value}) buffer.{read}());"
+        ));
+    }
+    match method {
+        // A list is the element count as a varint, then element after element.
+        "list" if descriptor.contains("Ljava/util/function/IntFunction;") => Some(format!(
+            "return {CODEC}.of((net.minecraft.network.FriendlyByteBuf buffer, Object value) -> {{ java.util.List elements = (java.util.List) value; buffer.writeVarInt(elements.size()); for (Object element : elements) p0.encode(buffer, element); }}, (net.minecraft.network.FriendlyByteBuf buffer) -> {{ int size = buffer.readVarInt(); java.util.List values = (java.util.List) p1.apply(0); for (int i = 0; i < size; i++) values.add(p0.decode(buffer)); return values; }});"
+        )),
+        "list" => Some(format!(
+            "return {CODEC}.of((net.minecraft.network.FriendlyByteBuf buffer, Object value) -> {{ java.util.List elements = (java.util.List) value; buffer.writeVarInt(elements.size()); for (Object element : elements) p0.encode(buffer, element); }}, (net.minecraft.network.FriendlyByteBuf buffer) -> {{ int size = buffer.readVarInt(); java.util.List values = new java.util.ArrayList(); for (int i = 0; i < size; i++) values.add(p0.decode(buffer)); return values; }});"
+        )),
+        "optional" => Some(format!(
+            "return {CODEC}.of((net.minecraft.network.FriendlyByteBuf buffer, Object value) -> {{ java.util.Optional optional = (java.util.Optional) value; buffer.writeBoolean(optional.isPresent()); if (optional.isPresent()) p0.encode(buffer, optional.get()); }}, (net.minecraft.network.FriendlyByteBuf buffer) -> buffer.readBoolean() ? java.util.Optional.ofNullable(p0.decode(buffer)) : java.util.Optional.empty());"
+        )),
+        // The `ByteBufCodecs` constant that forwards to a buffer-time factory:
+        // the mod's function runs on the bounded buffer and must answer a real
+        // codec, which `of(...)` and this slice's factories already do.
+        "fromCodec" => Some(format!(
+            "Object made = p0.apply(new net.minecraft.network.FriendlyByteBuf()); if (made instanceof {CODEC}) return ({CODEC}) made; {CODEC} fallback = new {CODEC}(); return fallback;"
+        )),
+        _ => None,
+    }
+}
+
 fn voxel_shape_placeholder() -> String {
     "return new net.minecraft.world.phys.shapes.VoxelShape(null) {\n".to_owned()
         + "    public it.unimi.dsi.fastutil.doubles.DoubleList getCoords(net.minecraft.core.Direction.Axis axis) {\n"
@@ -8083,7 +8594,7 @@ fn runtime_field_default_named(
     }
     match descriptor {
         "Lnet/minecraft/network/codec/StreamCodec;" => {
-            "new net.minecraft.network.codec.StreamCodec() {}".to_owned()
+            "new net.minecraft.network.codec.StreamCodec()".to_owned()
         }
         "Lcom/mojang/serialization/Codec;" | "Lcom/mojang/serialization/codecs/PrimitiveCodec;" => {
             "com.mojang.serialization.Codec.STRING".to_owned()
@@ -9649,6 +10160,568 @@ mod tests {
         ),
     ];
 
+    /// A game jar holding the classes a payload-codec target names, in the
+    /// shapes the façade reads (`classes::read_jar`): the codec pair, the
+    /// buffer, the two callbacks `StreamCodec.of` takes, the factories of
+    /// `ByteBufCodecs`, and the values a mod writes through them.
+    ///
+    /// A class file's constant pool is where the façade learns a shape, so each
+    /// class carries a real method body (`PoolBuilder`) that names its members,
+    /// constructors included.
+    fn stream_codec_game_jar(path: &Path) {
+        use crate::classes::tests_support::PoolBuilder;
+        let file = fs::File::create(path).expect("create the game jar");
+        let mut jar = zip::ZipWriter::new(file);
+        let mut write = |name: &str, bytes: &[u8]| {
+            jar.start_file(
+                format!("{name}.class"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .expect("start the game jar entry");
+            std::io::Write::write_all(&mut jar, bytes).expect("write the game class");
+        };
+        // A call over a two-byte pool index, then a `return`. The pool reader
+        // takes the names, not the stack depth.
+        let call = |index: u16, opcode: u8| {
+            let mut code = vec![opcode];
+            code.extend(index.to_be_bytes());
+            code.push(0xb1);
+            code
+        };
+        let _ = &call;
+        // Every type a signature names travels with its member entry, so the
+        // class's `refs` hold the types the façade has to resolve.
+        let mut codec = PoolBuilder::default();
+        // The types the signatures name, so the class's `refs` hold them.
+        for named in [
+            "net/minecraft/network/codec/StreamEncoder",
+            "net/minecraft/network/codec/StreamDecoder",
+            "net/minecraft/network/FriendlyByteBuf",
+        ] {
+            codec.class(named);
+        }
+        let of = codec.method(
+            "net/minecraft/network/codec/StreamCodec",
+            "of",
+            "(Lnet/minecraft/network/codec/StreamEncoder;Lnet/minecraft/network/codec/StreamDecoder;)Lnet/minecraft/network/codec/StreamCodec;",
+        );
+        let unit = codec.method(
+            "net/minecraft/network/codec/StreamCodec",
+            "unit",
+            "(Ljava/lang/Object;)Lnet/minecraft/network/codec/StreamCodec;",
+        );
+        let map = codec.method(
+            "net/minecraft/network/codec/StreamCodec",
+            "map",
+            "(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;",
+        );
+        let dispatch = codec.method(
+            "net/minecraft/network/codec/StreamCodec",
+            "dispatch",
+            "(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;",
+        );
+        let recursive = codec.method(
+            "net/minecraft/network/codec/StreamCodec",
+            "recursive",
+            "(Ljava/util/function/UnaryOperator;)Lnet/minecraft/network/codec/StreamCodec;",
+        );
+        let composite = codec.method(
+            "net/minecraft/network/codec/StreamCodec",
+            "composite",
+            "(Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Ljava/util/function/BiFunction;)Lnet/minecraft/network/codec/StreamCodec;",
+        );
+        let encode = codec.method(
+            "net/minecraft/network/codec/StreamCodec",
+            "encode",
+            "(Lnet/minecraft/network/FriendlyByteBuf;Ljava/lang/Object;)V",
+        );
+        let decode = codec.method(
+            "net/minecraft/network/codec/StreamCodec",
+            "decode",
+            "(Lnet/minecraft/network/FriendlyByteBuf;)Ljava/lang/Object;",
+        );
+        let init = codec.method("net/minecraft/network/codec/StreamCodec", "<init>", "()V");
+        let mut body = vec![0x01]; // aconst_null, then a null receiver call
+        for index in [encode, decode, init] {
+            body.extend(call(index, 0xb6));
+        }
+        for index in [of, unit, map, dispatch, recursive, composite] {
+            body.extend(call(index, 0xb8));
+        }
+        // The factories as real 26.3 shapes: `unit`/`recursive`/`composite`
+        // static, `map`/`dispatch` instance, `of` static.
+        let bytes = codec.build_with_members(
+            "net/minecraft/network/codec/StreamCodec",
+            "java/lang/Object",
+            &[
+                (
+                    "of",
+                    "(Lnet/minecraft/network/codec/StreamEncoder;Lnet/minecraft/network/codec/StreamDecoder;)Lnet/minecraft/network/codec/StreamCodec;",
+                    0x0009,
+                ),
+                (
+                    "unit",
+                    "(Ljava/lang/Object;)Lnet/minecraft/network/codec/StreamCodec;",
+                    0x0009,
+                ),
+                (
+                    "map",
+                    "(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;",
+                    0x0001,
+                ),
+                (
+                    "dispatch",
+                    "(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;",
+                    0x0001,
+                ),
+                (
+                    "recursive",
+                    "(Ljava/util/function/UnaryOperator;)Lnet/minecraft/network/codec/StreamCodec;",
+                    0x0009,
+                ),
+                (
+                    "composite",
+                    "(Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Ljava/util/function/BiFunction;)Lnet/minecraft/network/codec/StreamCodec;",
+                    0x0009,
+                ),
+                (
+                    "encode",
+                    "(Lnet/minecraft/network/FriendlyByteBuf;Ljava/lang/Object;)V",
+                    0x0001,
+                ),
+                (
+                    "decode",
+                    "(Lnet/minecraft/network/FriendlyByteBuf;)Ljava/lang/Object;",
+                    0x0001,
+                ),
+            ],
+            &[("horizonShapes", &body)],
+        );
+        write("net/minecraft/network/codec/StreamCodec", &bytes);
+
+        let mut encoders = PoolBuilder::default();
+        encoders.class("net/minecraft/network/FriendlyByteBuf");
+        let write_call = encoders.interface_method(
+            "net/minecraft/network/codec/StreamEncoder",
+            "encode",
+            "(Lnet/minecraft/network/FriendlyByteBuf;Ljava/lang/Object;)V",
+        );
+        let mut body = vec![0x01];
+        body.extend(call(write_call, 0xb9));
+        let bytes = encoders.build(
+            "net/minecraft/network/codec/StreamEncoder",
+            "java/lang/Object",
+            &[("horizonShapes", &body)],
+        );
+        write("net/minecraft/network/codec/StreamEncoder", &bytes);
+
+        let mut decoders = PoolBuilder::default();
+        decoders.class("net/minecraft/network/FriendlyByteBuf");
+        let read_call = decoders.interface_method(
+            "net/minecraft/network/codec/StreamDecoder",
+            "decode",
+            "(Lnet/minecraft/network/FriendlyByteBuf;)Ljava/lang/Object;",
+        );
+        let mut body = vec![0x01];
+        body.extend(call(read_call, 0xb9));
+        let bytes = decoders.build(
+            "net/minecraft/network/codec/StreamDecoder",
+            "java/lang/Object",
+            &[("horizonShapes", &body)],
+        );
+        write("net/minecraft/network/codec/StreamDecoder", &bytes);
+
+        let mut factories = PoolBuilder::default();
+        factories.class("net/minecraft/network/codec/StreamCodec");
+        factories.class("net/minecraft/network/FriendlyByteBuf");
+        let bool_codec = factories.method(
+            "net/minecraft/network/codec/ByteBufCodecs",
+            "BOOL",
+            "()Lnet/minecraft/network/codec/StreamCodec;",
+        );
+        let int_codec = factories.method(
+            "net/minecraft/network/codec/ByteBufCodecs",
+            "INT",
+            "()Lnet/minecraft/network/codec/StreamCodec;",
+        );
+        let string_codec = factories.method(
+            "net/minecraft/network/codec/ByteBufCodecs",
+            "STRING_UTF8",
+            "()Lnet/minecraft/network/codec/StreamCodec;",
+        );
+        let mut body = vec![0x01];
+        for index in [bool_codec, int_codec, string_codec] {
+            body.extend(call(index, 0xb8));
+        }
+        // The three factories as real 26.3 shapes: public static methods
+        // returning a codec, named by the body above.
+        let bytes = factories.build_with_members(
+            "net/minecraft/network/codec/ByteBufCodecs",
+            "java/lang/Object",
+            &[
+                (
+                    "BOOL",
+                    "()Lnet/minecraft/network/codec/StreamCodec;",
+                    0x0009,
+                ),
+                ("INT", "()Lnet/minecraft/network/codec/StreamCodec;", 0x0009),
+                (
+                    "STRING_UTF8",
+                    "()Lnet/minecraft/network/codec/StreamCodec;",
+                    0x0009,
+                ),
+            ],
+            &[("horizonShapes", &body)],
+        );
+        write("net/minecraft/network/codec/ByteBufCodecs", &bytes);
+
+        let mut buffer = PoolBuilder::default();
+        for named in [
+            "net/minecraft/network/FriendlyByteBuf",
+            "net/minecraft/network/codec/StreamCodec",
+        ] {
+            buffer.class(named);
+        }
+        let read_boolean = buffer.method(
+            "net/minecraft/network/FriendlyByteBuf",
+            "readBoolean",
+            "()Z",
+        );
+        let write_boolean = buffer.method(
+            "net/minecraft/network/FriendlyByteBuf",
+            "writeBoolean",
+            "(Z)Lnet/minecraft/network/FriendlyByteBuf;",
+        );
+        let read_var_int =
+            buffer.method("net/minecraft/network/FriendlyByteBuf", "readVarInt", "()I");
+        let write_var_int = buffer.method(
+            "net/minecraft/network/FriendlyByteBuf",
+            "writeVarInt",
+            "(I)Lnet/minecraft/network/FriendlyByteBuf;",
+        );
+        let read_utf = buffer.method(
+            "net/minecraft/network/FriendlyByteBuf",
+            "readUtf",
+            "()Ljava/lang/String;",
+        );
+        let write_utf = buffer.method(
+            "net/minecraft/network/FriendlyByteBuf",
+            "writeUtf",
+            "(Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;",
+        );
+        let reader = buffer.method(
+            "net/minecraft/network/FriendlyByteBuf",
+            "readerIndex",
+            "()I",
+        );
+        let readable = buffer.method(
+            "net/minecraft/network/FriendlyByteBuf",
+            "readableBytes",
+            "()I",
+        );
+        let writer = buffer.method(
+            "net/minecraft/network/FriendlyByteBuf",
+            "writerIndex",
+            "()I",
+        );
+        let buffer_init = buffer.method("net/minecraft/network/FriendlyByteBuf", "<init>", "()V");
+        let mut body = vec![0x01];
+        for index in [
+            read_boolean,
+            write_boolean,
+            read_var_int,
+            write_var_int,
+            read_utf,
+            write_utf,
+            reader,
+            readable,
+            writer,
+        ] {
+            body.extend(call(index, 0xb6));
+        }
+        body.extend(call(buffer_init, 0xb7));
+        let bytes = buffer.build(
+            "net/minecraft/network/FriendlyByteBuf",
+            "java/lang/Object",
+            &[("horizonShapes", &body)],
+        );
+        write("net/minecraft/network/FriendlyByteBuf", &bytes);
+
+        jar.finish().expect("finish the game jar");
+    }
+
+    /// The mod's payload class, compiled against the façade: a record sent
+    /// through `StreamCodec.composite`, a mapped unit codec, and the
+    /// `ByteBufCodecs` factories for its fields.
+    /// The mod's payload class, compiled against the façade. The façade's
+    /// `StreamCodec` and `ByteBufCodecs` are erased the way the generated
+    /// stubs are (the real 26.3 types are generic; their type parameters live
+    /// in `Signature` attributes the class reader does not decode), so the
+    /// source writes `StreamCodec<Ping>` as the bare type and lets the casts in
+    /// the probe do the typing.
+    const PAYLOAD_CODEC_TARGET: &str = r#"package demo;
+
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.codec.ByteBufCodecs;
+import net.minecraft.network.codec.StreamCodec;
+
+public final class PingPayload {
+    public record Ping(boolean flag, int count) {
+        public static final StreamCodec CODEC = StreamCodec.composite(
+                ByteBufCodecs.BOOL(), (Object ping) -> ((Ping) ping).flag(),
+                ByteBufCodecs.INT(), (Object ping) -> Integer.valueOf(((Ping) ping).count()),
+                (Object flag, Object count) -> new Ping((Boolean) flag, (Integer) count));
+    }
+
+    /** A composite whose members are themselves composed: a mapped codec
+     *  first, then a plain one, so the member order and each member's own
+     *  value are both exercised. */
+    public record Swap(boolean inverted, int count) {
+        public static final StreamCodec CODEC = StreamCodec.composite(
+                ByteBufCodecs.BOOL().map(
+                        (Object flag) -> Boolean.valueOf(!((Boolean) flag)),
+                        (Object flag) -> Boolean.valueOf(!((Boolean) flag))),
+                (Object value) -> ((Swap) value).inverted(),
+                ByteBufCodecs.INT(),
+                (Object value) -> Integer.valueOf(((Swap) value).count()),
+                (Object flag, Object count) -> new Swap((Boolean) flag, (Integer) count));
+    }
+
+    public static final StreamCodec FLAG = ByteBufCodecs.BOOL();
+
+    public static final StreamCodec NAME = ByteBufCodecs.STRING_UTF8();
+}
+"#;
+
+    /// The mod's driver, run after the façade: encode and decode through every
+    /// codec shape the slice builds, at the same buffer cursor.
+    const PAYLOAD_CODEC_PROBE: &str = r#"package demo;
+
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.codec.ByteBufCodecs;
+import net.minecraft.network.codec.StreamCodec;
+
+public final class CodecProbe {
+    @SuppressWarnings("unchecked")
+    public static void main(String[] args) {
+        FriendlyByteBuf buffer = new FriendlyByteBuf();
+        PingPayload.Ping sent = new PingPayload.Ping(true, 1234567);
+        PingPayload.Ping.CODEC.encode(buffer, sent);
+        PingPayload.Ping got = (PingPayload.Ping) PingPayload.Ping.CODEC.decode(buffer);
+        if (!got.flag() || got.count() != 1234567) throw new AssertionError("composite " + got);
+        if (buffer.readableBytes() != 0) throw new AssertionError("composite left " + buffer.readableBytes() + " bytes");
+        FriendlyByteBuf single = new FriendlyByteBuf();
+        PingPayload.FLAG.encode(single, true);
+        PingPayload.FLAG.encode(single, false);
+        if (!((Boolean) PingPayload.FLAG.decode(single)) || ((Boolean) PingPayload.FLAG.decode(single))) throw new AssertionError("bool");
+        // A composite over a mapped member: `inverted` is written through the
+        // map's `from` and read back through its `to`, so `true` survives.
+        PingPayload.Swap swapSent = new PingPayload.Swap(true, 42);
+        FriendlyByteBuf swapBuffer = new FriendlyByteBuf();
+        PingPayload.Swap.CODEC.encode(swapBuffer, swapSent);
+        PingPayload.Swap swapGot = (PingPayload.Swap) PingPayload.Swap.CODEC.decode(swapBuffer);
+        if (!swapGot.inverted() || swapGot.count() != 42) throw new AssertionError("nested composite " + swapGot);
+        if (swapBuffer.readableBytes() != 0) throw new AssertionError("nested composite left bytes");
+        FriendlyByteBuf named = new FriendlyByteBuf();
+        PingPayload.NAME.encode(named, "h\u00e9llo");
+        if (!"h\u00e9llo".equals((String) PingPayload.NAME.decode(named))) throw new AssertionError("string");
+        StreamCodec count = ByteBufCodecs.INT();
+        FriendlyByteBuf number = new FriendlyByteBuf();
+        count.encode(number, Integer.valueOf(-7));
+        if (((Integer) count.decode(number)).intValue() != -7) throw new AssertionError("int");
+        StreamCodec mapped = ByteBufCodecs.BOOL().map(
+                (Object flag) -> Boolean.valueOf(!((Boolean) flag)),
+                (Object flag) -> Boolean.valueOf(!((Boolean) flag)));
+        FriendlyByteBuf mappedBuffer = new FriendlyByteBuf();
+        mapped.encode(mappedBuffer, Boolean.TRUE);
+        // `map(to, from)`: `from` flips on the way out, `to` flips on the way
+        // back, so a `true` written reads back `true`.
+        if (!((Boolean) mapped.decode(mappedBuffer)).booleanValue()) throw new AssertionError("map");
+        StreamCodec unit = StreamCodec.unit("fixed");
+        FriendlyByteBuf empty = new FriendlyByteBuf();
+        unit.encode(empty, "ignored");
+        if (empty.writerIndex() != 0 || !"fixed".equals(unit.decode(empty))) throw new AssertionError("unit");
+        System.out.println("horizon payload codecs ok");
+    }
+}
+"#;
+
+    /// The whole slice, through the generator and the JVM: the façade is
+    /// generated from a game jar with the real 26.3 shapes, compiled, and the
+    /// mod's payload load runs against it. A codec that only linked would fail
+    /// here on the first `encode`, which is what the old placeholder object
+    /// did.
+    #[test]
+    fn payload_codecs_compile_and_round_trip_through_the_facade() {
+        use std::{path::PathBuf, process::Command};
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("horizon-port-pack-codecs-{stamp}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create the scratch root");
+        let game_jar = root.join("game-26.3.jar");
+        stream_codec_game_jar(&game_jar);
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let java = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("java"))
+            .unwrap_or_else(|| PathBuf::from("java"));
+        // The target jar: one class that names the codec surface.
+        let target = root.join("demo-mod.jar");
+        {
+            use crate::classes::tests_support::PoolBuilder;
+            let file = fs::File::create(&target).expect("create the target jar");
+            let mut jar = zip::ZipWriter::new(file);
+            jar.start_file(
+                "demo/PingPayload.class",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .expect("start the target entry");
+            let mut pool = PoolBuilder::default();
+            let composite = pool.method(
+                "net/minecraft/network/codec/StreamCodec",
+                "composite",
+                "(Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Ljava/util/function/BiFunction;)Lnet/minecraft/network/codec/StreamCodec;",
+            );
+            let unit = pool.method(
+                "net/minecraft/network/codec/StreamCodec",
+                "unit",
+                "(Ljava/lang/Object;)Lnet/minecraft/network/codec/StreamCodec;",
+            );
+            let map = pool.method(
+                "net/minecraft/network/codec/StreamCodec",
+                "map",
+                "(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;",
+            );
+            let boolean_codec = pool.method(
+                "net/minecraft/network/codec/ByteBufCodecs",
+                "BOOL",
+                "()Lnet/minecraft/network/codec/StreamCodec;",
+            );
+            let int_codec = pool.method(
+                "net/minecraft/network/codec/ByteBufCodecs",
+                "INT",
+                "()Lnet/minecraft/network/codec/StreamCodec;",
+            );
+            let string_codec = pool.method(
+                "net/minecraft/network/codec/ByteBufCodecs",
+                "STRING_UTF8",
+                "()Lnet/minecraft/network/codec/StreamCodec;",
+            );
+            let mut body = vec![0x01];
+            for (opcode, index) in [
+                (0xb8, composite),
+                (0xb8, unit),
+                (0xb6, map),
+                (0xb8, boolean_codec),
+                (0xb8, int_codec),
+                (0xb8, string_codec),
+            ] {
+                body.push(opcode);
+                body.extend(index.to_be_bytes());
+            }
+            // The buffer calls the payload's codec makes on the mod's behalf.
+            for (name, descriptor) in [
+                ("readBoolean", "()Z"),
+                ("writeBoolean", "(Z)Lnet/minecraft/network/FriendlyByteBuf;"),
+                ("readVarInt", "()I"),
+                ("writeVarInt", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+                ("readUtf", "()Ljava/lang/String;"),
+                (
+                    "writeUtf",
+                    "(Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;",
+                ),
+                ("readableBytes", "()I"),
+                ("writerIndex", "()I"),
+                ("<init>", "()V"),
+            ] {
+                let index = pool.method("net/minecraft/network/FriendlyByteBuf", name, descriptor);
+                body.push(0xb6);
+                body.extend(index.to_be_bytes());
+            }
+            body.push(0xb1);
+            std::io::Write::write_all(
+                &mut jar,
+                &pool.build(
+                    "demo/PingPayload",
+                    "java/lang/Object",
+                    &[("horizonShapes", &body)],
+                ),
+            )
+            .expect("write the target class");
+            jar.finish().expect("finish the target jar");
+        }
+        // The other façade tests skip when there is no JDK, because their
+        // source assertions still hold. This one is the only check that a
+        // codec actually round-trips, so a missing toolchain must fail loudly
+        // rather than pass with nothing run.
+        assert!(
+            Command::new(&javac).arg("-version").output().is_ok(),
+            "no javac on this machine: the codec slice is unverified"
+        );
+        let out = root.join("facade");
+        let report = generate(&target, &game_jar, &[], &out, &javac, &PathBuf::from("jar"))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the façade did not generate: {e} (sources kept in {})",
+                    out.display()
+                )
+            });
+        assert!(
+            report.jar.is_file(),
+            "the façade jar was not written: {report:?}"
+        );
+        // The mod's own classes, compiled against the generated façade.
+        let sources = root.join("mod-src");
+        let classes = root.join("mod-classes");
+        fs::create_dir_all(sources.join("demo")).expect("create the mod sources");
+        fs::write(sources.join("demo/PingPayload.java"), PAYLOAD_CODEC_TARGET)
+            .expect("write the payload");
+        fs::write(sources.join("demo/CodecProbe.java"), PAYLOAD_CODEC_PROBE)
+            .expect("write the probe");
+        fs::create_dir_all(&classes).expect("create the mod classes");
+        // The façade's `FriendlyByteBuf` names the Netty buffer in one
+        // constructor; a payload never loads that method, and `javac` only
+        // needs the type to exist.
+        let status = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .arg("-classpath")
+            .arg(&report.jar)
+            .arg(sources.join("demo/PingPayload.java"))
+            .arg(sources.join("demo/CodecProbe.java"))
+            .status()
+            .expect("run javac");
+        assert!(
+            status.success(),
+            "javac rejected the payload compiled against the generated façade"
+        );
+        let output = Command::new(&java)
+            .arg("-cp")
+            .arg(format!("{}:{}", report.jar.display(), classes.display()))
+            .arg("demo.CodecProbe")
+            .output()
+            .expect("run the codec probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "codec probe failed: {stdout}{stderr}"
+        );
+        assert!(
+            stdout.contains("horizon payload codecs ok"),
+            "probe output: {stdout}{stderr}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     fn friendly_byte_buf_java_source() -> String {
         use std::fmt::Write as _;
         // The probe class is the generated shape itself: package, return
@@ -9733,37 +10806,104 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// `ByteBufCodecs`' catalogue as codecs: each primitive pair writes and
+    /// reads the same call, a list writes its size before its elements, an
+    /// optional writes a presence byte, and a factory this slice does not
+    /// model answers `None` so the caller keeps the shape-only codec.
+    #[test]
+    fn byte_buf_codec_factories_cover_the_bounded_buffer() {
+        let bool_codec =
+            byte_buf_codec_factory("BOOL", "()Lnet/minecraft/network/codec/StreamCodec;")
+                .expect("BOOL is a primitive pair");
+        assert!(bool_codec.contains("buffer.writeBoolean(value)"));
+        assert!(bool_codec.contains("(java.lang.Boolean) buffer.readBoolean()"));
+        // An integer travels as a VarInt, which is what vanilla's `INT` is.
+        let int_codec =
+            byte_buf_codec_factory("INT", "()Lnet/minecraft/network/codec/StreamCodec;")
+                .expect("INT is a primitive pair");
+        assert!(int_codec.contains("buffer.writeVarInt(value)"));
+        assert!(int_codec.contains("buffer.readVarInt()"));
+        let string_codec =
+            byte_buf_codec_factory("STRING_UTF8", "()Lnet/minecraft/network/codec/StreamCodec;")
+                .expect("STRING_UTF8 is a primitive pair");
+        assert!(string_codec.contains("buffer.writeUtf(value)"));
+        assert!(string_codec.contains("buffer.readUtf()"));
+        // The callbacks are typed: the façade's `ByteBufCodecs` is raw, so a
+        // lambda without them would infer `Object` and the buffer call would
+        // not resolve.
+        for codec in [&bool_codec, &int_codec, &string_codec] {
+            assert!(
+                codec.contains("net.minecraft.network.FriendlyByteBuf buffer"),
+                "{codec}"
+            );
+        }
+        let list = byte_buf_codec_factory(
+            "list",
+            "(Lnet/minecraft/network/codec/StreamCodec;)Lnet/minecraft/network/codec/StreamCodec;",
+        )
+        .expect("a list is modelled");
+        assert!(list.contains("buffer.writeVarInt(elements.size())"));
+        assert!(list.contains("int size = buffer.readVarInt()"));
+        let optional = byte_buf_codec_factory(
+            "optional",
+            "(Lnet/minecraft/network/codec/StreamCodec;)Lnet/minecraft/network/codec/StreamCodec;",
+        )
+        .expect("an optional is modelled");
+        assert!(optional.contains("buffer.writeBoolean(optional.isPresent())"));
+        assert!(optional.contains("java.util.Optional.ofNullable(p0.decode(buffer))"));
+        // A factory outside the bounded value set keeps the shape-only codec.
+        assert!(
+            byte_buf_codec_factory("QUATERNION", "()Lnet/minecraft/network/codec/StreamCodec;")
+                .is_none()
+        );
+        assert!(
+            byte_buf_codec_factory(
+                "registry",
+                "(Lnet/minecraft/core/Registry;)Lnet/minecraft/network/codec/StreamCodec;"
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn stream_codec_factories_are_bootstrap_values() {
         assert_eq!(
-            runtime_body(
-                "net/minecraft/network/codec/StreamCodec",
-                "of",
-                "net.minecraft.network.codec.StreamCodec"
-            ),
-            "return new net.minecraft.network.codec.StreamCodec() {};"
+            stream_codec_body(
+                "unit",
+                "(Ljava/lang/Object;)Lnet/minecraft/network/codec/StreamCodec;"
+            )
+            .as_deref(),
+            Some(
+                "net.minecraft.network.codec.StreamCodec codec = new net.minecraft.network.codec.StreamCodec(); codec.horizonValue = p0; return codec;"
+            )
         );
         assert_eq!(
-            runtime_body(
-                "net/minecraft/network/codec/ByteBufCodecs",
-                "idMapper",
-                "net.minecraft.network.codec.StreamCodec"
-            ),
-            "return new net.minecraft.network.codec.StreamCodec() {};"
+            stream_codec_body(
+                "of",
+                "(Lnet/minecraft/network/codec/StreamEncoder;Lnet/minecraft/network/codec/StreamDecoder;)Lnet/minecraft/network/codec/StreamCodec;"
+            )
+            .as_deref(),
+            Some("net.minecraft.network.codec.StreamCodec codec = new net.minecraft.network.codec.StreamCodec(); return codec.horizonOf(p0, p1);")
         );
-        for method in ["optional", "nullable", "cast", "tuple"] {
-            assert_eq!(
-                runtime_body(
-                    "net/minecraft/network/codec/StreamCodec",
-                    method,
-                    "net.minecraft.network.codec.StreamCodec"
-                ),
-                "return this;"
-            );
-        }
+        // A composite keeps both members with their getters, in wire order.
+        let composite = stream_composite_body(
+            "(Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Ljava/util/function/BiFunction;)Lnet/minecraft/network/codec/StreamCodec;",
+        );
+        assert!(composite.contains("codec.horizonKind = HORIZON_COMPOSITE;"));
+        assert!(composite.contains("codec.horizonMember1 = p0;"));
+        assert!(composite.contains("codec.horizonGetters1 = p1;"));
+        assert!(composite.contains("codec.horizonMember2 = p2;"));
+        assert!(composite.contains("codec.horizonGetters2 = p3;"));
+        assert!(composite.contains("codec.horizonConstructor = p4;"));
+        // Encoders and decoders write and read `horizonMembers()` in order.
+        let encode = ENCODE_CODEC;
+        let decode = DECODE_CODEC;
+        assert!(encode.contains("for (int i = 1; i <= 8; i++)"));
+        assert!(encode.contains("horizonGetterAt(i).apply(p1)"));
+        assert!(decode.contains("horizonDecodeMembers(p0)"));
         assert_eq!(
             runtime_field_default("", "Lnet/minecraft/network/codec/StreamCodec;", "null"),
-            "new net.minecraft.network.codec.StreamCodec() {}"
+            "new net.minecraft.network.codec.StreamCodec()"
         );
         assert_eq!(
             runtime_field_default("", "Lcom/mojang/serialization/Codec;", "null"),
@@ -10437,13 +11577,11 @@ mod tests {
             ),
             "return horizonId.hashCode();"
         );
+        // A buffer-retyping factory keeps its receiver: the bounded codec
+        // answers for the value it already holds.
         assert_eq!(
-            runtime_body(
-                "net/minecraft/network/codec/StreamCodec",
-                "map",
-                "net.minecraft.network.codec.StreamCodec"
-            ),
-            "return this;"
+            stream_codec_body("cast", "()Lnet/minecraft/network/codec/StreamCodec;").as_deref(),
+            Some("return this;")
         );
         assert_eq!(
             runtime_body(

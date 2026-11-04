@@ -328,14 +328,27 @@ Caused by: java.lang.UnsupportedOperationException: horizon stub: net/minecraft/
 ```
 
 That is the loop working: the class loads, the entrypoint runs, and the first unimplemented game method
-is named with the mod's own file and line under it. The first runtime slice now treats
-`StreamCodec` factories as bootstrap values, returning an empty codec object so static registration can
-rather than the codec factory itself. Codec composition methods (`map`, `mapStream`, `dispatch`, `apply`, `optional`, `nullable`, `cast`, and `tuple`) preserve a non-null receiver, and
+is named with the mod's own file and line under it. The next failure is therefore the next concrete value
+or registry operation the mod reaches, rather than the codec factory itself.
+
+`StreamCodec` is now a working codec over the bounded `FriendlyByteBuf` rather than a placeholder object.
+`StreamCodec.of(encoder, decoder)` keeps the mod's two callbacks, `unit` writes nothing and decodes its
+value, `map` encodes through its `from` and decodes through its `to`, `dispatch` writes the type head and
+then the codec the mod's table answers for it, `recursive` builds its delegate once from the mod's factory,
+and `composite` writes its members in the order they were given, decoding each one and rebuilding the value
+with the mod's constructor function (a `Function` for one member, a `BiFunction` for two, and
+`Function3`… reflectively). The three buffer-callback interfaces (`StreamEncoder`, `StreamDecoder`,
+`StreamMemberEncoder`) are generated from the same slice and are generic, so a mod's lambda infers its
+parameter types. `ByteBufCodecs`' catalogue is real for the primitive pairs, `list`, `optional` and the
+buffer-time `fromCodec` constant, and a payload class compiled against the façade round-trips through all
+of them (`facade::tests::payload_codecs_compile_and_round_trip_through_the_facade`, which generates and
+compiles the façade and then runs the mod's codec probe on a JVM).
+What remains outside the bounded value set stays a shape-only codec: `mapStream`, `cast`, `optional`,
+`nullable` and `tuple` answer the receiver itself, a mod's own anonymous `new StreamCodec<>() { … }` body's
+callbacks are not recovered from its class file (it writes nothing and decodes `null`).
 `CustomPacketPayload.Type` retains its `Identifier` through construction, `id()`, `toString()`, equality,
 and hashing in the native host, so payload registration can compare and log type identities before crossing
-the native network boundary. The next failure
-is therefore the next concrete value or registry operation the mod reaches,
-rather than the codec factory itself.
+the native network boundary.
 
 The live core-plus-Fabric probe has since advanced through façade visibility, stateful `Identifier`
 values, `VarInt` sizing, a Fabric accessor shim, StringRepresentable codecs, data-component builders,

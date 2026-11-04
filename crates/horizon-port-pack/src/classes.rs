@@ -2352,9 +2352,103 @@ pub(crate) mod tests_support {
             self.add(18, &payload)
         }
 
-        /// The class file: `name` extending `superclass`, one public static
-        /// `()V` method per `(name, code)` with a `Code` attribute around
-        /// `code`, and the `BootstrapMethods` its dynamics need.
+        /// The class file: `name` extending `superclass`, `members` declared
+        /// as methods with their own access flags and descriptors (no code),
+        /// and one public static `()V` method per `(name, code)` so a body can
+        /// name the members a façade resolves. A member that also appears in
+        /// the code list is written once, with its body.
+        pub fn build_with_members(
+            &mut self,
+            name: &str,
+            superclass: &str,
+            members: &[(&str, &str, u16)],
+            methods: &[(&str, &[u8])],
+        ) -> Vec<u8> {
+            let declared: Vec<(&str, &str, u16)> = members
+                .iter()
+                .copied()
+                // A code method is written with its body below.
+                .filter(|(member, _, _)| !methods.iter().any(|(code, _)| code == member))
+                .collect();
+            // Every pool entry is added before the header writes the count:
+            // a `class()`/`utf8()` call after that line would be invisible to
+            // the reader and the file would be rejected.
+            let this = self.class(name);
+            let sup = self.class(superclass);
+            let code_attribute = self.utf8("Code");
+            let descriptor = self.utf8("()V");
+            let member_descriptors: Vec<u16> = declared
+                .iter()
+                .map(|(_, descriptor, _)| self.utf8(descriptor))
+                .collect();
+            let member_names: Vec<u16> = declared
+                .iter()
+                .map(|(member, _, _)| self.utf8(member))
+                .collect();
+            let names: Vec<u16> = methods
+                .iter()
+                .map(|(method, _)| self.utf8(method))
+                .collect();
+            let bootstrap_attribute = if self.bootstrap.is_empty() {
+                None
+            } else {
+                Some(self.utf8("BootstrapMethods"))
+            };
+            let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 65];
+            out.extend(((self.entries.len() + 1) as u16).to_be_bytes());
+            for entry in &self.entries {
+                out.extend(entry);
+            }
+            out.extend([0, 0x21]);
+            out.extend(this.to_be_bytes());
+            out.extend(sup.to_be_bytes());
+            out.extend([0, 0]); // interfaces
+            out.extend([0, 0]); // fields
+            // One methods table: the declared members (no code) and the code
+            // methods, under a single count.
+            out.extend(((declared.len() + methods.len()) as u16).to_be_bytes());
+            for (((_, _, access), member), descriptor) in
+                declared.iter().zip(&member_names).zip(&member_descriptors)
+            {
+                out.extend(access.to_be_bytes());
+                out.extend(member.to_be_bytes());
+                out.extend(descriptor.to_be_bytes());
+                out.extend([0, 0]); // attributes
+            }
+            for ((_, code), name) in methods.iter().zip(&names) {
+                out.extend([0, 0x09]); // public static
+                out.extend(name.to_be_bytes());
+                out.extend(descriptor.to_be_bytes());
+                let mut attribute = vec![0, 0, 0, 1]; // max_stack, max_locals
+                attribute.extend((code.len() as u32).to_be_bytes());
+                attribute.extend(*code);
+                attribute.extend([0, 0]); // exception table
+                attribute.extend([0, 0]); // code attributes
+                out.extend([0, 1]);
+                out.extend(code_attribute.to_be_bytes());
+                out.extend((attribute.len() as u32).to_be_bytes());
+                out.extend(attribute);
+            }
+            match bootstrap_attribute {
+                Some(name) => {
+                    out.extend([0, 1]);
+                    out.extend(name.to_be_bytes());
+                    let mut attribute = (self.bootstrap.len() as u16).to_be_bytes().to_vec();
+                    for (handle, arguments) in &self.bootstrap {
+                        attribute.extend(handle.to_be_bytes());
+                        attribute.extend((arguments.len() as u16).to_be_bytes());
+                        for argument in arguments {
+                            attribute.extend(argument.to_be_bytes());
+                        }
+                    }
+                    out.extend((attribute.len() as u32).to_be_bytes());
+                    out.extend(attribute);
+                }
+                None => out.extend([0, 0]),
+            }
+            out
+        }
+
         pub fn build(
             &mut self,
             name: &str,
@@ -3820,5 +3914,70 @@ public-f net.minecraft.world.level.Level method_1 ()V
             field_references(&classes),
             BTreeMap::from([("a/State#count(I)".to_owned(), 4)])
         );
+    }
+
+    /// A jar round trip keeps what `parse` reads: a class built by
+    /// `PoolBuilder` is still the same class once written to a jar and read
+    /// back. A writer and a reader that agreed only with each other would pass
+    /// the scanner's tests and still lose the methods here, and the façade
+    /// would then emit a `minimal()` stub for a class the jar carries.
+    #[test]
+    fn jar_round_trip_keeps_access_flags() {
+        let mut pool = PoolBuilder::default();
+        let _write = pool.method("a/Buf", "writeBoolean", "(Z)La/Buf;");
+        let bytes = pool.build("a/Buf", "java/lang/Object", &[("run", &[])]);
+        let path =
+            std::env::temp_dir().join(format!("horizon-classes-access-{}.jar", std::process::id()));
+        {
+            let file = std::fs::File::create(&path).expect("create the jar");
+            let mut jar = zip::ZipWriter::new(file);
+            jar.start_file("a/Buf.class", zip::write::SimpleFileOptions::default())
+                .expect("start the entry");
+            std::io::Write::write_all(&mut jar, &bytes).expect("write the class");
+            jar.finish().expect("finish the jar");
+        }
+        let classes = read_jar(&path).expect("read the jar");
+        let _ = std::fs::remove_file(&path);
+        let class = classes.iter().find(|c| c.name == "a/Buf").expect("a/Buf");
+        assert!(
+            class.declared.iter().all(|d| d.is_static()),
+            "the fixture's methods are static: {:?}",
+            class
+                .declared
+                .iter()
+                .map(|d| (d.name.as_str(), d.access))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The member-aware writer names each declared member with its own
+    /// descriptor and access flags, which is the shape a façade reads.
+    #[test]
+    fn member_aware_class_files_keep_flags_and_descriptors() {
+        let mut pool = PoolBuilder::default();
+        let bytes = pool.build_with_members(
+            "a/Codecs",
+            "java/lang/Object",
+            &[
+                ("BOOL", "()La/Codec;", 0x0009),
+                ("INT", "()La/Codec;", 0x0009),
+            ],
+            &[],
+        );
+        let class = parse(&bytes).expect("the fixture is a class file");
+        assert_eq!(class.name, "a/Codecs");
+        let declared: Vec<(&str, &str, u16)> = class
+            .declared
+            .iter()
+            .map(|d| (d.name.as_str(), d.descriptor.as_str(), d.access))
+            .collect();
+        assert_eq!(
+            declared,
+            [
+                ("BOOL", "()La/Codec;", 0x0009),
+                ("INT", "()La/Codec;", 0x0009),
+            ]
+        );
+        assert!(class.declared.iter().all(Declared::is_static));
     }
 }
