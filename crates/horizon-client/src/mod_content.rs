@@ -24,7 +24,10 @@ use std::{
     fmt, fs,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// A content mod to put in the root: its id and content.
@@ -212,6 +215,21 @@ fn bounded_ids(mut ids: Vec<String>) -> std::result::Result<Vec<String>, String>
 /// The last [`store_declared_ids`], for a world opening that no longer has
 /// the mods at hand.
 static DECLARED_IDS: Mutex<Option<DeclaredIds>> = Mutex::new(None);
+
+/// Serializes replacement of the process-wide Java declaration stores. A
+/// guest manifest must observe one coherent content root, rather than a mix
+/// of rows from two successive root builds.
+static DECLARED_JAVA_CONTENT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Incremented after all declaration tables are replaced. This is useful for
+/// diagnostics and lets callers identify the content snapshot used for a
+/// network manifest.
+static DECLARED_JAVA_CONTENT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The generation of the current declared Java content snapshot.
+pub fn declared_java_content_epoch() -> u64 {
+    DECLARED_JAVA_CONTENT_EPOCH.load(Ordering::Acquire)
+}
 
 /// Remember what a content root was built from: [`resource_root`] keeps the
 /// mods' declared ids here, so `build_registries` can merge them into the
@@ -477,6 +495,28 @@ pub fn store_declared_entities(mods: &[ContentMod]) {
     *DECLARED_ENTITIES.lock().unwrap_or_else(|e| e.into_inner()) = Some(declared);
 }
 
+/// Replace every process-wide Java declaration table as one operation. The
+/// resource-root builder uses this instead of five independent stores so the
+/// LAN manifest cannot capture a partially refreshed root.
+pub fn store_declared_java_content(mods: &[ContentMod]) {
+    let ids = declared_ids(mods);
+    let extra = declared_extra_ids(mods);
+    let block_entities = declared_block_entity_map(mods);
+    let menus = declared_menu_rows(mods);
+    let entities = declared_entity_rows(mods);
+    let _guard = DECLARED_JAVA_CONTENT_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *DECLARED_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(ids);
+    *DECLARED_EXTRA_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(extra);
+    *DECLARED_BLOCK_ENTITIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(block_entities);
+    *DECLARED_MENUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(menus);
+    *DECLARED_ENTITIES.lock().unwrap_or_else(|e| e.into_inner()) = Some(entities);
+    DECLARED_JAVA_CONTENT_EPOCH.fetch_add(1, Ordering::Release);
+}
+
 /// The entity rows the last content root held, cloned.
 pub fn stored_declared_entities() -> BTreeMap<String, EntityRow> {
     DECLARED_ENTITIES
@@ -484,6 +524,42 @@ pub fn stored_declared_entities() -> BTreeMap<String, EntityRow> {
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_default()
+}
+
+/// Capture every declared Java table under the same replacement lock. This is
+/// the snapshot used by the LAN manifest, so a client never receives ids from
+/// one content root and templates from another.
+pub fn stored_declared_java_content() -> DeclaredJavaContent {
+    let _guard = DECLARED_JAVA_CONTENT_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    DeclaredJavaContent {
+        ids: DECLARED_IDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default(),
+        extra: DECLARED_EXTRA_IDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default(),
+        block_entities: DECLARED_BLOCK_ENTITIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default(),
+        menus: DECLARED_MENUS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default(),
+        entities: DECLARED_ENTITIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default(),
+    }
 }
 
 /// A declared block entity as a remote manifest lists it: one row per block,
@@ -729,6 +805,9 @@ pub fn apply_declared_java_content(
     menus: impl IntoIterator<Item = MenuRow>,
     entities: impl IntoIterator<Item = EntityRow>,
 ) -> std::result::Result<usize, String> {
+    let _guard = DECLARED_JAVA_CONTENT_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let current = DeclaredJavaContent {
         ids: stored_declared_ids(),
         extra: stored_declared_extra_ids(),
@@ -745,6 +824,7 @@ pub fn apply_declared_java_content(
         .unwrap_or_else(|e| e.into_inner()) = Some(merged.block_entities);
     *DECLARED_MENUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged.menus);
     *DECLARED_ENTITIES.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged.entities);
+    DECLARED_JAVA_CONTENT_EPOCH.fetch_add(1, Ordering::Release);
     Ok(count)
 }
 
@@ -752,6 +832,9 @@ pub fn apply_declared_java_content(
 /// start from here.
 #[cfg(test)]
 pub(crate) fn clear_declared_java_content() {
+    let _guard = DECLARED_JAVA_CONTENT_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     *DECLARED_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(DeclaredIds::default());
     *DECLARED_EXTRA_IDS.lock().unwrap_or_else(|e| e.into_inner()) =
         Some(DeclaredExtraIds::default());
@@ -760,6 +843,7 @@ pub(crate) fn clear_declared_java_content() {
         .unwrap_or_else(|e| e.into_inner()) = Some(Default::default());
     *DECLARED_MENUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(Default::default());
     *DECLARED_ENTITIES.lock().unwrap_or_else(|e| e.into_inner()) = Some(Default::default());
+    DECLARED_JAVA_CONTENT_EPOCH.fetch_add(1, Ordering::Release);
 }
 
 /// The declaration for a block, if the last content root had one.
@@ -2568,11 +2652,7 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
 /// 25 s and peaks above 3 GB, more than everything the game keeps.
 pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<PathBuf> {
     if mods.iter().all(|m| m.content.is_empty()) {
-        store_declared_ids(&[]);
-        store_declared_extra_ids(&[]);
-        store_declared_block_entities(&[]);
-        store_declared_menus(&[]);
-        store_declared_entities(&[]);
+        store_declared_java_content(&[]);
         return Ok(base.to_owned());
     }
     let out = cache.join("mod-content");
@@ -2581,22 +2661,14 @@ pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<P
         // A reused root warns as the build did.
         let warnings = fs::read_to_string(out.join(WARNINGS)).unwrap_or_default();
         warnings.lines().for_each(|w| log::warn!("Horizon: {w}"));
-        store_declared_ids(mods);
-        store_declared_extra_ids(mods);
-        store_declared_block_entities(mods);
-        store_declared_menus(mods);
-        store_declared_entities(mods);
+        store_declared_java_content(mods);
         return Ok(out);
     }
     for warning in build(base, mods, &out)? {
         log::warn!("Horizon: {warning}");
     }
     fs::write(out.join(STAMP), stamp)?;
-    store_declared_ids(mods);
-    store_declared_extra_ids(mods);
-    store_declared_block_entities(mods);
-    store_declared_menus(mods);
-    store_declared_entities(mods);
+    store_declared_java_content(mods);
     Ok(out)
 }
 

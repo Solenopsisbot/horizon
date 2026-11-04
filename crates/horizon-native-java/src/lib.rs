@@ -14131,7 +14131,23 @@ fn branch_target_i32(
 fn return_desc(desc: &str) -> &str {
     desc.rsplit_once(')').map_or("V", |(_, ret)| ret)
 }
+
+/// Descriptor argument counts are read at every `invoke*` call site.  Keep a
+/// small thread-local cache so repeated calls through a hot mod callback do
+/// not rescan the same JVM descriptor on every dispatch.  The cache is
+/// intentionally bounded and per-thread: it has no lock on the interpreter's
+/// hot path and cannot retain an unbounded set of optional-mod descriptors.
+const MAX_DESCRIPTOR_COUNT_CACHE: usize = 2048;
+
+thread_local! {
+    static DESCRIPTOR_COUNT_CACHE: RefCell<BTreeMap<String, usize>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
 fn arg_count(desc: &str) -> usize {
+    if let Some(count) = DESCRIPTOR_COUNT_CACHE.with(|cache| cache.borrow().get(desc).copied()) {
+        return count;
+    }
     let Some(end) = desc.find(')') else { return 0 };
     let b = desc.as_bytes();
     let mut i = 1;
@@ -16616,6 +16632,23 @@ fn split_dynamic_captures(captures: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn descriptor_argument_count_cache_is_exact_and_bounded() {
+        DESCRIPTOR_COUNT_CACHE.with(|cache| cache.borrow_mut().clear());
+        assert_eq!(arg_count("(IJLjava/lang/String;[I)V"), 4);
+        assert_eq!(arg_count("()V"), 0);
+
+        for index in 0..(MAX_DESCRIPTOR_COUNT_CACHE + 32) {
+            let descriptor = format!("(Ldemo/Type{index};)V");
+            assert_eq!(arg_count(&descriptor), 1);
+        }
+
+        DESCRIPTOR_COUNT_CACHE.with(|cache| {
+            assert!(cache.borrow().len() <= MAX_DESCRIPTOR_COUNT_CACHE);
+        });
+    }
+
     #[test]
     fn string_format_supports_loader_diagnostic_subset() {
         let mut host = NullHost;

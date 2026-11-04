@@ -80,9 +80,14 @@ impl JavaContentManifest {
     /// The declarations the last content root recorded on this process: what
     /// the host sends, and what a guest would have if it had the mods.
     pub fn from_stored() -> Self {
-        let ids = mod_content::stored_declared_ids();
-        let extra = mod_content::stored_declared_extra_ids();
-        let block_entities = mod_content::stored_declared_block_entities()
+        let mod_content::DeclaredJavaContent {
+            ids,
+            extra,
+            block_entities,
+            menus,
+            entities,
+        } = mod_content::stored_declared_java_content();
+        let block_entities = block_entities
             .into_iter()
             .map(|(block, row)| BlockEntityRow {
                 block,
@@ -101,10 +106,8 @@ impl JavaContentManifest {
             menus: ids.menus,
             block_entity_types: ids.block_entity_types,
             block_entities,
-            menu_rows: mod_content::stored_declared_menus().into_values().collect(),
-            entity_rows: mod_content::stored_declared_entities()
-                .into_values()
-                .collect(),
+            menu_rows: menus.into_values().collect(),
+            entity_rows: entities.into_values().collect(),
         }
     }
 
@@ -797,8 +800,10 @@ mod tests {
         // The stores are process-wide, so start from no declarations.
         mod_content::clear_declared_java_content();
         let manifest = manifest();
+        let epoch_before = mod_content::declared_java_content_epoch();
         let count = manifest.apply().unwrap();
         assert!(count > 0);
+        assert!(mod_content::declared_java_content_epoch() > epoch_before);
         let ids = mod_content::stored_declared_ids();
         assert_eq!(ids.blocks, ["ruby:block"]);
         assert_eq!(ids.items, ["ruby:block", "ruby:gem"]);
