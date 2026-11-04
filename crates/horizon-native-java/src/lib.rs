@@ -12847,8 +12847,8 @@ impl<H: Host> Runtime<'_, H> {
                         0x60 => lhs.checked_add(rhs),
                         0x64 => lhs.checked_sub(rhs),
                         0x68 => lhs.checked_mul(rhs),
-                        0x6c => lhs.checked_div(rhs),
-                        _ => lhs.checked_rem(rhs),
+                        0x6c => java_int_div(lhs, rhs),
+                        _ => java_int_rem(lhs, rhs),
                     }
                     .ok_or_else(|| NativeError::Arithmetic {
                         class: class.to_owned(),
@@ -12863,8 +12863,8 @@ impl<H: Host> Runtime<'_, H> {
                         0x61 => lhs.checked_add(rhs),
                         0x65 => lhs.checked_sub(rhs),
                         0x69 => lhs.checked_mul(rhs),
-                        0x6d => lhs.checked_div(rhs),
-                        _ => lhs.checked_rem(rhs),
+                        0x6d => java_long_div(lhs, rhs),
+                        _ => java_long_rem(lhs, rhs),
                     }
                     .ok_or_else(|| NativeError::Arithmetic {
                         class: class.to_owned(),
@@ -13855,6 +13855,52 @@ fn pop_long(stack: &mut Vec<Value>, class: &str, method: &str) -> Result<i64, Na
         method: method.to_owned(),
         expected: "long",
     })
+}
+
+/// Java integer division differs from Rust's checked division only for the
+/// one overflow pair: `MIN_VALUE / -1` wraps back to `MIN_VALUE`.  A zero
+/// divisor still reports the interpreter's arithmetic error through `None`.
+fn java_int_div(lhs: i32, rhs: i32) -> Option<i32> {
+    if rhs == 0 {
+        None
+    } else if lhs == i32::MIN && rhs == -1 {
+        Some(i32::MIN)
+    } else {
+        lhs.checked_div(rhs)
+    }
+}
+
+/// Java defines the remainder of the overflowing integer division pair as
+/// zero, while a zero divisor remains an error.
+fn java_int_rem(lhs: i32, rhs: i32) -> Option<i32> {
+    if rhs == 0 {
+        None
+    } else if lhs == i32::MIN && rhs == -1 {
+        Some(0)
+    } else {
+        lhs.checked_rem(rhs)
+    }
+}
+
+/// The `long` counterparts of [`java_int_div`] and [`java_int_rem`].
+fn java_long_div(lhs: i64, rhs: i64) -> Option<i64> {
+    if rhs == 0 {
+        None
+    } else if lhs == i64::MIN && rhs == -1 {
+        Some(i64::MIN)
+    } else {
+        lhs.checked_div(rhs)
+    }
+}
+
+fn java_long_rem(lhs: i64, rhs: i64) -> Option<i64> {
+    if rhs == 0 {
+        None
+    } else if lhs == i64::MIN && rhs == -1 {
+        Some(0)
+    } else {
+        lhs.checked_rem(rhs)
+    }
 }
 
 /// Pop a `float`/`double`, which is [`Value::Float`] or an `int`/`long` the
