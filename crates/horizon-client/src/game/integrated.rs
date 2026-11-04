@@ -1055,13 +1055,9 @@ fn server_java_paths(paths: &[PathBuf]) -> std::result::Result<Vec<PathBuf>, Str
     for path in paths {
         let jar = horizon_native_java::NativeJar::from_path(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        let has_server_entrypoint = ["server", "main", "neoforge"]
-            .into_iter()
-            .any(|kind| !jar.discover_entrypoints(kind).is_empty());
-        let has_client_entrypoint = !jar.discover_entrypoints("client").is_empty();
-        if jar.client_side_only || (!has_server_entrypoint && has_client_entrypoint) {
+        if let Some(reason) = server_java_skip_reason(&jar) {
             log::info!(
-                "Horizon: skipping client-only Java mod on integrated server: {}",
+                "Horizon: skipping client-only Java mod on integrated server: {} ({reason})",
                 path.display()
             );
         } else {
@@ -1069,6 +1065,20 @@ fn server_java_paths(paths: &[PathBuf]) -> std::result::Result<Vec<PathBuf>, Str
         }
     }
     Ok(server)
+}
+
+/// Why a jar is valid for the window but has no server-side Java lifecycle.
+/// Keeping this decision separate makes the role filter's diagnostics stable:
+/// metadata and entrypoint-only client jars are distinguishable in the log.
+fn server_java_skip_reason(jar: &horizon_native_java::NativeJar) -> Option<&'static str> {
+    if jar.client_side_only {
+        return Some("clientSideOnly metadata");
+    }
+    let has_server_entrypoint = ["server", "main", "neoforge"]
+        .into_iter()
+        .any(|kind| !jar.discover_entrypoints(kind).is_empty());
+    let has_client_entrypoint = !jar.discover_entrypoints("client").is_empty();
+    (!has_server_entrypoint && has_client_entrypoint).then_some("client entrypoint only")
 }
 
 /// Component oracles supply their own synthetic levels and entity phases.
@@ -1173,6 +1183,34 @@ mod tests {
         let _ = fs::remove_file(client);
         let _ = fs::remove_file(fabric_client);
         let _ = fs::remove_file(server);
+    }
+
+    #[test]
+    fn integrated_loader_explains_each_client_only_reason() {
+        let mut metadata = horizon_native_java::NativeJar::default();
+        metadata.client_side_only = true;
+        assert_eq!(
+            server_java_skip_reason(&metadata),
+            Some("clientSideOnly metadata")
+        );
+
+        let mut client_entrypoint = horizon_native_java::NativeJar::default();
+        client_entrypoint.fabric_entrypoints.insert(
+            "client".into(),
+            vec![horizon_native_java::Entrypoint {
+                class: "demo.Client".into(),
+                method: None,
+                adapter: None,
+            }],
+        );
+        assert_eq!(
+            server_java_skip_reason(&client_entrypoint),
+            Some("client entrypoint only")
+        );
+        assert_eq!(
+            server_java_skip_reason(&horizon_native_java::NativeJar::default()),
+            None
+        );
     }
 
     #[test]
