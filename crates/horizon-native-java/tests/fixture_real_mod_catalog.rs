@@ -693,8 +693,13 @@ version = "1.0"
         // phase. Keep this explicit so a fixture cannot accidentally pass
         // while only the pre tick marker is dispatchable.
         let post_dispatches = host.dispatch_event(Value::Ref(Some("ServerTickEvent.Post".into())));
-        assert_eq!(post_dispatches.len(), 1, "{kind} listener should receive post ticks");
-        jar.execute_dispatch(&post_dispatches[0], &mut host).unwrap();
+        assert_eq!(
+            post_dispatches.len(),
+            1,
+            "{kind} listener should receive post ticks"
+        );
+        jar.execute_dispatch(&post_dispatches[0], &mut host)
+            .unwrap();
         let getenv = host
             .invocations()
             .iter()

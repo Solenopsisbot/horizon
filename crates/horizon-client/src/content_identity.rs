@@ -106,6 +106,7 @@ fn hash_facts(bytes: &[u8]) -> Result<[u8; 32], IdentityError> {
 }
 
 /// The content mods' mob effects in `registries.json`, by network id.
+#[cfg(test)]
 fn mod_effects(bytes: &[u8]) -> Result<Vec<(u64, String)>, IdentityError> {
     let text = std::str::from_utf8(bytes).map_err(|e| IdentityError::Registries(e.to_string()))?;
     let report = horizon_protocol::registry::Builtin::parse(text)
@@ -122,6 +123,7 @@ fn mod_effects(bytes: &[u8]) -> Result<Vec<(u64, String)>, IdentityError> {
 
 /// The block identity extended with the mods' effects; a root without them
 /// keeps its block-only identity.
+#[cfg(test)]
 fn hash_effects(blocks: [u8; 32], effects: &[(u64, String)]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(blocks);
