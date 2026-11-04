@@ -2710,9 +2710,60 @@ impl Host for StdHost {
             }
             ("java/lang/Math", "abs", "(I)I") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
-                value
-                    .checked_abs()
-                    .map(Value::Int)
+                Ok(Value::Int(value.wrapping_abs()))
+            }
+            // Long overloads retain Java's defined MIN_VALUE behaviour: abs
+            // and floorDiv(MIN_VALUE, -1) both return MIN_VALUE rather than
+            // trapping, while addExact still reports overflow.
+            ("java/lang/Math", "abs", "(J)J") => {
+                let value = expect_long(r, Self::argument(r, args, 0)?)?;
+                Ok(long_value(value.wrapping_abs()))
+            }
+            ("java/lang/Math", "max", "(JJ)J") => Ok(long_value(
+                expect_long(r, Self::argument(r, args, 0)?)?
+                    .max(expect_long(r, Self::argument(r, args, 1)?)?),
+            )),
+            ("java/lang/Math", "min", "(JJ)J") => Ok(long_value(
+                expect_long(r, Self::argument(r, args, 0)?)?
+                    .min(expect_long(r, Self::argument(r, args, 1)?)?),
+            )),
+            ("java/lang/Math", "floorDiv", "(JJ)J") => {
+                let left = expect_long(r, Self::argument(r, args, 0)?)?;
+                let right = expect_long(r, Self::argument(r, args, 1)?)?;
+                if right == 0 {
+                    return Err(NativeError::Arithmetic {
+                        class: r.owner.clone(),
+                        method: r.name.clone(),
+                    });
+                }
+                java_floor_div_long(left, right)
+                    .map(long_value)
+                    .ok_or_else(|| NativeError::Arithmetic {
+                        class: r.owner.clone(),
+                        method: r.name.clone(),
+                    })
+            }
+            ("java/lang/Math", "floorMod", "(JJ)J") => {
+                let left = expect_long(r, Self::argument(r, args, 0)?)?;
+                let right = expect_long(r, Self::argument(r, args, 1)?)?;
+                if right == 0 {
+                    return Err(NativeError::Arithmetic {
+                        class: r.owner.clone(),
+                        method: r.name.clone(),
+                    });
+                }
+                java_floor_mod_long(left, right)
+                    .map(long_value)
+                    .ok_or_else(|| NativeError::Arithmetic {
+                        class: r.owner.clone(),
+                        method: r.name.clone(),
+                    })
+            }
+            ("java/lang/Math", "addExact", "(JJ)J") => {
+                let left = expect_long(r, Self::argument(r, args, 0)?)?;
+                let right = expect_long(r, Self::argument(r, args, 1)?)?;
+                left.checked_add(right)
+                    .map(long_value)
                     .ok_or_else(|| NativeError::Arithmetic {
                         class: r.owner.clone(),
                         method: r.name.clone(),
@@ -13901,6 +13952,23 @@ fn java_long_rem(lhs: i64, rhs: i64) -> Option<i64> {
     } else {
         lhs.checked_rem(rhs)
     }
+}
+
+/// Java's long floor division/modulo pair, including the defined
+/// `MIN_VALUE / -1` wraparound and arithmetic wrap in `floorMod`.
+fn java_floor_div_long(lhs: i64, rhs: i64) -> Option<i64> {
+    let quotient = java_long_div(lhs, rhs)?;
+    let remainder = java_long_rem(lhs, rhs)?;
+    Some(if remainder != 0 && (lhs < 0) != (rhs < 0) {
+        quotient.wrapping_sub(1)
+    } else {
+        quotient
+    })
+}
+
+fn java_floor_mod_long(lhs: i64, rhs: i64) -> Option<i64> {
+    let quotient = java_floor_div_long(lhs, rhs)?;
+    Some(lhs.wrapping_sub(quotient.wrapping_mul(rhs)))
 }
 
 /// Pop a `float`/`double`, which is [`Value::Float`] or an `int`/`long` the
