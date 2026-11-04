@@ -61,22 +61,35 @@ impl PayloadLink {
     /// [`MAX_REGISTRATION`].
     pub fn registration(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        let declarations: Vec<&PayloadDeclaration> = self.registry.declarations().collect();
-        out.extend_from_slice(&(declarations.len().min(u16::MAX as usize) as u16).to_be_bytes());
-        for declaration in declarations.into_iter().take(u16::MAX as usize) {
-            out.extend_from_slice(&(declaration.id.len() as u16).to_be_bytes());
-            out.extend_from_slice(declaration.id.as_bytes());
-            out.push(declaration.direction.wire());
+        // Reserve the count until we know how many complete declarations fit.
+        // Truncating a finished buffer can cut a length-prefixed id or codec
+        // in half, making an otherwise valid registry impossible to apply.
+        out.extend_from_slice(&0u16.to_be_bytes());
+        let mut count = 0u16;
+        for declaration in self
+            .registry
+            .declarations()
+            .take(u16::MAX as usize)
+        {
+            let mut encoded = Vec::new();
+            encoded.extend_from_slice(&(declaration.id.len() as u16).to_be_bytes());
+            encoded.extend_from_slice(declaration.id.as_bytes());
+            encoded.push(declaration.direction.wire());
             match &declaration.codec {
                 Some(codec) => {
-                    out.push(1);
-                    out.extend_from_slice(&(codec.len() as u16).to_be_bytes());
-                    out.extend_from_slice(codec.as_bytes());
+                    encoded.push(1);
+                    encoded.extend_from_slice(&(codec.len() as u16).to_be_bytes());
+                    encoded.extend_from_slice(codec.as_bytes());
                 }
-                None => out.push(0),
+                None => encoded.push(0),
             }
+            if out.len() + encoded.len() > MAX_REGISTRATION {
+                break;
+            }
+            out.extend_from_slice(&encoded);
+            count += 1;
         }
-        out.truncate(MAX_REGISTRATION);
+        out[..2].copy_from_slice(&count.to_be_bytes());
         out
     }
 
@@ -470,6 +483,28 @@ mod tests {
         );
         assert_eq!(target.registry().declarations().count(), 2);
         assert!(target.apply_registration(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn registration_cap_keeps_only_complete_declarations() {
+        let mut source_registry = PayloadRegistry::default();
+        for index in 0..4_096 {
+            source_registry
+                .register(declaration(
+                    &format!("demo:channel_{index}"),
+                    PayloadDirection::PlayToServer,
+                    None,
+                ))
+                .unwrap();
+        }
+        let source = PayloadLink::new(source_registry);
+        let encoded = source.registration();
+        assert!(encoded.len() <= MAX_REGISTRATION);
+
+        let mut target = PayloadLink::default();
+        let applied = target.apply_registration(&encoded).unwrap();
+        assert!(applied < 4_096);
+        assert_eq!(target.registry().declarations().count(), applied);
     }
 
     #[test]
