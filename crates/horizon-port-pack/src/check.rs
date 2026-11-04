@@ -9,7 +9,15 @@
 //! - **Partly**: the content ports; the code features listed don't.
 //! - **Doesn't run**: nothing to port (everything it does is Java code), or
 //!   the jar can't be carried at all.
+//!
+//! Beside the report a check writes its provenance (`docs/java-mod-distribution.md`
+//! §5): the record `horizon_mods::java_artifact` keys, made from the jar's bytes
+//! and the versions this check depended on. Nothing reads it to skip a check —
+//! the report is exactly what it was — so the record only says why this answer
+//! belongs to this jar.
 use crate::{carry, classes, jar};
+use horizon_mods::api_level;
+use horizon_mods::java_artifact::{Abi, Format, Provenance, Source};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, io::Read, path::Path};
 
@@ -58,6 +66,10 @@ pub struct Check {
     #[serde(default)]
     pub native: Option<NativeProbe>,
 }
+
+/// The report's provenance file, beside `check.json` in the same folder
+/// ([`provenance`]).
+pub const PROVENANCE: &str = "check.provenance.json";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeProbe {
@@ -215,6 +227,36 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// The report's provenance, written as `check.provenance.json` beside it: the
+/// jar whose bytes it describes, and the versions `horizon-port-pack check`
+/// answers for.
+///
+/// The jar is the input (its own SHA-256, so a swapped jar is a different
+/// artifact). [`Format::new`] takes this crate's IR version; the ABI is the
+/// mod ABI level, and there is no hook level because `check` weaves nothing:
+/// a reader expecting the hook level finds it absent, not borrowed.
+pub fn provenance(jar_path: &Path) -> Result<Provenance, String> {
+    format_provenance(jar_path, abi())
+}
+
+fn abi() -> Abi {
+    Abi {
+        game: horizon_core::version::VERSION_ID.into(),
+        horizon_mod_abi: api_level::LEVEL,
+        native_hooks: None,
+    }
+}
+
+fn format_provenance(jar_path: &Path, abi: Abi) -> Result<Provenance, String> {
+    let source = Source::of_file("jar", jar_path)?;
+    Ok(Provenance::new(
+        "check",
+        Format::new(abi),
+        [source],
+        "check.json",
+    ))
+}
+
 /// Checks `jar` and carries it over into `out/carry/` (`out/check.json`,
 /// `out/carry-report.json` beside it). The carry is the folder mod an
 /// install copies.
@@ -252,6 +294,14 @@ pub fn check(jar_path: &Path, out: &Path) -> Result<Check, String> {
     fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     let done = |check: Check| -> Result<Check, String> {
         crate::pipeline::write_json(&out.join("check.json"), &check)?;
+        // Provenance is beside the report, not part of it: a check that cannot
+        // describe its jar still answers (the report is what the install
+        // reads), so this is logged and not returned.
+        if let Err(e) = provenance(jar_path)
+            .and_then(|record| crate::pipeline::write_json(&out.join(PROVENANCE), &record))
+        {
+            eprintln!("provenance not recorded for {}: {e}", jar_path.display());
+        }
         Ok(check)
     };
     if old_layout(&names) {
@@ -628,5 +678,122 @@ displayName = "Ruby"
         assert_eq!(c.verdict, Verdict::No);
         assert!(c.summary.contains("1.20 or older"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The report is what it was; the record beside it says which jar and
+    /// which versions answered for it.
+    #[test]
+    fn a_check_records_its_provenance_beside_the_report() {
+        let dir = temp("provenance");
+        let path = jar(
+            &dir,
+            &[
+                ("META-INF/neoforge.mods.toml", TOML),
+                (
+                    "assets/ruby/blockstates/ruby_block.json",
+                    br#"{"variants": {"": {"model": "ruby:block/ruby_block"}}}"#,
+                ),
+            ],
+        );
+        let c = check(&path, &dir.join("out")).unwrap();
+        assert_eq!(c.verdict, Verdict::Works, "{c:?}");
+
+        // Exactly the record the crate computes from the jar on disk.
+        let text = fs::read_to_string(dir.join("out").join(PROVENANCE)).unwrap();
+        let record: Provenance = serde_json::from_str(&text).unwrap();
+        assert_eq!(record, provenance(&path).unwrap());
+        assert_eq!(record.report, "check");
+        assert_eq!(record.output, "check.json");
+        // Not inside `check.json`: the report's fields are unchanged.
+        let report = fs::read_to_string(dir.join("out/check.json")).unwrap();
+        assert!(!report.contains("provenance"), "{report}");
+        assert!(!report.contains("\"key\""), "{report}");
+
+        assert_eq!(record.format.abi.game, horizon_core::version::VERSION_ID);
+        assert_eq!(record.format.abi.horizon_mod_abi, api_level::LEVEL);
+        assert_eq!(
+            record.format.ir_version,
+            horizon_mods::java_artifact::IR_VERSION
+        );
+        assert_eq!(
+            record.format.abi.native_hooks, None,
+            "a check weaves nothing"
+        );
+        assert_eq!(record.inputs.len(), 1, "{:?}", record.inputs);
+        assert_eq!(record.inputs[0].kind, "jar");
+        assert_eq!(record.inputs[0].sha256, sha256_of(&path));
+        // Nothing to reuse against a jar that is not this one.
+        assert!(
+            record
+                .check(record.format.clone(), &record.inputs)
+                .is_fresh()
+        );
+        let mut abi = record.format.abi.clone();
+        abi.horizon_mod_abi += 1;
+        assert_eq!(
+            record
+                .check(Format::new(abi), &record.inputs)
+                .reasons()
+                .len(),
+            1
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The record is written for a report that ports nothing too, it holds the
+    /// jar's own bytes, and it is stale for any other jar.
+    #[test]
+    fn a_refused_jar_still_gets_the_provenance_of_the_answer() {
+        let dir = temp("provenance-no");
+        let tile = crate::classes::tests_support::class_file("ruby/A", "java/lang/Object");
+        let path = jar(
+            &dir,
+            &[
+                ("META-INF/neoforge.mods.toml", TOML),
+                ("ruby/A.class", &tile),
+            ],
+        );
+        let c = check(&path, &dir.join("out")).unwrap();
+        assert_eq!(c.verdict, Verdict::No);
+        let record: Provenance =
+            serde_json::from_str(&fs::read_to_string(dir.join("out").join(PROVENANCE)).unwrap())
+                .unwrap();
+        assert_eq!(record.inputs[0].sha256, sha256_of(&path));
+
+        // Another jar — a byte different, and a jar name of its own — does not
+        // reuse this answer.
+        let other = dir.join("n.jar");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.push(0);
+        fs::write(&other, bytes).unwrap();
+        let later = provenance(&other).unwrap();
+        let status = record.check(later.format.clone(), &later.inputs);
+        assert!(!status.is_fresh(), "{status:?}");
+        assert_eq!(
+            status.reasons(),
+            [
+                format!("jar {} left", path.display()),
+                format!("jar {} appeared", other.display()),
+            ]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The key's input is the jar as bytes: a check of the same jar twice is
+    /// one artifact, so a re-check does not invent a new one.
+    #[test]
+    fn the_same_jar_is_the_same_artifact() {
+        let dir = temp("provenance-twice");
+        let path = jar(&dir, &[("META-INF/neoforge.mods.toml", TOML)]);
+        assert_eq!(
+            provenance(&path).unwrap().key,
+            provenance(&path).unwrap().key
+        );
+        assert!(provenance(&dir.join("missing.jar")).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn sha256_of(path: &Path) -> String {
+        horizon_mods::java_artifact::sha256_hex(&fs::read(path).unwrap())
     }
 }

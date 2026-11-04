@@ -220,4 +220,8 @@ A checked jar may include a bounded native Java probe. The Mods page keeps the n
 verdict, and when that probe stops it adds the reason (trimmed to a short, single-line diagnostic) and
 says that the embedded JVM fallback may be needed. This is evidence for compatibility planning; it does
 not execute arbitrary jar code or claim that every Java API is available. The complete check remains in
-`mod-browser/checks-1/<checksum>/check.json` for support reports.
+`mod-browser/checks-1/<checksum>/check.json` for support reports, and the answer's provenance (the jar's
+SHA-256 and the versions it was made against) is in `check.provenance.json` beside it
+([java-mod-distribution.md](java-mod-distribution.md#artifact-keys-horizon_modsjava_artifact)). A cached
+check is reused only when that record still matches its own key; one that was edited, or a folder copied
+under another jar's checksum, is checked again.

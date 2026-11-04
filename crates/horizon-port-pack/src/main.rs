@@ -22,7 +22,9 @@
 //! - `check <jar> <out>`: one mod jar on its own, as the launcher's mod
 //!   browser installs it: carried over into `<out>/carry/`, its classes
 //!   read, and the verdict (Works, Partly, Doesn't run) in
-//!   `<out>/check.json`.
+//!   `<out>/check.json`, with the report's provenance (the jar's SHA-256 and
+//!   the versions it was made against) in `<out>/check.provenance.json`
+//!   (`docs/java-mod-distribution.md` §5).
 //! - `census <jar or folder>... [--out <file>] [--top <n>] [--hooks <file>]`:
 //!   every class, member and Mixin point the jars' code names, ranked
 //!   (`census.json`): what a Java compatibility layer would have to provide
@@ -102,6 +104,12 @@ fn main() -> ExitCode {
                 }
                 for s in &c.skipped {
                     println!("  skipped: {s}");
+                }
+                // The answer's provenance, in the same line shape as the rest:
+                // which jar, against which versions (docs/java-mod-distribution.md §5).
+                match horizon_port_pack::check::provenance(path(1)?) {
+                    Ok(record) => println!("  provenance: {}", record),
+                    Err(e) => println!("  provenance: not recorded ({e})"),
                 }
                 Ok(())
             }

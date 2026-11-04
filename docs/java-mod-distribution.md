@@ -209,11 +209,13 @@ match recorded.check(format, &sources) {
 file is rebuilt with that reason, never reused. Records deserialize with `deny_unknown_fields`, so one from a
 future format is refused rather than read as this one.
 
-What this does **not** do yet: no caller writes or consults a record — `check`, `facade` and the woven set still
-produce what they are asked for at the path they are given, and `horizon-port-pack` has no cache folder. Wiring
-each producer is the remaining step: a `Source` per class read, `Source::of_file("jar", …)` per `--extra`, the JDK
-major as a `Source`, `Format::new` with the versions the build was made from, then publish under the key the way
-`horizon-prepare` does (staged, then renamed so a failed run cannot leave a half-written artifact).
+What this does **not** do yet: no caller uses a record to *skip* work. One caller now writes one —
+`horizon-port-pack check` puts a record beside its report (`check.provenance.json`, the jar as its `jar`
+source, `IR_VERSION`, the game and `horizon_mod_abi_version`, no hook level), and the launcher's check cache
+reuses a report only when the record in the same folder still matches its own key, so a folder copied under
+another jar's checksum is checked again (a folder from before records existed keeps its report). The rest is
+the remaining step: `facade` and the woven set still produce what they are asked for at the path they are
+given, and `horizon-port-pack` has no cache folder.
 
 ## 6. Support and telemetry
 

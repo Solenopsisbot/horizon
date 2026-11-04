@@ -2802,6 +2802,7 @@ dependencies = [
 name = "horizon-port-pack"
 version = "0.1.0"
 dependencies = [
+ "horizon-core",
  "horizon-mods",
  "horizon-native-java",
  "serde",

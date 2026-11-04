@@ -8,6 +8,7 @@
 //! Installing copies the carried-over folder mod into `horizon-mods/<mod id>/` beside
 //! `options.txt` and turns it on in `horizon-mods.txt`, where the game's Options > Mods reads it.
 use super::{installed::Entry, pick, FileRef, Kind, Project, Source, Support, Version};
+use horizon_mods::java_artifact;
 use horizon_port_pack::check::{self, Check, Verdict};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -89,7 +90,21 @@ fn checked_dir(home: &Path, file: &FileRef) -> Option<PathBuf> {
 }
 
 fn read_check(dir: &Path) -> Option<Check> {
-    serde_json::from_str(&fs::read_to_string(dir.join("check.json")).ok()?).ok()
+    let check: Check =
+        serde_json::from_str(&fs::read_to_string(dir.join("check.json")).ok()?).ok()?;
+    // The report describes exact bytes. `check.provenance.json` beside it names
+    // the jar it was made from; a copy of the folder under another jar's
+    // checksum, or a record that no longer matches its own key, is not that
+    // jar's answer, and the jar is checked again. A folder written before
+    // records existed keeps its report.
+    if let Ok(text) = fs::read_to_string(dir.join(check::PROVENANCE)) {
+        let record: Option<java_artifact::Provenance> = serde_json::from_str(&text).ok();
+        let fresh = record.is_some_and(|record| record.derive() == record.key);
+        if !fresh {
+            return None;
+        }
+    }
+    Some(check)
 }
 
 /// The check of `file` if it was made before.
@@ -422,5 +437,84 @@ mod tests {
         );
         assert!(checked_dir(home, &file(None, Some("../../etc"))).is_none());
         assert!(checked_dir(home, &file(None, None)).is_none());
+    }
+
+    /// The report is reused only when the record beside it still describes
+    /// itself. A folder copied under another jar's checksum, or a record edited
+    /// by hand, is checked again; a folder written before records existed keeps
+    /// the answer it has.
+    #[test]
+    fn a_cached_check_is_reused_only_with_a_record_that_describes_it() {
+        let home = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("java-provenance-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let file = FileRef {
+            url: String::new(),
+            name: "a.jar".into(),
+            size: 1,
+            sha512: Some("ab".repeat(64)),
+            sha256: None,
+            sha1: None,
+            primary: true,
+        };
+        let dir = checked_dir(&home, &file).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let check = Check {
+            mod_id: "demo".into(),
+            name: "Demo".into(),
+            version: "1".into(),
+            loader: "fabric".into(),
+            license: "MIT".into(),
+            verdict: Verdict::Works,
+            summary: "Content ports cleanly.".into(),
+            ports: Vec::new(),
+            skipped: Vec::new(),
+            depends: Vec::new(),
+            namespaces: vec!["demo".into()],
+            code: Default::default(),
+            native: None,
+        };
+        fs::write(dir.join("check.json"), serde_json::to_vec(&check).unwrap()).unwrap();
+
+        // Written before records existed: the old behaviour.
+        assert_eq!(cached(&home, &file), Some(check.clone()));
+
+        let record = |abi: u32, output: &str| {
+            java_artifact::Provenance::new(
+                "check",
+                java_artifact::Format::new(java_artifact::Abi {
+                    game: "26.3".into(),
+                    horizon_mod_abi: abi,
+                    native_hooks: None,
+                }),
+                [java_artifact::Source::of_bytes("jar", "a.jar", b"zip")],
+                output,
+            )
+        };
+        let consistent = record(7, "check.json");
+        fs::write(
+            dir.join("check.provenance.json"),
+            serde_json::to_vec(&consistent).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cached(&home, &file), Some(check.clone()));
+
+        // The record's key no longer matches its own contents.
+        let mut edited = consistent.clone();
+        edited.output = "other.json".into();
+        fs::write(
+            dir.join("check.provenance.json"),
+            serde_json::to_vec(&edited).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cached(&home, &file), None);
+
+        // Unreadable, and a record of a future format.
+        for text in ["{", r#"{"report":"check","future":1}"#] {
+            fs::write(dir.join("check.provenance.json"), text).unwrap();
+            assert_eq!(cached(&home, &file), None, "{text}");
+        }
+        fs::remove_dir_all(&home).unwrap();
     }
 }
