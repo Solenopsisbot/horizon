@@ -458,10 +458,17 @@ fn text_fits(text: &str) -> bool {
 }
 
 fn menu_row_fits(row: &MenuRow) -> bool {
+    // Open blocks are canonicalized before encoding and when applying a
+    // remote manifest. Count unique ids here as well, so duplicate entries do
+    // not make an otherwise valid declaration disappear from the stored
+    // template section.
+    let mut open_blocks = row.open_blocks.clone();
+    open_blocks.sort();
+    open_blocks.dedup();
     text_fits(&row.id)
         && text_fits(&row.title)
-        && row.open_blocks.len() <= MAX_DECLARED_OPEN_BLOCKS
-        && row.open_blocks.iter().all(|block| text_fits(block))
+        && open_blocks.len() <= MAX_DECLARED_OPEN_BLOCKS
+        && open_blocks.iter().all(|block| text_fits(block))
 }
 
 fn entity_row_fits(row: &EntityRow) -> bool {
@@ -2867,6 +2874,23 @@ mod declared_ids_tests {
         assert_eq!(entity.template, "minecraft:pig");
         assert!(declared_menu_rows(&[]).is_empty());
         assert!(declared_entity_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn duplicate_menu_open_blocks_do_not_consume_the_bound() {
+        let mut open_blocks: Vec<String> = (0..MAX_DECLARED_OPEN_BLOCKS)
+            .map(|i| format!("ruby:block{i}"))
+            .collect();
+        // The wire representation deduplicates these rows; the declaration
+        // collector must apply the same bound before deciding to keep it.
+        open_blocks.push("ruby:block0".into());
+        let row = MenuRow {
+            id: "ruby:menu".into(),
+            title: "container.ruby.menu".into(),
+            slots: 9,
+            open_blocks,
+        };
+        assert!(menu_row_fits(&row));
     }
 
     #[test]
