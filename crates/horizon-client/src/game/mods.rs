@@ -248,7 +248,11 @@ impl JavaEngine {
             // class, method and program counter; those keep counting as the
             // JVM fallback's, so this is a partial native result.
             Self::NativeQualified
-        } else if report.mixin_unresolved > 0
+        } else if report.mixin_plans > 0
+            // The game path currently records Mixin plans but does not weave
+            // them into Horizon's Rust-owned targets. Keep such jars visibly
+            // qualified until a production hook consumes the plan.
+            || report.mixin_unresolved > 0
             || report.mixin_config_errors > 0
             || !report.opaque_registrations.is_empty()
         {
@@ -2009,6 +2013,11 @@ clientSideOnly = true
             ..clean.clone()
         };
         assert_eq!(unresolved.engine(), JavaEngine::NativeQualified);
+        let planned = JavaCompatibilityReport {
+            mixin_plans: 1,
+            ..clean.clone()
+        };
+        assert_eq!(planned.engine(), JavaEngine::NativeQualified);
         let isolated = isolated_report("/mods/bad.jar", ExecutionRole::Client, "boom");
         assert_eq!(isolated.engine(), JavaEngine::NativeQualified);
 

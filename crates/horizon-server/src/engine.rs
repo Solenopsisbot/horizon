@@ -188,14 +188,19 @@ pub fn check_prepared(resources: &Path) -> Result<(), String> {
                 ("block-tags.json", "block_tags_sha256"),
             ] {
                 let Some(expected) = manifest.get(key).and_then(|v| v.as_str()) else {
+                    problems.push(format!(
+                        "horizon-resources.json is missing {key} (prepare the folder again)"
+                    ));
                     continue;
                 };
-                if let Ok(actual) = sha256_file(&resources.join(name))
-                    && !actual.eq_ignore_ascii_case(expected)
-                {
-                    problems.push(format!(
+                match sha256_file(&resources.join(name)) {
+                    Ok(actual) if !actual.eq_ignore_ascii_case(expected) => problems.push(format!(
                         "{name} is not the file the preparation wrote (checksum differs)"
-                    ));
+                    )),
+                    Err(error) => {
+                        problems.push(format!("{name} checksum could not be read: {error}"))
+                    }
+                    Ok(_) => {}
                 }
             }
         }
@@ -406,6 +411,16 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("block-tags.json"), "{text}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_without_checksums_is_rejected() {
+        let root = prepared_folder("missing-checksum");
+        std::fs::write(root.join("horizon-resources.json"), "{}").unwrap();
+        let text = check_prepared(&root).unwrap_err();
+        assert!(text.contains("missing facts_sha256"), "{text}");
+        assert!(text.contains("missing block_tags_sha256"), "{text}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
