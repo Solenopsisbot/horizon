@@ -181,6 +181,10 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.BlockBehaviour;
 
 public final class FabricCatalogMod implements ModInitializer {
+  private static final class ReflectProbe {
+    private static final String MARKER = "reflection-ok";
+  }
+
   public void onInitialize() {
     Identifier ruby = Identifier.fromNamespaceAndPath("catalog", "ruby");
     Identifier lampId = Identifier.tryParse("catalog:ruby_lamp");
@@ -198,6 +202,13 @@ public final class FabricCatalogMod implements ModInitializer {
     List<ModContainer> all = loader.getAllMods();
     if (self.isPresent() && !all.isEmpty()) {
       loader.isModLoaded("minecraft");
+    }
+    try {
+      Class<?> probe = Class.forName("catalog.FabricCatalogMod$ReflectProbe");
+      String marker = probe.getDeclaredField("MARKER").getName();
+      loader.isModLoaded(marker);
+    } catch (Exception failure) {
+      throw new IllegalStateException(failure);
     }
   }
 }
@@ -229,7 +240,7 @@ public final class FabricCatalogMod implements ModInitializer {
     assert_called!(&host, FABRIC_LOADER, "getInstance", 1);
     assert_called!(&host, FABRIC_LOADER, "getModContainer", 1);
     assert_called!(&host, FABRIC_LOADER, "getAllMods", 1);
-    assert_called!(&host, FABRIC_LOADER, "isModLoaded", 1);
+    assert_called!(&host, FABRIC_LOADER, "isModLoaded", 2);
 
     // Registry ids keep their `namespace:path` shape and the registered values
     // arrive as the constructed content markers.  `args[0]` (the registry
