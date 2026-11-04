@@ -130,12 +130,14 @@ measurement about a jar, not an endorsement; name, author and licence come from 
 
 ## 5. Update and rollback
 
-- **Keys.** The instance's mod set is a SHA-256 over sorted `(id, file SHA-256)` pairs (native builds already key
-  a build this way; Java is planned). A façade's key is the game jar's SHA-256, the generator version, the
-  `--extra` API jars' hashes, the JDK major and `horizon_mod_abi_version` — today `facade` just writes to the
-  output path it is given. A translation and tier key adds the mod set key, the jar's Mixin config set and the
-  check-schema version. Copy `horizon-prepare`'s `.local/exporters/<sha256>` (staged, then published) and the
-  check cache's folder bump, so a smarter check re-checks instead of reusing an old answer.
+- **Keys.** `horizon_port_pack::sha1_hex` / the inventory's sorted `(id, file SHA-256)` pairs key an instance's
+  mod set (native builds already key a build this way; Java is planned). A façade's key is the game jar's SHA-256,
+  the generator version, the `--extra` API jars' hashes, the JDK major and `horizon_mod_abi_version` — today
+  `facade` just writes to the output path it is given. A translation and tier key adds the mod set key, the jar's
+  Mixin config set and the check-schema version. A per-artifact key is now written and tested —
+  `horizon_mods::java_artifact` ([below](#artifact-keys-horizon_modsjava_artifact)); copy `horizon-prepare`'s
+  `.local/exporters/<sha256>` (staged, then published) and the check cache's folder bump, so a smarter check
+  re-checks instead of reusing an old answer.
 - **Invalidation.** A Minecraft version move (26.3 → the next) invalidates every façade, translation and tier;
   since 26.1 the game is unobfuscated, so that is one name table and one rebuild, not a remapper. A loader version
   move invalidates the shim layer and what is keyed on it. A Horizon build move re-tiers only if
@@ -145,6 +147,73 @@ measurement about a jar, not an endorsement; name, author and licence come from 
   by `native_mods::prune`). An update that fails (tier falling to 4, a startup throw, a crash blamed on a mod)
   reverts to the last keyed set and says so, instead of leaving the instance unopenable. Removing a mod removes
   its façade, translation and tier record with it.
+
+### Artifact keys: `horizon_mods::java_artifact`
+
+The per-artifact key the rules above describe is written and tested
+(`crates/horizon-mods/src/java_artifact.rs`). It keys one artifact, not an instance: the check report of one jar,
+one woven class set, one generated façade.
+
+A record (`Provenance`) is written beside an artifact, and its `key` is a SHA-256 over everything else in it:
+
+| Field | What it is | Moves when |
+|---|---|---|
+| `inputs` | one `Source` per class, jar, config or setting the artifact was made from: `kind`, `path`, `sha256` | a class's bytes change, a class is added or removed, a jar is swapped |
+| `format.abi.game` | `horizon_core::version::VERSION_ID` (`"26.3"`), passed in as a string so this crate hard-codes no version | Minecraft moves: every name and shape is regenerated |
+| `format.abi.horizon_mod_abi` | `horizon_mods::api_level::LEVEL`, i.e. `horizon_mod_abi_version` | a mod-API function is added; **not** a UI-only release |
+| `format.abi.native_hooks` | `NATIVE_HOOKS_API`, optional | a hook point is added (woven class sets and shims) |
+| `format.ir_version` | `java_artifact::IR_VERSION` | a smarter check, planner or weaver answers differently for the same bytes |
+| `output` | the artifact's name in its cache folder | a renamed artifact |
+
+The path is hashed with the bytes, so two classes swapping bytes is a different artifact; content is hashed and
+not the envelope, so re-zipping or re-signing a jar of identical classes rebuilds nothing. Inputs are sorted and
+deduplicated, so a caller's listing order cannot change the key. An input whose *absence* the producer acted on
+(a game class the check looked for) is recorded with `Source::absent`, so "not there" keys apart from "not
+recorded".
+
+`Provenance::canonical()` is the record without `key`, as compact JSON with sorted keys — the same bytes Python's
+`json.dumps(sort_keys=True, separators=(",", ":"))` writes, so a tool outside Rust can recompute a key. For
+`example/Mod.class` (bytes `ca fe ba be`), Minecraft 26.3, mod ABI 7, IR 1, output `check.json`:
+
+```json
+{"format":{"abi":{"game":"26.3","horizon_mod_abi":7},"ir_version":1},"inputs":[{"kind":"class","path":"example/Mod.class","sha256":"65ab12a8ff3263fbc257e5ddf0aa563c64573d0bab1f1115b9b107834cfa6971"}],"output":"check.json","report":"check"}
+```
+
+whose key is `e3e8966d1a503288c822e3c2f082b1760744391b33039bf649c8dc1c7ce1680b`. The test
+`a_key_computed_elsewhere_is_the_key_here` pins the shape against a Python-computed document, so the canonical
+form cannot drift from what other tools compute.
+
+Reuse is decided by recomputing, not by trusting the file:
+
+```rust
+use horizon_mods::java_artifact::{Abi, Format, Provenance, Source, Status};
+
+let format = Format::new(Abi {
+    game: "26.3".into(),
+    horizon_mod_abi: 7,
+    native_hooks: None,
+});
+let sources = [Source::of_bytes("class", "example/Mod.class", &class_bytes)];
+match recorded.check(format, &sources) {
+    Status::Fresh => reuse(&recorded),
+    // "rebuild: Horizon mod ABI 7 -> 8", "rebuild: class example/Mod.class changed",
+    // "rebuild: Minecraft 26.3 -> 26.4 (names and shapes regenerated)".
+    status => {
+        log(&status.explain());
+        rebuild(&Provenance::new("check", now, sources, "check.json"));
+    }
+}
+```
+
+`Status::Corrupt` means the record's own `key` does not match its own contents: a hand-edited or half-written
+file is rebuilt with that reason, never reused. Records deserialize with `deny_unknown_fields`, so one from a
+future format is refused rather than read as this one.
+
+What this does **not** do yet: no caller writes or consults a record — `check`, `facade` and the woven set still
+produce what they are asked for at the path they are given, and `horizon-port-pack` has no cache folder. Wiring
+each producer is the remaining step: a `Source` per class read, `Source::of_file("jar", …)` per `--extra`, the JDK
+major as a `Source`, `Format::new` with the versions the build was made from, then publish under the key the way
+`horizon-prepare` does (staged, then renamed so a failed run cannot leave a half-written artifact).
 
 ## 6. Support and telemetry
 
