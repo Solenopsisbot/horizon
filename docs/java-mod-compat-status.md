@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 4 November 2026, commit `d64ee01d6` (verified against NeoForge 26.3.0.101).
+Last checked: 4 November 2026, commit `22d786cdb` (verified against NeoForge 26.3.0.101).
 
 ## Supported now
 
