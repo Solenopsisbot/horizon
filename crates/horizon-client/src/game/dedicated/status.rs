@@ -19,6 +19,8 @@ const TPS_WINDOW: Duration = Duration::from_secs(5);
 const MAX_STATUS_JARS: usize = 8;
 /// The most payload directions one jar lists.
 const MAX_STATUS_ROWS: usize = 12;
+/// The most diagnostic rows (entrypoints and Mixin targets) one jar lists.
+const MAX_STATUS_DIAGNOSTICS: usize = 12;
 /// The most mod ids the `fml` section lists; FML's count stays whole.
 const MAX_FML_IDS: usize = 16;
 /// The most characters of a preflight failure the `fml` section repeats.
@@ -104,6 +106,8 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
         .map(|report| {
             json!({
                 "jar": report.jar.display().to_string(),
+                "id": report.id.as_deref(),
+                "version": report.version.as_deref(),
                 "engine": engine_name(report.engine()),
                 "backend": backend_name(report.engine()),
                 "loader": report.loader.map_or("unknown", loader_name),
@@ -113,6 +117,11 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
                 } else {
                     &report.entrypoint_kind
                 },
+                "declared_entrypoints": report
+                    .declared_entrypoints
+                    .iter()
+                    .take(MAX_STATUS_DIAGNOSTICS)
+                    .collect::<Vec<_>>(),
                 "typed": report.typed_registrations,
                 "opaque": report.opaque_registrations.len(),
                 "promoted": report.promoted.len(),
@@ -123,6 +132,12 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
                 "mixin_unresolved": report.mixin_unresolved,
                 "mixin_configs": report.mixin_configs,
                 "mixin_config_errors": report.mixin_config_errors,
+                "mixin_targets": report
+                    .mixin_targets
+                    .iter()
+                    .take(MAX_STATUS_DIAGNOSTICS)
+                    .collect::<Vec<_>>(),
+                "isolation_failure": report.isolation_failure.as_deref().map(bounded_error),
                 "payload": report
                     .payload_directions
                     .iter()
@@ -136,6 +151,7 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
         "jars": sorted.len(),
         "listed": entries.len(),
         "rejected": sorted.iter().filter(|r| r.client_side_only_rejected).count(),
+        "isolated": sorted.iter().filter(|r| r.isolation_failure.is_some()).count(),
         "engines": engines,
         "backends": backends,
         "typed": count(|r| r.typed_registrations),
@@ -538,6 +554,46 @@ mod tests {
         assert_eq!(section["entries"][0]["executed"], 0);
         assert_eq!(section["host_calls"], 0);
         assert_eq!(section["rejected"], 1);
+        assert_eq!(section["isolated"], 0);
+    }
+
+    #[test]
+    fn java_section_keeps_identity_and_native_failure_diagnostics_bounded() {
+        let mut report = java_report(
+            "/mods/diagnostic.jar",
+            JavaEngine::NativeQualified,
+            1,
+            2,
+            0,
+            (0, 0, 0, 0),
+        );
+        report.id = Some("diagnostic".to_owned());
+        report.version = Some("1.2.3".to_owned());
+        report.declared_entrypoints = (0..MAX_STATUS_DIAGNOSTICS + 2)
+            .map(|i| format!("entrypoint-{i:02}"))
+            .collect();
+        report.mixin_targets = (0..MAX_STATUS_DIAGNOSTICS + 2)
+            .map(|i| format!("Owner#{i:02}()V"))
+            .collect();
+        report.isolation_failure = Some("panic\nwhile invoking entrypoint".to_owned());
+
+        let section = java_section(&[report]);
+        assert_eq!(section["isolated"], 1);
+        let entry = &section["entries"][0];
+        assert_eq!(entry["id"], "diagnostic");
+        assert_eq!(entry["version"], "1.2.3");
+        assert_eq!(
+            entry["declared_entrypoints"].as_array().unwrap().len(),
+            MAX_STATUS_DIAGNOSTICS
+        );
+        assert_eq!(
+            entry["mixin_targets"].as_array().unwrap().len(),
+            MAX_STATUS_DIAGNOSTICS
+        );
+        assert_eq!(
+            entry["isolation_failure"],
+            "panic while invoking entrypoint"
+        );
     }
 
     /// The entry list is bounded; the counts and the work totals are not, so a

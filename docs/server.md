@@ -144,6 +144,10 @@ every OS), the dedicated loop answers `server-status` with TPS, MSPT (average, P
 clock `/tick query` uses), players (name, UUID, address, ping), loaded chunks and uptime. It answers
 `console <line>` with the command's output.
 
+The response's `java` section includes bounded per-jar diagnostics: mod id and version, selected and declared
+entrypoints, native or JVM backend, Mixin targets, and any isolated native failure text. Its aggregate `isolated`
+count remains complete even when the per-jar listing is capped.
+
 **The headless engine** comes after perf-ticks-2's work lands: Resources split into shared and per-game, the
 game built in `Game::new`, the integrated server on its own thread. On that base:
 
