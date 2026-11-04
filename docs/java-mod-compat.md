@@ -1113,6 +1113,49 @@ are ZGC/GenZGC settings, keeping mod code off the render thread except for draw-
 per-mod allocation profile in the census. This is the number to watch; if it cannot be held, the bridge
 stays server-side and client mods stay ports.
 
+### Measuring it
+
+`horizon-jvm --measure` runs the same argv as a **child** process and reports what the first two rows
+need. An embedded JVM in the probing process cannot be timed from outside it, and a measurement that
+shared the prober's memory would not be the player's figure:
+
+```sh
+horizon-jvm --measure --measure-repeat 5 \
+  --entry demo.Example --stubs facade.jar --loader fabric-loader.jar \
+  --libs ~/.minecraft/libraries mods/example.jar
+
+# Machine-readable, for a launcher's compatibility screen or a benchmark row:
+horizon-jvm --measure --json mods/example.jar
+```
+
+The flags and figures:
+
+| Flag | Default | What it bounds |
+|---|---|---|
+| `--measure` | off | Runs the probe in a child and reports instead of running it here |
+| `--measure-repeat <n>` | 1 | Samples (1–20); the report carries each one and the median |
+| `--measure-timeout <secs>` | 120 | Wall-clock ceiling for one sample; past it the child's whole process group is killed |
+| `--measure-sample-ms <ms>` | 5 | How often the child's RSS is sampled |
+
+The report gives `startup_ms` (spawn to the probe's own `jvm up:` line — the moment the JVM exists and
+is running this probe, so it excludes what the mod then does), `total_ms` (to exit), `cpu_ms` (the
+child's own user+system time, from `getrusage`), and `peak_rss_kib`. Peak RSS is the OS high-water mark
+(`VmHWM`) where the platform keeps one after exit — Linux here — and `n/a` elsewhere rather than a
+sampled floor presented as a peak. The discovery step runs in the measuring process first, so a jar that
+cannot be discovered is not measured either.
+
+A sample that exits non-zero **fails** the command, and so does one killed at the bound: a killed
+fixture is not a measurement, and the report always says which happened (`timedOut`, `status`). The same
+run is therefore the bounded-lifecycle check for a fixture — a mod that never returns, or that leaves a
+helper process running, cannot outlive its probe.
+
+On the development machine (Linux, OpenJDK 27, `--measure-repeat 3`, one trivial fixture that allocates
+20k arrays): startup ≈ 0.6–1.2 s, total ≈ 0.6–1.2 s, CPU ≈ 2.1–2.9 s, peak RSS ≈ 53–56 MB. The spread
+is the machine's load, which is the point of taking the median of several samples. That is a bare JVM
+with no façade and no game jar, against the ≤ 400 ms target above — which is why the target is a number
+to reach, not a claim already met. Numbers move with the JVM, the heap flag (`--heap`, default `-Xmx1g`)
+and the classpath, so compare like with like, and record the machine alongside the figure.
+
 ## Trust
 
 A bridged jar is third-party code the registry never reviewed, running with the player's rights. That is

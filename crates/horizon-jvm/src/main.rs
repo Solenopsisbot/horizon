@@ -399,7 +399,7 @@ fn main() -> ExitCode {
 }
 
 /// The usage line, kept as data so a test can check the kinds it names.
-const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] <jar>...";
+const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] [--measure [--measure-timeout <secs>] [--measure-sample-ms <ms>] [--measure-repeat <n>]] <jar>...";
 
 /// The FML listing/report flags, removed from the jar list before anything is
 /// resolved. `--fml-list` is the short spelling of `--list-fml-mods`.
@@ -425,6 +425,10 @@ fn take_flag(args: &mut Vec<String>, names: &[&str]) -> bool {
 
 fn run() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // A measured child is sent the recursive spelling instead of `--measure`.
+    // Stripping it here makes the child take the normal path, exactly as the
+    // measuring process would have.
+    take_recursive_flag(&mut args);
     let list_entrypoints_only = args.iter().any(|arg| arg == "--list-entrypoints");
     args.retain(|arg| arg != "--list-entrypoints");
     let list_mixin_configs_only = args.iter().any(|arg| arg == "--list-mixin-configs");
@@ -441,6 +445,9 @@ fn run() -> Result<(), String> {
     args.retain(|arg| arg != "--real-loader");
     let game_provider = take_game_provider_args(&mut args)?;
     let provider_report = take_flag(&mut args, &["--provider-report"]);
+    // A measurement runs the probe's own discovery first (so the fixture must
+    // be discoverable here too) and then times that same argv in a child.
+    let measure = take_measure_args(&mut args)?;
     let fml_flags = take_fml_flags(&mut args);
     let mixin_config_args = take_all(&mut args, "--mixin-config");
     let entry = take(&mut args, "--entry");
@@ -566,6 +573,19 @@ fn run() -> Result<(), String> {
     }
     if classpath.is_empty() {
         return Err("no classpath".to_owned());
+    }
+    // A measurement is a report about a child process, so it cannot run after
+    // this process owns an embedded JVM. The probe's own discovery above has
+    // already run (a jar it cannot discover is not measured either); the child
+    // times this same argv with only the measurement flag removed, and takes
+    // the normal path because this branch then sees no flag.
+    if let Some(measure) = measure {
+        let plan = measure_plan(
+            measure,
+            std::env::args_os().skip(1).collect(),
+            &entry_label(&entry_specs, &entry_kind),
+        );
+        return report_measure(&plan);
     }
     let nested = expand_nested_jars(&mut classpath)?;
     if let Some(bridge) = nested.compile_loader_bridge() {
@@ -2465,6 +2485,603 @@ fn bound_text(text: &str, limit: usize) -> String {
         end -= 1;
     }
     format!("{}{MARKER}", &text[..end])
+}
+
+// ---- Startup measurement (`--measure`) -----------------------------------
+//
+// The design page's performance budget (`docs/java-mod-compat.md`) sets a JVM
+// start time and a base memory figure, and phase 1 replaces them with numbers.
+// This is how a number is taken: the probe runs one representative fixture as
+// a *child* process (the embedded JVM in this process cannot be timed from
+// outside), and reports wall time to JVM-up and to the end, the child's CPU
+// time, and its peak RSS where the OS keeps one. The same run is what proves a
+// fixture is bounded: every sample is one child under one deadline, and a
+// sample that fails or is killed fails the command instead of reporting a
+// number for something that did not finish.
+
+/// The measurement's own defaults. A fixture is expected to finish far inside
+/// the timeout; one that does not is killed with its whole process group.
+const DEFAULT_MEASURE_TIMEOUT: f64 = 120.0;
+const DEFAULT_MEASURE_SAMPLE_MS: u64 = 5;
+const DEFAULT_MEASURE_REPEAT: usize = 1;
+const MAX_MEASURE_REPEAT: usize = 20;
+const MAX_MEASURE_TIMEOUT_SECS: f64 = 86_400.0;
+/// The sampler keeps `VmHWM`/`VmRSS` in KiB; a JVM larger than this is not a
+/// measurement, it is a runaway.
+const MAX_MEASURE_RSS_KIB: u64 = 1 << 26;
+
+/// What a measured child receives instead of `--measure`: it strips the flag
+/// and runs normally, so measuring twice in one process cannot happen.
+const RECURSIVE_MEASURE_FLAG: &str = "--measure-recursive";
+/// How deep in a measurement chain this process is; the spawn path refuses to
+/// go past [`MAX_MEASURE_DEPTH`].
+const MEASURE_RECURSION_ENV: &str = "HORIZON_JVM_MEASURE_DEPTH";
+const MAX_MEASURE_DEPTH: u32 = 3;
+
+/// The probe's own line once the JVM exists, which is where "startup" ends. A
+/// measurement without this line has no startup figure to report.
+const JVM_UP_MARKER: &str = "jvm up:";
+
+/// The `--measure*` flags, removed from the jar list before anything is resolved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MeasureArgs {
+    timeout_secs: f64,
+    sample_ms: u64,
+    repeat: usize,
+}
+
+/// Parse and remove `--measure [--measure-timeout <secs>] [--measure-sample-ms
+/// <ms>] [--measure-repeat <n>]`. Without `--measure`, the tuning flags are an
+/// error: silently ignoring them would measure nothing and say so.
+fn take_measure_args(args: &mut Vec<String>) -> Result<Option<MeasureArgs>, String> {
+    let enabled = take_flag(args, &["--measure"]);
+    // `--flag=value` is the other spelling this tool's neighbours accept.
+    let mut timeout = None;
+    let mut sample_ms = None;
+    let mut repeat = None;
+    let mut plain = Vec::with_capacity(args.len());
+    {
+        let mut iter = std::mem::take(args).into_iter();
+        while let Some(arg) = iter.next() {
+            let (name, inline) = arg.split_once('=').unwrap_or((&arg, ""));
+            let slot = match name {
+                "--measure-timeout" => &mut timeout,
+                "--measure-sample-ms" => &mut sample_ms,
+                "--measure-repeat" => &mut repeat,
+                _ => {
+                    plain.push(arg);
+                    continue;
+                }
+            };
+            let value = if inline.is_empty() {
+                iter.next().ok_or_else(|| format!("{name} needs a value"))?
+            } else {
+                inline.to_owned()
+            };
+            *slot = Some(value);
+        }
+    }
+    *args = plain;
+    if !enabled {
+        if timeout.is_some() || sample_ms.is_some() || repeat.is_some() {
+            return Err(
+                "--measure-timeout/--measure-sample-ms/--measure-repeat need --measure".into(),
+            );
+        }
+        return Ok(None);
+    }
+    let timeout_secs = match timeout {
+        Some(value) => value
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value > 0.0 && *value <= MAX_MEASURE_TIMEOUT_SECS)
+            .ok_or_else(|| {
+                format!("--measure-timeout: {value} is not a positive number of seconds")
+            })?,
+        None => DEFAULT_MEASURE_TIMEOUT,
+    };
+    let sample_ms = match sample_ms {
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                format!("--measure-sample-ms: {value} is not a positive whole number")
+            })?,
+        None => DEFAULT_MEASURE_SAMPLE_MS,
+    };
+    let repeat = match repeat {
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| (1..=MAX_MEASURE_REPEAT).contains(value))
+            .ok_or_else(|| {
+                format!("--measure-repeat: {value} is not between 1 and {MAX_MEASURE_REPEAT}")
+            })?,
+        None => DEFAULT_MEASURE_REPEAT,
+    };
+    Ok(Some(MeasureArgs {
+        timeout_secs,
+        sample_ms,
+        repeat,
+    }))
+}
+
+/// The argv a measured child receives: this probe's own invocation with the
+/// measurement flag replaced by its recursive spelling and the tuning flags
+/// removed *with their values*, so the child runs this probe normally.
+fn measure_child_args(argv: &[OsString]) -> Vec<OsString> {
+    let mut child = Vec::with_capacity(argv.len());
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        match arg.to_str() {
+            Some("--measure") => child.push(OsString::from(RECURSIVE_MEASURE_FLAG)),
+            Some(flag) if flag.starts_with("--measure-") && !flag.contains('=') => {
+                // The value is the next argument (the parser above required it).
+                let _ = iter.next();
+            }
+            Some(flag) if flag.starts_with("--measure-") => {}
+            _ => child.push(arg.clone()),
+        }
+    }
+    child
+}
+
+/// The environment marker for the child, refusing to recurse past the bound.
+/// A finite plan's child must itself be bounded: the child's own default
+/// measurement could not be entered, so the run would be unbounded again.
+/// How many measurement processes deep this one already is, and the refusal to
+/// go deeper. The child is a copy of this probe, so an unbounded chain would
+/// fork forever if a child ever kept the flag; the marker makes that a named
+/// error instead.
+fn measurement_depth() -> Result<u32, String> {
+    let depth = std::env::var(MEASURE_RECURSION_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    if depth >= MAX_MEASURE_DEPTH {
+        return Err(format!(
+            "measurement chain stopped at depth {MAX_MEASURE_DEPTH}: {RECURSIVE_MEASURE_FLAG} reached a probe that was already measuring"
+        ));
+    }
+    Ok(depth + 1)
+}
+
+/// Remove the recursive flag from the child's argv, so the child runs normally.
+fn take_recursive_flag(args: &mut Vec<String>) -> bool {
+    take_flag(args, &[RECURSIVE_MEASURE_FLAG])
+}
+
+/// One measurement invocation: how many times, how long a bound, how often to
+/// sample, and the argv the child runs.
+#[derive(Debug, Clone, PartialEq)]
+struct MeasurePlan {
+    label: String,
+    argv: Vec<OsString>,
+    timeout: std::time::Duration,
+    sample: std::time::Duration,
+    repeat: usize,
+}
+
+fn measure_plan(args: MeasureArgs, argv: Vec<OsString>, label: &str) -> MeasurePlan {
+    MeasurePlan {
+        label: label.to_owned(),
+        argv: measure_child_args(&argv),
+        timeout: std::time::Duration::from_secs_f64(args.timeout_secs),
+        sample: std::time::Duration::from_millis(args.sample_ms),
+        repeat: args.repeat,
+    }
+}
+
+/// The program the measured child is: this binary, which the OS already told us.
+fn current_program() -> Result<PathBuf, String> {
+    std::env::current_exe().map_err(|e| format!("this probe's own path: {e}"))
+}
+
+/// Run every sample, print the report, and fail the probe when any sample did
+/// not finish cleanly (a killed fixture is not a measurement).
+fn report_measure(plan: &MeasurePlan) -> Result<(), String> {
+    let program = current_program()?;
+    let mut runs = Vec::with_capacity(plan.repeat);
+    for _ in 0..plan.repeat {
+        let run = run_measured_child(&program, &plan.argv, plan.timeout, plan.sample)?;
+        // A run that printed no `jvm up:` never had a JVM to measure; naming
+        // that here is clearer than a blank startup figure downstream.
+        if run.startup_ms.is_none() && !run.timed_out {
+            eprintln!(
+                "horizon-jvm: the measured probe printed no `{JVM_UP_MARKER}` line; startup time is n/a"
+            );
+        }
+        runs.push(run);
+    }
+    let report = MeasureReport {
+        label: plan.label.clone(),
+        runs,
+    };
+    if std::env::args_os().any(|arg| arg == "--json") {
+        println!("{}", report.json());
+    } else {
+        print!("{}", report.text());
+    }
+    if report.succeeded() {
+        return Ok(());
+    }
+    let killed = report.runs.iter().filter(|run| run.timed_out).count();
+    if killed > 0 {
+        return Err(format!(
+            "measurement bound ({:.3}s) reached; the probe was killed {} time(s)",
+            plan.timeout.as_secs_f64(),
+            killed
+        ));
+    }
+    // A failed sample is not a measurement, and the child's own error is the
+    // only useful thing to say about it.
+    let reason = report
+        .runs
+        .iter()
+        .find(|run| !run.measured())
+        .map(|run| first_fml_error_line(&run.stderr, ""))
+        .unwrap_or_else(|| "no output".to_owned());
+    Err(format!(
+        "the measured probe exited unsuccessfully: {reason}"
+    ))
+}
+
+/// A label for what was measured: the entrypoints, or the kind when the run
+/// discovers its own (a `neoforge` constructor run, `--real-loader`).
+fn entry_label(entries: &[String], kind: &str) -> String {
+    match entries {
+        [] => format!("{kind} (discovered at runtime)"),
+        [one] => one.clone(),
+        _ => format!("{} {kind} entrypoint(s)", entries.len()),
+    }
+}
+
+/// One `VmHWM`/`VmRSS` read of a process, in KiB.
+fn read_vm(status: &str, key: &str) -> Option<u64> {
+    let line = status.lines().find(|line| line.starts_with(key))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The high-water mark of a process's resident set in KiB. Linux records it in
+/// `VmHWM` and it survives the process, so it is the figure to compare; macOS
+/// and Windows have no equivalent kept after exit, and report `None`.
+fn peak_rss_kib(status: &str) -> Option<u64> {
+    read_vm(status, "VmHWM:").filter(|kib| *kib <= MAX_MEASURE_RSS_KIB)
+}
+
+/// The current resident set in KiB, for a sampler that runs while the child lives.
+fn current_rss_kib(status: &str) -> Option<u64> {
+    read_vm(status, "VmRSS:").filter(|kib| *kib <= MAX_MEASURE_RSS_KIB)
+}
+
+/// Everything one measured child produced.
+#[derive(Debug, Clone, PartialEq)]
+struct MeasureRun {
+    /// Wall time to the `jvm up:` line, in milliseconds; `None` when the child
+    /// never printed one (it failed before the JVM was up).
+    startup_ms: Option<f64>,
+    /// Wall time to the child's exit, in milliseconds.
+    total_ms: f64,
+    /// The child's own user+system CPU time, in milliseconds, where the OS
+    /// reports it for a waited child.
+    cpu_ms: Option<f64>,
+    peak_rss_kib: Option<u64>,
+    success: bool,
+    timed_out: bool,
+    truncated: bool,
+    /// The child's stderr, kept only to explain a failed run.
+    stderr: String,
+}
+
+impl MeasureRun {
+    /// The child ran to a clean exit: the only case that is a measurement.
+    fn measured(&self) -> bool {
+        self.success && !self.timed_out
+    }
+}
+
+const MAX_MEASURE_REPORT_BYTES: usize = 64 * 1024;
+
+/// Number of runs plus the summary the report carries.
+#[derive(Debug, Clone, PartialEq)]
+struct MeasureReport {
+    label: String,
+    runs: Vec<MeasureRun>,
+}
+
+impl MeasureReport {
+    fn median(&self, figure: impl Fn(&MeasureRun) -> Option<f64>) -> Option<f64> {
+        let mut values: Vec<f64> = self.runs.iter().filter_map(figure).collect();
+        if values.is_empty() {
+            return None;
+        }
+        values.sort_by(f64::total_cmp);
+        let middle = values.len() / 2;
+        Some(if values.len() % 2 == 0 {
+            (values[middle - 1] + values[middle]) / 2.0
+        } else {
+            values[middle]
+        })
+    }
+
+    fn succeeded(&self) -> bool {
+        !self.runs.is_empty() && self.runs.iter().all(MeasureRun::measured)
+    }
+
+    fn text(&self) -> String {
+        let figure = |value: Option<f64>| {
+            value.map_or_else(|| "n/a".to_owned(), |value| format!("{value:.3}"))
+        };
+        let mut lines = vec![
+            format!("measure: entry {}", self.label),
+            format!("measure: {} run(s)", self.runs.len()),
+        ];
+        for (index, run) in self.runs.iter().enumerate() {
+            lines.push(format!(
+                "measure: run{index} startup_ms={} total_ms={:.3} cpu_ms={} peak_rss_kib={} status={}{}{}",
+                figure(run.startup_ms),
+                run.total_ms,
+                figure(run.cpu_ms),
+                run.peak_rss_kib
+                    .map_or_else(|| "n/a".to_owned(), |kib| kib.to_string()),
+                if run.measured() { "ok" } else { "failed" },
+                if run.timed_out { " (killed at the bound)" } else { "" },
+                // The figures above stay valid: only the child's own output was
+                // capped, after the marker that fixes the startup time.
+                if run.truncated { " (output truncated)" } else { "" },
+            ));
+        }
+        for (name, median) in [
+            ("startup_ms", self.median(|run| run.startup_ms)),
+            ("total_ms", self.median(|run| Some(run.total_ms))),
+            ("cpu_ms", self.median(|run| run.cpu_ms)),
+            (
+                "peak_rss_kib",
+                self.median(|run| run.peak_rss_kib.map(|kib| kib as f64))
+                    .map(|value| value.round()),
+            ),
+        ] {
+            lines.push(format!("measure: median_{name}={}", figure(median)));
+        }
+        // Bounded like every other report this probe prints.
+        bound_text(&(lines.join("\n") + "\n"), MAX_MEASURE_REPORT_BYTES)
+    }
+
+    fn json(&self) -> String {
+        serde_json::json!({
+            "entry": self.label,
+            "runs": self.runs.len(),
+            "status": if self.succeeded() { "ok" } else { "failed" },
+            "medianStartupMs": self.median(|run| run.startup_ms),
+            "medianTotalMs": self.median(|run| Some(run.total_ms)),
+            "medianCpuMs": self.median(|run| run.cpu_ms),
+            "medianPeakRssKiB": self.median(|run| run.peak_rss_kib.map(|kib| kib as f64)),
+            "samples": self.runs.iter().map(|run| {
+                serde_json::json!({
+                    "startupMs": run.startup_ms,
+                    "totalMs": run.total_ms,
+                    "cpuMs": run.cpu_ms,
+                    "peakRssKiB": run.peak_rss_kib,
+                    "status": if run.success { "ok" } else { "failed" },
+                    "timedOut": run.timed_out,
+                    "truncated": run.truncated,
+                })
+            }).collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+}
+
+/// Time one child to exit, sampling its RSS until it does. A child past
+/// `timeout` is killed with its whole process tree and reported as timed out.
+fn run_measured_child(
+    program: &Path,
+    argv: &[OsString],
+    timeout: std::time::Duration,
+    sample: std::time::Duration,
+) -> Result<MeasureRun, String> {
+    use std::{
+        io::BufRead,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Instant,
+    };
+
+    let mut command = Command::new(program);
+    command
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Replace, not append: a probe launched from a measuring probe (a
+        // future nested run) must not inherit two copies of the marker.
+        .env_remove(MEASURE_RECURSION_ENV)
+        .env(MEASURE_RECURSION_ENV, measurement_depth()?.to_string());
+    // A killed JVM leaves children behind on Linux; a fresh process group lets
+    // the kill reach all of them and keeps this process's signals out of it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let start = Instant::now();
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("could not start {}: {e}", program.display()))?;
+
+    // `jvm up:` is the probe's own first line after the JVM exists, and its
+    // time is taken when that line arrives, not when the stream ends. The
+    // reader keeps at most `MAX_FML_OUTPUT_BYTES` and drains the rest, so a
+    // chatty fixture cannot block on a full pipe or grow this process.
+    let startup = Arc::new(Mutex::new(None::<f64>));
+    let truncated = Arc::new(AtomicBool::new(false));
+    let watcher = Arc::clone(&startup);
+    let over = Arc::clone(&truncated);
+    let stdout = child.stdout.take().map(|reader| {
+        std::thread::spawn(move || {
+            let mut kept = 0usize;
+            for line in std::io::BufReader::new(reader).lines() {
+                let Ok(line) = line else { break };
+                if line.contains(JVM_UP_MARKER)
+                    && let Ok(mut slot) = watcher.lock()
+                {
+                    slot.get_or_insert(start.elapsed().as_secs_f64() * 1000.0);
+                }
+                if kept <= MAX_FML_OUTPUT_BYTES {
+                    kept += line.len() + 1;
+                } else {
+                    over.store(true, Ordering::Relaxed);
+                }
+                // The line itself is dropped on the next iteration; only its
+                // length was ever counted, so nothing accumulates here.
+            }
+        })
+    });
+    let stderr_over = Arc::clone(&truncated);
+    let stderr_text = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&stderr_text);
+    let stderr = child.stderr.take().map(|reader| {
+        std::thread::spawn(move || match read_bounded(reader, MAX_FML_STDERR_BYTES) {
+            Ok((text, was_truncated)) => {
+                if was_truncated {
+                    stderr_over.store(true, Ordering::Relaxed);
+                }
+                if let Ok(mut sink) = sink.lock() {
+                    *sink = text;
+                }
+            }
+            Err(_) => stderr_over.store(true, Ordering::Relaxed),
+        })
+    });
+
+    let outcome = supervise(&mut child, start, timeout, sample);
+    for reader in [stdout, stderr].into_iter().flatten() {
+        let _ = reader.join();
+    }
+    let (status, sampled_peak, cpu_ms) = outcome?;
+    let startup_ms = *startup
+        .lock()
+        .map_err(|_| "measure start time".to_owned())?;
+    let stderr_text = stderr_text
+        .lock()
+        .map(|text| text.clone())
+        .unwrap_or_default();
+    Ok(MeasureRun {
+        startup_ms,
+        total_ms: start.elapsed().as_secs_f64() * 1000.0,
+        cpu_ms,
+        peak_rss_kib: sampled_peak,
+        success: status.is_some_and(|status| status.success()),
+        timed_out: status.is_none(),
+        truncated: truncated.load(Ordering::Relaxed),
+        stderr: stderr_text,
+    })
+}
+
+/// Wait for `child` with a bound while sampling its RSS; returns the exit
+/// status (`None` when the bound was hit and the child was killed), the peak
+/// RSS in KiB, and the child's own CPU time in milliseconds.
+fn supervise(
+    child: &mut std::process::Child,
+    start: std::time::Instant,
+    timeout: std::time::Duration,
+    sample: std::time::Duration,
+) -> Result<(Option<std::process::ExitStatus>, Option<u64>, Option<f64>), String> {
+    let pid = child.id();
+    // `RUSAGE_CHILDREN` is cumulative over every child this process reaped, so
+    // each run's own CPU time is the difference around this one.
+    let cpu_before = children_cpu_ms();
+    let mut peak = None;
+    let mut status = None;
+    loop {
+        match child
+            .try_wait()
+            .map_err(|e| format!("waiting for the probe: {e}"))?
+        {
+            Some(waited) => {
+                status = Some(waited);
+                break;
+            }
+            None => {
+                let now = start.elapsed();
+                if now >= timeout {
+                    kill_tree(child);
+                    // A killed child is reaped here, so no zombie outlives it.
+                    let _ = child.wait();
+                    break;
+                }
+                if let Some(kib) = process_status(pid).as_deref().and_then(current_rss_kib) {
+                    peak = Some(peak.map_or(kib, |seen: u64| seen.max(kib)));
+                }
+                // Never sleep past the deadline: a short timeout must fire on
+                // time even when the sample interval is longer.
+                let nap = sample.min(timeout - now);
+                std::thread::sleep(nap.max(std::time::Duration::from_millis(1)));
+            }
+        }
+    }
+    // The OS keeps the high-water mark even after the child is gone, and it is
+    // exact where sampling can miss a spike; it wins whenever it is readable.
+    let peak = process_status(pid)
+        .as_deref()
+        .and_then(peak_rss_kib)
+        .or(peak);
+    let cpu_ms = match (cpu_before, children_cpu_ms()) {
+        (Some(before), Some(after)) => Some((after - before).max(0.0)),
+        _ => None,
+    };
+    Ok((status, peak, cpu_ms))
+}
+
+/// A process's `/proc/<pid>/status`, on Linux; `None` elsewhere.
+fn process_status(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/status")).ok()
+}
+
+/// Kill a child and everything that shares its process group.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // The child leads its own group (`process_group(0)` above), so its
+        // group id is its pid, and the negative form names the group rather
+        // than the process: a mod's own `java`/helper children go with it.
+        let group = child.id() as libc::pid_t;
+        // SAFETY: `kill` takes a plain integer id and a signal number; a
+        // vanished group returns ESRCH, which is the "already gone" answer.
+        let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+}
+
+/// The CPU time of children this process has reaped, in milliseconds.
+///
+/// `getrusage(RUSAGE_CHILDREN)` is cumulative, so a caller takes it before and
+/// after the run and subtracts; that is why one `--measure` run times exactly
+/// one child probe process: every sample, and every repeat, gets its own.
+#[cfg(unix)]
+fn children_cpu_ms() -> Option<f64> {
+    // SAFETY: `getrusage` writes only into the `rusage` it is given, which is
+    // a live local; `RUSAGE_CHILDREN` needs no other setup.
+    let usage = unsafe {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        if libc::getrusage(libc::RUSAGE_CHILDREN, usage.as_mut_ptr()) != 0 {
+            return None;
+        }
+        usage.assume_init()
+    };
+    let seconds = usage.ru_utime.tv_sec as f64
+        + usage.ru_utime.tv_usec as f64 / 1e6
+        + usage.ru_stime.tv_sec as f64
+        + usage.ru_stime.tv_usec as f64 / 1e6;
+    Some(seconds * 1000.0)
+}
+
+#[cfg(not(unix))]
+fn children_cpu_ms() -> Option<f64> {
+    None
 }
 
 struct FmlCapture {
@@ -6351,5 +6968,210 @@ mod fml_probe_tests {
             ]
         );
         let _ = fs::remove_dir_all(Path::new(&root));
+    }
+}
+
+/// The measurement flags, the child argv they produce, and the figures they
+/// report, all without starting a JVM.
+#[cfg(test)]
+mod measure_tests {
+    use super::{
+        DEFAULT_MEASURE_REPEAT, DEFAULT_MEASURE_SAMPLE_MS, DEFAULT_MEASURE_TIMEOUT,
+        MAX_MEASURE_REPEAT, MeasureArgs, MeasureReport, MeasureRun, current_rss_kib, entry_label,
+        measure_child_args, peak_rss_kib, take_measure_args, take_recursive_flag,
+    };
+    use std::{ffi::OsString, time::Duration};
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn run(status: &str, startup: Option<f64>, total: f64) -> MeasureRun {
+        MeasureRun {
+            startup_ms: startup,
+            total_ms: total,
+            cpu_ms: Some(total / 2.0),
+            peak_rss_kib: Some(2048),
+            success: status == "ok",
+            timed_out: status == "killed",
+            truncated: false,
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn takes_the_measurement_flags_and_their_values_out_of_the_jar_list() {
+        let mut args = strings(&[
+            "--measure",
+            "--measure-timeout",
+            "30",
+            "--measure-repeat=4",
+            "--measure-sample-ms",
+            "2",
+            "a.jar",
+            "b.jar",
+        ]);
+        let parsed = take_measure_args(&mut args).unwrap().unwrap();
+        assert_eq!(args, strings(&["a.jar", "b.jar"]));
+        assert_eq!(
+            parsed,
+            MeasureArgs {
+                timeout_secs: 30.0,
+                sample_ms: 2,
+                repeat: 4,
+            }
+        );
+        // The defaults, when only `--measure` is given.
+        let mut args = strings(&["--measure", "a.jar"]);
+        let parsed = take_measure_args(&mut args).unwrap().unwrap();
+        assert_eq!(parsed.timeout_secs, DEFAULT_MEASURE_TIMEOUT);
+        assert_eq!(parsed.sample_ms, DEFAULT_MEASURE_SAMPLE_MS);
+        assert_eq!(parsed.repeat, DEFAULT_MEASURE_REPEAT);
+        assert_eq!(args, strings(&["a.jar"]));
+    }
+
+    #[test]
+    fn refuses_tuning_flags_without_measure_and_values_that_are_not_bounded() {
+        // Ignoring the tuning flags would measure nothing and say the run was fine.
+        let mut args = strings(&["--measure-repeat", "3", "a.jar"]);
+        assert!(take_measure_args(&mut args).is_err());
+        for bad in [
+            strings(&["--measure", "--measure-timeout", "0", "a.jar"]),
+            strings(&["--measure", "--measure-timeout", "-1", "a.jar"]),
+            strings(&["--measure", "--measure-timeout", "inf", "a.jar"]),
+            strings(&["--measure", "--measure-sample-ms", "0", "a.jar"]),
+            strings(&["--measure", "--measure-repeat", "0", "a.jar"]),
+            strings(&["--measure", "--measure-repeat", "99", "a.jar"]),
+            strings(&["--measure", "--measure-timeout"]),
+        ] {
+            let mut args = bad.clone();
+            assert!(
+                take_measure_args(&mut args).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        // The repeat bound is a constant, not a magic number in the parser.
+        assert_eq!(MAX_MEASURE_REPEAT, 20);
+    }
+
+    #[test]
+    fn the_child_runs_this_probe_with_the_recursion_flag_and_no_tuning_flags() {
+        let argv = os(&[
+            "--measure",
+            "--measure-repeat",
+            "3",
+            "--measure-sample-ms=7",
+            "--entry",
+            "demo.Rep",
+            "mod.jar",
+        ]);
+        let child: Vec<String> = measure_child_args(&argv)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        // Every tuning flag went with its value; the jar list and the probe's
+        // own flags survived untouched.
+        assert_eq!(
+            child,
+            strings(&["--measure-recursive", "--entry", "demo.Rep", "mod.jar"])
+        );
+        // The child strips its flag, and leaves the jar list alone.
+        let mut args = child;
+        assert!(take_recursive_flag(&mut args));
+        assert_eq!(args, strings(&["--entry", "demo.Rep", "mod.jar"]));
+    }
+
+    #[test]
+    fn a_single_run_is_its_own_median_and_a_killed_run_fails_the_report() {
+        let ok = MeasureReport {
+            label: "demo.Rep".to_owned(),
+            runs: vec![run("ok", Some(600.0), 630.0)],
+        };
+        assert!(ok.succeeded());
+        assert_eq!(ok.median(|run| run.startup_ms), Some(600.0));
+        let text = ok.text();
+        assert!(text.contains("measure: entry demo.Rep"), "{text}");
+        assert!(text.contains("startup_ms=600.000"), "{text}");
+        assert!(text.contains("median_peak_rss_kib=2048"), "{text}");
+
+        // An even count averages the middle pair; a missing figure is skipped.
+        let even = MeasureReport {
+            label: "x".to_owned(),
+            runs: vec![
+                run("ok", Some(100.0), 200.0),
+                run("ok", None, 400.0),
+                run("ok", Some(200.0), 600.0),
+                run("ok", Some(400.0), 800.0),
+            ],
+        };
+        // 100, 200, 400 sort to 200; the missing sample is not counted as 0.
+        assert_eq!(even.median(|run| run.startup_ms), Some(200.0));
+        let pair = MeasureReport {
+            label: "x".to_owned(),
+            runs: vec![run("ok", Some(100.0), 200.0), run("ok", Some(200.0), 600.0)],
+        };
+        assert_eq!(pair.median(|run| run.startup_ms), Some(150.0));
+        let killed = MeasureReport {
+            label: "x".to_owned(),
+            runs: vec![run("ok", Some(1.0), 2.0), run("killed", None, 3.0)],
+        };
+        assert!(!killed.succeeded());
+        assert!(killed.text().contains("(killed at the bound)"));
+    }
+
+    #[test]
+    fn the_json_report_carries_every_sample_and_a_null_for_a_missing_figure() {
+        let report = MeasureReport {
+            label: "demo.Rep".to_owned(),
+            runs: vec![run("killed", None, 200.0), run("ok", Some(5.0), 9.0)],
+        };
+        let value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["runs"], 2);
+        assert!(value["medianStartupMs"].is_f64());
+        assert!(value["samples"][0]["startupMs"].is_null());
+        assert_eq!(value["samples"][0]["timedOut"], true);
+        assert_eq!(value["samples"][1]["peakRssKiB"], 2048);
+        // A null figure is a JSON null, never a sentinel number like -1.
+        assert!(report.json().contains("null"));
+    }
+
+    #[test]
+    fn reads_the_high_water_mark_and_the_current_floor_from_proc_status() {
+        let status =
+            "Name:\tjava\nVmPeak:\t 9000000 kB\nVmHWM:\t  524288 kB\nVmRSS:\t  131072 kB\n";
+        assert_eq!(peak_rss_kib(status), Some(524_288));
+        assert_eq!(current_rss_kib(status), Some(131_072));
+        // A process that reports neither keeps both absent rather than zero.
+        assert_eq!(peak_rss_kib("Name:\tjava\n"), None);
+        assert_eq!(current_rss_kib("Name:\tjava\n"), None);
+        // An unreadable figure is absent, and so is a runaway one.
+        assert_eq!(peak_rss_kib("VmHWM:\t  nonsense kB\n"), None);
+        assert_eq!(peak_rss_kib("VmHWM:\t  999999999999 kB\n"), None);
+    }
+
+    #[test]
+    fn labels_one_entrypoint_by_name_and_a_discovered_run_by_kind() {
+        assert_eq!(
+            entry_label(&[], "neoforge"),
+            "neoforge (discovered at runtime)"
+        );
+        assert_eq!(entry_label(&["demo.Rep".to_owned()], "main"), "demo.Rep");
+        assert_eq!(
+            entry_label(&["a.A".to_owned(), "b.B".to_owned()], "main"),
+            "2 main entrypoint(s)"
+        );
+    }
+
+    #[test]
+    fn a_plain_run_finishes_far_inside_the_default_bound() {
+        // The bound is a wall-clock ceiling for a whole fixture, so the defaults
+        // have to leave a real JVM room; a value in the same order as a sample
+        // interval would kill every fixture.
+        assert!(Duration::from_secs_f64(DEFAULT_MEASURE_TIMEOUT) > Duration::from_secs(30));
     }
 }
