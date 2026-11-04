@@ -142,6 +142,65 @@ impl JavaLoader {
     }
 }
 
+/// Which engine executed a jar, as one label a log line or a status reader can
+/// switch on. It is a description of the decision the loader already made in
+/// [`run_java_mods_with_report`], never an input to it: the four cases are the
+/// loader's own branches, and nothing here selects an engine.
+///
+/// `horizon-jvm` (the optional reference fallback) is a development artifact
+/// and is not wired into the game, so native, and the refusal, are the only
+/// results a game run can reach today. The other two are declared anyway so
+/// the label names the whole contract from [docs/java-mod-compat.md]'s tiers,
+/// and so a report that carries one can be tested without the fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JavaEngine {
+    /// The jar's own supported bytecode ran through `horizon-native-java`, and
+    /// nothing in its execution, hooks or declarations needed the fallback.
+    Native,
+    /// The native interpreter ran the jar, but the jar declared work it cannot
+    /// translate: report-only Mixin plans or configs, or opaque registrations
+    /// that no typed declaration promoted. The jar still ran natively; the
+    /// label only stops that partial result from counting as full coverage.
+    NativeQualified,
+    /// The embedded JVM (`horizon-jvm`) executed the jar. Not native coverage.
+    Sidecar,
+    /// The loader refused the jar before it ran. The reason stays the startup
+    /// error it always was; this label only names the outcome.
+    Refused,
+}
+
+impl JavaEngine {
+    /// The fixed label the report's `engine=` field and `server-status` carry.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::NativeQualified => "native-qualified",
+            Self::Sidecar => "sidecar",
+            Self::Refused => "refused",
+        }
+    }
+
+    /// The engine a report's own fields describe. See [`JavaEngine`] for why the
+    /// result never feeds back into the loader.
+    fn of_report(report: &JavaCompatibilityReport) -> Self {
+        if report.client_side_only_rejected {
+            Self::Refused
+        } else if report.isolation_failure.is_some() {
+            // The interpreter ran and failed. Its own diagnostics name the
+            // class, method and program counter; those keep counting as the
+            // JVM fallback's, so this is a partial native result.
+            Self::NativeQualified
+        } else if report.mixin_unresolved > 0
+            || report.mixin_config_errors > 0
+            || !report.opaque_registrations.is_empty()
+        {
+            Self::NativeQualified
+        } else {
+            Self::Native
+        }
+    }
+}
+
 /// The role names the compatibility diagnostics use. `ExecutionRole` is
 /// internal to the bin and has no display of its own.
 fn role_name(role: ExecutionRole) -> &'static str {
@@ -231,6 +290,9 @@ pub(super) struct JavaCompatibilityReport {
     /// ran. `None` for a jar that ran or was refused.
     pub(super) isolation_failure: Option<String>,
     pub(super) role: ExecutionRole,
+    /// Which engine executed the jar. `None` when a stored report predates the
+    /// field; callers read [`Self::engine`], never this directly.
+    pub(super) engine: Option<JavaEngine>,
 }
 
 /// What one entrypoint run recorded. Kept apart from the jar (and from the
@@ -298,16 +360,25 @@ impl JavaCompatibilityReport {
             client_side_only_rejected: facts.rejected,
             isolation_failure: None,
             role,
+            engine: None,
         }
+    }
+
+    /// The engine this report describes. A stored label wins (so a sidecar run
+    /// keeps saying `sidecar`); otherwise the fields decide, as they do for
+    /// every report the loader builds.
+    pub(super) fn engine(&self) -> JavaEngine {
+        self.engine.unwrap_or_else(|| JavaEngine::of_report(self))
     }
 
     /// The startup log's lines for this jar: a fixed order over fixed fields,
     /// with every list bounded and sorted.
     pub(super) fn summary(&self) -> Vec<String> {
         let mut lines = vec![format!(
-            "Horizon: Java compatibility {}: role={} loader={} id={} version={}",
+            "Horizon: Java compatibility {}: role={} engine={} loader={} id={} version={}",
             self.jar.display(),
             role_name(self.role),
+            self.engine().name(),
             self.loader.map_or("unknown", JavaLoader::name),
             self.id.as_deref().unwrap_or("unknown"),
             self.version.as_deref().unwrap_or("unknown"),
@@ -607,10 +678,36 @@ fn aggregate_line(reports: &[JavaCompatibilityReport], summary: &DeclarationSumm
         format!(", {}", declared.join(", "))
     };
     format!(
-        "Horizon: Java compatibility: {} jar(s), {typed} typed registrations, {opaque} opaque, {payloads} payload directions, {mixin_plans} mixin plan(s), {mixin_unresolved} unresolved{declared}",
+        "Horizon: Java compatibility: {} jar(s), {typed} typed registrations, {opaque} opaque, {payloads} payload directions, {mixin_plans} mixin plan(s), {mixin_unresolved} unresolved, {}{declared}",
         reports.len(),
+        engines_line(reports),
     )
 }
+
+/// Every [`JavaEngine`] label and how many of `reports` it describes, in the
+/// order the enum names them. Fixed, so a run with no jars prints `native=0`
+/// rather than leaving a reader to guess whether the field was missing.
+fn engines_line(reports: &[JavaCompatibilityReport]) -> String {
+    ENGINE_ORDER
+        .iter()
+        .map(|engine| {
+            let count = reports
+                .iter()
+                .filter(|report| report.engine() == *engine)
+                .count();
+            format!("{}={count}", engine.name())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The engines [`engines_line`] counts, in the order it prints them.
+const ENGINE_ORDER: [JavaEngine; 4] = [
+    JavaEngine::Native,
+    JavaEngine::NativeQualified,
+    JavaEngine::Sidecar,
+    JavaEngine::Refused,
+];
 
 /// The startup line naming the jars whose native execution was isolated: one
 /// bounded list, sorted so the window, its server thread and the dedicated
@@ -1717,8 +1814,10 @@ clientSideOnly = true
             },
         );
         let lines = vec![
-            "Horizon: Java compatibility /mods/demo.jar: role=dedicated-server loader=fabric \
-             id=demo version=1.2.3"
+            // `demo:token` was promoted, but it is still an opaque row the run
+            // recorded, so the result is qualified rather than clean native.
+            "Horizon: Java compatibility /mods/demo.jar: role=dedicated-server \
+             engine=native-qualified loader=fabric id=demo version=1.2.3"
                 .to_owned(),
             "  entrypoints: declared=[main] selected=main executed=1 host-calls=9 listeners=2"
                 .to_owned(),
@@ -1774,6 +1873,107 @@ clientSideOnly = true
         assert_eq!(
             bounded.opaque_registrations[0],
             "minecraft:item/demo:item_00"
+        );
+    }
+
+    /// The engine label is derived from the report's own fields and never the
+    /// other way round: two reports that differ only in the qualified facts
+    /// print different labels, and the run line counts both.
+    #[test]
+    fn java_engine_label_distinguishes_clean_and_qualified_native_runs() {
+        let mut jar = horizon_native_java::NativeJar::default();
+        jar.fabric_id = Some("demo".into());
+        let typed = [horizon_native_java::RegistryEntry::typed(
+            "minecraft:item",
+            "demo:gem",
+            horizon_native_java::RegistryDeclaration::Item {
+                template: "minecraft:stick".into(),
+                properties: BTreeMap::new(),
+            },
+        )];
+        let opaque = [horizon_native_java::RegistryEntry {
+            registry: "minecraft:item".into(),
+            id: "demo:token".into(),
+            value: horizon_native_java::Value::Ref(Some("opaque".into())),
+            declaration: None,
+        }];
+        let clean = JavaCompatibilityReport::new(
+            &jar,
+            std::path::Path::new("/mods/clean.jar"),
+            ExecutionRole::Client,
+            NativeRunFacts {
+                kind: "main",
+                executed: 1,
+                recorded: &typed,
+                typed: 1,
+                ..NativeRunFacts::default()
+            },
+        );
+        let qualified = JavaCompatibilityReport::new(
+            &jar,
+            std::path::Path::new("/mods/qualified.jar"),
+            ExecutionRole::Client,
+            NativeRunFacts {
+                kind: "main",
+                executed: 1,
+                recorded: &opaque,
+                ..NativeRunFacts::default()
+            },
+        );
+        assert_eq!(clean.engine(), JavaEngine::Native);
+        assert_eq!(qualified.engine(), JavaEngine::NativeQualified);
+        // A promoted row is still an opaque row the run recorded, so a jar
+        // whose declarations only promote stays qualified (the summary test
+        // above covers the header for exactly that shape).
+        assert!(!qualified.opaque_registrations.is_empty());
+        // The header carries the label right after the role, so a log reader
+        // never has to reconstruct it from the lines below.
+        assert!(
+            clean.summary()[0].contains("role=client engine=native loader=fabric"),
+            "{:?}",
+            clean.summary()[0]
+        );
+        assert!(
+            qualified.summary()[0].contains("role=client engine=native-qualified"),
+            "{:?}",
+            qualified.summary()[0]
+        );
+
+        // A jar that declared unreadable Mixin work is qualified even with no
+        // opaque registration, and an isolated panic is qualified too.
+        let unresolved = JavaCompatibilityReport {
+            mixin_unresolved: 1,
+            ..clean.clone()
+        };
+        assert_eq!(unresolved.engine(), JavaEngine::NativeQualified);
+        let isolated = isolated_report("/mods/bad.jar", ExecutionRole::Client, "boom");
+        assert_eq!(isolated.engine(), JavaEngine::NativeQualified);
+
+        // A stored label wins over the fields, which is how a sidecar run keeps
+        // saying `sidecar` without a JVM having to run in a test.
+        let sidecar = JavaCompatibilityReport {
+            engine: Some(JavaEngine::Sidecar),
+            ..clean.clone()
+        };
+        assert_eq!(sidecar.engine(), JavaEngine::Sidecar);
+        assert!(sidecar.summary()[0].contains("engine=sidecar"));
+
+        // Every label has its own fixed name.
+        let names: Vec<&str> = ENGINE_ORDER.iter().map(|engine| engine.name()).collect();
+        assert_eq!(names, ["native", "native-qualified", "sidecar", "refused"]);
+
+        // The run line counts one of each, in that order, before the declared
+        // part.
+        let reports = [clean, qualified, sidecar, isolated];
+        let line = aggregate_line(&reports, &mod_content::declaration_summary(&[]));
+        assert!(
+            line.contains("0 unresolved, native=1, native-qualified=2, sidecar=1, refused=0"),
+            "{line}"
+        );
+        // No jars still prints the labels rather than leaving them out.
+        assert_eq!(
+            engines_line(&[]),
+            "native=0, native-qualified=0, sidecar=0, refused=0"
         );
     }
 
@@ -2002,7 +2202,10 @@ clientSideOnly = true
         assert_eq!(report.promoted, ["minecraft:item/report:gem"]);
         let summary = report.summary();
         assert!(
-            summary[0].contains("role=dedicated-server loader=fabric id=report-mod version=1.0"),
+            summary[0].contains(
+                "role=dedicated-server engine=native-qualified loader=fabric \
+                 id=report-mod version=1.0"
+            ),
             "{summary:?}"
         );
         assert!(
@@ -2034,7 +2237,8 @@ clientSideOnly = true
         assert_eq!(
             aggregate_line(&reports, &summary),
             "Horizon: Java compatibility: 2 jar(s), 2 typed registrations, 3 opaque, \
-             0 payload directions, 0 mixin plan(s), 0 unresolved, 3 declared item(s)"
+             0 payload directions, 0 mixin plan(s), 0 unresolved, native=0, \
+             native-qualified=2, sidecar=0, refused=0, 3 declared item(s)"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2079,7 +2283,8 @@ clientSideOnly = true
             NativeRunFacts::default(),
         )];
         let legacy = "Horizon: Java compatibility: 1 jar(s), 0 typed registrations, 0 opaque, \
-                      0 payload directions, 0 mixin plan(s), 0 unresolved";
+                      0 payload directions, 0 mixin plan(s), 0 unresolved, native=1, \
+                      native-qualified=0, sidecar=0, refused=0";
         for summary in [
             mod_content::declaration_summary(&[]),
             mod_content::declaration_summary(&[ContentMod {
@@ -2128,7 +2333,8 @@ clientSideOnly = true
         assert_eq!(
             aggregate_line(&reports, &summary),
             "Horizon: Java compatibility: 1 jar(s), 0 typed registrations, 0 opaque, \
-             0 payload directions, 0 mixin plan(s), 0 unresolved, 1 declared item(s), \
+             0 payload directions, 0 mixin plan(s), 0 unresolved, native=1, \
+             native-qualified=0, sidecar=0, refused=0, 1 declared item(s), \
              1 other declared row(s)"
         );
         // Recipes alone: named as one other count rather than losing them.
@@ -2136,7 +2342,8 @@ clientSideOnly = true
         assert_eq!(
             aggregate_line(&reports, &summary),
             "Horizon: Java compatibility: 1 jar(s), 0 typed registrations, 0 opaque, \
-             0 payload directions, 0 mixin plan(s), 0 unresolved, 1 other declared row(s)"
+             0 payload directions, 0 mixin plan(s), 0 unresolved, native=1, \
+             native-qualified=0, sidecar=0, refused=0, 1 other declared row(s)"
         );
     }
 
@@ -2190,7 +2397,7 @@ clientSideOnly = true
         let report = isolated_report("/mods/bad.jar", ExecutionRole::DedicatedServer, "boom");
         let summary = report.summary();
         assert!(
-            summary[0].contains("role=dedicated-server loader=unknown"),
+            summary[0].contains("role=dedicated-server engine=native-qualified loader=unknown"),
             "{summary:?}"
         );
         assert_eq!(summary.last().map(String::as_str), Some("  isolated: boom"));

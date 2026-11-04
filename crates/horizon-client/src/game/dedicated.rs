@@ -10,7 +10,7 @@ use super::{
     Game, Options,
     execution_role::ExecutionRole,
     lan::LanSettings,
-    mods::{JavaCompatibilityReport, JavaLoader, MixinPlanning, fml},
+    mods::{JavaCompatibilityReport, JavaEngine, JavaLoader, MixinPlanning, fml},
     world_loading::WorldRequest,
 };
 use horizon_client::{
@@ -342,6 +342,9 @@ fn refusal_report(
         client_side_only_rejected: jar.is_some_and(|jar| jar.client_side_only),
         isolation_failure: None,
         role: ExecutionRole::DedicatedServer,
+        // Refused means the jar never ran; `client_side_only_rejected` alone
+        // would read as a decided refusal, so the engine is stated outright.
+        engine: Some(JavaEngine::Refused),
     }
 }
 
@@ -1884,6 +1887,8 @@ fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    use super::JavaEngine;
+    use super::status::engine_name;
     use super::{
         ExecutionRole, JAVA_PREFIX, JavaCompatibilityReport, JavaLoader, capture_log,
         java_refusal_lines, loader_name, log, log_from, log_java_reports, refusal_report,
@@ -2055,6 +2060,7 @@ mod tests {
             client_side_only_rejected: false,
             isolation_failure: None,
             role: ExecutionRole::DedicatedServer,
+            engine: None,
         }
     }
 
@@ -2092,8 +2098,9 @@ mod tests {
         assert_eq!(loader_name(JavaLoader::Fabric), "fabric");
         assert!(
             lines[0].contains(&format!(
-                "role={} loader={} id=demo version=1.0",
+                "role={} engine={} loader={} id=demo version=1.0",
                 role_name(reports[0].role),
+                engine_name(reports[0].engine()),
                 loader_name(JavaLoader::Fabric)
             )),
             "{lines:?}"
@@ -2159,6 +2166,33 @@ mod tests {
             ]
         );
         assert_eq!(section["entries"][0]["role"], "dedicated-server");
+        // Typed-only is full native coverage; an unpromoted opaque row is a
+        // qualified one; the client-only jar never ran.
+        assert_eq!(section["entries"][0]["engine"], "native");
+        assert_eq!(section["entries"][1]["engine"], "native-qualified");
+        assert_eq!(section["entries"][2]["engine"], "refused");
+        assert_eq!(
+            section["engines"],
+            serde_json::json!({
+                "native": 1,
+                "native-qualified": 1,
+                "sidecar": 0,
+                "refused": 1,
+            })
+        );
+        // The label map's keys are the report's own labels, never a second
+        // spelling that a log reader would have to translate.
+        for engine in [
+            JavaEngine::Native,
+            JavaEngine::NativeQualified,
+            JavaEngine::Sidecar,
+            JavaEngine::Refused,
+        ] {
+            assert!(
+                section["engines"].get(engine.name()).is_some(),
+                "{engine:?}"
+            );
+        }
         assert_eq!(section["entries"][1]["loader"], "neoforge");
         assert_eq!(
             section["entries"][1]["payload"],
@@ -2176,6 +2210,17 @@ mod tests {
         assert_eq!(directions, ["client->server", "server->client"]);
     }
 
+    /// A refused jar reports `engine=refused` even when its metadata is not
+    /// client-only, so a reader never has to infer an engine from an error.
+    #[test]
+    fn dedicated_java_refusal_always_names_the_engine() {
+        let path = std::path::Path::new("/horizon-absent-mods/plain.jar");
+        let summary = refusal_report(path, None).summary().join("\n");
+        assert!(summary.contains("engine=refused"), "{summary}");
+        assert!(!summary.contains("rejected: "), "{summary}");
+        assert_eq!(engine_name(JavaEngine::Refused), "refused");
+    }
+
     #[test]
     fn dedicated_java_refusal_names_the_role_and_declared_kinds() {
         let path = std::path::Path::new("/horizon-absent-mods/client-only.jar");
@@ -2185,7 +2230,9 @@ mod tests {
         jar.fabric_entrypoints.insert("client".into(), Vec::new());
         let summary = refusal_report(path, Some(&jar)).summary().join("\n");
         assert!(
-            summary.contains("role=dedicated-server loader=fabric id=client-only version=1.0"),
+            summary.contains(
+                "role=dedicated-server engine=refused loader=fabric id=client-only version=1.0"
+            ),
             "{summary}"
         );
         assert!(

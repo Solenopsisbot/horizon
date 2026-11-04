@@ -2,7 +2,9 @@
 //! section 2): `server-status` answers with the tick rate, the tick times `/tick query` reports, the players,
 //! the loaded chunks, the Java jars the loader started and the last NeoForge FML preflight; `console <line>`
 //! runs a console command and answers with the lines it logged.
-use super::{JavaCompatibilityReport, ServerState, capture_log, fml, loader_name, role_name};
+use super::{
+    JavaCompatibilityReport, JavaEngine, ServerState, capture_log, fml, loader_name, role_name,
+};
 use crate::game::Game;
 use serde_json::{Value, json};
 use std::{
@@ -22,10 +24,30 @@ const MAX_FML_IDS: usize = 16;
 /// The most characters of a preflight failure the `fml` section repeats.
 const MAX_FML_ERROR_CHARS: usize = 200;
 
+/// `JavaEngine`'s labels as the summary lines print them. The enum's `name` is
+/// private to `mods`; a test keeps this in step with it, like [`loader_name`].
+pub(super) fn engine_name(engine: JavaEngine) -> &'static str {
+    match engine {
+        JavaEngine::Native => "native",
+        JavaEngine::NativeQualified => "native-qualified",
+        JavaEngine::Sidecar => "sidecar",
+        JavaEngine::Refused => "refused",
+    }
+}
+
+/// The engine labels `engines` counts, in the order it prints them.
+const ENGINE_LABELS: [JavaEngine; 4] = [
+    JavaEngine::Native,
+    JavaEngine::NativeQualified,
+    JavaEngine::Sidecar,
+    JavaEngine::Refused,
+];
+
 /// The `java` section of `server-status`: which explicitly selected jars the
-/// dedicated loader started, each one's loader, role and entrypoint kind, how
-/// its registrations landed, and whether any was refused. Sorted by jar path
-/// and bounded, so two servers that started the same jars answer the same.
+/// dedicated loader started, each one's engine, loader, role and entrypoint
+/// kind, how its registrations landed, and whether any was refused. Sorted by
+/// jar path and bounded, so two servers that started the same jars answer the
+/// same.
 pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
     let mut sorted: Vec<&JavaCompatibilityReport> = reports.iter().collect();
     sorted.sort_by(|a, b| a.jar.cmp(&b.jar));
@@ -36,12 +58,25 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
     let count = |of: fn(&JavaCompatibilityReport) -> usize| {
         sorted.iter().map(|report| of(report)).sum::<usize>()
     };
+    // Every engine label with its count over every jar, refused ones included:
+    // the entries list is bounded, these counts are not.
+    let engines: serde_json::Map<String, Value> = ENGINE_LABELS
+        .iter()
+        .map(|engine| {
+            let count = sorted
+                .iter()
+                .filter(|report| report.engine() == *engine)
+                .count();
+            (engine_name(*engine).to_owned(), json!(count))
+        })
+        .collect();
     let entries: Vec<Value> = sorted
         .iter()
         .take(MAX_STATUS_JARS)
         .map(|report| {
             json!({
                 "jar": report.jar.display().to_string(),
+                "engine": engine_name(report.engine()),
                 "loader": report.loader.map_or("unknown", loader_name),
                 "role": role_name(report.role),
                 "entrypoint": if report.entrypoint_kind.is_empty() {
@@ -65,6 +100,7 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
         "jars": sorted.len(),
         "listed": entries.len(),
         "rejected": sorted.iter().filter(|r| r.client_side_only_rejected).count(),
+        "engines": engines,
         "typed": count(|r| r.typed_registrations),
         "opaque": count(|r| r.opaque_registrations.len()),
         "promoted": count(|r| r.promoted.len()),
