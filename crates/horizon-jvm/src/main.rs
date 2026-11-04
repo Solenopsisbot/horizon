@@ -2668,11 +2668,20 @@ fn measure_child_args(argv: &[OsString]) -> Vec<OsString> {
     while let Some(arg) = iter.next() {
         match arg.to_str() {
             Some("--measure") => child.push(OsString::from(RECURSIVE_MEASURE_FLAG)),
-            Some(flag) if flag.starts_with("--measure-") && !flag.contains('=') => {
+            Some(flag)
+                if matches!(
+                    flag.split_once('=').map_or(flag, |(name, _)| name),
+                    "--measure-timeout" | "--measure-sample-ms" | "--measure-repeat"
+                ) && !flag.contains('=') =>
+            {
                 // The value is the next argument (the parser above required it).
                 let _ = iter.next();
             }
-            Some(flag) if flag.starts_with("--measure-") => {}
+            Some(flag)
+                if matches!(
+                    flag.split_once('=').map_or(flag, |(name, _)| name),
+                    "--measure-timeout" | "--measure-sample-ms" | "--measure-repeat"
+                ) => {}
             _ => child.push(arg.clone()),
         }
     }
@@ -7153,6 +7162,18 @@ mod measure_tests {
             child,
             strings(&["--measure-recursive", "--entry", "demo.Rep", "mod.jar"])
         );
+        // Unknown flags with a similar prefix belong to the fixture and must
+        // survive the hand-off; only the three tuning flags are probe-owned.
+        let custom_child: Vec<String> =
+            measure_child_args(&os(&["--measure", "--measure-custom", "keep", "mod.jar"]))
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+        assert_eq!(
+            custom_child,
+            strings(&["--measure-recursive", "--measure-custom", "keep", "mod.jar"])
+        );
+
         // The child strips its flag, and leaves the jar list alone.
         let mut args = child;
         assert!(take_recursive_flag(&mut args));
