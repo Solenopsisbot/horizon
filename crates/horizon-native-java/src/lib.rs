@@ -1341,6 +1341,9 @@ pub struct StdHost {
     /// The runtime still owns the map; the host only provides the lifetime.
     persistent_static_fields: BTreeMap<String, Value>,
     persistent_initialized_classes: std::collections::BTreeSet<String>,
+    /// Bounded diagnostics for calls outside the modeled host surface.
+    unknown_host_calls: BTreeMap<String, usize>,
+    strict_unknown_host_calls: bool,
     next_lazy_optional: usize,
     next_fabric_event: usize,
     next_iterator: usize,
@@ -1393,9 +1396,46 @@ impl StdHost {
             throwable_causes: BTreeMap::new(),
             persistent_static_fields: BTreeMap::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
+            unknown_host_calls: BTreeMap::new(),
+            strict_unknown_host_calls: false,
             next_lazy_optional: 0,
             next_fabric_event: 0,
             next_iterator: 0,
+        }
+    }
+
+    /// Make an unmodeled host call fail instead of returning its neutral Java
+    /// value. The default stays lenient for compatibility, but diagnostics
+    /// are retained in either mode so callers can classify the run honestly.
+    pub fn with_strict_unknown_host_calls(mut self) -> Self {
+        self.strict_unknown_host_calls = true;
+        self
+    }
+
+    pub fn set_strict_unknown_host_calls(&mut self, strict: bool) {
+        self.strict_unknown_host_calls = strict;
+    }
+
+    pub fn unknown_host_calls(&self) -> Vec<(String, usize)> {
+        self.unknown_host_calls
+            .iter()
+            .map(|(method, count)| (method.clone(), *count))
+            .collect()
+    }
+
+    pub fn unknown_host_call_count(&self) -> usize {
+        self.unknown_host_calls.values().sum()
+    }
+
+    fn unknown_host_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        let key = format!("{}#{}{}", r.owner, r.name, r.descriptor);
+        if self.unknown_host_calls.len() < 64 || self.unknown_host_calls.contains_key(&key) {
+            *self.unknown_host_calls.entry(key).or_default() += 1;
+        }
+        if self.strict_unknown_host_calls {
+            Err(NativeError::UnknownHostCall(r.clone()))
+        } else {
+            Ok(Value::default_for(&r.descriptor))
         }
     }
 
@@ -2189,7 +2229,7 @@ impl Host for StdHost {
                 "rarity/{}",
                 r.name.to_ascii_lowercase()
             )))),
-            _ => Ok(Value::default_for(&r.descriptor)),
+            _ => self.unknown_host_call(r),
         }
     }
 
@@ -3078,7 +3118,7 @@ impl Host for StdHost {
                 open_inferred_builder(&mut self.block_property_builders, &marker);
                 Ok(Value::Ref(Some(marker)))
             }
-            _ => Ok(Value::default_for(&r.descriptor)),
+            _ => self.unknown_host_call(r),
         }
     }
 
@@ -7955,12 +7995,19 @@ pub enum NativeError {
         /// The message the bounded `Throwable` constructor recorded, if any.
         message: Option<String>,
     },
+    /// The fail-closed host mode rejected a call with no bounded model.
+    UnknownHostCall(MethodRef),
     Zip(String),
     Metadata(String),
 }
 impl std::fmt::Display for NativeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnknownHostCall(method) => write!(
+                f,
+                "unknown native host call {}#{}{}",
+                method.owner, method.name, method.descriptor
+            ),
             Self::UncaughtException { class, message } => match message {
                 Some(message) => write!(f, "uncaught exception {class}: {message}"),
                 None => write!(f, "uncaught exception {class}"),
@@ -19337,6 +19384,26 @@ mandatory = true
             Some(Value::Ref(Some("hé".into())))
         );
         assert_eq!(host.invocations()[1].args, Vec::new());
+    }
+
+    #[test]
+    fn standard_host_can_fail_closed_and_report_unknown_calls() {
+        let unknown = MethodRef {
+            owner: "demo/Unknown".into(),
+            name: "run".into(),
+            descriptor: "()I".into(),
+        };
+        let mut host = StdHost::new().with_strict_unknown_host_calls();
+        let error = host.invoke(&unknown, &[]).unwrap_err();
+        assert!(matches!(error, NativeError::UnknownHostCall(_)));
+        assert_eq!(
+            host.unknown_host_calls(),
+            vec![("demo/Unknown#run()I".into(), 1)]
+        );
+        assert_eq!(host.unknown_host_call_count(), 1);
+        host.set_strict_unknown_host_calls(false);
+        assert_eq!(host.invoke(&unknown, &[]).unwrap(), Value::Int(0));
+        assert_eq!(host.unknown_host_call_count(), 2);
     }
 
     #[test]
