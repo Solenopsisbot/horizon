@@ -186,6 +186,16 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid method", result.stderr)
 
+    def test_cli_rejects_non_finite_timeout(self):
+        with tempfile.NamedTemporaryFile(suffix=".jar") as handle:
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "tools" / "native_java_perf.py"),
+                 "--jar", handle.name, "--timeout", "nan"],
+                text=True, capture_output=True, timeout=60, check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("finite", result.stderr)
+
     def test_cli_bounds_warmup(self):
         with tempfile.NamedTemporaryFile(suffix=".jar") as handle:
             result = subprocess.run(

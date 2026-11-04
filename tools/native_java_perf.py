@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import statistics
@@ -302,8 +303,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"jar does not exist: {args.jar}")
     if not 1 <= args.runs <= MAX_RUNS:
         parser.error(f"--runs must be between 1 and {MAX_RUNS}")
-    if args.timeout <= 0 or args.timeout > 300:
-        parser.error("--timeout must be between 0 and 300 seconds")
+    if not math.isfinite(args.timeout) or args.timeout <= 0 or args.timeout > 300:
+        parser.error("--timeout must be a finite value between 0 and 300 seconds")
     if args.method and not 1 <= len(args.method) <= MAX_METHODS:
         parser.error(f"--method may be repeated at most {MAX_METHODS} times")
     if not 0 <= args.warmup <= MAX_WARMUP:
