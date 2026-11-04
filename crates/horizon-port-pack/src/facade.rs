@@ -2269,7 +2269,12 @@ const NEOFORGE_PAYLOAD_REGISTRAR: &str = r#"package net.neoforged.neoforge.netwo
 
 public class PayloadRegistrar {
     private static final java.util.Map<String, java.util.List<Object>> horizonPayloads = new java.util.LinkedHashMap<>();
+    private static final java.util.Map<String, java.util.List<Object>> horizonPayloadCodecs = new java.util.LinkedHashMap<>();
+    private static final java.util.Map<String, java.util.List<String>> horizonPayloadVersions = new java.util.LinkedHashMap<>();
+    private static final java.util.Map<String, java.util.List<Boolean>> horizonPayloadOptional = new java.util.LinkedHashMap<>();
     private int horizonRegistrationCount;
+    private String horizonVersion;
+    private boolean horizonIsOptional;
 
     public int horizonRegistrationCount() { return horizonRegistrationCount; }
 
@@ -2287,25 +2292,45 @@ public class PayloadRegistrar {
         return ids;
     }
 
+    public static java.util.List<Object> horizonPayloadCodecs(String direction) {
+        java.util.List<Object> values = horizonPayloadCodecs.get(direction);
+        return values == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(values);
+    }
+
+    public static java.util.List<String> horizonPayloadVersions(String direction) {
+        java.util.List<String> values = horizonPayloadVersions.get(direction);
+        return values == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(values);
+    }
+
+    public static java.util.List<Boolean> horizonPayloadOptional(String direction) {
+        java.util.List<Boolean> values = horizonPayloadOptional.get(direction);
+        return values == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(values);
+    }
+
     private static Object horizonPayloadId(Object type) {
         if (type == null) return null;
         try { return type.getClass().getMethod("id").invoke(type); } catch (Throwable ignored) { return null; }
     }
 
-    private PayloadRegistrar horizonRetain(String direction, Object type) {
+    private PayloadRegistrar horizonRetain(String direction, Object type, Object codec) {
         horizonPayloads.computeIfAbsent(direction, key -> new java.util.ArrayList<>()).add(type);
+        horizonPayloadCodecs.computeIfAbsent(direction, key -> new java.util.ArrayList<>()).add(codec);
+        horizonPayloadVersions.computeIfAbsent(direction, key -> new java.util.ArrayList<>()).add(horizonVersion);
+        horizonPayloadOptional.computeIfAbsent(direction, key -> new java.util.ArrayList<>()).add(horizonIsOptional);
         horizonRegistrationCount++;
+        horizonVersion = null;
+        horizonIsOptional = false;
         return this;
     }
 
-    public PayloadRegistrar playToServer(Object type, Object codec, Object handler) { return horizonRetain("playToServer", type); }
-    public PayloadRegistrar playToClient(Object type, Object codec, Object handler) { return horizonRetain("playToClient", type); }
-    public PayloadRegistrar playBidirectional(Object type, Object codec, Object handler) { return horizonRetain("playBidirectional", type); }
-    public PayloadRegistrar configurationToServer(Object type, Object codec, Object handler) { return horizonRetain("configurationToServer", type); }
-    public PayloadRegistrar configurationToClient(Object type, Object codec, Object handler) { return horizonRetain("configurationToClient", type); }
-    public PayloadRegistrar configurationBidirectional(Object type, Object codec, Object handler) { return horizonRetain("configurationBidirectional", type); }
-    public PayloadRegistrar optional() { return this; }
-    public PayloadRegistrar versioned(String version) { return this; }
+    public PayloadRegistrar playToServer(Object type, Object codec, Object handler) { return horizonRetain("playToServer", type, codec); }
+    public PayloadRegistrar playToClient(Object type, Object codec, Object handler) { return horizonRetain("playToClient", type, codec); }
+    public PayloadRegistrar playBidirectional(Object type, Object codec, Object handler) { return horizonRetain("playBidirectional", type, codec); }
+    public PayloadRegistrar configurationToServer(Object type, Object codec, Object handler) { return horizonRetain("configurationToServer", type, codec); }
+    public PayloadRegistrar configurationToClient(Object type, Object codec, Object handler) { return horizonRetain("configurationToClient", type, codec); }
+    public PayloadRegistrar configurationBidirectional(Object type, Object codec, Object handler) { return horizonRetain("configurationBidirectional", type, codec); }
+    public PayloadRegistrar optional() { horizonIsOptional = true; return this; }
+    public PayloadRegistrar versioned(String version) { horizonVersion = version; return this; }
 }
 "#;
 
@@ -2321,6 +2346,7 @@ const FABRIC_PAYLOAD_TYPE_REGISTRY: &str = r#"package net.fabricmc.fabric.api.ne
 
 public final class PayloadTypeRegistry {
     private static final java.util.Map<String, java.util.List<Object>> horizonPayloads = new java.util.LinkedHashMap<>();
+    private static final java.util.Map<String, java.util.List<Object>> horizonPayloadCodecs = new java.util.LinkedHashMap<>();
 
     private PayloadTypeRegistry() {}
 
@@ -2343,6 +2369,11 @@ public final class PayloadTypeRegistry {
         return ids;
     }
 
+    public static java.util.List<Object> horizonPayloadCodecs(String direction) {
+        java.util.List<Object> values = horizonPayloadCodecs.get(direction);
+        return values == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(values);
+    }
+
     private static Object horizonPayloadId(Object type) {
         if (type == null) return null;
         try { return type.getClass().getMethod("id").invoke(type); } catch (Throwable ignored) { return null; }
@@ -2358,6 +2389,7 @@ public final class PayloadTypeRegistry {
 
         public PayloadTypeRegistrar<T> register(Object type, Object codec) {
             horizonPayloads.computeIfAbsent(horizonDirection, key -> new java.util.ArrayList<>()).add(type);
+            horizonPayloadCodecs.computeIfAbsent(horizonDirection, key -> new java.util.ArrayList<>()).add(codec);
             horizonRegistrationCount++;
             return this;
         }
@@ -8425,7 +8457,7 @@ mod tests {
             "configurationToClient",
             "configurationBidirectional",
         ] {
-            let retained = format!("horizonRetain(\"{direction}\", type)");
+            let retained = format!("horizonRetain(\"{direction}\", type, codec)");
             assert!(
                 source.contains(&retained),
                 "missing direction: {directive}",
@@ -8435,7 +8467,12 @@ mod tests {
         assert!(source.contains(
             "try { return type.getClass().getMethod(\"id\").invoke(type); } catch (Throwable ignored) { return null; }"
         ));
-        assert!(source.contains("public PayloadRegistrar optional() { return this; }"));
+        assert!(source.contains(
+            "public PayloadRegistrar optional() { horizonIsOptional = true; return this; }"
+        ));
+        assert!(source.contains("public PayloadRegistrar versioned(String version) { horizonVersion = version; return this; }"));
+        assert!(source.contains("horizonPayloadCodecs"));
+        assert!(source.contains("horizonPayloadVersions"));
     }
 
     #[test]
@@ -8455,6 +8492,7 @@ mod tests {
             "public static <T> PayloadTypeRegistrar<T> configurationC2S() { return new PayloadTypeRegistrar<>(\"configurationToServer\"); }",
             "public PayloadTypeRegistrar<T> register(Object type, Object codec) {",
             "public static java.util.List<Object> horizonPayloadIds(String direction) {",
+            "public static java.util.List<Object> horizonPayloadCodecs(String direction) {",
         ] {
             assert!(source.contains(entry), "missing fragment: {entry}");
         }
@@ -8485,8 +8523,12 @@ mod tests {
         if (!"mod:client".equals(net.neoforged.neoforge.network.registration.PayloadRegistrar.horizonPayloadIds("playToClient").get(0).toString())) throw new AssertionError("client id");
         if (!"mod:config".equals(net.neoforged.neoforge.network.registration.PayloadRegistrar.horizonPayloadIds("configurationToServer").get(0).toString())) throw new AssertionError("config id");
         if (!"mod:both".equals(net.neoforged.neoforge.network.registration.PayloadRegistrar.horizonPayloadIds("playBidirectional").get(0).toString())) throw new AssertionError("both id");
+        if (net.neoforged.neoforge.network.registration.PayloadRegistrar.horizonPayloadCodecs("playToServer").get(0) != null) throw new AssertionError("server codec");
+        if (!"1".equals(net.neoforged.neoforge.network.registration.PayloadRegistrar.horizonPayloadVersions("playBidirectional").get(0))) throw new AssertionError("version");
+        if (!net.neoforged.neoforge.network.registration.PayloadRegistrar.horizonPayloadOptional("playBidirectional").get(0)) throw new AssertionError("optional");
         net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.PayloadTypeRegistrar<Object> fabric = net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.playS2C();
-        fabric.register(new Type("mod:s2c"), null).register(new Type("mod:s2c2"), null);
+        Object codec = new Object();
+        fabric.register(new Type("mod:s2c"), codec).register(new Type("mod:s2c2"), null);
         net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.playC2S().register(new Type("mod:c2s"), null);
         net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.configurationS2C().register(new Type("mod:cfg"), null);
         if (fabric.horizonRegistrationCount() != 2) throw new AssertionError("fabric count");
@@ -8494,6 +8536,7 @@ mod tests {
         if (net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.horizonPayloadIds("playToClient").size() != 2) throw new AssertionError("fabric ids");
         if (!"mod:c2s".equals(net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.horizonPayloadIds("playToServer").get(0).toString())) throw new AssertionError("fabric c2s id");
         if (net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.horizonPayloadIds("configurationToClient").size() != 1) throw new AssertionError("fabric config ids");
+        if (net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry.horizonPayloadCodecs("playToClient").get(0) != codec) throw new AssertionError("fabric codec");
         System.out.println("horizon payload registries ok");
     }
 }

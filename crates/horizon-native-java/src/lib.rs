@@ -1170,6 +1170,25 @@ pub trait Host {
     fn throwable_message(&self, _marker: &str) -> Option<String> {
         None
     }
+
+    /// Return jar-owned class state retained across native callback invocations.
+    /// Hosts that do not keep a resident jar instance use an empty snapshot.
+    fn persistent_class_state(
+        &self,
+    ) -> (BTreeMap<String, Value>, std::collections::BTreeSet<String>) {
+        (BTreeMap::new(), std::collections::BTreeSet::new())
+    }
+
+    /// Store jar-owned static fields and initialized-class markers after an
+    /// invocation. The bounded host rejects a state set that exceeds its
+    /// resident-instance cap rather than silently dropping fields.
+    fn store_persistent_class_state(
+        &mut self,
+        _fields: BTreeMap<String, Value>,
+        _initialized: std::collections::BTreeSet<String>,
+    ) -> Result<(), NativeError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1225,6 +1244,11 @@ const MAX_INVOKE_HOOKS: usize = 128;
 /// malformed.  A jar's own hierarchy is a handful of classes; the bound only
 /// stops a class file whose `super_class` chain loops.
 const MAX_SUPERCLASS_WALK: usize = 32;
+/// Resident Java class state is bounded per native mod instance. Static
+/// fields and initialized-class markers are retained across callbacks, but a
+/// jar cannot grow an unbounded heap through repeated event dispatch.
+const MAX_PERSISTENT_CLASS_FIELDS: usize = 1024;
+const MAX_PERSISTENT_INITIALIZED_CLASSES: usize = 1024;
 
 /// Deterministic, game-independent mappings for the small standard-library
 /// surface commonly reached during mod bootstrap.
@@ -1313,6 +1337,10 @@ pub struct StdHost {
     /// enough for bootstrap diagnostics without modelling Java stack traces.
     throwable_messages: BTreeMap<String, Option<String>>,
     throwable_causes: BTreeMap<String, Option<Value>>,
+    /// Jar-owned static fields retained across entrypoint/event invocations.
+    /// The runtime still owns the map; the host only provides the lifetime.
+    persistent_static_fields: BTreeMap<String, Value>,
+    persistent_initialized_classes: std::collections::BTreeSet<String>,
     next_lazy_optional: usize,
     next_fabric_event: usize,
     next_iterator: usize,
@@ -1363,6 +1391,8 @@ impl StdHost {
             capability_requests: Vec::new(),
             throwable_messages: BTreeMap::new(),
             throwable_causes: BTreeMap::new(),
+            persistent_static_fields: BTreeMap::new(),
+            persistent_initialized_classes: std::collections::BTreeSet::new(),
             next_lazy_optional: 0,
             next_fabric_event: 0,
             next_iterator: 0,
@@ -6212,6 +6242,37 @@ impl Host for StdHost {
             }
         }
     }
+
+    fn persistent_class_state(
+        &self,
+    ) -> (BTreeMap<String, Value>, std::collections::BTreeSet<String>) {
+        (
+            self.persistent_static_fields.clone(),
+            self.persistent_initialized_classes.clone(),
+        )
+    }
+
+    fn store_persistent_class_state(
+        &mut self,
+        fields: BTreeMap<String, Value>,
+        initialized: std::collections::BTreeSet<String>,
+    ) -> Result<(), NativeError> {
+        if fields.len() > MAX_PERSISTENT_CLASS_FIELDS {
+            return Err(NativeError::Metadata(format!(
+                "persistent Java static state exceeds {} fields",
+                MAX_PERSISTENT_CLASS_FIELDS
+            )));
+        }
+        if initialized.len() > MAX_PERSISTENT_INITIALIZED_CLASSES {
+            return Err(NativeError::Metadata(format!(
+                "persistent Java class state exceeds {} initialized classes",
+                MAX_PERSISTENT_INITIALIZED_CLASSES
+            )));
+        }
+        self.persistent_static_fields = fields;
+        self.persistent_initialized_classes = initialized;
+        Ok(())
+    }
 }
 
 fn expect_int(r: &MethodRef, value: &Value) -> Result<i32, NativeError> {
@@ -9078,13 +9139,15 @@ impl NativeJar {
                 }
             }
         });
+        let (persistent_static_fields, persistent_initialized_classes) =
+            host.persistent_class_state();
         let mut runtime = Runtime {
             classes: &self.classes,
             host,
             calls: 0,
             fields: BTreeMap::new(),
-            static_fields: BTreeMap::new(),
-            initialized_classes: std::collections::BTreeSet::new(),
+            static_fields: persistent_static_fields,
+            initialized_classes: persistent_initialized_classes,
             arrays: BTreeMap::new(),
             next_array: 0,
             next_object: 0,
@@ -9102,33 +9165,39 @@ impl NativeJar {
         if !runtime.classes.contains_key(&class_name) {
             return Err(NativeError::MissingMethod(format!("class {class}")));
         }
-        runtime.ensure_initialized(&class_name)?;
-        let file = runtime
-            .classes
-            .get(&class_name)
-            .ok_or_else(|| NativeError::MissingMethod(format!("class {class}")))?;
-        let is_static = file.method(method, "()V").is_some_and(Method::is_static);
-        if !is_static {
-            let constructor = file
-                .methods
-                .iter()
-                .find(|candidate| {
-                    candidate.name == "<init>" && (candidate.descriptor == "()V" || is_neoforge)
-                })
-                .cloned()
-                .ok_or_else(|| NativeError::MissingMethod(format!("{class_name}#<init>")))?;
-            let constructor_args = neutral_args(&constructor.descriptor);
-            runtime.invoke(
-                &class_name,
-                "<init>",
-                &constructor.descriptor,
-                Some(Value::Ref(Some(class_name.clone()))),
-                &constructor_args,
-            )?;
-        }
-        if method != "<init>" {
-            runtime.invoke(&class_name, method, "()V", None, &[])?;
-        }
+        let result = (|| -> Result<(), NativeError> {
+            runtime.ensure_initialized(&class_name)?;
+            let file = runtime
+                .classes
+                .get(&class_name)
+                .ok_or_else(|| NativeError::MissingMethod(format!("class {class}")))?;
+            let is_static = file.method(method, "()V").is_some_and(Method::is_static);
+            if !is_static {
+                let constructor = file
+                    .methods
+                    .iter()
+                    .find(|candidate| {
+                        candidate.name == "<init>" && (candidate.descriptor == "()V" || is_neoforge)
+                    })
+                    .cloned()
+                    .ok_or_else(|| NativeError::MissingMethod(format!("{class_name}#<init>")))?;
+                let constructor_args = neutral_args(&constructor.descriptor);
+                runtime.invoke(
+                    &class_name,
+                    "<init>",
+                    &constructor.descriptor,
+                    Some(Value::Ref(Some(class_name.clone()))),
+                    &constructor_args,
+                )?;
+            }
+            if method != "<init>" {
+                runtime.invoke(&class_name, method, "()V", None, &[])?;
+            }
+            Ok(())
+        })();
+        let persistence = runtime.persist_class_state();
+        result?;
+        persistence?;
         Ok(ExecutionReport {
             class: class.to_owned(),
             method: method.to_owned(),
@@ -11025,6 +11094,16 @@ impl<H: Host> Runtime<'_, H> {
             self.invoke(class, "<clinit>", "()V", None, &[])?;
         }
         Ok(())
+    }
+
+    /// Commit jar-owned class state to the resident host after an invocation.
+    /// The host applies its own bounded retention policy; a failed commit is
+    /// surfaced instead of silently dropping static fields or initialization.
+    fn persist_class_state(&mut self) -> Result<(), NativeError> {
+        self.host.store_persistent_class_state(
+            self.static_fields.clone(),
+            self.initialized_classes.clone(),
+        )
     }
 
     /// Answer the bounded `CallbackInfo` surface for the object this execution
@@ -19254,6 +19333,28 @@ mandatory = true
             Some(Value::Ref(Some("hé".into())))
         );
         assert_eq!(host.invocations()[1].args, Vec::new());
+    }
+
+    #[test]
+    fn standard_host_retains_persistent_class_state_with_bounds() {
+        let mut host = StdHost::new();
+        let fields = BTreeMap::from([("demo/Entry#COUNTI".to_owned(), Value::Int(7))]);
+        let initialized = std::collections::BTreeSet::from(["demo/Entry".to_owned()]);
+        host.store_persistent_class_state(fields.clone(), initialized.clone())
+            .unwrap();
+        assert_eq!(host.persistent_class_state(), (fields, initialized));
+        let too_many = (0..=MAX_PERSISTENT_CLASS_FIELDS)
+            .map(|index| {
+                (
+                    format!("demo/Entry#field{index}I"),
+                    Value::Int(index as i32),
+                )
+            })
+            .collect();
+        assert!(
+            host.store_persistent_class_state(too_many, std::collections::BTreeSet::new())
+                .is_err()
+        );
     }
 
     #[test]
