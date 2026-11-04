@@ -405,6 +405,82 @@ version = "1.0"
 }
 
 #[test]
+fn neoforge_catalog_mod_runs_direct_register_event_listener() {
+    // NeoForge mods commonly register directly from RegisterEvent instead of
+    // using DeferredRegister.  Keep this as a source-built real entrypoint so
+    // the event-bus callback, method reference, supplier and registration all
+    // cross the native host together.  The bounded RegisterEvent façade accepts
+    // a nullable registry key here; this isolates the callback path while the
+    // registry-key static identity remains a separately reported gap.
+    let stubs = sources! {
+        "net/neoforged/fml/common/Mod.java" => "package net.neoforged.fml.common; import java.lang.annotation.*; @Retention(RetentionPolicy.RUNTIME) public @interface Mod { String value(); }",
+        "net/neoforged/bus/api/IEventBus.java" => "package net.neoforged.bus.api; import java.util.function.Consumer; public interface IEventBus { default <T> IEventBus addListener(Consumer<T> listener) { return this; } }",
+        "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext.java" => "package net.neoforged.fml.javafmlmod; import net.neoforged.bus.api.IEventBus; public final class FMLJavaModLoadingContext { public static FMLJavaModLoadingContext get() { return new FMLJavaModLoadingContext(); } public IEventBus getModEventBus() { return null; } }",
+        "net/neoforged/neoforge/registries/RegisterEvent.java" => "package net.neoforged.neoforge.registries; import java.util.function.Supplier; import net.minecraft.resources.Identifier; import net.minecraft.resources.ResourceKey; public final class RegisterEvent { public void register(ResourceKey<?> key, Identifier id, Supplier<?> value) { } }",
+        "net/minecraft/resources/Identifier.java" => "package net.minecraft.resources; public final class Identifier { public static Identifier fromNamespaceAndPath(String namespace, String path) { return null; } }",
+        "net/minecraft/resources/ResourceKey.java" => "package net.minecraft.resources; public final class ResourceKey<T> { }",
+    };
+    let sources = sources! {
+        "catalog/NeoRegisterEventMod.java" => r#"
+package catalog;
+import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.fml.javafmlmod.FMLJavaModLoadingContext;
+import net.neoforged.neoforge.registries.RegisterEvent;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+
+@Mod("catalog-register")
+public final class NeoRegisterEventMod {
+  public NeoRegisterEventMod() {
+    IEventBus bus = FMLJavaModLoadingContext.get().getModEventBus();
+    bus.addListener(this::register);
+  }
+
+  private void register(RegisterEvent event) {
+    event.register(null, Identifier.fromNamespaceAndPath("catalog-register", "ruby"), () -> new Object());
+  }
+}
+"#,
+    };
+    let (root, jar_path) = build_catalog_jar(
+        "neoforge-register-event-catalog",
+        &stubs,
+        &sources,
+        "META-INF/neoforge.mods.toml",
+        br#"[[mods]]
+modId = "catalog-register"
+version = "1.0"
+"#,
+    );
+
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let entry = jar.discover_entrypoint("neoforge").unwrap();
+    let mut host = jar.seed_host(StdHost::new());
+    jar.execute(&entry.class, entry.method.as_deref(), "neoforge", &mut host)
+        .unwrap();
+
+    assert_eq!(host.listener_registrations().count(), 1);
+    let dispatches = host.dispatch_event(Value::Ref(Some("RegisterEvent".into())));
+    assert_eq!(dispatches.len(), 1);
+    jar.execute_dispatch(&dispatches[0], &mut host).unwrap();
+
+    assert_called!(
+        &host,
+        "net/neoforged/neoforge/registries/RegisterEvent",
+        "register",
+        1
+    );
+    assert_eq!(host.registrations().len(), 1);
+    let registration = &host.registrations()[0];
+    assert_eq!(registration.registry, "minecraft:unknown");
+    assert_eq!(registration.id, "catalog-register:ruby");
+    assert!(matches!(registration.value, Value::Ref(Some(_))));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn legacy_forge_catalog_mod_registers_through_bounded_aliases() {
     let stubs = sources! {
         "net/minecraftforge/fml/common/Mod.java" => "package net.minecraftforge.fml.common; import java.lang.annotation.*; @Retention(RetentionPolicy.RUNTIME) public @interface Mod { String value(); }",
