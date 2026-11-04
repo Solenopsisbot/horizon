@@ -28,6 +28,7 @@ use horizon_protocol::connection::Pipe;
 use horizon_protocol::{crypto::offline_uuid, text::translatable};
 use std::{
     net::TcpListener,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, Ordering},
@@ -1009,26 +1010,23 @@ fn run_server_java_mods(options: &mut Options) -> Result<()> {
     if options.java_mods.is_empty() {
         return Ok(());
     }
-    let mut additions = Vec::new();
-    for path in &options.java_mods {
-        match super::mods::run_java_mods(
-            std::slice::from_ref(path),
-            ExecutionRole::IntegratedServer,
-        ) {
-            Ok(mut content) => additions.append(&mut content),
-            Err(error) if client_only_server_error(&error) => {
-                log::info!(
-                    "Horizon: skipping client-only Java mod on integrated server: {}",
-                    path.display()
-                );
-            }
-            Err(error) => {
-                return Err(
-                    format!("native Java integrated-server startup failed: {error}").into(),
-                );
-            }
-        }
-    }
+    // Run all server jars in one native-loader call. The loader's payload
+    // registry is process-global and is reset once per call; invoking it once
+    // per jar silently discarded every jar's handlers except the last one.
+    // Client-only jars are filtered before the call because an integrated
+    // world accepts them on the client side while the server side must skip
+    // them without aborting the remaining server jars.
+    let server_paths = server_java_paths(&options.java_mods)
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    let additions = if server_paths.is_empty() {
+        Vec::new()
+    } else {
+        super::mods::run_java_mods(&server_paths, ExecutionRole::IntegratedServer).map_err(
+            |error| -> Box<dyn std::error::Error> {
+                format!("native Java integrated-server startup failed: {error}").into()
+            },
+        )?
+    };
     let content = std::sync::Arc::make_mut(&mut options.java_content);
     for mod_content in additions {
         if content.iter().any(|existing| existing.id == mod_content.id) {
@@ -1049,10 +1047,24 @@ fn run_server_java_mods(options: &mut Options) -> Result<()> {
     Ok(())
 }
 
-fn client_only_server_error(error: &str) -> bool {
-    error.contains("clientSideOnly mod cannot run for server execution")
-        || (error.contains("no native Fabric or NeoForge entrypoint for server execution")
-            && error.contains("available: client"))
+/// Select the jars that can execute on the integrated server. A client-only
+/// NeoForge jar is valid for the window's client side, so it is logged and
+/// omitted while the remaining jars stay in one loader batch.
+fn server_java_paths(paths: &[PathBuf]) -> std::result::Result<Vec<PathBuf>, String> {
+    let mut server = Vec::with_capacity(paths.len());
+    for path in paths {
+        let jar = horizon_native_java::NativeJar::from_path(path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if jar.client_side_only {
+            log::info!(
+                "Horizon: skipping client-only Java mod on integrated server: {}",
+                path.display()
+            );
+        } else {
+            server.push(path.clone());
+        }
+    }
+    Ok(server)
 }
 
 /// Component oracles supply their own synthetic levels and entity phases.
@@ -1101,21 +1113,54 @@ fn server_game(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, io::Write};
+    use zip::write::SimpleFileOptions;
+
+    fn neoforge_jar(tag: &str, client_only: bool) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "horizon-integrated-java-{tag}-{}-{}.jar",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        zip.start_file("META-INF/neoforge.mods.toml", SimpleFileOptions::default())
+            .unwrap();
+        writeln!(
+            zip,
+            "modLoader = \"javafml\"\n\n[[mods]]\nmodId = \"{tag}\"\nversion = \"1.0\"\nclientSideOnly = {client_only}"
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        path
+    }
 
     #[test]
-    fn integrated_server_skips_client_only_java_diagnostics() {
-        assert!(client_only_server_error(
-            "mod.jar: no native Fabric or NeoForge entrypoint for server execution (available: client)"
+    fn integrated_loader_batches_server_jars_and_skips_client_only() {
+        let client = neoforge_jar("client", true);
+        let server = neoforge_jar("server", false);
+        let paths = server_java_paths(&[client.clone(), server.clone()]).unwrap();
+        assert_eq!(paths, [server.clone()]);
+        let _ = fs::remove_file(client);
+        let _ = fs::remove_file(server);
+    }
+
+    #[test]
+    fn integrated_loader_reports_malformed_metadata_before_running_any_jar() {
+        let path = std::env::temp_dir().join(format!(
+            "horizon-integrated-java-bad-{}-{}.jar",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
-        assert!(client_only_server_error(
-            "mod.jar: clientSideOnly mod cannot run for server execution"
-        ));
-        assert!(!client_only_server_error(
-            "mod.jar: no native Fabric or NeoForge entrypoint for server execution (available: none)"
-        ));
-        assert!(!client_only_server_error(
-            "mod.jar: native interpreter failed at demo.Mod"
-        ));
+        fs::write(&path, b"not a jar").unwrap();
+        let error = server_java_paths(std::slice::from_ref(&path)).unwrap_err();
+        assert!(error.contains(&path.display().to_string()));
+        let _ = fs::remove_file(path);
     }
 
     #[test]
