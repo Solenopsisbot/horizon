@@ -3530,7 +3530,11 @@ impl Host for StdHost {
             ));
         }
         if (r.owner == "net/minecraft/world/level/Level"
-            || r.owner == "net/minecraft/world/level/block/entity/BlockEntity")
+            || r.owner == "net/minecraft/world/level/block/entity/BlockEntity"
+            // Forge and NeoForge expose the same bounded capability lookup on
+            // entities. Keep it keyed by the owner so a block capability seed
+            // cannot accidentally satisfy an entity query.
+            || r.owner == "net/minecraft/world/entity/Entity")
             && r.name == "getCapability"
             && r.descriptor.ends_with("LazyOptional;")
             && args.len() >= 2
