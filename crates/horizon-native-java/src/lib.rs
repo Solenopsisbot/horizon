@@ -5,6 +5,7 @@
 //! outside the loaded jar cross [`Host`], so unsupported behavior is explicit.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs::File,
     path::Path,
@@ -8290,6 +8291,10 @@ impl NativeJar {
                                     redirect,
                                     cancellable,
                                 );
+                                if let Some(reason) = unsupported_anchor_modifiers(anchor) {
+                                    unresolved.push((plan, reason));
+                                    continue;
+                                }
                                 match resolve_anchor_site(&plan)
                                     .and_then(|site| validate_anchor_plan(self, &plan, &site))
                                 {
@@ -14146,6 +14151,13 @@ fn arg_count(desc: &str) -> usize {
         i += 1;
         n += 1;
     }
+    DESCRIPTOR_COUNT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= MAX_DESCRIPTOR_COUNT_CACHE {
+            cache.clear();
+        }
+        cache.insert(desc.to_owned(), n);
+    });
     n
 }
 
@@ -16008,6 +16020,12 @@ fn is_bounded_jump_opcode(opcode: u8) -> bool {
 
 /// Resolve one anchor plan's raw selector to the bounded site it names.
 fn resolve_anchor_site(plan: &MixinAnchorPlan) -> Result<ResolvedAnchor, String> {
+    if plan.slice_from.is_some() || plan.slice_to.is_some() {
+        return Err(format!(
+            "native Mixin @At(\"{}\") anchor does not model @Slice; slices are supported only for HEAD/RETURN/TAIL/INVOKE injection plans",
+            plan.at
+        ));
+    }
     if plan.ordinal.is_some_and(|ordinal| ordinal < 0) {
         return Err(format!(
             "@At.ordinal {} is negative; native anchors use a non-negative site ordinal",
@@ -16092,6 +16110,33 @@ fn resolve_anchor_site(plan: &MixinAnchorPlan) -> Result<ResolvedAnchor, String>
             "native anchor execution does not support anchor {other}"
         )),
     }
+}
+
+/// Return a stable report-only reason for modifiers that the call-site anchor
+/// runtime cannot apply without changing the selected bytecode operation.
+///
+/// `@At(shift = NONE)` is the default no-op and remains executable.  A
+/// non-trivial shift or `by` value is intentionally kept out of the native
+/// anchor set; the bounded weaver currently applies those modifiers only to
+/// `MixinInjectionPlan` INVOKE/HEAD/RETURN/TAIL selectors.
+fn unsupported_anchor_modifiers(anchor: &AtSelector) -> Option<String> {
+    if anchor.slice_from.is_some() || anchor.slice_to.is_some() {
+        return Some(format!(
+            "native Mixin @At(\"{}\") anchor does not model @Slice; slices are supported only for HEAD/RETURN/TAIL/INVOKE injection plans",
+            anchor.anchor
+        ));
+    }
+    let shift = anchor
+        .shift
+        .as_deref()
+        .map(|value| value.rsplit('.').next().unwrap_or(value));
+    if anchor.by.is_some() || shift.is_some_and(|value| value != "NONE") {
+        return Some(format!(
+            "native Mixin @At(\"{}\") anchor does not model shift/by; call-site shifts are supported only for INVOKE injection plans",
+            anchor.anchor
+        ));
+    }
+    None
 }
 
 /// Whether a callback's parameter list is `base`, or `base` plus one trailing
@@ -24575,6 +24620,37 @@ mandatory = true
         );
         assert!(resolve_anchor_site(&plan("JUMP", Some("not-an-offset"), None)).is_err());
         assert!(resolve_anchor_site(&plan("JUMP", None, Some(0x2a))).is_err());
+
+        let mut sliced = plan("FIELD", Some("#count:I"), None);
+        sliced.slice_from = Some("HEAD".into());
+        sliced.slice_to = Some("RETURN".into());
+        let error = resolve_anchor_site(&sliced).expect_err("anchor slices stay report-only");
+        assert!(error.contains("does not model @Slice"));
+    }
+
+    #[test]
+    fn anchor_modifier_diagnostics_keep_noop_shift_executable() {
+        let selector = AtSelector {
+            anchor: "FIELD".into(),
+            target: Some("#count:I".into()),
+            opcode: None,
+            ordinal: None,
+            shift: Some("NONE".into()),
+            by: None,
+            slice_from: None,
+            slice_to: None,
+        };
+        assert!(unsupported_anchor_modifiers(&selector).is_none());
+
+        let mut shifted = selector.clone();
+        shifted.shift = Some("AFTER".into());
+        let error = unsupported_anchor_modifiers(&shifted).expect("shift must be reported");
+        assert!(error.contains("does not model shift/by"));
+
+        shifted.shift = None;
+        shifted.by = Some(2);
+        let error = unsupported_anchor_modifiers(&shifted).expect("by must be reported");
+        assert!(error.contains("does not model shift/by"));
     }
 
     #[test]
