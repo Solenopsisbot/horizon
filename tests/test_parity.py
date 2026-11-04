@@ -6,17 +6,12 @@ README = Path(__file__).resolve().parents[1] / 'README.md'
 
 
 class ParityTests(unittest.TestCase):
-    def test_readme_percentage_matches_table(self):
+    def test_readme_scoped_status_is_explicit(self):
         text = README.read_text()
-        heading = re.search(r'^### Java parity: (\d+)%$', text, re.MULTILINE)
-        self.assertIsNotNone(heading, 'README parity heading is missing')
-        table = text[heading.end():].split('| Subsystem | Score | Main gaps |', 1)[1].split('\n\n', 1)[0]
-        scores = [float(score) for score in re.findall(r'^\| [^|]+ \| (0|0\.25|0\.5|0\.75|1) \| [^|]+ \|$', table, re.MULTILINE)]
-        self.assertEqual(len(scores), table.count('\n|') - 1, 'Every row needs a score of 0, 0.25, 0.5, 0.75 or 1')
-        self.assertEqual(int(heading.group(1)), round(sum(scores) * 100 / len(scores)))
-        badge = re.search(r'badge/vanilla%20parity-(\d+)%25-', text)
-        self.assertIsNotNone(badge, 'README parity badge is missing')
-        self.assertEqual(badge.group(1), heading.group(1), 'The parity badge must match the table')
+        self.assertIn('vanilla%20parity-scoped', text)
+        self.assertIn('**Port-ledger checklist: 0 open** of 833 method-level rows.', text)
+        self.assertIn('does not prove that the corresponding runtime is complete', text)
+
 
 
 if __name__ == '__main__':

@@ -51,7 +51,8 @@ class ReadmeTests(unittest.TestCase):
         status = text.split("## Project status", 1)[1]
         self.assertTrue(status.lstrip().startswith("**Player-visible gaps:"), "the gaps come first under Project status")
         self.assertNotIn("<!--", status.split("###", 1)[0], "the website prints HTML comments of this intro")
-        self.assertTrue(re.search(r"^### Java parity: \d+%$", status, re.M), "the site still reads this heading")
+        self.assertIn("**Port-ledger checklist: 0 open**", status)
+        self.assertNotIn("### Java parity:", status)
 
 
 if __name__ == "__main__":
