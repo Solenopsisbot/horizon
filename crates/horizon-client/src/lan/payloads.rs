@@ -66,11 +66,7 @@ impl PayloadLink {
         // in half, making an otherwise valid registry impossible to apply.
         out.extend_from_slice(&0u16.to_be_bytes());
         let mut count = 0u16;
-        for declaration in self
-            .registry
-            .declarations()
-            .take(u16::MAX as usize)
-        {
+        for declaration in self.registry.declarations().take(u16::MAX as usize) {
             let mut encoded = Vec::new();
             encoded.extend_from_slice(&(declaration.id.len() as u16).to_be_bytes());
             encoded.extend_from_slice(declaration.id.as_bytes());
@@ -210,7 +206,12 @@ impl PayloadLink {
 /// A declaration accepts a concrete direction when it names it or is the
 /// bidirectional play form.
 pub fn accepts(declared: PayloadDirection, direction: PayloadDirection) -> bool {
-    declared == direction || declared == PayloadDirection::PlayBidirectional
+    declared == direction
+        || (declared == PayloadDirection::PlayBidirectional
+            && matches!(
+                direction,
+                PayloadDirection::PlayToClient | PayloadDirection::PlayToServer
+            ))
 }
 
 /// The jars and registrations of running Java mods, so a received frame can
@@ -577,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn bidirectional_declarations_accept_both_play_directions() {
+    fn bidirectional_declarations_accept_only_play_directions() {
         let mut link = PayloadLink::new(registry([declaration(
             "demo:both",
             PayloadDirection::PlayBidirectional,
@@ -591,6 +592,27 @@ mod tests {
         assert!(
             link.send("demo:both", PayloadDirection::PlayToClient, Vec::new())
                 .is_ok()
+        );
+        assert!(
+            link.send(
+                "demo:both",
+                PayloadDirection::ConfigurationToClient,
+                Vec::new()
+            )
+            .is_err()
+        );
+        let configuration_frame = PayloadFrame::new(
+            "demo:both",
+            PayloadDirection::ConfigurationToServer,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            link.receive(
+                &configuration_frame.encode(),
+                PayloadDirection::ConfigurationToServer
+            )
+            .is_err()
         );
         assert!(
             link.send("demo:both", PayloadDirection::PlayToServer, vec![1])
