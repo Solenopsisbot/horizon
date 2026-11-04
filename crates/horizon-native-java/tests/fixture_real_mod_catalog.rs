@@ -689,6 +689,12 @@ version = "1.0"
         let dispatches = host.dispatch_event(Value::Ref(Some("ServerTickEvent.Pre".into())));
         assert_eq!(dispatches.len(), 1, "{kind} listener should be retained");
         jar.execute_dispatch(&dispatches[0], &mut host).unwrap();
+        // The server loop uses the same resident host for the matching Post
+        // phase. Keep this explicit so a fixture cannot accidentally pass
+        // while only the pre tick marker is dispatchable.
+        let post_dispatches = host.dispatch_event(Value::Ref(Some("ServerTickEvent.Post".into())));
+        assert_eq!(post_dispatches.len(), 1, "{kind} listener should receive post ticks");
+        jar.execute_dispatch(&post_dispatches[0], &mut host).unwrap();
         let getenv = host
             .invocations()
             .iter()
@@ -697,7 +703,10 @@ version = "1.0"
             .collect::<Vec<_>>();
         assert_eq!(
             getenv,
-            vec![Some(Value::Ref(Some(marker.into())))],
+            vec![
+                Some(Value::Ref(Some(marker.into()))),
+                Some(Value::Ref(Some(marker.into()))),
+            ],
             "{kind} callback did not run"
         );
     }
