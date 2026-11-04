@@ -384,7 +384,10 @@ version = "1.0"
         payloads[1].payload_type,
         Value::Ref(Some("java/lang/Object".into()))
     );
-    assert_eq!(payloads[1].codec, Value::Ref(Some("catalog:client_codec".into())));
+    assert_eq!(
+        payloads[1].codec,
+        Value::Ref(Some("catalog:client_codec".into()))
+    );
     assert!(matches!(payloads[1].handler, Value::Ref(Some(_))));
 
     let _ = fs::remove_dir_all(root);
