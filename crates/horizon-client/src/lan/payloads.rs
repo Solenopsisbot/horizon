@@ -377,6 +377,12 @@ pub fn store_declared(
         count += 1;
     }
     *DECLARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(registry);
+    // Frames queued by a previous content root must not be sent using the
+    // replacement registry. Drop them atomically with the declaration swap.
+    JAVA_OUTGOING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     Ok(count)
 }
 
@@ -807,5 +813,29 @@ mod tests {
             marker,
             Value::Ref(Some(format!("payload-bytes/{}", "ab".repeat(256))))
         );
+    }
+
+    #[test]
+    fn replacing_declarations_discards_queued_java_frames() {
+        clear_handler_jars();
+        let old = declaration(
+            "demo:old",
+            PayloadDirection::PlayToServer,
+            Some("minecraft:raw"),
+        );
+        store_declared([old]).unwrap();
+        let mut host = horizon_native_java::StdHost::new();
+        host.queue_outgoing_payload("demo:old", "playToServer", vec![1]);
+        assert_eq!(publish_from_host(&mut host).unwrap(), 1);
+
+        // Replacing the content root invalidates sends queued under its old
+        // declarations, so no stale frame can leak into the new session.
+        store_declared([declaration(
+            "demo:new",
+            PayloadDirection::PlayToServer,
+            Some("minecraft:raw"),
+        )])
+        .unwrap();
+        assert!(take_java_outgoing().is_empty());
     }
 }
