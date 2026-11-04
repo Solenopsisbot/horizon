@@ -7,10 +7,12 @@ Two kinds of mod run in Horizon:
 | **Content mod** | `.hmod` | Data and assets: blocks, items, recipes, loot, tags, models, textures, structures. No code. | Read when the game starts |
 | **Native mod** | `.hnmod` | A [horizon-mixins](https://github.com/horizon-rust/horizon-mixins) bundle: Rust that changes the game's own source before it is compiled. | In a game the launcher builds for the player ([native-mods.md](native-mods.md)) |
 
-Fabric and NeoForge jars do **not** run as they are: their code calls and patches Minecraft's Java classes, and
-Horizon has none. What carries over is the data and assets inside a jar ([modpacks.md](modpacks.md)). The design
-for closing that gap, by supplying those classes and running the jar against them, is
-[java-mod-compat.md](java-mod-compat.md); none of it is built.
+Fabric and NeoForge jars do **not** run as ordinary player mods: their code calls and patches Minecraft's Java
+classes, while the shipped game exposes the native content and Rust-mod paths above. What carries over through the
+launcher is the data and assets inside a jar ([modpacks.md](modpacks.md)). A separate, developer-facing compatibility
+runtime now probes bounded 26.3 jars through `horizon-native-java` and can use the optional `horizon-jvm` fallback;
+its current limits and status are in [java-mod-compat.md](java-mod-compat.md) and
+[java-mod-compat-status.md](java-mod-compat-status.md). It is not yet the install-and-play Java-mod path.
 
 Mods are **off by default**. A fresh install has no `horizon-mods` folder and plays exactly like vanilla 26.3.
 
