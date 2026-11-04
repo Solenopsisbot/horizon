@@ -2135,8 +2135,33 @@ const FRIENDLY_BYTE_BUF_STATE: &str = r#"    protected java.util.List<Object> ho
         horizonPut(value >> 8);
         horizonPut(value);
     }
+    protected void horizonPutShortLE(int value) {
+        horizonPut(value);
+        horizonPut(value >> 8);
+    }
     protected int horizonGetShort() {
         return (horizonGet() << 8) | horizonGet();
+    }
+    protected int horizonGetShortLE() {
+        return horizonGet() | (horizonGet() << 8);
+    }
+    protected void horizonPutMedium(int value) {
+        horizonPut(value >> 16);
+        horizonPut(value >> 8);
+        horizonPut(value);
+    }
+    protected void horizonPutMediumLE(int value) {
+        horizonPut(value);
+        horizonPut(value >> 8);
+        horizonPut(value >> 16);
+    }
+    protected int horizonGetMedium() {
+        int value = (horizonGet() << 16) | (horizonGet() << 8) | horizonGet();
+        return (value & 0x800000) == 0 ? value : value | 0xff000000;
+    }
+    protected int horizonGetMediumLE() {
+        int value = horizonGet() | (horizonGet() << 8) | (horizonGet() << 16);
+        return (value & 0x800000) == 0 ? value : value | 0xff000000;
     }
     protected void horizonPutInt(int value) {
         horizonPut(value >> 24);
@@ -2144,15 +2169,32 @@ const FRIENDLY_BYTE_BUF_STATE: &str = r#"    protected java.util.List<Object> ho
         horizonPut(value >> 8);
         horizonPut(value);
     }
+    protected void horizonPutIntLE(int value) {
+        horizonPut(value);
+        horizonPut(value >> 8);
+        horizonPut(value >> 16);
+        horizonPut(value >> 24);
+    }
     protected int horizonGetInt() {
         return (horizonGet() << 24) | (horizonGet() << 16) | (horizonGet() << 8) | horizonGet();
+    }
+    protected int horizonGetIntLE() {
+        return horizonGet() | (horizonGet() << 8) | (horizonGet() << 16) | (horizonGet() << 24);
     }
     protected void horizonPutLong(long value) {
         for (int shift = 56; shift >= 0; shift -= 8) horizonPut((int) (value >> shift));
     }
+    protected void horizonPutLongLE(long value) {
+        for (int shift = 0; shift <= 56; shift += 8) horizonPut((int) (value >> shift));
+    }
     protected long horizonGetLong() {
         long value = 0L;
         for (int i = 0; i < 8; i++) value = (value << 8) | (long) horizonGet();
+        return value;
+    }
+    protected long horizonGetLongLE() {
+        long value = 0L;
+        for (int shift = 0; shift <= 56; shift += 8) value |= (long) horizonGet() << shift;
         return value;
     }
     protected void horizonPutVarInt(int value) {
@@ -5816,11 +5858,30 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("writeShort", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
                 return "horizonPutShort(p0); return this;".to_owned();
             }
+            ("writeShortLE", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutShortLE(p0); return this;".to_owned();
+            }
             ("readShort", "short", "()S") => {
                 return "return (short) horizonGetShort();".to_owned();
             }
+            ("readShortLE", "short", "()S") => {
+                return "return (short) horizonGetShortLE();".to_owned();
+            }
             ("readUnsignedShort", "int", "()I") => {
                 return "return horizonGetShort();".to_owned();
+            }
+            ("readUnsignedShortLE", "int", "()I") => {
+                return "return horizonGetShortLE();".to_owned();
+            }
+            ("writeMedium", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutMedium(p0); return this;".to_owned();
+            }
+            ("writeMediumLE", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutMediumLE(p0); return this;".to_owned();
+            }
+            ("readMedium", "int", "()I") => return "return horizonGetMedium();".to_owned(),
+            ("readMediumLE", "int", "()I") => {
+                return "return horizonGetMediumLE();".to_owned();
             }
             ("writeChar", _, "(C)Lnet/minecraft/network/FriendlyByteBuf;") => {
                 return "horizonPutShort(p0); return this;".to_owned();
@@ -5829,7 +5890,11 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("writeInt", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
                 return "horizonPutInt(p0); return this;".to_owned();
             }
+            ("writeIntLE", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutIntLE(p0); return this;".to_owned();
+            }
             ("readInt", "int", "()I") => return "return horizonGetInt();".to_owned(),
+            ("readIntLE", "int", "()I") => return "return horizonGetIntLE();".to_owned(),
             ("writeVarInt", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
                 return "horizonPutVarInt(p0); return this;".to_owned();
             }
@@ -5837,7 +5902,11 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("writeLong", _, "(J)Lnet/minecraft/network/FriendlyByteBuf;") => {
                 return "horizonPutLong(p0); return this;".to_owned();
             }
+            ("writeLongLE", _, "(J)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutLongLE(p0); return this;".to_owned();
+            }
             ("readLong", "long", "()J") => return "return horizonGetLong();".to_owned(),
+            ("readLongLE", "long", "()J") => return "return horizonGetLongLE();".to_owned(),
             ("writeVarLong", _, "(J)Lnet/minecraft/network/FriendlyByteBuf;") => {
                 return "horizonPutVarLong(p0); return this;".to_owned();
             }
@@ -9186,14 +9255,28 @@ mod tests {
         ("writeShort", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
         ("readShort", "()S"),
         ("readUnsignedShort", "()I"),
+        ("writeShortLE", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readShortLE", "()S"),
+        ("readUnsignedShortLE", "()I"),
+        ("writeMedium", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readMedium", "()I"),
+        (
+            "writeMediumLE",
+            "(I)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readMediumLE", "()I"),
         ("writeChar", "(C)Lnet/minecraft/network/FriendlyByteBuf;"),
         ("readChar", "()C"),
         ("writeInt", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
         ("readInt", "()I"),
+        ("writeIntLE", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readIntLE", "()I"),
         ("writeVarInt", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
         ("readVarInt", "()I"),
         ("writeLong", "(J)Lnet/minecraft/network/FriendlyByteBuf;"),
         ("readLong", "()J"),
+        ("writeLongLE", "(J)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readLongLE", "()J"),
         ("writeVarLong", "(J)Lnet/minecraft/network/FriendlyByteBuf;"),
         ("readVarLong", "()J"),
         ("writeFloat", "(F)Lnet/minecraft/network/FriendlyByteBuf;"),
@@ -9465,6 +9548,14 @@ mod tests {
         byte[] raw = buf.readByteArray();
         if (raw.length != 3 || raw[2] != 3) throw new AssertionError("byte array");
         if (buf.readableBytes() != 0 || buf.isReadable()) throw new AssertionError("drained " + buf.readableBytes());
+        FriendlyByteBuf little = new FriendlyByteBuf();
+        little.writeShortLE(-300).writeMedium(-0x12345).writeMediumLE(-0x12345);
+        little.writeIntLE(0x01020304).writeLongLE(-9007199254740993L);
+        if (little.readShortLE() != -300) throw new AssertionError("short le");
+        if (little.readMedium() != -0x12345) throw new AssertionError("medium");
+        if (little.readMediumLE() != -0x12345) throw new AssertionError("medium le");
+        if (little.readIntLE() != 0x01020304) throw new AssertionError("int le");
+        if (little.readLongLE() != -9007199254740993L) throw new AssertionError("long le");
         java.util.function.BiConsumer<FriendlyByteBuf, String> writeString = (b, value) -> b.writeUtf(value);
         java.util.function.Function<FriendlyByteBuf, Object> readString = b -> b.readUtf();
         FriendlyByteBuf second = new FriendlyByteBuf();

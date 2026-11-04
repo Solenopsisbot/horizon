@@ -5723,7 +5723,7 @@ impl Host for StdHost {
                 "net/fabricmc/loader/api/FabricLoader",
                 "getEntrypoints" | "getEntrypointContainers",
                 "(Ljava/lang/String;)Ljava/util/List;"
-                    | "(Ljava/lang/String;Ljava/lang/Class;)Ljava/util/List;",
+                | "(Ljava/lang/String;Ljava/lang/Class;)Ljava/util/List;",
             ) => {
                 let kind = expect_string(Self::argument(r, args, 0)?);
                 let values = self
@@ -25298,8 +25298,7 @@ mandatory = true
                 &MethodRef {
                     owner: "net/fabricmc/loader/api/FabricLoader".into(),
                     name: "getEntrypointContainers".into(),
-                    descriptor:
-                        "(Ljava/lang/String;Ljava/lang/Class;)Ljava/util/List;".into(),
+                    descriptor: "(Ljava/lang/String;Ljava/lang/Class;)Ljava/util/List;".into(),
                 },
                 &loader,
                 &[
