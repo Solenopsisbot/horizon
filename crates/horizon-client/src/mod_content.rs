@@ -2633,11 +2633,10 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
             &serde_json::to_vec(&remainders)?,
         )?;
     }
-    // Clients must agree on the block states and the mob effects' network ids.
-    if mods
-        .iter()
-        .any(|m| !m.content.blocks.is_empty() || !m.content.effects.is_empty())
-    {
+    // Clients must agree on every built-in registry whose network ids the
+    // overlay can extend, including item-only, entity-only, menu and data
+    // component content. The identity reader hashes the resulting report.
+    if mods.iter().any(|m| !m.content.is_empty()) {
         overlay.write(crate::content_identity::MARKER, b"1")?;
     }
     overlay.write(WARNINGS, warnings.join("\n").as_bytes())?;

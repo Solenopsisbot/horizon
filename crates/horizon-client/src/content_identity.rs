@@ -60,15 +60,38 @@ pub fn identity(root: &Path) -> Result<[u8; 32], IdentityError> {
     }
     let bytes = std::fs::read(root.join("facts.json")).map_err(IdentityError::Read)?;
     let mut hash = hash_facts(&bytes)?;
-    let effects = match std::fs::read(root.join("registries.json")) {
-        Ok(registries) => mod_effects(&registries)?,
-        Err(_) => Vec::new(),
-    };
-    if !effects.is_empty() {
-        hash = hash_effects(hash, &effects);
+    // The overlay assigns network ids to every built-in registry it changes,
+    // including item-only and entity-only content. Hash the complete ordered
+    // report so a marker cannot claim identity coverage while overlooking a
+    // registry whose ids affect packets.
+    if let Ok(registries) = std::fs::read(root.join("registries.json")) {
+        hash = hash_registries(hash, &registries)?;
     }
     identities.insert(root.to_owned(), hash);
     Ok(hash)
+}
+
+fn hash_registries(previous: [u8; 32], bytes: &[u8]) -> Result<[u8; 32], IdentityError> {
+    let report = horizon_protocol::registry::Builtin::parse(
+        std::str::from_utf8(bytes).map_err(|e| IdentityError::Registries(e.to_string()))?,
+    )
+    .map_err(|e| IdentityError::Registries(e.to_string()))?;
+    let mut names: Vec<_> = report.registries.keys().collect();
+    names.sort();
+    let mut hash = Sha256::new();
+    hash.update(previous);
+    for registry in names {
+        hash.update((registry.len() as u64).to_le_bytes());
+        hash.update(registry.as_bytes());
+        let entries = &report.registries[registry].names;
+        hash.update((entries.len() as u64).to_le_bytes());
+        for (id, name) in entries.iter().enumerate() {
+            hash.update((id as u64).to_le_bytes());
+            hash.update((name.len() as u64).to_le_bytes());
+            hash.update(name.as_bytes());
+        }
+    }
+    Ok(hash.finalize().into())
 }
 
 fn hash_facts(bytes: &[u8]) -> Result<[u8; 32], IdentityError> {
@@ -112,7 +135,7 @@ fn hash_effects(blocks: [u8; 32], effects: &[(u64, String)]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::{hash_effects, hash_facts, mod_effects};
+    use super::{hash_effects, hash_facts, hash_registries, mod_effects};
 
     #[test]
     fn mod_effects_join_the_identity() {
@@ -152,5 +175,28 @@ mod tests {
         assert!(hash_facts(br#"{"states":[["x",false,false,"x","minecraft:stone"]]}"#).is_err());
         assert!(hash_facts(br#"{"states":[[]]}"#).is_err());
         assert!(hash_facts(br#"{"states":[["x",false,false,"x",{"id":"x"},0]]}"#).is_err());
+    }
+
+    #[test]
+    fn registry_identity_tracks_item_only_and_entity_id_changes() {
+        let report = |item: &str, entity: &str| {
+            format!(
+                r#"{{"minecraft:item":{{"entries":{{"minecraft:air":{{"protocol_id":0}},"{item}":{{"protocol_id":1}}}}}},"minecraft:entity_type":{{"entries":{{"minecraft:pig":{{"protocol_id":0}},"{entity}":{{"protocol_id":1}}}}}}}}"#
+            )
+        };
+        let base = [3; 32];
+        let first = hash_registries(base, report("demo:token", "demo:drone").as_bytes()).unwrap();
+        assert_ne!(
+            first,
+            hash_registries(base, report("demo:other", "demo:drone").as_bytes()).unwrap()
+        );
+        assert_ne!(
+            first,
+            hash_registries(base, report("demo:token", "demo:beetle").as_bytes()).unwrap()
+        );
+        assert_eq!(
+            first,
+            hash_registries(base, report("demo:token", "demo:drone").as_bytes()).unwrap()
+        );
     }
 }
