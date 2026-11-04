@@ -309,6 +309,7 @@ public final class NeoCatalogMod {
   private void registerPayloads(RegisterPayloadHandlersEvent event) {
     PayloadRegistrar registrar = event.registrar("1");
     registrar.playToServer(Object.class, "catalog:codec", (payload, context) -> { });
+    registrar.playToClient(Object.class, "catalog:client_codec", (payload, context) -> { });
   }
 }
 "#,
@@ -370,7 +371,7 @@ version = "1.0"
     jar.execute_dispatch(&dispatches[0], &mut host).unwrap();
     assert_called!(&host, NEO_PAYLOAD_EVENT, "registrar", 1);
     let payloads = host.payload_registrations();
-    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads.len(), 2);
     assert_eq!(payloads[0].direction, "playToServer");
     assert_eq!(
         payloads[0].payload_type,
@@ -378,6 +379,13 @@ version = "1.0"
     );
     assert_eq!(payloads[0].codec, Value::Ref(Some("catalog:codec".into())));
     assert!(matches!(payloads[0].handler, Value::Ref(Some(_))));
+    assert_eq!(payloads[1].direction, "playToClient");
+    assert_eq!(
+        payloads[1].payload_type,
+        Value::Ref(Some("java/lang/Object".into()))
+    );
+    assert_eq!(payloads[1].codec, Value::Ref(Some("catalog:client_codec".into())));
+    assert!(matches!(payloads[1].handler, Value::Ref(Some(_))));
 
     let _ = fs::remove_dir_all(root);
 }
