@@ -5721,7 +5721,8 @@ impl Host for StdHost {
             (
                 "net/fabricmc/loader/api/FabricLoader",
                 "getEntrypoints" | "getEntrypointContainers",
-                "(Ljava/lang/String;)Ljava/util/List;",
+                "(Ljava/lang/String;)Ljava/util/List;"
+                    | "(Ljava/lang/String;Ljava/lang/Class;)Ljava/util/List;",
             ) => {
                 let kind = expect_string(Self::argument(r, args, 0)?);
                 let values = self
@@ -25182,6 +25183,35 @@ mandatory = true
             )
             .unwrap(),
             Value::Int(1)
+        );
+        let typed_entries = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "net/fabricmc/loader/api/FabricLoader".into(),
+                    name: "getEntrypointContainers".into(),
+                    descriptor:
+                        "(Ljava/lang/String;Ljava/lang/Class;)Ljava/util/List;".into(),
+                },
+                &loader,
+                &[
+                    Value::Ref(Some("main".into())),
+                    Value::Ref(Some("class/net.fabricmc.api.ModInitializer".into())),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/List".into(),
+                    name: "size".into(),
+                    descriptor: "()I".into(),
+                },
+                &typed_entries,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1),
+            "the generic Fabric entrypoint-container overload must retain the same ordered rows"
         );
         let container = host
             .invoke_instance(
