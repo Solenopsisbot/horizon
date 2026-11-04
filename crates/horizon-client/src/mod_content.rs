@@ -289,7 +289,29 @@ pub fn declared_block_entity_map(
             }
         }
     }
-    out
+    normalize_block_entity_map(out)
+}
+
+/// Keep each declaration's block list in sync with the effective map after
+/// duplicate blocks are resolved. This prevents a shadowed block from being
+/// emitted again when the declaration store is serialized for a guest.
+fn normalize_block_entity_map(
+    mut map: BTreeMap<String, DeclaredBlockEntity>,
+) -> BTreeMap<String, DeclaredBlockEntity> {
+    let mut blocks_by_declaration: BTreeMap<(String, String, bool), Vec<String>> = BTreeMap::new();
+    for (block, row) in &map {
+        blocks_by_declaration
+            .entry((row.id.clone(), row.template.clone(), row.ticker))
+            .or_default()
+            .push(block.clone());
+    }
+    for row in map.values_mut() {
+        let key = (row.id.clone(), row.template.clone(), row.ticker);
+        if let Some(blocks) = blocks_by_declaration.get(&key) {
+            row.valid_blocks = blocks.clone();
+        }
+    }
+    map
 }
 
 /// The last [`declared_block_entity_map`], for world load, save and chunk
@@ -553,6 +575,7 @@ pub fn declared_block_entity_map_from_rows(
             }
         }
     }
+    let out = normalize_block_entity_map(out);
     if out.len() > MAX_DECLARED_BLOCK_ENTITIES {
         return Err(format!(
             "declared block entities {} exceed {MAX_DECLARED_BLOCK_ENTITIES}",
@@ -2815,8 +2838,21 @@ mod declared_java_content_tests {
         assert_eq!(map["ruby:box"].id, "ruby:aaa_entity");
         assert_eq!(map["ruby:box"].template, "minecraft:chest");
         assert!(!map["ruby:box"].ticker);
-        // One declaration's rows rebuild its valid_blocks.
-        assert_eq!(map["ruby:crate"].valid_blocks, ["ruby:box", "ruby:crate"]);
+        // The effective map excludes the block shadowed by the lower id.
+        assert_eq!(map["ruby:crate"].valid_blocks, ["ruby:crate"]);
+    }
+
+    #[test]
+    fn shadowed_blocks_are_removed_from_the_winning_declaration_rows() {
+        let map = declared_block_entity_map_from_rows([
+            row("ruby:box", "ruby:z_entity", "minecraft:barrel", true),
+            row("ruby:crate", "ruby:z_entity", "minecraft:barrel", true),
+            row("ruby:box", "ruby:a_entity", "minecraft:chest", false),
+        ])
+        .unwrap();
+        assert_eq!(map["ruby:box"].id, "ruby:a_entity");
+        assert_eq!(map["ruby:box"].valid_blocks, ["ruby:box"]);
+        assert_eq!(map["ruby:crate"].valid_blocks, ["ruby:crate"]);
     }
 
     #[test]

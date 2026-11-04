@@ -1055,7 +1055,11 @@ fn server_java_paths(paths: &[PathBuf]) -> std::result::Result<Vec<PathBuf>, Str
     for path in paths {
         let jar = horizon_native_java::NativeJar::from_path(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        if jar.client_side_only {
+        let has_server_entrypoint = ["server", "main", "neoforge"]
+            .into_iter()
+            .any(|kind| !jar.discover_entrypoints(kind).is_empty());
+        let has_client_entrypoint = !jar.discover_entrypoints("client").is_empty();
+        if jar.client_side_only || (!has_server_entrypoint && has_client_entrypoint) {
             log::info!(
                 "Horizon: skipping client-only Java mod on integrated server: {}",
                 path.display()
@@ -1137,13 +1141,37 @@ mod tests {
         path
     }
 
+    fn fabric_client_jar(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "horizon-integrated-fabric-{tag}-{}-{}.jar",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        zip.start_file("fabric.mod.json", SimpleFileOptions::default())
+            .unwrap();
+        writeln!(
+            zip,
+            r#"{{"schemaVersion":1,"id":"{tag}","version":"1.0","entrypoints":{{"client":["demo.Client"]}}}}"#
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
     #[test]
     fn integrated_loader_batches_server_jars_and_skips_client_only() {
         let client = neoforge_jar("client", true);
         let server = neoforge_jar("server", false);
-        let paths = server_java_paths(&[client.clone(), server.clone()]).unwrap();
+        let fabric_client = fabric_client_jar("fabric-client");
+        let paths =
+            server_java_paths(&[client.clone(), fabric_client.clone(), server.clone()]).unwrap();
         assert_eq!(paths, [server.clone()]);
         let _ = fs::remove_file(client);
+        let _ = fs::remove_file(fabric_client);
         let _ = fs::remove_file(server);
     }
 
