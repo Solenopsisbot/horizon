@@ -462,7 +462,11 @@ fn run() -> Result<(), String> {
     // the flags select and says that nothing was attempted.
     if provider_report && args.is_empty() && !real_loader && !fml_flags.list && !fml_flags.report {
         print_provider_report(
-            &ProviderReport::not_run(&game_provider.jars, &game_provider.version),
+            &ProviderReport::not_run(
+                &game_provider.jars,
+                &game_provider.version,
+                ProviderSide::for_entry_kind(&entry_kind),
+            ),
             fml_flags.json,
         );
         return Ok(());
@@ -473,7 +477,11 @@ fn run() -> Result<(), String> {
         list_mixin_configs(&args, &mixin_config_args)?;
         if provider_report {
             print_provider_report(
-                &ProviderReport::not_run(&game_provider.jars, &game_provider.version),
+                &ProviderReport::not_run(
+                    &game_provider.jars,
+                    &game_provider.version,
+                    ProviderSide::for_entry_kind(&entry_kind),
+                ),
                 fml_flags.json,
             );
         }
@@ -486,7 +494,11 @@ fn run() -> Result<(), String> {
         list_entrypoints(&args)?;
         if provider_report {
             print_provider_report(
-                &ProviderReport::not_run(&game_provider.jars, &game_provider.version),
+                &ProviderReport::not_run(
+                    &game_provider.jars,
+                    &game_provider.version,
+                    ProviderSide::for_entry_kind(&entry_kind),
+                ),
                 fml_flags.json,
             );
         }
@@ -741,6 +753,7 @@ fn run() -> Result<(), String> {
                     &outcome,
                     game_provider.jars.len(),
                     &game_provider.version,
+                    ProviderSide::for_entry_kind(&entry_kind),
                 ),
                 fml_flags.json,
             );
@@ -1842,6 +1855,32 @@ enum ProviderStatus {
     NotRun,
 }
 
+/// The loader side selected for a provider run. `main` and lifecycle-only
+/// probes use the server side, matching [`client_side`] and the server-first
+/// bridge's authoritative role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderSide {
+    Client,
+    Server,
+}
+
+impl ProviderSide {
+    fn for_entry_kind(entry_kind: &str) -> Self {
+        if client_side(entry_kind) {
+            Self::Client
+        } else {
+            Self::Server
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Server => "server",
+        }
+    }
+}
+
 impl ProviderStatus {
     fn label(self) -> &'static str {
         match self {
@@ -1868,11 +1907,12 @@ impl ProviderOutcome {
     }
 }
 
-/// The `--provider-report` view: provider kind, supplied game jars, version,
-/// status and (only on a fallback) the bounded reason.
+/// The `--provider-report` view: provider kind, selected side, supplied game
+/// jars, version, status and (only on a fallback) the bounded reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderReport {
     kind: ProviderKind,
+    side: ProviderSide,
     game_jars: usize,
     game_version: String,
     status: ProviderStatus,
@@ -1880,9 +1920,10 @@ struct ProviderReport {
 }
 
 impl ProviderReport {
-    fn not_run(jars: &[PathBuf], game_version: &str) -> Self {
+    fn not_run(jars: &[PathBuf], game_version: &str, side: ProviderSide) -> Self {
         Self {
             kind: ProviderKind::for_jars(jars),
+            side,
             game_jars: jars.len(),
             game_version: game_version.to_owned(),
             status: ProviderStatus::NotRun,
@@ -1890,10 +1931,16 @@ impl ProviderReport {
         }
     }
 
-    fn from_outcome(outcome: &ProviderOutcome, game_jars: usize, game_version: &str) -> Self {
+    fn from_outcome(
+        outcome: &ProviderOutcome,
+        game_jars: usize,
+        game_version: &str,
+        side: ProviderSide,
+    ) -> Self {
         match outcome {
             ProviderOutcome::Production { .. } => Self {
                 kind: ProviderKind::Minecraft,
+                side,
                 game_jars,
                 game_version: game_version.to_owned(),
                 status: ProviderStatus::Ok,
@@ -1901,6 +1948,7 @@ impl ProviderReport {
             },
             ProviderOutcome::Fallback { reason, .. } => Self {
                 kind: ProviderKind::Test,
+                side,
                 game_jars,
                 game_version: game_version.to_owned(),
                 status: ProviderStatus::Fallback,
@@ -1908,6 +1956,7 @@ impl ProviderReport {
             },
             ProviderOutcome::Test { .. } => Self {
                 kind: ProviderKind::Test,
+                side,
                 game_jars,
                 game_version: game_version.to_owned(),
                 status: ProviderStatus::Ok,
@@ -1919,6 +1968,7 @@ impl ProviderReport {
     fn text(&self) -> String {
         let mut lines = vec![
             format!("provider: {}", self.kind.label()),
+            format!("side: {}", self.side.label()),
             format!("game jars: {}", self.game_jars),
             format!("game version: {}", self.game_version),
             format!("status: {}", self.status.label()),
@@ -1932,6 +1982,7 @@ impl ProviderReport {
     fn json(&self) -> String {
         let text = serde_json::json!({
             "provider": self.kind.label(),
+            "side": self.side.label(),
             "gameJars": self.game_jars,
             "gameVersion": self.game_version,
             "status": self.status.label(),
@@ -1943,6 +1994,7 @@ impl ProviderReport {
         }
         serde_json::json!({
             "provider": self.kind.label(),
+            "side": self.side.label(),
             "gameJars": self.game_jars,
             "gameVersion": "",
             "status": self.status.label(),
@@ -4977,24 +5029,24 @@ mod tests {
         MAX_FABRIC_ADD_MODS_BYTES, MAX_MIXIN_CONFIG_PROPERTY_BYTES, MAX_PROVIDER_REASON_CHARS,
         MAX_PROVIDER_REPORT_BYTES, MixinBootstrap, MixinConfigRef, MixinEnvironment,
         MixinPhaseDriver, MixinRegistrar, MixinSide, MixinStage, NO_ARG_CONSTRUCTOR, NeoforgeArg,
-        PhaseOutcome, ProviderKind, ProviderOutcome, ProviderReport, ProviderStatus, USAGE,
-        bounded_provider_reason, classpath_separator, client_side, constructor_only_entry_kind,
-        datagen_jvm_options, datagen_provider_line, datagen_providers_line,
-        datagen_shim_unavailable, declared_entrypoint_kinds, discover_entries,
-        discover_mixin_configs, entrypoints_from_metadata, fabric_add_mods, fabric_add_mods_count,
-        fabric_add_mods_line, fabric_entries, fabric_jvm_options, fabric_metadata,
-        fabric_mixin_configs, fallback_label, format_entrypoints, format_mixin_config_property,
-        format_mixin_configs, game_provider_jvm_options, initializer_for_kind, is_datagen_kind,
-        is_minecraft_class, is_minecraft_runtime_jar, link_failure, missing_entry_message,
-        mixin_bootstrap_line, mixin_config_names, mixin_config_property, mixin_configs_line,
-        mixin_jvm_options, mixin_registered_count, mixin_stages, neoforge_constructor,
-        neoforge_constructor_args, neoforge_constructor_descriptor, neoforge_ctor_fallback_line,
-        neoforge_ctor_line, neoforge_dist, neoforge_dist_fields, neoforge_metadata,
-        nested_jar_name, parse_constructors, parse_mixin_config, parse_provider_outcome,
-        pre_launch_entries, quilt_entrypoint_kind, quilt_mixin_configs, register_mixin_configs,
-        report_mixin_configs, run_mixin_phase, select_mixin_configs, should_retry_no_arg,
-        skip_mc_provider_requested, skipped_mixin_configs, split_entrypoint,
-        take_game_provider_args,
+        PhaseOutcome, ProviderKind, ProviderOutcome, ProviderReport, ProviderSide, ProviderStatus,
+        USAGE, bounded_provider_reason, classpath_separator, client_side,
+        constructor_only_entry_kind, datagen_jvm_options, datagen_provider_line,
+        datagen_providers_line, datagen_shim_unavailable, declared_entrypoint_kinds,
+        discover_entries, discover_mixin_configs, entrypoints_from_metadata, fabric_add_mods,
+        fabric_add_mods_count, fabric_add_mods_line, fabric_entries, fabric_jvm_options,
+        fabric_metadata, fabric_mixin_configs, fallback_label, format_entrypoints,
+        format_mixin_config_property, format_mixin_configs, game_provider_jvm_options,
+        initializer_for_kind, is_datagen_kind, is_minecraft_class, is_minecraft_runtime_jar,
+        link_failure, missing_entry_message, mixin_bootstrap_line, mixin_config_names,
+        mixin_config_property, mixin_configs_line, mixin_jvm_options, mixin_registered_count,
+        mixin_stages, neoforge_constructor, neoforge_constructor_args,
+        neoforge_constructor_descriptor, neoforge_ctor_fallback_line, neoforge_ctor_line,
+        neoforge_dist, neoforge_dist_fields, neoforge_metadata, nested_jar_name,
+        parse_constructors, parse_mixin_config, parse_provider_outcome, pre_launch_entries,
+        quilt_entrypoint_kind, quilt_mixin_configs, register_mixin_configs, report_mixin_configs,
+        run_mixin_phase, select_mixin_configs, should_retry_no_arg, skip_mc_provider_requested,
+        skipped_mixin_configs, split_entrypoint, take_game_provider_args,
     };
     use std::{
         fs::File,
@@ -5906,14 +5958,19 @@ config="demo.mixins.json""#,
 
     #[test]
     fn formats_the_provider_report_as_text_and_json() {
-        let report =
-            ProviderReport::from_outcome(&ProviderOutcome::Production { mods: 4 }, 1, "26.3");
+        let report = ProviderReport::from_outcome(
+            &ProviderOutcome::Production { mods: 4 },
+            1,
+            "26.3",
+            ProviderSide::Server,
+        );
         assert_eq!(
             report.text(),
-            "provider: minecraft\ngame jars: 1\ngame version: 26.3\nstatus: ok\n"
+            "provider: minecraft\nside: server\ngame jars: 1\ngame version: 26.3\nstatus: ok\n"
         );
         let value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
         assert_eq!(value["provider"], "minecraft");
+        assert_eq!(value["side"], "server");
         assert_eq!(value["gameJars"], 1);
         assert_eq!(value["status"], "ok");
         assert!(value["fallback"].is_null());
@@ -5925,17 +5982,23 @@ config="demo.mixins.json""#,
             },
             2,
             "26.3",
+            ProviderSide::Server,
         );
         assert_eq!(
             fallback.text(),
-            "provider: test\ngame jars: 2\ngame version: 26.3\nstatus: fallback\nfallback: locateGame returned false\n"
+            "provider: test\nside: server\ngame jars: 2\ngame version: 26.3\nstatus: fallback\nfallback: locateGame returned false\n"
         );
         let value: serde_json::Value = serde_json::from_str(&fallback.json()).unwrap();
         assert_eq!(value["provider"], "test");
+        assert_eq!(value["side"], "server");
         assert_eq!(value["status"], "fallback");
         assert_eq!(value["fallback"], "locateGame returned false");
 
-        let not_run = ProviderReport::not_run(&[PathBuf::from("mc/server.jar")], "26.3");
+        let not_run = ProviderReport::not_run(
+            &[PathBuf::from("mc/server.jar")],
+            "26.3",
+            ProviderSide::Server,
+        );
         assert_eq!(not_run.status, ProviderStatus::NotRun);
         assert!(not_run.text().contains("status: not-run"));
         assert!(!not_run.text().contains("fallback:"));
@@ -5945,6 +6008,7 @@ config="demo.mixins.json""#,
     fn bounds_the_provider_report() {
         let report = ProviderReport {
             kind: ProviderKind::Minecraft,
+            side: ProviderSide::Server,
             game_jars: 1,
             game_version: "x".repeat(MAX_PROVIDER_REPORT_BYTES * 2),
             status: ProviderStatus::Ok,
@@ -5955,6 +6019,16 @@ config="demo.mixins.json""#,
         assert!(report.text().contains("...(truncated)"));
         let value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
         assert_eq!(value["fallback"], "report truncated");
+    }
+
+    #[test]
+    fn reports_the_server_first_side_for_default_and_server_lifecycles() {
+        for kind in ["main", "server", "preLaunch", "neoforge", "datagen"] {
+            assert_eq!(ProviderSide::for_entry_kind(kind), ProviderSide::Server);
+        }
+        assert_eq!(ProviderSide::for_entry_kind("client"), ProviderSide::Client);
+        assert_eq!(ProviderSide::Server.label(), "server");
+        assert_eq!(ProviderSide::Client.label(), "client");
     }
 
     #[test]

@@ -459,6 +459,12 @@ cargo run -q -p horizon-jvm -- [--entry <entrypoint class>] [--entry-kind main|c
 cargo run -q -p horizon-native-java -- --json mods/example.jar main
 ```
 
+For a production-provider probe, add `--provider-report` (and optionally `--json`) to get the selected
+provider, game version, and loader side in one bounded diagnostic. `side: server` covers the default
+`main` kind and the server-first lifecycle kinds; `side: client` is emitted only for `--entry-kind client`.
+The side remains in fallback reports so a server-side provider failure can be diagnosed without inferring it
+from the entrypoint command line.
+
 When `--entry` is omitted, the runner discovers Fabric's `fabric.mod.json` entrypoints (including the
 string, object, and array forms), selects `main` by default, and executes every declaration in metadata
 order; `--entry-kind client` or `server` selects the other environment. Quilt's `quilt.mod.json` keys
