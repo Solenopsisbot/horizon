@@ -380,6 +380,15 @@ impl Game<'_> {
             && (self.serving.is_some() || self.options.dedicated.is_some())
         {
             self.native_lifecycle_server_tick_start(running);
+            let role = if self.options.dedicated.is_some() {
+                super::execution_role::ExecutionRole::DedicatedServer
+            } else {
+                super::execution_role::ExecutionRole::IntegratedServer
+            };
+            super::mods::dispatch_java_event(
+                role,
+                horizon_native_java::Value::Ref(Some("ServerTickEvent.Pre".into())),
+            );
         }
         let observe_level =
             running.is_some() && (self.serving.is_some() || self.options.dedicated.is_some());
@@ -432,6 +441,17 @@ impl Game<'_> {
         // `ServerTickEnd`: an errored tick or an idle-close failure (at
         // the `?` above) never reaches this site.
         self.native_lifecycle_server_tick_end(paused);
+        if running.is_some() && (self.serving.is_some() || self.options.dedicated.is_some()) {
+            let role = if self.options.dedicated.is_some() {
+                super::execution_role::ExecutionRole::DedicatedServer
+            } else {
+                super::execution_role::ExecutionRole::IntegratedServer
+            };
+            super::mods::dispatch_java_event(
+                role,
+                horizon_native_java::Value::Ref(Some("ServerTickEvent.Post".into())),
+            );
+        }
         Ok(())
     }
 

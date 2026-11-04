@@ -8,12 +8,70 @@ use horizon_client::{
     mod_list::{self, Installed},
     text::Text,
 };
-use std::path::PathBuf;
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+};
 
 // The opt-in real-loader preflight lives in `game/fml.rs`; it is registered
 // here because it reports beside this module's Java compatibility lines.
 #[path = "fml.rs"]
 pub(super) mod fml;
+
+/// Resident native Java runtimes keyed by role and jar path. Keeping the jar
+/// and host together makes event callbacks observe the same static fields and
+/// registrations that bootstrap created. The map is process-global because
+/// integrated and dedicated server ticks reach this module through separate
+/// `Game` values; the role prefix prevents cross-role reuse.
+static JAVA_RUNTIMES: OnceLock<
+    Mutex<BTreeMap<String, (horizon_native_java::NativeJar, horizon_native_java::StdHost)>>,
+> = OnceLock::new();
+
+fn java_runtimes()
+-> &'static Mutex<BTreeMap<String, (horizon_native_java::NativeJar, horizon_native_java::StdHost)>>
+{
+    JAVA_RUNTIMES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn java_runtime_key(role: ExecutionRole, path: &std::path::Path) -> String {
+    format!("{}:{}", role_name(role), path.display())
+}
+
+fn clear_java_runtimes(role: ExecutionRole) {
+    let prefix = format!("{}:", role_name(role));
+    java_runtimes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|key, _| !key.starts_with(&prefix));
+}
+
+/// Dispatch one server lifecycle event through the resident native jars. The
+/// event marker is deliberately small; world reads/writes remain Rust-owned
+/// host operations, while Java static state and callback registrations persist
+/// in each resident host. Failures are isolated to the jar and never abort the
+/// server tick.
+pub(super) fn dispatch_java_event(role: ExecutionRole, event: horizon_native_java::Value) -> usize {
+    let mut dispatched = 0;
+    let prefix = format!("{}:", role_name(role));
+    let mut runtimes = java_runtimes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (key, (jar, host)) in runtimes
+        .iter_mut()
+        .filter(|(key, _)| key.starts_with(&prefix))
+    {
+        for dispatch in host.dispatch_event(event.clone()) {
+            match jar.execute_dispatch(&dispatch, host) {
+                Ok(_) => dispatched += 1,
+                Err(error) => {
+                    log::warn!("Horizon: native Java event dispatch for {key} was skipped: {error}")
+                }
+            }
+        }
+    }
+    dispatched
+}
 
 #[derive(Default)]
 pub(super) struct ModsState {
@@ -852,6 +910,7 @@ pub(super) fn run_java_mods_with_report(
     role: ExecutionRole,
 ) -> Result<(Vec<ContentMod>, Vec<JavaCompatibilityReport>), String> {
     let mut reports = Vec::new();
+    clear_java_runtimes(role);
     if paths.is_empty() {
         return Ok((Vec::new(), reports));
     }
@@ -993,6 +1052,10 @@ pub(super) fn run_java_mods_with_report(
             jar.clone(),
             host.payload_registrations().to_vec(),
         );
+        java_runtimes()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(java_runtime_key(role, path), (jar.clone(), host.clone()));
         let listeners = host.listener_registrations().count();
         log::info!(
             "Horizon: native Java {} {} entrypoint(s) completed ({} host calls, {} registrations, {} listeners)",
