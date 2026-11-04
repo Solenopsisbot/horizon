@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 4 November 2026, commit `6114e6403` (verified against NeoForge 26.3.0.101).
+Last checked: 4 November 2026, commit `bb9c7c8d9` (verified against NeoForge 26.3.0.101).
 
 ## Supported now
 
@@ -45,6 +45,7 @@ Last checked: 4 November 2026, commit `6114e6403` (verified against NeoForge 26.
 - [x] Dispatch received payload frames to Java handlers: Fabric receivers are recorded, a frame id resolves through the host packet-type map, and the in-jar handler is invoked with a bounded `payload/<id>/<hex>` argument (plus a context marker); the server tick drains hub frames and routes them. Supported codecs decode before dispatch: UTF-8 string payloads arrive as the string, empty payloads as an empty marker, and raw payloads as `payload-bytes/<hex>`; opaque codecs keep the bounded hex marker. `PayloadValue` gives the transport a typed `Bytes`/`Text`/`Empty`/`Marker` value with bounded decode/encode round trips.
 - [x] Expose the payload transport to the Java host: `StdHost` queues Fabric networking sends with channel bytes, publishes them through the declared registry after bootstrap, and accepts received frames; the hub broadcasts queued frames on the next tick.
 - [x] Transport Java payload frames over LAN: a declared-channel registry travels on `horizon:payload_channels`, frames use `horizon:payload`, the hub and remote client validate direction and supported codecs (raw/UTF-8/empty) with bounded queues, and send/receive APIs exist on both sides. Mod code can originate frames through networking sends, and received frames dispatch to registered handlers through the bounded payload marker.
+- [x] Content identity covers item-only, entity-only, menu and other built-in registry changes: the overlay marks every non-empty content mod, and the ordered built-in registry report is hashed alongside block states so clients cannot silently reuse a matching block identity after another registry's network ids changed.
 - [x] Sync declared Java content to LAN guests: a bounded `horizon:java_content` v2 manifest (declared ids for blocks, items, effects, entity types, data components, attachments, menus and block entities, block→declared id/template/ticker rows, and bounded menu/entity templates) is sent once with the login burst and applied atomically to the guest's global stores, so a guest without the mod jars resolves declared ids and block-entity templates. V1 frames still decode. Malformed, oversized or conflicting manifests are rejected with a bounded reason; block/item templates, menu layout, entity attributes and hot reload are still missing.
 - [x] Replace Java declaration tables and capture LAN manifests as one coherent snapshot with an epoch counter, so resource-root refreshes cannot mix ids, templates and menu/entity rows from different generations.
 - [x] Persist declared menu clicks in the block entity: a declared menu over a template inventory opens as the matching vanilla chest menu on `Slots::Block`, so server clicks write the block entity and client prediction follows the same path.
