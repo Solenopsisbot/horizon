@@ -6,6 +6,14 @@ Dawn. Read it with [mods.md](mods.md) (what runs today), [modpacks.md](modpacks.
 port pipeline) and [native-hooks-neoforge.md](native-hooks-neoforge.md) (hooks named after NeoForge
 events).
 
+**Native product policy.** The shipped compatibility mode is a Rust process with no external JVM
+dependency. `horizon-native-java` is the execution engine for supported Java bytecode, and its host
+boundary maps loader/API calls into Horizon's Rust registries, server thread, networking and content
+stores. `horizon-jvm` is retained as an optional development/reference fallback for jars that have not
+yet reached native coverage; a fallback result never counts as native support and is never required by
+the native mode. A mod is only advertised as native when its exercised entrypoints, hooks and content
+declarations complete without that fallback.
+
 **Scope: 26.3 only.** A jar is in scope when its `fabric.mod.json` or `neoforge.mods.toml` says 26.3.
 Forge and NeoForge split at 1.20.2, so the 26.3 Forge-family loader is NeoForge; a jar declaring the old
 `mods.toml` remains out of runtime scope, while its metadata is still parsed for bounded native
@@ -22,16 +30,18 @@ Minecraft's Java classes, and Horizon has none." This page is the plan for the e
 gives them those classes, so a jar runs — unmodified — beside Horizon's own simulation.
 
 The instinct behind it is right, and this page is that instinct made precise: **map exactly what the
-loaders and the two mod APIs attach to, map what each of those is here, then run the jar against that
-map.** The one correction is the last word. You do not translate the jar to native Rust; you translate
-*the attachment points*, and the jar keeps running as Java. That inversion is what makes the project
-finite instead of a JVM rewrite.
+loaders and the two mod APIs attach to, map what each of those is here, then execute the supported
+bytecode against that map in Rust.** The optional JVM bridge can still run an unmodified jar when a
+native feature is missing, but that bridge is a compatibility aid rather than the product's native
+execution path. Keeping the host ABI and the native interpreter bounded makes the work measurable
+without claiming that every Java library or dynamic loader feature is already implemented.
 
-There is now a deliberately smaller native experiment beside the bridge. `horizon-native-java` parses
+There is now a deliberately smaller native execution path beside the optional bridge. `horizon-native-java` parses
 real classfiles and Fabric metadata, discovers `Class::method` entrypoints, and interprets a bounded
 no-argument bytecode subset. Calls it cannot model cross an explicit Rust `Host` boundary; unsupported
-opcodes report the class, method, and program counter so the launcher can fall back to the embedded JVM.
-This gives simple utility mods a no-JVM path without claiming that the subset is a general Java runtime.
+opcodes report the class, method, and program counter. This gives simple utility mods a no-JVM path
+without claiming that the subset is a general Java runtime; the optional JVM fallback is selected only
+when the caller explicitly allows it.
 
 ## The short version
 
@@ -62,12 +72,14 @@ Compatibility is selected per jar and Horizon build, in this order:
 4. For a mod that needs deeper integration, use the existing port pipeline (Tier 3). Only profiled hot methods
    of a bridged mod may later receive the optional Tier 5 native compilation mark; the rest remains on the JVM.
 
-The tier is a compatibility result, not a performance promise: Tier 0–2 means the jar still executes as Java,
-Tier 3 means an authored native Rust port replaces it, and Tier 4 means the jar is refused with a named reason.
-Native probe success therefore proves only the bounded native surface exercised by its fixture; it does not claim
-that the whole jar has become Rust or that JVM fallback coverage is complete.
+The tier is a compatibility result, not a performance promise. Native tiers 0–2 execute the jar's supported
+bytecode inside the Rust runtime and expose only the host operations named by the tier. Tier 3 is an authored
+native Rust port that replaces the jar. Tier 4 is a refusal with a named reason. An optional fallback label is
+kept separate from those tiers because it executes Java in `horizon-jvm` and therefore is not native coverage.
+Native probe success proves only the bounded native surface exercised by its fixture; it does not claim that the
+whole jar has become Rust or that optional fallback coverage is complete.
 
-## Why a JVM, and not "translate any jar to Rust"
+## Why an optional JVM fallback exists, and why it is not native support
 
 A jar is bytecode for the JVM. Two ways to make it run here:
 
