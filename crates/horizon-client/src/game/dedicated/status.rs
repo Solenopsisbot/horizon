@@ -43,11 +43,27 @@ const ENGINE_LABELS: [JavaEngine; 4] = [
     JavaEngine::Refused,
 ];
 
+/// What actually executed a jar, as opposed to how complete the result was:
+/// a native result stays in process, the sidecar fallback pays for a JVM, and
+/// a refused jar ran on nothing at all. `backends` counts every one.
+fn backend_name(engine: JavaEngine) -> &'static str {
+    match engine {
+        JavaEngine::Native | JavaEngine::NativeQualified => "native",
+        JavaEngine::Sidecar => "jvm",
+        JavaEngine::Refused => "none",
+    }
+}
+
+/// The backends `backends` counts, in the order it prints them.
+const BACKEND_LABELS: [&str; 3] = ["native", "jvm", "none"];
+
 /// The `java` section of `server-status`: which explicitly selected jars the
-/// dedicated loader started, each one's engine, loader, role and entrypoint
-/// kind, how its registrations landed, and whether any was refused. Sorted by
-/// jar path and bounded, so two servers that started the same jars answer the
-/// same.
+/// dedicated loader started, each one's engine, backend, loader, role and
+/// entrypoint kind, how its registrations landed, and whether any was refused.
+/// Each entry also carries the work the jar cost — executed entrypoints, native
+/// host calls, listeners and Mixin planning — and the section totals those over
+/// every jar, so the bounded entry list never hides the whole. Sorted by jar
+/// path and bounded, so two servers that started the same jars answer the same.
 pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
     let mut sorted: Vec<&JavaCompatibilityReport> = reports.iter().collect();
     sorted.sort_by(|a, b| a.jar.cmp(&b.jar));
@@ -70,6 +86,18 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
             (engine_name(*engine).to_owned(), json!(count))
         })
         .collect();
+    // The same jars by what ran them, not by how complete the run was: a
+    // qualified native result still costs no JVM.
+    let backends: serde_json::Map<String, Value> = BACKEND_LABELS
+        .iter()
+        .map(|backend| {
+            let count = sorted
+                .iter()
+                .filter(|report| backend_name(report.engine()) == *backend)
+                .count();
+            ((*backend).to_owned(), json!(count))
+        })
+        .collect();
     let entries: Vec<Value> = sorted
         .iter()
         .take(MAX_STATUS_JARS)
@@ -77,6 +105,7 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
             json!({
                 "jar": report.jar.display().to_string(),
                 "engine": engine_name(report.engine()),
+                "backend": backend_name(report.engine()),
                 "loader": report.loader.map_or("unknown", loader_name),
                 "role": role_name(report.role),
                 "entrypoint": if report.entrypoint_kind.is_empty() {
@@ -87,6 +116,13 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
                 "typed": report.typed_registrations,
                 "opaque": report.opaque_registrations.len(),
                 "promoted": report.promoted.len(),
+                "executed": report.executed_entrypoints,
+                "host_calls": report.host_calls,
+                "listeners": report.listeners,
+                "mixin_plans": report.mixin_plans,
+                "mixin_unresolved": report.mixin_unresolved,
+                "mixin_configs": report.mixin_configs,
+                "mixin_config_errors": report.mixin_config_errors,
                 "payload": report
                     .payload_directions
                     .iter()
@@ -101,9 +137,17 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
         "listed": entries.len(),
         "rejected": sorted.iter().filter(|r| r.client_side_only_rejected).count(),
         "engines": engines,
+        "backends": backends,
         "typed": count(|r| r.typed_registrations),
         "opaque": count(|r| r.opaque_registrations.len()),
         "promoted": count(|r| r.promoted.len()),
+        "executed": count(|r| r.executed_entrypoints),
+        "host_calls": count(|r| r.host_calls),
+        "listeners": count(|r| r.listeners),
+        "mixin_plans": count(|r| r.mixin_plans),
+        "mixin_unresolved": count(|r| r.mixin_unresolved),
+        "mixin_configs": count(|r| r.mixin_configs),
+        "mixin_config_errors": count(|r| r.mixin_config_errors),
         "payload_directions": directions,
         "entries": entries,
     })
@@ -339,5 +383,187 @@ mod tests {
         );
         // The environment's strict request shows even when nothing ran.
         assert_eq!(fml_section(None, true)["strict"], true);
+    }
+
+    /// A compatibility report built in memory with just the fields the status
+    /// section reads, so the backend and workload fields are testable without
+    /// compiling a jar or starting a loader.
+    fn java_report(
+        jar: &str,
+        engine: JavaEngine,
+        executed: usize,
+        host_calls: usize,
+        listeners: usize,
+        mixin: (usize, usize, usize, usize),
+    ) -> JavaCompatibilityReport {
+        JavaCompatibilityReport {
+            jar: std::path::PathBuf::from(jar),
+            id: None,
+            version: None,
+            loader: None,
+            declared_entrypoints: Vec::new(),
+            entrypoint_kind: String::new(),
+            executed_entrypoints: executed,
+            host_calls,
+            typed_registrations: 0,
+            opaque_registrations: Vec::new(),
+            promoted: Vec::new(),
+            payload_directions: Vec::new(),
+            listeners,
+            mixin_plans: mixin.0,
+            mixin_targets: Vec::new(),
+            mixin_unresolved: mixin.1,
+            mixin_configs: mixin.2,
+            mixin_config_errors: mixin.3,
+            client_side_only_rejected: false,
+            isolation_failure: None,
+            role: ExecutionRole::DedicatedServer,
+            engine: Some(engine),
+        }
+    }
+
+    /// The backend answers what ran a jar, not how complete the result was: a
+    /// qualified native run still pays for no JVM, and a refusal pays for
+    /// nothing.
+    #[test]
+    fn every_engine_names_one_backend() {
+        assert_eq!(backend_name(JavaEngine::Native), "native");
+        assert_eq!(backend_name(JavaEngine::NativeQualified), "native");
+        assert_eq!(backend_name(JavaEngine::Sidecar), "jvm");
+        assert_eq!(backend_name(JavaEngine::Refused), "none");
+    }
+
+    #[test]
+    fn java_section_counts_backends_and_the_work_each_jar_cost() {
+        let reports = [
+            java_report(
+                "/mods/b-sidecar.jar",
+                JavaEngine::Sidecar,
+                2,
+                40,
+                3,
+                (1, 2, 3, 0),
+            ),
+            java_report(
+                "/mods/a-native.jar",
+                JavaEngine::Native,
+                1,
+                7,
+                1,
+                (0, 0, 0, 0),
+            ),
+            java_report(
+                "/mods/c-refused.jar",
+                JavaEngine::Refused,
+                0,
+                0,
+                0,
+                (0, 0, 0, 0),
+            ),
+            java_report(
+                "/mods/d-qualified.jar",
+                JavaEngine::NativeQualified,
+                1,
+                5,
+                0,
+                (2, 1, 1, 1),
+            ),
+        ];
+        let section = java_section(&reports);
+        // Fixed keys: the three backends are always present, zero or not.
+        assert_eq!(
+            section["backends"],
+            json!({"native": 2, "jvm": 1, "none": 1})
+        );
+        assert_eq!(
+            section["engines"],
+            json!({"native": 1, "native-qualified": 1, "sidecar": 1, "refused": 1})
+        );
+        // Totals cover every jar, including any the bounded entry list drops.
+        assert_eq!(section["executed"], 4);
+        assert_eq!(section["host_calls"], 52);
+        assert_eq!(section["listeners"], 4);
+        assert_eq!(section["mixin_plans"], 3);
+        assert_eq!(section["mixin_unresolved"], 3);
+        assert_eq!(section["mixin_configs"], 4);
+        assert_eq!(section["mixin_config_errors"], 1);
+        // Entries are sorted by jar and repeat their own backend and counters.
+        let entries = section["entries"].as_array().unwrap();
+        let jars: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry["jar"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            jars,
+            [
+                "/mods/a-native.jar",
+                "/mods/b-sidecar.jar",
+                "/mods/c-refused.jar",
+                "/mods/d-qualified.jar"
+            ]
+        );
+        assert_eq!(entries[0]["backend"], "native");
+        assert_eq!(entries[0]["host_calls"], 7);
+        assert_eq!(entries[1]["backend"], "jvm");
+        assert_eq!(entries[1]["executed"], 2);
+        assert_eq!(entries[1]["listeners"], 3);
+        assert_eq!(entries[2]["backend"], "none");
+        assert_eq!(entries[2]["executed"], 0);
+        assert_eq!(entries[3]["backend"], "native");
+        assert_eq!(entries[3]["engine"], "native-qualified");
+        assert_eq!(entries[3]["mixin_unresolved"], 1);
+        assert_eq!(entries[3]["mixin_config_errors"], 1);
+    }
+
+    /// A refused jar keeps the report's refusal whatever its other fields say,
+    /// so a backend reader never sees `native` for a jar that never ran.
+    #[test]
+    fn a_refused_jar_is_never_counted_as_native_work() {
+        let mut refused = java_report(
+            "/mods/refused.jar",
+            JavaEngine::Refused,
+            0,
+            0,
+            0,
+            (0, 0, 0, 0),
+        );
+        refused.client_side_only_rejected = true;
+        let section = java_section(&[refused]);
+        assert_eq!(
+            section["backends"],
+            json!({"native": 0, "jvm": 0, "none": 1})
+        );
+        assert_eq!(section["entries"][0]["backend"], "none");
+        assert_eq!(section["entries"][0]["engine"], "refused");
+        assert_eq!(section["entries"][0]["executed"], 0);
+        assert_eq!(section["host_calls"], 0);
+        assert_eq!(section["rejected"], 1);
+    }
+
+    /// The entry list is bounded; the counts and the work totals are not, so a
+    /// server with more jars than the listing still answers for all of them.
+    #[test]
+    fn java_section_totals_survive_the_entry_bound() {
+        let reports: Vec<JavaCompatibilityReport> = (0..MAX_STATUS_JARS + 2)
+            .map(|i| {
+                java_report(
+                    &format!("/mods/{i:02}.jar"),
+                    JavaEngine::Native,
+                    1,
+                    2,
+                    0,
+                    (0, 0, 0, 0),
+                )
+            })
+            .collect();
+        let section = java_section(&reports);
+        assert_eq!(section["jars"], json!(MAX_STATUS_JARS + 2));
+        assert_eq!(section["listed"], json!(MAX_STATUS_JARS));
+        assert_eq!(section["host_calls"], json!(2 * (MAX_STATUS_JARS + 2)));
+        assert_eq!(section["backends"]["native"], json!(MAX_STATUS_JARS + 2));
+        assert_eq!(
+            section["entries"].as_array().unwrap().len(),
+            MAX_STATUS_JARS
+        );
     }
 }
