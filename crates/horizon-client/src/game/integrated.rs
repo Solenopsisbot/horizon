@@ -1169,7 +1169,7 @@ mod tests {
         let fabric_client = fabric_client_jar("fabric-client");
         let paths =
             server_java_paths(&[client.clone(), fabric_client.clone(), server.clone()]).unwrap();
-        assert_eq!(paths, [server.clone()]);
+        assert_eq!(paths.as_slice(), std::slice::from_ref(&server));
         let _ = fs::remove_file(client);
         let _ = fs::remove_file(fabric_client);
         let _ = fs::remove_file(server);
