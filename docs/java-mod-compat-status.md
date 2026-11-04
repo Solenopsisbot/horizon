@@ -2,7 +2,7 @@
 
 Status: active work for Minecraft 26.3. The implementation is tracked in [issue #6679](https://github.com/horizon-rust/horizon/issues/6679). This page is the short progress view; [java-mod-compat.md](java-mod-compat.md) remains the design and phase plan.
 
-Last checked: 4 November 2026, commit `73bdbee85` (verified against NeoForge 26.3.0.101).
+Last checked: 4 November 2026, commit `d64ee01d6` (verified against NeoForge 26.3.0.101).
 
 ## Supported now
 
@@ -93,6 +93,7 @@ Last checked: 4 November 2026, commit `73bdbee85` (verified against NeoForge 26.
 - [x] Generate and test the Java façade, including bounded public Mixin `@Accessor`/`@Invoker` stubs, array-returning signatures, common `Identifier` prefix/language-key/ordering helpers, Holder serialization queries, TagKey values, `HitResult`/`BlockHitResult` state and copy factories, bounded `FluidState` queries, bounded `EntityType.Builder`/`MobCategory`/`EntityDimensions`/`SpawnPlacements` values, bounded `Item.Properties` and `BlockBehaviour.Properties` values, `InteractionHand` name/opposite semantics, and the sealed 26.3 `InteractionResult` value records and constants.
 - [x] Report Java compatibility decisions per jar: `run_java_mods_with_report` names loader, role (`client`/`integrated-server`/`dedicated-server`), declared and executed entrypoints, typed/promoted/opaque registrations, payload directions, listener counts, and client-only rejection. The dedicated server logs these and exposes a bounded `java` section in server status. A bounded `compatibility_lines()` report ties together registry counts, declaration summary, menu bindings, block entities and payload channel/direction/codec coverage with a stable prefix for logs and status, and `server-status` carries a bounded `fml` section (ok/failed/not-run, role, jars, mods, sorted ids, error, strict).
 - [x] Make unknown host calls observable and optionally fail closed: `StdHost` retains bounded first-seen call counts, exposes a strict mode that returns `NativeError::UnknownHostCall`, and preserves the historical neutral-value behavior by default so existing probes remain compatible while diagnostics can classify degraded native runs.
+- [x] Keep engine labels fail-closed for unapplied Mixin work: a jar with any discovered Mixin plan is `native-qualified` until a production hook consumes it, and prepared server resources reject manifests that omit required checksums or reference unreadable files.
 - [x] Isolate a crashing Java mod: each jar's native execution is wrapped in `catch_unwind`, a panic becomes a bounded per-jar failure and later jars still run, a sorted `java isolation:` summary line names the failures, and `HORIZON_JAVA_STRICT=1` stops startup after every jar was attempted with the first failure. A global panic hook can still print before the unwind is caught.
 
 ## Partial or report-only
