@@ -553,6 +553,161 @@ version = "1.0"
 }
 
 #[test]
+fn representative_loader_mods_register_and_receive_server_tick_events() {
+    // Keep this fixture deliberately close to the bootstrap code in small
+    // production mods: Fabric uses an array-backed event, while Forge and
+    // NeoForge attach a method reference to their mod event bus.  The loader
+    // classes live only on the compile classpath, so the jar exercises the
+    // same host boundary as an installed mod.
+    let fabric_stubs = sources! {
+        "net/fabricmc/api/ModInitializer.java" =>
+            "package net.fabricmc.api; public interface ModInitializer { void onInitialize(); }",
+        "net/fabricmc/fabric/api/event/Event.java" =>
+            "package net.fabricmc.fabric.api.event; public interface Event<T> { void register(T listener); }",
+        "net/fabricmc/fabric/api/event/EventFactory.java" =>
+            "package net.fabricmc.fabric.api.event; import java.util.function.Function; public final class EventFactory { public static <T> Event<T> createArrayBacked(Class<T> type, Function<T[], T> factory) { return null; } }",
+        "net/fabricmc/fabric/api/event/lifecycle/v1/ServerTickEvents.java" => r#"
+package net.fabricmc.fabric.api.event.lifecycle.v1;
+import net.fabricmc.fabric.api.event.Event;
+import net.fabricmc.fabric.api.event.EventFactory;
+import net.minecraft.server.MinecraftServer;
+public final class ServerTickEvents {
+  @FunctionalInterface public interface Start { void onStartTick(MinecraftServer server); }
+  public static final Event<Start> START_SERVER_TICK = EventFactory.createArrayBacked(
+      Start.class, listeners -> server -> { for (Start listener : listeners) listener.onStartTick(server); });
+}
+"#,
+        "net/minecraft/server/MinecraftServer.java" =>
+            "package net.minecraft.server; public final class MinecraftServer { }",
+    };
+    let fabric_sources = sources! {
+        "catalog/FabricTickMod.java" => r#"
+package catalog;
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.minecraft.server.MinecraftServer;
+public final class FabricTickMod implements ModInitializer {
+  public void onInitialize() { ServerTickEvents.START_SERVER_TICK.register(this::onTick); }
+  private void onTick(MinecraftServer server) { System.getenv("fabric-server-tick"); }
+}
+"#,
+    };
+    let (fabric_root, fabric_path) = build_catalog_jar(
+        "fabric-server-tick",
+        &fabric_stubs,
+        &fabric_sources,
+        "fabric.mod.json",
+        br#"{"id":"fixture-fabric-tick","version":"1.0","entrypoints":{"main":"catalog.FabricTickMod"}}"#,
+    );
+
+    let forge_stubs = sources! {
+        "net/minecraftforge/fml/common/Mod.java" => "package net.minecraftforge.fml.common; import java.lang.annotation.*; @Retention(RetentionPolicy.RUNTIME) public @interface Mod { String value(); }",
+        "net/minecraftforge/eventbus/api/IEventBus.java" =>
+            "package net.minecraftforge.eventbus.api; import java.util.function.Consumer; public interface IEventBus { default <T> IEventBus addListener(Consumer<T> listener) { return this; } }",
+        "net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext.java" => "package net.minecraftforge.fml.javafmlmod; import net.minecraftforge.eventbus.api.IEventBus; public final class FMLJavaModLoadingContext { public static FMLJavaModLoadingContext get() { return new FMLJavaModLoadingContext(); } public IEventBus getModEventBus() { return null; } }",
+        "net/minecraftforge/event/TickEvent.java" => r#"
+package net.minecraftforge.event;
+public final class TickEvent { public static final class ServerTickEvent { } }
+"#,
+    };
+    let forge_sources = sources! {
+        "catalog/ForgeTickMod.java" => r#"
+package catalog;
+import net.minecraftforge.event.TickEvent;
+import net.minecraftforge.eventbus.api.IEventBus;
+import net.minecraftforge.fml.common.Mod;
+import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+@Mod("fixture-forge-tick") public final class ForgeTickMod {
+  public ForgeTickMod() {
+    IEventBus bus = FMLJavaModLoadingContext.get().getModEventBus();
+    bus.addListener(this::onTick);
+  }
+  private void onTick(TickEvent.ServerTickEvent event) { System.getenv("forge-server-tick"); }
+}
+"#,
+    };
+    let (forge_root, forge_path) = build_catalog_jar(
+        "forge-server-tick",
+        &forge_stubs,
+        &forge_sources,
+        "META-INF/mods.toml",
+        br#"modLoader = "javafml"
+[[mods]]
+modId = "fixture-forge-tick"
+version = "1.0"
+"#,
+    );
+
+    let neo_stubs = sources! {
+        "net/neoforged/fml/common/Mod.java" => "package net.neoforged.fml.common; import java.lang.annotation.*; @Retention(RetentionPolicy.RUNTIME) public @interface Mod { String value(); }",
+        "net/neoforged/bus/api/IEventBus.java" =>
+            "package net.neoforged.bus.api; import java.util.function.Consumer; public interface IEventBus { default <T> IEventBus addListener(Consumer<T> listener) { return this; } }",
+        "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext.java" => "package net.neoforged.fml.javafmlmod; import net.neoforged.bus.api.IEventBus; public final class FMLJavaModLoadingContext { public static FMLJavaModLoadingContext get() { return new FMLJavaModLoadingContext(); } public IEventBus getModEventBus() { return null; } }",
+        "net/neoforged/neoforge/event/tick/ServerTickEvent.java" => r#"
+package net.neoforged.neoforge.event.tick;
+public final class ServerTickEvent { public static final class Pre { } }
+"#,
+    };
+    let neo_sources = sources! {
+        "catalog/NeoTickMod.java" => r#"
+package catalog;
+import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.fml.javafmlmod.FMLJavaModLoadingContext;
+import net.neoforged.neoforge.event.tick.ServerTickEvent;
+@Mod("fixture-neo-tick") public final class NeoTickMod {
+  public NeoTickMod() {
+    IEventBus bus = FMLJavaModLoadingContext.get().getModEventBus();
+    bus.addListener(this::onTick);
+  }
+  private void onTick(ServerTickEvent.Pre event) { System.getenv("neo-server-tick"); }
+}
+"#,
+    };
+    let (neo_root, neo_path) = build_catalog_jar(
+        "neoforge-server-tick",
+        &neo_stubs,
+        &neo_sources,
+        "META-INF/neoforge.mods.toml",
+        br#"[[mods]]
+modId = "fixture-neo-tick"
+version = "1.0"
+"#,
+    );
+
+    let cases = [
+        (fabric_path, "main", "fabric-server-tick"),
+        (forge_path, "neoforge", "forge-server-tick"),
+        (neo_path, "neoforge", "neo-server-tick"),
+    ];
+    for (path, kind, marker) in cases {
+        let jar = NativeJar::from_path(&path).unwrap();
+        let entry = jar.discover_entrypoint(kind).unwrap();
+        let mut host = jar.seed_host(StdHost::new());
+        jar.execute(&entry.class, entry.method.as_deref(), kind, &mut host)
+            .unwrap();
+        let dispatches = host.dispatch_event(Value::Ref(Some("ServerTickEvent.Pre".into())));
+        assert_eq!(dispatches.len(), 1, "{kind} listener should be retained");
+        jar.execute_dispatch(&dispatches[0], &mut host).unwrap();
+        let getenv = host
+            .invocations()
+            .iter()
+            .filter(|call| call.method.owner == "java/lang/System" && call.method.name == "getenv")
+            .map(|call| call.args.first().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            getenv,
+            vec![Some(Value::Ref(Some(marker.into())))],
+            "{kind} callback did not run"
+        );
+    }
+
+    let _ = fs::remove_dir_all(fabric_root);
+    let _ = fs::remove_dir_all(forge_root);
+    let _ = fs::remove_dir_all(neo_root);
+}
+
+#[test]
 fn fabric_entrypoint_without_on_initialize_reports_missing_method() {
     let sources = sources! {
         "catalog/BrokenMod.java" => "package catalog; public final class BrokenMod { public void somethingElse() { } }",
