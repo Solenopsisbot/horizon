@@ -18112,4 +18112,1131 @@ public class DatagenProbe {
         );
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn mob_health_attribute_and_navigation_facades_keep_bounded_values() {
+        for (method, ret, descriptor, expected) in [
+            ("getHealth", "float", "()F", "return horizonHealth;"),
+            ("getMaxHealth", "float", "()F", "return horizonMaxHealth;"),
+            ("setHealth", "void", "(F)V", "horizonHealth = p0;"),
+            (
+                "getAttributes",
+                "net.minecraft.world.entity.ai.attributes.AttributeMap",
+                "()Lnet/minecraft/world/entity/ai/attributes/AttributeMap;",
+                "return horizonAttributeMap;",
+            ),
+            (
+                "getAttribute",
+                "net.minecraft.world.entity.ai.attributes.AttributeInstance",
+                "(Lnet/minecraft/core/Holder;)Lnet/minecraft/world/entity/ai/attributes/AttributeInstance;",
+                "return horizonAttributes.get(p0);",
+            ),
+            (
+                "getAttributeValue",
+                "double",
+                "(Lnet/minecraft/core/Holder;)D",
+                "return 0.0;",
+            ),
+            (
+                "getNavigation",
+                "net.minecraft.world.entity.ai.navigation.PathNavigation",
+                "()Lnet/minecraft/world/entity/ai/navigation/PathNavigation;",
+                "return horizonNavigation;",
+            ),
+            (
+                "finalizeSpawn",
+                "net.minecraft.world.entity.SpawnGroupData",
+                "(Lnet/minecraft/world/level/ServerLevelAccessor;Lnet/minecraft/world/DifficultyInstance;Lnet/minecraft/world/entity/EntitySpawnReason;Lnet/minecraft/world/entity/SpawnGroupData;)Lnet/minecraft/world/entity/SpawnGroupData;",
+                "horizonSpawnGroupData = p3; return p3;",
+            ),
+            (
+                "convertTo",
+                "net.minecraft.world.entity.Mob",
+                "(Lnet/minecraft/world/entity/EntityType;Lnet/minecraft/world/entity/ConversionParams;Lnet/minecraft/world/entity/EntitySpawnReason;Lnet/minecraft/world/entity/ConversionParams$AfterConversion;)Lnet/minecraft/world/entity/Mob;",
+                "return null;",
+            ),
+        ] {
+            assert_eq!(
+                runtime_body_with_descriptor(
+                    "net/minecraft/world/entity/Mob",
+                    method,
+                    ret,
+                    descriptor
+                ),
+                expected,
+                "Mob.{method}"
+            );
+        }
+        // 26.3 declares the attribute accessors on `LivingEntity`; a mod whose
+        // receiver is typed there emits that owner instead of `Mob`.
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/LivingEntity",
+                "getAttributes",
+                "net.minecraft.world.entity.ai.attributes.AttributeMap",
+                "()Lnet/minecraft/world/entity/ai/attributes/AttributeMap;",
+            ),
+            "return horizonAttributeMap;"
+        );
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/world/entity/LivingEntity",
+                "getHealth",
+                "float",
+                "()F",
+            ),
+            "return horizonHealth;"
+        );
+        // `SpawnGroupData` itself is the empty 26.3 marker interface.
+        let mut report = Report::default();
+        let source = render(
+            &Class {
+                name: "net/minecraft/world/entity/SpawnGroupData".to_owned(),
+                access: 0x0201,
+                superclass: "java/lang/Object".to_owned(),
+                ..Class::default()
+            },
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut report,
+            false,
+            &[],
+        );
+        assert!(source.contains("public interface SpawnGroupData"));
+
+        let mob = render(
+            &Class {
+                name: "net/minecraft/world/entity/Mob".to_owned(),
+                superclass: "net/minecraft/world/entity/LivingEntity".to_owned(),
+                ..Class::default()
+            },
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut Report::default(),
+            false,
+            &[],
+        );
+        for field in [
+            "horizonAttributes",
+            "horizonAttributeMap",
+            "horizonNavigation",
+            "horizonGoalSelector",
+            "horizonTargetSelector",
+            "horizonSpawnGroupData",
+        ] {
+            assert!(mob.contains(field), "Mob is missing {field}");
+        }
+    }
+
+    #[test]
+    fn attribute_facades_match_the_26_3_member_names() {
+        for (method, ret, expected) in [
+            ("getDefaultValue", "double", "return horizonBaseValue;"),
+            ("isClientSyncable", "boolean", "return horizonSyncable;"),
+            (
+                "setSyncable",
+                "net.minecraft.world.entity.ai.attributes.Attribute",
+                "horizonSyncable = p0; return this;",
+            ),
+            (
+                "setSentiment",
+                "net.minecraft.world.entity.ai.attributes.Attribute",
+                "horizonSentiment = p0; return this;",
+            ),
+            ("sanitizeValue", "double", "return p0;"),
+        ] {
+            assert_eq!(
+                runtime_body(
+                    "net/minecraft/world/entity/ai/attributes/Attribute",
+                    method,
+                    ret
+                ),
+                expected,
+                "Attribute.{method}"
+            );
+        }
+        // `getBaseValue` is the Yarn spelling; 26.3's own name is covered above.
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/ai/attributes/Attribute",
+                "getBaseValue",
+                "double"
+            ),
+            "return horizonBaseValue;"
+        );
+        for (method, expected) in [
+            ("getMinValue", "return horizonMinValue;"),
+            ("getMaxValue", "return horizonMaxValue;"),
+            ("getDefaultValue", "return horizonBaseValue;"),
+        ] {
+            assert_eq!(
+                runtime_body(
+                    "net/minecraft/world/entity/ai/attributes/RangedAttribute",
+                    method,
+                    "double"
+                ),
+                expected,
+                "RangedAttribute.{method}"
+            );
+        }
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/ai/attributes/AttributeSupplier",
+                "getBaseValue",
+                "double"
+            ),
+            "net.minecraft.world.entity.ai.attributes.AttributeInstance value = horizonAttributes.get(p0); return value == null ? 0.0 : value.getBaseValue();"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/ai/attributes/AttributeSupplier",
+                "hasModifier",
+                "boolean"
+            ),
+            "return horizonAttributes.containsKey(p0);"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/ai/attributes/AttributeSupplier",
+                "builder",
+                "net.minecraft.world.entity.ai.attributes.AttributeSupplier.Builder"
+            ),
+            "return new net.minecraft.world.entity.ai.attributes.AttributeSupplier.Builder();"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/ai/attributes/AttributeSupplier$Builder",
+                "add",
+                "net.minecraft.world.entity.ai.attributes.AttributeSupplier.Builder"
+            ),
+            "return this;"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/ai/attributes/AttributeSupplier$Builder",
+                "build",
+                "net.minecraft.world.entity.ai.attributes.AttributeSupplier"
+            ),
+            "return new net.minecraft.world.entity.ai.attributes.AttributeSupplier();"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/entity/ai/attributes/AttributeInstance",
+                "setBaseValue",
+                "void"
+            ),
+            "horizonBaseValue = p0; horizonValue = p0;"
+        );
+        let source = render(
+            &Class {
+                name: "net/minecraft/world/entity/ai/attributes/Attribute".to_owned(),
+                superclass: "java/lang/Object".to_owned(),
+                ..Class::default()
+            },
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut Report::default(),
+            false,
+            &[],
+        );
+        assert!(source.contains("horizonSyncable"));
+        assert!(source.contains("horizonSentiment"));
+    }
+
+    #[test]
+    fn synched_entity_data_and_damage_records_keep_bounded_values() {
+        assert_eq!(
+            runtime_body_with_descriptor(
+                "net/minecraft/network/syncher/SynchedEntityData",
+                "defineId",
+                "net.minecraft.network.syncher.EntityDataAccessor",
+                "(Ljava/lang/Class;Lnet/minecraft/network/syncher/EntityDataSerializer;)Lnet/minecraft/network/syncher/EntityDataAccessor;",
+            ),
+            "return new net.minecraft.network.syncher.EntityDataAccessor(horizonNextId++, p1);"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/network/syncher/SynchedEntityData",
+                "set",
+                "void"
+            ),
+            "horizonItems.put(p0, p1); horizonDirty.add(p0);"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/network/syncher/SynchedEntityData",
+                "isDirty",
+                "boolean"
+            ),
+            "return !horizonDirty.isEmpty();"
+        );
+        assert!(
+            runtime_body(
+                "net/minecraft/network/syncher/SynchedEntityData",
+                "packDirty",
+                "java.util.List"
+            )
+            .contains("horizonDirty.clear()")
+        );
+        assert!(
+            runtime_body(
+                "net/minecraft/network/syncher/SynchedEntityData",
+                "assignValues",
+                "void"
+            )
+            .contains("horizonAssigned.addAll")
+        );
+        // A record's component accessor is generated by the record header, so
+        // the Yarn `getId` drift edge delegates to it rather than to a field.
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/network/syncher/EntityDataAccessor",
+                "getId",
+                "int"
+            ),
+            "return id();"
+        );
+        assert_eq!(
+            runtime_body(
+                "net/minecraft/world/damagesource/DamageSource",
+                "getEntity",
+                "net.minecraft.world.entity.Entity"
+            ),
+            "return horizonEntity;"
+        );
+        for (method, ret, expected) in [
+            ("isDirect", "boolean", "return horizonDirectEntity != null;"),
+            (
+                "getDirectEntity",
+                "net.minecraft.world.entity.Entity",
+                "return horizonDirectEntity;",
+            ),
+            (
+                "getSourcePosition",
+                "net.minecraft.world.phys.Vec3",
+                "return horizonSourcePosition;",
+            ),
+            (
+                "getMsgId",
+                "java.lang.String",
+                "return horizonType == null ? \"generic\" : horizonType.msgId();",
+            ),
+            (
+                "getFoodExhaustion",
+                "float",
+                "return horizonType == null ? 0.0f : horizonType.exhaustion();",
+            ),
+        ] {
+            assert_eq!(
+                runtime_body("net/minecraft/world/damagesource/DamageSource", method, ret),
+                expected,
+                "DamageSource.{method}"
+            );
+        }
+        let source = render(
+            &Class {
+                name: "net/minecraft/network/syncher/SynchedEntityData".to_owned(),
+                ..Class::default()
+            },
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut Report::default(),
+            false,
+            &[],
+        );
+        assert!(source.contains("horizonNextId"));
+        assert!(source.contains("horizonItems"));
+        assert!(source.contains("horizonDirty"));
+    }
+
+    #[test]
+    fn record_facades_do_not_declare_instance_fields() {
+        // javac rejects an instance field on a record with "field declaration
+        // must be static"; `DamageType` and `EntityDataAccessor` are records in
+        // 26.3, so only their components carry state.
+        let damage_type = Class {
+            name: "net/minecraft/world/damagesource/DamageType".to_owned(),
+            superclass: "java/lang/Record".to_owned(),
+            declared: vec![
+                Declared {
+                    name: "msgId".to_owned(),
+                    descriptor: "Ljava/lang/String;".to_owned(),
+                    access: 0x0012,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "exhaustion".to_owned(),
+                    descriptor: "F".to_owned(),
+                    access: 0x0012,
+                    kind: MemberKind::Field,
+                },
+            ],
+            ..Class::default()
+        };
+        let accessor = Class {
+            name: "net/minecraft/network/syncher/EntityDataAccessor".to_owned(),
+            superclass: "java/lang/Record".to_owned(),
+            declared: vec![Declared {
+                name: "id".to_owned(),
+                descriptor: "I".to_owned(),
+                access: 0x0012,
+                kind: MemberKind::Field,
+            }],
+            ..Class::default()
+        };
+        for (class, forbidden) in [(&damage_type, "horizonMsgId"), (&accessor, "horizonId")] {
+            let source = render(
+                class,
+                None,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                None,
+                &mut Report::default(),
+                false,
+                &[],
+            );
+            assert!(source.contains("record "), "{} is not a record", class.name);
+            assert!(
+                !source.contains(forbidden),
+                "{} declares {forbidden}",
+                class.name
+            );
+        }
+    }
+
+    #[test]
+    fn neoforge_entity_registration_shims_retain_markers() {
+        assert_eq!(
+            NEOFORGE_BIOME_MODIFIER,
+            "net/neoforged/neoforge/common/world/BiomeModifier"
+        );
+        assert!(
+            NEOFORGE_ENTITY_JOIN_LEVEL_EVENT_SOURCE.contains("extends net.neoforged.bus.api.Event")
+        );
+        assert!(NEOFORGE_ENTITY_JOIN_LEVEL_EVENT_SOURCE.contains("getEntity"));
+        assert!(NEOFORGE_ENTITY_JOIN_LEVEL_EVENT_SOURCE.contains("loadedFromDisk"));
+        assert!(NEOFORGE_REGISTER_CAPABILITIES_EVENT_SOURCE.contains("registerBlockEntity"));
+        assert!(NEOFORGE_REGISTER_CAPABILITIES_EVENT_SOURCE.contains("registerBlock"));
+        assert!(NEOFORGE_REGISTER_CAPABILITIES_EVENT_SOURCE.contains("registerItem"));
+        assert!(NEOFORGE_REGISTER_CAPABILITIES_EVENT_SOURCE.contains("registerEntity"));
+        assert!(NEOFORGE_REGISTER_CAPABILITIES_EVENT_SOURCE.contains("horizonKeep"));
+        assert!(NEOFORGE_REGISTER_CAPABILITIES_EVENT_SOURCE.contains("isBlockRegistered"));
+        assert!(NEOFORGE_BIOME_MODIFIER_SOURCE.contains("enum Phase"));
+        assert!(NEOFORGE_BIOME_MODIFIER_SOURCE.contains("codec"));
+        assert!(NEOFORGE_ISTORAGE_SOURCE.contains("readNBT"));
+        assert!(NEOFORGE_ISTORAGE_SOURCE.contains("writeNBT"));
+    }
+
+    /// The entity/attribute/synched-data/damage slice through the generator and
+    /// javac: a miniature 26.3 game jar carries the real member shapes, a target
+    /// class names them all, and the generated façade has to compile as one
+    /// source set. That is the check a record field, a shadowed type or an
+    /// undeclared support class fails before any mod can load.
+    #[test]
+    fn entity_attribute_and_damage_facades_generate_and_compile() {
+        use crate::classes::tests_support::PoolBuilder;
+        use std::{path::PathBuf, process::Command};
+
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let tool = |name: &str| {
+            jdk_bin
+                .as_ref()
+                .map(|bin| bin.join(name))
+                .unwrap_or_else(|| PathBuf::from(name))
+        };
+        let Ok(version) = Command::new(tool("javac")).arg("-version").output() else {
+            return;
+        };
+        if !version.status.success() {
+            return;
+        }
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("horizon-port-pack-entity-{stamp}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create the scratch root");
+        let game_jar = root.join("game-26.3.jar");
+        {
+            let file = fs::File::create(&game_jar).expect("create the game jar");
+            let mut jar = zip::ZipWriter::new(file);
+            let mut class = |name: &str, superclass: &str, members: &[(&str, &str, u16)]| {
+                let mut pool = PoolBuilder::default();
+                let bytes = pool.build_with_members(name, superclass, members, &[]);
+                jar.start_file(
+                    format!("{name}.class"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .expect("start the game class");
+                std::io::Write::write_all(&mut jar, &bytes).expect("write the game class");
+            };
+            let attr = "net/minecraft/world/entity/ai/attributes/Attribute";
+            let instance = "net/minecraft/world/entity/ai/attributes/AttributeInstance";
+            let supplier = "net/minecraft/world/entity/ai/attributes/AttributeSupplier";
+            let builder = "net/minecraft/world/entity/ai/attributes/AttributeSupplier$Builder";
+            let accessor = "net/minecraft/network/syncher/EntityDataAccessor";
+            let mob = "net/minecraft/world/entity/Mob";
+            let living = "net/minecraft/world/entity/LivingEntity";
+            class(
+                "net/minecraft/world/entity/SpawnGroupData",
+                "java/lang/Object",
+                &[],
+            );
+            class("net/minecraft/core/Holder", "java/lang/Object", &[]);
+            class(
+                "net/minecraft/world/item/ItemStack",
+                "java/lang/Object",
+                &[
+                    ("<init>", "(Lnet/minecraft/world/item/Item;)V", 0x0001),
+                    ("<init>", "(Lnet/minecraft/world/item/Item;I)V", 0x0001),
+                ],
+            );
+            class("net/minecraft/world/item/Item", "java/lang/Object", &[]);
+            class(
+                "net/minecraft/core/component/DataComponentType",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/world/effect/MobEffect",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/world/effect/MobEffectInstance",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/world/entity/ai/attributes/AttributeMap",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/world/entity/ai/navigation/PathNavigation",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/world/entity/ai/goal/GoalSelector",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/network/syncher/EntityDataSerializer",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                living,
+                "java/lang/Object",
+                &[
+                    ("getHealth", "()F", 0x0001),
+                    ("getMaxHealth", "()F", 0x0001),
+                    ("setHealth", "(F)V", 0x0001),
+                    ("heal", "(F)V", 0x0001),
+                    (
+                        "getAttribute",
+                        "(Lnet/minecraft/core/Holder;)Lnet/minecraft/world/entity/ai/attributes/AttributeInstance;",
+                        0x0001,
+                    ),
+                    (
+                        "getAttributes",
+                        "()Lnet/minecraft/world/entity/ai/attributes/AttributeMap;",
+                        0x0001,
+                    ),
+                ],
+            );
+            class(
+                mob,
+                living,
+                &[
+                    ("isNoAi", "()Z", 0x0001),
+                    ("setNoAi", "(Z)V", 0x0001),
+                    (
+                        "getAttribute",
+                        "(Lnet/minecraft/core/Holder;)Lnet/minecraft/world/entity/ai/attributes/AttributeInstance;",
+                        0x0001,
+                    ),
+                    (
+                        "getAttributes",
+                        "()Lnet/minecraft/world/entity/ai/attributes/AttributeMap;",
+                        0x0001,
+                    ),
+                    (
+                        "getNavigation",
+                        "()Lnet/minecraft/world/entity/ai/navigation/PathNavigation;",
+                        0x0001,
+                    ),
+                    (
+                        "finalizeSpawn",
+                        "(Lnet/minecraft/world/level/ServerLevelAccessor;Lnet/minecraft/world/DifficultyInstance;Lnet/minecraft/world/entity/EntitySpawnReason;Lnet/minecraft/world/entity/SpawnGroupData;)Lnet/minecraft/world/entity/SpawnGroupData;",
+                        0x0001,
+                    ),
+                ],
+            );
+            class(
+                attr,
+                "java/lang/Object",
+                &[
+                    ("getDefaultValue", "()D", 0x0001),
+                    ("getDescriptionId", "()Ljava/lang/String;", 0x0001),
+                    ("isClientSyncable", "()Z", 0x0001),
+                    (
+                        "setSyncable",
+                        "(Z)Lnet/minecraft/world/entity/ai/attributes/Attribute;",
+                        0x0001,
+                    ),
+                ],
+            );
+            class(
+                "net/minecraft/world/entity/ai/attributes/RangedAttribute",
+                attr,
+                &[
+                    ("getMinValue", "()D", 0x0001),
+                    ("getMaxValue", "()D", 0x0001),
+                ],
+            );
+            class(
+                instance,
+                "java/lang/Object",
+                &[
+                    ("getBaseValue", "()D", 0x0001),
+                    ("getValue", "()D", 0x0001),
+                    ("setBaseValue", "(D)V", 0x0001),
+                ],
+            );
+            class(
+                supplier,
+                "java/lang/Object",
+                &[
+                    ("getBaseValue", "(Lnet/minecraft/core/Holder;)D", 0x0001),
+                    ("getValue", "(Lnet/minecraft/core/Holder;)D", 0x0001),
+                    (
+                        "createInstance",
+                        "(Ljava/util/function/Consumer;Lnet/minecraft/core/Holder;)Lnet/minecraft/world/entity/ai/attributes/AttributeInstance;",
+                        0x0001,
+                    ),
+                    (
+                        "builder",
+                        "()Lnet/minecraft/world/entity/ai/attributes/AttributeSupplier$Builder;",
+                        0x0009,
+                    ),
+                    ("hasAttribute", "(Lnet/minecraft/core/Holder;)Z", 0x0001),
+                ],
+            );
+            class(
+                builder,
+                "java/lang/Object",
+                &[
+                    (
+                        "add",
+                        "(Lnet/minecraft/core/Holder;)Lnet/minecraft/world/entity/ai/attributes/AttributeSupplier$Builder;",
+                        0x0001,
+                    ),
+                    (
+                        "build",
+                        "()Lnet/minecraft/world/entity/ai/attributes/AttributeSupplier;",
+                        0x0001,
+                    ),
+                ],
+            );
+            class(
+                "net/minecraft/network/syncher/SynchedEntityData",
+                "java/lang/Object",
+                &[
+                    (
+                        "defineId",
+                        "(Ljava/lang/Class;Lnet/minecraft/network/syncher/EntityDataSerializer;)Lnet/minecraft/network/syncher/EntityDataAccessor;",
+                        0x0009,
+                    ),
+                    (
+                        "get",
+                        "(Lnet/minecraft/network/syncher/EntityDataAccessor;)Ljava/lang/Object;",
+                        0x0001,
+                    ),
+                    (
+                        "set",
+                        "(Lnet/minecraft/network/syncher/EntityDataAccessor;Ljava/lang/Object;)V",
+                        0x0001,
+                    ),
+                    ("isDirty", "()Z", 0x0001),
+                    ("packDirty", "()Ljava/util/List;", 0x0001),
+                    ("assignValues", "(Ljava/util/List;)V", 0x0001),
+                ],
+            );
+            class(
+                accessor,
+                "java/lang/Object",
+                &[
+                    (
+                        "<init>",
+                        "(ILnet/minecraft/network/syncher/EntityDataSerializer;)V",
+                        0x0001,
+                    ),
+                    ("id", "()I", 0x0001),
+                ],
+            );
+            jar.finish().expect("finish the game jar");
+        }
+        // The target's constant pool names every member the slice implements;
+        // the class body itself only returns.
+        let target = root.join("demo-mod.jar");
+        {
+            let file = fs::File::create(&target).expect("create the target jar");
+            let mut jar = zip::ZipWriter::new(file);
+            let mut pool = PoolBuilder::default();
+            for (owner, name, descriptor) in [
+                ("net/minecraft/world/entity/Mob", "isNoAi", "()Z"),
+                ("net/minecraft/world/entity/Mob", "getHealth", "()F"),
+                ("net/minecraft/world/entity/Mob", "setHealth", "(F)V"),
+                (
+                    "net/minecraft/world/entity/Mob",
+                    "getAttribute",
+                    "(Lnet/minecraft/core/Holder;)Lnet/minecraft/world/entity/ai/attributes/AttributeInstance;",
+                ),
+                (
+                    "net/minecraft/world/entity/Mob",
+                    "getAttributes",
+                    "()Lnet/minecraft/world/entity/ai/attributes/AttributeMap;",
+                ),
+                (
+                    "net/minecraft/world/entity/Mob",
+                    "getNavigation",
+                    "()Lnet/minecraft/world/entity/ai/navigation/PathNavigation;",
+                ),
+                (
+                    "net/minecraft/world/entity/Mob",
+                    "finalizeSpawn",
+                    "(Lnet/minecraft/world/level/ServerLevelAccessor;Lnet/minecraft/world/DifficultyInstance;Lnet/minecraft/world/entity/EntitySpawnReason;Lnet/minecraft/world/entity/SpawnGroupData;)Lnet/minecraft/world/entity/SpawnGroupData;",
+                ),
+                (
+                    "net/minecraft/world/entity/LivingEntity",
+                    "getAttributes",
+                    "()Lnet/minecraft/world/entity/ai/attributes/AttributeMap;",
+                ),
+                (
+                    "net/minecraft/world/entity/ai/attributes/Attribute",
+                    "getDefaultValue",
+                    "()D",
+                ),
+                (
+                    "net/minecraft/world/entity/ai/attributes/Attribute",
+                    "setSyncable",
+                    "(Z)Lnet/minecraft/world/entity/ai/attributes/Attribute;",
+                ),
+                (
+                    "net/minecraft/world/entity/ai/attributes/RangedAttribute",
+                    "getMinValue",
+                    "()D",
+                ),
+                (
+                    "net/minecraft/world/entity/ai/attributes/AttributeSupplier",
+                    "getBaseValue",
+                    "(Lnet/minecraft/core/Holder;)D",
+                ),
+                (
+                    "net/minecraft/world/entity/ai/attributes/AttributeSupplier",
+                    "createInstance",
+                    "(Ljava/util/function/Consumer;Lnet/minecraft/core/Holder;)Lnet/minecraft/world/entity/ai/attributes/AttributeInstance;",
+                ),
+                (
+                    "net/minecraft/world/entity/ai/attributes/AttributeSupplier",
+                    "builder",
+                    "()Lnet/minecraft/world/entity/ai/attributes/AttributeSupplier$Builder;",
+                ),
+                (
+                    "net/minecraft/world/entity/ai/attributes/AttributeSupplier$Builder",
+                    "add",
+                    "(Lnet/minecraft/core/Holder;)Lnet/minecraft/world/entity/ai/attributes/AttributeSupplier$Builder;",
+                ),
+                (
+                    "net/minecraft/world/entity/ai/attributes/AttributeSupplier$Builder",
+                    "build",
+                    "()Lnet/minecraft/world/entity/ai/attributes/AttributeSupplier;",
+                ),
+                (
+                    "net/minecraft/world/entity/ai/attributes/AttributeInstance",
+                    "getBaseValue",
+                    "()D",
+                ),
+                (
+                    "net/minecraft/network/syncher/SynchedEntityData",
+                    "defineId",
+                    "(Ljava/lang/Class;Lnet/minecraft/network/syncher/EntityDataSerializer;)Lnet/minecraft/network/syncher/EntityDataAccessor;",
+                ),
+                (
+                    "net/minecraft/network/syncher/SynchedEntityData",
+                    "get",
+                    "(Lnet/minecraft/network/syncher/EntityDataAccessor;)Ljava/lang/Object;",
+                ),
+                (
+                    "net/minecraft/network/syncher/SynchedEntityData",
+                    "set",
+                    "(Lnet/minecraft/network/syncher/EntityDataAccessor;Ljava/lang/Object;)V",
+                ),
+                (
+                    "net/minecraft/network/syncher/SynchedEntityData",
+                    "packDirty",
+                    "()Ljava/util/List;",
+                ),
+                (
+                    "net/minecraft/network/syncher/SynchedEntityData",
+                    "assignValues",
+                    "(Ljava/util/List;)V",
+                ),
+                (
+                    "net/minecraft/network/syncher/EntityDataAccessor",
+                    "id",
+                    "()I",
+                ),
+            ] {
+                pool.method(owner, name, descriptor);
+            }
+            let bytes = pool.build("demo/Probe", "java/lang/Object", &[("run", &[0xb1])]);
+            jar.start_file("demo/Probe.class", zip::write::SimpleFileOptions::default())
+                .expect("start the target class");
+            std::io::Write::write_all(&mut jar, &bytes).expect("write the target class");
+            jar.finish().expect("finish the target jar");
+        }
+        let out = root.join("facade");
+        let report = generate(&target, &game_jar, &[], &out, &tool("javac"), &tool("jar"))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the façade did not generate: {e} (sources in {})",
+                    out.display()
+                )
+            });
+        assert!(
+            report.jar.is_file(),
+            "the façade jar was not written: {report:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `DamageType` is a record and `DamageSource` is a plain value: render both
+    /// and let javac decide. A hand-written record field or a method body that
+    /// names a missing state member fails here.
+    #[test]
+    fn damage_type_and_source_facades_compile() {
+        use std::{path::PathBuf, process::Command};
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(version) = Command::new(&javac).arg("-version").output() else {
+            return;
+        };
+        if !version.status.success() {
+            return;
+        }
+        let damages = ["net/minecraft/world/damagesource/DamageType".to_owned()];
+        let damage_type = Class {
+            name: damages[0].clone(),
+            superclass: "java/lang/Record".to_owned(),
+            declared: vec![
+                Declared {
+                    name: "msgId".to_owned(),
+                    descriptor: "Ljava/lang/String;".to_owned(),
+                    access: 0x0012,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "scaling".to_owned(),
+                    descriptor: "Lnet/minecraft/world/damagesource/DamageScaling;".to_owned(),
+                    access: 0x0012,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "exhaustion".to_owned(),
+                    descriptor: "F".to_owned(),
+                    access: 0x0012,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "effects".to_owned(),
+                    descriptor: "Lnet/minecraft/world/damagesource/DamageEffects;".to_owned(),
+                    access: 0x0012,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "deathMessageType".to_owned(),
+                    descriptor: "Lnet/minecraft/world/damagesource/DeathMessageType;".to_owned(),
+                    access: 0x0012,
+                    kind: MemberKind::Field,
+                },
+            ],
+            ..Class::default()
+        };
+        let source = Class {
+            name: "net/minecraft/world/damagesource/DamageSource".to_owned(),
+            superclass: "java/lang/Object".to_owned(),
+            declared: [
+                ("type", "()Lnet/minecraft/world/damagesource/DamageType;"),
+                ("getEntity", "()Lnet/minecraft/world/entity/Entity;"),
+                ("getDirectEntity", "()Lnet/minecraft/world/entity/Entity;"),
+                ("getSourcePosition", "()Lnet/minecraft/world/phys/Vec3;"),
+                ("isDirect", "()Z"),
+                ("getMsgId", "()Ljava/lang/String;"),
+                ("getWeaponItem", "()Lnet/minecraft/world/item/ItemStack;"),
+            ]
+            .iter()
+            .map(|(name, descriptor)| Declared {
+                name: (*name).to_owned(),
+                descriptor: (*descriptor).to_owned(),
+                access: 0x0001,
+                kind: MemberKind::Method,
+            })
+            .collect(),
+            ..Class::default()
+        };
+        let used = source
+            .declared
+            .iter()
+            .map(|member| (member.name.clone(), member.descriptor.clone()))
+            .collect::<BTreeSet<_>>();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("horizon-port-pack-damage-{stamp}"));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        fs::create_dir_all(&src).expect("create the source root");
+        fs::create_dir_all(&classes).expect("create the classes root");
+        let mut files = Vec::new();
+        let mut write = |path: &str, text: &str| {
+            let file = src.join(path);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write the source");
+            files.push(file);
+        };
+        write(
+            "net/minecraft/world/damagesource/DamageType.java",
+            &render(
+                &damage_type,
+                None,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                None,
+                &mut Report::default(),
+                false,
+                &[],
+            ),
+        );
+        write(
+            "net/minecraft/world/damagesource/DamageSource.java",
+            &render(
+                &source,
+                Some(&used),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                None,
+                &mut Report::default(),
+                false,
+                &[],
+            ),
+        );
+        write(
+            "net/minecraft/world/damagesource/DamageScaling.java",
+            "package net.minecraft.world.damagesource;\npublic enum DamageScaling { NEVER, WHEN_CAUSED_BY_LIVING_NON_PLAYER, ALWAYS }\n",
+        );
+        write(
+            "net/minecraft/world/damagesource/DamageEffects.java",
+            "package net.minecraft.world.damagesource;\npublic enum DamageEffects { HURT, THORNS, DROWNING }\n",
+        );
+        write(
+            "net/minecraft/world/damagesource/DeathMessageType.java",
+            "package net.minecraft.world.damagesource;\npublic enum DeathMessageType { DEFAULT, FALL_VARIANTS, INTENTIONAL_GAME_DESIGN }\n",
+        );
+        write(
+            "net/minecraft/world/entity/Entity.java",
+            "package net.minecraft.world.entity;\npublic class Entity {}\n",
+        );
+        write(
+            "net/minecraft/world/phys/Vec3.java",
+            "package net.minecraft.world.phys;\npublic class Vec3 {}\n",
+        );
+        write(
+            "net/minecraft/world/item/ItemStack.java",
+            "package net.minecraft.world.item;\npublic class ItemStack {}\n",
+        );
+        let status = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+            .expect("run javac");
+        assert!(status.success(), "javac rejected the damage façade");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two generic overloads erase to one Java signature; the façade emits the
+    /// first one only. Genuinely different erasures (the two- and three-argument
+    /// `set`) both stay.
+    #[test]
+    fn facade_emits_one_method_per_erasure() {
+        let class = Class {
+            name: "net/minecraft/network/syncher/SynchedEntityData".to_owned(),
+            superclass: "java/lang/Object".to_owned(),
+            declared: vec![
+                Declared {
+                    name: "set".to_owned(),
+                    descriptor:
+                        "(Lnet/minecraft/network/syncher/EntityDataAccessor;Ljava/lang/Object;)V"
+                            .to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
+                    name: "set".to_owned(),
+                    descriptor:
+                        "(Lnet/minecraft/network/syncher/EntityDataAccessor;Ljava/lang/Object;Z)V"
+                            .to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
+                    name: "get".to_owned(),
+                    descriptor:
+                        "(Lnet/minecraft/network/syncher/EntityDataAccessor;)Ljava/lang/Object;"
+                            .to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
+                    name: "get".to_owned(),
+                    descriptor:
+                        "(Lnet/minecraft/network/syncher/EntityDataAccessor;)Ljava/lang/String;"
+                            .to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+            ],
+            ..Class::default()
+        };
+        let used = class
+            .declared
+            .iter()
+            .map(|member| (member.name.clone(), member.descriptor.clone()))
+            .collect::<BTreeSet<_>>();
+        let source = render(
+            &class,
+            Some(&used),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut Report::default(),
+            false,
+            &[],
+        );
+        assert_eq!(
+            source.matches("public void set(").count(),
+            2,
+            "both set erasures: {source}"
+        );
+        assert_eq!(
+            source.matches("public java.lang.Object get(").count(),
+            1,
+            "one get erasure: {source}"
+        );
+        assert!(
+            !source.contains("public java.lang.String get("),
+            "the duplicate erasure was not deduped: {source}"
+        );
+    }
+
+    /// The four NeoForge entity/capability/biome shims compile as a unit and
+    /// expose the 26.3 member names a mod snapshots against.
+    #[test]
+    fn neoforge_entity_registration_shims_compile() {
+        use std::{path::PathBuf, process::Command};
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(version) = Command::new(&javac).arg("-version").output() else {
+            return;
+        };
+        if !version.status.success() {
+            return;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("horizon-port-pack-neoforge-{stamp}"));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        fs::create_dir_all(&src).expect("create the source root");
+        fs::create_dir_all(&classes).expect("create the classes root");
+        let mut files = Vec::new();
+        let mut write = |path: &str, text: &str| {
+            let file = src.join(path);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write the source");
+            files.push(file);
+        };
+        write("net/neoforged/bus/api/Event.java", NEOFORGE_EVENT);
+        for (class, source) in [
+            (
+                NEOFORGE_ENTITY_JOIN_LEVEL_EVENT,
+                NEOFORGE_ENTITY_JOIN_LEVEL_EVENT_SOURCE,
+            ),
+            (
+                NEOFORGE_REGISTER_CAPABILITIES_EVENT,
+                NEOFORGE_REGISTER_CAPABILITIES_EVENT_SOURCE,
+            ),
+            (NEOFORGE_BIOME_MODIFIER, NEOFORGE_BIOME_MODIFIER_SOURCE),
+            (NEOFORGE_ISTORAGE, NEOFORGE_ISTORAGE_SOURCE),
+        ] {
+            write(&format!("{class}.java"), source);
+        }
+        write(
+            "Probe.java",
+            r#"import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
+import net.neoforged.neoforge.capabilities.RegisterCapabilitiesEvent;
+import net.neoforged.neoforge.common.world.BiomeModifier;
+import net.neoforged.neoforge.common.capabilities.IStorage;
+public class Probe {
+    static void run(EntityJoinLevelEvent join, RegisterCapabilitiesEvent caps, BiomeModifier modifier, IStorage<Object> storage) {
+        Object entity = join.getEntity();
+        Object level = join.getLevel();
+        boolean loaded = join.loadedFromDisk();
+        join.setCanceled(true);
+        caps.registerItem(null, null);
+        caps.registerBlockEntity(null, null, null);
+        caps.registerEntity(null, null, null);
+        Object codec = modifier.codec();
+        modifier.modify(null, null, BiomeModifier.Phase.ADD, null);
+        Object read = storage.readNBT(null, null, null);
+    }
+}
+"#,
+        );
+        let status = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+            .expect("run javac");
+        assert!(status.success(), "javac rejected the NeoForge entity shims");
+        let _ = fs::remove_dir_all(&root);
+    }
 }
