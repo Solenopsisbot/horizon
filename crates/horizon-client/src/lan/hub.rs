@@ -486,6 +486,7 @@ impl Hub {
     /// the bidirectional play form. A server-bound frame is the client
     /// window's to send, from the mirror queue (`payloads::take_java_to_server`),
     /// so the hub never broadcasts it.
+    #[cfg(test)]
     fn client_bound(frames: impl IntoIterator<Item = PayloadFrame>) -> Vec<PayloadFrame> {
         frames
             .into_iter()
@@ -1454,7 +1455,7 @@ impl Hub {
         // Only frames a client can receive are the hub's to broadcast. A
         // server-bound frame stays with the client window, whose pump reads
         // it from the mirror queue (`payloads::take_java_to_server`).
-        for frame in Self::client_bound(payloads::take_java_outgoing()) {
+        for frame in payloads::take_java_to_clients(PAYLOAD_TICK_CAP) {
             self.broadcast_payload(&frame);
         }
         events
@@ -3383,6 +3384,9 @@ const INBOX_LIMIT: usize = 20 * PACKETS_PER_TICK;
 /// The same in bytes on the wire: 8000 full books would hold gigabytes. A
 /// real client's largest packets (a 100-page book) are a few hundred kB.
 const INBOX_BYTES: usize = 16 << 20;
+/// Mod payload frames broadcast in one tick, matching the link's send queue;
+/// the rest wait for the next tick.
+const PAYLOAD_TICK_CAP: usize = 256;
 
 /// The `minecraft:gravity` attribute of a player.
 const PLAYER_GRAVITY: f64 = 0.08;

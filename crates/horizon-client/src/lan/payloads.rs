@@ -450,6 +450,34 @@ pub fn take_java_to_server(max: usize) -> Vec<PayloadFrame> {
     queue.drain(..count).collect()
 }
 
+/// Take at most `max` frames Java mods addressed to a client (`PlayToClient`,
+/// or the bidirectional play form), oldest first; the rest stay queued for
+/// the next call. A server-bound frame is not this queue's to deliver: the
+/// client window reads it from [`JAVA_TO_SERVER`] (`take_java_to_server`), so
+/// it is never returned here and never broadcast by the hub.
+pub fn take_java_to_clients(max: usize) -> Vec<PayloadFrame> {
+    let mut queue = JAVA_OUTGOING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut taken = Vec::new();
+    let mut kept = Vec::with_capacity(queue.len());
+    for frame in queue.drain(..) {
+        let client_bound = matches!(
+            frame.direction(),
+            PayloadDirection::PlayToClient | PayloadDirection::PlayBidirectional
+        );
+        if !client_bound {
+            // Its copy is already in the mirror for the client window.
+            continue;
+        }
+        if taken.len() < max {
+            taken.push(frame);
+        } else {
+            kept.push(frame);
+        }
+    }
+    *queue = kept;
+    taken
+}
+
 /// Hand received frames to a Java host for its bootstrap/bootstrap-time view.
 /// Returns how many were delivered.
 pub fn deliver_to_host(
@@ -1196,5 +1224,42 @@ mod tests {
         clear_handler_jars();
         let _ = take_java_outgoing();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The hub's drain takes only the frames a client can receive; the
+    /// server-bound ones stay reachable in the client window's mirror.
+    #[test]
+    fn client_drain_takes_only_client_bound_frames_and_keeps_server_bound_ones() {
+        let _guard = global_state();
+        clear_handler_jars();
+        store_declared([
+            declaration("demo:up", PayloadDirection::PlayToServer, None),
+            declaration("demo:down", PayloadDirection::PlayToClient, None),
+            declaration("demo:both", PayloadDirection::PlayBidirectional, None),
+        ])
+        .unwrap();
+        let mut host = horizon_native_java::StdHost::new();
+        host.queue_outgoing_payload("demo:up", "playToServer", vec![1]);
+        host.queue_outgoing_payload("demo:down", "playToClient", vec![2]);
+        host.queue_outgoing_payload("demo:both", "playToServer", vec![3]);
+        host.queue_outgoing_payload("demo:down", "playToClient", vec![4]);
+        assert_eq!(publish_from_host(&mut host).unwrap(), 4);
+
+        // A bounded call leaves the rest for the next tick.
+        let first = take_java_to_clients(1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id(), "demo:down");
+        assert_eq!(first[0].bytes(), &[2]);
+        let rest = take_java_to_clients(256);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].bytes(), &[4]);
+        assert!(take_java_to_clients(256).is_empty());
+
+        // The server-bound frames were kept for the client window.
+        let to_server = take_java_to_server(256);
+        assert_eq!(to_server.len(), 2);
+        assert_eq!(to_server[0].bytes(), &[1]);
+        assert_eq!(to_server[1].bytes(), &[3]);
+        assert!(take_java_outgoing().is_empty());
     }
 }
