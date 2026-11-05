@@ -28441,7 +28441,8 @@ mandatory = true
             "common.json".into(),
             br#"{"mixins":["demo.BravoMixin","demo.ZuluMixin"]}"#.to_vec(),
         );
-        jar.resources.insert("fabric.mod.json".into(), "fabric".into());
+        jar.resources
+            .insert("fabric.mod.json".into(), "fabric".into());
         jar.resources.insert("client.json".into(), "client".into());
         jar.resources.insert("common.json".into(), "common".into());
         let mut host = MarkerHost::default();
