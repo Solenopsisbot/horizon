@@ -91,7 +91,7 @@ FABRIC_SOURCES = {
     ),
     "org/spongepowered/asm/mixin/Mixin.java": (
         "package org.spongepowered.asm.mixin; import java.lang.annotation.*; "
-        "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE) public @interface Mixin { Class<?>[] value() default {}; }"
+        "@Retention(RetentionPolicy.CLASS) @Target(ElementType.TYPE) public @interface Mixin { Class<?>[] value() default {}; }"
     ),
     "org/spongepowered/asm/mixin/injection/At.java": (
         "package org.spongepowered.asm.mixin.injection; import java.lang.annotation.*; "

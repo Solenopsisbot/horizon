@@ -4,7 +4,7 @@ Binary: target/fast/horizon-native-java + horizon-jvm (prebuilt, --bin-dir targe
 Probe timeout: 60s; limit: 32 per root invocation; nested probing enabled (8 per jar, depth 1)
 
 Committed source fixtures:
-  fabric-fixture.jar sha256=dad9816f3656 size=5971
+  fabric-fixture.jar sha256=8eacd78db5c2 size=5980
   forge-fixture.jar sha256=d0d0b8ae5723 size=1565
   neoforge-fixture.jar sha256=9b0128c580d4 size=2524
 

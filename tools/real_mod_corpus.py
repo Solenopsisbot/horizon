@@ -132,13 +132,21 @@ class Probe:
         return value.get("status") if value else None
 
     def report(self) -> dict[str, Any]:
-        return {
+        report = {
             "tool": self.tool,
             "mode": self.mode,
             "exit": self.code,
             "timed_out": self.timed_out,
             "status": self.status(),
         }
+        if self.mode == "mixin-plans":
+            value = self.json() or {}
+            for key in ("plans", "unresolved", "configs"):
+                entries = value.get(key)
+                report[key] = len(entries) if isinstance(entries, list) else (
+                    0 if value.get("status") == "ok" else "error"
+                )
+        return report
 
 
 def tail(probe: Probe) -> str:
@@ -827,6 +835,12 @@ def classify_jar(jar: JarFile, server: Path | None, toolchain: ProbeToolchain, a
     row["verdict"] = verdict
     row["reason"] = why
     row["probes"] = [probe.report() for probe in probes]
+    for probe in probes:
+        if probe.mode == "mixin-plans":
+            plan_report = probe.report()
+            for key in ("plans", "unresolved", "configs"):
+                row[key] = plan_report[key]
+            break
     return row, meta
 
 
@@ -925,6 +939,9 @@ def probe_nested(parent: Path, meta: dict[str, Any], depth: int,
                 "reason": reason,
                 "depth": depth,
             })
+            for key in ("plans", "unresolved", "configs"):
+                if key in row:
+                    rows[-1][key] = row[key]
             if depth < state.depth:
                 child_rows, child_skipped = probe_nested(target, child_meta, depth + 1, state)
                 rows.extend(child_rows)

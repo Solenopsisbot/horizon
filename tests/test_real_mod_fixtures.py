@@ -153,6 +153,9 @@ class RealModFixtureTest(unittest.TestCase):
         row = rows[jar.name]
         self.assertEqual(row["verdict"], "fallback")
         self.assertEqual(row["reason"], "no entrypoint; 1 mixin plan(s) need the loader")
+        self.assertEqual(row["plans"], 1)
+        self.assertEqual(row["unresolved"], 0)
+        self.assertEqual(row["configs"], 1)
 
     def test_manifest_is_deterministic_and_fabric_nested_probe_is_folded(self) -> None:
         self.assertEqual(set(self.manifest), {"fabric-fixture.jar", "forge-fixture.jar", "neoforge-fixture.jar"})
