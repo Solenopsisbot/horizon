@@ -88,11 +88,25 @@ public final class HorizonLoaderBridge {
   private static String classPathFailure;
   private static String knotInitOutcome;
 
+  // ---- Optional Knot loader hand-off and transform-chain probe -----------
+  //
+  // `--knot-launch` uses the loader `KnotClassLoaderInterface.create` built:
+  // `getClassLoader()` is the class loader `Knot.init` returns to a real
+  // launch, so it becomes the launcher's target (see `targetLoader`), and a
+  // class read through it proves `KnotClassDelegate.loadClass` really routes
+  // through `getPostMixinClassByteArray` -> `IMixinTransformer`.
+  private static boolean knotLaunch;
+  private static ClassLoader knotLoader;
+  private static String knotLaunchOutcome;
+
   public static boolean testLaunchCalled() { return testLaunchCalled; }
 
   /** Reset the unlock state; called once at the start of a production run. */
-  private static void resetClassPathState(boolean unlock) {
+  private static void resetClassPathState(boolean unlock, boolean launch) {
     classPathUnlock = unlock;
+    knotLaunch = launch;
+    knotLoader = null;
+    knotLaunchOutcome = null;
     classPath = null;
     classPathType = null;
     classPathJars.clear();
@@ -166,6 +180,61 @@ public final class HorizonLoaderBridge {
       initialize.invoke(classPath);
       // KnotClassDelegate installs one IMixinTransformer; the API is void, so
       // this is the number of transformers that this initialization call owns.
+      return "ok 1 transformers";
+    } catch (Throwable failure) {
+      return bound("failed " + summarize(failure));
+    }
+  }
+
+  /**
+   * The Mixin steps `Knot.init` runs between `freeze` and the delegate's
+   * `initializeTransformers`: `FabricLoaderImpl.loadClassTweakers`,
+   * `FabricMixinBootstrap.init(envType, loader)` (which points Mixin at
+   * `MixinServiceKnot` and calls `MixinBootstrap.init`) and
+   * `FabricLauncherBase.finishMixinBootstrapping` (Mixin to DEFAULT phase).
+   * Without them `MixinServiceKnot.getTransformer()` stays null and the
+   * delegate's reflective fallback cannot construct mixin 0.8.7's
+   * `MixinTransformer`: it has no no-arg constructor, so the delegate reports
+   * "mixin transformer unavailable?".
+   */
+  private static String initializeMixinBootstrap(Object loader, Class<?> impl, boolean client) {
+    try {
+      impl.getMethod("loadClassTweakers").invoke(loader);
+      Object side = Enum.valueOf((Class) Class.forName("net.fabricmc.api.EnvType"),
+          client ? "CLIENT" : "SERVER");
+      Class<?> bootstrap = Class.forName("net.fabricmc.loader.impl.launch.FabricMixinBootstrap");
+      bootstrap.getMethod("init", Class.forName("net.fabricmc.api.EnvType"), impl)
+          .invoke(null, side, loader);
+      Method finish = Class.forName("net.fabricmc.loader.impl.launch.FabricLauncherBase")
+          .getDeclaredMethod("finishMixinBootstrapping");
+      finish.setAccessible(true);
+      finish.invoke(null);
+      return null;
+    } catch (Throwable failure) {
+      return summarize(failure);
+    }
+  }
+
+  /**
+   * Hand the Knot loader to the launcher.
+   *
+   * Fabric has no `setTargetClassLoader`: `FabricLauncher.getTargetClassLoader`
+   * is the only hand-off a provider/entrypoint uses, and the real
+   * `Knot.init(String[])` returns `KnotClassLoaderInterface.getClassLoader()` as
+   * the game's loader. This probe owns the launcher, so it stores that loader
+   * and answers every target read with it (`targetLoader`).
+   */
+  private static synchronized String handOffKnotLoader() {
+    if (classPath == null) return "failed Knot class loader was not created";
+    try {
+      Method getLoader = classPathType.getDeclaredMethod("getClassLoader");
+      getLoader.setAccessible(true);
+      Object loader = getLoader.invoke(classPath);
+      if (!(loader instanceof ClassLoader)) return "failed Knot loader is unavailable";
+      knotLoader = (ClassLoader) loader;
+      // `Knot.init` also makes its loader the thread's context class loader;
+      // the hand-off is the same one a real launch makes.
+      Thread.currentThread().setContextClassLoader(knotLoader);
       return "ok 1 transformers";
     } catch (Throwable failure) {
       return bound("failed " + summarize(failure));
@@ -292,12 +361,19 @@ public final class HorizonLoaderBridge {
 
   public static String bootstrapProduction(String[] gameJars, String gameVersion, String side,
       boolean development, boolean realLaunch, boolean discovery) throws Exception {
-    return bootstrapProduction(gameJars, gameVersion, side, development, realLaunch, discovery, false);
+    return bootstrapProduction(gameJars, gameVersion, side, development, realLaunch, discovery, false, false);
   }
 
   public static String bootstrapProduction(String[] gameJars, String gameVersion, String side,
       boolean development, boolean realLaunch, boolean discovery, boolean classpathUnlock) throws Exception {
-    resetClassPathState(classpathUnlock);
+    return bootstrapProduction(gameJars, gameVersion, side, development, realLaunch, discovery,
+        classpathUnlock, false);
+  }
+
+  public static String bootstrapProduction(String[] gameJars, String gameVersion, String side,
+      boolean development, boolean realLaunch, boolean discovery, boolean classpathUnlock,
+      boolean knotLaunchFlag) throws Exception {
+    resetClassPathState(classpathUnlock, knotLaunchFlag);
     if (gameJars == null || gameJars.length == 0) return "test\t0\tno game jar supplied";
     boolean client = "client".equals(side);
     try {
@@ -349,7 +425,16 @@ public final class HorizonLoaderBridge {
       }
       String unlock = classpathUnlock ? classPathOutcome() : "";
       if (classpathUnlock) {
-        knotInitOutcome = initializeKnotTransformers();
+        // Knot's own order before the delegate installs its transformer:
+        // loadClassTweakers -> FabricMixinBootstrap.init ->
+        // finishMixinBootstrapping -> initializeTransformers.
+        String mixinFailure = initializeMixinBootstrap(loader, impl, client);
+        if (mixinFailure != null) {
+          knotInitOutcome = bound("failed mixin bootstrap: " + mixinFailure);
+        } else {
+          knotInitOutcome = initializeKnotTransformers();
+        }
+        if (knotLaunch) knotLaunchOutcome = handOffKnotLoader();
       }
       Collection<?> allMods = (Collection<?>) impl.getMethod("getAllMods").invoke(loader);
       List<String> ids = new ArrayList<>();
@@ -382,7 +467,8 @@ public final class HorizonLoaderBridge {
         StubEntrypoint.main(launchArgs);
       }
       return "minecraft\t" + allMods.size() + "\t" + freezeReason + "\t" + development + "\t"
-          + String.join(",", ids) + "\t" + unlock + "\t" + (knotInitOutcome == null ? "" : knotInitOutcome);
+          + String.join(",", ids) + "\t" + unlock + "\t" + (knotInitOutcome == null ? "" : knotInitOutcome)
+          + "\t" + (knotLaunchOutcome == null ? "" : knotLaunchOutcome);
     } catch (Throwable failure) {
       String reason = summarize(failure);
       try {
@@ -431,11 +517,11 @@ public final class HorizonLoaderBridge {
           addClassPathEntry(a[0], prefixes, false);
           return null;
         }
-        case "getTargetClassLoader": return target;
-        case "getResourceAsStream": return target.getResourceAsStream((String) a[0]);
+        case "getTargetClassLoader": return targetLoader(target);
+        case "getResourceAsStream": return targetLoader(target).getResourceAsStream((String) a[0]);
         case "getClassByteArray": {
           String name = (String) a[0];
-          try (InputStream in = target.getResourceAsStream(name.replace('.', '/') + ".class")) {
+          try (InputStream in = targetLoader(target).getResourceAsStream(name.replace('.', '/') + ".class")) {
             if (in == null) throw new IOException(name);
             return in.readAllBytes();
           }
@@ -450,10 +536,23 @@ public final class HorizonLoaderBridge {
         case "getManifest": return null;
         case "getMappingConfiguration": return mappingConfiguration(gameVersion);
         case "isClassLoaded": return false;
-        case "loadIntoTarget": return Class.forName((String) a[0], false, target);
+        case "loadIntoTarget": return Class.forName((String) a[0], false, targetLoader(target));
         default: return defaultValue(m.getReturnType());
       }
     });
+  }
+
+  /**
+   * The loader the launcher hands to the game. Fabric's `FabricLauncher` API is
+   * getter-only (`getTargetClassLoader`; there is no `setTargetClassLoader`),
+   * and a real `Knot.init(String[])` returns
+   * `KnotClassLoaderInterface.getClassLoader()` as the game's loader, so
+   * `--knot-launch` stores that loader here and every launcher target read
+   * answers with it. Without the flag this is the system loader, exactly as
+   * before.
+   */
+  private static ClassLoader targetLoader(ClassLoader fallback) {
+    return knotLoader != null ? knotLoader : fallback;
   }
 
   public static final class StubEntrypoint {
@@ -642,7 +741,7 @@ fn main() -> ExitCode {
 }
 
 /// The usage line, kept as data so a test can check the kinds it names.
-const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--real-launch] [--fabric-discovery] [--classpath-unlock] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] [--measure [--measure-timeout <secs>] [--measure-sample-ms <ms>] [--measure-repeat <n>]] <jar>...";
+const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--real-launch] [--fabric-discovery] [--classpath-unlock] [--knot-launch] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] [--measure [--measure-timeout <secs>] [--measure-sample-ms <ms>] [--measure-repeat <n>]] <jar>...";
 
 /// The FML listing/report flags, removed from the jar list before anything is
 /// resolved. `--fml-list` is the short spelling of `--list-fml-mods`.
@@ -686,7 +785,12 @@ fn run() -> Result<(), String> {
     args.retain(|arg| arg != "--fabric-discovery");
     // Opt-in: extend the Knot classpath with the resolved game jars and the
     // loader's mod code sources. Without it the run is byte-identical.
-    let classpath_unlock = args.iter().any(|arg| arg == "--classpath-unlock");
+    // `--knot-launch` builds on it: it hands that loader to the launcher and
+    // proves the transformer chain, which needs an unlocked classpath, so it
+    // implies the unlock.
+    let knot_launch = args.iter().any(|arg| arg == "--knot-launch");
+    args.retain(|arg| arg != "--knot-launch");
+    let classpath_unlock = args.iter().any(|arg| arg == "--classpath-unlock") || knot_launch;
     args.retain(|arg| arg != "--classpath-unlock");
     // Run the real Fabric or NeoForge loader instead of this probe's own scan.
     // A supplied Minecraft jar opts into the production provider, which only
@@ -960,7 +1064,7 @@ fn run() -> Result<(), String> {
                 .call_static_method(
                     &bridge,
                     "bootstrapProduction",
-                    "([Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZZZ)Ljava/lang/String;",
+                    "([Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZZZZ)Ljava/lang/String;",
                     &[
                         JValue::Object(&jars),
                         JValue::Object(&JObject::from(version)),
@@ -969,6 +1073,7 @@ fn run() -> Result<(), String> {
                         JValue::Bool(real_launch as u8),
                         JValue::Bool(fabric_discovery as u8),
                         JValue::Bool(classpath_unlock as u8),
+                        JValue::Bool(knot_launch as u8),
                     ],
                 )
                 .and_then(|value| value.l())
@@ -1025,6 +1130,10 @@ fn run() -> Result<(), String> {
         if let Some(value) = &knot_init {
             println!("{}", knot_init_line(value));
         }
+        let knot_launch = knot_launch_value(knot_launch, &outcome);
+        if let Some(value) = &knot_launch {
+            println!("{}", knot_launch_line(value));
+        }
         if provider_report {
             let report = ProviderReport::from_outcome(
                 &outcome,
@@ -1033,7 +1142,8 @@ fn run() -> Result<(), String> {
                 ProviderSide::for_entry_kind(&entry_kind),
             )
             .with_classpath_unlock(unlock)
-            .with_knot_init(knot_init);
+            .with_knot_init(knot_init)
+            .with_knot_launch(knot_launch);
             print_provider_report(&report, fml_flags.json);
         }
         return Ok(());
@@ -2221,6 +2331,9 @@ enum ProviderOutcome {
         classpath_unlock: Option<String>,
         /// The bounded result of KnotClassLoaderInterface.initializeTransformers.
         knot_init: Option<String>,
+        /// The bounded `--knot-launch` result: the Knot loader handed to the
+        /// launcher and the class the transformer chain rewrote.
+        knot_launch: Option<String>,
     },
     Fallback {
         mods: usize,
@@ -2255,6 +2368,7 @@ struct ProviderReport {
     freeze_reason: Option<String>,
     classpath_unlock: Option<String>,
     knot_init: Option<String>,
+    knot_launch: Option<String>,
 }
 
 impl ProviderReport {
@@ -2270,6 +2384,7 @@ impl ProviderReport {
             freeze_reason: None,
             classpath_unlock: None,
             knot_init: None,
+            knot_launch: None,
         }
     }
 
@@ -2285,6 +2400,12 @@ impl ProviderReport {
         self
     }
 
+    /// Attach the `--knot-launch` outcome; `None` leaves the report unchanged.
+    fn with_knot_launch(mut self, value: Option<String>) -> Self {
+        self.knot_launch = value.map(|value| bounded_classpath_unlock(&value));
+        self
+    }
+
     fn from_outcome(
         outcome: &ProviderOutcome,
         game_jars: usize,
@@ -2296,6 +2417,7 @@ impl ProviderReport {
                 development,
                 freeze_reason,
                 knot_init,
+                knot_launch,
                 ..
             } => Self {
                 kind: ProviderKind::Minecraft,
@@ -2308,6 +2430,7 @@ impl ProviderReport {
                 freeze_reason: freeze_reason.clone(),
                 classpath_unlock: None,
                 knot_init: knot_init.clone(),
+                knot_launch: knot_launch.clone(),
             },
             ProviderOutcome::Fallback { reason, .. } => Self {
                 kind: ProviderKind::Test,
@@ -2320,6 +2443,7 @@ impl ProviderReport {
                 freeze_reason: None,
                 classpath_unlock: None,
                 knot_init: None,
+                knot_launch: None,
             },
             ProviderOutcome::Test { .. } => Self {
                 kind: ProviderKind::Test,
@@ -2332,6 +2456,7 @@ impl ProviderReport {
                 freeze_reason: None,
                 classpath_unlock: None,
                 knot_init: None,
+                knot_launch: None,
             },
         }
     }
@@ -2359,6 +2484,9 @@ impl ProviderReport {
         if let Some(init) = &self.knot_init {
             lines.push(knot_init_line(init));
         }
+        if let Some(launch) = &self.knot_launch {
+            lines.push(knot_launch_line(launch));
+        }
         bound_text(&(lines.join("\n") + "\n"), MAX_PROVIDER_REPORT_BYTES)
     }
 
@@ -2374,6 +2502,7 @@ impl ProviderReport {
             "freeze": self.freeze_reason,
             "classpathUnlock": self.classpath_unlock,
             "knotInit": self.knot_init,
+            "knotLaunch": self.knot_launch,
         })
         .to_string();
         if text.len() <= MAX_PROVIDER_REPORT_BYTES {
@@ -2390,6 +2519,7 @@ impl ProviderReport {
             "freeze": self.freeze_reason,
             "classpathUnlock": self.classpath_unlock,
             "knotInit": self.knot_init,
+            "knotLaunch": self.knot_launch,
         })
         .to_string()
     }
@@ -2493,11 +2623,33 @@ fn knot_init_value(requested: bool, outcome: &ProviderOutcome) -> Option<String>
     }
 }
 
-/// The bridge returns `minecraft<TAB><mods><TAB><freeze><TAB><development><TAB><ids><TAB><unlock><TAB><knot-init>` on success and
+/// `knot-launch: <value>`, the one bounded stdout and report line.
+fn knot_launch_line(value: &str) -> String {
+    format!("knot-launch: {value}")
+}
+
+/// The Knot loader hand-off and transform-chain proof for a real-loader run.
+fn knot_launch_value(requested: bool, outcome: &ProviderOutcome) -> Option<String> {
+    if !requested {
+        return None;
+    }
+    match outcome {
+        ProviderOutcome::Production { knot_launch, .. } => Some(match knot_launch {
+            Some(value) => bounded_classpath_unlock(value),
+            None => "failed no knot-launch result".to_owned(),
+        }),
+        ProviderOutcome::Fallback { .. } => {
+            Some("skipped (production game provider unavailable)".to_owned())
+        }
+        ProviderOutcome::Test { .. } => Some("skipped (no --game-jar)".to_owned()),
+    }
+}
+
+/// The bridge returns `minecraft<TAB><mods><TAB><freeze><TAB><development><TAB><ids><TAB><unlock><TAB><knot-init><TAB><knot-launch>` on success and
 /// `test<TAB><mods><TAB><reason>` after falling back. The unlock field is only
 /// present when `--classpath-unlock` was passed.
 fn parse_provider_outcome(text: &str) -> Result<ProviderOutcome, String> {
-    let mut parts = text.splitn(7, '\t');
+    let mut parts = text.splitn(8, '\t');
     let kind = parts.next().unwrap_or_default();
     let mods = parts
         .next()
@@ -2528,6 +2680,11 @@ fn parse_provider_outcome(text: &str) -> Result<ProviderOutcome, String> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(bounded_classpath_unlock);
+            let knot_launch = parts
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(bounded_classpath_unlock);
             Ok(ProviderOutcome::Production {
                 mods,
                 freeze_reason: (!freeze.is_empty()).then(|| bounded_provider_reason(freeze)),
@@ -2535,6 +2692,7 @@ fn parse_provider_outcome(text: &str) -> Result<ProviderOutcome, String> {
                 discovered_ids,
                 classpath_unlock,
                 knot_init,
+                knot_launch,
             })
         }
         "test" => Ok(ProviderOutcome::Fallback {
@@ -5534,15 +5692,16 @@ mod tests {
         fabric_mixin_configs, fallback_label, format_entrypoints, format_mixin_config_property,
         format_mixin_configs, game_provider_jvm_options, initializer_for_kind, is_datagen_kind,
         is_minecraft_class, is_minecraft_runtime_jar, knot_init_line, knot_init_value,
-        link_failure, missing_entry_message, mixin_bootstrap_line, mixin_config_names,
-        mixin_config_property, mixin_configs_line, mixin_jvm_options, mixin_registered_count,
-        mixin_stages, neoforge_constructor, neoforge_constructor_args,
-        neoforge_constructor_descriptor, neoforge_ctor_fallback_line, neoforge_ctor_line,
-        neoforge_dist, neoforge_dist_fields, neoforge_metadata, nested_jar_name,
-        parse_constructors, parse_mixin_config, parse_provider_outcome, pre_launch_entries,
-        quilt_entrypoint_kind, quilt_mixin_configs, register_mixin_configs, report_mixin_configs,
-        run_mixin_phase, select_mixin_configs, should_retry_no_arg, skip_mc_provider_requested,
-        skipped_mixin_configs, split_entrypoint, take_game_provider_args,
+        knot_launch_line, knot_launch_value, link_failure, missing_entry_message,
+        mixin_bootstrap_line, mixin_config_names, mixin_config_property, mixin_configs_line,
+        mixin_jvm_options, mixin_registered_count, mixin_stages, neoforge_constructor,
+        neoforge_constructor_args, neoforge_constructor_descriptor, neoforge_ctor_fallback_line,
+        neoforge_ctor_line, neoforge_dist, neoforge_dist_fields, neoforge_metadata,
+        nested_jar_name, parse_constructors, parse_mixin_config, parse_provider_outcome,
+        pre_launch_entries, quilt_entrypoint_kind, quilt_mixin_configs, register_mixin_configs,
+        report_mixin_configs, run_mixin_phase, select_mixin_configs, should_retry_no_arg,
+        skip_mc_provider_requested, skipped_mixin_configs, split_entrypoint,
+        take_game_provider_args,
     };
     use std::{
         fs::File,
@@ -6456,6 +6615,7 @@ config="demo.mixins.json""#,
                 discovered_ids: vec![],
                 classpath_unlock: None,
                 knot_init: None,
+                knot_launch: None,
             }
         );
         assert_eq!(
@@ -6467,6 +6627,7 @@ config="demo.mixins.json""#,
                 discovered_ids: vec!["alpha".to_owned(), "beta".to_owned()],
                 classpath_unlock: None,
                 knot_init: None,
+                knot_launch: None,
             }
         );
         // A freeze failure is whitespace-collapsed and bounded.
@@ -6523,6 +6684,7 @@ config="demo.mixins.json""#,
             discovered_ids: vec![],
             classpath_unlock: Some("ok 7 jars".to_owned()),
             knot_init: None,
+            knot_launch: None,
         };
         // Off by default: no value, so nothing is printed or reported.
         assert_eq!(classpath_unlock_value(false, &unlocked), None);
@@ -6558,6 +6720,7 @@ config="demo.mixins.json""#,
             discovered_ids: vec![],
             classpath_unlock: None,
             knot_init: None,
+            knot_launch: None,
         };
         assert_eq!(
             classpath_unlock_value(true, &missing).as_deref(),
@@ -6613,6 +6776,7 @@ config="demo.mixins.json""#,
             discovered_ids: vec![],
             classpath_unlock: Some("ok 2 jars".to_owned()),
             knot_init: Some("ok 1 transformers".to_owned()),
+            knot_launch: None,
         };
         assert_eq!(
             knot_init_value(true, &outcome).as_deref(),
@@ -6631,6 +6795,79 @@ config="demo.mixins.json""#,
     }
 
     #[test]
+    fn reports_the_knot_launch_hand_off() {
+        let outcome = ProviderOutcome::Production {
+            mods: 1,
+            freeze_reason: None,
+            development: false,
+            discovered_ids: vec![],
+            classpath_unlock: Some("ok 2 jars".to_owned()),
+            knot_init: Some("ok 1 transformers".to_owned()),
+            knot_launch: Some("ok 1 transformers".to_owned()),
+        };
+        // Off by default: nothing is printed or reported.
+        assert_eq!(knot_launch_value(false, &outcome), None);
+        assert_eq!(
+            knot_launch_value(true, &outcome).as_deref(),
+            Some("ok 1 transformers")
+        );
+        assert_eq!(
+            knot_launch_line("ok 1 transformers"),
+            "knot-launch: ok 1 transformers"
+        );
+        // A production result without the field is a failure, not an `ok`, and
+        // a run that never reached the provider says so.
+        let missing = ProviderOutcome::Production {
+            mods: 1,
+            freeze_reason: None,
+            development: false,
+            discovered_ids: vec![],
+            classpath_unlock: Some("ok 1 jars".to_owned()),
+            knot_init: Some("ok 1 transformers".to_owned()),
+            knot_launch: None,
+        };
+        assert_eq!(
+            knot_launch_value(true, &missing).as_deref(),
+            Some("failed no knot-launch result")
+        );
+        assert_eq!(
+            knot_launch_value(true, &ProviderOutcome::Test { mods: 0 }).as_deref(),
+            Some("skipped (no --game-jar)")
+        );
+
+        // The bridge's eighth field carries the outcome; the older seven-field
+        // shape still parses and stays `None`.
+        let parsed = parse_provider_outcome(
+            "minecraft\t2\t\tfalse\t\tok 7 jars\tok 1 transformers\tok 1 transformers",
+        )
+        .unwrap();
+        let ProviderOutcome::Production {
+            knot_launch: Some(launch),
+            ..
+        } = parsed
+        else {
+            panic!("expected a knot-launch value");
+        };
+        assert_eq!(launch, "ok 1 transformers");
+        assert_eq!(
+            knot_launch_value(
+                true,
+                &parse_provider_outcome("minecraft\t2\t\tfalse\t\tok 7 jars\tok 1 transformers")
+                    .unwrap()
+            )
+            .as_deref(),
+            Some("failed no knot-launch result")
+        );
+
+        // The report carries the same one line, and nothing when unasked.
+        let report = ProviderReport::from_outcome(&outcome, 1, "26.3", ProviderSide::Server)
+            .with_knot_launch(Some("ok 1 transformers".to_owned()));
+        assert!(report.text().contains("knot-launch: ok 1 transformers\n"));
+        let json: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
+        assert_eq!(json["knotLaunch"], "ok 1 transformers");
+    }
+
+    #[test]
     fn formats_the_provider_report_as_text_and_json() {
         let report = ProviderReport::from_outcome(
             &ProviderOutcome::Production {
@@ -6640,6 +6877,7 @@ config="demo.mixins.json""#,
                 discovered_ids: vec![],
                 classpath_unlock: None,
                 knot_init: None,
+                knot_launch: None,
             },
             1,
             "26.3",
@@ -6699,6 +6937,7 @@ config="demo.mixins.json""#,
             freeze_reason: None,
             classpath_unlock: None,
             knot_init: None,
+            knot_launch: None,
         };
         assert!(report.text().len() <= MAX_PROVIDER_REPORT_BYTES);
         assert!(report.json().len() <= MAX_PROVIDER_REPORT_BYTES);
@@ -7536,10 +7775,15 @@ mod real_loader_tests {
             "addCodeSource",
             "setAllowedPrefixes",
             "classPathOutcome",
+            "handOffKnotLoader",
+            "getTargetClassLoader",
+            "targetLoader",
+            "loadIntoTarget",
         ] {
             assert!(LOADER_BRIDGE_SOURCE.contains(needed), "missing {needed}");
         }
         assert!(USAGE.contains("--real-loader"));
+        assert!(USAGE.contains("--knot-launch"));
         assert!(USAGE.contains("--game-jar"));
         assert!(USAGE.contains("--game-version"));
         assert!(USAGE.contains("--provider-report"));
