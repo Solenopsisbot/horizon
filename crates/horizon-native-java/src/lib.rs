@@ -622,6 +622,17 @@ pub struct MixinExecutionReport {
     /// the HEAD/RETURN/TAIL/INVOKE entry points and for a `@Redirect` at
     /// `HEAD`, which replaces the whole body rather than hooking a site.
     pub matched_anchor_sites: usize,
+    /// Discovered plans this execution left out because the jar's readable
+    /// Mixin configs do not apply their class on the selected side.
+    ///
+    /// Only [`NativeJar::execute_discovered_mixins_on`] fills this: a plan
+    /// whose `@Mixin` class no config lists is skipped with
+    /// [`MixinSkipReason::NotInConfig`], one whose config applies it only on
+    /// the other physical side with [`MixinSkipReason::OtherSide`], and one
+    /// whose config names a plugin with [`MixinSkipReason::ConfigPlugin`]. The
+    /// single-plan entry points, and a jar with no readable config at all,
+    /// leave it empty.
+    pub skipped_plans: Vec<SkippedMixinPlan>,
 }
 
 /// Runtime state for the `CallbackInfo` objects one native Mixin execution
@@ -9289,6 +9300,7 @@ impl NativeJar {
     fn discovered_mixin_plans(
         &self,
         target: &MethodRef,
+        gate: &mut ExecutionConfigGate,
     ) -> Result<Vec<MixinInjectionPlan>, NativeError> {
         let mut before = Vec::new();
         let mut after = Vec::new();
@@ -9296,12 +9308,18 @@ impl NativeJar {
         // Discovery sorts alphabetically for stable reports; callbacks run in
         // the order real Mixin applies the configs and `@Mixin` priorities.
         let mut ordered = self.mixin_injection_plans();
-        self.sort_mixin_plans_in_apply_order(&mut ordered, &self.mixin_configs());
+        self.sort_mixin_plans_in_apply_order(&mut ordered, &gate.configs);
         for mut plan in ordered {
             if plan.target.owner != target.owner || plan.target.name != target.name {
                 continue;
             }
             if !plan.target.descriptor.is_empty() && plan.target.descriptor != target.descriptor {
+                continue;
+            }
+            // A class no readable config applies on this side never runs, and
+            // its anchor shape is irrelevant: record the config reason before
+            // the shape checks can reject the plan for something else.
+            if gate.skips(&plan) {
                 continue;
             }
             plan.target.descriptor = target.descriptor.clone();
@@ -10373,6 +10391,7 @@ impl NativeJar {
             return_value_overridden: false,
             matched_invoke_sites: 0,
             matched_anchor_sites: 0,
+            skipped_plans: Vec::new(),
         })
     }
 
@@ -10513,6 +10532,7 @@ impl NativeJar {
             return_value_overridden: false,
             matched_invoke_sites: 0,
             matched_anchor_sites: 0,
+            skipped_plans: Vec::new(),
         })
     }
 
@@ -10772,6 +10792,7 @@ impl NativeJar {
             return_value_overridden: override_value.is_some(),
             matched_invoke_sites: 0,
             matched_anchor_sites: 0,
+            skipped_plans: Vec::new(),
         })
     }
 
@@ -10917,6 +10938,7 @@ impl NativeJar {
             return_value_overridden: false,
             matched_invoke_sites: matched_sites.len(),
             matched_anchor_sites: 0,
+            skipped_plans: Vec::new(),
         })
     }
 
@@ -10959,6 +10981,16 @@ impl NativeJar {
     /// before that call, and each local modifier replaces the value stored to
     /// or loaded from its selected slot.  Their results join
     /// [`MixinExecutionReport::callback_results`] at the point they ran.
+    /// [`Self::execute_discovered_mixins_on`] without a selected physical side.
+    ///
+    /// With no side to split the configs' `client`/`server` lists with, the
+    /// gate only asks whether a readable config claims the `@Mixin` class at
+    /// all. A jar with no readable config at all stays executable: there is
+    /// nothing to gate against, and the load-time weave is what refuses such a
+    /// jar. A caller that knows its side calls
+    /// [`Self::execute_discovered_mixins_on`], where an unlisted class, a class
+    /// its config applies only on the other side, and a config plugin each
+    /// become a [`MixinExecutionReport::skipped_plans`] row.
     pub fn execute_discovered_mixins<H: Host>(
         &self,
         target: &MethodRef,
@@ -10966,27 +10998,68 @@ impl NativeJar {
         args: &[Value],
         host: &mut H,
     ) -> Result<MixinExecutionReport, NativeError> {
+        self.execute_discovered_mixins_gated(target, receiver, args, host, None)
+    }
+
+    /// [`Self::execute_discovered_mixins`] gated on the physical `side`.
+    ///
+    /// Every discovered plan is filtered through the same [`mixin_config_gate`]
+    /// the load-time weave applies: a class no readable config lists is skipped
+    /// as [`MixinSkipReason::NotInConfig`], a class whose config applies it on
+    /// the other side as [`MixinSkipReason::OtherSide`], and a class whose
+    /// first applying config names a plugin as [`MixinSkipReason::ConfigPlugin`].
+    /// The skipped plans are reported in
+    /// [`MixinExecutionReport::skipped_plans`] rather than vanishing, and a
+    /// plan the gate refuses is not validated for its anchor shape, because it
+    /// never reaches the weave.
+    pub fn execute_discovered_mixins_on<H: Host>(
+        &self,
+        side: MixinSide,
+        target: &MethodRef,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        self.execute_discovered_mixins_gated(target, receiver, args, host, Some(side))
+    }
+
+    fn execute_discovered_mixins_gated<H: Host>(
+        &self,
+        target: &MethodRef,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+        side: Option<MixinSide>,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        let mut gate = ExecutionConfigGate::new(self, side);
         let overwrites = self
             .mixin_overwrite_plans()
             .into_iter()
             .filter(|plan| plan_target_matches(&plan.target, target))
+            .filter(|plan| !gate.skips(plan))
             .collect::<Vec<_>>();
         if !overwrites.is_empty() {
-            return self.execute_overwrite_plans(target, &overwrites, receiver, args, host);
+            let mut report =
+                self.execute_overwrite_plans(target, &overwrites, receiver, args, host, &gate)?;
+            report.skipped_plans = gate.skipped;
+            return Ok(report);
         }
-        let mut modify_hooks = self.discovered_modify_hooks(target, receiver.as_ref(), args)?;
-        let plans = self.discovered_mixin_plans(target)?;
+        let mut modify_hooks =
+            self.discovered_modify_hooks(target, receiver.as_ref(), args, &mut gate)?;
+        let plans = self.discovered_mixin_plans(target, &mut gate)?;
         // One anchor family per target: an INVOKE selection runs the target
         // once with the call-site hook table.
         if plans.first().is_some_and(|plan| plan.at == "INVOKE") {
-            return self.execute_invoke_plans(
+            let mut report = self.execute_invoke_plans(
                 target,
                 &plans,
                 receiver,
                 args,
                 host,
                 modify_hooks.as_mut(),
-            );
+            )?;
+            report.skipped_plans = gate.skipped;
+            return Ok(report);
         }
         let target_class = self.classes.get(&target.owner).ok_or_else(|| {
             NativeError::MissingMethod(format!(
@@ -11091,7 +11164,7 @@ impl NativeJar {
                 callback_results.extend(hooks.results.iter().cloned());
             }
             callback_results.extend(return_results);
-            return Ok(MixinExecutionReport {
+            let report = MixinExecutionReport {
                 callback_result: callback_results.last().cloned().unwrap_or(Value::Void),
                 target_result: overridden.clone().unwrap_or(result),
                 callback_results,
@@ -11103,7 +11176,9 @@ impl NativeJar {
                 matched_anchor_sites: modify_hooks
                     .as_ref()
                     .map_or(0, |hooks| hooks.matched_anchor_sites.len()),
-            });
+                skipped_plans: gate.skipped,
+            };
+            return Ok(report);
         };
         Ok(MixinExecutionReport {
             callback_result: head_results.last().cloned().unwrap_or(Value::Void),
@@ -11113,6 +11188,7 @@ impl NativeJar {
             return_value_overridden: false,
             matched_invoke_sites: 0,
             matched_anchor_sites: 0,
+            skipped_plans: gate.skipped,
         })
     }
 
@@ -11129,6 +11205,7 @@ impl NativeJar {
         receiver: Option<Value>,
         args: &[Value],
         host: &mut H,
+        gate: &ExecutionConfigGate,
     ) -> Result<MixinExecutionReport, NativeError> {
         let Some(plan) = plans.first() else {
             return Err(NativeError::Metadata(format!(
@@ -11145,25 +11222,31 @@ impl NativeJar {
                 plans.len()
             )));
         }
+        // A plan the config gate refuses never runs, so it does not compete
+        // with the overwrite for the target.
         let injections = self
             .mixin_injection_plans()
             .iter()
             .filter(|candidate| plan_target_matches(&candidate.target, target))
+            .filter(|candidate| gate.applies(&candidate.callback.owner))
             .count();
         let anchors = self
             .mixin_anchor_plans()
             .iter()
             .filter(|candidate| plan_target_matches(&candidate.target, target))
+            .filter(|candidate| gate.applies(&candidate.callback.owner))
             .count();
         let modify_args = self
             .mixin_modify_arg_plans()
             .iter()
             .filter(|candidate| plan_target_matches(&candidate.target, target))
+            .filter(|candidate| gate.applies(&candidate.callback.owner))
             .count();
         let modify_variables = self
             .mixin_modify_variable_plans()
             .iter()
             .filter(|candidate| plan_target_matches(&candidate.target, target))
+            .filter(|candidate| gate.applies(&candidate.callback.owner))
             .count();
         let others = injections + anchors + modify_args + modify_variables;
         if others > 0 {
@@ -11187,16 +11270,19 @@ impl NativeJar {
         target: &MethodRef,
         receiver: Option<&Value>,
         args: &[Value],
+        gate: &mut ExecutionConfigGate,
     ) -> Result<Option<ModifyHooks>, NativeError> {
         let arg_plans = self
             .mixin_modify_arg_plans()
             .into_iter()
             .filter(|plan| plan_target_matches(&plan.target, target))
+            .filter(|plan| !gate.skips_modify_arg(plan))
             .collect::<Vec<_>>();
         let variable_plans = self
             .mixin_modify_variable_plans()
             .into_iter()
             .filter(|plan| plan_target_matches(&plan.target, target))
+            .filter(|plan| !gate.skips_modify_variable(plan))
             .collect::<Vec<_>>();
         if arg_plans.is_empty() && variable_plans.is_empty() {
             return Ok(None);
@@ -11496,6 +11582,7 @@ impl NativeJar {
             return_value_overridden: false,
             matched_invoke_sites: 0,
             matched_anchor_sites: 0,
+            skipped_plans: Vec::new(),
         })
     }
 
@@ -11614,6 +11701,7 @@ impl NativeJar {
             return_value_overridden: false,
             matched_invoke_sites: 0,
             matched_anchor_sites: hooks.matched_sites.len(),
+            skipped_plans: Vec::new(),
         })
     }
 
@@ -11715,6 +11803,7 @@ impl NativeJar {
             return_value_overridden: false,
             matched_invoke_sites: 0,
             matched_anchor_sites: 0,
+            skipped_plans: Vec::new(),
         })
     }
 
@@ -15666,6 +15755,94 @@ fn mixin_config_gate(
     } else {
         MixinSkipReason::NotInConfig
     })
+}
+
+/// Whether any readable config lists one `@Mixin` class, on either side.
+///
+/// The side-agnostic interpreter entry has no physical side to split
+/// `client`/`server` lists with, so it only asks whether a config claims the
+/// class at all. A caller that knows its side calls
+/// [`NativeJar::execute_discovered_mixins_on`] instead, where the side-limited
+/// list split applies.
+fn mixin_config_lists_any_side(configs: &[MixinConfig], class: &str) -> bool {
+    let binary = class.replace('/', ".");
+    configs.iter().any(|config| {
+        config.mixins.contains(&binary)
+            || config.client.contains(&binary)
+            || config.server.contains(&binary)
+    })
+}
+
+/// The config gate one interpreter execution applies to its discovered plans.
+///
+/// The rows a gate skips are collected here so
+/// [`MixinExecutionReport::skipped_plans`] can carry the bounded reason instead
+/// of silently dropping an unlisted plan.
+struct ExecutionConfigGate {
+    configs: Vec<MixinConfig>,
+    config_sides: BTreeMap<String, MixinSide>,
+    side: Option<MixinSide>,
+    skipped: Vec<SkippedMixinPlan>,
+}
+
+impl ExecutionConfigGate {
+    fn new(jar: &NativeJar, side: Option<MixinSide>) -> Self {
+        Self {
+            configs: jar.mixin_configs(),
+            config_sides: jar.mixin_config_sides(),
+            side,
+            skipped: Vec::new(),
+        }
+    }
+
+    /// Why one plan stays out of this execution, if it does.
+    ///
+    /// With no readable config at all there is nothing to gate against, so the
+    /// jar's plans stay executable; the load-time weave still refuses them.
+    /// This is the side-agnostic entry's case. With a selected side the same
+    /// [`mixin_config_gate`] the weave uses decides.
+    fn reason(&self, class: &str) -> Option<MixinSkipReason> {
+        if self.configs.is_empty() {
+            return None;
+        }
+        match self.side {
+            Some(side) => mixin_config_gate(&self.configs, &self.config_sides, class, side).err(),
+            None => (!mixin_config_lists_any_side(&self.configs, class))
+                .then_some(MixinSkipReason::NotInConfig),
+        }
+    }
+
+    /// Whether `class` may run here, without recording a row.
+    fn applies(&self, class: &str) -> bool {
+        self.reason(class).is_none()
+    }
+
+    /// Record one plan row as skipped when the gate refuses its class.
+    fn skips_ref(&mut self, target: &MethodRef, callback: &MethodRef, at: &str) -> bool {
+        let Some(reason) = self.reason(&callback.owner) else {
+            return false;
+        };
+        self.skipped.push(SkippedMixinPlan {
+            target: target.clone(),
+            callback: callback.clone(),
+            at: at.to_owned(),
+            reason,
+        });
+        true
+    }
+
+    /// Record `plan` as skipped when the gate refuses its class.
+    fn skips(&mut self, plan: &MixinInjectionPlan) -> bool {
+        self.skips_ref(&plan.target, &plan.callback, &plan.at)
+    }
+
+    fn skips_modify_arg(&mut self, plan: &MixinModifyArgPlan) -> bool {
+        self.skips_ref(&plan.target, &plan.callback, "MODIFY_ARG")
+    }
+
+    fn skips_modify_variable(&mut self, plan: &MixinModifyVariablePlan) -> bool {
+        self.skips_ref(&plan.target, &plan.callback, &plan.at)
+    }
 }
 
 /// One row per class a config lists that has no plan and no row yet.
@@ -27753,6 +27930,164 @@ mandatory = true
             host.markers,
             vec!["demo/Probe#alpha", "demo/Probe#beta", "demo/Probe#target"],
             "HEAD callbacks run in plan order before the target, once"
+        );
+    }
+
+    /// A jar whose `fabric.mod.json` declares one Mixin config holding `config`.
+    fn configured_jar(classes: impl IntoIterator<Item = ClassFile>, config: &str) -> NativeJar {
+        let mut jar = NativeJar::from_classes(classes);
+        jar.resource_bytes.insert(
+            "fabric.mod.json".into(),
+            br#"{"id":"demo","version":"1","mixins":["demo.mixins.json"]}"#.to_vec(),
+        );
+        jar.resource_bytes
+            .insert("demo.mixins.json".into(), config.as_bytes().to_vec());
+        jar
+    }
+
+    #[test]
+    fn discovered_mixins_skip_classes_no_config_lists() {
+        let jar = configured_jar(
+            [
+                target_class(),
+                marker_mixin(
+                    "demo/ListedMixin",
+                    "run()V",
+                    "HEAD",
+                    false,
+                    "listed",
+                    "listed",
+                ),
+                marker_mixin(
+                    "demo/UnlistedMixin",
+                    "run()V",
+                    "HEAD",
+                    false,
+                    "unlisted",
+                    "unlisted",
+                ),
+            ],
+            r#"{"mixins":["demo.ListedMixin"]}"#,
+        );
+        let target = MethodRef {
+            owner: "demo/Target".into(),
+            name: "run".into(),
+            descriptor: "()V".into(),
+        };
+
+        // The side-agnostic entry only asks whether a config claims the class.
+        let mut host = MarkerHost::default();
+        let report = jar
+            .execute_discovered_mixins(&target, None, &[], &mut host)
+            .unwrap();
+        assert_eq!(
+            host.markers,
+            vec!["demo/Probe#listed", "demo/Probe#target"],
+            "a plan no config lists never runs"
+        );
+        assert_eq!(report.skipped_plans.len(), 1);
+        assert_eq!(report.skipped_plans[0].callback.owner, "demo/UnlistedMixin");
+        assert_eq!(report.skipped_plans[0].reason, MixinSkipReason::NotInConfig);
+
+        // A selected side gates through the same rule and reports it too.
+        let mut host = MarkerHost::default();
+        let report = jar
+            .execute_discovered_mixins_on(MixinSide::Server, &target, None, &[], &mut host)
+            .unwrap();
+        assert_eq!(host.markers, vec!["demo/Probe#listed", "demo/Probe#target"]);
+        assert_eq!(
+            report
+                .skipped_plans
+                .iter()
+                .map(|row| row.reason.label())
+                .collect::<Vec<_>>(),
+            ["not-in-config"]
+        );
+
+        // A jar with no readable config has nothing to gate against: the
+        // interpreter's callers are probes on an already-resolved jar.
+        let plain = NativeJar::from_classes([
+            target_class(),
+            marker_mixin("demo/PlainMixin", "run()V", "HEAD", false, "plain", "plain"),
+        ]);
+        let mut host = MarkerHost::default();
+        let report = plain
+            .execute_discovered_mixins_on(MixinSide::Server, &target, None, &[], &mut host)
+            .unwrap();
+        assert_eq!(host.markers, vec!["demo/Probe#plain", "demo/Probe#target"]);
+        assert!(report.skipped_plans.is_empty());
+    }
+
+    #[test]
+    fn discovered_mixins_on_the_other_side_are_skipped_as_other_side() {
+        let jar = configured_jar(
+            [
+                target_class(),
+                marker_mixin(
+                    "demo/ClientMixin",
+                    "run()V",
+                    "HEAD",
+                    false,
+                    "client",
+                    "client",
+                ),
+            ],
+            r#"{"client":["demo.ClientMixin"]}"#,
+        );
+        let target = MethodRef {
+            owner: "demo/Target".into(),
+            name: "run".into(),
+            descriptor: "()V".into(),
+        };
+
+        let mut host = MarkerHost::default();
+        let report = jar
+            .execute_discovered_mixins_on(MixinSide::Server, &target, None, &[], &mut host)
+            .unwrap();
+        assert_eq!(host.markers, vec!["demo/Probe#target"]);
+        assert_eq!(report.skipped_plans[0].reason, MixinSkipReason::OtherSide);
+
+        // The same class applies on the client.
+        let mut host = MarkerHost::default();
+        jar.execute_discovered_mixins_on(MixinSide::Client, &target, None, &[], &mut host)
+            .unwrap();
+        assert_eq!(host.markers, vec!["demo/Probe#client", "demo/Probe#target"]);
+    }
+
+    #[test]
+    fn discovered_mixins_with_a_config_plugin_are_skipped() {
+        let jar = configured_jar(
+            [
+                target_class(),
+                marker_mixin(
+                    "demo/PluginMixin",
+                    "run()V",
+                    "HEAD",
+                    false,
+                    "plugin",
+                    "plugin",
+                ),
+            ],
+            r#"{"plugin":"demo.Plugin","mixins":["demo.PluginMixin"]}"#,
+        );
+        let mut host = MarkerHost::default();
+        let report = jar
+            .execute_discovered_mixins_on(
+                MixinSide::Server,
+                &MethodRef {
+                    owner: "demo/Target".into(),
+                    name: "run".into(),
+                    descriptor: "()V".into(),
+                },
+                None,
+                &[],
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(host.markers, vec!["demo/Probe#target"]);
+        assert_eq!(
+            report.skipped_plans[0].reason,
+            MixinSkipReason::ConfigPlugin
         );
     }
 
