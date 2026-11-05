@@ -373,6 +373,20 @@ pub fn generate_many(
             }
         }
     }
+    // The capability-provider and item-handler shims name the side a capability
+    // is queried for and the stacks a handler moves, and a mod that only
+    // registers a token or listens on the bus never mentions them.
+    if uses_neoforge || uses_legacy_forge {
+        for name in [
+            "net/minecraft/core/Direction",
+            "net/minecraft/world/item/ItemStack",
+            "net/minecraft/world/item/Item",
+        ] {
+            if game.contains_key(name) && !lib_names.contains(name) && !own.contains(name) {
+                wanted.insert(name.to_owned());
+            }
+        }
+    }
     // The Fabric event shims name game types in their callback signatures, and
     // a mod that only writes `register(server -> {})` carries no reference to
     // them. Seed the façade with the types the emitted holders need; a
@@ -1365,6 +1379,66 @@ pub fn generate_many(
         }
     }
     if uses_neoforge || uses_legacy_forge {
+        // 26.3's `Registry` is an interface (and its façade stub drops the type
+        // parameter): a shim that builds one needs an anonymous implementation,
+        // and one that extends it cannot name a class or a type argument.
+        let game_registry_interface = game
+            .get("net/minecraft/core/Registry")
+            .is_some_and(|class| class.access & 0x0200 != 0);
+        // Whether `Registry` in this compilation is one of these shims (a
+        // generic class) or the game's own stub.
+        let registry_is_shim = !(wanted.contains("net/minecraft/core/Registry")
+            || lib_names.contains("net/minecraft/core/Registry"));
+        let defaulted_registry = if registry_is_shim {
+            concat!(
+                "package net.minecraft.core;\n",
+                "import net.minecraft.resources.Identifier;\n",
+                "public class DefaultedRegistry<T> extends Registry<T> {\n",
+                "    public Identifier getKey(Object value) { return super.getKey(value); }\n",
+                "}\n",
+            )
+            .to_owned()
+        } else if game_registry_interface {
+            concat!(
+                "package net.minecraft.core;\n",
+                "import net.minecraft.resources.Identifier;\n",
+                "public interface DefaultedRegistry<T> extends Registry {\n",
+                "    Identifier getKey(Object value);\n",
+                "}\n",
+            )
+            .to_owned()
+        } else {
+            // The game's `Registry` is a class stub: it already declares
+            // `getKey`, and the stub drops type parameters.
+            String::new()
+        };
+        let register_event = concat!(
+            "package net.neoforged.neoforge.registries;\n",
+            "import java.util.function.Consumer;\n",
+            "import java.util.function.Supplier;\n",
+            "import net.minecraft.core.Registry;\n",
+            "import net.minecraft.resources.Identifier;\n",
+            "import net.minecraft.resources.ResourceKey;\n",
+            "import net.neoforged.bus.api.Event;\n",
+            "public class RegisterEvent extends Event {\n",
+            "    private final ResourceKey horizonRegistryKey = new ResourceKey();\n",
+            "    private final Registry horizonRegistry = __HORIZON_REGISTRY_INIT__;\n",
+            "    public void register(ResourceKey key, Identifier id, Supplier value) { if (value != null) horizonRegistry.register(key, id, value.get()); }\n",
+            "    public void register(ResourceKey key, Consumer callback) { if (callback != null) callback.accept(new RegisterHelper() { public void register(Identifier id, Object value) { horizonRegistry.register(key, id, value); } }); }\n",
+            "    public ResourceKey getRegistryKey() { return horizonRegistryKey; }\n",
+            "    public Registry getRegistry() { return horizonRegistry; }\n",
+            "    public Registry getRegistry(ResourceKey key) { return horizonRegistry; }\n",
+            "    public interface RegisterHelper { default void register(ResourceKey key, Object value) {} void register(Identifier id, Object value); }\n",
+            "}\n",
+        )
+        .replace(
+            "__HORIZON_REGISTRY_INIT__",
+            if game_registry_interface {
+                "new Registry() {}"
+            } else {
+                "new Registry()"
+            },
+        );
         let shims = [
             (
                 "net/neoforged/fml/common/Mod.java",
@@ -1656,25 +1730,7 @@ pub fn generate_many(
             ),
             (
                 "net/neoforged/neoforge/registries/RegisterEvent.java",
-                concat!(
-                    "package net.neoforged.neoforge.registries;\n",
-                    "import java.util.function.Consumer;\n",
-                    "import java.util.function.Supplier;\n",
-                    "import net.minecraft.core.Registry;\n",
-                    "import net.minecraft.resources.Identifier;\n",
-                    "import net.minecraft.resources.ResourceKey;\n",
-                    "import net.neoforged.bus.api.Event;\n",
-                    "public class RegisterEvent extends Event {\n",
-                    "    private final ResourceKey horizonRegistryKey = new ResourceKey();\n",
-                    "    private final Registry horizonRegistry = new Registry();\n",
-                    "    public void register(ResourceKey key, Identifier id, Supplier value) { if (value != null) horizonRegistry.register(key, id, value.get()); }\n",
-                    "    public void register(ResourceKey key, Consumer callback) { if (callback != null) callback.accept(new RegisterHelper() { public void register(Identifier id, Object value) { horizonRegistry.register(key, id, value); } }); }\n",
-                    "    public ResourceKey getRegistryKey() { return horizonRegistryKey; }\n",
-                    "    public Registry getRegistry() { return horizonRegistry; }\n",
-                    "    public Registry getRegistry(ResourceKey key) { return horizonRegistry; }\n",
-                    "    public interface RegisterHelper { default void register(ResourceKey key, Object value) {} void register(Identifier id, Object value); }\n",
-                    "}\n",
-                ),
+                register_event.as_str(),
             ),
             (
                 "net/minecraft/core/Registry.java",
@@ -1685,7 +1741,7 @@ pub fn generate_many(
                     "public class Registry<T> {\n",
                     "    protected final Map<Identifier,Object> horizonEntries = new LinkedHashMap<>();\n",
                     "    protected final Map<Identifier,ResourceKey> horizonKeys = new LinkedHashMap<>();\n",
-                    "    public <V> V register(ResourceKey<V> key, Identifier id, V value) { horizonEntries.put(id, value); horizonKeys.put(id, key); return value; }\n",
+                    "    public <V> V register(ResourceKey key, Identifier id, V value) { horizonEntries.put(id, value); horizonKeys.put(id, key); return value; }\n",
                     "    public boolean containsKey(Identifier id) { return horizonEntries.containsKey(id); }\n",
                     "    @SuppressWarnings(\"unchecked\") public T get(Identifier id) { return (T) horizonEntries.get(id); }\n",
                     "    public Optional<T> getOptional(Identifier id) { return Optional.ofNullable(get(id)); }\n",
@@ -1696,13 +1752,7 @@ pub fn generate_many(
             ),
             (
                 "net/minecraft/core/DefaultedRegistry.java",
-                concat!(
-                    "package net.minecraft.core;\n",
-                    "import net.minecraft.resources.Identifier;\n",
-                    "public class DefaultedRegistry<T> extends Registry<T> {\n",
-                    "    public Identifier getKey(Object value) { return super.getKey(value); }\n",
-                    "}\n",
-                ),
+                defaulted_registry.as_str(),
             ),
             (
                 "net/minecraft/resources/Identifier.java",
@@ -1800,6 +1850,11 @@ pub fn generate_many(
             ),
         ];
         for (relative, source) in shims {
+            // A shim whose shape the game's own stub already provides (see
+            // `defaulted_registry`) contributes no file.
+            if source.is_empty() {
+                continue;
+            }
             let game_value = match relative {
                 "net/minecraft/core/Registry.java" => Some("net/minecraft/core/Registry"),
                 "net/minecraft/core/DefaultedRegistry.java" => {
@@ -2058,24 +2113,40 @@ pub fn generate_many(
         let path = std::env::join_paths(&compile_jars).map_err(|e| e.to_string())?;
         command.arg("-classpath").arg(path);
     }
-    let status = command
+    let output = command
         .arg(format!("@{}", list.display()))
-        .status()
+        .output()
         .map_err(|e| format!("{}: {e}", javac.display()))?;
-    if !status.success() {
-        return Err(format!("javac failed: {status}"));
+    if !output.status.success() {
+        // `javac` diagnoses the exact file and line; a caller (the launcher or
+        // a test) has nothing else to go on, so keep them in the error instead
+        // of letting them drain to a terminal nobody reads.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let diagnostics = format!(
+            "{}{}{}",
+            stdout.trim(),
+            if stdout.trim().is_empty() { "" } else { "\n" },
+            stderr.trim()
+        );
+        return Err(if diagnostics.is_empty() {
+            format!("javac failed: {}", output.status)
+        } else {
+            format!("javac failed: {}\n{diagnostics}", output.status)
+        });
     }
-    let status = Command::new(jar)
+    let output = Command::new(jar)
         .arg("--create")
         .arg("--file")
         .arg(&report.jar)
         .arg("-C")
         .arg(&classes_dir)
         .arg(".")
-        .status()
+        .output()
         .map_err(|e| format!("{}: {e}", jar.display()))?;
-    if !status.success() {
-        return Err(format!("jar failed: {status}"));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("jar failed: {}: {}", output.status, stderr.trim()));
     }
     Ok(report)
 }
@@ -3046,7 +3117,9 @@ const FABRIC_SERVER_PLAYER_EVENTS: &[FabricEvent] = &[
 
 fn fabric_event_source(package: &str, class: &str, doc: &str, events: &[FabricEvent]) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "package {package};");
+    // Callers pass the API class's path (`a/b/C`) or its Java package
+    // (`a.b`); a package declaration only accepts the dotted form.
+    let _ = writeln!(out, "package {};", package.replace('/', "."));
     let _ = writeln!(out);
     let _ = writeln!(out, "import net.fabricmc.fabric.api.event.Event;");
     let _ = writeln!(out);
@@ -5138,6 +5211,17 @@ fn functional_interface(name: &str) -> bool {
 /// support class can pull in its own support.
 fn support_types(name: &str) -> &'static [&'static str] {
     match name {
+        // `Player`/`ServerPlayer` carry an inventory and its abilities even when
+        // the mod only names one player accessor; the bounded fields construct
+        // both, so they travel with the player.
+        "net/minecraft/world/entity/player/Player" | "net/minecraft/server/level/ServerPlayer" => {
+            &[
+                "net/minecraft/world/entity/player/Inventory",
+                "net/minecraft/world/entity/player/Abilities",
+            ]
+        }
+        // The bounded inventory names the stacks it stores.
+        "net/minecraft/world/entity/player/Inventory" => &["net/minecraft/world/item/ItemStack"],
         // The bounded `Mob` value names these in its fields and its health,
         // attribute and navigation accessors. They travel with it so a mod
         // that only names one flag still gets a source that compiles.
@@ -5458,9 +5542,12 @@ fn render(
         class.name.as_str(),
         "net/minecraft/core/Registry" | "net/minecraft/core/DefaultedRegistry"
     ) {
+        // An interface's bounded store is a shared constant (`protected` is
+        // not a legal interface modifier); a class keeps the per-instance map.
+        let prefix = if is_interface { "" } else { "protected final " };
         let _ = writeln!(
             out,
-            "    protected final java.util.Map<net.minecraft.resources.Identifier, Object> horizonEntries = new java.util.LinkedHashMap<>();\n    protected final java.util.Map<net.minecraft.resources.Identifier, net.minecraft.resources.ResourceKey> horizonKeys = new java.util.LinkedHashMap<>();"
+            "    {prefix}java.util.Map<net.minecraft.resources.Identifier, Object> horizonEntries = new java.util.LinkedHashMap<>();\n    {prefix}java.util.Map<net.minecraft.resources.Identifier, net.minecraft.resources.ResourceKey> horizonKeys = new java.util.LinkedHashMap<>();"
         );
     }
     let holder_impl = class.name.starts_with("net/minecraft/core/Holder$") && !is_interface;
@@ -5763,6 +5850,22 @@ fn render(
     }
     // Constructors, so a mod's `super(...)` links.
     let mut no_arg = identifier || resource_key;
+    // The `Identifier`/`ResourceKey` bodies above write their constructors by
+    // hand. A game jar that also declares the same signature (older
+    // `ResourceLocation` releases have a public `(String, String)` one) must
+    // not get a second, empty copy.
+    let mut provided_ctors: BTreeSet<String> = BTreeSet::new();
+    if identifier {
+        provided_ctors.insert("()V".to_owned());
+        provided_ctors.insert("(Ljava/lang/String;Ljava/lang/String;)V".to_owned());
+    }
+    if resource_key {
+        provided_ctors.insert("()V".to_owned());
+        provided_ctors.insert(
+            "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/resources/Identifier;)V"
+                .to_owned(),
+        );
+    }
     for method in class
         .declared
         .iter()
@@ -5771,8 +5874,11 @@ fn render(
         if !(method.is_public() || method.is_protected()) || is_interface || is_record {
             continue;
         }
-        let params = parameters(&method.descriptor);
         no_arg |= method.descriptor == "()V";
+        if !provided_ctors.insert(method.descriptor.clone()) {
+            continue;
+        }
+        let params = parameters(&method.descriptor);
         let body = if matches!(
             (class.name.as_str(), method.descriptor.as_str()),
             (
@@ -5814,7 +5920,9 @@ fn render(
             "this.horizonLocation = p0; this.horizonDirection = p1; this.horizonBlockPos = p2; this.horizonInside = p3;"
         } else if class.name == "net/minecraft/world/level/block/Block" {
             "this.stateDefinition = new net.minecraft.world.level.block.state.StateDefinition();"
-        } else if class.name == "net/minecraft/client/KeyMapping" {
+        } else if class.name == "net/minecraft/client/KeyMapping"
+            && method.descriptor.starts_with("(Ljava/lang/String;")
+        {
             "this.horizonName = p0;"
         } else if class.name == "net/minecraft/world/item/ItemStack" {
             match method.descriptor.as_str() {
