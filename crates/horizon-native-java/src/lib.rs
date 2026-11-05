@@ -9088,9 +9088,10 @@ impl NativeJar {
     /// Config paths follow the loader declarations, in the order they name
     /// them: `fabric.mod.json`'s `mixins` list (bare strings and
     /// `{config, environment}` objects), NeoForge's `[[mixins]]` blocks in
-    /// `META-INF/neoforge.mods.toml`, and the legacy Forge `MixinConfigs`
-    /// key in `META-INF/mods.toml`. A config in a subfolder is read when a
-    /// declaration names it. Only a jar with no loader metadata at all falls
+    /// `META-INF/neoforge.mods.toml`, the legacy Forge `MixinConfigs` key in
+    /// `META-INF/mods.toml`, and the same attribute in `META-INF/MANIFEST.MF`
+    /// (unfolded across continuation lines). A config in a subfolder is read
+    /// when a declaration names it. Only a jar with no loader metadata at all falls
     /// back to its root-level `*.mixins.json` files, sorted by path, and each
     /// fallback config is reported by [`Self::mixin_config_warnings`]. A
     /// malformed, oversized or out-of-bound config is skipped and reported by
@@ -9186,6 +9187,19 @@ impl NativeJar {
                     entries.into_iter().map(|(path, _)| path).collect(),
                 );
             }
+        }
+        // Legacy Forge declared the same list in the jar manifest. It is read
+        // after the TOML files so a jar that carries both keeps the newer
+        // declaration's order.
+        if let Some(declared_paths) = self
+            .resource_bytes
+            .get("META-INF/MANIFEST.MF")
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(manifest_mixin_config_paths)
+            && !declared_paths.is_empty()
+        {
+            declared = true;
+            push_mixin_config_paths(&mut paths, declared_paths);
         }
         let mut warnings = Vec::new();
         if !declared && !self.has_loader_metadata() {
@@ -15518,6 +15532,56 @@ fn toml_mixin_config_entries(text: &str) -> Vec<(String, Option<MixinSide>)> {
     entries
 }
 
+/// Mixin config paths a legacy Forge `META-INF/MANIFEST.MF` declares.
+///
+/// Forge's gradle plugin wrote the config list as a manifest attribute, so a
+/// jar from that era can name its configs nowhere else. A manifest folds a long
+/// value over several lines: every continuation starts with one space and joins
+/// the line before it without a separator. The attribute name is matched without
+/// regard to case, as the manifest format requires, and the value is the same
+/// comma-separated list the TOML key carries. At most [`MAX_MIXIN_CONFIGS`]
+/// paths are kept, and a duplicate never displaces the first declaration.
+fn manifest_mixin_config_paths(text: &str) -> Vec<String> {
+    fn flush(line: &str, paths: &mut Vec<String>) {
+        let Some((key, value)) = line.split_once(':') else {
+            return;
+        };
+        if !key.trim().eq_ignore_ascii_case("MixinConfigs") {
+            return;
+        }
+        for path in value
+            .split(',')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            if paths.len() >= MAX_MIXIN_CONFIGS {
+                return;
+            }
+            if !paths.iter().any(|known| known == path) {
+                paths.push(path.to_owned());
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    let mut logical = String::new();
+    for raw in text.lines() {
+        // A manifest may use CRLF; `lines` keeps the `\r`.
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if let Some(continuation) = line.strip_prefix(' ') {
+            // A continuation after an empty line has nothing to continue.
+            if !logical.is_empty() {
+                logical.push_str(continuation);
+            }
+            continue;
+        }
+        flush(&logical, &mut paths);
+        logical.clear();
+        logical.push_str(line);
+    }
+    flush(&logical, &mut paths);
+    paths
+}
+
 /// Map a loader's environment spelling onto an execution side.
 fn mixin_side(value: &str) -> Option<MixinSide> {
     match value.to_ascii_lowercase().as_str() {
@@ -15812,7 +15876,9 @@ fn is_mod_annotation(value: &str) -> bool {
 /// Read the small, stable part of NeoForge's loader metadata needed by the
 /// native launcher.  This intentionally accepts only the first `[[mods]]`
 /// record and required dependency records; the full loader validates version
-/// ranges and display metadata elsewhere.
+/// ranges and display metadata elsewhere. Every block header ends the section
+/// before it, so a `[[mixins]]` or `[[features]]` block cannot leak its keys
+/// into the mod or dependency record above it.
 fn parse_neoforge_metadata(
     text: &str,
 ) -> Result<(Option<String>, Option<String>, Vec<String>, bool), NativeError> {
@@ -15849,22 +15915,24 @@ fn parse_neoforge_metadata(
         if line.is_empty() {
             continue;
         }
-        if line.starts_with("[[mods]]") {
+        if line.starts_with('[') {
+            // A block header ends the previous block whatever it names. An
+            // unknown `[[...]]` block (`[[mixins]]`, `[[features]]`, ...) must
+            // not leave its keys landing in the section before it.
             if section == Section::Dependency {
                 flush(&mut dependency, &mut dependency_required);
             }
-            section = if id.is_none() {
-                Section::Mods
+            section = if line.starts_with("[[mods]]") {
+                if id.is_none() {
+                    Section::Mods
+                } else {
+                    Section::None
+                }
+            } else if line.starts_with("[[dependencies.") {
+                Section::Dependency
             } else {
                 Section::None
             };
-            continue;
-        }
-        if line.starts_with("[[dependencies.") {
-            if section == Section::Dependency {
-                flush(&mut dependency, &mut dependency_required);
-            }
-            section = Section::Dependency;
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
@@ -18410,6 +18478,36 @@ mandatory = true
     }
 
     #[test]
+    fn neoforge_metadata_resets_the_section_on_an_unknown_block() {
+        let text = r#"
+[[mods]]
+modId = "demo"
+version = "1.0"
+
+[[dependencies.demo]]
+modId = "needed"
+type = "required"
+
+[[mixins]]
+config = "demo.mixins.json"
+modId = "leak"
+mandatory = true
+
+[[mods]]
+modId = "second"
+clientSideOnly = true
+"#;
+        let (id, version, required, client_side_only) = parse_neoforge_metadata(text).unwrap();
+        // `[[mixins]]` ends the dependency block: its `modId`/`mandatory` must
+        // not land in the previous dependency, and the second `[[mods]]` block
+        // must not rewrite the first mod's identity or side flag.
+        assert_eq!(id.as_deref(), Some("demo"));
+        assert_eq!(version.as_deref(), Some("1.0"));
+        assert_eq!(required, ["needed"]);
+        assert!(!client_side_only);
+    }
+
+    #[test]
     fn jar_reads_neoforge_metadata_for_native_loader_seeding() {
         let path = std::env::temp_dir().join(format!(
             "horizon-native-neoforge-metadata-{}.jar",
@@ -18668,6 +18766,65 @@ modId="minecraft"
                 ("a.mixins.json".to_owned(), None),
                 ("b.mixins.json".to_owned(), None),
             ]
+        );
+    }
+
+    #[test]
+    fn manifest_mixin_configs_unfold_continuations_without_leaking_keys() {
+        let text = concat!(
+            "Manifest-Version: 1.0\r\n",
+            "MixinConfigs: one.mixins.json,\r\n",
+            " two.mixins.json\r\n",
+            "Implementation-Title: demo\r\n",
+            "Other: three.mixins.json\r\n",
+            "MixInConfigs: four.mixins.json\r\n",
+        );
+        assert_eq!(
+            manifest_mixin_config_paths(text),
+            [
+                "one.mixins.json".to_owned(),
+                "two.mixins.json".to_owned(),
+                // The manifest attribute name is case-insensitive; another
+                // attribute whose value looks like a config is not a source.
+                "four.mixins.json".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_forge_manifest_declares_the_jars_mixin_configs() {
+        let mut jar = NativeJar::from_classes([target_class()]);
+        jar.resource_bytes.insert(
+            "META-INF/MANIFEST.MF".into(),
+            concat!(
+                "Manifest-Version: 1.0\r\n",
+                "MixinConfigs: legacy.mixins.json,\r\n",
+                " extra.mixins.json\r\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+        for path in ["legacy.mixins.json", "extra.mixins.json"] {
+            jar.resource_bytes.insert(
+                path.into(),
+                format!(
+                    r#"{{"mixins":["demo.{}"]}}"#,
+                    path.trim_end_matches(".mixins.json")
+                )
+                .into_bytes(),
+            );
+        }
+        let paths = jar
+            .mixin_configs()
+            .into_iter()
+            .map(|config| config.path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["legacy.mixins.json", "extra.mixins.json"]);
+        assert!(
+            jar.mixin_config_errors()
+                .iter()
+                .all(|(path, _)| !path.contains("MANIFEST")),
+            "a readable manifest is a declaration, not an error"
         );
     }
 
