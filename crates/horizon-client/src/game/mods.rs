@@ -2318,6 +2318,275 @@ clientSideOnly = true
         );
     }
 
+    /// Builds a Fabric jar around `sources`, the Mixin stubs and `Probe`, with
+    /// `demo.Main` as its `main` entrypoint and `config` as `demo.mixins.json`.
+    /// `Probe` stays out of the jar, so its calls reach the host. The caller
+    /// removes the returned root.
+    fn weave_fixture_jar(name: &str, sources: &[(&str, &str)], config: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-game-java-weave-{name}-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        std::fs::create_dir_all(&classes).unwrap();
+        let shared = [
+            (
+                "org/spongepowered/asm/mixin/Mixin.java",
+                r#"package org.spongepowered.asm.mixin; import java.lang.annotation.*; @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE) public @interface Mixin { Class<?>[] value() default {}; }"#,
+            ),
+            (
+                "org/spongepowered/asm/mixin/injection/At.java",
+                r#"package org.spongepowered.asm.mixin.injection; import java.lang.annotation.*; @Retention(RetentionPolicy.RUNTIME) @Target({}) public @interface At { String value() default ""; }"#,
+            ),
+            (
+                "org/spongepowered/asm/mixin/injection/Inject.java",
+                r#"package org.spongepowered.asm.mixin.injection; import java.lang.annotation.*; @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD) public @interface Inject { String[] method(); At[] at(); boolean cancellable() default false; }"#,
+            ),
+            (
+                "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.java",
+                "package org.spongepowered.asm.mixin.injection.callback; public class CallbackInfo { public void cancel() {} }",
+            ),
+            (
+                "demo/Probe.java",
+                "package demo; public final class Probe { public static void mark(String marker) {} }",
+            ),
+        ];
+        let mut paths = Vec::new();
+        for (name, text) in shared.iter().chain(sources) {
+            let path = src.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            paths.push(path);
+        }
+        let status = Command::new("javac")
+            .arg("--release")
+            .arg("17")
+            .arg("-d")
+            .arg(&classes)
+            .args(&paths)
+            .status()
+            .unwrap();
+        assert!(status.success(), "javac failed");
+        let jar = root.join(format!("{name}.jar"));
+        let options = zip::write::SimpleFileOptions::default();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(
+            br#"{"id":"weave-mod","version":"1.0","entrypoints":{"main":["demo.Main"]},"mixins":["demo.mixins.json"]}"#,
+        )
+        .unwrap();
+        zip.start_file("demo.mixins.json", options).unwrap();
+        zip.write_all(config.as_bytes()).unwrap();
+        for (name, _) in sources {
+            let class = format!("{}.class", name.trim_end_matches(".java"));
+            zip.start_file(class.as_str(), options).unwrap();
+            zip.write_all(&std::fs::read(classes.join(&class)).unwrap())
+                .unwrap();
+        }
+        zip.finish().unwrap();
+        (root, jar)
+    }
+
+    const WEAVE_MAIN: (&str, &str) = (
+        "demo/Main.java",
+        "package demo; public final class Main { public void onInitialize() { Target.run(); } }",
+    );
+    const WEAVE_TARGET: (&str, &str) = (
+        "demo/Target.java",
+        r#"package demo; public final class Target { public static void run() { Probe.mark("target"); } public static void other() {} }"#,
+    );
+    const WEAVE_PLAIN_MIXIN: (&str, &str) = (
+        "demo/PlainMixin.java",
+        r#"package demo; import org.spongepowered.asm.mixin.Mixin; import org.spongepowered.asm.mixin.injection.At; import org.spongepowered.asm.mixin.injection.Inject; @Mixin(Target.class) public abstract class PlainMixin { @Inject(method = "run()V", at = @At("HEAD")) private static void onRun() { Probe.mark("callback"); } }"#,
+    );
+
+    /// How many host calls `sources` make when no config lists their mixins: the
+    /// same classes, so anything a woven jar adds came from the weave.
+    fn unwoven_host_calls(name: &str, sources: &[(&str, &str)]) -> usize {
+        let (root, path) = weave_fixture_jar(name, sources, r#"{"package":"demo","mixins":[]}"#);
+        let (_, reports) =
+            run_java_mods_with_report(std::slice::from_ref(&path), ExecutionRole::DedicatedServer)
+                .unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        reports[0].host_calls
+    }
+
+    /// The whole loader path: a jar whose every plan wove runs its callback from
+    /// the rewritten target and earns the plain label, still reporting its plan.
+    #[test]
+    fn java_mod_with_every_mixin_plan_woven_reports_native() {
+        let sources = [WEAVE_MAIN, WEAVE_TARGET, WEAVE_PLAIN_MIXIN];
+        let (root, path) = weave_fixture_jar(
+            "all-woven",
+            &sources,
+            r#"{"package":"demo","mixins":["PlainMixin"]}"#,
+        );
+        let (_, reports) =
+            run_java_mods_with_report(std::slice::from_ref(&path), ExecutionRole::DedicatedServer)
+                .unwrap();
+        let report = &reports[0];
+        assert_eq!(report.mixin_plans, 1);
+        assert_eq!(report.engine(), JavaEngine::Native, "{report:?}");
+        assert!(
+            report.summary()[0].contains("role=dedicated-server engine=native loader=fabric"),
+            "{:?}",
+            report.summary()
+        );
+        let unwoven = unwoven_host_calls("all-woven-base", &sources);
+        assert!(
+            report.host_calls > unwoven,
+            "the callback must run from the woven target: {} against {unwoven}",
+            report.host_calls
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// One plan left out is enough: the woven one still runs, and the jar stays
+    /// qualified with a warning that names what does not.
+    #[test]
+    fn java_mod_with_a_skipped_mixin_plan_stays_qualified() {
+        let sources = [
+            WEAVE_MAIN,
+            WEAVE_TARGET,
+            WEAVE_PLAIN_MIXIN,
+            (
+                "demo/CancelMixin.java",
+                r#"package demo; import org.spongepowered.asm.mixin.Mixin; import org.spongepowered.asm.mixin.injection.At; import org.spongepowered.asm.mixin.injection.Inject; import org.spongepowered.asm.mixin.injection.callback.CallbackInfo; @Mixin(Target.class) public abstract class CancelMixin { @Inject(method = "other()V", at = @At("HEAD"), cancellable = true) private static void onOther(CallbackInfo info) {} }"#,
+            ),
+        ];
+        let (root, path) = weave_fixture_jar(
+            "mixed",
+            &sources,
+            r#"{"package":"demo","mixins":["PlainMixin","CancelMixin"]}"#,
+        );
+        let jar = horizon_native_java::NativeJar::from_path(&path).unwrap();
+        let weave = jar.plan_load_time_weave(mixin_side(ExecutionRole::DedicatedServer));
+        let mixin = MixinPlanning::of(Some(&jar)).with_weave(&weave);
+        assert_eq!((mixin.plans, mixin.woven, mixin.skipped), (2, 1, 1));
+        let (level, line) = mixin.weave_line(&path).unwrap();
+        assert_eq!(level, log::Level::Warn);
+        assert!(line.contains("1 woven, 1 skipped"), "{line}");
+        assert!(line.contains("skipped Mixin work does not run"), "{line}");
+        assert!(
+            line.contains("cancellable HEAD demo/Target#other()V"),
+            "{line}"
+        );
+
+        let (_, reports) =
+            run_java_mods_with_report(std::slice::from_ref(&path), ExecutionRole::DedicatedServer)
+                .unwrap();
+        assert_eq!(reports[0].engine(), JavaEngine::NativeQualified);
+        assert!(
+            reports[0].summary()[0].contains("engine=native-qualified"),
+            "{:?}",
+            reports[0].summary()
+        );
+        let unwoven = unwoven_host_calls("mixed-base", &sources);
+        assert!(
+            reports[0].host_calls > unwoven,
+            "the plan that did weave still runs: {} against {unwoven}",
+            reports[0].host_calls
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `@Mixin` has `CLASS` retention in real jars, so they report no plans. The
+    /// listed classes must still qualify the jar: this was reading as native.
+    #[test]
+    fn java_mod_listing_mixins_with_no_visible_plan_stays_qualified() {
+        let (root, path) = weave_fixture_jar(
+            "listed",
+            &[
+                WEAVE_MAIN,
+                WEAVE_TARGET,
+                (
+                    "demo/RealMixin.java",
+                    "package demo; public abstract class RealMixin {}",
+                ),
+            ],
+            r#"{"package":"demo","mixins":["RealMixin"]}"#,
+        );
+        let (_, reports) =
+            run_java_mods_with_report(std::slice::from_ref(&path), ExecutionRole::DedicatedServer)
+                .unwrap();
+        assert_eq!(reports[0].mixin_plans, 0);
+        assert_eq!(reports[0].engine(), JavaEngine::NativeQualified);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The side a jar's configs are read for is the one its host reports to the
+    /// mod. The fixture suite pins what each side does with a config's lists.
+    #[test]
+    fn java_mixin_side_follows_the_environment_the_host_reports() {
+        use horizon_native_java::MixinSide;
+        assert_eq!(mixin_side(ExecutionRole::Client), MixinSide::Client);
+        assert_eq!(
+            mixin_side(ExecutionRole::IntegratedServer),
+            MixinSide::Server
+        );
+        assert_eq!(
+            mixin_side(ExecutionRole::DedicatedServer),
+            MixinSide::Server
+        );
+    }
+
+    /// The per-jar line and the run's totals: left off with nothing to say,
+    /// informational when everything wove, bounded when something did not.
+    #[test]
+    fn java_mixin_weave_lines_are_deterministic_and_bounded() {
+        let path = std::path::Path::new("/mods/demo.jar");
+        let quiet = MixinPlanning::default();
+        assert_eq!(quiet.weave_line(path), None);
+        assert_eq!(mixin_weave_line(std::slice::from_ref(&quiet)), None);
+        assert!(
+            quiet.fully_applied(),
+            "no Mixin work is nothing left undone"
+        );
+
+        let woven = MixinPlanning {
+            plans: 2,
+            woven: 2,
+            ..MixinPlanning::default()
+        };
+        assert!(woven.fully_applied());
+        assert_eq!(
+            woven.weave_line(path),
+            Some((
+                log::Level::Info,
+                "Horizon: Java compatibility /mods/demo.jar: mixin weave: 2 woven, 0 skipped"
+                    .to_owned()
+            ))
+        );
+
+        let many = MixinPlanning {
+            plans: 1,
+            woven: 1,
+            skipped: MAX_REPORT_ROWS + 3,
+            skip_reasons: (0..MAX_REPORT_ROWS)
+                .map(|row| format!("row{row}"))
+                .collect(),
+            ..MixinPlanning::default()
+        };
+        assert!(!many.fully_applied());
+        let (level, line) = many.weave_line(path).unwrap();
+        assert_eq!(level, log::Level::Warn);
+        assert!(line.ends_with("row11] (+3 more)"), "{line}");
+
+        // A plan that was neither woven nor skipped is not applied either.
+        let unaccounted = MixinPlanning {
+            plans: 1,
+            ..MixinPlanning::default()
+        };
+        assert!(!unaccounted.fully_applied());
+
+        assert_eq!(
+            mixin_weave_line(&[quiet, woven, many]).as_deref(),
+            Some("Horizon: Java compatibility: mixin weave: 3 woven, 15 skipped across 2 jar(s)")
+        );
+    }
+
     /// One compiled initializer, shipped under two typed declarations: the
     /// callback registers `report:gem` and `report:token` opaquely, so the
     /// first declaration collides with a row and the second does not.
