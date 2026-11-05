@@ -1089,7 +1089,7 @@ fn main() -> ExitCode {
 }
 
 /// The usage line, kept as data so a test can check the kinds it names.
-const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--real-launch] [--fabric-discovery] [--classpath-unlock] [--knot-launch] [--launch-game] [--mixin-apply-probe <class#method=value>] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] [--measure [--measure-timeout <secs>] [--measure-sample-ms <ms>] [--measure-repeat <n>]] <jar>...";
+const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--real-launch] [--fabric-discovery] [--classpath-unlock] [--knot-launch] [--launch-game] [--accept-eula] [--mixin-apply-probe <class#method=value>] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] [--measure [--measure-timeout <secs>] [--measure-sample-ms <ms>] [--measure-repeat <n>]] <jar>...";
 
 /// The FML listing/report flags, removed from the jar list before anything is
 /// resolved. `--fml-list` is the short spelling of `--list-fml-mods`.
@@ -1137,6 +1137,13 @@ fn run() -> Result<(), String> {
     let launch_game_child = args.iter().any(|arg| arg == "--launch-game-child");
     let launch_game_flag = launch_game_child || args.iter().any(|arg| arg == "--launch-game");
     args.retain(|arg| arg != "--launch-game" && arg != "--launch-game-child");
+    // This opt-in is deliberately meaningful only for the bounded child. The
+    // child changes into `LaunchHomes::game`, so writing here cannot touch a
+    // user's real game directory or EULA file.
+    let accept_eula = take_flag(&mut args, &["--accept-eula"]);
+    if accept_eula && !launch_game_flag {
+        return Err("--accept-eula requires --launch-game".to_owned());
+    }
     let launch_this_process = launch_game_flag && real_launch_enabled();
     // A mixin-application probe loads a class through Knot after the loader is
     // initialized, so it needs the same unlocked classpath `--knot-launch`
@@ -1269,7 +1276,7 @@ fn run() -> Result<(), String> {
     // what it was before the flag existed, and the game never starts.
     if launch_game_flag && !launch_game_child {
         let status = if launch_this_process {
-            run_launch_game_child()?
+            run_launch_game_child(accept_eula)?
         } else {
             LAUNCH_GAME_GATE_SKIPPED.to_owned()
         };
@@ -2011,8 +2018,12 @@ fn absolutize_launch_args(args: Vec<OsString>, cwd: &Path) -> Vec<OsString> {
 /// Run the gated launch in a child of this binary and return the one status
 /// value. The parent never starts a JVM itself, so a game that ignores every
 /// shutdown path still dies with the process group at the deadline.
-fn run_launch_game_child() -> Result<String, String> {
+fn run_launch_game_child(accept_eula: bool) -> Result<String, String> {
     let homes = LaunchHomes::new()?;
+    if accept_eula {
+        fs::write(homes.game.join("eula.txt"), "eula=true\n")
+            .map_err(|error| format!("write scratch eula.txt: {error}"))?;
+    }
     let exe = std::env::current_exe().map_err(|error| format!("launch child: {error}"))?;
     let cwd = std::env::current_dir().map_err(|error| format!("launch child: {error}"))?;
     let mut command = Command::new(exe);
