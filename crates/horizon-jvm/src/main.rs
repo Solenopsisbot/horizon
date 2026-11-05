@@ -622,7 +622,7 @@ fn main() -> ExitCode {
 }
 
 /// The usage line, kept as data so a test can check the kinds it names.
-const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--real-launch] [--fabric-discovery] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] [--measure [--measure-timeout <secs>] [--measure-sample-ms <ms>] [--measure-repeat <n>]] <jar>...";
+const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--real-launch] [--fabric-discovery] [--classpath-unlock] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] [--measure [--measure-timeout <secs>] [--measure-sample-ms <ms>] [--measure-repeat <n>]] <jar>...";
 
 /// The FML listing/report flags, removed from the jar list before anything is
 /// resolved. `--fml-list` is the short spelling of `--list-fml-mods`.
@@ -664,6 +664,10 @@ fn run() -> Result<(), String> {
     args.retain(|arg| arg != "--real-launch");
     let fabric_discovery = args.iter().any(|arg| arg == "--fabric-discovery");
     args.retain(|arg| arg != "--fabric-discovery");
+    // Opt-in: extend the Knot classpath with the resolved game jars and the
+    // loader's mod code sources. Without it the run is byte-identical.
+    let classpath_unlock = args.iter().any(|arg| arg == "--classpath-unlock");
+    args.retain(|arg| arg != "--classpath-unlock");
     // Run the real Fabric or NeoForge loader instead of this probe's own scan.
     // A supplied Minecraft jar opts into the production provider, which only
     // the real-loader path can run; a report-only invocation still only reports
@@ -936,7 +940,7 @@ fn run() -> Result<(), String> {
                 .call_static_method(
                     &bridge,
                     "bootstrapProduction",
-                    "([Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZZ)Ljava/lang/String;",
+                    "([Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZZZ)Ljava/lang/String;",
                     &[
                         JValue::Object(&jars),
                         JValue::Object(&JObject::from(version)),
@@ -944,6 +948,7 @@ fn run() -> Result<(), String> {
                         JValue::Bool(fabric_development as u8),
                         JValue::Bool(real_launch as u8),
                         JValue::Bool(fabric_discovery as u8),
+                        JValue::Bool(classpath_unlock as u8),
                     ],
                 )
                 .and_then(|value| value.l())
@@ -990,16 +995,21 @@ fn run() -> Result<(), String> {
             }
             ProviderOutcome::Test { .. } => {}
         }
+        // One bounded line when the flag was passed; nothing otherwise, so an
+        // unflagged run's output is unchanged.
+        let unlock = classpath_unlock_value(classpath_unlock, &outcome);
+        if let Some(value) = &unlock {
+            println!("{}", classpath_unlock_line(value));
+        }
         if provider_report {
-            print_provider_report(
-                &ProviderReport::from_outcome(
-                    &outcome,
-                    game_provider.jars.len(),
-                    &game_provider.version,
-                    ProviderSide::for_entry_kind(&entry_kind),
-                ),
-                fml_flags.json,
-            );
+            let report = ProviderReport::from_outcome(
+                &outcome,
+                game_provider.jars.len(),
+                &game_provider.version,
+                ProviderSide::for_entry_kind(&entry_kind),
+            )
+            .with_classpath_unlock(unlock);
+            print_provider_report(&report, fml_flags.json);
         }
         return Ok(());
     }
@@ -2181,6 +2191,9 @@ enum ProviderOutcome {
         /// Mod ids the loader discovered, sorted and bounded by the bridge.
         /// Empty when discovery was not requested.
         discovered_ids: Vec<String>,
+        /// The bridge's bounded `classpath-unlock` outcome, only when the run
+        /// asked for it. `None` keeps an unflagged run byte-identical.
+        classpath_unlock: Option<String>,
     },
     Fallback {
         mods: usize,
@@ -2213,6 +2226,7 @@ struct ProviderReport {
     fallback_reason: Option<String>,
     development: Option<bool>,
     freeze_reason: Option<String>,
+    classpath_unlock: Option<String>,
 }
 
 impl ProviderReport {
@@ -2226,7 +2240,15 @@ impl ProviderReport {
             fallback_reason: None,
             development: None,
             freeze_reason: None,
+            classpath_unlock: None,
         }
+    }
+
+    /// Attach the `--classpath-unlock` outcome; `None` leaves the report as it
+    /// was before the flag existed.
+    fn with_classpath_unlock(mut self, value: Option<String>) -> Self {
+        self.classpath_unlock = value.map(|value| bounded_classpath_unlock(&value));
+        self
     }
 
     fn from_outcome(
@@ -2249,6 +2271,7 @@ impl ProviderReport {
                 fallback_reason: None,
                 development: Some(*development),
                 freeze_reason: freeze_reason.clone(),
+                classpath_unlock: None,
             },
             ProviderOutcome::Fallback { reason, .. } => Self {
                 kind: ProviderKind::Test,
@@ -2259,6 +2282,7 @@ impl ProviderReport {
                 fallback_reason: Some(reason.clone()),
                 development: None,
                 freeze_reason: None,
+                classpath_unlock: None,
             },
             ProviderOutcome::Test { .. } => Self {
                 kind: ProviderKind::Test,
@@ -2269,6 +2293,7 @@ impl ProviderReport {
                 fallback_reason: None,
                 development: None,
                 freeze_reason: None,
+                classpath_unlock: None,
             },
         }
     }
@@ -2290,6 +2315,9 @@ impl ProviderReport {
         if let Some(reason) = &self.freeze_reason {
             lines.push(format!("freeze: {reason}"));
         }
+        if let Some(unlock) = &self.classpath_unlock {
+            lines.push(classpath_unlock_line(unlock));
+        }
         bound_text(&(lines.join("\n") + "\n"), MAX_PROVIDER_REPORT_BYTES)
     }
 
@@ -2303,6 +2331,7 @@ impl ProviderReport {
             "fallback": self.fallback_reason,
             "isDevelopment": self.development,
             "freeze": self.freeze_reason,
+            "classpathUnlock": self.classpath_unlock,
         })
         .to_string();
         if text.len() <= MAX_PROVIDER_REPORT_BYTES {
@@ -2317,6 +2346,7 @@ impl ProviderReport {
             "fallback": "report truncated",
             "isDevelopment": self.development,
             "freeze": self.freeze_reason,
+            "classpathUnlock": self.classpath_unlock,
         })
         .to_string()
     }
@@ -2349,6 +2379,9 @@ fn game_provider_jvm_options(jars: &[PathBuf], version: &str, client: bool) -> V
     ]
 }
 
+/// The `--classpath-unlock` line's bound: one short stdout/report line.
+const MAX_CLASSPATH_UNLOCK_CHARS: usize = 400;
+
 /// One line for a provider failure: whitespace collapsed, capped, and never
 /// empty, so a report always names something.
 fn bounded_provider_reason(reason: &str) -> String {
@@ -2359,10 +2392,47 @@ fn bounded_provider_reason(reason: &str) -> String {
     collapsed.chars().take(MAX_PROVIDER_REASON_CHARS).collect()
 }
 
-/// The bridge returns `minecraft<TAB><mods><TAB><freeze><TAB><development><TAB><ids>` on success and
-/// `test<TAB><mods><TAB><reason>` after falling back.
+/// The `--classpath-unlock` outcome as one bounded, single-line value. Empty is
+/// impossible: a missing result still says the unlock failed.
+fn bounded_classpath_unlock(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "failed unknown".to_owned();
+    }
+    collapsed.chars().take(MAX_CLASSPATH_UNLOCK_CHARS).collect()
+}
+
+/// The unlock value for a real-loader run, or `None` when the flag was not
+/// passed. A run that never reached the production provider says so instead of
+/// claiming an unlock that did not happen.
+fn classpath_unlock_value(requested: bool, outcome: &ProviderOutcome) -> Option<String> {
+    if !requested {
+        return None;
+    }
+    match outcome {
+        ProviderOutcome::Production {
+            classpath_unlock, ..
+        } => Some(match classpath_unlock {
+            Some(value) => bounded_classpath_unlock(value),
+            None => "failed no classpath-unlock result".to_owned(),
+        }),
+        ProviderOutcome::Fallback { .. } => {
+            Some("skipped (production game provider unavailable)".to_owned())
+        }
+        ProviderOutcome::Test { .. } => Some("skipped (no --game-jar)".to_owned()),
+    }
+}
+
+/// `classpath-unlock: <value>`, the one line stdout and the report carry.
+fn classpath_unlock_line(value: &str) -> String {
+    format!("classpath-unlock: {value}")
+}
+
+/// The bridge returns `minecraft<TAB><mods><TAB><freeze><TAB><development><TAB><ids><TAB><unlock>` on success and
+/// `test<TAB><mods><TAB><reason>` after falling back. The unlock field is only
+/// present when `--classpath-unlock` was passed.
 fn parse_provider_outcome(text: &str) -> Result<ProviderOutcome, String> {
-    let mut parts = text.splitn(5, '\t');
+    let mut parts = text.splitn(6, '\t');
     let kind = parts.next().unwrap_or_default();
     let mods = parts
         .next()
@@ -2382,11 +2452,18 @@ fn parse_provider_outcome(text: &str) -> Result<ProviderOutcome, String> {
                         .collect()
                 })
                 .unwrap_or_default();
+            // A run without the flag carries no unlock field.
+            let classpath_unlock = parts
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(bounded_classpath_unlock);
             Ok(ProviderOutcome::Production {
                 mods,
                 freeze_reason: (!freeze.is_empty()).then(|| bounded_provider_reason(freeze)),
                 development,
                 discovered_ids,
+                classpath_unlock,
             })
         }
         "test" => Ok(ProviderOutcome::Fallback {
@@ -5371,28 +5448,30 @@ fn nested_jar_name(entry: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DATAGEN_GENERATOR_CLASS, DEFAULT_GAME_VERSION, Entrypoint, MAX_FABRIC_ADD_MODS,
-        MAX_FABRIC_ADD_MODS_BYTES, MAX_MIXIN_CONFIG_PROPERTY_BYTES, MAX_PROVIDER_REASON_CHARS,
-        MAX_PROVIDER_REPORT_BYTES, MixinBootstrap, MixinConfigRef, MixinEnvironment,
-        MixinPhaseDriver, MixinRegistrar, MixinSide, MixinStage, NO_ARG_CONSTRUCTOR, NeoforgeArg,
-        PhaseOutcome, ProviderKind, ProviderOutcome, ProviderReport, ProviderSide, ProviderStatus,
-        USAGE, bounded_provider_reason, classpath_separator, client_side,
-        constructor_only_entry_kind, datagen_jvm_options, datagen_provider_line,
-        datagen_providers_line, datagen_shim_unavailable, declared_entrypoint_kinds,
-        declared_mod_ids, discover_entries, discover_mixin_configs, discovery_line,
-        entrypoints_from_metadata, fabric_add_mods, fabric_add_mods_count, fabric_add_mods_line,
-        fabric_entries, fabric_jvm_options, fabric_metadata, fabric_mixin_configs, fallback_label,
-        format_entrypoints, format_mixin_config_property, format_mixin_configs,
-        game_provider_jvm_options, initializer_for_kind, is_datagen_kind, is_minecraft_class,
-        is_minecraft_runtime_jar, link_failure, missing_entry_message, mixin_bootstrap_line,
-        mixin_config_names, mixin_config_property, mixin_configs_line, mixin_jvm_options,
-        mixin_registered_count, mixin_stages, neoforge_constructor, neoforge_constructor_args,
-        neoforge_constructor_descriptor, neoforge_ctor_fallback_line, neoforge_ctor_line,
-        neoforge_dist, neoforge_dist_fields, neoforge_metadata, nested_jar_name,
-        parse_constructors, parse_mixin_config, parse_provider_outcome, pre_launch_entries,
-        quilt_entrypoint_kind, quilt_mixin_configs, register_mixin_configs, report_mixin_configs,
-        run_mixin_phase, select_mixin_configs, should_retry_no_arg, skip_mc_provider_requested,
-        skipped_mixin_configs, split_entrypoint, take_game_provider_args,
+        DATAGEN_GENERATOR_CLASS, DEFAULT_GAME_VERSION, Entrypoint, MAX_CLASSPATH_UNLOCK_CHARS,
+        MAX_FABRIC_ADD_MODS, MAX_FABRIC_ADD_MODS_BYTES, MAX_MIXIN_CONFIG_PROPERTY_BYTES,
+        MAX_PROVIDER_REASON_CHARS, MAX_PROVIDER_REPORT_BYTES, MixinBootstrap, MixinConfigRef,
+        MixinEnvironment, MixinPhaseDriver, MixinRegistrar, MixinSide, MixinStage,
+        NO_ARG_CONSTRUCTOR, NeoforgeArg, PhaseOutcome, ProviderKind, ProviderOutcome,
+        ProviderReport, ProviderSide, ProviderStatus, USAGE, bounded_classpath_unlock,
+        bounded_provider_reason, classpath_separator, classpath_unlock_line,
+        classpath_unlock_value, client_side, constructor_only_entry_kind, datagen_jvm_options,
+        datagen_provider_line, datagen_providers_line, datagen_shim_unavailable,
+        declared_entrypoint_kinds, declared_mod_ids, discover_entries, discover_mixin_configs,
+        discovery_line, entrypoints_from_metadata, fabric_add_mods, fabric_add_mods_count,
+        fabric_add_mods_line, fabric_entries, fabric_jvm_options, fabric_metadata,
+        fabric_mixin_configs, fallback_label, format_entrypoints, format_mixin_config_property,
+        format_mixin_configs, game_provider_jvm_options, initializer_for_kind, is_datagen_kind,
+        is_minecraft_class, is_minecraft_runtime_jar, link_failure, missing_entry_message,
+        mixin_bootstrap_line, mixin_config_names, mixin_config_property, mixin_configs_line,
+        mixin_jvm_options, mixin_registered_count, mixin_stages, neoforge_constructor,
+        neoforge_constructor_args, neoforge_constructor_descriptor, neoforge_ctor_fallback_line,
+        neoforge_ctor_line, neoforge_dist, neoforge_dist_fields, neoforge_metadata,
+        nested_jar_name, parse_constructors, parse_mixin_config, parse_provider_outcome,
+        pre_launch_entries, quilt_entrypoint_kind, quilt_mixin_configs, register_mixin_configs,
+        report_mixin_configs, run_mixin_phase, select_mixin_configs, should_retry_no_arg,
+        skip_mc_provider_requested, skipped_mixin_configs, split_entrypoint,
+        take_game_provider_args,
     };
     use std::{
         fs::File,
@@ -6303,7 +6382,8 @@ config="demo.mixins.json""#,
                 mods: 12,
                 freeze_reason: None,
                 development: false,
-                discovered_ids: vec![]
+                discovered_ids: vec![],
+                classpath_unlock: None,
             }
         );
         assert_eq!(
@@ -6313,6 +6393,7 @@ config="demo.mixins.json""#,
                 freeze_reason: None,
                 development: true,
                 discovered_ids: vec!["alpha".to_owned(), "beta".to_owned()],
+                classpath_unlock: None,
             }
         );
         // A freeze failure is whitespace-collapsed and bounded.
@@ -6361,6 +6442,94 @@ config="demo.mixins.json""#,
     }
 
     #[test]
+    fn reports_a_bounded_classpath_unlock_line() {
+        let unlocked = ProviderOutcome::Production {
+            mods: 2,
+            freeze_reason: None,
+            development: false,
+            discovered_ids: vec![],
+            classpath_unlock: Some("ok 7 jars".to_owned()),
+        };
+        // Off by default: no value, so nothing is printed or reported.
+        assert_eq!(classpath_unlock_value(false, &unlocked), None);
+        assert_eq!(
+            classpath_unlock_value(true, &unlocked).as_deref(),
+            Some("ok 7 jars")
+        );
+        assert_eq!(
+            classpath_unlock_line("ok 7 jars"),
+            "classpath-unlock: ok 7 jars"
+        );
+        // A run that never reached the production provider says so.
+        assert_eq!(
+            classpath_unlock_value(
+                true,
+                &ProviderOutcome::Fallback {
+                    mods: 0,
+                    reason: "locateGame returned false".to_owned(),
+                }
+            )
+            .as_deref(),
+            Some("skipped (production game provider unavailable)")
+        );
+        assert_eq!(
+            classpath_unlock_value(true, &ProviderOutcome::Test { mods: 0 }).as_deref(),
+            Some("skipped (no --game-jar)")
+        );
+        // A production result without the field is a failure, not an `ok`.
+        let missing = ProviderOutcome::Production {
+            mods: 1,
+            freeze_reason: None,
+            development: false,
+            discovered_ids: vec![],
+            classpath_unlock: None,
+        };
+        assert_eq!(
+            classpath_unlock_value(true, &missing).as_deref(),
+            Some("failed no classpath-unlock result")
+        );
+
+        // One line, bounded, never empty.
+        let long = bounded_classpath_unlock(&format!("failed line one\n\t{}", "x".repeat(2000)));
+        assert!(long.starts_with("failed line one "));
+        assert!(!long.contains('\n'));
+        assert!(!long.contains('\t'));
+        assert!(long.chars().count() <= MAX_CLASSPATH_UNLOCK_CHARS);
+        assert_eq!(bounded_classpath_unlock(" \n\t "), "failed unknown");
+
+        // The bridge's sixth field carries the outcome; the older five-field
+        // shape still parses and stays `None`.
+        let parsed = parse_provider_outcome("minecraft\t2\t\tfalse\t\tok 7 jars").unwrap();
+        let ProviderOutcome::Production {
+            classpath_unlock: Some(unlock),
+            ..
+        } = parsed
+        else {
+            panic!("expected an unlock value");
+        };
+        assert_eq!(unlock, "ok 7 jars");
+        assert_eq!(
+            classpath_unlock_value(
+                true,
+                &parse_provider_outcome("minecraft\t2\t\tfalse\t").unwrap()
+            )
+            .as_deref(),
+            Some("failed no classpath-unlock result")
+        );
+
+        // The report carries the same one line, and nothing when unasked.
+        let report = ProviderReport::from_outcome(&unlocked, 1, "26.3", ProviderSide::Server)
+            .with_classpath_unlock(Some("ok 7 jars".to_owned()));
+        assert!(report.text().contains("classpath-unlock: ok 7 jars\n"));
+        let value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
+        assert_eq!(value["classpathUnlock"], "ok 7 jars");
+        let plain = ProviderReport::from_outcome(&unlocked, 1, "26.3", ProviderSide::Server);
+        assert!(!plain.text().contains("classpath-unlock"));
+        let value: serde_json::Value = serde_json::from_str(&plain.json()).unwrap();
+        assert!(value["classpathUnlock"].is_null());
+    }
+
+    #[test]
     fn formats_the_provider_report_as_text_and_json() {
         let report = ProviderReport::from_outcome(
             &ProviderOutcome::Production {
@@ -6368,6 +6537,7 @@ config="demo.mixins.json""#,
                 freeze_reason: None,
                 development: false,
                 discovered_ids: vec![],
+                classpath_unlock: None,
             },
             1,
             "26.3",
@@ -6425,6 +6595,7 @@ config="demo.mixins.json""#,
             fallback_reason: Some("y".repeat(MAX_PROVIDER_REPORT_BYTES)),
             development: Some(false),
             freeze_reason: None,
+            classpath_unlock: None,
         };
         assert!(report.text().len() <= MAX_PROVIDER_REPORT_BYTES);
         assert!(report.json().len() <= MAX_PROVIDER_REPORT_BYTES);
