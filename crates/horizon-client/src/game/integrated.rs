@@ -1021,11 +1021,10 @@ fn run_server_java_mods(options: &mut Options) -> Result<()> {
     let additions = if server_paths.is_empty() {
         Vec::new()
     } else {
-        super::mods::run_java_mods_tolerant(&server_paths, ExecutionRole::IntegratedServer).map_err(
-            |error| -> Box<dyn std::error::Error> {
+        super::mods::run_java_mods_tolerant(&server_paths, ExecutionRole::IntegratedServer)
+            .map_err(|error| -> Box<dyn std::error::Error> {
                 format!("native Java integrated-server startup failed: {error}").into()
-            },
-        )?
+            })?
     };
     publish_server_content(&mut options.java_content, additions)
 }

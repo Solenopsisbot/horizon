@@ -2109,7 +2109,10 @@ fn a_candle_on_an_uneaten_cake_makes_a_candle_cake() {
         assert_eq!(w.use_item(pos, item), InteractionResult::Success);
         let unlit = w.id(block, &[("lit", "false")]);
         let lit = w.id(block, &[("lit", "true")]);
-        assert_ne!(unlit, lit, "candle cake lit variants must be distinct states");
+        assert_ne!(
+            unlit, lit,
+            "candle cake lit variants must be distinct states"
+        );
         assert_eq!(w.get(pos), unlit);
         assert_eq!(w.prop(pos, "lit"), "false");
     }
@@ -2118,7 +2121,10 @@ fn a_candle_on_an_uneaten_cake_makes_a_candle_cake() {
     w.use_item(pos, "minecraft:candle");
     assert_ne!(w.get(pos), w.id("candle_cake", &[("lit", "false")]));
     w.put(pos, cake);
-    assert_eq!(w.use_item(pos, "minecraft:stone"), InteractionResult::Success);
+    assert_eq!(
+        w.use_item(pos, "minecraft:stone"),
+        InteractionResult::Success
+    );
     // An unrelated item falls through to CakeBlock.useWithoutItem, so an
     // eligible player eats a slice rather than leaving the cake untouched.
     assert_eq!(w.get(pos), w.id("cake", &[("bites", "1")]));

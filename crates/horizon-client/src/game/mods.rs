@@ -1118,7 +1118,6 @@ pub(super) fn fml_preflight(
 /// interpreter before resource workers start. Java jars are never discovered
 /// implicitly: a launcher or developer must pass `--java-mod PATH`.
 #[allow(dead_code)] // the strict path the startup tests pin
-#[allow(dead_code)] // the strict path the startup tests pin
 pub(super) fn run_java_mods(
     paths: &[PathBuf],
     role: ExecutionRole,

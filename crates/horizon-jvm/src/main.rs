@@ -1259,12 +1259,9 @@ fn run() -> Result<(), String> {
         let home = client_home
             .clone()
             .or_else(|| std::env::var_os(CLIENT_HOME_ENV).map(PathBuf::from));
-        let line = ClientReadiness::detect(
-            home.as_deref(),
-            &game_provider.version,
-            &game_provider.jars,
-        )
-        .line();
+        let line =
+            ClientReadiness::detect(home.as_deref(), &game_provider.version, &game_provider.jars)
+                .line();
         println!("{line}");
         Some(line)
     } else {
@@ -4269,7 +4266,11 @@ impl ClientReadiness {
         let home = home
             .map(Path::to_path_buf)
             .or_else(|| std::env::var_os(CLIENT_HOME_ENV).map(PathBuf::from))
-            .or_else(|| game_jars.first().and_then(|jar| client_home_from_jar(jar, version)));
+            .or_else(|| {
+                game_jars
+                    .first()
+                    .and_then(|jar| client_home_from_jar(jar, version))
+            });
         let Some(home) = home else {
             if game_jars.is_empty() {
                 missing.push(format!(
@@ -7422,27 +7423,26 @@ mod tests {
         MixinSide, MixinStage, NO_ARG_CONSTRUCTOR, NeoforgeArg, PhaseOutcome, ProviderKind,
         ProviderOutcome, ProviderReport, ProviderSide, ProviderStatus, USAGE,
         absolutize_launch_args, bounded_classpath_unlock, bounded_provider_reason,
-        classpath_separator, classpath_unlock_line, classpath_unlock_value, client_side,
-        client_home_from_jar, client_natives_missing, is_duplicate_log4j_jar,
-        constructor_only_entry_kind, datagen_jvm_options, datagen_provider_line,
-        datagen_providers_line, datagen_shim_unavailable, declared_entrypoint_kinds,
-        declared_mod_ids, discover_entries, discover_mixin_configs, discovery_line,
-        entrypoints_from_metadata, fabric_add_mods, fabric_add_mods_count, fabric_add_mods_line,
-        fabric_entries, fabric_jvm_options, fabric_metadata, fabric_mixin_configs, fallback_label,
-        format_entrypoints, format_mixin_config_property, format_mixin_configs,
-        game_provider_jvm_options, initializer_for_kind, is_datagen_kind, is_minecraft_class,
-        is_minecraft_runtime_jar, knot_init_line, knot_init_value, knot_launch_line,
-        knot_launch_value, launch_failure_reason, launch_game_line, launch_game_value,
-        launch_status_line, link_failure, missing_entry_message, mixin_apply_line,
-        mixin_apply_value, mixin_bootstrap_line, mixin_config_names, mixin_config_property,
-        mixin_configs_line, mixin_jvm_options, mixin_registered_count, mixin_stages,
-        neoforge_constructor, neoforge_constructor_args, neoforge_constructor_descriptor,
-        neoforge_ctor_fallback_line, neoforge_ctor_line, neoforge_dist, neoforge_dist_fields,
-        neoforge_metadata, nested_jar_name, parse_constructors, parse_mixin_config,
-        parse_provider_outcome, pre_launch_entries, quilt_entrypoint_kind, quilt_mixin_configs,
-        register_mixin_configs, report_mixin_configs, run_mixin_phase, select_mixin_configs,
-        should_retry_no_arg, skip_mc_provider_requested, skipped_mixin_configs, split_entrypoint,
-        take_game_provider_args,
+        classpath_separator, classpath_unlock_line, classpath_unlock_value, client_home_from_jar,
+        client_natives_missing, client_side, constructor_only_entry_kind, datagen_jvm_options,
+        datagen_provider_line, datagen_providers_line, datagen_shim_unavailable,
+        declared_entrypoint_kinds, declared_mod_ids, discover_entries, discover_mixin_configs,
+        discovery_line, entrypoints_from_metadata, fabric_add_mods, fabric_add_mods_count,
+        fabric_add_mods_line, fabric_entries, fabric_jvm_options, fabric_metadata,
+        fabric_mixin_configs, fallback_label, format_entrypoints, format_mixin_config_property,
+        format_mixin_configs, game_provider_jvm_options, initializer_for_kind, is_datagen_kind,
+        is_duplicate_log4j_jar, is_minecraft_class, is_minecraft_runtime_jar, knot_init_line,
+        knot_init_value, knot_launch_line, knot_launch_value, launch_failure_reason,
+        launch_game_line, launch_game_value, launch_status_line, link_failure,
+        missing_entry_message, mixin_apply_line, mixin_apply_value, mixin_bootstrap_line,
+        mixin_config_names, mixin_config_property, mixin_configs_line, mixin_jvm_options,
+        mixin_registered_count, mixin_stages, neoforge_constructor, neoforge_constructor_args,
+        neoforge_constructor_descriptor, neoforge_ctor_fallback_line, neoforge_ctor_line,
+        neoforge_dist, neoforge_dist_fields, neoforge_metadata, nested_jar_name,
+        parse_constructors, parse_mixin_config, parse_provider_outcome, pre_launch_entries,
+        quilt_entrypoint_kind, quilt_mixin_configs, register_mixin_configs, report_mixin_configs,
+        run_mixin_phase, select_mixin_configs, should_retry_no_arg, skip_mc_provider_requested,
+        skipped_mixin_configs, split_entrypoint, take_game_provider_args,
     };
     use std::{
         fs,
@@ -7530,7 +7530,9 @@ mod tests {
 
     #[test]
     fn real_launch_dedupes_bundled_logging_jars_only_when_parent_has_one() {
-        let libs = vec![PathBuf::from("/mc/org/apache/logging/log4j/log4j-api-2.26.0.jar")];
+        let libs = vec![PathBuf::from(
+            "/mc/org/apache/logging/log4j/log4j-api-2.26.0.jar",
+        )];
         assert!(is_duplicate_log4j_jar("log4j-api-2.26.0.jar", &libs));
         assert!(!is_duplicate_log4j_jar("log4j-core-2.26.0.jar", &libs));
         assert!(!is_duplicate_log4j_jar("asm-9.8.jar", &libs));
@@ -7542,7 +7544,10 @@ mod tests {
             client_home_from_jar(Path::new("/mc/versions/26.3/26.3.jar"), "26.3"),
             Some(PathBuf::from("/mc"))
         );
-        assert_eq!(client_home_from_jar(Path::new("/tmp/client.jar"), "26.3"), None);
+        assert_eq!(
+            client_home_from_jar(Path::new("/tmp/client.jar"), "26.3"),
+            None
+        );
     }
 
     #[test]
@@ -7550,7 +7555,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "horizon-jvm-native-missing-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
         assert_eq!(
