@@ -24,6 +24,7 @@ use std::{
     ffi::OsString,
     fs::{self, File},
     io::Read,
+    net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     time::{SystemTime, UNIX_EPOCH},
@@ -81,6 +82,7 @@ const LAUNCH_GAME_TIMEOUT_ENV: &str = "HORIZON_LAUNCH_TIMEOUT_SECS";
 const LAUNCH_CAPTURE_BYTES: usize = 64 * 1024;
 /// Characters of that output echoed to stderr when the launch did not exit 0.
 const LAUNCH_OUTPUT_ECHO_CHARS: usize = 4000;
+const LAUNCH_SERVER_PORT_ENV: &str = "HORIZON_SERVER_PORT";
 
 /// The second `--launch-game` gate.
 fn real_launch_enabled() -> bool {
@@ -386,9 +388,27 @@ public final class HorizonLoaderBridge {
       System.out.println("launch-game: started");
       System.out.flush();
       providerIface.getMethod("launch", ClassLoader.class).invoke(provider, knotLoader);
+      // Fabric's provider starts the server on its own non-daemon thread and
+      // returns from this reflective hand-off. Keep the embedded JVM alive
+      // until those game threads finish so the Rust supervisor can observe
+      // the real process exit (or enforce its timeout).
+      waitForGameThreads();
       return "exit 0";
     } catch (Throwable failure) {
       return bound("failed " + summarize(failure));
+    }
+  }
+
+  private static void waitForGameThreads() throws InterruptedException {
+    Thread current = Thread.currentThread();
+    for (;;) {
+      boolean live = false;
+      for (Thread thread : Thread.getAllStackTraces().keySet()) {
+        if (thread == current || !thread.isAlive() || thread.isDaemon()) continue;
+        live = true;
+        thread.join(250L);
+      }
+      if (!live) return;
     }
   }
 
@@ -1179,6 +1199,10 @@ fn run() -> Result<(), String> {
     let stubs = take(&mut args, "--stubs").map(PathBuf::from);
     let loader = take(&mut args, "--loader").map(PathBuf::from);
     let libs = take(&mut args, "--libs").map(PathBuf::from);
+    let loader_libs = libs.as_deref().and_then(asm_readiness);
+    if let Some(line) = &loader_libs {
+        println!("{line}");
+    }
     // Read-only probes: a client home and mapping files are inspected, never
     // started, and neither moves the launch gate.
     let client_home = take(&mut args, "--client-home").map(PathBuf::from);
@@ -1222,7 +1246,8 @@ fn run() -> Result<(), String> {
                 ProviderSide::for_entry_kind(&entry_kind),
             )
             .with_remap(remap_line.clone())
-            .with_client_launch(client_launch_line.clone()),
+            .with_client_launch(client_launch_line.clone())
+            .with_loader_libs(loader_libs.clone()),
             fml_flags.json,
         );
         return Ok(());
@@ -1239,7 +1264,8 @@ fn run() -> Result<(), String> {
                     ProviderSide::for_entry_kind(&entry_kind),
                 )
                 .with_remap(remap_line.clone())
-                .with_client_launch(client_launch_line.clone()),
+                .with_client_launch(client_launch_line.clone())
+                .with_loader_libs(loader_libs.clone()),
                 fml_flags.json,
             );
         }
@@ -1263,7 +1289,8 @@ fn run() -> Result<(), String> {
                     ProviderSide::for_entry_kind(&entry_kind),
                 )
                 .with_remap(remap_line.clone())
-                .with_client_launch(client_launch_line.clone()),
+                .with_client_launch(client_launch_line.clone())
+                .with_loader_libs(loader_libs.clone()),
                 fml_flags.json,
             );
         }
@@ -1290,6 +1317,7 @@ fn run() -> Result<(), String> {
                 )
                 .with_remap(remap_line.clone())
                 .with_client_launch(client_launch_line.clone())
+                .with_loader_libs(loader_libs.clone())
                 .with_launch_game(Some(status)),
                 fml_flags.json,
             );
@@ -1612,7 +1640,8 @@ fn run() -> Result<(), String> {
             .with_knot_init(knot_init)
             .with_knot_launch(knot_launch)
             .with_mixin_apply(mixin_apply)
-            .with_launch_game(launch);
+            .with_launch_game(launch)
+            .with_loader_libs(loader_libs.clone());
             print_provider_report(&report, fml_flags.json);
         }
         return Ok(());
@@ -1945,6 +1974,90 @@ fn launch_status_line(output: &str) -> Option<String> {
         .map(|value| value.trim().to_owned())
 }
 
+/// Report the ASM line used by the real loader without relying on a fixed
+/// installation path. Fabric 26.3 needs ASM 9.8; 9.7 cannot parse its class
+/// files and 9.10+ trips tinyremapper's final-method clash.
+fn asm_readiness(libs: &Path) -> Option<String> {
+    fn visit(root: &Path, versions: &mut Vec<(u32, u32)>) {
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, versions);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".jar") || !path.to_string_lossy().contains("org/ow2/asm") {
+                continue;
+            }
+            let stem = name.strip_suffix(".jar").unwrap_or(name);
+            let Some(version) = stem.rsplit_once('-').map(|(_, version)| version) else {
+                continue;
+            };
+            let mut numbers = version.split('.');
+            let (Some(major), Some(minor)) = (numbers.next(), numbers.next()) else {
+                continue;
+            };
+            let (Ok(major), Ok(minor)) = (major.parse(), minor.parse()) else {
+                continue;
+            };
+            versions.push((major, minor));
+        }
+    }
+    let mut versions = Vec::new();
+    visit(libs, &mut versions);
+    versions.sort_unstable();
+    versions.dedup();
+    let &(major, minor) = versions.last()?;
+    if major == 9 && minor == 8 {
+        Some("loader-libs: ok 9.8".to_owned())
+    } else if major == 9 && minor <= 7 {
+        Some(format!(
+            "loader-libs: warning ASM {major}.{minor} too old for 26.3 class files"
+        ))
+    } else if major > 9 || (major == 9 && minor >= 10) {
+        Some(format!(
+            "loader-libs: warning ASM {major}.{minor} triggers tinyremapper final-method clash"
+        ))
+    } else {
+        Some(format!(
+            "loader-libs: warning unsupported ASM {major}.{minor}"
+        ))
+    }
+}
+
+fn seed_launch_game_files(game: &Path, accept_eula: bool) -> Result<(), String> {
+    let properties = game.join("server.properties");
+    if !properties.exists() {
+        let port = std::env::var(LAUNCH_SERVER_PORT_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or_else(|| {
+                TcpListener::bind(("127.0.0.1", 0))
+                    .ok()
+                    .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port()))
+                    .unwrap_or(25565)
+            });
+        let contents = format!(
+            "server-port={port}\nonline-mode=false\nlevel-type=minecraft:flat\nmax-players=4\nspawn-protection=0\nview-distance=4\n"
+        );
+        fs::write(&properties, contents)
+            .map_err(|error| format!("write scratch server.properties: {error}"))?;
+    }
+    if accept_eula {
+        let eula = game.join("eula.txt");
+        if !eula.exists() {
+            fs::write(eula, "eula=true\n")
+                .map_err(|error| format!("write scratch eula.txt: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Flags whose next argument is a path, so the child can be given absolute
 /// values before it changes into its fresh game directory.
 const LAUNCH_PATH_ARG_FLAGS: [&str; 6] = [
@@ -2020,10 +2133,7 @@ fn absolutize_launch_args(args: Vec<OsString>, cwd: &Path) -> Vec<OsString> {
 /// shutdown path still dies with the process group at the deadline.
 fn run_launch_game_child(accept_eula: bool) -> Result<String, String> {
     let homes = LaunchHomes::new()?;
-    if accept_eula {
-        fs::write(homes.game.join("eula.txt"), "eula=true\n")
-            .map_err(|error| format!("write scratch eula.txt: {error}"))?;
-    }
+    seed_launch_game_files(&homes.game, accept_eula)?;
     let exe = std::env::current_exe().map_err(|error| format!("launch child: {error}"))?;
     let cwd = std::env::current_dir().map_err(|error| format!("launch child: {error}"))?;
     let mut command = Command::new(exe);
@@ -3217,6 +3327,7 @@ struct ProviderReport {
     knot_launch: Option<String>,
     mixin_apply: Option<String>,
     launch_game: Option<String>,
+    loader_libs: Option<String>,
     remap: Option<String>,
     client_launch: Option<String>,
 }
@@ -3237,6 +3348,7 @@ impl ProviderReport {
             knot_launch: None,
             mixin_apply: None,
             launch_game: None,
+            loader_libs: None,
             remap: None,
             client_launch: None,
         }
@@ -3269,6 +3381,11 @@ impl ProviderReport {
     /// Attach the `--launch-game` outcome.
     fn with_launch_game(mut self, value: Option<String>) -> Self {
         self.launch_game = value.map(|value| bounded_classpath_unlock(&value));
+        self
+    }
+
+    fn with_loader_libs(mut self, value: Option<String>) -> Self {
+        self.loader_libs = value.map(|value| bounded_classpath_unlock(&value));
         self
     }
 
@@ -3311,6 +3428,7 @@ impl ProviderReport {
                 knot_launch: knot_launch.clone(),
                 mixin_apply: mixin_apply.clone(),
                 launch_game: launch_game.clone(),
+                loader_libs: None,
                 remap: None,
                 client_launch: None,
             },
@@ -3328,6 +3446,7 @@ impl ProviderReport {
                 knot_launch: None,
                 mixin_apply: None,
                 launch_game: None,
+                loader_libs: None,
                 remap: None,
                 client_launch: None,
             },
@@ -3345,6 +3464,7 @@ impl ProviderReport {
                 knot_launch: None,
                 mixin_apply: None,
                 launch_game: None,
+                loader_libs: None,
                 remap: None,
                 client_launch: None,
             },
@@ -3383,6 +3503,9 @@ impl ProviderReport {
         if let Some(launch) = &self.launch_game {
             lines.push(launch_game_line(launch));
         }
+        if let Some(loader_libs) = &self.loader_libs {
+            lines.push(loader_libs.clone());
+        }
         if let Some(remap) = &self.remap {
             lines.push(remap.clone());
         }
@@ -3407,6 +3530,7 @@ impl ProviderReport {
             "knotLaunch": self.knot_launch,
             "mixinApply": self.mixin_apply,
             "launchGame": self.launch_game,
+            "loaderLibs": self.loader_libs,
             "remap": self.remap,
             "clientLaunch": self.client_launch,
         })
@@ -3428,6 +3552,7 @@ impl ProviderReport {
             "knotLaunch": self.knot_launch,
             "mixinApply": self.mixin_apply,
             "launchGame": self.launch_game,
+            "loaderLibs": self.loader_libs,
             "remap": self.remap,
             "clientLaunch": self.client_launch,
         })
@@ -8645,6 +8770,7 @@ config="demo.mixins.json""#,
             knot_launch: None,
             mixin_apply: None,
             launch_game: None,
+            loader_libs: None,
             remap: None,
             client_launch: None,
         };
