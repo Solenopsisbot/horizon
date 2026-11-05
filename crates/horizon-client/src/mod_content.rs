@@ -19,6 +19,7 @@ use horizon_core::geometry::{Aabb, Axis, ShapeOp, Vec3, VoxelShape};
 use horizon_mods::content::{Block, Content, MobEffect, Rarity};
 use horizon_world::nbt::{self, JavaString, Limits, Tag};
 use serde::{Deserialize, Serialize, de};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
@@ -540,6 +541,22 @@ pub fn stored_declared_java_content() -> DeclaredJavaContent {
     let _guard = DECLARED_JAVA_CONTENT_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    capture_declared_java_content()
+}
+
+/// The declarations and the generation they were captured at, read under one
+/// lock: a v3 manifest carries both without mixing the epoch of one content
+/// root with the rows of another.
+pub fn declared_java_content_snapshot() -> (u64, DeclaredJavaContent) {
+    let _guard = DECLARED_JAVA_CONTENT_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let content = capture_declared_java_content();
+    (DECLARED_JAVA_CONTENT_EPOCH.load(Ordering::Acquire), content)
+}
+
+/// Every declaration table, for callers already holding the replacement lock.
+fn capture_declared_java_content() -> DeclaredJavaContent {
     DeclaredJavaContent {
         ids: DECLARED_IDS
             .lock()
@@ -567,6 +584,13 @@ pub fn stored_declared_java_content() -> DeclaredJavaContent {
             .clone()
             .unwrap_or_default(),
     }
+}
+
+/// The content hash of the declarations this process holds right now, 0 when
+/// it holds none: what a v3 manifest's header is compared against before its
+/// declarations replace the local ones.
+pub fn stored_declared_java_content_hash() -> u64 {
+    stored_declared_java_content().content_hash()
 }
 
 /// A declared block entity as a remote manifest lists it: one row per block,
@@ -620,6 +644,108 @@ impl DeclaredJavaContent {
             + self.block_entities.len()
             + self.menus.len()
             + self.entities.len()
+    }
+
+    /// A bounded hash over these declarations in one canonical order: the
+    /// eight registries' sorted ids, then the block-entity, menu and entity
+    /// rows by key. A v3 login manifest carries it in its header, so a guest
+    /// can tell "the same declarations" from "different ones" without
+    /// comparing every row. Empty content hashes to 0, so "nothing declared"
+    /// never compares equal to a real declaration set.
+    pub fn content_hash(&self) -> u64 {
+        if self.is_empty() {
+            return 0;
+        }
+        let mut hasher = ContentHasher::new();
+        // The registries in frame order, sorted and deduplicated the way the
+        // frame encodes them, so store order cannot change the hash.
+        let registries: [&[String]; 8] = [
+            &self.ids.blocks,
+            &self.ids.items,
+            &self.ids.effects,
+            &self.ids.entity_types,
+            &self.extra.data_components,
+            &self.extra.attachments,
+            &self.ids.menus,
+            &self.ids.block_entity_types,
+        ];
+        for (index, ids) in registries.iter().enumerate() {
+            hasher.tag(index as u8);
+            let mut ids: Vec<&String> = ids.iter().collect();
+            ids.sort();
+            ids.dedup();
+            hasher.count(ids.len());
+            for id in ids {
+                hasher.text(id);
+            }
+        }
+        // Rows are keyed and iterated in key order; `valid_blocks` is derived
+        // from the keys, so the block alone identifies each row.
+        hasher.tag(8);
+        hasher.count(self.block_entities.len());
+        for (block, row) in &self.block_entities {
+            hasher.text(block);
+            hasher.text(&row.id);
+            hasher.text(&row.template);
+            hasher.byte(u8::from(row.ticker));
+        }
+        hasher.tag(9);
+        hasher.count(self.menus.len());
+        for (id, row) in &self.menus {
+            hasher.text(id);
+            hasher.text(&row.title);
+            hasher.count(row.slots as usize);
+            let mut blocks = row.open_blocks.clone();
+            blocks.sort();
+            blocks.dedup();
+            hasher.count(blocks.len());
+            for block in &blocks {
+                hasher.text(block);
+            }
+        }
+        hasher.tag(10);
+        hasher.count(self.entities.len());
+        for (id, row) in &self.entities {
+            hasher.text(id);
+            hasher.text(&row.template);
+            hasher.text(&row.category);
+            hasher.byte(row.flags);
+        }
+        hasher.finish()
+    }
+}
+
+/// The canonical byte stream [`DeclaredJavaContent::content_hash`] hashes:
+/// tagged, length-prefixed fields in one order. The first 8 bytes of SHA-256
+/// are enough to tell declaration sets apart on the wire, and a fixed width
+/// keeps the v3 header bounded.
+struct ContentHasher(Sha256);
+
+impl ContentHasher {
+    fn new() -> Self {
+        Self(Sha256::new())
+    }
+
+    fn tag(&mut self, tag: u8) {
+        self.0.update([tag]);
+    }
+
+    fn count(&mut self, count: usize) {
+        self.0.update((count as u64).to_be_bytes());
+    }
+
+    fn text(&mut self, text: &str) {
+        self.0.update((text.len() as u64).to_be_bytes());
+        self.0.update(text.as_bytes());
+    }
+
+    fn byte(&mut self, byte: u8) {
+        self.0.update([byte]);
+    }
+
+    fn finish(self) -> u64 {
+        let digest = self.0.finalize();
+        u64::from_be_bytes(digest[..8].try_into().unwrap_or_default())
     }
 }
 
@@ -773,6 +899,27 @@ fn normalize_declared_ids(ids: DeclaredIds) -> std::result::Result<DeclaredIds, 
     })
 }
 
+/// Normalize one declaration batch into the snapshot
+/// [`merge_declared_java_content`] works on, without touching the stores: the
+/// ids, extra ids and rows as the stores would hold them, or an error when the
+/// batch is malformed. A v3 manifest hashes this snapshot so the guest and the
+/// host agree on what "the same declarations" means.
+pub fn normalized_declared_java_content(
+    ids: DeclaredIds,
+    extra: DeclaredExtraIds,
+    rows: impl IntoIterator<Item = BlockEntityRow>,
+    menus: impl IntoIterator<Item = MenuRow>,
+    entities: impl IntoIterator<Item = EntityRow>,
+) -> std::result::Result<DeclaredJavaContent, String> {
+    Ok(DeclaredJavaContent {
+        ids: normalize_declared_ids(ids)?,
+        extra: extra.normalize()?,
+        block_entities: declared_block_entity_map_from_rows(rows)?,
+        menus: declared_menus_from_rows(menus)?,
+        entities: declared_entities_from_rows(entities)?,
+    })
+}
+
 /// Merge a remote manifest into the declarations already loaded. An empty
 /// current set takes the incoming one, an identical set is a no-op, and two
 /// different non-empty sets conflict: a guest that has its own mods never
@@ -786,13 +933,7 @@ pub fn merge_declared_java_content(
     menus: impl IntoIterator<Item = MenuRow>,
     entities: impl IntoIterator<Item = EntityRow>,
 ) -> std::result::Result<DeclaredJavaContent, String> {
-    let incoming = DeclaredJavaContent {
-        ids: normalize_declared_ids(ids)?,
-        extra: extra.normalize()?,
-        block_entities: declared_block_entity_map_from_rows(rows)?,
-        menus: declared_menus_from_rows(menus)?,
-        entities: declared_entities_from_rows(entities)?,
-    };
+    let incoming = normalized_declared_java_content(ids, extra, rows, menus, entities)?;
     if incoming.is_empty() {
         return Ok(current.clone());
     }
