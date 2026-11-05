@@ -765,7 +765,6 @@ mod tests {
         EntityDeclaration, MenuDeclaration, NativeDeclarations, SpawnRestriction,
     };
     use horizon_mods::payloads::PayloadDirection;
-    use std::sync::Mutex;
 
     /// The snapshot lives in a process-wide `OnceLock`, so tests that publish a
     /// batch take turns instead of observing each other's rows. The lock is
