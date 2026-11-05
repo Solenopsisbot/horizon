@@ -15,8 +15,8 @@ from tools import real_mod_corpus
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER = ROOT / "tools" / "real_mod_fixtures" / "build.py"
 
-# Real sponge-mixin's `@Mixin` is CLASS-retention, unlike the RUNTIME stub the committed
-# fixtures use, so the probe only finds this mixin through the annotation's class bytes.
+# Real sponge-mixin's `@Mixin` is CLASS-retention; keep this separately compiled fixture
+# focused on proving discovery through the annotation's class bytes.
 CLASS_RETENTION_SOURCES = {
     "org/spongepowered/asm/mixin/Mixin.java": (
         "package org.spongepowered.asm.mixin; import java.lang.annotation.*; "
