@@ -387,6 +387,19 @@ pub fn generate_many(
             }
         }
     }
+    // The entity-event slice carries the joined entity and its level: the whole
+    // unit is written whenever one of its surfaces is named, so both shapes seed
+    // with it.
+    if uses_neoforge_entity_events {
+        for name in [
+            "net/minecraft/world/entity/Entity",
+            "net/minecraft/world/level/Level",
+        ] {
+            if game.contains_key(name) && !lib_names.contains(name) && !own.contains(name) {
+                wanted.insert(name.to_owned());
+            }
+        }
+    }
     // The Fabric event shims name game types in their callback signatures, and
     // a mod that only writes `register(server -> {})` carries no reference to
     // them. Seed the façade with the types the emitted holders need; a
@@ -1949,6 +1962,18 @@ pub fn generate_many(
                 (NEOFORGE_ISTORAGE, NEOFORGE_ISTORAGE_SOURCE),
             ] {
                 if available.contains(class) {
+                    continue;
+                }
+                // The join-level event's 26.3 shape names `Entity` and `Level`
+                // in its signatures; a jar that lacks either cannot compile it
+                // and is reported instead of getting an Object-shaped copy.
+                if class == NEOFORGE_ENTITY_JOIN_LEVEL_EVENT
+                    && !(game.contains_key("net/minecraft/world/entity/Entity")
+                        && game.contains_key("net/minecraft/world/level/Level"))
+                {
+                    report.missing.push(format!(
+                        "{class} (needs net/minecraft/world/entity/Entity, net/minecraft/world/level/Level)"
+                    ));
                     continue;
                 }
                 write_shim(&mut files, &src, class, source)?;
@@ -4533,13 +4558,13 @@ const NEOFORGE_ISTORAGE: &str = "net/neoforged/neoforge/common/capabilities/ISto
 
 const NEOFORGE_ENTITY_JOIN_LEVEL_EVENT_SOURCE: &str = r#"package net.neoforged.neoforge.event.entity;
 public class EntityJoinLevelEvent extends net.neoforged.bus.api.Event {
-    private final Object horizonEntity;
-    private final Object horizonLevel;
+    private final net.minecraft.world.entity.Entity horizonEntity;
+    private final net.minecraft.world.level.Level horizonLevel;
     private final boolean horizonLoadedFromDisk;
-    public EntityJoinLevelEvent(Object entity, Object level) { this(entity, level, false); }
-    public EntityJoinLevelEvent(Object entity, Object level, boolean loadedFromDisk) { super(true); this.horizonEntity = entity; this.horizonLevel = level; this.horizonLoadedFromDisk = loadedFromDisk; }
-    public Object getEntity() { return horizonEntity; }
-    public Object getLevel() { return horizonLevel; }
+    public EntityJoinLevelEvent(net.minecraft.world.entity.Entity entity, net.minecraft.world.level.Level level) { this(entity, level, false); }
+    public EntityJoinLevelEvent(net.minecraft.world.entity.Entity entity, net.minecraft.world.level.Level level, boolean loadedFromDisk) { super(true); this.horizonEntity = entity; this.horizonLevel = level; this.horizonLoadedFromDisk = loadedFromDisk; }
+    public net.minecraft.world.entity.Entity getEntity() { return horizonEntity; }
+    public net.minecraft.world.level.Level getLevel() { return horizonLevel; }
     public boolean loadedFromDisk() { return horizonLoadedFromDisk; }
 }
 "#;
@@ -19741,6 +19766,15 @@ public class DatagenProbe {
             files.push(file);
         };
         write("net/neoforged/bus/api/Event.java", NEOFORGE_EVENT);
+        // The 26.3 join-level event names the joined entity and its level.
+        write(
+            "net/minecraft/world/entity/Entity.java",
+            "package net.minecraft.world.entity;\npublic class Entity {}\n",
+        );
+        write(
+            "net/minecraft/world/level/Level.java",
+            "package net.minecraft.world.level;\npublic class Level {}\n",
+        );
         for (class, source) in [
             (
                 NEOFORGE_ENTITY_JOIN_LEVEL_EVENT,
@@ -20495,6 +20529,9 @@ public class Probe {
                     "net/fabricmc/fabric/api/datagen/v1/DataGeneratorEntrypoint",
                     "net/neoforged/neoforge/network/registration/PayloadRegistrar",
                     "net/neoforged/neoforge/registries/RegisterEvent",
+                    // Names the entity-event unit without the join event, so
+                    // the seeded Entity/Level are exercised on that path too.
+                    "net/neoforged/neoforge/capabilities/RegisterCapabilitiesEvent",
                     "net/minecraft/world/entity/Entity",
                     "net/minecraft/core/Registry",
                 ],
@@ -20509,6 +20546,7 @@ public class Probe {
                     "net/fabricmc/fabric/api/datagen/v1/FabricDataGenerator.java",
                     "net/neoforged/neoforge/network/registration/PayloadRegistrar.java",
                     "net/neoforged/neoforge/registries/RegisterEvent.java",
+                    "net/neoforged/neoforge/capabilities/RegisterCapabilitiesEvent.java",
                     "net/minecraft/core/Registry.java",
                     "net/minecraft/core/DefaultedRegistry.java",
                     "net/minecraft/world/entity/Entity.java",
