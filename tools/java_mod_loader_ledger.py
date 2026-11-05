@@ -123,11 +123,18 @@ def main() -> int:
     args = parser.parse_args()
     if args.batch_size < 1 or args.timeout < 1:
         parser.error("--batch-size and --timeout must be positive")
-    binary = args.binary if args.binary.is_absolute() else Path.cwd() / args.binary
-    game = discover(args.game, DEFAULT_GAME, "server-26.3-pinned.jar")
-    loader = discover(args.loader, DEFAULT_LOADER, "fabric-loader*.jar")
-    if args.libs:
-        libs = args.libs
+    binary_arg = args.binary
+    if binary_arg == Path("target/fast/horizon-jvm") and os.environ.get("HORIZON_JVM_BIN"):
+        binary_arg = Path(os.environ["HORIZON_JVM_BIN"])
+    binary = binary_arg if binary_arg.is_absolute() else Path.cwd() / binary_arg
+    game_arg = args.game or (Path(os.environ["HORIZON_MINECRAFT_JAR"])
+                             if os.environ.get("HORIZON_MINECRAFT_JAR") else None)
+    loader_arg = args.loader or (Path(os.environ["FABRIC_LOADER_JAR"])
+                                 if os.environ.get("FABRIC_LOADER_JAR") else None)
+    game = discover(game_arg, DEFAULT_GAME, "server-26.3-pinned.jar")
+    loader = discover(loader_arg, DEFAULT_LOADER, "fabric-loader*.jar")
+    if args.libs or os.environ.get("FABRIC_LIBS_DIR"):
+        libs = args.libs or Path(os.environ["FABRIC_LIBS_DIR"])
     else:
         candidates = [DEFAULT_LIBS] + sorted(Path("/tmp/opencode").glob("*/libraries"))
         libs = next((candidate for candidate in candidates
