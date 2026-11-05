@@ -468,6 +468,36 @@ impl Hub {
         std::mem::take(&mut self.payload_inbox)
     }
 
+    /// Encode one declared frame for a client. The link's queued copy is
+    /// dropped: the caller sends the returned bytes, and a copy left behind
+    /// would fill the link's send queue until every later send failed.
+    fn encode_for_client(
+        link: &mut PayloadLink,
+        id: &str,
+        direction: PayloadDirection,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        let data = link.send(id, direction, bytes)?;
+        link.take_outgoing();
+        Ok(data)
+    }
+
+    /// The frames of a drained queue a client can receive: `playToClient`, or
+    /// the bidirectional play form. A server-bound frame is the client
+    /// window's to send, from the mirror queue (`payloads::take_java_to_server`),
+    /// so the hub never broadcasts it.
+    fn client_bound(frames: impl IntoIterator<Item = PayloadFrame>) -> Vec<PayloadFrame> {
+        frames
+            .into_iter()
+            .filter(|frame| {
+                matches!(
+                    frame.direction(),
+                    PayloadDirection::PlayToClient | PayloadDirection::PlayBidirectional
+                )
+            })
+            .collect()
+    }
+
     /// Send one frame to every guest that accepts it; frames Java mods queued
     /// at bootstrap go out on the next tick after a player joins.
     pub fn broadcast_payload(&mut self, frame: &PayloadFrame) {
@@ -478,10 +508,12 @@ impl Hub {
         ) {
             return;
         }
-        let data = match self
-            .payloads
-            .send(frame.id(), direction, frame.bytes().to_vec())
-        {
+        let data = match Self::encode_for_client(
+            &mut self.payloads,
+            frame.id(),
+            direction,
+            frame.bytes().to_vec(),
+        ) {
             Ok(data) => data,
             Err(error) => {
                 log::warn!("Horizon: mod payload {} was not sent: {error}", frame.id());
@@ -507,7 +539,7 @@ impl Hub {
         direction: PayloadDirection,
         bytes: Vec<u8>,
     ) -> Result<(), String> {
-        let data = self.payloads.send(id, direction, bytes)?;
+        let data = Self::encode_for_client(&mut self.payloads, id, direction, bytes)?;
         let g = self
             .guest(conn)
             .ok_or_else(|| format!("guest {conn} is not here"))?;
@@ -1419,7 +1451,10 @@ impl Hub {
                 self.kick(conn, translatable("disconnect.timeout", &[]));
             }
         }
-        for frame in payloads::take_java_outgoing() {
+        // Only frames a client can receive are the hub's to broadcast. A
+        // server-bound frame stays with the client window, whose pump reads
+        // it from the mirror queue (`payloads::take_java_to_server`).
+        for frame in Self::client_bound(payloads::take_java_outgoing()) {
             self.broadcast_payload(&frame);
         }
         events
@@ -3442,6 +3477,65 @@ fn listed_properties(
 mod tests {
     use super::*;
     use crate::fast_hash::FxHashSet;
+    use horizon_mods::payloads::{PayloadDeclaration, PayloadRegistry};
+
+    fn payload_link(
+        declarations: impl IntoIterator<Item = (&'static str, PayloadDirection)>,
+    ) -> PayloadLink {
+        let mut registry = PayloadRegistry::default();
+        for (id, direction) in declarations {
+            registry
+                .register(PayloadDeclaration {
+                    id: id.into(),
+                    direction,
+                    codec: None,
+                })
+                .unwrap();
+        }
+        PayloadLink::new(registry)
+    }
+
+    /// A broadcast encodes its frame every tick; a copy left in the link's
+    /// send queue would fill it (256 frames) and every later broadcast would
+    /// fail. More sends than the cap must all go out.
+    #[test]
+    fn repeated_broadcast_encodings_do_not_fill_the_link_send_queue() {
+        let mut link = payload_link([("demo:down", PayloadDirection::PlayToClient)]);
+        for n in 0..300u16 {
+            let data = Hub::encode_for_client(
+                &mut link,
+                "demo:down",
+                PayloadDirection::PlayToClient,
+                n.to_be_bytes().to_vec(),
+            )
+            .expect("the send queue is cleared after every frame");
+            let (frame, used) = PayloadFrame::decode(&data).unwrap();
+            assert_eq!(used, data.len());
+            assert_eq!(frame.bytes(), &n.to_be_bytes());
+            assert!(
+                link.outgoing().is_empty(),
+                "the link keeps no queued copy of a broadcast"
+            );
+        }
+    }
+
+    /// A mixed drain keeps the frames a client can receive, in order, and
+    /// leaves the server-bound and configuration ones for the client window
+    /// (which reads the server-bound frames from the mirror queue).
+    #[test]
+    fn the_hub_drain_keeps_only_client_bound_frames() {
+        let frame = |id: &str, direction| PayloadFrame::new(id, direction, Vec::new()).unwrap();
+        let drained = vec![
+            frame("demo:up", PayloadDirection::PlayToServer),
+            frame("demo:down", PayloadDirection::PlayToClient),
+            frame("demo:both", PayloadDirection::PlayBidirectional),
+            frame("demo:config", PayloadDirection::ConfigurationToClient),
+        ];
+        let kept = Hub::client_bound(drained);
+        let ids: Vec<&str> = kept.iter().map(|frame| frame.id()).collect();
+        assert_eq!(ids, ["demo:down", "demo:both"]);
+        assert!(Hub::client_bound(Vec::new()).is_empty());
+    }
 
     /// The declared Java content frame goes out only when there is something
     /// to resolve, and it decodes back to the same manifest.
