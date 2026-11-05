@@ -119,6 +119,23 @@ def discover(explicit: Path | None, fallback: Path, pattern: str) -> Path:
     return found[0]
 
 
+def _launch_dirs() -> set[Path]:
+    return set(Path(tempfile.gettempdir()).glob("horizon-launch-*"))
+
+
+def _append_child_log(output: str, before: set[Path]) -> str:
+    """Fabric's mod listing goes to the game log, not the parent's stdout."""
+    new = sorted(_launch_dirs() - before, key=lambda path: path.stat().st_mtime, reverse=True)
+    for directory in new:
+        log = directory / "game" / "logs" / "latest.log"
+        if log.is_file():
+            try:
+                return output + "\n" + log.read_text(errors="replace")
+            except OSError:
+                continue
+    return output
+
+
 def run_batch(binary: Path, game: Path, loader: Path, libs: Path, jars: list[Path], timeout: int) -> tuple[int, str]:
     with tempfile.TemporaryDirectory(prefix="horizon-loader-") as scratch:
         env = os.environ.copy()
@@ -136,14 +153,16 @@ def run_batch(binary: Path, game: Path, loader: Path, libs: Path, jars: list[Pat
                    "--libs", str(libs), "--game-jar", str(game), "--game-version", "26.3"] + [str(j) for j in jars]
         process = subprocess.Popen(command, cwd=scratch, env=env, start_new_session=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        before = _launch_dirs()
         try:
             output, _ = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             output, _ = process.communicate()
+            output = _append_child_log(output, before)
             output += f"\nledger: timeout after {timeout}s\n"
             return 124, output
-        return process.returncode, output
+        return process.returncode, _append_child_log(output, before)
 
 
 def parse_log(output: str, mods: list[tuple[Path, str, str]]) -> dict:
