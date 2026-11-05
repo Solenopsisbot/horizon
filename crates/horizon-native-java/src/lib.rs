@@ -14826,6 +14826,139 @@ fn fabric_mixin_config_paths(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The configs `fabric.mod.json` limits to one physical side, by path.
+///
+/// Only `{config, environment}` entries naming `client` or `server` appear: a
+/// bare string, `*` and a missing environment all apply on both sides.
+fn fabric_mixin_config_sides(text: &str) -> BTreeMap<String, MixinSide> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return BTreeMap::new();
+    };
+    let entries = match value.get("mixins") {
+        Some(serde_json::Value::Array(entries)) => entries.as_slice(),
+        Some(entry) => std::slice::from_ref(entry),
+        None => &[],
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let side = match entry.get("environment")?.as_str()? {
+                "client" => MixinSide::Client,
+                "server" => MixinSide::Server,
+                _ => return None,
+            };
+            Some((entry.get("config")?.as_str()?.to_owned(), side))
+        })
+        .collect()
+}
+
+/// Whether the jar's readable configs apply one `@Mixin` class on `side`.
+///
+/// `class` is an internal name; a config lists Java binary names. The first
+/// config that applies the class decides, so a config plugin only vetoes what
+/// its own config would have applied.
+fn mixin_config_gate(
+    configs: &[MixinConfig],
+    config_sides: &BTreeMap<String, MixinSide>,
+    class: &str,
+    side: MixinSide,
+) -> Result<(), MixinSkipReason> {
+    let binary = class.replace('/', ".");
+    let mut listed = false;
+    for config in configs {
+        let (here, other) = match side {
+            MixinSide::Client => (&config.client, &config.server),
+            MixinSide::Server => (&config.server, &config.client),
+        };
+        let on_side = config.mixins.contains(&binary) || here.contains(&binary);
+        listed |= on_side || other.contains(&binary);
+        if on_side
+            && config_sides
+                .get(&config.path)
+                .is_none_or(|only| *only == side)
+        {
+            return match config.plugin {
+                Some(_) => Err(MixinSkipReason::ConfigPlugin),
+                None => Ok(()),
+            };
+        }
+    }
+    Err(if listed {
+        MixinSkipReason::OtherSide
+    } else {
+        MixinSkipReason::NotInConfig
+    })
+}
+
+/// One row per class a config lists that has no plan and no row yet.
+///
+/// Without these a real jar reads as fully applied: its `@Mixin` annotations are
+/// invisible to discovery, so it reports no plans however many classes it lists.
+fn listed_without_plan(
+    configs: &[MixinConfig],
+    plans: &[MixinInjectionPlan],
+    skipped: &mut Vec<SkippedMixinPlan>,
+) {
+    let mut accounted = plans
+        .iter()
+        .map(|plan| plan.callback.owner.clone())
+        .chain(skipped.iter().map(|row| row.callback.owner.clone()))
+        .collect::<BTreeSet<_>>();
+    for config in configs {
+        for class in config
+            .mixins
+            .iter()
+            .chain(&config.client)
+            .chain(&config.server)
+        {
+            let owner = class.replace('.', "/");
+            if accounted.insert(owner.clone()) {
+                let member = MethodRef {
+                    owner,
+                    name: String::new(),
+                    descriptor: String::new(),
+                };
+                skipped.push(SkippedMixinPlan {
+                    target: member.clone(),
+                    callback: member,
+                    at: "@Mixin".to_owned(),
+                    reason: MixinSkipReason::ListedWithoutPlan,
+                });
+            }
+        }
+    }
+}
+
+/// The row for one `@Inject` plan the load-time weave left out.
+fn skipped_plan(plan: &MixinInjectionPlan, reason: MixinSkipReason) -> SkippedMixinPlan {
+    SkippedMixinPlan {
+        target: plan.target.clone(),
+        callback: plan.callback.clone(),
+        at: plan.at.clone(),
+        reason,
+    }
+}
+
+/// One line of at most [`MAX_WEAVE_REASON_CHARS`] characters, so a weaver error
+/// quoting a mod's own names cannot flood a report.
+fn bounded_weave_reason(reason: &str) -> String {
+    let mut bounded = reason
+        .chars()
+        .take(MAX_WEAVE_REASON_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if reason.chars().count() > MAX_WEAVE_REASON_CHARS {
+        bounded.push_str("...");
+    }
+    bounded
+}
+
 /// Read one Mixin JSON config under the bounded native limits.
 ///
 /// The root must be an object. A one-entry class list may be a bare string as
@@ -17097,6 +17230,71 @@ mod tests {
             .map(|plan| plan.callback.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, ["head2", "head1", "ret1", "tail1"]);
+    }
+
+    #[test]
+    fn mixin_config_gate_follows_lists_environment_and_plugins() {
+        let config = |path: &str, mixins: &[&str], client: &[&str], plugin: Option<&str>| {
+            let names = |list: &[&str]| list.iter().map(|name| (*name).to_owned()).collect();
+            MixinConfig {
+                path: path.into(),
+                package: None,
+                mixins: names(mixins),
+                client: names(client),
+                server: Vec::new(),
+                required: true,
+                priority: None,
+                plugin: plugin.map(str::to_owned),
+                refmap: None,
+            }
+        };
+        let gate = |configs: &[MixinConfig], text: &str, side| {
+            mixin_config_gate(configs, &fabric_mixin_config_sides(text), "demo/M", side)
+        };
+        let common = [config("a.mixins.json", &["demo.M"], &[], None)];
+        assert_eq!(gate(&common, "{}", MixinSide::Server), Ok(()));
+        // The `client` list only applies on the physical client.
+        let client = [config("a.mixins.json", &[], &["demo.M"], None)];
+        assert_eq!(gate(&client, "{}", MixinSide::Client), Ok(()));
+        assert_eq!(
+            gate(&client, "{}", MixinSide::Server),
+            Err(MixinSkipReason::OtherSide)
+        );
+        // Fabric's per-config environment limits a config's common list too,
+        // while `*` and a bare string apply everywhere.
+        let limited = r#"{"mixins":[{"config":"a.mixins.json","environment":"client"}]}"#;
+        assert_eq!(
+            gate(&common, limited, MixinSide::Server),
+            Err(MixinSkipReason::OtherSide)
+        );
+        assert_eq!(gate(&common, limited, MixinSide::Client), Ok(()));
+        let any = r#"{"mixins":[{"config":"a.mixins.json","environment":"*"},"b.mixins.json"]}"#;
+        assert_eq!(gate(&common, any, MixinSide::Server), Ok(()));
+        // A class no config lists never applies, and a plugin can veto one.
+        assert_eq!(
+            gate(&[], "{}", MixinSide::Client),
+            Err(MixinSkipReason::NotInConfig)
+        );
+        let plugin = [config(
+            "a.mixins.json",
+            &["demo.M"],
+            &[],
+            Some("demo.Plugin"),
+        )];
+        assert_eq!(
+            gate(&plugin, "{}", MixinSide::Client),
+            Err(MixinSkipReason::ConfigPlugin)
+        );
+    }
+
+    #[test]
+    fn weaver_reasons_stay_one_bounded_line() {
+        let long = format!("first\nsecond {}", "x".repeat(MAX_WEAVE_REASON_CHARS));
+        let bounded = bounded_weave_reason(&long);
+        assert!(bounded.starts_with("first second"), "{bounded}");
+        assert!(bounded.ends_with("..."), "{bounded}");
+        assert_eq!(bounded.chars().count(), MAX_WEAVE_REASON_CHARS + 3);
+        assert_eq!(bounded_weave_reason("short"), "short");
     }
 
     #[test]
