@@ -6617,14 +6617,19 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("readBooleanArray", "boolean[]", "()[Z") => {
                 return "int length = horizonGetVarInt(); if (length < 0 || length > HORIZON_MAX_BYTES) throw new IllegalArgumentException(\"Invalid boolean array length: \" + length); if (length > horizonReadable()) return new boolean[0]; boolean[] data = new boolean[length]; for (int i = 0; i < length; i++) data[i] = horizonGet() != 0; return data;".to_owned();
             }
-            ("writeIntArray", _, "([I)V") => {
-                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (int value : p0) horizonPutInt(value);".to_owned();
+            // 26.3 writes an `int[]` as a VarInt count then VarInt elements
+            // and calls it `writeVarIntArray`; `writeIntArray` is gone from
+            // the real buffer. Keep the older spelling as an alias over the
+            // same wire form so a jar naming either one round-trips.
+            ("writeVarIntArray", _, "([I)V") | ("writeIntArray", _, "([I)V") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (int value : p0) horizonPutVarInt(value);".to_owned();
             }
-            ("writeIntArray", _, "([I)Lnet/minecraft/network/FriendlyByteBuf;") => {
-                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (int value : p0) horizonPutInt(value); return this;".to_owned();
+            ("writeVarIntArray", _, "([I)Lnet/minecraft/network/FriendlyByteBuf;")
+            | ("writeIntArray", _, "([I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (int value : p0) horizonPutVarInt(value); return this;".to_owned();
             }
-            ("readIntArray", "int[]", "()[I") => {
-                return "int length = horizonGetVarInt(); if (length < 0 || length > HORIZON_MAX_BYTES / 4) throw new IllegalArgumentException(\"Invalid int array length: \" + length); if (length * 4 > horizonReadable()) return new int[0]; int[] data = new int[length]; for (int i = 0; i < length; i++) data[i] = horizonGetInt(); return data;".to_owned();
+            ("readVarIntArray", "int[]", "()[I") | ("readIntArray", "int[]", "()[I") => {
+                return "int length = horizonGetVarInt(); if (length < 0 || length > HORIZON_MAX_BYTES) throw new IllegalArgumentException(\"Invalid int array length: \" + length); if (length > horizonReadable()) return new int[0]; int[] data = new int[length]; for (int i = 0; i < length; i++) data[i] = horizonGetVarInt(); return data;".to_owned();
             }
             ("writeLongArray", _, "([J)V") => {
                 return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (long value : p0) horizonPutLong(value);".to_owned();
@@ -10487,6 +10492,13 @@ mod tests {
             "([Z)Lnet/minecraft/network/FriendlyByteBuf;",
         ),
         ("readBooleanArray", "()[Z"),
+        ("writeVarIntArray", "([I)V"),
+        (
+            "writeVarIntArray",
+            "([I)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readVarIntArray", "()[I"),
+        // The old spelling stays an alias of the same VarInt wire form.
         ("writeIntArray", "([I)V"),
         (
             "writeIntArray",
@@ -10667,7 +10679,15 @@ mod tests {
             )
             .ends_with("return this;")
         );
-        assert!(friendly_byte_buf_body("writeIntArray", "([I)V").contains("horizonPutInt(value)"));
+        // The 26.3 spelling and the retired one write the same VarInt form.
+        assert!(
+            friendly_byte_buf_body("writeVarIntArray", "([I)V").contains("horizonPutVarInt(value)")
+        );
+        assert!(
+            friendly_byte_buf_body("writeIntArray", "([I)V").contains("horizonPutVarInt(value)")
+        );
+        assert!(!friendly_byte_buf_body("writeIntArray", "([I)V").contains("horizonPutInt(value)"));
+        assert!(friendly_byte_buf_body("readVarIntArray", "()[I").contains("horizonGetVarInt()"));
         assert!(friendly_byte_buf_body("readDoubleArray", "()[D").contains("horizonGetLong()"));
         assert_eq!(
             friendly_byte_buf_body("writeFloatLE", "(F)V"),
@@ -10776,12 +10796,14 @@ mod tests {
         buf.writeString("string alias");
         buf.writeBooleanArray(new boolean[] {true, false, true});
         buf.writeIntArray(new int[] {-7, 42});
+        buf.writeVarIntArray(new int[] {-7, 42});
         buf.writeLongArray(new long[] {9L, -11L});
         buf.writeFloatArray(new float[] {1.25f, -2.5f});
         buf.writeDoubleArray(new double[] {3.5d, -4.75d});
         buf.writeStringArray(new String[] {"one", "two"});
         buf.writeBooleanArray(new boolean[] {true, false, true});
         buf.writeIntArray(new int[] {-1, 2, 3});
+        buf.writeVarIntArray(new int[] {-1, 2, 3});
         buf.writeLongArray(new long[] {4L, -5L});
         buf.writeFloatArray(new float[] {6.5f, -7.25f});
         buf.writeDoubleArray(new double[] {8.5d, -9.25d});
@@ -10811,6 +10833,7 @@ mod tests {
         if (!"string alias".equals(buf.readString())) throw new AssertionError("string alias");
         if (!java.util.Arrays.equals(buf.readBooleanArray(), new boolean[] {true, false, true})) throw new AssertionError("boolean array");
         if (!java.util.Arrays.equals(buf.readIntArray(), new int[] {-7, 42})) throw new AssertionError("int array");
+        if (!java.util.Arrays.equals(buf.readVarIntArray(), new int[] {-7, 42})) throw new AssertionError("varint array");
         if (!java.util.Arrays.equals(buf.readLongArray(), new long[] {9L, -11L})) throw new AssertionError("long array");
         if (!java.util.Arrays.equals(buf.readFloatArray(), new float[] {1.25f, -2.5f})) throw new AssertionError("float array");
         if (!java.util.Arrays.equals(buf.readDoubleArray(), new double[] {3.5d, -4.75d})) throw new AssertionError("double array");
@@ -10819,6 +10842,8 @@ mod tests {
         if (booleans.length != 3 || !booleans[0] || booleans[1] || !booleans[2]) throw new AssertionError("boolean array");
         int[] ints = buf.readIntArray();
         if (ints.length != 3 || ints[0] != -1 || ints[2] != 3) throw new AssertionError("int array");
+        int[] varints = buf.readVarIntArray();
+        if (varints.length != 3 || varints[0] != -1 || varints[2] != 3) throw new AssertionError("varint array");
         long[] longs = buf.readLongArray();
         if (longs.length != 2 || longs[1] != -5L) throw new AssertionError("long array");
         float[] floats = buf.readFloatArray();
@@ -11487,6 +11512,7 @@ public final class CodecProbe {
                     *method,
                     "writeString"
                         | "writeBooleanArray"
+                        | "writeVarIntArray"
                         | "writeIntArray"
                         | "writeLongArray"
                         | "writeFloatArray"
