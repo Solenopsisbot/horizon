@@ -16105,10 +16105,12 @@ fn parse_neoforge_metadata(
         if line.is_empty() {
             continue;
         }
-        if line.starts_with('[') {
+        if line.starts_with('[') && line.ends_with(']') {
             // A block header ends the previous block whatever it names. An
             // unknown `[[...]]` block (`[[mixins]]`, `[[features]]`, ...) must
-            // not leave its keys landing in the section before it.
+            // not leave its keys landing in the section before it. A wrapped
+            // array value's continuation line starts with `[` too but ends
+            // with `,`, so it is not mistaken for a header.
             if section == Section::Dependency {
                 flush(&mut dependency, &mut dependency_required);
             }
