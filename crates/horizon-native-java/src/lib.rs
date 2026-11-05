@@ -630,8 +630,9 @@ pub struct MixinExecutionReport {
     /// with [`MixinSkipReason::NotInConfig`], one whose config applies it only on
     /// the other physical side with [`MixinSkipReason::OtherSide`], and one
     /// whose config names a plugin with [`MixinSkipReason::ConfigPlugin`]. The
-    /// single-plan entry points, and a jar with no readable config at all,
-    /// leave it empty.
+    /// single-plan entry points leave it empty, and so does the side-agnostic
+    /// entry for a jar with no readable config at all. The side-aware entry
+    /// fills it for every plan of such a jar, since no config lists the class.
     pub skipped_plans: Vec<SkippedMixinPlan>,
 }
 
@@ -11011,7 +11012,9 @@ impl NativeJar {
     /// The skipped plans are reported in
     /// [`MixinExecutionReport::skipped_plans`] rather than vanishing, and a
     /// plan the gate refuses is not validated for its anchor shape, because it
-    /// never reaches the weave.
+    /// never reaches the weave. A jar with no readable config at all refuses
+    /// every plan, exactly as the weave does, because no config lists the
+    /// class.
     pub fn execute_discovered_mixins_on<H: Host>(
         &self,
         side: MixinSide,
@@ -15807,16 +15810,16 @@ impl ExecutionConfigGate {
 
     /// Why one plan stays out of this execution, if it does.
     ///
-    /// With no readable config at all there is nothing to gate against, so the
-    /// jar's plans stay executable; the load-time weave still refuses them.
-    /// This is the side-agnostic entry's case. With a selected side the same
-    /// [`mixin_config_gate`] the weave uses decides.
+    /// With a selected side the same [`mixin_config_gate`] the weave uses
+    /// decides, including its refusal of every class when no config is
+    /// readable. The side-agnostic entry has no side to split lists with, so it
+    /// only asks whether a config claims the class and leaves a jar with no
+    /// readable config executable: its callers are fixtures and probes on a jar
+    /// whose configs were already resolved out of band.
     fn reason(&self, class: &str) -> Option<MixinSkipReason> {
-        if self.configs.is_empty() {
-            return None;
-        }
         match self.side {
             Some(side) => mixin_config_gate(&self.configs, &self.config_sides, class, side).err(),
+            None if self.configs.is_empty() => None,
             None => (!mixin_config_lists_any_side(&self.configs, class))
                 .then_some(MixinSkipReason::NotInConfig),
         }
@@ -28062,18 +28065,26 @@ mandatory = true
             ["not-in-config"]
         );
 
-        // A jar with no readable config has nothing to gate against: the
-        // interpreter's callers are probes on an already-resolved jar.
+        // A jar with no readable config: the side-agnostic entry stays
+        // executable for fixtures and probes, while the side-aware entry
+        // refuses every plan exactly as the load-time weave does.
         let plain = NativeJar::from_classes([
             target_class(),
             marker_mixin("demo/PlainMixin", "run()V", "HEAD", false, "plain", "plain"),
         ]);
         let mut host = MarkerHost::default();
         let report = plain
-            .execute_discovered_mixins_on(MixinSide::Server, &target, None, &[], &mut host)
+            .execute_discovered_mixins(&target, None, &[], &mut host)
             .unwrap();
         assert_eq!(host.markers, vec!["demo/Probe#plain", "demo/Probe#target"]);
         assert!(report.skipped_plans.is_empty());
+
+        let mut host = MarkerHost::default();
+        let report = plain
+            .execute_discovered_mixins_on(MixinSide::Server, &target, None, &[], &mut host)
+            .unwrap();
+        assert_eq!(host.markers, vec!["demo/Probe#target"]);
+        assert_eq!(report.skipped_plans[0].reason, MixinSkipReason::NotInConfig);
     }
 
     #[test]
