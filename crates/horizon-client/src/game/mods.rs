@@ -1206,7 +1206,9 @@ pub(super) fn run_java_mods_with_report(
         // The interpreter and the host callbacks it reaches are mod code: a
         // panic in them fails this jar, not the game or the server thread.
         let execution = isolate_jar(|| {
-            let mut host = seeded_native_host(&jar, path, role);
+            let mut host = seeded_native_host(&jar, path, role)
+                .with_mixin_bridge_instances(&weave.classes)
+                .map_err(|error| error.to_string())?;
             let mut calls = 0;
             for entry in &entrypoints {
                 let report = jar
