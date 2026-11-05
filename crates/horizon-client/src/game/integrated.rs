@@ -1265,8 +1265,9 @@ mod tests {
         );
     }
 
-    /// The declaration store is process-wide: tests that write it take turns.
-    static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The declaration store is process-wide: tests that write it take turns,
+    /// on the lock the registry and dedicated tests share.
+    use crate::game::java_registry::REGISTRY_TEST_LOCK as STORE_LOCK;
 
     fn declared_mod(
         id: &str,
