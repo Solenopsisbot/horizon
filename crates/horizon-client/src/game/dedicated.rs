@@ -407,8 +407,43 @@ pub(super) fn load_java_mods(options: &mut Options) -> Result<()> {
     let (content, reports) = load_java_mod_paths(&options.java_mods)?;
     log_java_reports(&reports, "INFO");
     *JAVA_REPORTS.lock().unwrap() = reports;
+    publish_java_content(&content)?;
     options.java_content = Arc::new(content);
     Ok(())
+}
+
+/// Publish the dedicated role's declarations to the two process-wide views
+/// the rest of the game reads, as the integrated server does after its
+/// entrypoints ran (`integrated.rs`):
+///
+/// * the typed registry snapshot ([`super::java_registry`]), so lookups stop
+///   falling back to the raw content list and the coalescing and conflict
+///   diagnostics run in this role too. A rejected batch stops startup, like
+///   the integrated server; and
+/// * the declaration store that feeds a guest's login manifest. A dedicated
+///   server has no window whose content-root build fills it, so without this
+///   its guests would be sent an empty manifest. Rows the store already holds
+///   differently keep the stored row and are logged, never fatal.
+///
+/// Returns the log lines it wrote, for tests.
+fn publish_java_content(
+    content: &[horizon_client::mod_content::ContentMod],
+) -> Result<Vec<String>> {
+    let registry = super::java_registry::try_synchronize(content)
+        .map_err(|error| format!("dedicated Java registry synchronization failed: {error}"))?;
+    let mut lines = registry.diagnostics();
+    let union = horizon_client::mod_content::union_declared_java_content(content);
+    if union.conflict_count > 0 {
+        lines.push(format!(
+            "declared Java content conflicts with the content already loaded, keeping the loaded rows for LAN guests: {} ({} row(s))",
+            union.conflicts.join(", "),
+            union.conflict_count
+        ));
+    }
+    for line in &lines {
+        log("INFO", &format!("Horizon: {line}"));
+    }
+    Ok(lines)
 }
 
 /// `HORIZON_NEOFORGE_SERVER` and `HORIZON_JVM_BIN` together ask for the opt-in
@@ -1918,6 +1953,100 @@ mod tests {
             assert!(chrono::NaiveTime::parse_from_str(&line[1..9], "%H:%M:%S").is_ok());
             assert_eq!(&line[9..], suffix);
         }
+    }
+
+    fn declaring_mod(id: &str, block: &str) -> horizon_client::mod_content::ContentMod {
+        let declarations = horizon_mods::native::NativeDeclarations {
+            blocks: vec![horizon_mods::content::Block {
+                id: block.into(),
+                template: "minecraft:stone".into(),
+                properties: Default::default(),
+                shapes: None,
+                default_state: Default::default(),
+                item: false,
+                components: Default::default(),
+            }],
+            ..Default::default()
+        };
+        horizon_client::mod_content::ContentMod {
+            id: id.into(),
+            content: horizon_mods::content::Content::from_native(id, declarations).unwrap(),
+        }
+    }
+
+    /// The dedicated role used to bypass the typed snapshot: its lookups fell
+    /// back to the raw content list and no registry diagnostics ran. After a
+    /// declaration the snapshot is populated, the diagnostics are logged, and
+    /// the guest manifest's store holds the id.
+    #[test]
+    fn dedicated_java_content_reaches_the_snapshot_and_the_guest_store() {
+        let _guard = crate::game::java_registry::REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mods = [declaring_mod("dedsync", "dedsync:ore")];
+        let mut lines = Vec::new();
+        let captured = capture_log(|| {
+            lines = super::publish_java_content(&mods).unwrap();
+        });
+        assert!(
+            lines[0].starts_with("java registry: 1 block ids"),
+            "{lines:?}"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|line| line.contains("java registry: 1 block ids")),
+            "{captured:?}"
+        );
+        assert_eq!(
+            crate::game::java_registry::current_snapshot().blocks,
+            ["dedsync:ore"]
+        );
+        assert!(
+            horizon_client::mod_content::stored_declared_java_content()
+                .ids
+                .blocks
+                .iter()
+                .any(|id| id == "dedsync:ore")
+        );
+        // The same batch again is a no-op for the store and adds no warning.
+        let again = super::publish_java_content(&mods).unwrap();
+        assert!(
+            !again.iter().any(|line| line.contains("conflicts")),
+            "{again:?}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_dedicated_registry_batch_stops_startup_naming_the_role() {
+        let _guard = crate::game::java_registry::REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Two mods that declare one entity id with different templates make
+        // the batch ambiguous, so the registry rejects it.
+        let entity = |mod_id: &str, template: &str| {
+            let declarations = horizon_mods::native::NativeDeclarations {
+                entities: vec![horizon_mods::native::EntityDeclaration {
+                    id: "dedbad:thing".into(),
+                    template: template.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            horizon_client::mod_content::ContentMod {
+                id: mod_id.into(),
+                content: horizon_mods::content::Content::from_native(mod_id, declarations).unwrap(),
+            }
+        };
+        let mods = [
+            entity("dedbad-a", "minecraft:zombie"),
+            entity("dedbad-b", "minecraft:cow"),
+        ];
+        let error = super::publish_java_content(&mods).unwrap_err().to_string();
+        assert!(
+            error.starts_with("dedicated Java registry synchronization failed"),
+            "{error}"
+        );
     }
 
     #[test]

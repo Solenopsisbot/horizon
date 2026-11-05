@@ -472,8 +472,19 @@ impl JavaRegistrySnapshot {
 
 static SNAPSHOT: OnceLock<RwLock<JavaRegistrySnapshot>> = OnceLock::new();
 
+/// Serializes the tests, in any game module, that publish to or read back the
+/// process-wide snapshot.
+#[cfg(test)]
+pub(super) static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn state() -> &'static RwLock<JavaRegistrySnapshot> {
     SNAPSHOT.get_or_init(|| RwLock::new(JavaRegistrySnapshot::default()))
+}
+
+/// A copy of the published snapshot, for status and diagnostics readers that
+/// must not hold the registry lock while they format.
+pub(super) fn current_snapshot() -> JavaRegistrySnapshot {
+    state().read().expect("java registry lock poisoned").clone()
 }
 
 /// The first declared menu `block` opens from, by id: the published snapshot
@@ -757,8 +768,9 @@ mod tests {
     use std::sync::Mutex;
 
     /// The snapshot lives in a process-wide `OnceLock`, so tests that publish a
-    /// batch take turns instead of observing each other's rows.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// batch take turns instead of observing each other's rows. The lock is
+    /// shared with the other game modules' tests (`REGISTRY_TEST_LOCK`).
+    use super::REGISTRY_TEST_LOCK as TEST_LOCK;
 
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
         TEST_LOCK

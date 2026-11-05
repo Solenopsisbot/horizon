@@ -6,6 +6,8 @@ use super::{
     JavaCompatibilityReport, JavaEngine, ServerState, capture_log, fml, loader_name, role_name,
 };
 use crate::game::Game;
+use crate::game::java_registry::{JavaRegistrySnapshot, PayloadSummary};
+use horizon_client::mod_content::DeclarationSummary;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -169,6 +171,52 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
     })
 }
 
+/// The `declared` subtotal of the `java` section: what the typed registry
+/// snapshot holds per registry kind, the distinct menu bindings and
+/// block-entity blocks, the rows coalescing folded away (sorted by table, a
+/// fixed set of tables), and the snapshot's own bounded compatibility lines.
+/// The lines are [`JavaRegistrySnapshot::compatibility_lines`] verbatim, cut to
+/// [`MAX_STATUS_ROWS`], so status and log never format the same counts twice.
+/// Every key is fixed, so a server with no declarations answers zeros.
+pub(super) fn declared_section(
+    snapshot: &JavaRegistrySnapshot,
+    declared: &DeclarationSummary,
+    payloads: &PayloadSummary,
+) -> Value {
+    let summary = snapshot.summary();
+    let mut lines = snapshot.compatibility_lines(declared, payloads);
+    let truncated = lines.len() > MAX_STATUS_ROWS;
+    lines.truncate(MAX_STATUS_ROWS);
+    json!({
+        "blocks": summary.blocks,
+        "items": summary.items,
+        "entities": summary.entities,
+        "data_components": summary.data_components,
+        "attachments": summary.attachments,
+        "menus": summary.menus,
+        "block_entities": summary.block_entities,
+        "menu_bindings": summary.menu_bindings,
+        "block_entity_blocks": summary.block_entity_blocks,
+        "coalesced": snapshot.coalesced,
+        "lines": lines,
+        "lines_truncated": truncated,
+    })
+}
+
+/// [`java_section`] plus a `declared` key at the end. The jar keys are
+/// unchanged, so a status reader written before the key existed keeps
+/// reading the same fields and ignores the new one.
+pub(super) fn java_section_with_declared(
+    reports: &[JavaCompatibilityReport],
+    snapshot: &JavaRegistrySnapshot,
+    declared: &DeclarationSummary,
+    payloads: &PayloadSummary,
+) -> Value {
+    let mut section = java_section(reports);
+    section["declared"] = declared_section(snapshot, declared, payloads);
+    section
+}
+
 /// The `fml` section of `server-status`: the last opt-in FancyModLoader
 /// preflight — its role, the jars offered to it, FML's own mod count and ids,
 /// why it failed and whether the environment asked for it to be strict. The
@@ -298,7 +346,14 @@ impl Game<'_> {
             "max_players": max_players,
             "chunks": self.world.chunks.len(),
             "paused": state.paused,
-            "java": java_section(&state.java),
+            "java": java_section_with_declared(
+                &state.java,
+                &crate::game::java_registry::current_snapshot(),
+                &horizon_client::mod_content::declaration_summary(&self.options.java_content),
+                &PayloadSummary::from_declarations(
+                    &horizon_client::lan::payloads::declared_by_id(),
+                ),
+            ),
             "fml": fml_section(fml::last_report().as_ref(), fml::strict_requested()),
         })
     }
@@ -621,5 +676,122 @@ mod tests {
             section["entries"].as_array().unwrap().len(),
             MAX_STATUS_JARS
         );
+    }
+
+    /// A snapshot with a few ids per kind, built by hand: the status section
+    /// reads counts, so no content root or process-wide registry is involved.
+    fn snapshot_with(blocks: &[&str], menus: usize) -> JavaRegistrySnapshot {
+        let strings = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect();
+        JavaRegistrySnapshot {
+            blocks: strings(blocks),
+            items: strings(&["ruby:gem"]),
+            menus: (0..menus)
+                .map(|i| horizon_mods::native::MenuDeclaration {
+                    id: format!("ruby:menu{i}"),
+                    title_key: "container.ruby.crate".into(),
+                    slots: 27,
+                    open_blocks: Vec::new(),
+                })
+                .collect(),
+            coalesced: [("items".to_owned(), 2)].into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn declared_section_counts_each_registry_kind() {
+        let snapshot = snapshot_with(&["ruby:ore", "ruby:block"], 1);
+        let section = declared_section(&snapshot, &Default::default(), &Default::default());
+        assert_eq!(section["blocks"], 2);
+        assert_eq!(section["items"], 1);
+        assert_eq!(section["menus"], 1);
+        assert_eq!(section["entities"], 0);
+        assert_eq!(section["coalesced"], json!({ "items": 2 }));
+        // The lines are the snapshot's own, not a second formatting of them.
+        let expected = snapshot.compatibility_lines(&Default::default(), &Default::default());
+        let lines: Vec<String> = section["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line.as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(lines, expected);
+        assert_eq!(section["lines_truncated"], false);
+        // Deterministic: the same inputs give byte-identical output.
+        assert_eq!(
+            section.to_string(),
+            declared_section(&snapshot, &Default::default(), &Default::default()).to_string()
+        );
+    }
+
+    #[test]
+    fn an_empty_snapshot_answers_zeros_and_declared_none() {
+        let section = declared_section(
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        for key in [
+            "blocks",
+            "items",
+            "entities",
+            "data_components",
+            "attachments",
+            "menus",
+            "block_entities",
+            "menu_bindings",
+            "block_entity_blocks",
+        ] {
+            assert_eq!(section[key], 0, "{key}");
+        }
+        assert_eq!(section["coalesced"], json!({}));
+        assert!(
+            section["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line.as_str().unwrap().ends_with("declared: none"))
+        );
+    }
+
+    #[test]
+    fn declared_lines_stay_within_the_row_bound() {
+        // Many declared kinds and payload ids still print at most the cap.
+        let declared = DeclarationSummary {
+            blocks: 3,
+            items: 3,
+            ..Default::default()
+        };
+        let section = declared_section(&snapshot_with(&["a:b"], 0), &declared, &Default::default());
+        assert!(section["lines"].as_array().unwrap().len() <= MAX_STATUS_ROWS);
+    }
+
+    /// The new key sits beside the old ones: removing it leaves exactly the
+    /// section an older server answered, and an older reader's fields still
+    /// parse from the serialized form.
+    #[test]
+    fn the_declared_key_does_not_disturb_the_old_java_section() {
+        let reports = [java_report(
+            "/mods/a.jar",
+            JavaEngine::Native,
+            1,
+            2,
+            3,
+            (0, 0, 0, 0),
+        )];
+        let snapshot = snapshot_with(&["ruby:ore"], 0);
+        let mut section = java_section_with_declared(
+            &reports,
+            &snapshot,
+            &Default::default(),
+            &Default::default(),
+        );
+        let wire = section.to_string();
+        let parsed: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(parsed["jars"], 1);
+        assert_eq!(parsed["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["declared"]["blocks"], 1);
+        section.as_object_mut().unwrap().remove("declared");
+        assert_eq!(section, java_section(&reports));
     }
 }
