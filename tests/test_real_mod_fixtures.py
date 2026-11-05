@@ -15,11 +15,40 @@ from tools import real_mod_corpus
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER = ROOT / "tools" / "real_mod_fixtures" / "build.py"
 
+# Real sponge-mixin's `@Mixin` is CLASS-retention, unlike the RUNTIME stub the committed
+# fixtures use, so the probe only finds this mixin through the annotation's class bytes.
+CLASS_RETENTION_SOURCES = {
+    "org/spongepowered/asm/mixin/Mixin.java": (
+        "package org.spongepowered.asm.mixin; import java.lang.annotation.*; "
+        "@Retention(RetentionPolicy.CLASS) @Target(ElementType.TYPE) "
+        "public @interface Mixin { Class<?>[] value() default {}; }"
+    ),
+    "org/spongepowered/asm/mixin/injection/At.java": (
+        "package org.spongepowered.asm.mixin.injection; import java.lang.annotation.*; "
+        "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD) "
+        "public @interface At { String value(); }"
+    ),
+    "org/spongepowered/asm/mixin/injection/Inject.java": (
+        "package org.spongepowered.asm.mixin.injection; import java.lang.annotation.*; "
+        "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD) "
+        "public @interface Inject { String method(); At at(); }"
+    ),
+    "demo/cr/Target.java": "package demo.cr; public class Target { public void tick() {} }",
+    "demo/cr/ClassRetentionMixin.java": (
+        "package demo.cr; import org.spongepowered.asm.mixin.Mixin; "
+        "import org.spongepowered.asm.mixin.injection.*; "
+        "@Mixin(Target.class) public class ClassRetentionMixin { "
+        "@Inject(method=\"tick\", at=@At(\"HEAD\")) private void head() {} }"
+    ),
+}
+
 
 class RealModFixtureTest(unittest.TestCase):
     def setUp(self) -> None:
         if shutil.which("javac") is None:
             self.skipTest("javac is unavailable")
+        if shutil.which("jar") is None:
+            self.skipTest("jar is unavailable")
         self.temp = tempfile.TemporaryDirectory(prefix="horizon-real-fixtures-test-")
         self.addCleanup(self.temp.cleanup)
         self.output = Path(self.temp.name) / "jars"
@@ -60,6 +89,70 @@ class RealModFixtureTest(unittest.TestCase):
             if (path / "horizon-native-java").is_file():
                 return path
         return ROOT / "target" / "debug"
+
+    def class_retention_jar(self) -> Path:
+        """Compile a jar whose `@Mixin` annotation has CLASS retention, as sponge-mixin's does."""
+        work = Path(self.temp.name) / "class-retention"
+        source, classes = work / "src", work / "classes"
+        classes.mkdir(parents=True)
+        paths = []
+        for name, body in CLASS_RETENTION_SOURCES.items():
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+            paths.append(path)
+        subprocess.run(
+            ["javac", "-source", "8", "-target", "8", "-d", str(classes), *map(str, paths)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        (classes / "fabric.mod.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "id": "class_retention_fixture",
+            "version": "1.0",
+            "entrypoints": {},
+            "mixins": ["cr.mixins.json"],
+        }))
+        (classes / "cr.mixins.json").write_text(json.dumps({
+            "required": True,
+            "package": "demo.cr",
+            "compatibilityLevel": "JAVA_8",
+            "mixins": ["ClassRetentionMixin"],
+        }))
+        jar = work / "class-retention-fixture.jar"
+        subprocess.run(
+            ["jar", "--create", "--file", str(jar), "-C", str(classes), "."],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        return jar
+
+    def test_class_retention_mixin_reports_a_plan(self) -> None:
+        probe = self.bin_dir / "horizon-native-java"
+        if not probe.is_file():
+            self.skipTest("horizon-native-java is not built")
+        jar = self.class_retention_jar()
+        result = subprocess.run(
+            [str(probe), "--mixin-plans", str(jar)],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+        payload = json.loads(result.stdout.splitlines()[-1])
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(len(payload["plans"]), 1)
+        self.assertEqual(payload["targets"], ["demo/cr/Target#tick"])
+        self.assertEqual(payload["plans"][0]["callback"], "demo/cr/ClassRetentionMixin#head")
+        # The corpus folds the same probe into the fallback reason, so discovery is visible
+        # without a loader: no entrypoint, but one plan instead of "one config, no plans".
+        shutil.copy2(jar, self.fabric_root / jar.name)
+        rows = {row["file"]: row for row in self.corpus("--fabric-jars")["jars"]}
+        row = rows[jar.name]
+        self.assertEqual(row["verdict"], "fallback")
+        self.assertEqual(row["reason"], "no entrypoint; 1 mixin plan(s) need the loader")
 
     def test_manifest_is_deterministic_and_fabric_nested_probe_is_folded(self) -> None:
         self.assertEqual(set(self.manifest), {"fabric-fixture.jar", "forge-fixture.jar", "neoforge-fixture.jar"})
