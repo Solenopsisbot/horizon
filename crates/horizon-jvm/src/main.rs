@@ -682,8 +682,6 @@ public final class HorizonLoaderBridge {
     if (gameJars == null || gameJars.length == 0) return "test\t0\tno game jar supplied";
     boolean client = "client".equals(side);
     try {
-      java.net.URL[] urls = new java.net.URL[gameJars.length];
-      for (int i = 0; i < gameJars.length; i++) urls[i] = Paths.get(gameJars[i]).toUri().toURL();
       System.setProperty("fabric.gameVersion", gameVersion);
       System.setProperty("fabric.gameJarPath", gameJars[0]);
       System.setProperty(client ? "fabric.gameJarPath.client" : "fabric.gameJarPath.server", gameJars[0]);
@@ -3483,10 +3481,12 @@ fn launch_game_value(requested: bool, outcome: &ProviderOutcome) -> Option<Strin
             Some(value) => bounded_classpath_unlock(value),
             None => "failed no launch-game result".to_owned(),
         }),
+        // The launch was requested but the provider never ran: that is a
+        // failure to start, not a skip.
         ProviderOutcome::Fallback { .. } => {
-            Some("skipped (production game provider unavailable)".to_owned())
+            Some("failed production game provider unavailable".to_owned())
         }
-        ProviderOutcome::Test { .. } => Some("skipped (no --game-jar)".to_owned()),
+        ProviderOutcome::Test { .. } => Some("failed no --game-jar".to_owned()),
     }
 }
 
@@ -7794,11 +7794,11 @@ config="demo.mixins.json""#,
                 }
             )
             .as_deref(),
-            Some("skipped (production game provider unavailable)")
+            Some("failed production game provider unavailable")
         );
         assert_eq!(
             launch_game_value(true, &ProviderOutcome::Test { mods: 0 }).as_deref(),
-            Some("skipped (no --game-jar)")
+            Some("failed no --game-jar")
         );
 
         let report = ProviderReport::from_outcome(&outcome, 1, "26.3", ProviderSide::Server)
