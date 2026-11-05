@@ -29,6 +29,8 @@ const KINDS: [(PackKind, &str, &str); 5] = [
 const SHOWN: [PackKind; 3] = [PackKind::Mod, PackKind::ResourcePack, PackKind::Shader];
 /// Java mods checked at once.
 const CHECKING: usize = 2;
+/// Installed Java mods whose probe diagnostics the panel lists before "(+N more)".
+const DIAGNOSED: usize = 5;
 /// The sources to pick from on the Resource packs and Modpacks tabs; CurseForge is shown beside them as coming soon.
 const SOURCES: [(SourceId, &str); 2] = [
     (SourceId::Modrinth, "Modrinth"),
@@ -97,6 +99,9 @@ pub(super) struct Mods {
     native_notice: Option<(SourceId, String, Option<Project>)>,
     /// Java mods' checks, by source and project.
     pub(super) checks: HashMap<(SourceId, String), Checking>,
+    /// Installed Java mods' cached checks, read from disk once, by the entry's checksum; `None`
+    /// when the cache has none. Emptied whenever a check is written or cleared.
+    diagnostics: HashMap<String, Option<Box<Check>>>,
     /// Horizon registry projects' trust and capabilities, by id ([`horizon::trust_and_capabilities`]).
     pub(super) about: HashMap<String, Vec<String>>,
     /// The project page, filters and images.
@@ -176,6 +181,7 @@ impl Mods {
             updates: HashMap::new(),
             confirm_remove: None,
             checks: HashMap::new(),
+            diagnostics: HashMap::new(),
             about: HashMap::new(),
             browse: Default::default(),
             tx,
@@ -347,6 +353,7 @@ impl Launcher {
                     m.message = Some(result);
                     m.installed = installed::Installed::load(&m.home()).entries;
                     native_on = native_mods::turns_on(native_on, &m.installed);
+                    m.diagnostics.clear();
                     m.installed_list.reset();
                     if modpack {
                         // The Modpacks page reads its list again.
@@ -360,6 +367,9 @@ impl Launcher {
                         Err(e) => Checking::Failed(e),
                     };
                     m.checks.insert(key, state);
+                    // A check just written may be the cache an installed row reads.
+                    m.diagnostics.clear();
+                    m.installed_list.reset();
                 }
                 Event::Loaded(l) => loaded.push(l),
                 Event::About(about) => {
@@ -1140,9 +1150,124 @@ impl Launcher {
         out
     }
 
+    /// Clears the cached compatibility check of an installed Java mod, so it is probed again
+    /// the next time its jar is checked (an install, an update or a search listing it).
+    fn mods_clear_check(&mut self, entry: &installed::Entry) {
+        let home = self.mods.home();
+        self.mods.message = Some(java::clear_check(&home, &entry.checksum).map(|_| {
+            // Plain English like the probe lines: the language tables are not extended for the
+            // diagnostics panel yet.
+            format!(
+                "Cleared the compatibility cache for {}. It is checked again the next time it is installed, updated or listed in a search.",
+                entry.title
+            )
+        }));
+        self.mods
+            .checks
+            .remove(&(entry.source, entry.project.clone()));
+        self.mods.diagnostics.clear();
+        self.mods.installed_list.reset();
+    }
+
+    /// The probe diagnostics panel for the installed Java mods that have a cached check: the
+    /// [`DIAGNOSED`] most relevant, each with a button that clears its cache, then "(+N more)".
+    fn mods_diagnostics(
+        &self,
+        entries: &[&installed::Entry],
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let t = self.theme;
+        let mut found: Vec<(&installed::Entry, &Check)> = entries
+            .iter()
+            .filter_map(|e| Some((*e, self.mods.diagnostics.get(&e.checksum)?.as_deref()?)))
+            .collect();
+        if found.is_empty() {
+            return None;
+        }
+        found.sort_by(|(ea, a), (eb, b)| {
+            java::most_relevant_first(a, b).then_with(|| ea.title.cmp(&eb.title))
+        });
+        let more = found.len().saturating_sub(DIAGNOSED);
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(caps("Java compatibility").text_color(t.muted));
+        for (e, check) in found.into_iter().take(DIAGNOSED) {
+            let d = java::diagnostics(check);
+            let color = if d.failed { t.warn } else { t.success };
+            let entry = e.clone();
+            let clear = button(
+                SharedString::from(format!("mods-clear-check-{}", e.project)),
+                "Clear compatibility cache",
+                Kind::Ghost,
+                &t,
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.mods_clear_check(&entry);
+                cx.notify();
+            }));
+            panel = panel.child(
+                plate(&t)
+                    .p(px(12.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(e.title.clone())
+                                    .child(blocks::badge(d.verdict, color, &t)),
+                            )
+                            .child(clear),
+                    )
+                    .children(d.lines.into_iter().map(|line| {
+                        text(theme::CAPTION)
+                            .font_family(theme::MONO)
+                            .text_color(t.ink_soft)
+                            .child(line)
+                    })),
+            );
+        }
+        if more > 0 {
+            panel = panel.child(
+                text(theme::CAPTION)
+                    .text_color(t.muted)
+                    .child(format!("(+{more} more)")),
+            );
+        }
+        Some(panel)
+    }
+
+    /// Reads the cached checks of the installed Java mods the browser put in `horizon-mods`,
+    /// once per checksum (until a check is written or cleared).
+    fn load_diagnostics(&mut self) {
+        if self.mods.java.is_some() || self.mods.kind != PackKind::Mod {
+            return;
+        }
+        let home = self.mods.home();
+        for e in &self.mods.installed {
+            if e.kind == PackKind::Mod && e.source != SourceId::Horizon {
+                self.mods
+                    .diagnostics
+                    .entry(e.checksum.clone())
+                    .or_insert_with(|| java::cached_for_entry(&home, &e.checksum).map(Box::new));
+            }
+        }
+    }
+
     fn mods_installed_list(&mut self, cx: &mut Context<Self>) -> Option<Div> {
         let t = self.theme;
         let kind = self.mods.kind;
+        self.load_diagnostics();
         // Each project's own icon (Modrinth's, asked for once), at the row's size.
         let ids = self
             .mods
@@ -1357,6 +1482,9 @@ impl Launcher {
             |index| self.mods.confirm_remove.as_ref() == Some(&entries[index].project),
             row,
         );
+        let panel = (self.mods.java.is_none() && kind == PackKind::Mod)
+            .then(|| self.mods_diagnostics(&entries, cx))
+            .flatten();
         Some(
             div()
                 .flex()
@@ -1370,7 +1498,8 @@ impl Launcher {
                         .child(caps(tr("Installed")).text_color(t.muted))
                         .children(update_all),
                 )
-                .child(list),
+                .child(list)
+                .children(panel),
         )
     }
 
