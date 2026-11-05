@@ -418,5 +418,11 @@
   "Stopped: {error} (the embedded JVM fallback may be needed)": "Zatrzymano: {error} (może być potrzebny wbudowany zapasowy JVM)",
   "Not probed": "Niesprawdzone",
   "plain zip": "zwykły zip",
-  "unknown": "nieznany"
+  "unknown": "nieznany",
+  "Runtime": "Runtime",
+  "Runtime: {engine} · loader: {loader} · woven: {woven} · skipped: {skipped} · registrations: {registrations} · opaque: {opaque} · payloads: {payloads}": "Runtime: {engine} · loader: {loader} · woven: {woven} · skipped: {skipped} · registrations: {registrations} · opaque: {opaque} · payloads: {payloads}",
+  "Runtime skipped: {reason}": "Runtime skipped: {reason}",
+  "Runtime isolation: {error}": "Runtime isolation: {error}",
+  "Runtime: {count} jar(s) reported": "Runtime: {count} jar(s) reported",
+  "No runtime report": "No runtime report"
 }

@@ -12,6 +12,7 @@ use crate::i18n::{self, Language};
 use horizon_mods::java_artifact;
 use horizon_port_pack::check::{self, Check, Verdict};
 use horizon_port_pack::classes::Feature;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -92,6 +93,101 @@ pub struct Diagnostics {
     /// Whether the probe stopped on an error.
     pub failed: bool,
     pub lines: Vec<String>,
+}
+
+const RUNTIME_SCHEMA: u32 = 1;
+const RUNTIME_MAX_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimeReport {
+    schema_version: u32,
+    jars: Vec<RuntimeJar>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimeJar {
+    file: String,
+    loader: String,
+    engine: String,
+    woven: usize,
+    skipped: usize,
+    first_skip_reason: Option<String>,
+    registrations: usize,
+    opaque: usize,
+    payload_channels: Vec<String>,
+    isolation_failure: Option<String>,
+}
+
+/// Reads the game's bounded runtime sidecar. Unknown schema versions are
+/// deliberately ignored so a newer game never produces misleading lines.
+pub fn runtime_report(home: &Path) -> Option<serde_json::Value> {
+    let bytes = fs::read(home.join("java-runtime.json")).ok()?;
+    if bytes.len() > RUNTIME_MAX_BYTES {
+        return None;
+    }
+    let report: RuntimeReport = serde_json::from_slice(&bytes).ok()?;
+    (report.schema_version == RUNTIME_SCHEMA)
+        .then(|| serde_json::to_value(report).ok())
+        .flatten()
+}
+
+/// Bounded runtime lines for one installed jar, matched by its file name.
+pub fn runtime_lines_in(
+    language: Language,
+    report: &serde_json::Value,
+    file_name: &str,
+) -> Option<Vec<String>> {
+    let report: RuntimeReport = serde_json::from_value(report.clone()).ok()?;
+    let jar = report.jars.into_iter().find(|jar| {
+        Path::new(&jar.file)
+            .file_name()
+            .is_some_and(|name| name == file_name)
+            || jar.file == file_name
+    })?;
+    let woven = jar.woven.to_string();
+    let skipped = jar.skipped.to_string();
+    let registrations = jar.registrations.to_string();
+    let opaque = jar.opaque.to_string();
+    let payloads = jar.payload_channels.len().to_string();
+    let mut lines = vec![say(
+        language,
+        "Runtime: {engine} · loader: {loader} · woven: {woven} · skipped: {skipped} · registrations: {registrations} · opaque: {opaque} · payloads: {payloads}",
+        &[
+            ("engine", &jar.engine),
+            ("loader", &jar.loader),
+            ("woven", &woven),
+            ("skipped", &skipped),
+            ("registrations", &registrations),
+            ("opaque", &opaque),
+            ("payloads", &payloads),
+        ],
+    )];
+    if let Some(reason) = jar.first_skip_reason {
+        lines.push(say(
+            language,
+            "Runtime skipped: {reason}",
+            &[("reason", &bounded(&reason))],
+        ));
+    }
+    if let Some(error) = jar.isolation_failure {
+        lines.push(say(
+            language,
+            "Runtime isolation: {error}",
+            &[("error", &bounded(&error))],
+        ));
+    }
+    Some(lines)
+}
+
+/// One summary line when the report has no matching installed file.
+pub fn runtime_summary_in(language: Language, report: &serde_json::Value) -> Option<String> {
+    let report: RuntimeReport = serde_json::from_value(report.clone()).ok()?;
+    let count = report.jars.len().to_string();
+    Some(say(
+        language,
+        "Runtime: {count} jar(s) reported",
+        &[("count", &count)],
+    ))
 }
 
 /// The most entrypoint names listed before "+N more".
@@ -817,6 +913,25 @@ mod tests {
         assert!(stopped.starts_with("Arrêté : é"), "{stopped}");
         assert!(stopped.ends_with(')'), "{stopped}");
         assert!(stopped.chars().count() < 320, "{}", stopped.chars().count());
+    }
+
+    #[test]
+    fn runtime_report_matches_file_and_bounds_rendered_lines() {
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "jars": [{
+                "file": "mods/demo.jar", "loader": "fabric", "engine": "native-qualified",
+                "woven": 2, "skipped": 1, "first_skip_reason": "bad target",
+                "registrations": 4, "opaque": 1, "payload_channels": ["play"],
+                "isolation_failure": null
+            }]
+        });
+        let lines = runtime_lines_in(Language::English, &report, "demo.jar").unwrap();
+        assert!(lines[0].contains("native-qualified"));
+        assert!(lines[1].contains("bad target"));
+        assert!(runtime_lines_in(Language::English, &report, "other.jar").is_none());
+        let stale = serde_json::json!({"schema_version": 2, "jars": []});
+        assert!(runtime_summary_in(Language::English, &stale).is_some());
     }
 
     #[test]

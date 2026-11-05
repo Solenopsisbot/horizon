@@ -418,5 +418,11 @@
   "Stopped: {error} (the embedded JVM fallback may be needed)": "已停止：{error}（可能需要内嵌 JVM 回退）",
   "Not probed": "未探测",
   "plain zip": "普通 zip",
-  "unknown": "未知"
+  "unknown": "未知",
+  "Runtime": "Runtime",
+  "Runtime: {engine} · loader: {loader} · woven: {woven} · skipped: {skipped} · registrations: {registrations} · opaque: {opaque} · payloads: {payloads}": "Runtime: {engine} · loader: {loader} · woven: {woven} · skipped: {skipped} · registrations: {registrations} · opaque: {opaque} · payloads: {payloads}",
+  "Runtime skipped: {reason}": "Runtime skipped: {reason}",
+  "Runtime isolation: {error}": "Runtime isolation: {error}",
+  "Runtime: {count} jar(s) reported": "Runtime: {count} jar(s) reported",
+  "No runtime report": "No runtime report"
 }

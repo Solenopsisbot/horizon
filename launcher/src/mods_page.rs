@@ -6,6 +6,7 @@
 //! are listed on its Modpacks tab.
 use super::line_edit::{self, Key, LineEdit};
 use super::*;
+use crate::i18n;
 use horizon_launcher::browser::{
     self, horizon, installed, java, java_instance, Kind as PackKind, Project, Query, SourceId,
     Support,
@@ -1242,6 +1243,59 @@ impl Launcher {
         Some(panel)
     }
 
+    /// The in-game native Java runtime report, if the game wrote one for this
+    /// instance. It is kept separate from the cached probe so either source
+    /// can be missing without hiding the other.
+    fn mods_runtime(&self, entries: &[&installed::Entry]) -> Option<Div> {
+        let t = self.theme;
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(caps(tr("Runtime")).text_color(t.muted));
+        let Some(report) = java::runtime_report(&self.mods.home()) else {
+            return Some(
+                panel.child(
+                    text(theme::CAPTION)
+                        .text_color(t.ink_soft)
+                        .child(tr("No runtime report")),
+                ),
+            );
+        };
+        let mut matched = 0usize;
+        for entry in entries {
+            let Some(name) = std::path::Path::new(&entry.file)
+                .file_name()
+                .and_then(|name| name.to_str())
+            else {
+                continue;
+            };
+            if let Some(lines) = java::runtime_lines_in(i18n::current(), &report, name) {
+                matched += 1;
+                panel = panel.child(
+                    plate(&t)
+                        .p(px(8.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(entry.title.clone())
+                        .children(lines.into_iter().map(|line| {
+                            text(theme::CAPTION)
+                                .font_family(theme::MONO)
+                                .text_color(t.ink_soft)
+                                .child(line)
+                        })),
+                );
+            }
+        }
+        if matched == 0 {
+            if let Some(summary) = java::runtime_summary_in(i18n::current(), &report) {
+                panel = panel.child(text(theme::CAPTION).text_color(t.ink_soft).child(summary));
+            }
+        }
+        Some(panel)
+    }
+
     /// Reads the cached checks of the installed Java mods the browser put in `horizon-mods`,
     /// once per checksum (until a check is written or cleared).
     fn load_diagnostics(&mut self) {
@@ -1480,6 +1534,9 @@ impl Launcher {
         let panel = (self.mods.java.is_none() && kind == PackKind::Mod)
             .then(|| self.mods_diagnostics(&entries, cx))
             .flatten();
+        let runtime = (self.mods.java.is_none() && kind == PackKind::Mod)
+            .then(|| self.mods_runtime(&entries))
+            .flatten();
         Some(
             div()
                 .flex()
@@ -1494,7 +1551,8 @@ impl Launcher {
                         .children(update_all),
                 )
                 .child(list)
-                .children(panel),
+                .children(panel)
+                .children(runtime),
         )
     }
 

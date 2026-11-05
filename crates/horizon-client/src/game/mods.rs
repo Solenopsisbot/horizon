@@ -2,7 +2,7 @@
 //! assets (`content_root`), and the Mods page's rows. Code mods are native
 //! (`native_hooks.rs`); WebAssembly code mods don't run any more. The opt-in
 //! real NeoForge loader preflight is `fml.rs`.
-use super::{Game, execution_role::ExecutionRole};
+use super::{execution_role::ExecutionRole, Game};
 use horizon_client::{
     mod_content::{self, ContentMod, DeclarationSummary},
     mod_list::{self, Installed},
@@ -18,6 +18,8 @@ use std::{
 // here because it reports beside this module's Java compatibility lines.
 #[path = "fml.rs"]
 pub(super) mod fml;
+#[path = "java_runtime_file.rs"]
+mod java_runtime_file;
 
 /// Resident native Java runtimes keyed by role and jar path. Keeping the jar
 /// and host together makes event callbacks observe the same static fields and
@@ -1132,6 +1134,7 @@ pub(super) fn run_java_mods_with_report(
     let mut reports = Vec::new();
     clear_java_runtimes(role);
     if paths.is_empty() {
+        write_java_runtime_report(&reports);
         return Ok((Vec::new(), reports));
     }
     let kinds: &[&str] = match role {
@@ -1167,6 +1170,8 @@ pub(super) fn run_java_mods_with_report(
             for line in report.summary() {
                 log::warn!("{line}");
             }
+            reports.push(report);
+            write_java_runtime_report(&reports);
             return Err(format!(
                 "{}: clientSideOnly mod cannot run for server execution",
                 path.display()
@@ -1424,12 +1429,57 @@ pub(super) fn run_java_mods_with_report(
     if let Err(error) = horizon_client::lan::payloads::store_declared(payload_declarations) {
         log::warn!("Horizon: Java payload channels were not registered: {error}");
     }
+    write_java_runtime_report(&reports);
     // Every jar has been attempted: the strict opt-in stops here, naming the
     // first isolated failure instead of carrying on with the rest.
     if let Some(error) = isolation_startup_error(&reports, strict_isolation_enabled()) {
         return Err(error);
     }
     Ok((native_content, reports))
+}
+
+/// Publish the bounded sidecar consumed by the launcher's Mods diagnostics.
+/// `HORIZON_HOME` is the game's stable data directory for both integrated and
+/// dedicated runs; a missing variable leaves the report beside the process.
+fn write_java_runtime_report(reports: &[JavaCompatibilityReport]) {
+    let home = std::env::var_os("HORIZON_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let jars = reports
+        .iter()
+        .map(|report| java_runtime_file::RuntimeJar {
+            file: report
+                .jar
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| report.jar.to_string_lossy().into_owned()),
+            loader: report
+                .loader
+                .map(JavaLoader::name)
+                .unwrap_or("unknown")
+                .into(),
+            engine: match report.engine() {
+                JavaEngine::Native => "native",
+                JavaEngine::NativeQualified => "native-qualified",
+                JavaEngine::Sidecar | JavaEngine::Refused => "fallback",
+            }
+            .into(),
+            woven: report.mixin_weave.woven,
+            skipped: report.mixin_weave.skipped,
+            first_skip_reason: report.mixin_weave.reason.clone(),
+            registrations: report.typed_registrations + report.opaque_registrations.len(),
+            opaque: report.opaque_registrations.len(),
+            payload_channels: report.payload_directions.clone(),
+            isolation_failure: report.isolation_failure.clone(),
+        })
+        .collect();
+    let report = java_runtime_file::RuntimeReport {
+        schema_version: java_runtime_file::SCHEMA_VERSION,
+        jars,
+    };
+    if let Err(error) = java_runtime_file::write(&home, report) {
+        log::warn!("Horizon: Java runtime report was not written: {error}");
+    }
 }
 
 /// The mods' mob effects join vanilla's (`brewing::effect`), once the root
