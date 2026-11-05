@@ -207,7 +207,7 @@ hook at all (the hook-host class below); where the decision stays in Rust, a nam
 
 The tool is `horizon-port-pack census` (it starts there, and splits into its own crate when phase 1
 needs it). It reads the way `check` does — constant pool, annotations, `fabric.mod.json` /
-`mods.toml`, `*.mixins.json`; no decompiling, no running:
+`mods.toml`, `*.mixins.json`, `META-INF/MANIFEST.MF` MixinConfigs; no decompiling, no running:
 
 - every class the jar's code references, by count;
 - every **member** reference — `(owner, name, descriptor)` — which `classes::parse` does not record yet;
@@ -429,11 +429,13 @@ entrypoint now exercises this path through its `MinecraftAccessor` cast. Static 
 with no transformed target use explicit shims.
 
 The native probe also reads Mixin annotations from real classfiles. Class and method
-`RuntimeVisibleAnnotations` survive parsing, so `@Mixin` targets (both `targets` and `value`) and `@Inject`
+`RuntimeVisibleAnnotations` survive parsing, and the `@Mixin` marker is also read from
+`RuntimeInvisibleAnnotations` because real Mixin declares it with CLASS retention, so `@Mixin` targets (both `targets` and `value`) and `@Inject`
 methods with `method` (name or `name(descriptor)`), nested `@At` anchors (`HEAD`, `RETURN`, `TAIL`) and
 `cancellable` become deterministic `MixinInjectionPlan`s. `NativeJar::execute_discovered_mixins` runs the
-HEAD callbacks in declaration order, invokes the target once, then runs RETURN/TAIL callbacks on the same
-target, and validates every callback before executing any of them (INVOKE remains a separate anchor family). A cancellable HEAD plan receives a
+HEAD callbacks in Mixin's apply order, invokes the target once, then runs RETURN/TAIL callbacks on the same
+target, and validates every callback before executing any of them (INVOKE remains a separate anchor family). Execution is config-gated through
+`execute_discovered_mixins_on`: a plan whose class no readable config lists on the selected side, or whose first matching config has a plugin, is skipped with a bounded reason. A cancellable HEAD plan receives a
 runtime-owned `CallbackInfo`; `cancel()` stops the remaining HEAD callbacks and the target body and returns
 the target's default value, and the report says `cancelled`. RETURN/TAIL callbacks receive a
 `CallbackInfoReturnable` seeded with the real result; `setReturnValue` overrides it, and a non-void target
