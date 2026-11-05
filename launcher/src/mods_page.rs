@@ -1175,23 +1175,20 @@ impl Launcher {
         cx: &mut Context<Self>,
     ) -> Option<Div> {
         let t = self.theme;
-        let mut found: Vec<(&installed::Entry, &Check)> = entries
+        let found: Vec<(&installed::Entry, &Check)> = entries
             .iter()
             .filter_map(|e| Some((*e, self.mods.diagnostics.get(&e.checksum)?.as_deref()?)))
             .collect();
         if found.is_empty() {
             return None;
         }
-        found.sort_by(|(ea, a), (eb, b)| {
-            java::most_relevant_first(a, b).then_with(|| ea.title.cmp(&eb.title))
-        });
-        let more = found.len().saturating_sub(DIAGNOSED);
+        let (shown, more) = diagnosed(found);
         let mut panel = div()
             .flex()
             .flex_col()
             .gap(px(8.))
             .child(caps(tr("Java compatibility")).text_color(t.muted));
-        for (e, check) in found.into_iter().take(DIAGNOSED) {
+        for (e, check) in shown {
             let d = java::diagnostics(check);
             let color = if d.failed { t.warn } else { t.success };
             let entry = e.clone();
@@ -1708,6 +1705,20 @@ fn source_switch(
     segments("mods-source", &SOURCES, current, t, on_pick).child(soon)
 }
 
+/// The diagnostics panel's rows: the [`DIAGNOSED`] most relevant of `found`, and how many it
+/// leaves out for "(+N more)". Most relevant first, ties by mod name, like the panel.
+fn diagnosed<'a>(
+    found: impl IntoIterator<Item = (&'a installed::Entry, &'a Check)>,
+) -> (Vec<(&'a installed::Entry, &'a Check)>, usize) {
+    let mut found: Vec<_> = found.into_iter().collect();
+    found.sort_by(|(ea, a), (eb, b)| {
+        java::most_relevant_first(a, b).then_with(|| ea.title.cmp(&eb.title))
+    });
+    let more = found.len().saturating_sub(DIAGNOSED);
+    found.truncate(DIAGNOSED);
+    (found, more)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1745,5 +1756,94 @@ mod tests {
         let sum = format!("SHA-512:{}", "ab".repeat(64));
         assert_eq!(short_sum(&sum), "SHA-512 abababababab…abababab");
         assert_eq!(short_sum("SHA-1:abcd"), "SHA-1:abcd");
+    }
+
+    fn installed_entry(title: &str, checksum: &str) -> installed::Entry {
+        installed::Entry {
+            source: SourceId::Modrinth,
+            project: title.to_lowercase(),
+            slug: title.to_lowercase(),
+            title: title.into(),
+            kind: PackKind::Mod,
+            version: "1.0.0".into(),
+            number: "1".into(),
+            file: format!("mods/{title}.jar"),
+            checksum: checksum.into(),
+            page: String::new(),
+            dependency: false,
+            verdict: None,
+            skipped: Vec::new(),
+            namespaces: Vec::new(),
+        }
+    }
+
+    fn probe_check(mixins: usize, calls: usize, failed: bool) -> Check {
+        use horizon_port_pack::check::{NativeProbe, Verdict};
+        use horizon_port_pack::classes::Feature;
+        let mut check = Check {
+            mod_id: "demo".into(),
+            name: "Demo".into(),
+            version: "1".into(),
+            loader: "fabric".into(),
+            license: "MIT".into(),
+            verdict: Verdict::Works,
+            summary: String::new(),
+            ports: Vec::new(),
+            skipped: Vec::new(),
+            depends: Vec::new(),
+            namespaces: Vec::new(),
+            code: Default::default(),
+            native: Some(NativeProbe {
+                kind: Some("main".into()),
+                entrypoint: Some("demo.Main".into()),
+                entrypoints: vec!["demo.Main".into()],
+                seeded_mods: Vec::new(),
+                calls,
+                registrations: 0,
+                listeners: 0,
+                payloads: 0,
+                error: failed.then(|| "boom".into()),
+            }),
+        };
+        check.code.features.insert(Feature::Mixin, mixins);
+        check
+    }
+
+    /// The panel lists the five most relevant (a stopped probe first, then Mixins, then host
+    /// calls; ties by name) and says how many the rest are.
+    #[test]
+    fn diagnostics_panel_bounds_the_list_and_counts_the_rest() {
+        let entries = [
+            installed_entry("Failed", "a"),
+            installed_entry("Heavy", "b"),
+            installed_entry("Alpha", "c"),
+            installed_entry("Beta", "d"),
+            installed_entry("Gamma", "e"),
+            installed_entry("Delta", "f"),
+            installed_entry("Epsilon", "g"),
+        ];
+        let checks = [
+            probe_check(0, 1, true),
+            probe_check(3, 9, false),
+            probe_check(0, 9, false),
+            probe_check(0, 5, false),
+            probe_check(0, 5, false),
+            probe_check(0, 2, false),
+            probe_check(0, 0, false),
+        ];
+        let (shown, more) = diagnosed(entries.iter().zip(&checks));
+        assert_eq!(more, 2);
+        assert_eq!(shown.len(), DIAGNOSED);
+        assert_eq!(
+            shown
+                .iter()
+                .map(|(e, _)| e.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Failed", "Heavy", "Alpha", "Beta", "Gamma"]
+        );
+        // Fewer than the panel shows: no "+N more" line.
+        let (shown, more) = diagnosed(entries[..3].iter().zip(&checks[..3]));
+        assert_eq!(more, 0);
+        assert_eq!(shown.len(), 3);
     }
 }
