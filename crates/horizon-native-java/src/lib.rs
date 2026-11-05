@@ -9787,7 +9787,7 @@ impl NativeJar {
         // own plans. Each group stays in apply order.
         let mut by_owner: BTreeMap<String, Vec<MixinInjectionPlan>> = BTreeMap::new();
         for plan in &plans {
-            match self.load_time_head_plan(plan, side, &configs, &config_sides) {
+            match self.load_time_inject_plan(plan, side, &configs, &config_sides) {
                 Ok(concrete) => {
                     let group = by_owner.entry(concrete.target.owner.clone()).or_default();
                     if group.contains(&concrete) {
@@ -9802,7 +9802,7 @@ impl NativeJar {
             }
         }
         for (owner, group) in by_owner {
-            self.weave_head_group(&owner, group, &mut weave);
+            self.weave_plan_group(&owner, group, &mut weave);
         }
         weave
     }
@@ -9908,17 +9908,26 @@ impl NativeJar {
 
     /// One plan as the load-time weave would apply it, with its target
     /// descriptor made concrete, or why it stays out.
-    fn load_time_head_plan(
+    ///
+    /// The anchors are checked before the config and the target class, so a
+    /// `RETURN` on a Minecraft class reports the target, not the anchor.
+    /// `RETURN`/`TAIL` reach the weaver for a `void` target only: a
+    /// value-returning one needs a `CallbackInfoReturnable` the load-time path
+    /// does not wire.
+    fn load_time_inject_plan(
         &self,
         plan: &MixinInjectionPlan,
         side: MixinSide,
         configs: &[MixinConfig],
         config_sides: &BTreeMap<String, MixinSide>,
     ) -> Result<MixinInjectionPlan, MixinSkipReason> {
-        if plan.at != "HEAD" {
+        if !matches!(plan.at.as_str(), "HEAD" | "RETURN" | "TAIL") {
             return Err(MixinSkipReason::NonHeadAnchor);
         }
-        if plan.slice.is_some() || plan.shift.is_some() {
+        // A `HEAD` insert must stay at offset 0 and a `RETURN`/`TAIL` insert at
+        // its return site, so a `shift` is outside every anchor here; a `slice`
+        // selects `RETURN` sites and is outside `HEAD`.
+        if plan.shift.is_some() || (plan.at == "HEAD" && plan.slice.is_some()) {
             return Err(MixinSkipReason::SelectorModifier);
         }
         mixin_config_gate(configs, config_sides, &plan.callback.owner, side)?;
@@ -9938,10 +9947,16 @@ impl NativeJar {
         if target.name == "<init>" {
             return Err(MixinSkipReason::ConstructorTarget);
         }
+        let returns_value = crate::return_desc(&target.descriptor) != "V";
         // A `void` target takes the woven `CallbackInfo` + `if (isCancelled())
-        // return` shape; a non-void one would also need the descriptor's default
-        // value in the target's shape, which the bounded weaver does not emit.
-        if plan.cancellable && crate::return_desc(&target.descriptor) != "V" {
+        // return` shape at HEAD, and the plain stack-neutral callback at
+        // RETURN/TAIL. A value-returning target would also need the descriptor's
+        // result in the target's shape, which this path leaves to the
+        // interpreter.
+        if plan.at != "HEAD" && returns_value {
+            return Err(MixinSkipReason::NonHeadAnchor);
+        }
+        if plan.cancellable && (plan.at != "HEAD" || returns_value) {
             return Err(MixinSkipReason::Cancellable);
         }
         let callback = self
@@ -10000,10 +10015,11 @@ impl NativeJar {
 
     /// Weave one target class's plans into `weave`, or record why not.
     ///
-    /// The common case applies them all in one pass. After a rejection each plan
-    /// is tried alone on the original class, so one bad callback does not take
-    /// the rest of the class with it.
-    fn weave_head_group(
+    /// The plans share a target owner but may use different anchors. The common
+    /// case applies them all in one pass. After a rejection each plan is tried
+    /// alone on the original class, so one bad callback does not take the rest
+    /// of the class with it.
+    fn weave_plan_group(
         &self,
         owner: &str,
         mut group: Vec<MixinInjectionPlan>,
@@ -18718,7 +18734,7 @@ mod tests {
             by: 1,
         });
         assert_eq!(
-            NativeJar::default().load_time_head_plan(
+            NativeJar::default().load_time_inject_plan(
                 &plan,
                 MixinSide::Client,
                 &[],
@@ -18784,7 +18800,7 @@ mod tests {
             refmap: None,
         };
         let target = method_ref("demo/T", "m");
-        let open = jar.load_time_head_plan(
+        let open = jar.load_time_inject_plan(
             &MixinInjectionPlan::inject_at_head(target.clone(), method_ref("demo/Open", "cb")),
             MixinSide::Server,
             std::slice::from_ref(&config),
@@ -18795,7 +18811,7 @@ mod tests {
             Ok("()V".into()),
             "a package-visible instance callback weaves through a bridge"
         );
-        let private = jar.load_time_head_plan(
+        let private = jar.load_time_inject_plan(
             &MixinInjectionPlan::inject_at_head(target, method_ref("demo/Private", "cb")),
             MixinSide::Server,
             std::slice::from_ref(&config),

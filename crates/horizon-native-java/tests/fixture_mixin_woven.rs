@@ -79,6 +79,7 @@ public @interface Inject {
 const CALLBACK_INFO: &str = r#"package org.spongepowered.asm.mixin.injection.callback;
 public class CallbackInfo {
     public void cancel() {}
+    public boolean isCancelled() { return false; }
 }
 "#;
 
@@ -592,7 +593,7 @@ public final class Target {
     public Target() {}
     public static void good() { Probe.mark("good-target", 0); }
     public static void both() { Probe.mark("both-target", 0); }
-    public static void returned() {}
+    public static int number() { Probe.mark("number", 0); return 3; }
     public static void over(int value) {}
     public static void over(long value) {}
     public static void takesInfo() {}
@@ -611,7 +612,7 @@ public abstract class ReasonsMixin {
     // A name with no descriptor, resolved because only one method answers it.
     @Inject(method = "good", at = @At("HEAD"))
     private static void good() { Probe.mark("good", 0); }
-    @Inject(method = "returned()V", at = @At("RETURN"))
+    @Inject(method = "number()I", at = @At("RETURN"))
     private static void onReturned() {}
     @Inject(method = "over", at = @At("HEAD"))
     private static void onOver() {}
@@ -1058,4 +1059,134 @@ public abstract class ValueMixin {
         marks(&[("target", 0), ("after", 7)]),
         "the unwoven target keeps its own answer"
     );
+}
+
+/// A `void` `RETURN` plan is woven: the callback runs after the body, at every
+/// return instruction.
+#[test]
+fn a_woven_return_callback_runs_after_the_body() {
+    let fixture = Fixture::build(
+        "return-void",
+        "RUNTIME",
+        &[
+            (
+                "demo/Main.java",
+                r#"package demo;
+public final class Main {
+    public void onInitialize() {
+        Target.run();
+        Target.branchy();
+        Target.branchy();
+        Probe.mark("after", Counter.value);
+    }
+}
+"#,
+            ),
+            ("demo/Counter.java", COUNTER),
+            (
+                "demo/Target.java",
+                r#"package demo;
+public final class Target {
+    public static void run() { Probe.mark("target", Counter.value); }
+    public static void branchy() { if (Counter.value > 0) { return; } Counter.value++; }
+}
+"#,
+            ),
+            (
+                "demo/ReturnMixin.java",
+                r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+@Mixin(Target.class)
+public abstract class ReturnMixin {
+    @Inject(method = "run()V", at = @At("RETURN"))
+    private static void onRun() { Probe.mark("return", Counter.value); }
+    @Inject(method = "branchy()V", at = @At("TAIL"))
+    private static void onBranchy() { Probe.mark("tail", Counter.value); }
+}
+"#,
+            ),
+        ],
+        &[(
+            "demo.mixins.json",
+            r#"{"package":"demo","mixins":["ReturnMixin"]}"#,
+        )],
+    );
+    let plain = fixture.load();
+    assert_eq!(
+        run_main(&plain),
+        marks(&[("target", 0), ("after", 1)]),
+        "an unwoven jar never reaches the callbacks"
+    );
+    let (jar, weave) = woven(plain, MixinSide::Server);
+    assert_eq!(
+        weave
+            .woven
+            .iter()
+            .map(|plan| plan.callback.name.as_str())
+            .collect::<Vec<_>>(),
+        ["onRun", "onBranchy"]
+    );
+    assert!(weave.skipped.is_empty(), "{:#?}", weave.skipped);
+    // `run` returns once. A `TAIL` insert sits on the method's last return, so
+    // only `branchy`'s fall-through path reaches it; its early return does not.
+    assert_eq!(
+        run_main(&jar),
+        marks(&[("target", 0), ("return", 0), ("tail", 1), ("after", 1)])
+    );
+}
+
+/// A `void` `RETURN` whose callback expects a `CallbackInfo` gets one, and
+/// cancelling it is meaningless at a return site (the body already ran).
+#[test]
+fn a_woven_return_callback_can_take_a_callback_info() {
+    let fixture = Fixture::build(
+        "return-info",
+        "RUNTIME",
+        &[
+            (
+                "demo/Main.java",
+                r#"package demo;
+public final class Main {
+    public void onInitialize() {
+        Target.run();
+    }
+}
+"#,
+            ),
+            (
+                "demo/Target.java",
+                r#"package demo;
+public final class Target {
+    public static void run() { Probe.mark("target", 0); }
+}
+"#,
+            ),
+            (
+                "demo/InfoMixin.java",
+                r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+@Mixin(Target.class)
+public abstract class InfoMixin {
+    @Inject(method = "run()V", at = @At("RETURN"))
+    private static void onRun(CallbackInfo info) {
+        Probe.mark("return", info.isCancelled() ? 1 : 0);
+    }
+}
+"#,
+            ),
+        ],
+        &[(
+            "demo.mixins.json",
+            r#"{"package":"demo","mixins":["InfoMixin"]}"#,
+        )],
+    );
+    let (jar, weave) = woven(fixture.load(), MixinSide::Server);
+    assert_eq!(weave.woven.len(), 1, "{:#?}", weave.woven);
+    assert!(weave.skipped.is_empty(), "{:#?}", weave.skipped);
+    assert_eq!(run_main(&jar), marks(&[("target", 0), ("return", 0)]));
 }
