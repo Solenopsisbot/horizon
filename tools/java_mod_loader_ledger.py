@@ -190,7 +190,7 @@ def parse_log(output: str, mods: list[tuple[Path, str, str]]) -> dict:
             "mixin_lines": mixin_lines[:20], "crash_lines": crashes[:20],
             "mixin_applied_count": sum("apply" in line.lower() and "error" not in line.lower() and "fail" not in line.lower() for line in mixin_lines),
             "failure_reasons": reasons[:5], "loading_count": int(loading[-1]) if loading else None,
-            "done": "Done (" in output, "exit": None}
+            "done": "Done (" in output or "launch-game: exit 0" in output, "exit": None}
 
 
 def render(result: dict) -> str:
