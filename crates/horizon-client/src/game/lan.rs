@@ -1756,8 +1756,17 @@ impl Game<'_> {
                     Vec::new()
                 };
                 if pass.first {
+                    let role = if self.options.dedicated.is_some() {
+                        horizon_client::lan::payloads::HandlerRole::DedicatedServer
+                    } else {
+                        horizon_client::lan::payloads::HandlerRole::IntegratedServer
+                    };
                     for (_, frame) in host.hub.take_payloads() {
-                        match horizon_client::lan::payloads::dispatch_received(&frame) {
+                        match horizon_client::lan::payloads::dispatch_received_as_role(
+                            &frame,
+                            horizon_mods::payloads::PayloadDirection::PlayToServer,
+                            role,
+                        ) {
                             Ok(true) => {}
                             Ok(false) => {
                                 log::warn!("Horizon: no Java handler for payload {}", frame.id())
