@@ -196,6 +196,25 @@ impl Drop for Fixture {
 fn run_main(jar: &NativeJar) -> Vec<(String, i32)> {
     let mut host = jar.seed_host(StdHost::new());
     jar.execute("demo.Main", None, "main", &mut host).unwrap();
+    probe_marks(&host)
+}
+
+/// [`run_main`] with the synthetic bridge instances the game's loader seeds
+/// before it executes a woven jar.
+fn run_woven_main(
+    jar: &NativeJar,
+    weave: &horizon_native_java::LoadTimeMixinWeave,
+) -> Vec<(String, i32)> {
+    let mut host = jar
+        .seed_host(StdHost::new())
+        .with_mixin_bridge_instances(&weave.classes)
+        .unwrap();
+    jar.execute("demo.Main", None, "main", &mut host).unwrap();
+    probe_marks(&host)
+}
+
+/// The `Probe.mark` calls a completed run recorded, in order.
+fn probe_marks(host: &StdHost) -> Vec<(String, i32)> {
     host.invocations()
         .iter()
         .filter(|invocation| invocation.method.owner == "demo/Probe")
@@ -301,6 +320,76 @@ public abstract class TargetMixin {
         plain.resource_names().collect::<Vec<_>>()
     );
     assert_eq!(jar.mixin_configs(), plain.mixin_configs());
+}
+
+#[test]
+fn an_instance_callback_is_woven_through_its_bridge_and_runs() {
+    let fixture = Fixture::build(
+        "instance",
+        "RUNTIME",
+        &[
+            ("demo/Main.java", MAIN_RUNS_TARGET),
+            ("demo/Counter.java", COUNTER),
+            (
+                "demo/Target.java",
+                r#"package demo;
+public final class Target {
+    public static void run() { Probe.mark("target", Counter.value); }
+}
+"#,
+            ),
+            (
+                "demo/InstanceMixin.java",
+                r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+@Mixin(Target.class)
+public abstract class InstanceMixin {
+    // Package-visible: the synthetic bridge sits in this package.
+    @Inject(method = "run()V", at = @At("HEAD"))
+    void onRun() {
+        Counter.value++;
+        Probe.mark("instance", Counter.value);
+    }
+}
+"#,
+            ),
+        ],
+        &[(
+            "demo.mixins.json",
+            r#"{"package":"demo","mixins":["InstanceMixin"]}"#,
+        )],
+    );
+
+    let (jar, weave) = woven(fixture.load(), MixinSide::Server);
+    assert_eq!(weave.skipped, [], "{:#?}", weave.skipped);
+    assert_eq!(weave.woven.len(), 1);
+    assert_eq!(weave.woven[0].callback.owner, "demo/InstanceMixin");
+    let bridge = weave
+        .classes
+        .added
+        .keys()
+        .find(|name| name.contains("$$HorizonBridge$"))
+        .expect("an instance callback needs its bridge class");
+    assert!(
+        bridge.starts_with("demo/InstanceMixin$$HorizonBridge$"),
+        "{bridge}"
+    );
+    let seeds = horizon_native_java::mixin_bridge_instances(&weave.classes).unwrap();
+    assert_eq!(
+        seeds,
+        [horizon_native_java::MixinBridgeInstance {
+            field: format!("{bridge}#callback0Ldemo/InstanceMixin;"),
+            owner: "demo/InstanceMixin".into(),
+        }]
+    );
+    // The instance callback runs from the woven target through the bridge the
+    // host seeded, before the target body, exactly like a static one.
+    assert_eq!(
+        run_woven_main(&jar, &weave),
+        marks(&[("instance", 1), ("target", 1), ("after", 1)])
+    );
 }
 
 /// The names are deliberately not alphabetical: discovery sorts by callback
@@ -611,7 +700,6 @@ public abstract class MemberMixin {
         // The `over` overloads, and `both`'s second selector for a method the
         // first one already wove.
         ("ambiguous-target", 2),
-        ("callback-not-static", 1),
         ("config-plugin", 1),
         ("constructor-target", 1),
         ("listed-without-plan", 1),
@@ -621,8 +709,19 @@ public abstract class MemberMixin {
         ("target-missing", 1),
         ("target-outside-jar", 1),
         ("unsupported-family", 1),
+        // The private instance callback: the weaver cannot bridge it.
+        ("weaver-rejected", 1),
     ]);
     assert_eq!(skip_labels(&weave), expected, "{:#?}", weave.skipped);
+    let private = weave
+        .skipped
+        .iter()
+        .find(|row| row.reason.label() == "weaver-rejected")
+        .expect("the private instance callback is a weaver reason");
+    assert!(
+        private.to_string().contains("demo/ReasonsMixin#onInstance"),
+        "{private}"
+    );
 
     // A rejected plan costs only itself: the same class's good plans still run.
     let woven_names = weave

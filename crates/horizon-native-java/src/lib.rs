@@ -13,7 +13,9 @@ use std::{
 
 pub mod weaver;
 
-use weaver::{InvokeShift, Shift, SiteSelector, SliceBounds};
+use weaver::{
+    InvokeShift, Shift, SiteSelector, SliceBounds, weave_classes_with_extras_and_instance_callbacks,
+};
 
 pub use weaver::{
     ReturnMode, WovenClasses, callback_info_class, callback_info_returnable_class, weave_class,
@@ -399,8 +401,6 @@ pub enum MixinSkipReason {
     AmbiguousTarget,
     /// `<init>`: a `HEAD` insert would run before the superclass constructor.
     ConstructorTarget,
-    /// The weaver inserts `invokestatic`, so an instance callback cannot link.
-    CallbackNotStatic,
     /// The weaver refused the plan; its bounded reason.
     Weaver(String),
     /// A config lists the class but discovery found no plan for it: the class
@@ -425,7 +425,6 @@ impl MixinSkipReason {
             Self::TargetMissing => "target-missing",
             Self::AmbiguousTarget => "ambiguous-target",
             Self::ConstructorTarget => "constructor-target",
-            Self::CallbackNotStatic => "callback-not-static",
             Self::Weaver(_) => "weaver-rejected",
             Self::ListedWithoutPlan => "listed-without-plan",
         }
@@ -478,6 +477,67 @@ pub struct LoadTimeMixinWeave {
     pub woven: Vec<MixinInjectionPlan>,
     /// Everything else the jar's Mixin classes declare.
     pub skipped: Vec<SkippedMixinPlan>,
+}
+
+/// One synthetic instance-callback bridge a woven jar added.
+///
+/// The weaver reaches an instance callback through a `<owner>$$HorizonBridge$`
+/// class with one static field per callback and an `install<i>(L<owner>;)V`
+/// setter. A load-time weave passes only the target in its class set, so the
+/// host seeds the field instead of calling the setter.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MixinBridgeInstance {
+    /// The persistent static field key: `<bridge>#callback<i><owner descriptor>`.
+    pub field: String,
+    /// The callback owner marker the field must hold.
+    pub owner: String,
+}
+
+/// The synthetic instance-callback bridges `woven` added, in deterministic
+/// order.
+///
+/// Only a class the weaver named `*$$HorizonBridge$*` is read, and only its
+/// static `callback<i>` fields: everything else in [`WovenClasses::added`] is a
+/// `CallbackInfo` helper that holds no instance.
+pub fn mixin_bridge_instances(
+    woven: &WovenClasses,
+) -> Result<Vec<MixinBridgeInstance>, NativeError> {
+    let mut seeds = Vec::new();
+    for (name, bytes) in &woven.added {
+        if !name.contains("$$HorizonBridge$") {
+            continue;
+        }
+        let class = ClassFile::parse(bytes)?;
+        if class.name != *name {
+            return Err(NativeError::Metadata(format!(
+                "woven bridge {name} holds the bytes of {}",
+                class.name
+            )));
+        }
+        for field in &class.fields {
+            if !field.is_static() || !field.name.starts_with("callback") {
+                continue;
+            }
+            let owner = field
+                .descriptor
+                .strip_prefix('L')
+                .and_then(|descriptor| descriptor.strip_suffix(';'))
+                .filter(|owner| !owner.is_empty())
+                .ok_or_else(|| {
+                    NativeError::Metadata(format!(
+                        "woven bridge {name} field {} has a non-reference descriptor {}",
+                        field.name, field.descriptor
+                    ))
+                })?;
+            seeds.push(MixinBridgeInstance {
+                field: format!("{}#{}{}", class.name, field.name, field.descriptor),
+                owner: owner.to_owned(),
+            });
+        }
+    }
+    seeds.sort();
+    seeds.dedup();
+    Ok(seeds)
 }
 
 /// Longest weaver reason a [`MixinSkipReason::Weaver`] keeps, in characters.
@@ -1599,6 +1659,34 @@ impl StdHost {
     pub fn with_property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.properties.insert(key.into(), value.into());
         self
+    }
+
+    /// Seed the synthetic instance-callback bridges `woven` added so each
+    /// bridge's `getstatic` finds its callback owner's instance.
+    ///
+    /// The weaver gives every bridge an `install<i>(L<owner>;)V` setter, but a
+    /// load-time weave holds only the target class, so nothing calls it.
+    /// Weaving a jar keeps its instance callbacks reachable from the woven
+    /// target, but the bridge's `install<i>(L<owner>;)V` setter is what a real
+    /// JVM host must call (reflectively: the bridge class is unnamed and has no
+    /// interface) before the woven code runs. This bounded interpreter instead
+    /// seeds the static field through the host that already retains jar-owned
+    /// static state, which has the same effect and keeps the value across
+    /// entrypoint and event invocations.
+    pub fn with_mixin_bridge_instances(
+        mut self,
+        woven: &WovenClasses,
+    ) -> Result<Self, NativeError> {
+        let seeds = mixin_bridge_instances(woven)?;
+        if seeds.is_empty() {
+            return Ok(self);
+        }
+        let (mut fields, initialized) = self.persistent_class_state();
+        for seed in seeds {
+            fields.insert(seed.field, Value::Ref(Some(seed.owner)));
+        }
+        self.store_persistent_class_state(fields, initialized)?;
+        Ok(self)
     }
 
     /// Seed a deterministic environment value returned by `System.getenv`.
@@ -9342,10 +9430,12 @@ impl NativeJar {
     /// Decide what can be woven into this jar at load, and weave it.
     ///
     /// The bounded subset is a non-cancellable `@Inject` at `HEAD` whose target
-    /// method is in this jar, whose callback is static, and whose `@Mixin` class
-    /// a readable config applies on `side`. Every other plan family and shape is
-    /// a [`SkippedMixinPlan`] with its reason, never an approximation, and so is
-    /// a config-listed class discovery found no plan for.
+    /// method is in this jar and whose `@Mixin` class a readable config applies
+    /// on `side`. A static callback is called directly; an instance callback is
+    /// reached through the synthetic bridge class the weaver adds. Every other
+    /// plan family and shape is a [`SkippedMixinPlan`] with its reason, never an
+    /// approximation, and so is a config-listed class discovery found no plan
+    /// for.
     ///
     /// Callbacks run in the order of [`Self::mixin_plans_in_apply_order`]. A
     /// rejected plan costs only itself: the rest of its class still weaves. This
@@ -9483,17 +9573,58 @@ impl NativeJar {
         if target.name == "<init>" {
             return Err(MixinSkipReason::ConstructorTarget);
         }
-        let callback_is_static = self
+        let callback = self
             .classes
             .get(&plan.callback.owner)
-            .and_then(|class| class.method(&plan.callback.name, &plan.callback.descriptor))
-            .is_some_and(Method::is_static);
-        if !callback_is_static {
-            return Err(MixinSkipReason::CallbackNotStatic);
+            .and_then(|class| class.method(&plan.callback.name, &plan.callback.descriptor));
+        let Some(callback) = callback else {
+            return Err(MixinSkipReason::Weaver(bounded_weave_reason(&format!(
+                "Mixin callback {}#{}{} is not in this jar",
+                plan.callback.owner, plan.callback.name, plan.callback.descriptor
+            ))));
+        };
+        // An instance callback is reached through a synthetic bridge class the
+        // weaver adds (see `weave_classes_with_extras_and_instance_callbacks`).
+        // A separate class cannot invoke a `private` one, and the load-time
+        // weave holds only the target in its class set, so the weaver cannot
+        // check this itself.
+        if !callback.is_static() && callback.access & 0x0002 != 0 {
+            return Err(MixinSkipReason::Weaver(bounded_weave_reason(&format!(
+                "Mixin callback {}#{}{} is private; a synthetic bridge class cannot invoke it, so the bounded weave needs it public or package-visible",
+                plan.callback.owner, plan.callback.name, plan.callback.descriptor
+            ))));
         }
         let mut concrete = plan.clone();
         concrete.target.descriptor = target.descriptor.clone();
         Ok(concrete)
+    }
+
+    /// The distinct callbacks of `plans` that are instance methods in this jar.
+    ///
+    /// The weaver needs these named explicitly because the load-time weave
+    /// passes it a class set holding only the target: from that set alone it
+    /// cannot tell a static callback from an instance one.
+    fn instance_callbacks_for(&self, plans: &[MixinInjectionPlan]) -> Vec<MethodRef> {
+        let mut seen = BTreeSet::new();
+        let mut instance = Vec::new();
+        for plan in plans {
+            if self
+                .classes
+                .get(&plan.callback.owner)
+                .and_then(|class| class.method(&plan.callback.name, &plan.callback.descriptor))
+                .is_some_and(|method| !method.is_static())
+            {
+                let key = (
+                    plan.callback.owner.clone(),
+                    plan.callback.name.clone(),
+                    plan.callback.descriptor.clone(),
+                );
+                if seen.insert(key) {
+                    instance.push(plan.callback.clone());
+                }
+            }
+        }
+        instance
     }
 
     /// Weave one target class's plans into `weave`, or record why not.
@@ -9511,8 +9642,13 @@ impl NativeJar {
             return;
         };
         let set = BTreeMap::from([(owner.to_owned(), class.clone())]);
+        let instance_callbacks = self.instance_callbacks_for(&group);
         let apply = |plans: &[MixinInjectionPlan]| -> Result<WovenClasses, String> {
-            let woven = weave_classes_with_extras(&set, &mixin_plans_in_weave_order(plans))?;
+            let woven = weave_classes_with_extras_and_instance_callbacks(
+                &set,
+                &mixin_plans_in_weave_order(plans),
+                &instance_callbacks,
+            )?;
             // Parsed here so `with_woven_classes` cannot fail on planned bytes.
             for bytes in woven.classes.values().chain(woven.added.values()) {
                 ClassFile::parse(bytes).map_err(|error| error.to_string())?;
@@ -9521,14 +9657,12 @@ impl NativeJar {
         };
         let outcome = match apply(&group) {
             Err(_) if group.len() <= MAX_ISOLATED_WEAVE_PLANS => {
-                group.retain(|plan| {
-                    match weave_class_with_extras(class, std::slice::from_ref(plan)) {
-                        Ok(_) => true,
-                        Err(error) => {
-                            let reason = MixinSkipReason::Weaver(bounded_weave_reason(&error));
-                            weave.skipped.push(skipped_plan(plan, reason));
-                            false
-                        }
+                group.retain(|plan| match apply(std::slice::from_ref(plan)) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        let reason = MixinSkipReason::Weaver(bounded_weave_reason(&error));
+                        weave.skipped.push(skipped_plan(plan, reason));
+                        false
                     }
                 });
                 if group.is_empty() {
@@ -17717,6 +17851,85 @@ mod tests {
             ),
             Err(MixinSkipReason::SelectorModifier)
         );
+    }
+
+    #[test]
+    fn load_time_weave_bridges_instance_callbacks_but_names_private_ones() {
+        let target = ClassFile {
+            name: "demo/T".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "m".into(),
+                descriptor: "()V".into(),
+                access: 0x0009,
+                code: Some(vec![0xb1]),
+                max_locals: 0,
+                max_stack: 0,
+                annotations: Vec::new(),
+            }],
+            annotations: Vec::new(),
+            raw: Vec::new(),
+        };
+        let callback = |owner: &str, access: u16| ClassFile {
+            name: owner.into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "cb".into(),
+                descriptor: "()V".into(),
+                access,
+                code: Some(vec![0xb1]),
+                max_locals: 1,
+                max_stack: 0,
+                annotations: Vec::new(),
+            }],
+            annotations: Vec::new(),
+            raw: Vec::new(),
+        };
+        let jar = NativeJar::from_classes([
+            target,
+            callback("demo/Open", 0x0000),
+            callback("demo/Private", 0x0002),
+        ]);
+        let config = MixinConfig {
+            path: "a.mixins.json".into(),
+            package: None,
+            mixins: vec!["demo.Open".into(), "demo.Private".into()],
+            client: Vec::new(),
+            server: Vec::new(),
+            required: true,
+            priority: None,
+            plugin: None,
+            refmap: None,
+        };
+        let target = method_ref("demo/T", "m");
+        let open = jar.load_time_head_plan(
+            &MixinInjectionPlan::inject_at_head(target.clone(), method_ref("demo/Open", "cb")),
+            MixinSide::Server,
+            std::slice::from_ref(&config),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            open.map(|plan| plan.target.descriptor),
+            Ok("()V".into()),
+            "a package-visible instance callback weaves through a bridge"
+        );
+        let private = jar.load_time_head_plan(
+            &MixinInjectionPlan::inject_at_head(target, method_ref("demo/Private", "cb")),
+            MixinSide::Server,
+            std::slice::from_ref(&config),
+            &BTreeMap::new(),
+        );
+        let Err(MixinSkipReason::Weaver(reason)) = private else {
+            panic!("a private instance callback must be a weaver reason: {private:?}");
+        };
+        assert!(reason.contains("demo/Private#cb"), "{reason}");
+        assert!(reason.contains("private"), "{reason}");
     }
 
     #[test]
