@@ -152,11 +152,19 @@ def run_one(binary: Path, resources: Path, jar: Path, *, timeout: float, port: i
             proc = subprocess.Popen(command, cwd=game_dir, env=env, stdout=log,
                                     stderr=subprocess.STDOUT, start_new_session=True)
             timed_out = False
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _kill_process(proc)
+            deadline = start + timeout
+            while proc.poll() is None:
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    _kill_process(proc)
+                    break
+                try:
+                    if b"Done (" in log_path.read_bytes()[-MAX_OUTPUT:]:
+                        _kill_process(proc)
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.05)
         try:
             with log_path.open("rb") as log:
                 log.seek(0, os.SEEK_END)
