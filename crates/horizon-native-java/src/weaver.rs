@@ -6573,6 +6573,12 @@ fn bridge_instance_callbacks(
     let mut bridges = BTreeMap::new();
     for (owner, methods) in &by_owner {
         let bridge_name = bridge_class_name(owner, &class.name);
+        if bridge_name.len() > u16::MAX as usize {
+            return Err(format!(
+                "{owner}: the synthetic bridge name for {} is longer than the class-file name limit",
+                class.name
+            ));
+        }
         added.insert(
             bridge_name.clone(),
             bridge_class(&bridge_name, owner, methods)?,

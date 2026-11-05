@@ -73,11 +73,15 @@ pub struct MethodRef {
     pub descriptor: String,
 }
 
-/// One runtime-visible annotation on a class or method.
+/// One annotation on a class or method.
 ///
 /// Only the annotation subset needed for Mixin discovery is modelled.  Nested
 /// annotations and arrays keep their declared shape so `@Inject(method = ...,
 /// at = ...)` can be read without inventing a reflective object graph.
+///
+/// A class's list also carries the `@Mixin` marker when the class file records
+/// it as invisible, which is where sponge-mixin's `CLASS` retention puts it;
+/// no other invisible annotation is surfaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Annotation {
     pub descriptor: String,
@@ -399,9 +403,9 @@ pub enum MixinSkipReason {
     CallbackNotStatic,
     /// The weaver refused the plan; its bounded reason.
     Weaver(String),
-    /// A config lists the class but discovery found no plan for it. Real Mixin
-    /// jars land here today: `@Mixin` has `CLASS` retention, the parser only
-    /// reads runtime-visible annotations, so nothing about them is applied.
+    /// A config lists the class but discovery found no plan for it: the class
+    /// declares no injection member this runtime can name, so there is nothing
+    /// a weave could apply.
     ListedWithoutPlan,
 }
 
@@ -8304,7 +8308,11 @@ impl NativeJar {
         }
     }
 
-    /// Discover native Mixin injection plans from runtime-visible annotations.
+    /// Discover native Mixin injection plans from the classes' annotations.
+    ///
+    /// `@Mixin` is found whether its class file records it as visible or
+    /// invisible (real Mixin uses `CLASS` retention); `@Inject` and the other
+    /// injection annotations are runtime-visible.
     ///
     /// This is a translation plan, not weaving: it maps `@Mixin` targets and
     /// `@Inject` callbacks onto the bounded execution anchors handled by
@@ -8449,7 +8457,7 @@ impl NativeJar {
     }
 
     /// Discover native `FIELD`/`NEW`/`JUMP` and `@Redirect` anchor plans from
-    /// runtime-visible annotations.
+    /// the classes' annotations.
     ///
     /// The plans are a translation plan, not weaving: each carries the raw
     /// `@At` site plus the bounded selector this runtime resolved from it.
@@ -15249,8 +15257,9 @@ fn mixin_config_gate(
 
 /// One row per class a config lists that has no plan and no row yet.
 ///
-/// Without these a real jar reads as fully applied: its `@Mixin` annotations are
-/// invisible to discovery, so it reports no plans however many classes it lists.
+/// A class whose only members are outside the bounded families (or that has
+/// none at all) would otherwise read as fully applied: the config says it runs,
+/// yet no plan names it. The row keeps that gap visible.
 fn listed_without_plan(
     configs: &[MixinConfig],
     plans: &[MixinInjectionPlan],
