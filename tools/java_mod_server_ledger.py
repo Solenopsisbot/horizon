@@ -297,7 +297,10 @@ def main(argv: list[str] | None = None) -> int:
                             port=args.port_base + index))
     rows.sort(key=lambda row: row.file)
     counts = summary(rows)
-    summary_fields = [f"{key}={value}" for key, value in counts.items() if key != "reason_categories"]
+    summary_fields = [f"{key}={value}" for key, value in counts.items()
+                      if key not in {"reason_categories", "recommendations"}]
+    summary_fields.extend(f"recommend_{key}={value}"
+                          for key, value in counts["recommendations"].items())
     summary_fields.extend(f"reason_{key}={value}" for key, value in counts["reason_categories"].items())
     text = "\n".join([format_row(row) for row in rows] + ["summary\t" + "\t".join(summary_fields)]) + "\n"
     if args.output:
