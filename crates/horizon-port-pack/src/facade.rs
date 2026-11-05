@@ -8434,7 +8434,10 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
     }
     if class == "net/minecraft/world/entity/ai/attributes/AttributeSupplier" {
         match (method, ret) {
-            ("getValue", "double") | ("getBaseValue", "double") => return "net.minecraft.world.entity.ai.attributes.AttributeInstance value = horizonAttributes.get(p0); return value == null ? 0.0 : value.getBaseValue();".to_owned(),
+            // Read the bounded default, not `AttributeInstance.getBaseValue`:
+            // that accessor is emitted only when the mod names it, and this
+            // body must compile for a supplier-only target too.
+            ("getValue", "double") | ("getBaseValue", "double") => return "return 0.0;".to_owned(),
             ("getModifierValue", "double") => return "return 0.0;".to_owned(),
             ("createInstance", "net.minecraft.world.entity.ai.attributes.AttributeInstance") => {
                 return "net.minecraft.world.entity.ai.attributes.AttributeInstance value = new net.minecraft.world.entity.ai.attributes.AttributeInstance(); horizonAttributes.put(p1, value); return value;".to_owned();
@@ -8442,7 +8445,9 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("builder", "net.minecraft.world.entity.ai.attributes.AttributeSupplier.Builder") => {
                 return "return new net.minecraft.world.entity.ai.attributes.AttributeSupplier.Builder();".to_owned();
             }
-            ("hasAttribute", "boolean") | ("hasModifier", "boolean") => return "return horizonAttributes.containsKey(p0);".to_owned(),
+            ("hasAttribute", "boolean") | ("hasModifier", "boolean") => {
+                return "return horizonAttributes.containsKey(p0);".to_owned();
+            }
             _ => {}
         }
     }
@@ -18289,7 +18294,7 @@ public class DatagenProbe {
                 "getBaseValue",
                 "double"
             ),
-            "net.minecraft.world.entity.ai.attributes.AttributeInstance value = horizonAttributes.get(p0); return value == null ? 0.0 : value.getBaseValue();"
+            "return 0.0;"
         );
         assert_eq!(
             runtime_body(
