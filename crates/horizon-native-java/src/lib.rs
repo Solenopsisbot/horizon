@@ -7910,6 +7910,17 @@ struct BootstrapMethod {
 
 impl ClassFile {
     pub fn parse(bytes: &[u8]) -> Result<Self, NativeError> {
+        Self::parse_with_warnings(bytes).map(|(class, _)| class)
+    }
+
+    /// [`Self::parse`], plus the bounded diagnostics parsing the class produced.
+    ///
+    /// A malformed `RuntimeInvisibleAnnotations` table is skipped with one row
+    /// here instead of failing the class file: real Mixin jars carry the
+    /// `@Mixin` marker there, so failing would lose every plan the jar declares.
+    /// Each row is already one bounded line, prefixed with the class's internal
+    /// name.
+    pub fn parse_with_warnings(bytes: &[u8]) -> Result<(Self, Vec<String>), NativeError> {
         let mut r = Reader::new(bytes);
         if r.u4()? != 0xCAFE_BABE {
             return Err(NativeError::InvalidClass("bad magic"));
@@ -7925,17 +7936,24 @@ impl ClassFile {
         r.skip(interface_count * 2)?;
         let fields = read_fields(&mut r, &pool)?;
         let methods = read_methods(&mut r, &pool)?;
-        let (annotations, bootstrap_methods) = read_class_attributes(&mut r, &pool)?;
-        Ok(Self {
-            name,
-            super_name,
-            pool,
-            bootstrap_methods,
-            methods,
-            fields,
-            annotations,
-            raw: bytes.to_vec(),
-        })
+        let (annotations, bootstrap_methods, warnings) = read_class_attributes(&mut r, &pool)?;
+        let warnings = warnings
+            .into_iter()
+            .map(|warning| format!("{name}: {warning}"))
+            .collect();
+        Ok((
+            Self {
+                name,
+                super_name,
+                pool,
+                bootstrap_methods,
+                methods,
+                fields,
+                annotations,
+                raw: bytes.to_vec(),
+            },
+            warnings,
+        ))
     }
 
     /// Re-encode this class file.
@@ -8198,6 +8216,12 @@ pub struct NativeJar {
     /// Explicit Horizon-owned declarations from `META-INF/horizon-native.json`.
     pub native_id: Option<String>,
     pub native_declarations: Vec<RegistryEntry>,
+    /// Bounded class-parse diagnostics the jar read produced.
+    ///
+    /// Today only malformed `RuntimeInvisibleAnnotations` tables, which are
+    /// skipped so one bad attribute cannot fail the whole jar. Exposed through
+    /// [`Self::class_annotation_warnings`].
+    class_annotation_warnings: Vec<String>,
 }
 
 const MAX_RESOURCE_BYTES: usize = 4 * 1024 * 1024;
@@ -8211,6 +8235,9 @@ const MAX_MIXIN_CONFIG_CLASSES: usize = 4096;
 /// Bytes one Mixin config may occupy. This sits below the jar-wide resource
 /// bound so one oversized config cannot hide the rest of the jar's metadata.
 const MAX_MIXIN_CONFIG_BYTES: usize = 1024 * 1024;
+/// Class-parse diagnostics one jar keeps. A hostile jar can repeat the same
+/// malformed attribute across thousands of classes; the first rows say it all.
+const MAX_CLASS_ANNOTATION_WARNINGS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entrypoint {
@@ -8972,6 +8999,15 @@ impl NativeJar {
         self.mixin_config_scan().1
     }
 
+    /// Class-parse diagnostics that were skipped instead of failing the jar.
+    ///
+    /// Each row is one bounded line, prefixed with the class's internal name.
+    /// A malformed `RuntimeInvisibleAnnotations` table lands here; the class
+    /// (and the jar) still loads, and every readable attribute still applies.
+    pub fn class_annotation_warnings(&self) -> &[String] {
+        &self.class_annotation_warnings
+    }
+
     fn mixin_config_scan(&self) -> (Vec<MixinConfig>, Vec<(String, String)>) {
         let mut paths = BTreeSet::new();
         if let Some(text) = self
@@ -9136,6 +9172,7 @@ impl NativeJar {
         let mut neoforge_metadata = None;
         let mut forge_metadata = None;
         let mut native_metadata = None;
+        let mut class_annotation_warnings = Vec::new();
         for i in 0..zip.len() {
             let mut e = zip
                 .by_index(i)
@@ -9193,7 +9230,13 @@ impl NativeJar {
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(&mut e, &mut bytes)
                     .map_err(|e| NativeError::Zip(e.to_string()))?;
-                let class = ClassFile::parse(&bytes)?;
+                let (class, warnings) = ClassFile::parse_with_warnings(&bytes)?;
+                for warning in warnings {
+                    if class_annotation_warnings.len() >= MAX_CLASS_ANNOTATION_WARNINGS {
+                        break;
+                    }
+                    class_annotation_warnings.push(warning);
+                }
                 if class
                     .pool
                     .iter()
@@ -9239,6 +9282,7 @@ impl NativeJar {
         jar.neoforge_entrypoints = neoforge_entrypoints;
         jar.native_id = native_id;
         jar.native_declarations = native_declarations;
+        jar.class_annotation_warnings = class_annotation_warnings;
         Ok(jar)
     }
 
@@ -15782,17 +15826,34 @@ fn skip_attributes(r: &mut Reader<'_>, pool: &[Cp]) -> Result<(), NativeError> {
     Ok(())
 }
 
+/// Descriptor of Mixin's class marker annotation.
+///
+/// sponge-mixin declares `@Mixin` with `CLASS` retention, so javac writes it
+/// into `RuntimeInvisibleAnnotations`. Discovery and the native host's
+/// `Class.getAnnotation` both read [`ClassFile::annotations`], so the marker
+/// has to be surfaced there even though it is invisible to `javap`'s default
+/// view; nothing else from that table is.
+const MIXIN_ANNOTATION_DESCRIPTOR: &str = "Lorg/spongepowered/asm/mixin/Mixin;";
+
+/// Annotations one class's invisible table may hold before the rest are
+/// skipped with a diagnostic. A real class carries a handful; the cap keeps a
+/// hostile `count` from spending work proportional to 65535 entries.
+const MAX_INVISIBLE_ANNOTATIONS: usize = 1024;
+
 /// Read the class attributes that follow the fields and methods.
 ///
 /// `BootstrapMethods` and `RuntimeVisibleAnnotations` share this attribute
-/// table, so both are collected in one pass over it.
+/// table, so both are collected in one pass over it. `RuntimeInvisibleAnnotations`
+/// is read only for the `@Mixin` marker (see [`MIXIN_ANNOTATION_DESCRIPTOR`]);
+/// a malformed table is skipped into `warnings` rather than failing the class.
 fn read_class_attributes(
     r: &mut Reader<'_>,
     pool: &[Cp],
-) -> Result<(Vec<Annotation>, Vec<BootstrapMethod>), NativeError> {
+) -> Result<(Vec<Annotation>, Vec<BootstrapMethod>, Vec<String>), NativeError> {
     let count = r.u2()? as usize;
     let mut annotations = Vec::new();
     let mut methods = Vec::new();
+    let mut warnings = Vec::new();
     for _ in 0..count {
         let name = utf8(pool, r.u2()?)?;
         let length = r.u4()? as usize;
@@ -15801,6 +15862,9 @@ fn read_class_attributes(
             "RuntimeVisibleAnnotations" => {
                 let mut body = Reader::new(bytes);
                 annotations.extend(read_annotations(&mut body, pool)?);
+            }
+            "RuntimeInvisibleAnnotations" => {
+                read_invisible_mixin_annotations(bytes, pool, &mut annotations, &mut warnings);
             }
             "BootstrapMethods" => {
                 let mut body = Reader::new(bytes);
@@ -15822,7 +15886,83 @@ fn read_class_attributes(
             _ => {}
         }
     }
-    Ok((annotations, methods))
+    Ok((annotations, methods, warnings))
+}
+
+/// Surface the `@Mixin` marker a real jar keeps in the invisible table.
+///
+/// Every other invisible annotation stays invisible: only
+/// [`MIXIN_ANNOTATION_DESCRIPTOR`] is appended to `annotations`, and only when
+/// a runtime-visible copy did not already put it there. A malformed entry gets
+/// one bounded row in `warnings` and stops this attribute; the attribute's
+/// bytes are a bounded slice, so the class's remaining attributes still parse
+/// and the jar stays loadable.
+fn read_invisible_mixin_annotations(
+    bytes: &[u8],
+    pool: &[Cp],
+    annotations: &mut Vec<Annotation>,
+    warnings: &mut Vec<String>,
+) {
+    let mut body = Reader::new(bytes);
+    let count = match body.u2() {
+        Ok(count) => count as usize,
+        Err(error) => {
+            push_class_annotation_warning(
+                warnings,
+                format!("invisible annotations: {}", annotation_diagnostic(error)),
+            );
+            return;
+        }
+    };
+    if count > MAX_INVISIBLE_ANNOTATIONS {
+        push_class_annotation_warning(
+            warnings,
+            format!(
+                "invisible annotations declare {count} entries; reading the first \
+                 {MAX_INVISIBLE_ANNOTATIONS}"
+            ),
+        );
+    }
+    for index in 0..count.min(MAX_INVISIBLE_ANNOTATIONS) {
+        match read_annotation(&mut body, pool) {
+            Ok(annotation) => {
+                if annotation.descriptor == MIXIN_ANNOTATION_DESCRIPTOR
+                    && !annotations
+                        .iter()
+                        .any(|existing| existing.descriptor == MIXIN_ANNOTATION_DESCRIPTOR)
+                {
+                    annotations.push(annotation);
+                }
+            }
+            Err(error) => {
+                // The reader cannot resynchronise inside the table, so the
+                // entries after a malformed one are skipped with it.
+                push_class_annotation_warning(
+                    warnings,
+                    format!(
+                        "invisible annotation #{index}: {}",
+                        annotation_diagnostic(error)
+                    ),
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// One short name for a malformed annotation entry, so a diagnostic reads the
+/// same whether the value tag was unknown or the attribute simply ended.
+fn annotation_diagnostic(error: NativeError) -> String {
+    match error {
+        NativeError::Truncated => "truncated attribute".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+fn push_class_annotation_warning(warnings: &mut Vec<String>, warning: String) {
+    if warnings.len() < MAX_CLASS_ANNOTATION_WARNINGS {
+        warnings.push(bounded_weave_reason(&warning));
+    }
 }
 
 fn read_annotations(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Annotation>, NativeError> {
@@ -17401,6 +17541,8 @@ fn split_dynamic_captures(captures: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
+    use std::process::Command;
 
     /// A class with one static `m()V` that returns, the smallest shape the
     /// weaver accepts. Pool: 1 name, 2 Class 1, 3 `java/lang/Object`, 4 Class 3,
@@ -25627,6 +25769,256 @@ mandatory = true
             read_annotations(&mut truncated, &pool),
             Err(NativeError::InvalidClass(_))
         ));
+    }
+
+    /// Minimal class file bytes naming `class_name`, with no fields or methods.
+    ///
+    /// `utf8_extra` adds constant-pool UTF-8 entries from index 5, and each
+    /// `(name, body)` pair becomes a class attribute whose name sits after
+    /// them, so a caller can build a `RuntimeInvisibleAnnotations` table, a
+    /// visible one, or both, without hand-counting the pool.
+    fn class_bytes_with_attributes(
+        class_name: &str,
+        utf8_extra: &[&str],
+        attributes: &[(&str, &[u8])],
+    ) -> Vec<u8> {
+        fn utf8(out: &mut Vec<u8>, value: &str) {
+            out.push(1);
+            out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52];
+        // Magic/version, then the pool count before the entries: `Empty` plus
+        // the name, Class, Object and Class above, the UTF-8 extras and the
+        // attribute names.
+        let pool_count = 5 + utf8_extra.len() + attributes.len();
+        out.extend_from_slice(&(pool_count as u16).to_be_bytes());
+        utf8(&mut out, class_name); // 1
+        out.extend_from_slice(&[7, 0, 1]); // 2: Class 1
+        utf8(&mut out, "java/lang/Object"); // 3
+        out.extend_from_slice(&[7, 0, 3]); // 4: Class 3
+        for extra in utf8_extra {
+            utf8(&mut out, extra);
+        }
+        for (name, _) in attributes {
+            utf8(&mut out, name);
+        }
+        out.extend_from_slice(&[0, 0x21]); // public super
+        out.extend_from_slice(&[0, 2, 0, 4]); // this, super
+        out.extend_from_slice(&[0, 0]); // interfaces
+        out.extend_from_slice(&[0, 0]); // fields
+        out.extend_from_slice(&[0, 0]); // methods
+        out.extend_from_slice(&(attributes.len() as u16).to_be_bytes());
+        let first_name = 5 + utf8_extra.len();
+        for (index, (_, body)) in attributes.iter().enumerate() {
+            out.extend_from_slice(&((first_name + index) as u16).to_be_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    #[test]
+    fn class_retention_mixin_annotation_is_discovered() {
+        let Some(javac) = javac() else {
+            eprintln!("skipping: no javac on PATH or under JAVA_HOME");
+            return;
+        };
+        // Real sponge-mixin declares `@Mixin` with CLASS retention, so javac
+        // writes it into RuntimeInvisibleAnnotations. `@Inject` and `@At` are
+        // RUNTIME, as in the real jar, so only the marker is invisible.
+        let sources = [
+            (
+                "org/spongepowered/asm/mixin/Mixin.java",
+                "package org.spongepowered.asm.mixin;\n\
+                 import java.lang.annotation.*;\n\
+                 @Retention(RetentionPolicy.CLASS)\n\
+                 @Target(ElementType.TYPE)\n\
+                 public @interface Mixin {\n\
+                     Class<?>[] targets() default {};\n\
+                     String[] value() default {};\n\
+                 }\n",
+            ),
+            (
+                "org/spongepowered/asm/mixin/injection/At.java",
+                "package org.spongepowered.asm.mixin.injection;\n\
+                 import java.lang.annotation.*;\n\
+                 @Retention(RetentionPolicy.RUNTIME)\n\
+                 public @interface At {\n\
+                     String value();\n\
+                 }\n",
+            ),
+            (
+                "org/spongepowered/asm/mixin/injection/Inject.java",
+                "package org.spongepowered.asm.mixin.injection;\n\
+                 import java.lang.annotation.*;\n\
+                 @Retention(RetentionPolicy.RUNTIME)\n\
+                 @Target(ElementType.METHOD)\n\
+                 public @interface Inject {\n\
+                     String[] method();\n\
+                     At[] at();\n\
+                     boolean cancellable() default false;\n\
+                 }\n",
+            ),
+            (
+                "demo/Target.java",
+                "package demo;\npublic class Target { public void run() {} }\n",
+            ),
+            (
+                "demo/RetentionMixin.java",
+                "package demo;\n\
+                 import org.spongepowered.asm.mixin.Mixin;\n\
+                 import org.spongepowered.asm.mixin.injection.At;\n\
+                 import org.spongepowered.asm.mixin.injection.Inject;\n\
+                 @Mixin(targets = Target.class)\n\
+                 public class RetentionMixin {\n\
+                     @Inject(method = \"run()V\", at = @At(\"HEAD\"))\n\
+                     public static void onRun() {}\n\
+                 }\n",
+            ),
+        ];
+        let root = std::env::temp_dir().join(format!(
+            "horizon-native-java-class-retention-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for (path, source) in &sources {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, source).unwrap();
+        }
+        let classes = root.join("classes");
+        std::fs::create_dir_all(&classes).unwrap();
+        let status = Command::new(javac)
+            .arg("-d")
+            .arg(&classes)
+            .args(sources.iter().map(|(path, _)| root.join(path)))
+            .status()
+            .unwrap();
+        assert!(status.success(), "javac failed");
+        let bytes = std::fs::read(classes.join("demo/RetentionMixin.class")).unwrap();
+        let (class, warnings) = ClassFile::parse_with_warnings(&bytes).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Only the Mixin marker is lifted out of the invisible table.
+        assert_eq!(class.annotations.len(), 1, "{:?}", class.annotations);
+        assert_eq!(class.annotations[0].descriptor, MIXIN_ANNOTATION_DESCRIPTOR);
+
+        let jar = NativeJar::from_classes([class]);
+        let plans = jar.mixin_injection_plans();
+        assert_eq!(plans.len(), 1, "{plans:?}");
+        assert_eq!(plans[0].target.owner, "demo/Target");
+        assert_eq!(plans[0].target.name, "run");
+        assert_eq!(plans[0].target.descriptor, "()V");
+        assert_eq!(plans[0].callback.owner, "demo/RetentionMixin");
+        assert_eq!(plans[0].callback.name, "onRun");
+        assert_eq!(plans[0].at, "HEAD");
+        assert!(!plans[0].cancellable);
+        assert_eq!(jar.mixin_discovery_report().injections, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_invisible_annotations_warn_without_failing_the_jar() {
+        // A readable visible annotation beside the broken invisible table, so
+        // the test also proves the failure does not swallow the attribute.
+        let visible = [0u8, 1, 0, 5, 0, 0];
+        // One annotation whose element value tag 'X' is not a value tag.
+        let malformed = [0u8, 1, 0, 5, 0, 1, 0, 5, b'X'];
+        let broken = class_bytes_with_attributes(
+            "demo/Broken",
+            &["Ldemo/Visible;"],
+            &[
+                ("RuntimeVisibleAnnotations", &visible),
+                ("RuntimeInvisibleAnnotations", &malformed),
+            ],
+        );
+        let (class, warnings) = ClassFile::parse_with_warnings(&broken).unwrap();
+        assert_eq!(
+            class.annotations,
+            vec![Annotation {
+                descriptor: "Ldemo/Visible;".into(),
+                values: BTreeMap::new(),
+            }]
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("demo/Broken: invisible annotation #0"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].chars().count() <= MAX_WEAVE_REASON_CHARS + 3);
+        // The parse-only entry point drops the warning and stays usable.
+        assert!(ClassFile::parse(&broken).is_ok());
+
+        // A table that declares more entries than the bound is skipped the
+        // same way, so neither class can fail the jar around it.
+        let oversized = class_bytes_with_attributes(
+            "demo/Oversized",
+            &[],
+            &[("RuntimeInvisibleAnnotations", &[0xFF, 0xFF])],
+        );
+        let path = std::env::temp_dir().join(format!(
+            "horizon-native-java-invisible-{}.jar",
+            std::process::id()
+        ));
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("demo/Broken.class", options).unwrap();
+        zip.write_all(&broken).unwrap();
+        zip.start_file("demo/Oversized.class", options).unwrap();
+        zip.write_all(&oversized).unwrap();
+        zip.finish().unwrap();
+        let jar = NativeJar::from_path(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let warnings = jar.class_annotation_warnings();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|warning| warning
+                .starts_with("demo/Oversized: invisible annotations declare 65535")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("demo/Oversized: invisible annotation #0")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.chars().count() <= MAX_WEAVE_REASON_CHARS + 3),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_class_with_visible_and_invisible_mixin_markers_keeps_one() {
+        let marker = [0u8, 1, 0, 5, 0, 0];
+        let bytes = class_bytes_with_attributes(
+            "demo/Double",
+            &[MIXIN_ANNOTATION_DESCRIPTOR],
+            &[
+                ("RuntimeVisibleAnnotations", &marker),
+                ("RuntimeInvisibleAnnotations", &marker),
+            ],
+        );
+        let (class, warnings) = ClassFile::parse_with_warnings(&bytes).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(class.annotations.len(), 1, "{:?}", class.annotations);
+        assert_eq!(class.annotations[0].descriptor, MIXIN_ANNOTATION_DESCRIPTOR);
+    }
+
+    /// The `javac` a fixture should use, or `None` when no JDK is installed.
+    fn javac() -> Option<PathBuf> {
+        let from_home = std::env::var_os("JAVA_HOME")
+            .map(|home| PathBuf::from(home).join("bin/javac"))
+            .filter(|path| path.exists());
+        let javac = from_home.unwrap_or_else(|| PathBuf::from("javac"));
+        Command::new(&javac)
+            .arg("-version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|_| javac)
     }
 
     #[test]
