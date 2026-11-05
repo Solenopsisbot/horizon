@@ -412,8 +412,10 @@ fn load_java_mod_paths_with_policy(
         }
     }
     if !accepted_paths.is_empty() {
-        match super::mods::run_java_mods_with_report(&accepted_paths, ExecutionRole::DedicatedServer)
-        {
+        match super::mods::run_java_mods_with_report(
+            &accepted_paths,
+            ExecutionRole::DedicatedServer,
+        ) {
             Ok((loaded, mut loaded_reports)) => {
                 content.extend(loaded);
                 accepted_reports.append(&mut loaded_reports);
@@ -432,6 +434,12 @@ fn load_java_mod_paths_with_policy(
         }
     }
     reports.extend(accepted_reports.iter().cloned());
+    reports.sort_by_key(|report| {
+        paths
+            .iter()
+            .position(|path| path == &report.jar)
+            .unwrap_or(usize::MAX)
+    });
     log_java_reports(&accepted_reports, "INFO");
     Ok((content, reports))
 }
@@ -447,12 +455,10 @@ fn dedicated_java_refusal(path: &std::path::Path) -> Option<String> {
             path.display()
         ));
     }
-    let entrypoints = ["server", "main", "neoforge"]
-        .iter()
-        .find_map(|kind| {
-            let entries = jar.discover_entrypoints(kind);
-            (!entries.is_empty()).then_some((*kind, entries))
-        });
+    let entrypoints = ["server", "main", "neoforge"].iter().find_map(|kind| {
+        let entries = jar.discover_entrypoints(kind);
+        (!entries.is_empty()).then_some((*kind, entries))
+    });
     let Some((kind, entries)) = entrypoints else {
         let mut available: Vec<String> = jar.fabric_entrypoints.keys().cloned().collect();
         if !jar.neoforge_entrypoints.is_empty() {
@@ -2272,8 +2278,14 @@ mod tests {
         let error = load_java_mod_paths_with_policy(std::slice::from_ref(&path), true)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("dedicated Java mod startup failed"), "{error}");
-        assert!(error.contains("horizon-missing-dedicated-java-mod.jar"), "{error}");
+        assert!(
+            error.contains("dedicated Java mod startup failed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("horizon-missing-dedicated-java-mod.jar"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2282,7 +2294,10 @@ mod tests {
         let error = load_java_mod_paths_with_policy(std::slice::from_ref(&path), true)
             .unwrap_err()
             .to_string();
-        assert!(error.starts_with("dedicated Java mod startup failed: "), "{error}");
+        assert!(
+            error.starts_with("dedicated Java mod startup failed: "),
+            "{error}"
+        );
         assert!(error.contains(path.to_string_lossy().as_ref()), "{error}");
     }
 

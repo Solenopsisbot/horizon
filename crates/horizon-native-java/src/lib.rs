@@ -380,11 +380,14 @@ pub enum MixinSkipReason {
     /// `@Redirect`, `@Overwrite`, `@ModifyArg` or `@ModifyVariable`, or a member
     /// of a `@Mixin` class that real Mixin would merge into its target.
     UnsupportedFamily,
-    /// A `RETURN`, `TAIL` or `INVOKE` anchor.
+    /// An anchor the load-time weave does not apply, such as `INVOKE`, or a
+    /// `FIELD`/`NEW`/`JUMP` anchor.
     NonHeadAnchor,
-    /// `cancellable`: a `HEAD` on a non-void target, which would need a
-    /// `CallbackInfoReturnable` carrying the descriptor's default value. A
-    /// cancellable `HEAD` on a `void` target is woven.
+    /// `cancellable`: a `HEAD` on a value-returning target, or a `RETURN`/`TAIL`
+    /// on a `void` one. Neither has a woven shape: the first would need the
+    /// descriptor's default value, and the second has no result to answer. A
+    /// cancellable `HEAD` on `void` and a cancellable `RETURN`/`TAIL` on a
+    /// value-returning target are woven.
     Cancellable,
     /// A `@Slice` or `shift`/`by`, which a `HEAD` insert would silently ignore.
     SelectorModifier,
@@ -9910,10 +9913,10 @@ impl NativeJar {
     /// descriptor made concrete, or why it stays out.
     ///
     /// The anchors are checked before the config and the target class, so a
-    /// `RETURN` on a Minecraft class reports the target, not the anchor.
-    /// `RETURN`/`TAIL` reach the weaver for a `void` target only: a
-    /// value-returning one needs a `CallbackInfoReturnable` the load-time path
-    /// does not wire.
+    /// `RETURN` on a Minecraft class reports the target, not the anchor. A
+    /// `void` `HEAD` takes the plain `CallbackInfo` plus cancel branch; a
+    /// `RETURN`/`TAIL` insert is stack-neutral on `void` and carries the result
+    /// in a `CallbackInfoReturnable` otherwise.
     fn load_time_inject_plan(
         &self,
         plan: &MixinInjectionPlan,
@@ -9948,15 +9951,17 @@ impl NativeJar {
             return Err(MixinSkipReason::ConstructorTarget);
         }
         let returns_value = crate::return_desc(&target.descriptor) != "V";
-        // A `void` target takes the woven `CallbackInfo` + `if (isCancelled())
-        // return` shape at HEAD, and the plain stack-neutral callback at
-        // RETURN/TAIL. A value-returning target would also need the descriptor's
-        // result in the target's shape, which this path leaves to the
-        // interpreter.
-        if plan.at != "HEAD" && returns_value {
-            return Err(MixinSkipReason::NonHeadAnchor);
-        }
-        if plan.cancellable && (plan.at != "HEAD" || returns_value) {
+        // The `void` shapes are the plain `HEAD` `CallbackInfo`+cancel branch
+        // and the stack-neutral RETURN/TAIL callback; the value shapes are the
+        // RETURN/TAIL `CallbackInfoReturnable`. A cancellable `HEAD` on a
+        // value-returning target and a cancellable `RETURN`/`TAIL` on a `void`
+        // one have no woven shape here.
+        let cancellable_shape = if plan.at == "HEAD" {
+            !returns_value
+        } else {
+            returns_value
+        };
+        if plan.cancellable && !cancellable_shape {
             return Err(MixinSkipReason::Cancellable);
         }
         let callback = self

@@ -83,6 +83,13 @@ public class CallbackInfo {
 }
 "#;
 
+const CALLBACK_INFO_RETURNABLE: &str = r#"package org.spongepowered.asm.mixin.injection.callback;
+public class CallbackInfoReturnable<T> extends CallbackInfo {
+    public void setReturnValue(T value) {}
+    public T getReturnValue() { return null; }
+}
+"#;
+
 const PROBE: &str = r#"package demo;
 public final class Probe {
     public static void mark(String marker, int value) {}
@@ -96,6 +103,7 @@ const COMPILE_ONLY: &[&str] = &[
     "org/spongepowered/asm/mixin/injection/At.class",
     "org/spongepowered/asm/mixin/injection/Inject.class",
     "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.class",
+    "org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable.class",
     "demo/Probe.class",
 ];
 
@@ -129,6 +137,10 @@ impl Fixture {
             (
                 "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.java",
                 CALLBACK_INFO,
+            ),
+            (
+                "org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable.java",
+                CALLBACK_INFO_RETURNABLE,
             ),
             ("demo/Probe.java", PROBE),
         ];
@@ -707,24 +719,35 @@ public abstract class MemberMixin {
         ("config-plugin", 1),
         ("constructor-target", 1),
         ("listed-without-plan", 1),
-        ("non-head-anchor", 1),
         ("not-in-config", 1),
         ("other-side", 1),
         ("target-missing", 1),
         ("target-outside-jar", 1),
         ("unsupported-family", 1),
-        // The private instance callback: the weaver cannot bridge it.
-        ("weaver-rejected", 1),
+        // The private instance callback (the weaver cannot bridge it) and a
+        // value-returning RETURN whose callback takes no CallbackInfoReturnable
+        // (the insert would have no place to put the result).
+        ("weaver-rejected", 2),
     ]);
     assert_eq!(skip_labels(&weave), expected, "{:#?}", weave.skipped);
     let private = weave
         .skipped
         .iter()
-        .find(|row| row.reason.label() == "weaver-rejected")
+        .find(|row| row.callback.name == "onInstance")
         .expect("the private instance callback is a weaver reason");
+    assert_eq!(private.reason.label(), "weaver-rejected");
     assert!(
         private.to_string().contains("demo/ReasonsMixin#onInstance"),
         "{private}"
+    );
+    let value_return = weave
+        .skipped
+        .iter()
+        .find(|row| row.callback.name == "onReturned")
+        .expect("the value-returning RETURN is reported");
+    assert!(
+        value_return.to_string().contains("CallbackInfoReturnable"),
+        "{value_return}"
     );
 
     // A rejected plan costs only itself: the same class's good plans still run.
@@ -1189,4 +1212,125 @@ public abstract class InfoMixin {
     assert_eq!(weave.woven.len(), 1, "{:#?}", weave.woven);
     assert!(weave.skipped.is_empty(), "{:#?}", weave.skipped);
     assert_eq!(run_main(&jar), marks(&[("target", 0), ("return", 0)]));
+}
+
+/// A value-returning `RETURN` insert carries the result in a
+/// `CallbackInfoReturnable` the weave builds; an override reaches the caller.
+#[test]
+fn a_woven_return_can_replace_a_value_targets_result() {
+    let fixture = Fixture::build(
+        "return-value-override",
+        "RUNTIME",
+        &[
+            (
+                "demo/Main.java",
+                r#"package demo;
+public final class Main {
+    public void onInitialize() {
+        Probe.mark("after", Target.number());
+    }
+}
+"#,
+            ),
+            (
+                "demo/Target.java",
+                r#"package demo;
+public final class Target {
+    public static int number() { Probe.mark("target", 0); return 3; }
+}
+"#,
+            ),
+            (
+                "demo/ValueMixin.java",
+                r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+@Mixin(Target.class)
+public abstract class ValueMixin {
+    @Inject(method = "number()I", at = @At("RETURN"))
+    private static void onNumber(CallbackInfoReturnable<Integer> info) {
+        Probe.mark("return", 0);
+        info.setReturnValue(9);
+    }
+}
+"#,
+            ),
+        ],
+        &[(
+            "demo.mixins.json",
+            r#"{"package":"demo","mixins":["ValueMixin"]}"#,
+        )],
+    );
+    let (jar, weave) = woven(fixture.load(), MixinSide::Server);
+    assert_eq!(weave.woven.len(), 1, "{:#?}", weave.woven);
+    assert!(weave.skipped.is_empty(), "{:#?}", weave.skipped);
+    assert!(
+        weave
+            .classes
+            .added
+            .contains_key("org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable"),
+        "{:#?}",
+        weave.classes.added.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        run_main(&jar),
+        marks(&[("target", 0), ("return", 0), ("after", 9)])
+    );
+}
+
+/// Without an override, the insert answers the target's own result.
+#[test]
+fn a_woven_return_keeps_the_targets_value_when_it_sets_none() {
+    let fixture = Fixture::build(
+        "return-value-plain",
+        "RUNTIME",
+        &[
+            (
+                "demo/Main.java",
+                r#"package demo;
+public final class Main {
+    public void onInitialize() {
+        Probe.mark("after", Target.number());
+    }
+}
+"#,
+            ),
+            (
+                "demo/Target.java",
+                r#"package demo;
+public final class Target {
+    public static int number() { Probe.mark("target", 0); return 3; }
+}
+"#,
+            ),
+            (
+                "demo/ValueMixin.java",
+                r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+@Mixin(Target.class)
+public abstract class ValueMixin {
+    @Inject(method = "number()I", at = @At("RETURN"))
+    private static void onNumber(CallbackInfoReturnable<Integer> info) {
+        Probe.mark("return", info.getReturnValue() == null ? 1 : 0);
+    }
+}
+"#,
+            ),
+        ],
+        &[(
+            "demo.mixins.json",
+            r#"{"package":"demo","mixins":["ValueMixin"]}"#,
+        )],
+    );
+    let (jar, weave) = woven(fixture.load(), MixinSide::Server);
+    assert_eq!(weave.woven.len(), 1, "{:#?}", weave.woven);
+    assert_eq!(
+        run_main(&jar),
+        marks(&[("target", 0), ("return", 0), ("after", 3)])
+    );
 }
