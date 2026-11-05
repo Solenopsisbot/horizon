@@ -324,6 +324,9 @@ pub(super) struct Remote {
     pub(super) menu_title: Option<horizon_client::text::Text>,
     /// Registered mod payload channels and frames the server sent.
     pub(super) payloads: PayloadLink,
+    /// Joins the chunks of an oversized mod payload frame the server sends
+    /// ([`payloads::chunk_envelopes`]); one transfer is in flight at a time.
+    chunks: payloads::ChunkAssembler,
     state_id: i32,
     use_target: Option<[i32; 3]>,
     entities: HashMap<i32, Tracked>,
@@ -723,6 +726,7 @@ impl Game<'_> {
             menu: None,
             menu_title: None,
             payloads: PayloadLink::from_declared(),
+            chunks: payloads::ChunkAssembler::new(),
             state_id: 0,
             use_target: None,
             entities: HashMap::new(),
@@ -2480,7 +2484,7 @@ impl Game<'_> {
             }
             C::CustomPayload(p) if p.channel == payloads::CHANNEL => {
                 if let Some(r) = self.remote.as_mut()
-                    && let Err(error) = r.payloads.receive(&p.data, PayloadDirection::PlayToClient)
+                    && let Err(error) = receive_payload(&mut r.payloads, &mut r.chunks, &p.data)
                 {
                     log::warn!("Horizon: bad mod payload from the server: {error}");
                 }
@@ -7577,10 +7581,15 @@ impl Game<'_> {
         // The frame goes out right here; the link's own copy would only pile
         // up against its queue cap.
         r.payloads.take_outgoing();
-        self.send(S::CustomPayload(CustomPayload {
-            channel: payloads::CHANNEL.to_owned(),
-            data,
-        }));
+        // A frame above the packet envelope travels as consecutive chunks the
+        // server joins; a smaller one is the frame itself, as in v1.
+        let envelopes = payloads::chunk_envelopes(&data)?;
+        for envelope in envelopes {
+            self.send(S::CustomPayload(CustomPayload {
+                channel: payloads::CHANNEL.to_owned(),
+                data: envelope,
+            }));
+        }
         Ok(())
     }
 
@@ -8884,8 +8893,49 @@ struct PayloadPump {
     failed: Vec<(String, String)>,
     /// Frames Java mods queued that were refused before sending.
     rejected: Vec<(String, String)>,
-    /// Encoded `horizon:payload` bodies to send to the server.
+    /// Encoded `horizon:payload` bodies to send to the server, in order: a
+    /// frame that fits the packet envelope is one body, and a bigger one is
+    /// its consecutive chunks ([`payloads::chunk_envelopes`]).
     encoded: Vec<Vec<u8>>,
+}
+
+/// One `horizon:payload` packet from the server. A frame within the packet
+/// envelope goes to `link` exactly as a v1 sender's does; a bigger one arrives
+/// as consecutive chunks ([`payloads::chunk_envelopes`]) that `chunks` joins
+/// back. `Ok(false)` means more chunks are due.
+///
+/// A malformed, out-of-order or interrupted chunk sequence rejects and resets
+/// the assembler, so the next frame starts clean instead of wedging the
+/// connection, and a frame the link itself refuses (undeclared channel, bad
+/// codec) takes its transfer down with it.
+fn receive_payload(
+    link: &mut PayloadLink,
+    chunks: &mut payloads::ChunkAssembler,
+    data: &[u8],
+) -> std::result::Result<bool, String> {
+    if !payloads::is_chunk_envelope(data) {
+        // A whole frame cannot sit between the chunks of a transfer: if one
+        // arrives, the sender started over and the incomplete chunks are stale.
+        if !chunks.is_idle() {
+            *chunks = payloads::ChunkAssembler::new();
+            return Err("a whole frame arrived mid-transfer".to_owned());
+        }
+        link.receive(data, PayloadDirection::PlayToClient)?;
+        return Ok(true);
+    }
+    let joined = match chunks.push(data) {
+        Ok(Some(joined)) => joined,
+        Ok(None) => return Ok(false),
+        Err(error) => {
+            *chunks = payloads::ChunkAssembler::new();
+            return Err(error);
+        }
+    };
+    if let Err(error) = link.receive(&joined, PayloadDirection::PlayToClient) {
+        *chunks = payloads::ChunkAssembler::new();
+        return Err(error);
+    }
+    Ok(true)
 }
 
 /// One client tick of mod payload traffic over `link`. First up to `cap`
@@ -8925,7 +8975,12 @@ fn pump_client_payloads(
             ))
         };
         match result {
-            Ok(data) => pump.encoded.push(data),
+            // A frame above the packet envelope travels as consecutive chunks;
+            // the chunks spell the frame's own bytes, in order.
+            Ok(data) => match payloads::chunk_envelopes(&data) {
+                Ok(envelopes) => pump.encoded.extend(envelopes),
+                Err(error) => pump.rejected.push((frame.id().to_owned(), error)),
+            },
             Err(error) => pump.rejected.push((frame.id().to_owned(), error)),
         }
     }
@@ -8937,7 +8992,8 @@ fn pump_client_payloads(
 
 #[cfg(test)]
 mod tests {
-    use super::{pump_client_payloads, synced_local_use};
+    use super::{pump_client_payloads, receive_payload, synced_local_use};
+    use horizon_client::lan::payloads;
     use horizon_client::lan::payloads::PayloadLink;
     use horizon_mods::payloads::{
         PayloadDeclaration, PayloadDirection, PayloadFrame, PayloadRegistry,
@@ -9013,6 +9069,220 @@ mod tests {
         assert_eq!(pump.dispatched, 72);
         assert_eq!(pump.encoded.len(), 14);
         assert!(link.incoming().is_empty() && pending.is_empty());
+    }
+
+    /// A client link over opaque (`minecraft:raw`) frames both ways, so a
+    /// frame far above the packet envelope is a valid payload.
+    fn opaque_client_link() -> PayloadLink {
+        let mut registry = PayloadRegistry::default();
+        for (id, direction) in [
+            ("demo:down", PayloadDirection::PlayToClient),
+            ("demo:up", PayloadDirection::PlayToServer),
+        ] {
+            registry
+                .register(PayloadDeclaration {
+                    id: id.into(),
+                    direction,
+                    codec: Some("minecraft:raw".into()),
+                })
+                .unwrap();
+        }
+        PayloadLink::new(registry)
+    }
+
+    /// `size` bytes a big test frame carries, deterministic and not a run of
+    /// one byte, so a dropped or reordered chunk changes the bytes.
+    fn frame_bytes(size: usize) -> Vec<u8> {
+        (0..size).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// `bytes` as the frame `id` travels with, split the way a sender splits
+    /// it: one body when it fits the envelope, its chunks when it does not.
+    fn frame_chunks(id: &str, direction: PayloadDirection, size: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let bytes = frame_bytes(size);
+        let encoded = PayloadFrame::new(id, direction, bytes.clone())
+            .unwrap()
+            .encode();
+        let envelopes = payloads::chunk_envelopes(&encoded).unwrap();
+        (bytes, envelopes)
+    }
+
+    /// A 40 KiB frame leaves the client as consecutive chunks that the
+    /// server's assembler joins to the frame's own bytes, losslessly.
+    #[test]
+    fn a_frame_above_the_envelope_leaves_the_client_as_chunks() {
+        let (bytes, _) = frame_chunks("demo:up", PayloadDirection::PlayToServer, 40 * 1024);
+        let mut link = opaque_client_link();
+        let mut pending = vec![
+            PayloadFrame::new("demo:up", PayloadDirection::PlayToServer, bytes.clone()).unwrap(),
+        ];
+        let pump = pump_client_payloads(&mut link, 256, 256, &mut |_| Ok(true), &mut |max| {
+            pending.drain(..max.min(pending.len())).collect()
+        });
+        assert!(pump.rejected.is_empty() && pump.failed.is_empty());
+        assert!(
+            pump.encoded.len() > 1,
+            "40 KiB needs several envelope-sized chunks"
+        );
+        for envelope in &pump.encoded {
+            assert!(
+                envelope.len() <= payloads::MAX_ENVELOPE,
+                "each chunk fits the packet envelope"
+            );
+            assert!(payloads::is_chunk_envelope(envelope));
+        }
+        // The server's read loop feeds the chunks to one assembler.
+        let mut server = payloads::ChunkAssembler::new();
+        let mut joined = Vec::new();
+        for envelope in &pump.encoded {
+            if let Some(frame) = server.push(envelope).unwrap() {
+                joined.push(frame);
+            }
+        }
+        assert_eq!(joined.len(), 1, "one frame, not one per chunk");
+        let (decoded, used) = PayloadFrame::decode(&joined[0]).unwrap();
+        assert_eq!(used, joined[0].len());
+        assert_eq!(decoded.direction(), PayloadDirection::PlayToServer);
+        assert_eq!(decoded.bytes(), &bytes[..]);
+        assert!(link.outgoing().is_empty(), "no queued copy is left behind");
+    }
+
+    /// A 40 KiB frame from the server reaches the client's link whole: the
+    /// chunks are joined before dispatch, and only the last one completes it.
+    #[test]
+    fn a_frame_above_the_envelope_reaches_the_client_whole() {
+        let (bytes, envelopes) =
+            frame_chunks("demo:down", PayloadDirection::PlayToClient, 40 * 1024);
+        assert!(envelopes.len() > 1);
+        let mut link = opaque_client_link();
+        let mut chunks = payloads::ChunkAssembler::new();
+        let mut completed = 0;
+        for (n, envelope) in envelopes.iter().enumerate() {
+            let done = receive_payload(&mut link, &mut chunks, envelope).unwrap();
+            assert_eq!(
+                done,
+                n + 1 == envelopes.len(),
+                "only the last chunk completes the frame"
+            );
+            completed += usize::from(done);
+        }
+        assert_eq!(completed, 1);
+        assert!(chunks.is_idle());
+        let incoming = link.take_incoming();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].direction(), PayloadDirection::PlayToClient);
+        assert_eq!(incoming[0].bytes(), &bytes[..]);
+    }
+
+    /// A frame within the envelope is unchanged on the wire in both
+    /// directions: one body, the frame's own encoding, never a chunk.
+    #[test]
+    fn a_small_frame_is_unchanged() {
+        let small = PayloadFrame::new("demo:up", PayloadDirection::PlayToServer, b"hi".to_vec())
+            .unwrap()
+            .encode();
+        let mut link = opaque_client_link();
+        let mut pending = vec![
+            PayloadFrame::new("demo:up", PayloadDirection::PlayToServer, b"hi".to_vec()).unwrap(),
+        ];
+        let pump = pump_client_payloads(&mut link, 256, 256, &mut |_| Ok(true), &mut |max| {
+            pending.drain(..max.min(pending.len())).collect()
+        });
+        assert_eq!(
+            pump.encoded,
+            vec![small.clone()],
+            "one v1 body, byte for byte"
+        );
+        assert!(!payloads::is_chunk_envelope(&pump.encoded[0]));
+
+        // The same holds coming back: a whole frame is not a chunk.
+        let down = PayloadFrame::new("demo:down", PayloadDirection::PlayToClient, b"hi".to_vec())
+            .unwrap()
+            .encode();
+        let mut link = opaque_client_link();
+        let mut chunks = payloads::ChunkAssembler::new();
+        assert!(receive_payload(&mut link, &mut chunks, &down).unwrap());
+        assert!(chunks.is_idle());
+        let incoming = link.take_incoming();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].bytes(), b"hi");
+    }
+
+    /// A chunk sequence that skips, repeats, runs past its total or names an
+    /// undeclared frame rejects; the assembler resets, so the next frame
+    /// after the bad one still arrives.
+    #[test]
+    fn a_malformed_chunk_sequence_rejects_and_resets() {
+        let (bytes, envelopes) =
+            frame_chunks("demo:down", PayloadDirection::PlayToClient, 100 * 1024);
+        assert!(envelopes.len() >= 3, "the test needs a skipped chunk");
+        let mut link = opaque_client_link();
+        // Out of order: chunk 2 arrives where chunk 1 was due.
+        let mut chunks = payloads::ChunkAssembler::new();
+        assert!(!receive_payload(&mut link, &mut chunks, &envelopes[0]).unwrap());
+        assert!(!chunks.is_idle());
+        assert!(receive_payload(&mut link, &mut chunks, &envelopes[2]).is_err());
+        assert!(chunks.is_idle(), "the bad transfer is dropped");
+        assert!(link.incoming().is_empty());
+
+        // A whole frame mid-transfer is a restart: the stale chunks go.
+        let mut chunks = payloads::ChunkAssembler::new();
+        assert!(!receive_payload(&mut link, &mut chunks, &envelopes[0]).unwrap());
+        let whole = PayloadFrame::new("demo:down", PayloadDirection::PlayToClient, b"x".to_vec())
+            .unwrap()
+            .encode();
+        assert!(receive_payload(&mut link, &mut chunks, &whole).is_err());
+        assert!(chunks.is_idle());
+
+        // A chunk of a frame the link refuses (undeclared here) resets too.
+        let (_, unknown) =
+            frame_chunks("demo:elsewhere", PayloadDirection::PlayToClient, 40 * 1024);
+        let mut chunks = payloads::ChunkAssembler::new();
+        let mut last = Ok(false);
+        for envelope in &unknown {
+            last = receive_payload(&mut link, &mut chunks, envelope);
+        }
+        assert!(last.is_err(), "the undeclared frame is refused");
+        assert!(chunks.is_idle());
+
+        // The connection still carries a complete frame afterwards.
+        let mut chunks = payloads::ChunkAssembler::new();
+        let mut joined = Vec::new();
+        for envelope in &envelopes {
+            if receive_payload(&mut link, &mut chunks, envelope).unwrap() {
+                joined.push(());
+            }
+        }
+        assert_eq!(joined.len(), 1);
+        assert_eq!(link.take_incoming()[0].bytes(), &bytes[..]);
+    }
+
+    /// The per-tick cap counts frames, not chunks: a tick sends whole frames
+    /// and leaves the rest queued, so no transfer is left half-sent.
+    #[test]
+    fn the_per_tick_cap_still_holds_for_chunked_frames() {
+        let (bytes, envelopes) = frame_chunks("demo:up", PayloadDirection::PlayToServer, 40 * 1024);
+        let per_frame = envelopes.len();
+        let mut link = opaque_client_link();
+        let mut pending: Vec<PayloadFrame> = (0..3)
+            .map(|_| {
+                PayloadFrame::new("demo:up", PayloadDirection::PlayToServer, bytes.clone()).unwrap()
+            })
+            .collect();
+        let pump = pump_client_payloads(&mut link, 256, 2, &mut |_| Ok(true), &mut |max| {
+            pending.drain(..max.min(pending.len())).collect()
+        });
+        assert_eq!(pump.encoded.len(), 2 * per_frame);
+        assert_eq!(pending.len(), 1, "the third frame waits for the next tick");
+        let mut server = payloads::ChunkAssembler::new();
+        let mut joined = 0;
+        for envelope in &pump.encoded {
+            if server.push(envelope).unwrap().is_some() {
+                joined += 1;
+            }
+        }
+        assert_eq!(joined, 2, "both frames arrive complete, in order");
+        assert!(server.is_idle());
     }
 
     /// With no handler jar the frame is consumed and recorded as unhandled;
