@@ -603,6 +603,7 @@ def expect_mixin_probe(archive: Path) -> dict | None:
             "server": ["demo.ServerMixin"],
             "required": False,
             "priority": 1500,
+            "mixin_priority": None,
         }
     ]
     status, plans_report, output = probe_json(archive, "--mixin-plans")
@@ -869,7 +870,7 @@ def main() -> int:
         # The Mixin jar declares an ordinary entrypoint, so the same classes
         # serve the plan report and a normal execution run.  Its Fabric
         # ``mixins`` list names the root config, which carries every modelled
-        # field; a second root config is malformed on purpose.
+        # field, and a second declared config that is malformed on purpose.
         (mixin_metadata / "fabric.mod.json").write_text(
             json.dumps(
                 {
@@ -878,7 +879,7 @@ def main() -> int:
                     "version": "1.0.0",
                     "depends": {"minecraft": "26.3", "fabricloader": "*"},
                     "entrypoints": {"main": ["demo.MixinEntry"]},
-                    "mixins": ["demo.mixins.json"],
+                    "mixins": ["demo.mixins.json", "broken.mixins.json"],
                 }
             ),
             encoding="utf-8",
