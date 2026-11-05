@@ -2,7 +2,7 @@
 //! assets (`content_root`), and the Mods page's rows. Code mods are native
 //! (`native_hooks.rs`); WebAssembly code mods don't run any more. The opt-in
 //! real NeoForge loader preflight is `fml.rs`.
-use super::{execution_role::ExecutionRole, Game};
+use super::{Game, execution_role::ExecutionRole};
 use horizon_client::{
     mod_content::{self, ContentMod, DeclarationSummary},
     mod_list::{self, Installed},
