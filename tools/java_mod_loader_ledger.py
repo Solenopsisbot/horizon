@@ -144,6 +144,7 @@ def run_batch(binary: Path, game: Path, loader: Path, libs: Path, jars: list[Pat
         env.update({
             "HORIZON_REAL_LAUNCH": "1",
             "HORIZON_NO_AUDIO": "1",
+            "HORIZON_LAUNCH_STOP_AT_DONE": "1",
             "HORIZON_MINECRAFT_JAR": str(game),
             "FABRIC_LOADER_JAR": str(loader),
             "FABRIC_LIBS_DIR": str(libs),

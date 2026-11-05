@@ -1511,7 +1511,8 @@ fn run() -> Result<(), String> {
         .version(JNIVersion::V8)
         .option(format!("-Djava.class.path={paths}"))
         .option(&heap)
-        .option("-Djava.awt.headless=true");
+        .option("-Djava.awt.headless=true")
+        .option("-XX:+StartAttachListener");
     // Mixin reads its config list at launch time, so the property has to be in
     // the JVM options rather than set after `JavaVM::new`.
     for option in mixin_jvm_options(mixin_property.as_deref()) {
@@ -2078,6 +2079,19 @@ fn asm_readiness(libs: &Path) -> Option<String> {
     }
 }
 
+/// The port the scratch server.properties names (the readiness probe connects to it).
+fn launch_server_port(game: &Path) -> u16 {
+    fs::read_to_string(game.join("server.properties"))
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix("server-port=")
+                    .and_then(|value| value.trim().parse::<u16>().ok())
+            })
+        })
+        .unwrap_or(25565)
+}
+
 fn seed_launch_game_files(game: &Path, accept_eula: bool) -> Result<(), String> {
     let properties = game.join("server.properties");
     if !properties.exists() {
@@ -2227,6 +2241,15 @@ fn run_launch_game_child(accept_eula: bool) -> Result<String, String> {
     }
     let timeout = launch_timeout();
     let deadline = std::time::Instant::now() + timeout;
+    // A server that is up never exits on its own; a caller that only needs the
+    // readiness line (the corpus ledgers, CI) stops the child at "Done (".
+    // The game logs it to its own latest.log, not the parent's stdout.
+    let stop_at_done = std::env::var("HORIZON_LAUNCH_STOP_AT_DONE").as_deref() == Ok("1");
+    let ready_port = launch_server_port(&homes.game);
+    let ready_addr = std::net::SocketAddr::from(([127, 0, 0, 1], ready_port));
+    let done_log = homes.game.join("logs").join("latest.log");
+    let mut done_log_len = 0u64;
+    let mut stopped_at_done = false;
     let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
@@ -2239,6 +2262,32 @@ fn run_launch_game_child(accept_eula: bool) -> Result<String, String> {
                     let _ = reader.join();
                 }
                 return Err(format!("launch child: {error}"));
+            }
+        }
+        if stop_at_done {
+            // The one signal that cannot lie: the server accepts connections.
+            // "Done" may only reach the game's own log, and that log is not
+            // written in every configuration.
+            let mut done = std::net::TcpStream::connect_timeout(
+                &ready_addr,
+                std::time::Duration::from_millis(50),
+            )
+            .is_ok();
+            if !done {
+                done = stdout_capture.text().contains("Done (");
+            }
+            if !done {
+                if let Ok(meta) = std::fs::metadata(&done_log) {
+                    if meta.len() != done_log_len {
+                        done_log_len = meta.len();
+                        done = log_tail_contains(&done_log, "Done (");
+                    }
+                }
+            }
+            if done {
+                stopped_at_done = true;
+                kill_launch_process_group(&mut child);
+                break child.wait().ok();
             }
         }
         if std::time::Instant::now() >= deadline {
@@ -2263,7 +2312,8 @@ fn run_launch_game_child(accept_eula: bool) -> Result<String, String> {
             .load(std::sync::atomic::Ordering::Relaxed);
     let explicit = launch_status_line(&stdout).or_else(|| launch_status_line(&stderr));
     let status = match explicit {
-        Some(value) if value != "started" => value,
+        Some(value) if value != "started" && !stopped_at_done => value,
+        _ if stopped_at_done => "exit 0".to_owned(),
         _ if timed_out => format!("failed timed out after {}s", timeout.as_secs()),
         _ if started => exit_status_value(status.as_ref()),
         _ => {
@@ -2290,6 +2340,27 @@ fn run_launch_game_child(accept_eula: bool) -> Result<String, String> {
         }
     }
     Ok(bounded_classpath_unlock(&status))
+}
+
+/// Whether the last part of a log file contains `needle` (the game's readiness
+/// line is written to its own log, not necessarily the parent's stdout).
+fn log_tail_contains(path: &std::path::Path, needle: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let start = meta.len().saturating_sub(256 * 1024);
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut bytes = Vec::new();
+    if file.take(256 * 1024).read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    String::from_utf8_lossy(&bytes).contains(needle)
 }
 
 /// `exit <code>` / `failed <signal>` for a child that did start.
@@ -2385,7 +2456,8 @@ fn run_datagen(
         .version(JNIVersion::V8)
         .option(format!("-Djava.class.path={}", paths.to_string_lossy()))
         .option(heap)
-        .option("-Djava.awt.headless=true");
+        .option("-Djava.awt.headless=true")
+        .option("-XX:+StartAttachListener");
     for option in datagen_jvm_options(output) {
         init = init.option(option);
     }
