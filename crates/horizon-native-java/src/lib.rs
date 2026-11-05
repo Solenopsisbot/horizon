@@ -5,6 +5,7 @@
 //! outside the loaded jar cross [`Host`], so unsupported behavior is explicit.
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -7141,6 +7142,31 @@ fn enum_ordinal(value: &Value) -> i32 {
         "SERVER" => 1,
         _ => 0,
     }
+}
+
+/// The captured values of one `invokedynamic` site, as one bounded marker.
+///
+/// A string-concat site captures the previous concat's marker, so its text
+/// would double at every link of a chain: a config writer that joins a few
+/// hundred keys reached a gigabyte before the bound. Transcribing the head is
+/// enough to name the site, and the bound keeps the chain flat.
+fn bounded_captured_markers(values: &[Value]) -> String {
+    const MAX_MARKER_CHARS: usize = 4096;
+    let mut text = String::new();
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            text.push(',');
+        }
+        let marker = value_marker(value);
+        let room = MAX_MARKER_CHARS.saturating_sub(text.chars().count());
+        if marker.chars().count() > room {
+            text.extend(marker.chars().take(room));
+            text.push('\u{2026}');
+            break;
+        }
+        text.push_str(&marker);
+    }
+    text
 }
 
 fn value_marker(value: &Value) -> String {
@@ -15313,11 +15339,7 @@ impl<H: Host> Runtime<'_, H> {
                     let marker = format!(
                         "@indy:{class}#{method}:{index}:{}:{}",
                         target.as_deref().unwrap_or("?"),
-                        captured
-                            .iter()
-                            .map(value_marker)
-                            .collect::<Vec<_>>()
-                            .join(",")
+                        bounded_captured_markers(&captured)
                     );
                     if return_desc(&descriptor) != "V" {
                         stack.push(Value::Ref(Some(marker)));
@@ -15895,6 +15917,64 @@ fn utf8(pool: &[Cp], index: u16) -> Result<String, NativeError> {
     }
 }
 
+/// Rewrite raw control characters inside JSON string literals as escapes.
+///
+/// Fabric reads `fabric.mod.json` with Gson's lenient parser, which accepts an
+/// unescaped newline or tab inside a string. Real jars put a multiline
+/// `description` there, and a strict parser rejects the whole document, so the
+/// jar loads with no id and no entrypoints. The rewrite only touches characters
+/// inside a string literal and escapes them as JSON requires, so a valid
+/// document is returned unchanged.
+fn lenient_json_text(text: &str) -> Cow<'_, str> {
+    let mut out = String::new();
+    let mut changed = false;
+    let mut in_string = false;
+    let mut escaped = false;
+    for value in text.chars() {
+        if !in_string {
+            if value == '"' {
+                in_string = true;
+            }
+            out.push(value);
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            out.push(value);
+            continue;
+        }
+        match value {
+            '\\' => {
+                escaped = true;
+                out.push(value);
+            }
+            '"' => {
+                in_string = false;
+                out.push(value);
+            }
+            value if (value as u32) < 0x20 => {
+                changed = true;
+                match value {
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    '\u{0008}' => out.push_str("\\b"),
+                    '\u{000C}' => out.push_str("\\f"),
+                    value => {
+                        out.push_str(&format!("\\u{:04x}", value as u32));
+                    }
+                }
+            }
+            value => out.push(value),
+        }
+    }
+    if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 fn parse_metadata(
     text: &str,
 ) -> Result<
@@ -15906,8 +15986,8 @@ fn parse_metadata(
     ),
     NativeError,
 > {
-    let v: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| NativeError::Metadata(e.to_string()))?;
+    let v: serde_json::Value = serde_json::from_str(&lenient_json_text(text))
+        .map_err(|e| NativeError::Metadata(e.to_string()))?;
     let id = v.get("id").and_then(|x| x.as_str()).map(str::to_owned);
     let version = v.get("version").and_then(|x| match x {
         serde_json::Value::String(s) => Some(s.to_owned()),
@@ -15979,7 +16059,7 @@ fn parse_metadata(
 /// files eligible for the fallback; `Some([])` is a declaration that loads
 /// nothing.
 fn fabric_mixin_config_paths(text: &str) -> Option<Vec<String>> {
-    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&lenient_json_text(text)).ok()?;
     let mixins = value.get("mixins")?;
     let values = match mixins {
         serde_json::Value::Array(values) => values.clone(),
@@ -19158,6 +19238,58 @@ mod tests {
                 Vec::<String>::new(),
             )
         );
+    }
+
+    #[test]
+    fn invokedynamic_captures_stay_bounded_across_concat_chains() {
+        // One captured marker is transcribed up to the bound, never whole.
+        let captured = bounded_captured_markers(&[Value::Ref(Some("x".repeat(1 << 20)))]);
+        assert_eq!(
+            captured.chars().count(),
+            4097,
+            "4096 transcribed + ellipsis"
+        );
+        assert!(captured.ends_with('\u{2026}'), "{captured}");
+
+        // A concat site captures the previous concat's marker text, so a real
+        // chain nests. Each link adds one bounded prefix instead of doubling:
+        // transcription used to grow without limit here.
+        let mut value = Value::Ref(Some("x".repeat(64)));
+        for _ in 0..64 {
+            let captured = bounded_captured_markers(std::slice::from_ref(&value));
+            value = Value::Ref(Some(format!("@indy:demo/C#m:0:?:{captured}")));
+        }
+        let Value::Ref(Some(marker)) = &value else {
+            panic!("expected a marker");
+        };
+        assert!(
+            marker.chars().count() < 64 * (4096 + 128),
+            "{}",
+            marker.chars().count()
+        );
+    }
+
+    #[test]
+    fn metadata_accepts_a_raw_control_character_inside_a_string() {
+        // Gson's lenient parser, which Fabric reads the metadata with, accepts
+        // the multiline `description` real jars ship. A strict parser rejects
+        // the whole document, losing the id, the entrypoints and the configs.
+        let text = "{\n\t\"schemaVersion\": 1,\n\t\"id\": \"weaponmaster\",\n\t\"version\": \"4.4.3\",\n\t\"description\": \"first line\nsecond line\twith a tab\",\n\t\"entrypoints\": {\"main\": [\"demo.Main\"]},\n\t\"mixins\": [\"demo.mixins.json\"]\n}";
+        let (id, version, entrypoints, _) = parse_metadata(text).unwrap();
+        assert_eq!(id.as_deref(), Some("weaponmaster"));
+        assert_eq!(version.as_deref(), Some("4.4.3"));
+        assert_eq!(entrypoints["main"][0].class, "demo.Main");
+        assert_eq!(
+            fabric_mixin_config_paths(text),
+            Some(vec!["demo.mixins.json".to_owned()])
+        );
+        // A valid document is returned unchanged.
+        assert!(matches!(
+            lenient_json_text(r#"{"id":"demo"}"#),
+            Cow::Borrowed(_)
+        ));
+        let error = parse_metadata(r#"{"id" "demo"}"#).unwrap_err();
+        assert!(matches!(error, NativeError::Metadata(_)), "{error}");
     }
 
     #[test]
