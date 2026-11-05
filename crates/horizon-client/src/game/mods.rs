@@ -212,11 +212,12 @@ impl JavaLoader {
 /// and so a report that carries one can be tested without the fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum JavaEngine {
-    /// The jar's own supported bytecode ran through `horizon-native-java`, and
-    /// nothing in its execution, hooks or declarations needed the fallback.
+    /// The jar's own supported bytecode ran through `horizon-native-java`, every
+    /// Mixin plan it declares was woven into it at load, and nothing in its
+    /// execution, hooks or declarations needed the fallback.
     Native,
     /// The native interpreter ran the jar, but the jar declared work it cannot
-    /// translate: report-only Mixin plans or configs, or opaque registrations
+    /// translate: Mixin plans or configs left unapplied, or opaque registrations
     /// that no typed declaration promoted. The jar still ran natively; the
     /// label only stops that partial result from counting as full coverage.
     NativeQualified,
@@ -240,7 +241,21 @@ impl JavaEngine {
 
     /// The engine a report's own fields describe. See [`JavaEngine`] for why the
     /// result never feeds back into the loader.
+    ///
+    /// The fields alone cannot say a plan was woven, so this counts every plan
+    /// as unapplied. The loader states the woven verdict through
+    /// [`Self::of_weave`]; a report it never ran keeps this safe reading.
     fn of_report(report: &JavaCompatibilityReport) -> Self {
+        Self::decide(report, report.mixin_plans > 0)
+    }
+
+    /// The engine a jar the loader ran and wove earned: plain native exactly when
+    /// the weave left no Mixin work behind.
+    fn of_weave(report: &JavaCompatibilityReport, mixin: &MixinPlanning) -> Self {
+        Self::decide(report, !mixin.fully_applied())
+    }
+
+    fn decide(report: &JavaCompatibilityReport, unapplied_mixins: bool) -> Self {
         if report.client_side_only_rejected {
             Self::Refused
         } else if report.isolation_failure.is_some() {
@@ -248,10 +263,7 @@ impl JavaEngine {
             // class, method and program counter; those keep counting as the
             // JVM fallback's, so this is a partial native result.
             Self::NativeQualified
-        } else if report.mixin_plans > 0
-            // The game path currently records Mixin plans but does not weave
-            // them into Horizon's Rust-owned targets. Keep such jars visibly
-            // qualified until a production hook consumes the plan.
+        } else if unapplied_mixins
             || report.mixin_unresolved > 0
             || report.mixin_config_errors > 0
             || !report.opaque_registrations.is_empty()
@@ -273,11 +285,28 @@ fn role_name(role: ExecutionRole) -> &'static str {
     }
 }
 
+/// The side a jar's Mixin configs are read for: the one [`seeded_native_host`]
+/// tells the mod it is on, so its code and its mixins agree. Real Mixin follows
+/// the physical side, but Horizon's integrated server is its own host that runs
+/// `server` entrypoints and reports `SERVER`.
+fn mixin_side(role: ExecutionRole) -> horizon_native_java::MixinSide {
+    match role {
+        ExecutionRole::Client => horizon_native_java::MixinSide::Client,
+        ExecutionRole::IntegratedServer | ExecutionRole::DedicatedServer => {
+            horizon_native_java::MixinSide::Server
+        }
+    }
+}
+
 /// The Mixin translation planning one jar declares, as a report keeps it: the
-/// plans the bounded runtime would weave, the methods they hook (sorted and
-/// bounded), the selectors it could not read, and the configs it read. Scanned
-/// once per jar, so the window, its server thread and the dedicated server
-/// report the same numbers.
+/// plans it declares, the methods they hook (sorted and bounded), the selectors
+/// the bounded runtime could not read, the configs it read, and what the load
+/// weave did with all of that. Scanned once per jar, so the window, its server
+/// thread and the dedicated server report the same numbers.
+///
+/// The weave's counts are logged from here rather than kept on
+/// [`JavaCompatibilityReport`]: the report carries the verdict they earn, as its
+/// stored engine label.
 #[derive(Debug, Default, Clone)]
 pub(super) struct MixinPlanning {
     pub(super) plans: usize,
@@ -285,6 +314,13 @@ pub(super) struct MixinPlanning {
     pub(super) unresolved: usize,
     pub(super) configs: usize,
     pub(super) config_errors: usize,
+    /// Plans now in the jar's bytecode. Zero for a jar never woven.
+    pub(super) woven: usize,
+    /// Mixin work that does not run: plans, other plan families and listed
+    /// classes the weave could not apply.
+    pub(super) skipped: usize,
+    /// Why, one row per skipped item, sorted and bounded.
+    pub(super) skip_reasons: Vec<String>,
 }
 
 impl MixinPlanning {
@@ -302,7 +338,51 @@ impl MixinPlanning {
             unresolved: jar.unresolved_invoke_plans().len(),
             configs: jar.mixin_configs().len(),
             config_errors: jar.mixin_config_errors().len(),
+            woven: 0,
+            skipped: 0,
+            skip_reasons: Vec::new(),
         }
+    }
+
+    /// This planning with the outcome of the jar's load weave recorded.
+    fn with_weave(mut self, weave: &horizon_native_java::LoadTimeMixinWeave) -> Self {
+        self.woven = weave.woven.len();
+        self.skipped = weave.skipped.len();
+        self.skip_reasons = bounded_sorted(weave.skipped.iter().map(ToString::to_string));
+        self
+    }
+
+    /// Whether everything the jar's mixins ask for is in its bytecode.
+    fn fully_applied(&self) -> bool {
+        self.skipped == 0 && self.woven == self.plans
+    }
+
+    /// The startup line for this jar's weave, a warning when anything stayed
+    /// out. `None` for a jar with no Mixin work, so it logs what it always did.
+    fn weave_line(&self, path: &std::path::Path) -> Option<(log::Level, String)> {
+        if self.woven == 0 && self.skipped == 0 {
+            return None;
+        }
+        let mut line = format!(
+            "Horizon: Java compatibility {}: mixin weave: {} woven, {} skipped",
+            path.display(),
+            self.woven,
+            self.skipped,
+        );
+        if self.skipped == 0 {
+            return Some((log::Level::Info, line));
+        }
+        // No JVM fallback is wired into the game, so skipped work simply does
+        // not run while the rest of the jar does.
+        line.push_str(&format!(
+            "; skipped Mixin work does not run: [{}]",
+            self.skip_reasons.join(", ")
+        ));
+        let more = self.skipped.saturating_sub(self.skip_reasons.len());
+        if more > 0 {
+            line.push_str(&format!(" (+{more} more)"));
+        }
+        Some((log::Level::Warn, line))
     }
 }
 
@@ -332,14 +412,15 @@ pub(super) struct JavaCompatibilityReport {
     pub(super) promoted: Vec<String>,
     pub(super) payload_directions: Vec<String>,
     pub(super) listeners: usize,
-    /// `@Inject` plans the bounded runtime would weave, counted as translation
-    /// planning rather than weaving: nothing is patched into a class.
+    /// `@Inject` plans the jar declares. A woven jar keeps reporting them, because
+    /// its `@Mixin` classes are unchanged; the load weave applies the bounded
+    /// subset, and [`Self::engine`] says whether that was all of them.
     pub(super) mixin_plans: usize,
     /// The methods those plans hook, `owner#name(descriptor)`, sorted and
     /// bounded like every other list here.
     pub(super) mixin_targets: Vec<String>,
     /// `@At("INVOKE")` plans whose call site the bounded runtime cannot read,
-    /// so they stay on the JVM fallback instead of a guessed target.
+    /// so they do not run rather than hook a guessed target.
     pub(super) mixin_unresolved: usize,
     /// Mixin JSON configs the jar declares and this runtime could read.
     pub(super) mixin_configs: usize,
@@ -352,8 +433,9 @@ pub(super) struct JavaCompatibilityReport {
     /// ran. `None` for a jar that ran or was refused.
     pub(super) isolation_failure: Option<String>,
     pub(super) role: ExecutionRole,
-    /// Which engine executed the jar. `None` when a stored report predates the
-    /// field; callers read [`Self::engine`], never this directly.
+    /// Which engine executed the jar, stated by whoever knows more than the other
+    /// fields can say: a refusal, a sidecar run, a jar the loader wove. `None`
+    /// leaves [`Self::engine`] to the fields; callers read that, never this.
     pub(super) engine: Option<JavaEngine>,
 }
 
@@ -370,6 +452,8 @@ struct NativeRunFacts<'a> {
     typed: usize,
     promoted: Vec<String>,
     rejected: bool,
+    /// The jar's planning with its load weave recorded, for a jar that ran.
+    mixin: Option<&'a MixinPlanning>,
 }
 
 impl JavaCompatibilityReport {
@@ -394,8 +478,11 @@ impl JavaCompatibilityReport {
         promoted.truncate(MAX_REPORT_ROWS);
         // Mixin planning comes from the jar's annotations and configs, so a
         // refused jar reports what it would have woven just like a run one.
-        let mixin = MixinPlanning::of(Some(jar));
-        Self {
+        let woven = facts.mixin;
+        let mixin = woven
+            .cloned()
+            .unwrap_or_else(|| MixinPlanning::of(Some(jar)));
+        let mut report = Self {
             jar: path.to_owned(),
             id: native_mod_id(jar, path).map(str::to_owned),
             version: native_mod_version(jar).map(str::to_owned),
@@ -423,7 +510,9 @@ impl JavaCompatibilityReport {
             isolation_failure: None,
             role,
             engine: None,
-        }
+        };
+        report.engine = woven.map(|mixin| JavaEngine::of_weave(&report, mixin));
+        report
     }
 
     /// The engine this report describes. A stored label wins (so a sidecar run
@@ -501,7 +590,7 @@ impl JavaCompatibilityReport {
             return None;
         }
         Some(format!(
-            "Horizon: native Java {} has {} unresolved Mixin plan(s) and {} unreadable Mixin config(s); those stay on the JVM fallback",
+            "Horizon: native Java {} has {} unresolved Mixin plan(s) and {} unreadable Mixin config(s); those do not run",
             self.jar.display(),
             self.mixin_unresolved,
             self.mixin_config_errors,
@@ -746,6 +835,23 @@ fn aggregate_line(reports: &[JavaCompatibilityReport], summary: &DeclarationSumm
     )
 }
 
+/// The run's weave totals, one line beside the aggregate. Left off when no jar
+/// had Mixin work, so a run of plain jars logs exactly the lines it always did.
+fn mixin_weave_line(plannings: &[MixinPlanning]) -> Option<String> {
+    let woven = plannings.iter().map(|mixin| mixin.woven).sum::<usize>();
+    let skipped = plannings.iter().map(|mixin| mixin.skipped).sum::<usize>();
+    if woven == 0 && skipped == 0 {
+        return None;
+    }
+    let jars = plannings
+        .iter()
+        .filter(|mixin| mixin.woven > 0 || mixin.skipped > 0)
+        .count();
+    Some(format!(
+        "Horizon: Java compatibility: mixin weave: {woven} woven, {skipped} skipped across {jars} jar(s)"
+    ))
+}
+
 /// Every [`JavaEngine`] label and how many of `reports` it describes, in the
 /// order the enum names them. Fixed, so a run with no jars prints `native=0`
 /// rather than leaving a reader to guess whether the field was missing.
@@ -820,6 +926,35 @@ fn isolation_startup_error(reports: &[JavaCompatibilityReport], strict: bool) ->
             .as_deref()
             .unwrap_or("non-string panic payload"),
     ))
+}
+
+/// The report and log lines for a jar whose weave or entrypoints panicked. Its
+/// engine stays to the report's fields, where the failure qualifies it.
+fn isolated_jar_report(
+    jar: &horizon_native_java::NativeJar,
+    path: &std::path::Path,
+    role: ExecutionRole,
+    kind: &str,
+    message: &str,
+) -> JavaCompatibilityReport {
+    let mut report = JavaCompatibilityReport::new(
+        jar,
+        path,
+        role,
+        NativeRunFacts {
+            kind,
+            ..NativeRunFacts::default()
+        },
+    );
+    report.isolation_failure = Some(bounded_isolation_message(message));
+    for line in report.summary() {
+        log::warn!("{line}");
+    }
+    log::warn!(
+        "Horizon: native Java {} was isolated after a panic; later jars still run",
+        path.display()
+    );
+    report
 }
 
 /// Runs one jar's native execution, turning a panic into its bounded message
@@ -926,6 +1061,7 @@ pub(super) fn run_java_mods_with_report(
     };
     let mut native_content = Vec::new();
     let mut payload_declarations = Vec::new();
+    let mut mixin_plannings = Vec::new();
     horizon_client::lan::payloads::clear_handler_jars();
     for path in paths {
         let jar = horizon_native_java::NativeJar::from_path(path)
@@ -983,6 +1119,24 @@ pub(super) fn run_java_mods_with_report(
                 path.display()
             ));
         }
+        // Weave at load so every later use of this jar, entrypoints and resident
+        // callbacks alike, runs the rewritten classes. The weaver parses the
+        // mod's own bytes, so a panic in it fails this jar and no other.
+        let weave = match isolate_jar(|| jar.plan_load_time_weave(mixin_side(role))) {
+            Ok(weave) => weave,
+            Err(message) => {
+                reports.push(isolated_jar_report(&jar, path, role, kind, &message));
+                continue;
+            }
+        };
+        let mixin = MixinPlanning::of(Some(&jar)).with_weave(&weave);
+        if let Some((level, line)) = mixin.weave_line(path) {
+            log::log!(level, "{line}");
+        }
+        mixin_plannings.push(mixin.clone());
+        let jar = jar
+            .with_woven_classes(&weave.classes)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
         // The interpreter and the host callbacks it reaches are mod code: a
         // panic in them fails this jar, not the game or the server thread.
         let execution = isolate_jar(|| {
@@ -1003,24 +1157,7 @@ pub(super) fn run_java_mods_with_report(
             // A refused entrypoint stays the startup error it always was.
             Ok(Err(error)) => return Err(error),
             Err(message) => {
-                let mut report = JavaCompatibilityReport::new(
-                    &jar,
-                    path,
-                    role,
-                    NativeRunFacts {
-                        kind,
-                        ..NativeRunFacts::default()
-                    },
-                );
-                report.isolation_failure = Some(bounded_isolation_message(&message));
-                for line in report.summary() {
-                    log::warn!("{line}");
-                }
-                log::warn!(
-                    "Horizon: native Java {} was isolated after a panic; later jars still run",
-                    path.display()
-                );
-                reports.push(report);
+                reports.push(isolated_jar_report(&jar, path, role, kind, &message));
                 continue;
             }
         };
@@ -1107,6 +1244,7 @@ pub(super) fn run_java_mods_with_report(
                 typed: entries.len(),
                 promoted,
                 rejected: false,
+                mixin: Some(&mixin),
             },
         );
         if !entries.is_empty() {
@@ -1143,6 +1281,9 @@ pub(super) fn run_java_mods_with_report(
         log::info!("{line}");
     }
     log::info!("{}", aggregate_line(&reports, &summary));
+    if let Some(line) = mixin_weave_line(&mixin_plannings) {
+        log::info!("{line}");
+    }
     if let Some(line) = isolation_summary(&reports) {
         log::warn!("{line}");
     }
@@ -1878,6 +2019,7 @@ clientSideOnly = true
                 typed: 1,
                 promoted: vec!["minecraft:item/demo:gem".into()],
                 rejected: false,
+                mixin: None,
             },
         );
         let lines = vec![
@@ -2171,7 +2313,7 @@ clientSideOnly = true
         assert_eq!(
             untranslatable.mixin_warning().as_deref(),
             Some(
-                "Horizon: native Java /mods/demo.jar has 1 unresolved Mixin plan(s) and 2 unreadable Mixin config(s); those stay on the JVM fallback"
+                "Horizon: native Java /mods/demo.jar has 1 unresolved Mixin plan(s) and 2 unreadable Mixin config(s); those do not run"
             )
         );
     }
