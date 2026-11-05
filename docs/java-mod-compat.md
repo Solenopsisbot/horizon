@@ -440,11 +440,21 @@ the target's default value, and the report says `cancelled`. RETURN/TAIL callbac
 requires the returnable marker. `@At(value = "INVOKE", target = ...)` plans resolve descriptor,
 `owner.method(...)` and `owner#name` selectors; the interpreter runs their hooks before the matched call, and a
 cancellable hook suppresses that call and returns the descriptor default. Unparseable selectors stay
-report-only. `--mixin-plans` reports the same plans without running an entrypoint. This is planning and
-bounded native invocation, and a first classfile writer now re-emits parsed classes byte-for-byte and weaves
-HEAD callbacks into straight-line methods with no `CallbackInfo`, branches, exception table or stack-map
-frames. `@Redirect`, `@ModifyArg`/`@ModifyVariable`, `FIELD`/`NEW`/`JUMP`, slices, ordinal selectors and every
-method outside that subset still take the interpreter or JVM path.
+report-only. `--mixin-plans` reports the same plans without running an entrypoint.
+
+The game's loader weaves one narrow subset when it loads a jar: a non-cancellable `@Inject` at `HEAD` whose
+target method is in the jar, whose callback is static, and whose `@Mixin` class a readable config applies on
+the side the host reports. It runs the rewritten classes, logs woven and skipped counts with bounded reasons,
+and labels the jar `native` only when nothing was skipped. Callbacks run in Mixin's apply order: `@Mixin`
+priority, then config priority and list position, then method order in the class.
+
+That subset reaches fixtures, not real mods. Real `@Mixin` has `CLASS` retention and the parser reads
+runtime-visible annotations, so a real jar reports no plans and its listed classes count as skipped:
+`lithium-fabric` lists 293 and all are skipped. Real callbacks are also instance methods taking `CallbackInfo`,
+which the weaver rejects, and their targets are Minecraft classes outside the jar. Cancellable `HEAD`,
+`RETURN`/`TAIL`, `INVOKE`, `@Redirect`, `@ModifyArg`/`@ModifyVariable`, `FIELD`/`NEW`/`JUMP`, slices, ordinal
+selectors and every method outside that subset run only through the interpreter's own entry points or the
+standalone JVM runner. In a game run they do not run at all, and the jar reads `native-qualified`.
 
 Reproduce:
 
