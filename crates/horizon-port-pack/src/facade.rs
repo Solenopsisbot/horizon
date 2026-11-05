@@ -323,6 +323,15 @@ pub fn generate_many(
                 .iter()
                 .any(|r| neoforge_registration_holders.contains(&r.split('$').next().unwrap_or(r)))
         });
+    // NeoForge entity capability and biome hooks are library classes. Emit
+    // bounded markers only for jars that name one of the event surfaces.
+    let uses_neoforge_entity_events = uses_neoforge
+        && names_any(&[
+            NEOFORGE_ENTITY_JOIN_LEVEL_EVENT,
+            NEOFORGE_REGISTER_CAPABILITIES_EVENT,
+            NEOFORGE_BIOME_MODIFIER,
+            NEOFORGE_ISTORAGE,
+        ]);
     let own: BTreeSet<&str> = target.iter().map(|c| c.name.as_str()).collect();
     // Shapes from dependency jars are real classes on javac/the probe
     // classpaths. Keep their names available when deciding whether a game
@@ -1869,6 +1878,25 @@ pub fn generate_many(
                 ],
                 || fill_client(NEOFORGE_ENTITY_RENDERERS),
             )?;
+        }
+        if uses_neoforge_entity_events {
+            for (class, source) in [
+                (
+                    NEOFORGE_ENTITY_JOIN_LEVEL_EVENT,
+                    NEOFORGE_ENTITY_JOIN_LEVEL_EVENT_SOURCE,
+                ),
+                (
+                    NEOFORGE_REGISTER_CAPABILITIES_EVENT,
+                    NEOFORGE_REGISTER_CAPABILITIES_EVENT_SOURCE,
+                ),
+                (NEOFORGE_BIOME_MODIFIER, NEOFORGE_BIOME_MODIFIER_SOURCE),
+                (NEOFORGE_ISTORAGE, NEOFORGE_ISTORAGE_SOURCE),
+            ] {
+                if available.contains(class) {
+                    continue;
+                }
+                write_shim(&mut files, &src, class, source)?;
+            }
         }
         // NeoForge's model events: `RegisterAdditional` retains the model keys
         // a listener asks for and `ModifyBakingResult` the baked models it hands
@@ -4417,6 +4445,63 @@ public class ModelEvent extends Event {
 /// `net.neoforged.neoforge.attachment.AttachmentType` is absent.
 const NEOFORGE_ATTACHMENT_TYPE: &str = "net/neoforged/neoforge/attachment/AttachmentType";
 
+const NEOFORGE_ENTITY_JOIN_LEVEL_EVENT: &str =
+    "net/neoforged/neoforge/event/entity/EntityJoinLevelEvent";
+const NEOFORGE_REGISTER_CAPABILITIES_EVENT: &str =
+    "net/neoforged/neoforge/capabilities/RegisterCapabilitiesEvent";
+// NeoForge 26.3 puts `BiomeModifier` in `common.world`, next to
+// `ModifiableBiomeInfo`, not in a `common.world.biome` package.
+const NEOFORGE_BIOME_MODIFIER: &str = "net/neoforged/neoforge/common/world/BiomeModifier";
+// Legacy marker: 26.3 NeoForge has no `IStorage` (its transfer API is
+// `net.neoforged.neoforge.transfer.ResourceHandler`). Keep the name for jars
+// built against an older API without claiming a 26.3 class.
+const NEOFORGE_ISTORAGE: &str = "net/neoforged/neoforge/common/capabilities/IStorage";
+
+const NEOFORGE_ENTITY_JOIN_LEVEL_EVENT_SOURCE: &str = r#"package net.neoforged.neoforge.event.entity;
+public class EntityJoinLevelEvent extends net.neoforged.bus.api.Event {
+    private final Object horizonEntity;
+    private final Object horizonLevel;
+    private final boolean horizonLoadedFromDisk;
+    public EntityJoinLevelEvent(Object entity, Object level) { this(entity, level, false); }
+    public EntityJoinLevelEvent(Object entity, Object level, boolean loadedFromDisk) { super(true); this.horizonEntity = entity; this.horizonLevel = level; this.horizonLoadedFromDisk = loadedFromDisk; }
+    public Object getEntity() { return horizonEntity; }
+    public Object getLevel() { return horizonLevel; }
+    public boolean loadedFromDisk() { return horizonLoadedFromDisk; }
+}
+"#;
+
+const NEOFORGE_REGISTER_CAPABILITIES_EVENT_SOURCE: &str = r#"package net.neoforged.neoforge.capabilities;
+public class RegisterCapabilitiesEvent extends net.neoforged.bus.api.Event {
+    private final java.util.List<Object> horizonRegistrations = new java.util.ArrayList<>();
+    private void horizonKeep(Object capability, Object target, Object provider) { horizonRegistrations.add(new Object[] { capability, target, provider }); }
+    public <T> void registerBlock(Object capability, Object provider, Object... blocks) { horizonKeep(capability, blocks, provider); }
+    public <T> void registerBlockEntity(Object capability, Object type, Object provider) { horizonKeep(capability, type, provider); }
+    public <T> void registerItem(Object capability, Object provider, Object... items) { horizonKeep(capability, items, provider); }
+    public <T> void registerEntity(Object capability, Object type, Object provider) { horizonKeep(capability, type, provider); }
+    public boolean isBlockRegistered(Object capability, Object block) { return false; }
+    public boolean isEntityRegistered(Object capability, Object type) { return false; }
+    public boolean isItemRegistered(Object capability, Object item) { return false; }
+    public void setProxyable(Object capability) {}
+    public void setNonProxyable(Object capability) {}
+    public java.util.List<Object> horizonRegistrations() { return java.util.Collections.unmodifiableList(horizonRegistrations); }
+}
+"#;
+
+const NEOFORGE_BIOME_MODIFIER_SOURCE: &str = r#"package net.neoforged.neoforge.common.world;
+public interface BiomeModifier {
+    default void modify(Object registryAccess, Object biome, BiomeModifier.Phase phase, Object builder) {}
+    default Object codec() { return null; }
+    enum Phase { BEFORE_EVERYTHING, ADD, REMOVE, MODIFY, AFTER_EVERYTHING }
+}
+"#;
+
+const NEOFORGE_ISTORAGE_SOURCE: &str = r#"package net.neoforged.neoforge.common.capabilities;
+public interface IStorage<T> {
+    default Object readNBT(Object capability, T instance, Object side) { return null; }
+    default void writeNBT(Object capability, T instance, Object side, Object nbt) {}
+}
+"#;
+
 /// Bounded NeoForge `AttachmentType`: `builder(Supplier)` keeps the default
 /// supplier, `serialize(Codec, Supplier)` the codec and its default,
 /// `copyOnDeath()` the flag, and `build()` the value. NeoForge registers the
@@ -5052,6 +5137,28 @@ fn functional_interface(name: &str) -> bool {
 /// support class can pull in its own support.
 fn support_types(name: &str) -> &'static [&'static str] {
     match name {
+        // The bounded `Mob` value names these in its fields and its health,
+        // attribute and navigation accessors. They travel with it so a mod
+        // that only names one flag still gets a source that compiles.
+        "net/minecraft/world/entity/Mob" => &[
+            "net/minecraft/world/entity/SpawnGroupData",
+            "net/minecraft/world/entity/ai/attributes/AttributeMap",
+            "net/minecraft/world/entity/ai/navigation/PathNavigation",
+            "net/minecraft/world/entity/ai/goal/GoalSelector",
+        ],
+        // The bounded `LivingEntity` carries health, hands and effects; a mod
+        // that only names `getHealth` still needs those value types present.
+        "net/minecraft/world/entity/LivingEntity" => &[
+            "net/minecraft/world/item/ItemStack",
+            "net/minecraft/world/effect/MobEffect",
+            "net/minecraft/world/effect/MobEffectInstance",
+        ],
+        // An `ItemStack` value names the item it holds and the component map it
+        // carries; both must exist wherever the stack is generated.
+        "net/minecraft/world/item/ItemStack" => &[
+            "net/minecraft/world/item/Item",
+            "net/minecraft/core/component/DataComponentType",
+        ],
         "net/minecraft/world/entity/EntityType"
         | "net/minecraft/world/entity/EntityType$Builder" => {
             &["net/minecraft/world/entity/EntityDimensions"]
@@ -5499,13 +5606,52 @@ fn render(
     if class.name == "net/minecraft/world/entity/Mob" {
         let _ = writeln!(
             out,
-            "    protected boolean horizonNoAi;\n    protected boolean horizonAggressive;\n    protected boolean horizonBaby;\n    protected boolean horizonPersistenceRequired;\n    protected net.minecraft.world.entity.LivingEntity horizonTarget;"
+            "    protected boolean horizonNoAi;\n    protected boolean horizonAggressive;\n    protected boolean horizonBaby;\n    protected boolean horizonPersistenceRequired;\n    protected net.minecraft.world.entity.LivingEntity horizonTarget;\n    protected java.util.Map<Object, net.minecraft.world.entity.ai.attributes.AttributeInstance> horizonAttributes = new java.util.IdentityHashMap<>();\n    protected net.minecraft.world.entity.ai.attributes.AttributeMap horizonAttributeMap = new net.minecraft.world.entity.ai.attributes.AttributeMap();\n    protected net.minecraft.world.entity.ai.navigation.PathNavigation horizonNavigation = new net.minecraft.world.entity.ai.navigation.PathNavigation();\n    protected net.minecraft.world.entity.ai.goal.GoalSelector horizonGoalSelector = new net.minecraft.world.entity.ai.goal.GoalSelector();\n    protected net.minecraft.world.entity.ai.goal.GoalSelector horizonTargetSelector = new net.minecraft.world.entity.ai.goal.GoalSelector();\n    protected net.minecraft.world.entity.SpawnGroupData horizonSpawnGroupData;"
+        );
+    }
+    if class.name == "net/minecraft/world/entity/ai/attributes/Attribute" {
+        let _ = writeln!(
+            out,
+            "    protected double horizonBaseValue;\n    protected double horizonMinValue = Double.NEGATIVE_INFINITY;\n    protected double horizonMaxValue = Double.POSITIVE_INFINITY;\n    protected String horizonDescriptionId = \"generic\";\n    protected boolean horizonSyncable;\n    protected Object horizonSentiment;"
+        );
+    }
+    if class.name == "net/minecraft/world/entity/ai/attributes/RangedAttribute" {
+        let _ = writeln!(
+            out,
+            "    protected double horizonBaseValue;\n    protected double horizonMinValue;\n    protected double horizonMaxValue;"
+        );
+    }
+    if class.name == "net/minecraft/world/entity/ai/attributes/AttributeSupplier" {
+        let _ = writeln!(
+            out,
+            "    protected java.util.Map<Object, net.minecraft.world.entity.ai.attributes.AttributeInstance> horizonAttributes = new java.util.IdentityHashMap<>();"
+        );
+    }
+    if class.name == "net/minecraft/world/entity/ai/attributes/AttributeInstance" {
+        let _ = writeln!(
+            out,
+            "    protected double horizonBaseValue;\n    protected double horizonValue;"
+        );
+    }
+    if class.name == "net/minecraft/network/syncher/SynchedEntityData" {
+        let _ = writeln!(
+            out,
+            "    protected static int horizonNextId;\n    protected java.util.Map<net.minecraft.network.syncher.EntityDataAccessor, Object> horizonItems = new java.util.HashMap<>();\n    protected java.util.Set<net.minecraft.network.syncher.EntityDataAccessor> horizonDirty = new java.util.HashSet<>();\n    protected java.util.List<Object> horizonAssigned = new java.util.ArrayList<>();"
+        );
+    }
+    // `EntityDataAccessor` and `DamageType` are records in 26.3: javac rejects
+    // instance fields on a record, so their state is the record components
+    // themselves. Their generated accessors already return the real values.
+    if class.name == "net/minecraft/world/damagesource/DamageSource" {
+        let _ = writeln!(
+            out,
+            "    protected net.minecraft.world.damagesource.DamageType horizonType;\n    protected net.minecraft.world.entity.Entity horizonEntity;\n    protected net.minecraft.world.entity.Entity horizonDirectEntity;\n    protected net.minecraft.world.phys.Vec3 horizonSourcePosition;"
         );
     }
     if class.name == "net/minecraft/world/entity/LivingEntity" {
         let _ = writeln!(
             out,
-            "    protected float horizonHealth = 20.0f;\n    protected float horizonMaxHealth = 20.0f;\n    protected net.minecraft.world.item.ItemStack horizonMainHand = new net.minecraft.world.item.ItemStack();\n    protected net.minecraft.world.item.ItemStack horizonOffhand = new net.minecraft.world.item.ItemStack();\n    protected int horizonArmorValue;\n    protected java.util.Map<net.minecraft.world.effect.MobEffect, net.minecraft.world.effect.MobEffectInstance> horizonEffects = new java.util.IdentityHashMap<>();"
+            "    protected float horizonHealth = 20.0f;\n    protected float horizonMaxHealth = 20.0f;\n    protected net.minecraft.world.item.ItemStack horizonMainHand = new net.minecraft.world.item.ItemStack();\n    protected net.minecraft.world.item.ItemStack horizonOffhand = new net.minecraft.world.item.ItemStack();\n    protected int horizonArmorValue;\n    protected java.util.Map<net.minecraft.world.effect.MobEffect, net.minecraft.world.effect.MobEffectInstance> horizonEffects = new java.util.IdentityHashMap<>();\n    protected java.util.Map<Object, net.minecraft.world.entity.ai.attributes.AttributeInstance> horizonAttributes = new java.util.IdentityHashMap<>();\n    protected net.minecraft.world.entity.ai.attributes.AttributeMap horizonAttributeMap = new net.minecraft.world.entity.ai.attributes.AttributeMap();"
         );
     }
     if class.name == "net/minecraft/world/effect/MobEffectInstance" {
@@ -5603,6 +5749,18 @@ fn render(
             && method.descriptor == "(DDD)V")
         {
             "this.horizonX = p0; this.horizonY = p1; this.horizonZ = p2;"
+        } else if class.name == "net/minecraft/network/syncher/EntityDataAccessor"
+            && method.descriptor == "(I)V"
+        {
+            "this.horizonId = p0;"
+        } else if class.name == "net/minecraft/world/entity/ai/attributes/Attribute"
+            && method.descriptor == "(Ljava/lang/String;D)V"
+        {
+            "this.horizonDescriptionId = p0; this.horizonBaseValue = p1;"
+        } else if class.name == "net/minecraft/world/entity/ai/attributes/RangedAttribute"
+            && method.descriptor == "(Ljava/lang/String;DDD)V"
+        {
+            "this.horizonDescriptionId = p0; this.horizonBaseValue = p1; this.horizonMinValue = p2; this.horizonMaxValue = p3;"
         } else if class.name == "net/minecraft/world/phys/AABB" && method.descriptor == "(DDDDDD)V"
         {
             "this.horizonMinX = p0; this.horizonMinY = p1; this.horizonMinZ = p2; this.horizonMaxX = p3; this.horizonMaxY = p4; this.horizonMaxZ = p5; this.minX = p0; this.minY = p1; this.minZ = p2; this.maxX = p3; this.maxY = p4; this.maxZ = p5;"
@@ -8203,6 +8361,186 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("setTarget", "void", "(Lnet/minecraft/world/entity/LivingEntity;)V") => {
                 return "horizonTarget = p0;".to_owned();
             }
+            // Health is declared on `LivingEntity`, but a mod whose receiver is
+            // typed `Mob` emits the call with `Mob` as the owner. The fields
+            // are inherited by the generated stub, so the bodies are the same.
+            ("getHealth", "float", "()F") => return "return horizonHealth;".to_owned(),
+            ("getMaxHealth", "float", "()F") => return "return horizonMaxHealth;".to_owned(),
+            ("setHealth", "void", "(F)V") => return "horizonHealth = p0;".to_owned(),
+            ("heal", "void", "(F)V") => {
+                return "horizonHealth = Math.min(horizonMaxHealth, horizonHealth + p0);"
+                    .to_owned();
+            }
+            ("getAttribute", "net.minecraft.world.entity.ai.attributes.AttributeInstance", _) => {
+                return "return horizonAttributes.get(p0);".to_owned();
+            }
+            ("getAttributeValue", "double", _) => return "return 0.0;".to_owned(),
+            ("getAttributeBaseValue", "double", _) => return "return 0.0;".to_owned(),
+            ("getAttributes", "net.minecraft.world.entity.ai.attributes.AttributeMap", _) => {
+                return "return horizonAttributeMap;".to_owned();
+            }
+            ("getNavigation", _, _) => return "return horizonNavigation;".to_owned(),
+            ("goalSelector", _, _) => return "return horizonGoalSelector;".to_owned(),
+            ("targetSelector", _, _) => return "return horizonTargetSelector;".to_owned(),
+            // `finalizeSpawn` hands the group data back, so a mod's override and
+            // its `super` call observe the same marker instead of a throw.
+            ("finalizeSpawn", "net.minecraft.world.entity.SpawnGroupData", _) => {
+                return "horizonSpawnGroupData = p3; return p3;".to_owned();
+            }
+            ("convertTo", _, _) => return "return null;".to_owned(),
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/entity/Entity" && method == "convertTo" {
+        return "return null;".to_owned();
+    }
+    if class == "net/minecraft/world/entity/ai/attributes/Attribute" {
+        match (method, ret) {
+            // 26.3 names the base value `getDefaultValue`; `getBaseValue` is
+            // the Yarn spelling kept for a snapshot-drift synthetic edge.
+            ("getDefaultValue", "double") | ("getBaseValue", "double") => {
+                return "return horizonBaseValue;".to_owned();
+            }
+            ("getMinValue", "double") => return "return horizonMinValue;".to_owned(),
+            ("getMaxValue", "double") => return "return horizonMaxValue;".to_owned(),
+            ("getDescriptionId", "java.lang.String") => {
+                return "return horizonDescriptionId;".to_owned();
+            }
+            ("isClientSyncable", "boolean") => return "return horizonSyncable;".to_owned(),
+            ("setSyncable", "net.minecraft.world.entity.ai.attributes.Attribute") => {
+                return "horizonSyncable = p0; return this;".to_owned();
+            }
+            ("setSentiment", "net.minecraft.world.entity.ai.attributes.Attribute") => {
+                return "horizonSentiment = p0; return this;".to_owned();
+            }
+            ("sanitizeValue", "double") => return "return p0;".to_owned(),
+            ("getStyle", "net.minecraft.ChatFormatting") => return "return null;".to_owned(),
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/entity/ai/attributes/RangedAttribute" {
+        match (method, ret) {
+            ("getDefaultValue", "double") | ("getBaseValue", "double") => {
+                return "return horizonBaseValue;".to_owned();
+            }
+            ("getMinValue", "double") => return "return horizonMinValue;".to_owned(),
+            ("getMaxValue", "double") => return "return horizonMaxValue;".to_owned(),
+            ("setSyncable", "net.minecraft.world.entity.ai.attributes.Attribute") => {
+                return "horizonSyncable = p0; return this;".to_owned();
+            }
+            ("sanitizeValue", "double") => return "return p0;".to_owned(),
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/entity/ai/attributes/AttributeSupplier" {
+        match (method, ret) {
+            ("getValue", "double") | ("getBaseValue", "double") => return "net.minecraft.world.entity.ai.attributes.AttributeInstance value = horizonAttributes.get(p0); return value == null ? 0.0 : value.getBaseValue();".to_owned(),
+            ("getModifierValue", "double") => return "return 0.0;".to_owned(),
+            ("createInstance", "net.minecraft.world.entity.ai.attributes.AttributeInstance") => {
+                return "net.minecraft.world.entity.ai.attributes.AttributeInstance value = new net.minecraft.world.entity.ai.attributes.AttributeInstance(); horizonAttributes.put(p1, value); return value;".to_owned();
+            }
+            ("builder", "net.minecraft.world.entity.ai.attributes.AttributeSupplier.Builder") => {
+                return "return new net.minecraft.world.entity.ai.attributes.AttributeSupplier.Builder();".to_owned();
+            }
+            ("hasAttribute", "boolean") | ("hasModifier", "boolean") => return "return horizonAttributes.containsKey(p0);".to_owned(),
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/entity/ai/attributes/AttributeSupplier$Builder" {
+        match (method, ret) {
+            ("add", "net.minecraft.world.entity.ai.attributes.AttributeSupplier.Builder") => {
+                return "return this;".to_owned();
+            }
+            ("build", "net.minecraft.world.entity.ai.attributes.AttributeSupplier")
+            | ("create", "net.minecraft.world.entity.ai.attributes.AttributeSupplier") => {
+                return "return new net.minecraft.world.entity.ai.attributes.AttributeSupplier();"
+                    .to_owned();
+            }
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/entity/ai/attributes/AttributeInstance" {
+        match (method, ret) {
+            ("getBaseValue", "double") => return "return horizonBaseValue;".to_owned(),
+            ("getValue", "double") => return "return horizonValue;".to_owned(),
+            ("setBaseValue", "void") => {
+                return "horizonBaseValue = p0; horizonValue = p0;".to_owned();
+            }
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/network/syncher/SynchedEntityData" {
+        match (method, ret) {
+            ("get", "java.lang.Object") => return "return horizonItems.get(p0);".to_owned(),
+            ("set", "void") => return "horizonItems.put(p0, p1); horizonDirty.add(p0);".to_owned(),
+            ("define", "void") => return "horizonItems.put(p0, p1);".to_owned(),
+            // 26.3's `defineId` allocates the accessor; keep the id monotonic
+            // so two definitions in one class do not collide.
+            ("defineId", "net.minecraft.network.syncher.EntityDataAccessor") => {
+                return "return new net.minecraft.network.syncher.EntityDataAccessor(horizonNextId++, p1);".to_owned();
+            }
+            ("isDirty", "boolean") => return "return !horizonDirty.isEmpty();".to_owned(),
+            ("packDirty", _) => return "java.util.List values = new java.util.ArrayList(); for (Object key : horizonDirty) values.add(horizonItems.get(key)); horizonDirty.clear(); return values;".to_owned(),
+            ("getNonDefaultValues", _) => return "java.util.List values = new java.util.ArrayList(); for (Object key : horizonDirty) values.add(horizonItems.get(key)); return values;".to_owned(),
+            ("assignValues", "void") => return "horizonAssigned.clear(); if (p0 != null) horizonAssigned.addAll((java.util.List) p0);".to_owned(),
+            ("pack", _) => return "return new java.util.ArrayList();".to_owned(),
+            ("clearDirty", "void") => return "horizonDirty.clear();".to_owned(),
+            _ => {}
+        }
+    }
+    // `EntityDataAccessor` is a record in 26.3: `id()` is its component
+    // accessor, and the Yarn `getId` spelling is only a drift edge.
+    if class == "net/minecraft/network/syncher/EntityDataAccessor" && method == "getId" {
+        return "return id();".to_owned();
+    }
+    // `DamageType` is a record in 26.3. Its component accessors are generated
+    // by the record declaration, so these arms only serve snapshot drift.
+    if class == "net/minecraft/world/damagesource/DamageType" {
+        match (method, ret) {
+            ("msgId", "java.lang.String") => return "return \"generic\";".to_owned(),
+            ("exhaustion", "float") => return "return 0.0f;".to_owned(),
+            ("scaling", _) | ("effects", _) | ("deathMessageType", _) => {
+                return "return null;".to_owned();
+            }
+            _ => {}
+        }
+    }
+    if class == "net/minecraft/world/damagesource/DamageSource" {
+        match (method, ret) {
+            ("type", "net.minecraft.world.damagesource.DamageType") => {
+                return "return horizonType;".to_owned();
+            }
+            ("getEntity", "net.minecraft.world.entity.Entity") => {
+                return "return horizonEntity;".to_owned();
+            }
+            ("getDirectEntity", "net.minecraft.world.entity.Entity") => {
+                return "return horizonDirectEntity;".to_owned();
+            }
+            ("getSourcePosition", "net.minecraft.world.phys.Vec3") => {
+                return "return horizonSourcePosition;".to_owned();
+            }
+            ("sourcePositionRaw", "net.minecraft.world.phys.Vec3") => {
+                return "return horizonSourcePosition;".to_owned();
+            }
+            ("typeHolder", _) => return "return null;".to_owned(),
+            ("isDirect", "boolean") => return "return horizonDirectEntity != null;".to_owned(),
+            ("getMsgId", "java.lang.String") => {
+                return "return horizonType == null ? \"generic\" : horizonType.msgId();"
+                    .to_owned();
+            }
+            ("scalesWithDifficulty", "boolean") | ("isCreativePlayer", "boolean") => {
+                return "return false;".to_owned();
+            }
+            ("getWeaponItem", "net.minecraft.world.item.ItemStack") => {
+                return "return new net.minecraft.world.item.ItemStack();".to_owned();
+            }
+            ("getLocalizedDeathMessage", "net.minecraft.network.chat.Component") => {
+                return "return null;".to_owned();
+            }
+            ("is", "boolean") => return "return false;".to_owned(),
+            ("getFoodExhaustion", "float") => {
+                return "return horizonType == null ? 0.0f : horizonType.exhaustion();".to_owned();
+            }
             _ => {}
         }
     }
@@ -8304,6 +8642,16 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("removeAllEffects", "boolean", "()Z") => {
                 return "boolean hadEffects = !horizonEffects.isEmpty(); horizonEffects.clear(); return hadEffects;".to_owned();
             }
+            // `getAttribute`/`getAttributes` are declared here in 26.3, so the
+            // common receiver type is `LivingEntity`, not only `Mob`.
+            ("getAttribute", "net.minecraft.world.entity.ai.attributes.AttributeInstance", _) => {
+                return "return horizonAttributes.get(p0);".to_owned();
+            }
+            ("getAttributes", "net.minecraft.world.entity.ai.attributes.AttributeMap", _) => {
+                return "return horizonAttributeMap;".to_owned();
+            }
+            ("getAttributeValue", "double", _) => return "return 0.0;".to_owned(),
+            ("getAttributeBaseValue", "double", _) => return "return 0.0;".to_owned(),
             _ => {}
         }
     }
