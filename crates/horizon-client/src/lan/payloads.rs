@@ -8,8 +8,8 @@
 //! client can drive the same state machine.
 
 use horizon_mods::payloads::{
-    PayloadDeclaration, PayloadDirection, PayloadFrame, PayloadRegistry, PayloadValue, marker_hex,
-    validate_payload,
+    MAX_PAYLOAD_BYTES, MAX_PAYLOAD_ID, PayloadDeclaration, PayloadDirection, PayloadFrame,
+    PayloadRegistry, PayloadValue, marker_hex, validate_payload,
 };
 use horizon_native_java::{
     NativeJar, PayloadRegistration, StdHost, Value, dispatch_payload_frame_with,
@@ -26,6 +26,157 @@ const MAX_INCOMING: usize = 256;
 const MAX_OUTGOING: usize = 256;
 const MAX_REGISTRATION: usize = 64 * 1024;
 const MAX_DECLARATIONS: usize = 4096;
+
+/// The most bytes one `horizon:payload` packet may carry: vanilla's
+/// `ServerboundCustomPayloadPacket` discards anything above this, in play and
+/// in configuration (`horizon_protocol::quiet::MAX_PAYLOAD`). A mod frame
+/// bigger than the envelope travels as chunks ([`chunk_envelopes`]).
+pub const MAX_ENVELOPE: usize = horizon_protocol::quiet::MAX_PAYLOAD;
+
+/// How many chunks one frame may split into. Each envelope carries at most
+/// [`MAX_ENVELOPE`] bytes, so 64 chunks cover the 1 MiB payload model twice
+/// over while still bounding a sender's work to one small number.
+pub const MAX_CHUNKS: usize = 64;
+
+/// The most bytes a joined frame may hold: the payload model's 1 MiB plus the
+/// frame's `u32` length, direction and id header. Chunking never raises the
+/// payload cap; it only lets a frame that fits reach the other side.
+pub const MAX_JOINED: usize = MAX_PAYLOAD_BYTES + 4 + 3 + MAX_PAYLOAD_ID;
+
+/// The first four bytes of a chunk envelope, the payload model's frame length,
+/// or anything the model can produce: a v1 receiver's [`PayloadFrame::decode`]
+/// rejects such a length, so a chunk is never mistaken for a frame.
+const CHUNK_MAGIC: [u8; 4] = [0xFF, b'H', b'P', b'C'];
+/// The chunk envelope version this build writes.
+const CHUNK_VERSION: u8 = 1;
+/// Magic, version, index, count, and the transfer's total length.
+const CHUNK_HEADER: usize = 4 + 1 + 2 + 2 + 4;
+/// The bytes of a frame one chunk envelope carries.
+const CHUNK_DATA: usize = MAX_ENVELOPE - CHUNK_HEADER;
+
+/// Split one encoded frame into `horizon:payload` envelopes. A frame that
+/// fits the envelope comes back as itself, exactly as a v1 sender would send
+/// it, so small frames are unchanged on the wire. A bigger one (up to
+/// [`MAX_JOINED`]) becomes consecutive chunks an assembler joins back.
+pub fn chunk_envelopes(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if data.len() <= MAX_ENVELOPE {
+        return Ok(vec![data.to_vec()]);
+    }
+    if data.len() > MAX_JOINED {
+        return Err(format!(
+            "payload frame of {} bytes exceeds {MAX_JOINED}",
+            data.len()
+        ));
+    }
+    let count = data.len().div_ceil(CHUNK_DATA);
+    if count > MAX_CHUNKS {
+        return Err(format!(
+            "payload frame needs {count} chunks (max {MAX_CHUNKS})"
+        ));
+    }
+    let count = u16::try_from(count).map_err(|_| "chunk count overflows".to_owned())?;
+    let total = u32::try_from(data.len())
+        .map_err(|_| format!("payload frame of {} bytes overflows", data.len()))?;
+    let mut envelopes = Vec::with_capacity(count as usize);
+    for (index, chunk) in data.chunks(CHUNK_DATA).enumerate() {
+        let mut envelope = Vec::with_capacity(CHUNK_HEADER + chunk.len());
+        envelope.extend_from_slice(&CHUNK_MAGIC);
+        envelope.push(CHUNK_VERSION);
+        envelope.extend_from_slice(&(index as u16).to_be_bytes());
+        envelope.extend_from_slice(&count.to_be_bytes());
+        envelope.extend_from_slice(&total.to_be_bytes());
+        envelope.extend_from_slice(chunk);
+        debug_assert!(envelope.len() <= MAX_ENVELOPE);
+        envelopes.push(envelope);
+    }
+    Ok(envelopes)
+}
+
+/// Whether an envelope is a chunk rather than a whole frame. A frame's first
+/// four bytes are its length and can never be [`CHUNK_MAGIC`].
+pub fn is_chunk_envelope(data: &[u8]) -> bool {
+    data.len() >= CHUNK_HEADER && data.starts_with(&CHUNK_MAGIC) && data[4] == CHUNK_VERSION
+}
+
+/// Joins the chunks of consecutive oversized frames on one connection. The
+/// stream is ordered, so chunks of one frame arrive in order; a chunk out of
+/// order, a restart mid-transfer or a transfer past its declared total
+/// rejects, and the assembler starts over.
+#[derive(Debug, Default)]
+pub struct ChunkAssembler {
+    count: u16,
+    next: u16,
+    total: u32,
+    data: Vec<u8>,
+}
+
+impl ChunkAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// No transfer is in progress.
+    pub fn is_idle(&self) -> bool {
+        self.next == 0
+    }
+
+    /// Feed one chunk envelope. `Ok(None)` means more chunks are due;
+    /// `Ok(Some(frame))` is the frame the chunks spelled.
+    pub fn push(&mut self, envelope: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        if !is_chunk_envelope(envelope) {
+            return Err("payload chunk is not a chunk envelope".to_owned());
+        }
+        let index = u16::from_be_bytes([envelope[5], envelope[6]]);
+        let count = u16::from_be_bytes([envelope[7], envelope[8]]);
+        let total = u32::from_be_bytes([envelope[9], envelope[10], envelope[11], envelope[12]]);
+        if count == 0 || usize::from(count) > MAX_CHUNKS {
+            return Err(format!("payload frame declares {count} chunks"));
+        }
+        if usize::try_from(total).map_or(true, |total| total > MAX_JOINED) {
+            return Err(format!("payload frame declares {total} bytes"));
+        }
+        if index >= count {
+            return Err(format!("payload chunk {index} of {count} is out of range"));
+        }
+        if index == 0 {
+            // A fresh transfer replaces an incomplete one, so a dropped tail
+            // cannot wedge the connection.
+            self.count = count;
+            self.next = 0;
+            self.total = total;
+            self.data.clear();
+            self.data.reserve(usize::try_from(total).unwrap_or(0));
+        }
+        if count != self.count || total != self.total || index != self.next {
+            let due = self.next;
+            *self = Self::default();
+            return Err(format!(
+                "payload chunk {index} arrived where chunk {due} was due"
+            ));
+        }
+        let chunk = &envelope[CHUNK_HEADER..];
+        let total = usize::try_from(total).unwrap_or(0);
+        if self.data.len() + chunk.len() > total {
+            *self = Self::default();
+            return Err(format!("payload chunks exceed their {total} bytes"));
+        }
+        self.data.extend_from_slice(chunk);
+        self.next += 1;
+        if self.next < self.count {
+            return Ok(None);
+        }
+        if self.data.len() != total {
+            *self = Self::default();
+            return Err(format!(
+                "payload frame is {} bytes, not its {total}",
+                self.data.len()
+            ));
+        }
+        let joined = std::mem::take(&mut self.data);
+        *self = Self::default();
+        Ok(Some(joined))
+    }
+}
 
 /// One connection's payload state: the declarations both sides agreed on,
 /// received frames waiting for the game, and encoded frames waiting to be
@@ -1224,6 +1375,108 @@ mod tests {
         clear_handler_jars();
         let _ = take_java_outgoing();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- chunking oversized frames -------------------------------------
+
+    #[test]
+    fn frames_within_the_envelope_travel_unchanged() {
+        let small = vec![0x5a; MAX_ENVELOPE];
+        let envelopes = chunk_envelopes(&small).unwrap();
+        assert_eq!(
+            envelopes,
+            vec![small.clone()],
+            "a v1 frame is its own envelope"
+        );
+        assert!(!is_chunk_envelope(&envelopes[0]));
+        assert_eq!(chunk_envelopes(&[1, 2, 3]).unwrap(), vec![vec![1, 2, 3]]);
+    }
+
+    #[test]
+    fn oversized_frames_split_and_join_losslessly() {
+        for len in [
+            MAX_ENVELOPE + 1,
+            MAX_ENVELOPE * 2,
+            MAX_JOINED,
+            MAX_PAYLOAD_BYTES,
+        ] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let envelopes = chunk_envelopes(&data).unwrap();
+            assert!(envelopes.len() > 1);
+            assert!(
+                envelopes
+                    .iter()
+                    .all(|envelope| envelope.len() <= MAX_ENVELOPE && is_chunk_envelope(envelope))
+            );
+            let mut assembler = ChunkAssembler::new();
+            let mut joined = None;
+            for envelope in &envelopes {
+                if let Some(frame) = assembler.push(envelope).unwrap() {
+                    joined = Some(frame);
+                }
+            }
+            assert_eq!(joined.as_deref(), Some(data.as_slice()));
+            assert!(assembler.is_idle());
+        }
+        // The payload model's cap still applies to a joined frame.
+        assert!(chunk_envelopes(&vec![0; MAX_JOINED + 1]).is_err());
+    }
+
+    #[test]
+    fn a_frame_beyond_the_envelope_round_trips_through_chunks() {
+        let frame = PayloadFrame::new(
+            "demo:big",
+            PayloadDirection::PlayToServer,
+            vec![7; MAX_ENVELOPE * 2],
+        )
+        .unwrap();
+        let encoded = frame.encode();
+        assert!(encoded.len() > MAX_ENVELOPE);
+        let mut assembler = ChunkAssembler::new();
+        let mut joined = Vec::new();
+        for envelope in chunk_envelopes(&encoded).unwrap() {
+            if let Some(data) = assembler.push(&envelope).unwrap() {
+                joined = data;
+            }
+        }
+        let (decoded, used) = PayloadFrame::decode(&joined).unwrap();
+        assert_eq!(used, joined.len());
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn malformed_chunk_sequences_reject_and_reset() {
+        let data = vec![1u8; MAX_ENVELOPE * 2];
+        let envelopes = chunk_envelopes(&data).unwrap();
+
+        // Chunks must arrive in order from index 0.
+        let mut assembler = ChunkAssembler::new();
+        assert!(assembler.push(&envelopes[1]).is_err());
+        assert!(assembler.is_idle());
+
+        // A dropped tail never completes; a fresh transfer replaces it.
+        let mut assembler = ChunkAssembler::new();
+        for envelope in &envelopes[..envelopes.len() - 1] {
+            assert!(assembler.push(envelope).unwrap().is_none());
+        }
+        assert!(!assembler.is_idle());
+        assert!(assembler.push(&envelopes[0]).unwrap().is_none());
+        assert!(assembler.push(&envelopes[1]).unwrap().is_none());
+
+        // A count or total past the bounds rejects before any allocation.
+        let mut over_count = envelopes[0].clone();
+        over_count[7..9].copy_from_slice(&(MAX_CHUNKS as u16 + 1).to_be_bytes());
+        assert!(ChunkAssembler::new().push(&over_count).is_err());
+        let mut over_total = envelopes[0].clone();
+        over_total[9..13].copy_from_slice(&(MAX_JOINED as u32 + 1).to_be_bytes());
+        assert!(ChunkAssembler::new().push(&over_total).is_err());
+        // An index outside the declared count rejects.
+        let mut over_index = envelopes[0].clone();
+        over_index[5..7].copy_from_slice(&(u16::MAX).to_be_bytes());
+        assert!(ChunkAssembler::new().push(&over_index).is_err());
+        // A whole frame is not a chunk envelope.
+        let frame = PayloadFrame::new("demo:x", PayloadDirection::PlayToServer, vec![1]).unwrap();
+        assert!(ChunkAssembler::new().push(&frame.encode()).is_err());
     }
 
     /// The hub's drain takes only the frames a client can receive; the
