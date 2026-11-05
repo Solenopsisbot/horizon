@@ -535,6 +535,23 @@ impl Hub {
             .collect()
     }
 
+    /// The `horizon:payload` packets one encoded frame travels as: the frame
+    /// itself when it fits the packet envelope, exactly as a v1 sender sends
+    /// it, and consecutive chunks when it does not
+    /// ([`payloads::chunk_envelopes`]), which the client's assembler joins.
+    fn payload_packets(data: Vec<u8>) -> Result<Vec<C>, String> {
+        let envelopes = payloads::chunk_envelopes(&data)?;
+        Ok(envelopes
+            .into_iter()
+            .map(|data| {
+                C::CustomPayload(CustomPayload {
+                    channel: payloads::CHANNEL.to_owned(),
+                    data,
+                })
+            })
+            .collect())
+    }
+
     /// Send one frame to every guest that accepts it; frames Java mods queued
     /// at bootstrap go out on the next tick after a player joins.
     pub fn broadcast_payload(&mut self, frame: &PayloadFrame) {
@@ -557,13 +574,18 @@ impl Hub {
                 return;
             }
         };
-        let packet = C::CustomPayload(CustomPayload {
-            channel: payloads::CHANNEL.to_owned(),
-            data,
-        });
+        let packets = match Self::payload_packets(data) {
+            Ok(packets) => packets,
+            Err(error) => {
+                log::warn!("Horizon: mod payload {} was not sent: {error}", frame.id());
+                return;
+            }
+        };
+        // A frame's chunks go out together and in order: interleaving two
+        // frames would leave the client's assembler a transfer it must reset.
         for g in &self.guests {
             if self.here(g) {
-                g.send(&packet);
+                g.send_all(&packets);
             }
         }
     }
@@ -577,13 +599,11 @@ impl Hub {
         bytes: Vec<u8>,
     ) -> Result<(), String> {
         let data = Self::encode_for_client(&mut self.payloads, id, direction, bytes)?;
+        let packets = Self::payload_packets(data)?;
         let g = self
             .guest(conn)
             .ok_or_else(|| format!("guest {conn} is not here"))?;
-        g.send(&C::CustomPayload(CustomPayload {
-            channel: payloads::CHANNEL.to_owned(),
-            data,
-        }));
+        g.send_all(&packets);
         Ok(())
     }
 
@@ -3630,6 +3650,52 @@ mod tests {
                 "the link keeps no queued copy of a broadcast"
             );
         }
+    }
+
+    /// A 40 KiB frame leaves the hub as consecutive `horizon:payload`
+    /// packets a client's assembler joins to the frame itself; a frame within
+    /// the packet envelope is one packet, byte-identical to v1.
+    #[test]
+    fn a_payload_above_the_envelope_travels_as_chunks() {
+        let bytes: Vec<u8> = (0..40 * 1024).map(|i| (i % 251) as u8).collect();
+        let encoded = PayloadFrame::new("demo:down", PayloadDirection::PlayToClient, bytes.clone())
+            .unwrap()
+            .encode();
+        let packets = Hub::payload_packets(encoded.clone()).unwrap();
+        assert!(packets.len() > 1, "40 KiB needs several chunks");
+        let mut assembler = payloads::ChunkAssembler::new();
+        let mut joined = Vec::new();
+        for packet in &packets {
+            let C::CustomPayload(payload) = packet else {
+                panic!("a payload travels on the payload channel only");
+            };
+            assert_eq!(payload.channel, payloads::CHANNEL);
+            assert!(payload.data.len() <= payloads::MAX_ENVELOPE);
+            assert!(payloads::is_chunk_envelope(&payload.data));
+            if let Some(frame) = assembler.push(&payload.data).unwrap() {
+                joined.push(frame);
+            }
+        }
+        assert_eq!(joined, vec![encoded], "the frame, losslessly");
+
+        // A small frame is the one packet a v1 hub sent.
+        let small = PayloadFrame::new("demo:down", PayloadDirection::PlayToClient, b"hi".to_vec())
+            .unwrap()
+            .encode();
+        let packets = Hub::payload_packets(small.clone()).unwrap();
+        assert_eq!(packets.len(), 1);
+        let C::CustomPayload(payload) = &packets[0] else {
+            panic!("a payload travels on the payload channel only");
+        };
+        assert_eq!(payload.data, small, "unchanged on the wire");
+        assert!(!payloads::is_chunk_envelope(&payload.data));
+    }
+
+    /// A frame past the joined cap is refused rather than half-chunked.
+    #[test]
+    fn an_oversized_payload_is_refused_before_it_is_chunked() {
+        let data = vec![0; payloads::MAX_JOINED + 1];
+        assert!(Hub::payload_packets(data).is_err());
     }
 
     /// A mixed drain keeps the frames a client can receive, in order, and
