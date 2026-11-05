@@ -389,7 +389,14 @@ public final class HorizonLoaderBridge {
           .getMethod("getEntrypoint");
       Method onPreLaunch = type.getMethod("onPreLaunch");
       for (Object container : containers) {
-        onPreLaunch.invoke(entrypoint.invoke(container));
+        try {
+          onPreLaunch.invoke(entrypoint.invoke(container));
+        } catch (Throwable failure) {
+          // A preLaunch callback is mod code. One client-only callback (for
+          // example MagicLib's nested platform probe) must not prevent the
+          // server and the remaining callbacks from starting.
+          System.err.println("fabric-loader: preLaunch callback skipped: " + summarize(failure));
+        }
       }
       return null;
     } catch (Throwable failure) {
@@ -9765,6 +9772,7 @@ mod real_loader_tests {
             "probeMixinApplication",
             "horizon.mixin.probe",
             "invokePreLaunch",
+            "preLaunch callback skipped",
             "launchTheGame",
             "launch-game: started",
             "getTargetClassLoader",
