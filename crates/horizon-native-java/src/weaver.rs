@@ -6873,7 +6873,10 @@ fn detect_instance_callbacks(
 /// The host installs the instance the bridge delegates to with the bridge's
 /// `install<i>(L<callback owner>;)V` static method.  A `private` callback is a
 /// reason: a separate class cannot invoke it, and the bounded weave does not
-/// rewrite the callback owner to add an accessor.
+/// rewrite the callback owner to add an accessor.  This entry point can only
+/// check that when `classes` holds the callback owner; a caller with a partial
+/// class set must leave a private instance callback out of
+/// `instance_callbacks` and report it itself.
 pub fn weave_classes_with_extras_and_instance_callbacks(
     classes: &BTreeMap<String, ClassFile>,
     plans: &[MixinInjectionPlan],
