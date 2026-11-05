@@ -86,7 +86,7 @@ public final class ThrowingEntrypoint {
         "diagnostic names neither the class nor the message: {text}"
     );
     match error {
-        NativeError::UncaughtException { class, message } => {
+        NativeError::UncaughtException { class, message, .. } => {
             assert_eq!(class, "java/lang/IllegalStateException");
             assert_eq!(message.as_deref(), Some("boom"));
         }
@@ -114,4 +114,62 @@ public final class QuietEntrypoint {
     let report = execute(&jar).expect("constructing an exception must not fail the entrypoint");
     assert_eq!(report.class, "demo.QuietEntrypoint");
     assert_eq!(report.method, "onInitialize");
+}
+
+#[test]
+fn caught_null_pointer_from_require_non_null_continues_the_entrypoint() {
+    let jar = build_fixture(
+        "caught-null",
+        "fixture-caught-null",
+        "demo.CaughtNullEntrypoint",
+        r#"
+package demo;
+public final class CaughtNullEntrypoint {
+  public void onInitialize() {
+    String text;
+    try {
+      text = java.util.Objects.requireNonNull((String) null, "value");
+    } catch (NullPointerException expected) {
+      text = "caught";
+    }
+    if (!"caught".equals(text)) {
+      throw new IllegalStateException("not caught: " + text);
+    }
+  }
+}
+"#,
+    );
+
+    let report = execute(&jar).expect("a caught NullPointerException must not fail the entrypoint");
+    assert_eq!(report.class, "demo.CaughtNullEntrypoint");
+}
+
+#[test]
+fn a_nested_method_throw_is_caught_by_the_caller() {
+    let jar = build_fixture(
+        "nested-catch",
+        "fixture-nested-catch",
+        "demo.NestedCatchEntrypoint",
+        r#"
+package demo;
+public final class NestedCatchEntrypoint {
+  private static void fail() {
+    throw new IllegalStateException("inner");
+  }
+
+  public void onInitialize() {
+    try {
+      fail();
+    } catch (IllegalStateException expected) {
+      if (!"inner".equals(expected.getMessage())) {
+        throw new IllegalStateException("message: " + expected.getMessage());
+      }
+    }
+  }
+}
+"#,
+    );
+
+    let report = execute(&jar).expect("the caller's exception table must catch the nested throw");
+    assert_eq!(report.class, "demo.NestedCatchEntrypoint");
 }
