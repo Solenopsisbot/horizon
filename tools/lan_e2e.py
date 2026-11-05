@@ -5993,6 +5993,18 @@ def main():
     SERVER_THREAD = args.server_thread
     if not SERVER_THREAD:
         print('DEPRECATED: --in-frame is unsupported and will be removed soon. Do not use it.', file=sys.stderr)
+    resources = lab.RESOURCES.resolve()
+    payload_only = args.check and all(name == 'payload_chunks' for name in args.check)
+    if payload_only and not (resources / 'horizon-resources.json').exists():
+        detail = 'skipped (prepared resources unavailable; payload chunk check needs two running games)'
+        out = Path(args.out).resolve()
+        out.mkdir(parents=True, exist_ok=True)
+        result = {'payload_chunks': {'pass': False, 'skipped': True, 'detail': detail}}
+        (out / 'results.json').write_text(json.dumps({'mode': 'server-thread' if SERVER_THREAD else 'in-frame',
+                                                       'checks': result}, indent=2) + '\n')
+        print(f'[lan] payload_chunks: SKIP {detail}')
+        print(json.dumps(result, indent=1))
+        sys.exit(0)
     if args.bin_dir:
         bins = Path(args.bin_dir).resolve()
     else:
@@ -6002,7 +6014,6 @@ def main():
         meta = json.loads(subprocess.run(['cargo', 'metadata', '--format-version', '1', '--no-deps'], cwd=ROOT,
                                          capture_output=True, text=True, check=True).stdout)
         bins = Path(meta['target_directory']) / 'fast'
-    resources = lab.RESOURCES.resolve()
     if not (resources / 'horizon-resources.json').exists():
         sys.exit(f'no prepared resources in {resources}')
     try:
@@ -9635,6 +9646,22 @@ def check_arrow_pickup(host, guest, out):
 
 CHECKS += ['arrow_pickup']
 CHECK_FNS['arrow_pickup'] = check_arrow_pickup
+
+
+def check_payload_chunks(host, guest, out):
+    """Exercise the native mod payload chunk path once a control injection exists.
+
+    The LAN transport is wired through ``LanHost::send_payload`` but the control
+    socket currently exposes no bounded command for a test to enqueue a declared
+    frame.  Do not substitute chat or a vanilla custom payload: that would skip
+    the mod registry, chunk assembler, and the unchanged small-frame path.
+    """
+    return ('skipped (horizon-ctl has no mod-payload injection hook; add a bounded '
+            'host control command at Game::control_command -> LanHost::send_payload)')
+
+
+CHECKS += ['payload_chunks']
+CHECK_FNS['payload_chunks'] = check_payload_chunks
 
 
 if __name__ == '__main__':
