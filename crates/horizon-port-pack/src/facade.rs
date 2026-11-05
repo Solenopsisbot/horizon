@@ -1819,7 +1819,8 @@ pub fn generate_many(
                     "public class DeferredRegister<T> {\n",
                     "    private String horizonNamespace = \"minecraft\";\n",
                     "    private Object horizonRegistry;\n",
-                    "    public static <T> DeferredRegister<T> create(Object registry, String id) { DeferredRegister<T> value = new DeferredRegister<>(); value.horizonRegistry = registry; value.horizonNamespace = id; return value; }\n",
+                    "    public static <T> DeferredRegister<T> create(net.minecraft.core.Registry registry, String id) { DeferredRegister<T> value = new DeferredRegister<>(); value.horizonRegistry = registry; value.horizonNamespace = id; return value; }\n",
+                    "    public static <T> DeferredRegister<T> create(net.minecraft.resources.ResourceKey registryKey, String id) { DeferredRegister<T> value = new DeferredRegister<>(); value.horizonNamespace = id; return value; }\n",
                     "    public <V extends T> DeferredHolder<V> register(String id, Supplier<V> value) { DeferredHolder<V> holder = new DeferredHolder<>(); holder.horizonBind(new Identifier(horizonNamespace, id), new ResourceKey(), value); return holder; }\n",
                     "    public void register(IEventBus bus) {}\n",
                     "}\n",
@@ -1846,7 +1847,7 @@ pub fn generate_many(
                 concat!(
                     "package net.minecraftforge.network.simple;\n",
                     "public class SimpleChannel {\n",
-                    "    public SimpleChannel registerMessage(int id, Class type, Object encoder, Object decoder, Object handler) { return this; }\n",
+                    "    public SimpleChannel registerMessage(int id, Class type, java.util.function.BiFunction encoder, java.util.function.BiFunction decoder, java.util.function.BiConsumer handler) { return this; }\n",
                     "}\n",
                 ),
             ),
@@ -20592,6 +20593,45 @@ public class Probe {
                     out.join("src").join(file).is_file(),
                     "{name}: the shim {file} was not generated (sources in {})",
                     out.display()
+                );
+            }
+            // A mod's compiled call site names the erased parameter types, so
+            // these shims must carry them too: `Object` would fail the invoke
+            // at runtime even though the shim compiles.
+            let read = |file: &str| {
+                fs::read_to_string(out.join("src").join(file))
+                    .unwrap_or_else(|e| panic!("{name}: cannot read {file}: {e}"))
+            };
+            if name == "neoforge" {
+                let deferred = read("net/neoforged/neoforge/registries/DeferredRegister.java");
+                assert!(
+                    deferred.contains("create(net.minecraft.core.Registry registry, String id)"),
+                    "{name}: DeferredRegister lost its Registry descriptor"
+                );
+                assert!(
+                    deferred.contains(
+                        "create(net.minecraft.resources.ResourceKey registryKey, String id)"
+                    ),
+                    "{name}: DeferredRegister lost its ResourceKey descriptor"
+                );
+                let join = read("net/neoforged/neoforge/event/entity/EntityJoinLevelEvent.java");
+                for member in [
+                    "public net.minecraft.world.entity.Entity getEntity()",
+                    "public net.minecraft.world.level.Level getLevel()",
+                ] {
+                    assert!(
+                        join.contains(member),
+                        "{name}: the join event lost {member}"
+                    );
+                }
+            }
+            if name == "legacy-forge" {
+                let channel = read("net/minecraftforge/network/simple/SimpleChannel.java");
+                assert!(
+                    channel.contains(
+                        "java.util.function.BiFunction encoder, java.util.function.BiFunction decoder, java.util.function.BiConsumer handler"
+                    ),
+                    "{name}: the channel registration lost its JDK descriptors"
                 );
             }
         }
