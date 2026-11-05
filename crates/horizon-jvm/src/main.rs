@@ -34,6 +34,22 @@ struct NestedJars {
     root: PathBuf,
 }
 
+#[cfg(test)]
+mod remap_tests {
+    use super::*;
+
+    #[test]
+    fn parses_synthetic_tiny_v2_intermediary_tree() {
+        let fixture = "tiny\t2\t0\tofficial\tintermediary\tnamed\nc\tnet/minecraft/Server\ta\tServer\n\tm\t()V\tstart\tb\tstartServer\n";
+        let tree = parse_mappings(fixture).expect("synthetic mappings should parse");
+        assert_eq!(tree.source, "intermediary");
+        assert_eq!(tree.target, "official");
+        assert_eq!(tree.classes, 1);
+        assert_eq!(tree.members, 1);
+        assert!(remap_report_line(&Ok(tree)).starts_with("remap: ok 1 entries"));
+    }
+}
+
 impl NestedJars {
     fn new() -> Result<Self, String> {
         let stamp = SystemTime::now()
@@ -990,17 +1006,23 @@ public final class HorizonLoaderBridge {
     setField(type, config, "namespace", "named");
     setField(type, config, "gameId", "minecraft");
     setField(type, config, "gameVersion", gameVersion);
-    setField(type, config, "mappingName", "none");
+    String mappingPath = System.getProperty("horizon.mapping.path");
+    setField(type, config, "mappingName", mappingPath == null ? "none" : "horizon");
     setField(type, config, "namespaces", Arrays.asList("official", "intermediary", "named"));
     setField(type, config, "initializedMetadata", true);
     setField(type, config, "initializedMappings", true);
-    // The provider dereferences the mapping tree unconditionally; a tree whose
-    // only namespace is the runtime one means every supplied class already
-    // carries its runtime names, so no remap is needed.
     Class<?> tree = Class.forName("net.fabricmc.loader.impl.lib.mappingio.tree.MemoryMappingTree");
     Object mappings = tree.getConstructor().newInstance();
-    tree.getMethod("visitNamespaces", String.class, java.util.List.class)
-        .invoke(mappings, "named", Arrays.asList("official"));
+    if (mappingPath != null && !mappingPath.isBlank()) {
+      Class<?> reader = Class.forName("net.fabricmc.loader.impl.lib.mappingio.MappingReader");
+      Class<?> visitor = Class.forName("net.fabricmc.loader.impl.lib.mappingio.MappingVisitor");
+      reader.getMethod("read", Path.class, visitor).invoke(null, Paths.get(mappingPath), mappings);
+    } else {
+      // The provider dereferences the mapping tree unconditionally when no
+      // installation supplied a real tree, so retain the historical empty tree.
+      tree.getMethod("visitNamespaces", String.class, java.util.List.class)
+          .invoke(mappings, "named", Arrays.asList("official"));
+    }
     setField(type, config, "mappings", mappings);
     return config;
   }
@@ -1150,6 +1172,37 @@ fn run() -> Result<(), String> {
     let stubs = take(&mut args, "--stubs").map(PathBuf::from);
     let loader = take(&mut args, "--loader").map(PathBuf::from);
     let libs = take(&mut args, "--libs").map(PathBuf::from);
+    // Read-only probes: a client home and mapping files are inspected, never
+    // started, and neither moves the launch gate.
+    let client_home = take(&mut args, "--client-home").map(PathBuf::from);
+    let mappings = take_all(&mut args, "--mappings")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let remap_report = args.iter().any(|arg| arg == "--remap-report");
+    args.retain(|arg| arg != "--remap-report");
+    let remap_line = remap_report.then(|| remap_report_line(&resolve_remap_tree(&mappings)));
+    // A client run reports what its install still lacks before anything else:
+    // the assets, client jar and natives live outside the classpath, so a
+    // missing one is a readiness fact, not a load failure.
+    let client_launch_line = if client_side(&entry_kind) {
+        let home = client_home
+            .clone()
+            .or_else(|| std::env::var_os(CLIENT_HOME_ENV).map(PathBuf::from));
+        let line = ClientReadiness::detect(home.as_deref(), &game_provider.version).line();
+        println!("{line}");
+        Some(line)
+    } else {
+        None
+    };
+    // `--remap-report` builds the tree the loader's mapping configuration needs
+    // and says whether it is real; a run without the flag prints nothing here.
+    if remap_report {
+        println!(
+            "{}",
+            remap_line.as_deref().unwrap_or("remap: failed unknown")
+        );
+    }
     let heap = take(&mut args, "--heap").unwrap_or_else(|| "-Xmx1g".to_owned());
     let real_loader = real_loader_flag || (!game_provider.jars.is_empty() && !args.is_empty());
     // A report with no run behind it is still useful: it names the provider
@@ -1160,7 +1213,9 @@ fn run() -> Result<(), String> {
                 &game_provider.jars,
                 &game_provider.version,
                 ProviderSide::for_entry_kind(&entry_kind),
-            ),
+            )
+            .with_remap(remap_line.clone())
+            .with_client_launch(client_launch_line.clone()),
             fml_flags.json,
         );
         return Ok(());
@@ -1175,13 +1230,20 @@ fn run() -> Result<(), String> {
                     &game_provider.jars,
                     &game_provider.version,
                     ProviderSide::for_entry_kind(&entry_kind),
-                ),
+                )
+                .with_remap(remap_line.clone())
+                .with_client_launch(client_launch_line.clone()),
                 fml_flags.json,
             );
         }
         return Ok(());
     }
     if args.is_empty() && !fml_flags.list && !fml_flags.report {
+        // `--remap-report` alone is a complete request: the line above is the
+        // whole answer, and an empty jar list is not an error for it.
+        if remap_report {
+            return Ok(());
+        }
         return Err(USAGE.to_owned());
     }
     if list_entrypoints_only {
@@ -1192,7 +1254,9 @@ fn run() -> Result<(), String> {
                     &game_provider.jars,
                     &game_provider.version,
                     ProviderSide::for_entry_kind(&entry_kind),
-                ),
+                )
+                .with_remap(remap_line.clone())
+                .with_client_launch(client_launch_line.clone()),
                 fml_flags.json,
             );
         }
@@ -1217,6 +1281,8 @@ fn run() -> Result<(), String> {
                     &game_provider.version,
                     ProviderSide::for_entry_kind(&entry_kind),
                 )
+                .with_remap(remap_line.clone())
+                .with_client_launch(client_launch_line.clone())
                 .with_launch_game(Some(status)),
                 fml_flags.json,
             );
@@ -1382,6 +1448,9 @@ fn run() -> Result<(), String> {
     ) {
         init = init.option(option);
     }
+    if let Some(path) = mapping_loader_path(&mappings) {
+        init = init.option(format!("-D{MAPPING_PATH_PROPERTY}={}", path.display()));
+    }
     // A mixin-application probe is read by the bridge after the loader has
     // registered its configs, so the spec travels as a system property.
     if let Some(spec) = &mixin_apply_probe {
@@ -1530,6 +1599,8 @@ fn run() -> Result<(), String> {
                 &game_provider.version,
                 ProviderSide::for_entry_kind(&entry_kind),
             )
+            .with_remap(remap_line.clone())
+            .with_client_launch(client_launch_line.clone())
             .with_classpath_unlock(unlock)
             .with_knot_init(knot_init)
             .with_knot_launch(knot_launch)
@@ -3135,6 +3206,8 @@ struct ProviderReport {
     knot_launch: Option<String>,
     mixin_apply: Option<String>,
     launch_game: Option<String>,
+    remap: Option<String>,
+    client_launch: Option<String>,
 }
 
 impl ProviderReport {
@@ -3153,6 +3226,8 @@ impl ProviderReport {
             knot_launch: None,
             mixin_apply: None,
             launch_game: None,
+            remap: None,
+            client_launch: None,
         }
     }
 
@@ -3186,6 +3261,16 @@ impl ProviderReport {
         self
     }
 
+    fn with_remap(mut self, value: Option<String>) -> Self {
+        self.remap = value;
+        self
+    }
+
+    fn with_client_launch(mut self, value: Option<String>) -> Self {
+        self.client_launch = value;
+        self
+    }
+
     fn from_outcome(
         outcome: &ProviderOutcome,
         game_jars: usize,
@@ -3215,6 +3300,8 @@ impl ProviderReport {
                 knot_launch: knot_launch.clone(),
                 mixin_apply: mixin_apply.clone(),
                 launch_game: launch_game.clone(),
+                remap: None,
+                client_launch: None,
             },
             ProviderOutcome::Fallback { reason, .. } => Self {
                 kind: ProviderKind::Test,
@@ -3230,6 +3317,8 @@ impl ProviderReport {
                 knot_launch: None,
                 mixin_apply: None,
                 launch_game: None,
+                remap: None,
+                client_launch: None,
             },
             ProviderOutcome::Test { .. } => Self {
                 kind: ProviderKind::Test,
@@ -3245,6 +3334,8 @@ impl ProviderReport {
                 knot_launch: None,
                 mixin_apply: None,
                 launch_game: None,
+                remap: None,
+                client_launch: None,
             },
         }
     }
@@ -3281,6 +3372,12 @@ impl ProviderReport {
         if let Some(launch) = &self.launch_game {
             lines.push(launch_game_line(launch));
         }
+        if let Some(remap) = &self.remap {
+            lines.push(remap.clone());
+        }
+        if let Some(client) = &self.client_launch {
+            lines.push(client.clone());
+        }
         bound_text(&(lines.join("\n") + "\n"), MAX_PROVIDER_REPORT_BYTES)
     }
 
@@ -3299,6 +3396,8 @@ impl ProviderReport {
             "knotLaunch": self.knot_launch,
             "mixinApply": self.mixin_apply,
             "launchGame": self.launch_game,
+            "remap": self.remap,
+            "clientLaunch": self.client_launch,
         })
         .to_string();
         if text.len() <= MAX_PROVIDER_REPORT_BYTES {
@@ -3318,6 +3417,8 @@ impl ProviderReport {
             "knotLaunch": self.knot_launch,
             "mixinApply": self.mixin_apply,
             "launchGame": self.launch_game,
+            "remap": self.remap,
+            "clientLaunch": self.client_launch,
         })
         .to_string()
     }
@@ -3561,6 +3662,543 @@ fn parse_provider_outcome(text: &str) -> Result<ProviderOutcome, String> {
             "production game provider returned an unknown result: {other}"
         )),
     }
+}
+
+/// Upper bound for one `remap:` or `client-launch:` stdout line.
+const MAX_READINESS_LINE_CHARS: usize = 400;
+
+/// Names mapping files without a flag, so a harness can point the probe at an
+/// installation it owns instead of guessing where one lives.
+const MAPPINGS_ENV: &str = "HORIZON_MAPPINGS";
+const MAPPING_PATH_PROPERTY: &str = "horizon.mapping.path";
+
+/// The game directory a launcher sets for a client run: the folder that holds
+/// `versions/`, `assets/` and `libraries/`.
+const CLIENT_HOME_ENV: &str = "HORIZON_MINECRAFT_HOME";
+
+/// The namespace Fabric's loader reads a mapping tree in. Mod class names are
+/// remapped out of the game's runtime namespace, so a tree without it cannot
+/// feed `MappingConfiguration`.
+const INTERMEDIARY_NAMESPACE: &str = "intermediary";
+
+/// Bound on a mapping file read into memory. A real intermediary tree is a few
+/// megabytes; anything far beyond that is not a mappings file worth parsing.
+const MAX_MAPPING_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How far below a search root a mapping file may sit. A project-local Loom
+/// cache keeps its tree at `projects/versions/<v>/source_mappings/<hash>.tiny`,
+/// five levels down; nothing deeper is a mapping file we look for.
+const MAPPING_SCAN_DEPTH: usize = 5;
+
+/// A mapping tree in the shape Fabric's `MappingConfiguration` takes: one
+/// source namespace (`intermediary`), one target namespace, and the number of
+/// class and member names that actually change. An identity tree is rejected
+/// rather than reported as a remap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemapTree {
+    source: String,
+    target: String,
+    /// Class mappings whose two names differ.
+    classes: usize,
+    /// Field and method mappings whose two names differ.
+    members: usize,
+}
+
+impl RemapTree {
+    fn line(&self) -> String {
+        format!(
+            "remap: ok {} entries ({} -> {})",
+            self.classes, self.source, self.target
+        )
+    }
+}
+
+/// One line, whitespace collapsed and capped, for either readiness probe.
+fn bounded_readiness_line(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "failed unknown".to_owned();
+    }
+    collapsed.chars().take(MAX_READINESS_LINE_CHARS).collect()
+}
+
+/// The bounded `remap:` line: a built tree names its source and target, and a
+/// failure names the file or the search roots that were checked. A failure is
+/// never dressed up as a success.
+fn remap_report_line(tree: &Result<RemapTree, String>) -> String {
+    match tree {
+        Ok(tree) => bounded_readiness_line(&tree.line()),
+        Err(reason) => bounded_readiness_line(&format!("remap: failed {reason}")),
+    }
+}
+
+/// Whether a namespace name can be a class, field or method name. This is what
+/// separates a tiny v2 class line from a comment line when a tree has only one
+/// namespace, where both have the same field count.
+fn is_namespaced_name(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(char::is_whitespace)
+}
+
+/// Parse a tiny v1 or v2 mapping tree and keep the class and member pairs whose
+/// intermediary and target names differ. The source namespace is
+/// [`INTERMEDIARY_NAMESPACE`]; a tree without it, or one whose names never
+/// change (an identity tree), is an error instead of a fake remap.
+fn parse_mappings(text: &str) -> Result<RemapTree, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| "empty mapping file".to_owned())?
+        .trim_end_matches('\r');
+    let (namespaces, tiny_v2) = if let Some(rest) = header.strip_prefix("tiny\t") {
+        let fields: Vec<&str> = rest.split('\t').collect();
+        if fields.first() != Some(&"2") {
+            return Err(format!(
+                "unsupported tiny version {}",
+                fields.first().copied().unwrap_or("?")
+            ));
+        }
+        // `tiny 2 <patch> <namespace>...`
+        let namespaces = fields.get(2..).unwrap_or_default();
+        (namespaces.to_vec(), true)
+    } else if let Some(rest) = header.strip_prefix("v1\t") {
+        (rest.split('\t').collect::<Vec<_>>(), false)
+    } else {
+        return Err("not a tiny v1 or v2 mapping file".to_owned());
+    };
+    let source_index = namespaces
+        .iter()
+        .position(|namespace| *namespace == INTERMEDIARY_NAMESPACE)
+        .ok_or_else(|| format!("no intermediary namespace (has {})", namespaces.join(", ")))?;
+    let target_index = namespaces
+        .iter()
+        .position(|namespace| *namespace == "official")
+        .or_else(|| {
+            namespaces
+                .iter()
+                .position(|namespace| *namespace != INTERMEDIARY_NAMESPACE)
+        })
+        .ok_or_else(|| "no target namespace".to_owned())?;
+    let target = namespaces[target_index].to_owned();
+    let mut classes = 0;
+    let mut members = 0;
+    let mut unchanged = 0;
+    for raw in lines {
+        let line = raw.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start_matches('\t').len();
+        let body = &line[indent..];
+        let mut fields = body.split('\t');
+        let Some(kind) = fields.next() else {
+            continue;
+        };
+        let rest: Vec<&str> = fields.collect();
+        if tiny_v2 {
+            match kind {
+                "c" if indent == 0 => {
+                    if rest.len() != namespaces.len()
+                        || !rest.iter().all(|name| is_namespaced_name(name))
+                    {
+                        continue;
+                    }
+                    let from = rest[source_index];
+                    let to = rest[target_index];
+                    if from == to {
+                        unchanged += 1;
+                    } else if !from.is_empty() && !to.is_empty() {
+                        classes += 1;
+                    }
+                }
+                "f" | "m" if indent > 0 => {
+                    // `<kind> <descriptor> <namespace name>...`
+                    if rest.len() != namespaces.len() + 1 {
+                        continue;
+                    }
+                    let names = &rest[1..];
+                    if !names.iter().all(|name| is_namespaced_name(name)) {
+                        continue;
+                    }
+                    let from = names[source_index];
+                    let to = names[target_index];
+                    if from == to {
+                        unchanged += 1;
+                    } else if !from.is_empty() && !to.is_empty() {
+                        members += 1;
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            match kind {
+                "CLASS" => {
+                    if rest.len() != namespaces.len() {
+                        continue;
+                    }
+                    let from = rest[source_index];
+                    let to = rest[target_index];
+                    if from == to {
+                        unchanged += 1;
+                    } else if !from.is_empty() && !to.is_empty() {
+                        classes += 1;
+                    }
+                }
+                "FIELD" | "METHOD" => {
+                    // `<kind> <owner> <descriptor> <namespace name>...`
+                    if rest.len() != namespaces.len() + 2 {
+                        continue;
+                    }
+                    let names = &rest[2..];
+                    let from = names[source_index];
+                    let to = names[target_index];
+                    if from == to {
+                        unchanged += 1;
+                    } else if !from.is_empty() && !to.is_empty() {
+                        members += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if classes == 0 {
+        if unchanged > 0 {
+            return Err(format!(
+                "identity tree ({unchanged} names unchanged, 0 remapped)"
+            ));
+        }
+        return Err("no class entries".to_owned());
+    }
+    Ok(RemapTree {
+        source: INTERMEDIARY_NAMESPACE.to_owned(),
+        target,
+        classes,
+        members,
+    })
+}
+
+/// Read a mappings file, accepting a tiny text file or a jar whose entry is
+/// `mappings.tiny`. The read is bounded, so a huge or hostile file cannot take
+/// the probe's memory with it.
+fn read_mapping_text(path: &Path) -> Result<String, String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.len() > MAX_MAPPING_BYTES {
+        return Err(format!(
+            "{}: larger than {MAX_MAPPING_BYTES} bytes",
+            path.display()
+        ));
+    }
+    let archive = matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("jar" | "zip")
+    );
+    if archive {
+        let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|error| format!("{}: {error}", path.display()))?;
+        for index in 0..archive.len() {
+            let Ok(entry) = archive.by_index(index) else {
+                continue;
+            };
+            let name = entry.name().to_ascii_lowercase();
+            if !name.ends_with(".tiny") {
+                continue;
+            }
+            let mut reader = entry.take(MAX_MAPPING_BYTES + 1);
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
+                .map_err(|error| format!("{}!{name}: {error}", path.display()))?;
+            if bytes.len() as u64 > MAX_MAPPING_BYTES {
+                return Err(format!(
+                    "{}!{name}: larger than {MAX_MAPPING_BYTES}",
+                    path.display()
+                ));
+            }
+            return String::from_utf8(bytes)
+                .map_err(|_| format!("{}!{name}: not UTF-8", path.display()));
+        }
+        return Err(format!("{}: no .tiny mappings entry", path.display()));
+    }
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8", path.display()))
+}
+
+/// Whether a name looks like a mappings file. A `.tiny` always is one; a jar
+/// only when its name says it carries intermediary, yarn or mappings.
+fn is_mapping_file_name(path: &Path) -> bool {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("tiny") => true,
+        Some("jar" | "zip") => {
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            name.contains("intermediary") || name.contains("mapping") || name.contains("yarn")
+        }
+        _ => false,
+    }
+}
+
+/// Collect mapping files below `dir`, sorted so the first candidate is stable.
+/// The bulk cargo directories (asset objects, remapped jars, extracted natives)
+/// are skipped: they can hold millions of files and never hold a mapping tree.
+fn mapping_files_under(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if depth == 0 {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if matches!(
+                name.as_str(),
+                "objects" | "remappedJars" | "remapped_mods" | "natives" | "minecraftMaven"
+            ) {
+                continue;
+            }
+            mapping_files_under(&path, depth - 1, out);
+        } else if is_mapping_file_name(&path) {
+            out.push(path);
+        }
+    }
+}
+
+/// The roots checked when no `--mappings` path is given, in a stable order.
+/// Each carries the depth that still reaches a real file: a Loom project cache
+/// nests its tree five levels down, the others never go that deep.
+fn mapping_search_roots() -> Vec<(PathBuf, usize)> {
+    let mut roots = vec![(PathBuf::from("/tmp/opencode"), 3)];
+    if let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+    {
+        roots.push((home.join(".fabric"), 3));
+        roots.push((home.join(".minecraft"), 3));
+        roots.push((home.join(".gradle/caches"), 3));
+        roots.push((home.join(".gradle/caches/fabric-loom"), 3));
+        roots.push((
+            home.join(".gradle/caches/modules-2/files-2.1/net.fabricmc"),
+            4,
+        ));
+        roots.push((home.join(".gradle/loom-cache"), MAPPING_SCAN_DEPTH));
+    }
+    roots
+}
+
+/// Build a real remap tree from the files the caller named, then from
+/// `HORIZON_MAPPINGS`, then from the standard roots. Every candidate is parsed;
+/// if none yields an intermediary tree the first concrete failure is reported
+/// with the roots that were checked, so a missing installation is visible
+/// rather than silently treated as identity.
+fn resolve_remap_tree(explicit: &[PathBuf]) -> Result<RemapTree, String> {
+    let mut paths: Vec<PathBuf> = explicit.to_vec();
+    if let Some(value) = std::env::var_os(MAPPINGS_ENV) {
+        paths.extend(std::env::split_paths(&value));
+    }
+    let mut candidates = Vec::new();
+    let mut checked = Vec::new();
+    if paths.is_empty() {
+        for (root, depth) in mapping_search_roots() {
+            checked.push(root.display().to_string());
+            if root.is_dir() {
+                mapping_files_under(&root, depth, &mut candidates);
+            }
+        }
+        if candidates.is_empty() {
+            return Err(format!("no mappings file; checked {}", checked.join(", ")));
+        }
+    } else {
+        for path in &paths {
+            if path.is_dir() {
+                let before = candidates.len();
+                mapping_files_under(path, MAPPING_SCAN_DEPTH, &mut candidates);
+                if candidates.len() == before {
+                    return Err(format!("no mapping file under {}", path.display()));
+                }
+            } else if path.is_file() {
+                candidates.push(path.clone());
+            } else {
+                return Err(format!("no such mappings path: {}", path.display()));
+            }
+        }
+    }
+    let mut first_error = None;
+    for candidate in candidates {
+        let parsed = read_mapping_text(&candidate).and_then(|text| parse_mappings(&text));
+        match parsed {
+            Ok(tree) => return Ok(tree),
+            Err(error) => {
+                first_error.get_or_insert_with(|| format!("{}: {error}", candidate.display()));
+            }
+        }
+    }
+    Err(first_error.unwrap_or_else(|| "no mappings file".to_owned()))
+}
+
+/// Select the concrete tiny file to hand to Fabric's MappingReader. Archives
+/// are reportable but are not passed to the loader because MappingReader reads
+/// a filesystem mapping stream; callers can point at their extracted `.tiny`.
+fn mapping_loader_path(explicit: &[PathBuf]) -> Option<PathBuf> {
+    let mut candidates = explicit.to_vec();
+    if let Some(value) = std::env::var_os(MAPPINGS_ENV) {
+        candidates.extend(std::env::split_paths(&value));
+    }
+    if candidates.is_empty() {
+        for (root, depth) in mapping_search_roots() {
+            let mut found = Vec::new();
+            mapping_files_under(&root, depth, &mut found);
+            candidates.extend(found);
+        }
+    }
+    candidates.into_iter().find(|path| {
+        path.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some("tiny")
+            && read_mapping_text(path)
+                .and_then(|text| parse_mappings(&text))
+                .is_ok()
+    })
+}
+
+/// What a client launch still needs from the local install. A launcher extracts
+/// natives from the `libraries` jars, so an extracted directory and the jars
+/// themselves both count as present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientReadiness {
+    missing: Vec<String>,
+}
+
+impl ClientReadiness {
+    fn detect(home: Option<&Path>, version: &str) -> Self {
+        let Some(home) = home else {
+            return Self {
+                missing: vec![format!(
+                    "no client home (pass --client-home <dir> or set {CLIENT_HOME_ENV})"
+                )],
+            };
+        };
+        let mut missing = Vec::new();
+        let version_dir = home.join("versions").join(version);
+        if !version_dir.join(format!("{version}.jar")).is_file() {
+            missing.push(format!("versions/{version}/{version}.jar"));
+        }
+        if let Err(label) = client_assets_index(home, version) {
+            missing.push(label);
+        }
+        if !client_natives_present(home, version) {
+            missing.push("natives".to_owned());
+        }
+        Self { missing }
+    }
+
+    fn ready(&self) -> bool {
+        self.missing.is_empty()
+    }
+
+    fn line(&self) -> String {
+        if self.ready() {
+            return "client-launch: ready".to_owned();
+        }
+        bounded_readiness_line(&format!(
+            "client-launch: needs assets ({})",
+            self.missing.join(", ")
+        ))
+    }
+}
+
+/// The asset index the version json names, falling back to the version id. The
+/// returned label on failure is already relative to the game home.
+fn client_assets_index(home: &Path, version: &str) -> Result<PathBuf, String> {
+    let version_json = home
+        .join("versions")
+        .join(version)
+        .join(format!("{version}.json"));
+    let id = fs::read_to_string(&version_json)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("assetIndex")?
+                .get("id")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| version.to_owned());
+    let path = home
+        .join("assets")
+        .join("indexes")
+        .join(format!("{id}.json"));
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(format!("assets/indexes/{id}.json"))
+    }
+}
+
+/// The OS token LWJGL's native jars carry (`natives-linux` and friends).
+fn native_os_token() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "windows",
+        "macos" => "macos",
+        _ => "linux",
+    }
+}
+
+fn dir_non_empty(dir: &Path) -> bool {
+    fs::read_dir(dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+/// Whether some file below `dir` (to `depth`) has `token` in its name.
+fn any_file_under(dir: &Path, depth: usize, token: &str) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if depth > 0 && any_file_under(&entry.path(), depth - 1, token) {
+                return true;
+            }
+        } else if entry
+            .file_name()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains(token)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extracted natives (what a launcher makes at start) or the native jars in
+/// `libraries` (what it extracts them from).
+fn client_natives_present(home: &Path, version: &str) -> bool {
+    if [
+        home.join("versions").join(version).join("natives"),
+        home.join("natives"),
+    ]
+    .iter()
+    .any(|dir| dir_non_empty(dir))
+    {
+        return true;
+    }
+    let token = format!("natives-{}", native_os_token());
+    any_file_under(&home.join("libraries"), 6, &token)
 }
 
 /// A Java `String[]` from paths the user supplied.
@@ -7996,6 +8634,8 @@ config="demo.mixins.json""#,
             knot_launch: None,
             mixin_apply: None,
             launch_game: None,
+            remap: None,
+            client_launch: None,
         };
         assert!(report.text().len() <= MAX_PROVIDER_REPORT_BYTES);
         assert!(report.json().len() <= MAX_PROVIDER_REPORT_BYTES);
