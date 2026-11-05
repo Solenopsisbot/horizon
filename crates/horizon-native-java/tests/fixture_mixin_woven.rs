@@ -527,7 +527,7 @@ public abstract class ReasonsMixin {
     private static void onMissing() {}
     @Inject(method = "<init>()V", at = @At("HEAD"))
     private static void onConstructor() {}
-    // The shape real mods use for a plain HEAD, which the weaver cannot express.
+    // The shape real mods use for a plain HEAD: a trailing CallbackInfo.
     @Inject(method = "takesInfo()V", at = @At("HEAD"))
     private static void onTakesInfo(CallbackInfo info) {}
     @Inject(method = "instanceCallback()V", at = @At("HEAD"))
@@ -621,7 +621,6 @@ public abstract class MemberMixin {
         ("target-missing", 1),
         ("target-outside-jar", 1),
         ("unsupported-family", 1),
-        ("weaver-rejected", 1),
     ]);
     assert_eq!(skip_labels(&weave), expected, "{:#?}", weave.skipped);
 
@@ -631,7 +630,7 @@ public abstract class MemberMixin {
         .iter()
         .map(|plan| plan.callback.name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(woven_names, ["good", "onBoth"]);
+    assert_eq!(woven_names, ["good", "onTakesInfo", "onBoth"]);
     assert_eq!(weave.woven[0].target.descriptor, "()V", "resolved overload");
     assert_eq!(
         run_main(&jar),
@@ -643,18 +642,6 @@ public abstract class MemberMixin {
         ]),
         "each callback runs exactly once"
     );
-
-    // Every weaver reason a report might print stays one bounded line.
-    let rejected = weave
-        .skipped
-        .iter()
-        .find_map(|row| match &row.reason {
-            MixinSkipReason::Weaver(detail) => Some(detail),
-            _ => None,
-        })
-        .expect("the CallbackInfo callback is the weaver's to refuse");
-    assert!(rejected.contains("CallbackInfo"), "{rejected}");
-    assert!(rejected.chars().count() <= 203, "{rejected}");
 
     // The same class list on the other side applies the `client` mixin.
     let (_, client_weave) = woven(fixture.load(), MixinSide::Client);
