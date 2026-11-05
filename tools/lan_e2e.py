@@ -5968,7 +5968,8 @@ def run(ctl, out, resources, checks):
                 results[name] = {'pass': False, 'detail': repr(e)}
                 for g in (host, guest):
                     back_to_game(g)
-            print(f'[lan] {name}: {"PASS" if results[name]["pass"] else "FAIL"} {results[name]["detail"]}')
+            outcome = 'SKIP' if results[name].get('skipped') else ('PASS' if results[name]['pass'] else 'FAIL')
+            print(f'[lan] {name}: {outcome} {results[name]["detail"]}')
     finally:
         logs = {g.name: g.close() for g in (guest, host)}
         for name, text in logs.items():
