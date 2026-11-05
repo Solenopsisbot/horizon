@@ -18346,11 +18346,12 @@ fn utf8(pool: &[Cp], index: u16) -> Result<String, NativeError> {
 /// Rewrite raw control characters inside JSON string literals as escapes.
 ///
 /// Fabric reads `fabric.mod.json` with Gson's lenient parser, which accepts an
-/// unescaped newline or tab inside a string. Real jars put a multiline
-/// `description` there, and a strict parser rejects the whole document, so the
-/// jar loads with no id and no entrypoints. The rewrite only touches characters
-/// inside a string literal and escapes them as JSON requires, so a valid
-/// document is returned unchanged.
+/// unescaped C0 control character inside a string. Real jars put multiline
+/// `description` values there, and a strict parser rejects the whole document,
+/// so the jar loads with no id and no entrypoints. The rewrite only touches
+/// characters inside a string literal and escapes them as JSON requires, so a
+/// valid document is returned unchanged; invalid backslash escapes remain for
+/// serde_json to reject.
 fn lenient_json_text(text: &str) -> Cow<'_, str> {
     let mut out = String::new();
     let mut changed = false;
@@ -21724,7 +21725,7 @@ mod tests {
         // Gson's lenient parser, which Fabric reads the metadata with, accepts
         // the multiline `description` real jars ship. A strict parser rejects
         // the whole document, losing the id, the entrypoints and the configs.
-        let text = "{\n\t\"schemaVersion\": 1,\n\t\"id\": \"weaponmaster\",\n\t\"version\": \"4.4.3\",\n\t\"description\": \"first line\nsecond line\twith a tab\",\n\t\"entrypoints\": {\"main\": [\"demo.Main\"]},\n\t\"mixins\": [\"demo.mixins.json\"]\n}";
+        let text = "{\n\t\"schemaVersion\": 1,\n\t\"id\": \"weaponmaster\",\n\t\"version\": \"4.4.3\",\n\t\"description\": \"first line\nsecond line\twith a tab\u{0008} and a form\u{000c} feed\",\n\t\"entrypoints\": {\"main\": [\"demo.Main\"]},\n\t\"mixins\": [\"demo.mixins.json\"]\n}";
         let (id, version, entrypoints, _) = parse_metadata(text).unwrap();
         assert_eq!(id.as_deref(), Some("weaponmaster"));
         assert_eq!(version.as_deref(), Some("4.4.3"));
@@ -21738,6 +21739,14 @@ mod tests {
             lenient_json_text(r#"{"id":"demo"}"#),
             Cow::Borrowed(_)
         ));
+        let rewritten =
+            lenient_json_text("{\"description\":\"tab\tback\u{0008}form\u{000c}feed\nline\"}");
+        assert_eq!(
+            rewritten,
+            r#"{"description":"tab\tback\bform\ffeed\nline"}"#
+        );
+        let error = parse_metadata(r#"{"id":"demo\q"}"#).unwrap_err();
+        assert!(matches!(error, NativeError::Metadata(_)), "{error}");
         let error = parse_metadata(r#"{"id" "demo"}"#).unwrap_err();
         assert!(matches!(error, NativeError::Metadata(_)), "{error}");
     }
