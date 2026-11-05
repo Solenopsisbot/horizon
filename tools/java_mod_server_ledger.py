@@ -32,6 +32,8 @@ class Row:
     skipped: int = 0
     reason: str = ""
     seconds: float = 0.0
+    skip_reasons: tuple[str, ...] = ()
+    recommend: str = ""
 
 
 def bounded(value: str, limit: int = MAX_REASON) -> str:
@@ -82,6 +84,10 @@ def parse_log(text: str, filename: str, *, seconds: float = 0.0, timed_out: bool
         if counts:
             woven, skipped = map(int, counts.groups())
 
+    skip_reasons = tuple(re.findall(
+        r"\b(target-outside-jar|target-missing|game-class)\b", text, re.I
+    ))
+
     done = bool(re.search(r"Done \(", text))
     reason = ""
     for pattern in (r"startup failed:\s*([^\n]+)", r"refused:\s*([^\n]+)",
@@ -123,8 +129,27 @@ def parse_log(text: str, filename: str, *, seconds: float = 0.0, timed_out: bool
             verdict = "skipped"
         else:
             verdict = "refused"
+    row = Row(filename, ident, version, verdict, subtype, engine, woven, skipped,
+              reason, round(seconds, 3), skip_reasons)
     return Row(filename, ident, version, verdict, subtype, engine, woven, skipped,
-               reason, round(seconds, 3))
+               reason, round(seconds, 3), skip_reasons, recommendation(row))
+
+
+LOADER_SKIP_REASONS = {"target-outside-jar", "target-missing", "game-class"}
+
+
+def recommendation(row: Row) -> str:
+    """Choose the next compatibility path from the stable server outcome."""
+    if row.engine.lower() in {"loader", "jvm", "knot"}:
+        return "loader"
+    if row.verdict == "skipped" and row.subtype in {"client-only", "library"}:
+        return "native"
+    if row.verdict == "ran":
+        loader_skips = sum(reason.lower() in LOADER_SKIP_REASONS for reason in row.skip_reasons)
+        if row.skipped and loader_skips * 2 >= row.skipped and loader_skips:
+            return "loader"
+        return "native"
+    return "native-gap"
 
 
 def reason_category(row: Row) -> str:
@@ -148,6 +173,7 @@ def reason_category(row: Row) -> str:
 
 def summary(rows: list[Row]) -> dict[str, object]:
     categories = sorted({reason_category(row) for row in rows})
+    recommendations = sorted({recommendation(row) for row in rows})
     return {
         "total": len(rows),
         "ran": sum(row.verdict == "ran" for row in rows),
@@ -155,6 +181,8 @@ def summary(rows: list[Row]) -> dict[str, object]:
         "skipped": sum(row.verdict == "skipped" for row in rows),
         "reason_categories": {category: sum(reason_category(row) == category for row in rows)
                               for category in categories},
+        "recommendations": {value: sum(recommendation(row) == value for row in rows)
+                             for value in recommendations},
     }
 
 
@@ -229,7 +257,8 @@ def format_row(row: Row) -> str:
     values = [row.file, f"id={row.id}", f"version={row.version}", f"verdict={row.verdict}",
               f"subtype={row.subtype}",
               f"engine={row.engine}", f"woven={row.woven}", f"skipped={row.skipped}",
-              f"reason={bounded(row.reason)}", f"seconds={row.seconds:.3f}"]
+              f"reason={bounded(row.reason)}", f"recommend={recommendation(row)}",
+              f"seconds={row.seconds:.3f}"]
     return "\t".join(value.replace("\t", " ") for value in values)
 
 

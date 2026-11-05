@@ -41,6 +41,7 @@ class JavaModServerLedgerTests(unittest.TestCase):
         self.assertEqual(LEDGER.summary([row, LEDGER.Row("ok.jar", verdict="ran")]), {
             "total": 2, "ran": 1, "refused": 1, "skipped": 0,
             "reason_categories": {"none": 1, "timeout": 1},
+            "recommendations": {"native": 1, "native-gap": 1},
         })
 
     def test_parse_entrypoint_refusals_are_skipped_by_subtype(self):
@@ -78,6 +79,25 @@ class JavaModServerLedgerTests(unittest.TestCase):
         self.assertEqual(LEDGER.summary(rows)["reason_categories"], {
             "invalid-class": 1, "no-entrypoint": 1, "none": 1,
         })
+
+    def test_recommendation_classifies_native_loader_and_gap(self):
+        ran = LEDGER.parse_log(
+            "engine=native-qualified id=gamefix version=1\n"
+            "mixin weave: 1 woven, 3 skipped; skipped Mixin work does not run: "
+            "[target-outside-jar HEAD net/minecraft/server/level/ServerPlayer#tick, "
+            "target-outside-jar HEAD net/minecraft/world/level/Level#tick, "
+            "unsupported-family INVOKE demo/Target#run]\nDone (1s)",
+            "gamefix.jar",
+        )
+        client = LEDGER.Row("client.jar", verdict="skipped", subtype="client-only", engine="refused")
+        refused = LEDGER.Row("broken.jar", verdict="refused", engine="refused", reason="Metadata(bad)")
+        self.assertEqual(ran.recommend, "loader")
+        self.assertEqual(LEDGER.recommendation(client), "native")
+        self.assertEqual(LEDGER.recommendation(refused), "native-gap")
+
+    def test_recommendation_prefers_loader_engine(self):
+        row = LEDGER.Row("knot.jar", verdict="refused", engine="knot")
+        self.assertEqual(LEDGER.recommendation(row), "loader")
 
     def test_integration_requires_prepared_resources(self):
         resources = ROOT / ".local/horizon-client/26.3"
