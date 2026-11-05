@@ -18573,6 +18573,26 @@ mandatory = true
     }
 
     #[test]
+    fn mixin_configs_stay_out_when_loader_metadata_declares_none() {
+        let mut jar = NativeJar::default();
+        for name in ["fabric.mod.json", "root.mixins.json"] {
+            jar.resources
+                .insert(name.into(), format!("jar-resource/{name}"));
+        }
+        jar.resource_bytes
+            .insert("fabric.mod.json".into(), br#"{"id":"undeclared"}"#.to_vec());
+        jar.resource_bytes.insert(
+            "root.mixins.json".into(),
+            br#"{"mixins":["demo.RootMixin"]}"#.to_vec(),
+        );
+        assert!(
+            jar.mixin_configs().is_empty(),
+            "Fabric would not load an undeclared root config"
+        );
+        assert!(jar.mixin_config_warnings().is_empty());
+    }
+
+    #[test]
     fn mixin_configs_follow_neoforge_declarations_and_environment() {
         let mut jar = NativeJar::default();
         jar.resources
