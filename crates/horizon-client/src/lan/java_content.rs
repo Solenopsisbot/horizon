@@ -11,14 +11,19 @@ use crate::mod_content::{
     MAX_DECLARED_ENTITIES, MAX_DECLARED_IDS, MAX_DECLARED_MENUS, MAX_DECLARED_OPEN_BLOCKS,
     MAX_DECLARED_TEXT, MenuRow,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The channel the login manifest travels on.
 pub const CHANNEL: &str = "horizon:java_content";
 
-/// The manifest version this build writes: ids and block-entity rows, then
-/// bounded menu and entity template sections.
-pub const VERSION: u16 = 2;
+/// The manifest version this build writes: a v3 header (the declared-content
+/// epoch and a content hash), then the v1 body and the v2 menu and entity
+/// template sections.
+pub const VERSION: u16 = 3;
+
+/// The second manifest version, still decoded: the v1 body and the bounded
+/// template sections, with no header.
+pub const VERSION_V2: u16 = 2;
 
 /// The first manifest version, still decoded: ids and block-entity rows only.
 pub const VERSION_V1: u16 = 1;
@@ -61,6 +66,10 @@ const SECTIONS: usize = 2;
 /// same content always gives the same bytes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JavaContentManifest {
+    /// The declared-content epoch the host wrote in the v3 header
+    /// ([`mod_content::declared_java_content_epoch`]); 0 for a v1 or v2 frame,
+    /// which carries no header.
+    pub epoch: u64,
     pub blocks: Vec<String>,
     pub items: Vec<String>,
     pub effects: Vec<String>,
@@ -80,13 +89,14 @@ impl JavaContentManifest {
     /// The declarations the last content root recorded on this process: what
     /// the host sends, and what a guest would have if it had the mods.
     pub fn from_stored() -> Self {
+        let (epoch, stored) = mod_content::declared_java_content_snapshot();
         let mod_content::DeclaredJavaContent {
             ids,
             extra,
             block_entities,
             menus,
             entities,
-        } = mod_content::stored_declared_java_content();
+        } = stored;
         let block_entities = block_entities
             .into_iter()
             .map(|(block, row)| BlockEntityRow {
@@ -97,6 +107,7 @@ impl JavaContentManifest {
             })
             .collect();
         Self {
+            epoch,
             blocks: ids.blocks,
             items: ids.items,
             effects: ids.effects,
@@ -132,15 +143,26 @@ impl JavaContentManifest {
         ]
     }
 
-    /// The frame: `u16` version 2, the v1 body (per registry a `u16` count and
+    /// The frame: a `u16` version 3 header (`u64` declared-content epoch and
+    /// `u64` content hash), then the v1 body (per registry a `u16` count and
     /// its ids, then a `u16` row count and per row the block, declared id and
     /// template, and a `u8` ticker flag), then a `u16` section count and the
-    /// menu and entity sections in kind order.
+    /// menu and entity sections in kind order. The hash covers the
+    /// declarations, so the same content always gives the same header.
     pub fn encode(&self) -> Result<Vec<u8>, String> {
+        let mut body = Writer::default();
+        self.encode_body(&mut body)?;
+        self.encode_sections(&mut body)?;
         let mut writer = Writer::default();
         writer.u16(VERSION)?;
-        self.encode_body(&mut writer)?;
+        writer.u64(self.epoch)?;
+        writer.u64(self.content_hash()?)?;
+        writer.raw(&body.bytes)?;
+        Ok(writer.bytes)
+    }
 
+    /// The v2 menu and entity template sections, in ascending kind order.
+    fn encode_sections(&self, writer: &mut Writer) -> Result<(), String> {
         let mut menus = self.menu_rows.clone();
         sort_unique_menus(&mut menus)?;
         if menus.len() > MAX_MENUS {
@@ -190,7 +212,35 @@ impl JavaContentManifest {
             }
             writer.u8(row.flags)?;
         }
-        Ok(writer.bytes)
+        Ok(())
+    }
+
+    /// These declarations as one normalized snapshot, without touching the
+    /// stores: the same ids and rows [`apply`](Self::apply) would store.
+    fn declared(&self) -> Result<mod_content::DeclaredJavaContent, String> {
+        mod_content::normalized_declared_java_content(
+            DeclaredIds {
+                blocks: self.blocks.clone(),
+                items: self.items.clone(),
+                effects: self.effects.clone(),
+                entity_types: self.entity_types.clone(),
+                menus: self.menus.clone(),
+                block_entity_types: self.block_entity_types.clone(),
+            },
+            DeclaredExtraIds {
+                data_components: self.data_components.clone(),
+                attachments: self.attachments.clone(),
+            },
+            self.block_entities.clone(),
+            self.menu_rows.clone(),
+            self.entity_rows.clone(),
+        )
+    }
+
+    /// The declarations' content hash, as the v3 header carries it: equal for
+    /// two manifests declaring the same thing, whatever their row order.
+    pub fn content_hash(&self) -> Result<u64, String> {
+        Ok(self.declared()?.content_hash())
     }
 
     /// The v1 body, shared by both versions: the eight registries and the
@@ -227,12 +277,20 @@ impl JavaContentManifest {
         Ok(())
     }
 
-    /// Decode one frame, v1 or v2. Every count and length is checked against
-    /// its cap, text is validated as UTF-8, the ticker flag must be 0 or 1,
-    /// section kinds must ascend without repeats (an unknown kind rejects),
-    /// and any byte after the last row rejects. Ids and rows come back sorted
+    /// Decode one frame, v1, v2 or v3. Every count and length is checked
+    /// against its cap, text is validated as UTF-8, the ticker flag must be 0
+    /// or 1, section kinds must ascend without repeats (an unknown kind
+    /// rejects), and any byte after the last row rejects. A v3 header's hash
+    /// must match the declarations it covers. Ids and rows come back sorted
     /// and deduplicated; a v1 frame has no templates.
     pub fn decode(data: &[u8]) -> Result<Self, String> {
+        Self::decode_frame(data).map(|(manifest, _)| manifest)
+    }
+
+    /// [`decode`](Self::decode) plus the version the frame declared, so a
+    /// caller can apply a v3 header's checks and leave a v1 or v2 frame to the
+    /// plain merge rules.
+    pub fn decode_frame(data: &[u8]) -> Result<(Self, u16), String> {
         if data.len() > MAX_FRAME {
             return Err(format!(
                 "declared Java content is {} bytes (max {MAX_FRAME})",
@@ -241,14 +299,21 @@ impl JavaContentManifest {
         }
         let mut reader = Reader { bytes: data, at: 0 };
         let version = reader.u16()?;
-        if version != VERSION && version != VERSION_V1 {
+        if version != VERSION && version != VERSION_V2 && version != VERSION_V1 {
             return Err(format!(
-                "declared Java content version {version} is not {VERSION} or {VERSION_V1}"
+                "declared Java content version {version} is not {VERSION}, \
+                 {VERSION_V2} or {VERSION_V1}"
             ));
         }
         let mut manifest = Self::default();
+        let declared_hash = if version == VERSION {
+            manifest.epoch = reader.u64()?;
+            Some(reader.u64()?)
+        } else {
+            None
+        };
         manifest.decode_body(&mut reader)?;
-        if version == VERSION {
+        if version == VERSION || version == VERSION_V2 {
             manifest.decode_sections(&mut reader)?;
         }
         if reader.at != data.len() {
@@ -257,7 +322,16 @@ impl JavaContentManifest {
                 data.len() - reader.at
             ));
         }
-        Ok(manifest)
+        if let Some(declared_hash) = declared_hash {
+            let hash = manifest.content_hash()?;
+            if hash != declared_hash {
+                return Err(format!(
+                    "declared Java content hash {hash:#018x} is not the header's \
+                     {declared_hash:#018x}"
+                ));
+            }
+        }
+        Ok((manifest, version))
     }
 
     fn decode_body(&mut self, reader: &mut Reader) -> Result<(), String> {
@@ -422,9 +496,80 @@ fn sort_unique_entities(rows: &mut Vec<EntityRow>) -> Result<(), String> {
     Ok(())
 }
 
-/// Decode one received frame and store it; the client's whole handler.
-pub fn apply(data: &[u8]) -> Result<usize, String> {
-    JavaContentManifest::decode(data)?.apply()
+/// What one received manifest did to the declarations this process holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The manifest was stored; this many declarations resolve now.
+    Applied(usize),
+    /// The frame was well formed but the client already holds a different,
+    /// non-empty declaration set; the local content is unchanged and the
+    /// bounded one-line reason is for the log.
+    Refused(String),
+}
+
+/// The declared-content epoch of the last v3 manifest this client applied, 0
+/// until one is. Diagnostics, and a later post-login re-send, use it to tell
+/// "the host's declarations changed" from "the same content again".
+static APPLIED_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The declared-content epoch of the last v3 manifest this client applied.
+pub fn applied_epoch() -> u64 {
+    APPLIED_EPOCH.load(Ordering::Acquire)
+}
+
+/// Decode one received frame and store it; the client's whole handler. A v3
+/// header is checked against the local declarations first, so a guest with its
+/// own mods keeps them.
+pub fn apply(data: &[u8]) -> Result<Outcome, String> {
+    let (manifest, version) = JavaContentManifest::decode_frame(data)?;
+    manifest.apply_frame(version)
+}
+
+impl JavaContentManifest {
+    /// Apply a decoded frame of `version`. A v1 or v2 frame follows the plain
+    /// merge rule. A v3 frame is refused, leaving the stores untouched, when
+    /// the process already holds different non-empty declarations; the header
+    /// hash was already checked by [`decode_frame`](Self::decode_frame).
+    fn apply_frame(&self, version: u16) -> Result<Outcome, String> {
+        if version != VERSION {
+            return self.apply().map(Outcome::Applied);
+        }
+        if !self.is_empty() {
+            let local = mod_content::stored_declared_java_content_hash();
+            let incoming = self.content_hash()?;
+            if local != 0 && local != incoming {
+                return Ok(Outcome::Refused(refusal_reason(
+                    self.epoch, local, incoming,
+                )));
+            }
+        }
+        let count = self.apply()?;
+        APPLIED_EPOCH.store(self.epoch, Ordering::Release);
+        Ok(Outcome::Applied(count))
+    }
+}
+
+/// The longest refusal line [`refusal_reason`] builds; the log and any future
+/// chat line stay bounded whatever the host sends.
+pub const MAX_REFUSAL: usize = 160;
+
+/// One bounded, single-line reason for keeping the local declarations.
+fn refusal_reason(epoch: u64, local: u64, incoming: u64) -> String {
+    let reason = format!(
+        "server declared Java content {incoming:#018x} (epoch {epoch}) but this client \
+         already holds {local:#018x}; keeping the local content"
+    );
+    // Control characters never reach the log line, and it stays within
+    // `MAX_REFUSAL` bytes whatever the host's numbers were.
+    let mut bounded = String::with_capacity(MAX_REFUSAL);
+    for c in reason.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if bounded.len() + c.len_utf8() > MAX_REFUSAL {
+            break;
+        }
+        bounded.push(c);
+    }
+    bounded
 }
 
 static REJECTED: AtomicBool = AtomicBool::new(false);
@@ -434,6 +579,16 @@ static REJECTED: AtomicBool = AtomicBool::new(false);
 pub fn warn_once(error: &str) {
     if !REJECTED.swap(true, Ordering::Relaxed) {
         log::warn!("Horizon: declared Java content was rejected: {error}");
+    }
+}
+
+static REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// Log a refused manifest once: a host re-sending conflicting declarations
+/// should not fill the log one line per frame.
+pub fn warn_refused_once(reason: &str) {
+    if !REFUSED.swap(true, Ordering::Relaxed) {
+        log::warn!("Horizon: kept the local Java content: {reason}");
     }
 }
 
@@ -459,6 +614,18 @@ impl Writer {
     fn u16(&mut self, value: u16) -> Result<(), String> {
         self.reserve(2)?;
         self.bytes.extend_from_slice(&value.to_be_bytes());
+        Ok(())
+    }
+
+    fn u64(&mut self, value: u64) -> Result<(), String> {
+        self.reserve(8)?;
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+        Ok(())
+    }
+
+    fn raw(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.reserve(bytes.len())?;
+        self.bytes.extend_from_slice(bytes);
         Ok(())
     }
 
@@ -511,6 +678,14 @@ impl Reader<'_> {
         Ok(u16::from_be_bytes([hi, lo]))
     }
 
+    fn u64(&mut self) -> Result<u64, String> {
+        let mut bytes = [0u8; 8];
+        for byte in &mut bytes {
+            *byte = self.u8()?;
+        }
+        Ok(u64::from_be_bytes(bytes))
+    }
+
     fn count(&mut self, max: usize, what: &str) -> Result<usize, String> {
         let count = self.u16()? as usize;
         if count > max {
@@ -560,6 +735,7 @@ mod tests {
 
     fn manifest() -> JavaContentManifest {
         JavaContentManifest {
+            epoch: 0,
             blocks: vec!["ruby:block".into()],
             items: vec!["ruby:block".into(), "ruby:gem".into()],
             effects: vec!["ruby:glow".into()],
@@ -765,7 +941,7 @@ mod tests {
 
         // Unknown, repeated and out-of-order section kinds reject.
         let body = |writer: &mut Writer| {
-            writer.u16(VERSION).unwrap();
+            writer.u16(VERSION_V2).unwrap();
             source.encode_body(writer).unwrap();
         };
         let mut frame = Writer::default();
@@ -790,8 +966,65 @@ mod tests {
         frame.u8(0xff).unwrap(); // not UTF-8
         assert!(JavaContentManifest::decode(&frame.bytes).is_err());
         // A v2 frame cut before its sections is truncated.
+        let mut frame = Writer::default();
+        frame.u16(VERSION_V2).unwrap();
+        source.encode_body(&mut frame).unwrap();
+        assert!(JavaContentManifest::decode(&frame.bytes).is_err());
+        assert!(JavaContentManifest::decode(&frame.bytes[..frame.bytes.len() - 1]).is_err());
+    }
+
+    /// A v3 frame carries the declaring root's epoch and a hash of the
+    /// declarations in its header; the epoch survives the round trip, and a
+    /// header hash that does not match the declarations rejects.
+    #[test]
+    fn v3_header_carries_the_epoch_and_a_content_hash() {
+        let mut source = manifest();
+        source.epoch = 7;
         let bytes = source.encode().unwrap();
-        assert!(JavaContentManifest::decode(&bytes[..bytes.len() - 1]).is_err());
+        assert_eq!(u16::from_be_bytes([bytes[0], bytes[1]]), VERSION);
+        let (decoded, version) = JavaContentManifest::decode_frame(&bytes).unwrap();
+        assert_eq!(version, VERSION);
+        assert_eq!(decoded, source);
+        assert_eq!(decoded.epoch, 7);
+        // Another epoch is the same declarations, so the hash is unchanged
+        // and only the epoch bytes differ.
+        let mut other_epoch = manifest();
+        other_epoch.epoch = 9;
+        assert_eq!(
+            source.content_hash().unwrap(),
+            other_epoch.content_hash().unwrap()
+        );
+        let other = other_epoch.encode().unwrap();
+        assert_ne!(bytes[2..10], other[2..10], "the epoch is in the header");
+        assert_eq!(bytes[10..], other[10..], "the declarations are identical");
+        // A changed declaration changes the hash.
+        let mut other_content = manifest();
+        other_content.blocks.push("ruby:other".into());
+        assert_ne!(
+            source.content_hash().unwrap(),
+            other_content.content_hash().unwrap()
+        );
+        // Flipping a header hash byte rejects before anything is applied.
+        let mut wrong_hash = bytes.clone();
+        wrong_hash[17] ^= 0xff;
+        assert!(JavaContentManifest::decode(&wrong_hash).is_err());
+    }
+
+    /// A v2 frame still decodes exactly as before: body and template sections,
+    /// no header and therefore epoch 0.
+    #[test]
+    fn v2_frames_decode_without_a_header() {
+        let source = manifest();
+        let mut writer = Writer::default();
+        writer.u16(VERSION_V2).unwrap();
+        source.encode_body(&mut writer).unwrap();
+        source.encode_sections(&mut writer).unwrap();
+        let (decoded, version) = JavaContentManifest::decode_frame(&writer.bytes).unwrap();
+        assert_eq!(version, VERSION_V2);
+        assert_eq!(decoded.epoch, 0);
+        assert_eq!(decoded.menu_rows, source.menu_rows);
+        assert_eq!(decoded.entity_rows, source.entity_rows);
+        assert_eq!(JavaContentManifest::decode(&writer.bytes).unwrap(), source);
     }
 
     #[test]
@@ -856,6 +1089,69 @@ mod tests {
             ["ruby:local"],
             "local declarations survive"
         );
+    }
+
+    /// A v3 frame whose declarations differ from the non-empty local ones is
+    /// refused with a bounded one-line reason: nothing is applied, no epoch is
+    /// recorded, and the same frame applies once the local content is gone.
+    #[test]
+    fn a_v3_manifest_over_different_local_declarations_is_refused() {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        mod_content::clear_declared_java_content();
+        let local = DeclaredIds {
+            blocks: vec!["ruby:local".into()],
+            ..Default::default()
+        };
+        mod_content::apply_declared_java_content(local, DeclaredExtraIds::default(), [], [], [])
+            .unwrap();
+        assert_ne!(mod_content::stored_declared_java_content_hash(), 0);
+        let epoch_before = mod_content::declared_java_content_epoch();
+        let applied_before = applied_epoch();
+
+        let mut incoming = manifest();
+        incoming.epoch = 12;
+        let bytes = incoming.encode().unwrap();
+        match apply(&bytes).unwrap() {
+            Outcome::Refused(reason) => {
+                assert!(reason.contains("keeping the local content"), "{reason}");
+                assert!(reason.len() <= MAX_REFUSAL);
+                assert!(!reason.contains('\n'));
+                assert!(reason.is_ascii());
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(mod_content::stored_declared_ids().blocks, ["ruby:local"]);
+        assert_eq!(mod_content::declared_java_content_epoch(), epoch_before);
+        assert_eq!(applied_epoch(), applied_before, "a refusal records nothing");
+
+        // With no local declarations the same frame applies and is recorded.
+        mod_content::clear_declared_java_content();
+        assert_eq!(
+            apply(&bytes).unwrap(),
+            Outcome::Applied(mod_content::stored_declared_java_content().count())
+        );
+        assert_eq!(mod_content::stored_declared_ids().blocks, ["ruby:block"]);
+        assert_eq!(applied_epoch(), 12);
+        // Re-sending the same content is the same hash, so not a conflict.
+        assert!(matches!(apply(&bytes).unwrap(), Outcome::Applied(_)));
+        assert_eq!(applied_epoch(), 12);
+    }
+
+    /// An empty v3 frame is not a conflict, as an empty v2 frame never was.
+    #[test]
+    fn an_empty_v3_frame_over_local_declarations_is_not_refused() {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        mod_content::clear_declared_java_content();
+        let local = DeclaredIds {
+            blocks: vec!["ruby:local".into()],
+            ..Default::default()
+        };
+        mod_content::apply_declared_java_content(local, DeclaredExtraIds::default(), [], [], [])
+            .unwrap();
+        let empty = JavaContentManifest::default();
+        let outcome = apply(&empty.encode().unwrap()).unwrap();
+        assert!(matches!(outcome, Outcome::Applied(_)), "{outcome:?}");
+        assert_eq!(mod_content::stored_declared_ids().blocks, ["ruby:local"]);
     }
 
     #[test]
