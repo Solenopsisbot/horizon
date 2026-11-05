@@ -128,6 +128,21 @@ public final class HorizonLoaderBridge {
   private static String knotMixinOutcome;
   private static String launchGameOutcome;
 
+  /**
+   * The bundled Minecraft jar carries its own Log4j classes.  A probe also
+   * has loader libraries on the system class path; letting the provider's
+   * Log4j handler see both copies makes Log4j's `UpperLookup` fail its
+   * cross-class-loader cast.  Real game launches use Fabric's public console
+   * handler for the loader phase, so exactly one handler owns the log stream.
+   */
+  private static void installPlainLogHandler() throws Exception {
+    Class<?> log = Class.forName("net.fabricmc.loader.impl.util.log.Log");
+    Class<?> handler = Class.forName("net.fabricmc.loader.impl.util.log.LogHandler");
+    Object console = Class.forName("net.fabricmc.loader.impl.util.log.ConsoleLogHandler")
+        .getConstructor().newInstance();
+    log.getMethod("init", handler).invoke(null, console);
+  }
+
   // ---- Optional Knot loader hand-off and transform-chain probe -----------
   //
   // `--knot-launch` uses the loader `KnotClassLoaderInterface.create` built:
@@ -190,14 +205,13 @@ public final class HorizonLoaderBridge {
       }
       registerValidParentClassPath(initialClassPath);
       if (knotLaunch) {
-        // The hand-off `Knot.init` makes: the game's loader is the thread's
-        // context loader from creation onwards.
+        // Capture the loader now; the context loader switches after provider
+        // initialization so Log4j setup sees only the parent copy.
         Method getLoader = type.getDeclaredMethod("getClassLoader");
         getLoader.setAccessible(true);
         Object loader = getLoader.invoke(classPath);
         if (loader instanceof ClassLoader) {
           knotLoader = (ClassLoader) loader;
-          Thread.currentThread().setContextClassLoader(knotLoader);
         }
       }
     } catch (Throwable failure) {
@@ -246,6 +260,10 @@ public final class HorizonLoaderBridge {
       setPrefixes.setAccessible(true);
       setPrefixes.invoke(classPath, entry, prefixes == null ? new String[0] : prefixes);
       if (!codeSource) return;
+      // Minecraft's bundler supplies Log4j jars through a separate capture
+      // loader. Keep them parent-visible only; registering them as Knot code
+      // sources beside the loader's copy recreates Log4j's UpperLookup cast.
+      if (knotLaunch && isLoggingJar(entry)) return;
       Method add = classPathType.getDeclaredMethod("addCodeSource", Path.class);
       add.setAccessible(true);
       add.invoke(classPath, entry);
@@ -254,6 +272,11 @@ public final class HorizonLoaderBridge {
     } catch (Throwable failure) {
       if (classPathFailure == null) classPathFailure = summarize(failure);
     }
+  }
+
+  private static boolean isLoggingJar(Path path) {
+    String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
+    return name.startsWith("log4j-") || name.startsWith("slf4j-");
   }
 
   /** `ok <n> jars`, or `failed <reason>`; never more than 400 characters. */
@@ -746,7 +769,9 @@ public final class HorizonLoaderBridge {
       Class<?> impl = Class.forName("net.fabricmc.loader.impl.FabricLoaderImpl");
       Object loader = impl.getField("INSTANCE").get(null);
       impl.getMethod("setGameProvider", providerIface).invoke(loader, provider);
+      if (launchGame) installPlainLogHandler();
       providerClass.getMethod("initialize", launcherIface).invoke(provider, launcher);
+      if (knotLoader != null) Thread.currentThread().setContextClassLoader(knotLoader);
       impl.getMethod("load").invoke(loader);
       String freezeReason = "";
       try {
@@ -790,6 +815,20 @@ public final class HorizonLoaderBridge {
         }
         Collections.sort(ids);
         if (ids.size() > 64) ids = new ArrayList<>(ids.subList(0, 64));
+      }
+      if (launchGame) {
+        List<String> listing = new ArrayList<>();
+        Method getMetadata = Class.forName("net.fabricmc.loader.api.ModContainer")
+            .getMethod("getMetadata");
+        Method getId = Class.forName("net.fabricmc.loader.api.metadata.ModMetadata")
+            .getMethod("getId");
+        for (Object mod : allMods) {
+          try { listing.add(String.valueOf(getId.invoke(getMetadata.invoke(mod)))); }
+          catch (Throwable ignored) { }
+        }
+        Collections.sort(listing);
+        System.out.println("fabric-loader: Loading " + allMods.size() + " mods (" + String.join(",", listing) + ")");
+        System.out.flush();
       }
       if (realLaunch) {
         // The launcher below names StubEntrypoint as the entrypoint, which is
@@ -1220,7 +1259,12 @@ fn run() -> Result<(), String> {
         let home = client_home
             .clone()
             .or_else(|| std::env::var_os(CLIENT_HOME_ENV).map(PathBuf::from));
-        let line = ClientReadiness::detect(home.as_deref(), &game_provider.version).line();
+        let line = ClientReadiness::detect(
+            home.as_deref(),
+            &game_provider.version,
+            &game_provider.jars,
+        )
+        .line();
         println!("{line}");
         Some(line)
     } else {
@@ -1419,7 +1463,7 @@ fn run() -> Result<(), String> {
         );
         return report_measure(&plan);
     }
-    let nested = expand_nested_jars(&mut classpath)?;
+    let nested = expand_nested_jars(&mut classpath, launch_game_flag)?;
     if let Some(bridge) = nested.compile_loader_bridge() {
         classpath.insert(0, bridge);
     }
@@ -4215,24 +4259,43 @@ struct ClientReadiness {
 }
 
 impl ClientReadiness {
-    fn detect(home: Option<&Path>, version: &str) -> Self {
-        let Some(home) = home else {
-            return Self {
-                missing: vec![format!(
-                    "no client home (pass --client-home <dir> or set {CLIENT_HOME_ENV})"
-                )],
-            };
-        };
+    fn detect(home: Option<&Path>, version: &str, game_jars: &[PathBuf]) -> Self {
         let mut missing = Vec::new();
-        let version_dir = home.join("versions").join(version);
-        if !version_dir.join(format!("{version}.jar")).is_file() {
-            missing.push(format!("versions/{version}/{version}.jar"));
+        if let Some(game_jar) = game_jars.first() {
+            if !game_jar.is_file() {
+                missing.push(game_jar.display().to_string());
+            }
         }
-        if let Err(label) = client_assets_index(home, version) {
+        let home = home
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os(CLIENT_HOME_ENV).map(PathBuf::from))
+            .or_else(|| game_jars.first().and_then(|jar| client_home_from_jar(jar, version)));
+        let Some(home) = home else {
+            if game_jars.is_empty() {
+                missing.push(format!(
+                    "no client home (pass --client-home <dir> or set {CLIENT_HOME_ENV})"
+                ));
+            } else {
+                missing.push(format!(
+                    "no client home for --game-jar (pass --client-home <dir> or set {CLIENT_HOME_ENV})"
+                ));
+            }
+            return Self { missing };
+        };
+        if game_jars.is_empty() {
+            let game_jar = home
+                .join("versions")
+                .join(version)
+                .join(format!("{version}.jar"));
+            if !game_jar.is_file() {
+                missing.push(game_jar.display().to_string());
+            }
+        }
+        if let Err(label) = client_assets_index(&home, version) {
             missing.push(label);
         }
-        if !client_natives_present(home, version) {
-            missing.push("natives".to_owned());
+        if let Some(label) = client_natives_missing(&home, version) {
+            missing.push(label);
         }
         Self { missing }
     }
@@ -4252,8 +4315,24 @@ impl ClientReadiness {
     }
 }
 
-/// The asset index the version json names, falling back to the version id. The
-/// returned label on failure is already relative to the game home.
+fn client_home_from_jar(jar: &Path, version: &str) -> Option<PathBuf> {
+    let file = jar.file_name()?.to_str()?;
+    if file != format!("{version}.jar") {
+        return None;
+    }
+    let version_dir = jar.parent()?;
+    if version_dir.file_name()?.to_str()? != version {
+        return None;
+    }
+    let versions = version_dir.parent()?;
+    if versions.file_name()?.to_str()? != "versions" {
+        return None;
+    }
+    versions.parent().map(Path::to_path_buf)
+}
+
+/// The asset index the version json names, falling back to the version id. A
+/// failure returns the exact path the client launch still needs.
 fn client_assets_index(home: &Path, version: &str) -> Result<PathBuf, String> {
     let version_json = home
         .join("versions")
@@ -4277,7 +4356,7 @@ fn client_assets_index(home: &Path, version: &str) -> Result<PathBuf, String> {
     if path.is_file() {
         Ok(path)
     } else {
-        Err(format!("assets/indexes/{id}.json"))
+        Err(path.display().to_string())
     }
 }
 
@@ -4323,7 +4402,7 @@ fn any_file_under(dir: &Path, depth: usize, token: &str) -> bool {
 
 /// Extracted natives (what a launcher makes at start) or the native jars in
 /// `libraries` (what it extracts them from).
-fn client_natives_present(home: &Path, version: &str) -> bool {
+fn client_natives_missing(home: &Path, version: &str) -> Option<String> {
     if [
         home.join("versions").join(version).join("natives"),
         home.join("natives"),
@@ -4331,10 +4410,14 @@ fn client_natives_present(home: &Path, version: &str) -> bool {
     .iter()
     .any(|dir| dir_non_empty(dir))
     {
-        return true;
+        return None;
     }
     let token = format!("natives-{}", native_os_token());
-    any_file_under(&home.join("libraries"), 6, &token)
+    if any_file_under(&home.join("libraries"), 6, &token) {
+        None
+    } else {
+        Some(home.join("natives").display().to_string())
+    }
 }
 
 /// A Java `String[]` from paths the user supplied.
@@ -7260,7 +7343,15 @@ fn is_minecraft_class(name: &str) -> bool {
 }
 
 /// Extract Fabric's `META-INF/jars/*.jar` entries and add them to the classpath.
-fn expand_nested_jars(classpath: &mut Vec<PathBuf>) -> Result<NestedJars, String> {
+/// A bundled Minecraft jar carries the same Log4j jars as the resolved loader
+/// libraries. During a real Knot launch, registering both copies gives Log4j
+/// classes two class loaders and its `UpperLookup` cast fails while building
+/// the configuration. Keep the already-resolved loader copy for that opt-in
+/// launch path; ordinary probes retain their previous nested-jar behavior.
+fn expand_nested_jars(
+    classpath: &mut Vec<PathBuf>,
+    dedupe_log4j: bool,
+) -> Result<NestedJars, String> {
     const MAX_NESTED_JARS: usize = 4096;
     let extracted = NestedJars::new()?;
     let mut index = 0;
@@ -7281,6 +7372,9 @@ fn expand_nested_jars(classpath: &mut Vec<PathBuf>) -> Result<NestedJars, String
             let Some(name) = nested_jar_name(entry.name()) else {
                 continue;
             };
+            if dedupe_log4j && is_duplicate_log4j_jar(name, classpath) {
+                continue;
+            }
             if serial >= MAX_NESTED_JARS {
                 return Err(format!(
                     "nested jar limit exceeded ({MAX_NESTED_JARS}); refusing an unbounded JiJ classpath"
@@ -7296,6 +7390,18 @@ fn expand_nested_jars(classpath: &mut Vec<PathBuf>) -> Result<NestedJars, String
         }
     }
     Ok(extracted)
+}
+
+fn is_duplicate_log4j_jar(name: &str, classpath: &[PathBuf]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if !lower.starts_with("log4j-") && !lower.starts_with("slf4j-") {
+        return false;
+    }
+    classpath.iter().any(|path| {
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(name))
+    })
 }
 
 fn nested_jar_name(entry: &str) -> Option<&str> {
@@ -7317,6 +7423,7 @@ mod tests {
         ProviderOutcome, ProviderReport, ProviderSide, ProviderStatus, USAGE,
         absolutize_launch_args, bounded_classpath_unlock, bounded_provider_reason,
         classpath_separator, classpath_unlock_line, classpath_unlock_value, client_side,
+        client_home_from_jar, client_natives_missing, is_duplicate_log4j_jar,
         constructor_only_entry_kind, datagen_jvm_options, datagen_provider_line,
         datagen_providers_line, datagen_shim_unavailable, declared_entrypoint_kinds,
         declared_mod_ids, discover_entries, discover_mixin_configs, discovery_line,
@@ -7338,9 +7445,11 @@ mod tests {
         take_game_provider_args,
     };
     use std::{
+        fs,
         fs::File,
         io::Write,
         path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
     };
     use zip::write::SimpleFileOptions;
 
@@ -7417,6 +7526,38 @@ mod tests {
         assert_eq!(nested_jar_name("META-INF/jars/deps/kotlin.jar"), None);
         assert_eq!(nested_jar_name("META-INF/jars/"), None);
         assert_eq!(nested_jar_name("META-INF/services/x"), None);
+    }
+
+    #[test]
+    fn real_launch_dedupes_bundled_logging_jars_only_when_parent_has_one() {
+        let libs = vec![PathBuf::from("/mc/org/apache/logging/log4j/log4j-api-2.26.0.jar")];
+        assert!(is_duplicate_log4j_jar("log4j-api-2.26.0.jar", &libs));
+        assert!(!is_duplicate_log4j_jar("log4j-core-2.26.0.jar", &libs));
+        assert!(!is_duplicate_log4j_jar("asm-9.8.jar", &libs));
+    }
+
+    #[test]
+    fn client_home_is_inferred_only_from_standard_version_layout() {
+        assert_eq!(
+            client_home_from_jar(Path::new("/mc/versions/26.3/26.3.jar"), "26.3"),
+            Some(PathBuf::from("/mc"))
+        );
+        assert_eq!(client_home_from_jar(Path::new("/tmp/client.jar"), "26.3"), None);
+    }
+
+    #[test]
+    fn missing_natives_names_the_client_home_path() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-jvm-native-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            client_natives_missing(&root, "26.3"),
+            Some(root.join("natives").display().to_string())
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
