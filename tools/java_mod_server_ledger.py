@@ -25,7 +25,8 @@ class Row:
     file: str
     id: str = "?"
     version: str = "?"
-    verdict: str = "timeout"
+    verdict: str = "refused"
+    subtype: str = ""
     engine: str = "?"
     woven: int = 0
     skipped: int = 0
@@ -89,25 +90,72 @@ def parse_log(text: str, filename: str, *, seconds: float = 0.0, timed_out: bool
         if failure:
             reason = bounded(failure.group(1) if failure.lastindex else failure.group(0))
             break
+    if not re.search(r"no native Fabric or NeoForge entrypoint", reason, re.I):
+        entrypoint_line = next((line for line in text.splitlines()
+                                if re.search(r"no native Fabric or NeoForge entrypoint", line, re.I)), None)
+        if entrypoint_line:
+            reason = bounded(entrypoint_line.split("ERROR", 1)[-1].lstrip(" :"))
     if not reason:
         errors = [line for line in text.splitlines() if "ERROR" in line]
         if errors:
             reason = bounded(errors[-1].split("ERROR", 1)[-1].lstrip(" :"))
-    if done:
+    subtype = ""
+    # A refused engine can still let the dedicated server reach Done: the mod
+    # was skipped while the vanilla server continued, so Done is not success
+    # for that row.
+    if done and engine != "refused":
         verdict = "ran"
         reason = ""
-    elif timed_out:
-        verdict = "timeout"
-        reason = reason or "hard timeout"
     else:
-        verdict = "aborted"
-        reason = reason or (f"exit code {exit_code}" if exit_code not in (None, 0) else "server stopped before Done")
-    return Row(filename, ident, version, verdict, engine, woven, skipped, reason, round(seconds, 3))
+        if timed_out:
+            reason = reason or "hard timeout"
+        else:
+            reason = reason or (f"exit code {exit_code}" if exit_code not in (None, 0)
+                                else ("engine refused" if engine == "refused"
+                                      else "server stopped before Done"))
+        entrypoint = re.search(
+            r"no native Fabric or NeoForge entrypoint for server execution\s*"
+            r"\(available:\s*([^)]*)\)", reason + "\n" + text, re.I
+        )
+        if entrypoint:
+            available = {item.strip() for item in entrypoint.group(1).split(",")}
+            subtype = "client-only" if available & {"client", "modmenu"} else "library"
+            verdict = "skipped"
+        else:
+            verdict = "refused"
+    return Row(filename, ident, version, verdict, subtype, engine, woven, skipped,
+               reason, round(seconds, 3))
 
 
-def summary(rows: list[Row]) -> dict[str, int]:
-    return {"total": len(rows), **{key: sum(row.verdict == key for row in rows)
-                                    for key in ("ran", "aborted", "timeout")}}
+def reason_category(row: Row) -> str:
+    if row.verdict == "ran":
+        return "none"
+    reason = row.reason.lower()
+    if "no native fabric or neoforge entrypoint" in reason:
+        return "no-entrypoint"
+    if "timeout" in reason:
+        return "timeout"
+    if "metad" in reason:
+        return "metadata"
+    if "invalidclass" in reason:
+        return "invalid-class"
+    if "startup failed" in reason:
+        return "startup-failed"
+    if "exit code" in reason:
+        return "exit-code"
+    return "other"
+
+
+def summary(rows: list[Row]) -> dict[str, object]:
+    categories = sorted({reason_category(row) for row in rows})
+    return {
+        "total": len(rows),
+        "ran": sum(row.verdict == "ran" for row in rows),
+        "refused": sum(row.verdict == "refused" for row in rows),
+        "skipped": sum(row.verdict == "skipped" for row in rows),
+        "reason_categories": {category: sum(reason_category(row) == category for row in rows)
+                              for category in categories},
+    }
 
 
 def _kill_process(proc: subprocess.Popen[bytes]) -> None:
@@ -179,6 +227,7 @@ def run_one(binary: Path, resources: Path, jar: Path, *, timeout: float, port: i
 
 def format_row(row: Row) -> str:
     values = [row.file, f"id={row.id}", f"version={row.version}", f"verdict={row.verdict}",
+              f"subtype={row.subtype}",
               f"engine={row.engine}", f"woven={row.woven}", f"skipped={row.skipped}",
               f"reason={bounded(row.reason)}", f"seconds={row.seconds:.3f}"]
     return "\t".join(value.replace("\t", " ") for value in values)
@@ -219,9 +268,9 @@ def main(argv: list[str] | None = None) -> int:
                             port=args.port_base + index))
     rows.sort(key=lambda row: row.file)
     counts = summary(rows)
-    text = "\n".join([format_row(row) for row in rows] + [
-        "summary\t" + "\t".join(f"{key}={value}" for key, value in counts.items())
-    ]) + "\n"
+    summary_fields = [f"{key}={value}" for key, value in counts.items() if key != "reason_categories"]
+    summary_fields.extend(f"reason_{key}={value}" for key, value in counts["reason_categories"].items())
+    text = "\n".join([format_row(row) for row in rows] + ["summary\t" + "\t".join(summary_fields)]) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(text, encoding="utf-8")
