@@ -159,6 +159,9 @@ impl Session {
                 "use horizon-ctl COMMAND --help outside scripts",
             ));
         }
+        if name == "payload" {
+            return payload_command(self, words);
+        }
         let number = |i: usize, what: &str| -> Result<f64, Failure> {
             words
                 .get(i)
@@ -261,6 +264,55 @@ impl Session {
             thread::sleep(Duration::from_millis(250));
         }
     }
+}
+
+fn payload_command(session: &mut Session, words: &[String]) -> Result<Value, Failure> {
+    let usage = "usage: horizon-ctl payload send CHANNEL HEX|utf8:TEXT client|server";
+    let [_, action, channel, value, role] = words else {
+        return Err(Failure::usage(usage));
+    };
+    if action != "send" {
+        return Err(Failure::usage(usage));
+    }
+    if channel.is_empty() || channel.len() > horizon_mods::payloads::MAX_PAYLOAD_ID {
+        return Err(Failure::usage(format!(
+            "CHANNEL must be 1..{} bytes",
+            horizon_mods::payloads::MAX_PAYLOAD_ID
+        )));
+    }
+    if role != "client" && role != "server" {
+        return Err(Failure::usage("ROLE must be client or server"));
+    }
+    let bytes = if let Some(text) = value.strip_prefix("utf8:") {
+        text.as_bytes().to_vec()
+    } else {
+        let hex = value.strip_prefix("hex:").unwrap_or(value);
+        if !hex.len().is_multiple_of(2) {
+            return Err(Failure::usage("HEX must have an even number of digits"));
+        }
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.as_bytes().as_chunks::<2>().0 {
+            let high = (pair[0] as char).to_digit(16);
+            let low = (pair[1] as char).to_digit(16);
+            let Some((high, low)) = high.zip(low) else {
+                return Err(Failure::usage("HEX contains an invalid digit"));
+            };
+            bytes.push(((high << 4) | low) as u8);
+        }
+        bytes
+    };
+    if bytes.len() > horizon_mods::payloads::MAX_PAYLOAD_BYTES {
+        return Err(Failure::usage(format!(
+            "payload is {} bytes (max {})",
+            bytes.len(),
+            horizon_mods::payloads::MAX_PAYLOAD_BYTES
+        )));
+    }
+    let encoded = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    session.game(&format!("payload send {channel} {encoded} {role}"))
 }
 
 /// `logs [--lines N] [--crash]` for the game in `home`: the reply's `text` is the log's last

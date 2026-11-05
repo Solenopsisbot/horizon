@@ -2,6 +2,7 @@
 use super::{Game, Screen};
 use horizon_client::{Result, items::ItemStack};
 use horizon_core::geometry::Vec3;
+use horizon_mods::payloads::{MAX_PAYLOAD_BYTES, MAX_PAYLOAD_ID, PayloadDirection};
 use serde_json::{Value, json};
 use std::{
     sync::mpsc::Sender,
@@ -42,6 +43,7 @@ const HELP: &[&str] = &[
     "save                           save the world",
     "save-all                       save the world, rewriting every resident chunk",
     "connect HOST[:PORT] [NAME]     join a multiplayer server (offline mode) from the title screen",
+    "payload send CHANNEL HEX|utf8:TEXT client|server  inject one bounded declared mod payload",
     "chat MESSAGE                   send chat or a /command to the server",
     "disconnect                     leave the server for the server list",
     "respawn                        respawn after death on a server",
@@ -182,6 +184,9 @@ impl Game<'_> {
             return Ok(Some(value));
         }
         if let Some(value) = self.lan_control(&words)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.payload_control(&words)? {
             return Ok(Some(value));
         }
         if let Some(value) = self.friends_control(&words)? {
@@ -840,6 +845,23 @@ impl Game<'_> {
         }
     }
 
+    fn payload_control(&mut self, words: &[&str]) -> Result<Option<Value>> {
+        let Some((id, direction, bytes)) = parse_payload_command(words)? else {
+            return Ok(None);
+        };
+        let bytes_len = bytes.len();
+        let sent = if let Some(server) = &self.integrated {
+            server
+                .call(move |game| send_host_payload(game, &id, direction, bytes))
+                .ok_or("the integrated server stopped")??
+        } else {
+            send_host_payload(self, &id, direction, bytes)?
+        };
+        Ok(Some(
+            json!({ "ok": true, "guests": sent, "bytes": bytes_len }),
+        ))
+    }
+
     /// `horizon-ctl save` and `save-all`.
     fn control_save(&mut self, all: bool) -> Result<()> {
         if all {
@@ -1124,6 +1146,114 @@ impl Game<'_> {
         // The scoreboard sidebar the HUD shows.
         status["sidebar"] = self.sidebar_status();
         status
+    }
+}
+
+fn send_host_payload(
+    game: &mut Game<'_>,
+    id: &str,
+    direction: PayloadDirection,
+    bytes: Vec<u8>,
+) -> std::result::Result<usize, String> {
+    let host = game
+        .lan
+        .as_mut()
+        .ok_or_else(|| "LAN host is not open".to_owned())?;
+    let guests: Vec<u32> = host
+        .hub
+        .guests
+        .iter()
+        .filter(|guest| guest.placed)
+        .map(|guest| guest.conn)
+        .collect();
+    if guests.is_empty() {
+        return Err("no placed guest".to_owned());
+    }
+    let count = guests.len();
+    for conn in guests {
+        host.hub.send_payload(conn, id, direction, bytes.clone())?;
+    }
+    Ok(count)
+}
+
+fn parse_payload_command(
+    words: &[&str],
+) -> std::result::Result<Option<(String, PayloadDirection, Vec<u8>)>, String> {
+    if words.first() != Some(&"payload") {
+        return Ok(None);
+    }
+    if words.len() != 5 || words[1] != "send" {
+        return Err("payload send CHANNEL HEX|utf8:TEXT client|server".to_owned());
+    }
+    let id = words[2];
+    if id.is_empty() || id.len() > MAX_PAYLOAD_ID {
+        return Err(format!(
+            "payload channel is empty or over {MAX_PAYLOAD_ID} bytes"
+        ));
+    }
+    let direction = match words[4] {
+        "client" => PayloadDirection::PlayToClient,
+        "server" => PayloadDirection::PlayToServer,
+        _ => return Err("payload role must be client or server".to_owned()),
+    };
+    let encoded = words[3];
+    let bytes = if let Some(text) = encoded.strip_prefix("utf8:") {
+        text.as_bytes().to_vec()
+    } else {
+        let hex = encoded.strip_prefix("hex:").unwrap_or(encoded);
+        if !hex.len().is_multiple_of(2) {
+            return Err("payload hex has an odd length".to_owned());
+        }
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.as_bytes().as_chunks::<2>().0 {
+            let high = (pair[0] as char)
+                .to_digit(16)
+                .ok_or_else(|| "payload hex is invalid".to_owned())?;
+            let low = (pair[1] as char)
+                .to_digit(16)
+                .ok_or_else(|| "payload hex is invalid".to_owned())?;
+            bytes.push(((high << 4) | low) as u8);
+        }
+        bytes
+    };
+    if bytes.len() > MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "payload is {} bytes (max {MAX_PAYLOAD_BYTES})",
+            bytes.len()
+        ));
+    }
+    Ok(Some((id.to_owned(), direction, bytes)))
+}
+
+#[cfg(test)]
+mod payload_control_tests {
+    use super::{PayloadDirection, parse_payload_command};
+    use horizon_mods::payloads::{MAX_PAYLOAD_BYTES, MAX_PAYLOAD_ID};
+
+    #[test]
+    fn parses_payload_forms_and_roles() {
+        let (_, direction, bytes) =
+            parse_payload_command(&["payload", "send", "demo:down", "utf8:hello", "client"])
+                .unwrap()
+                .unwrap();
+        assert_eq!(direction, PayloadDirection::PlayToClient);
+        assert_eq!(bytes, b"hello");
+        let (_, direction, bytes) =
+            parse_payload_command(&["payload", "send", "demo:up", "hex:00ff", "server"])
+                .unwrap()
+                .unwrap();
+        assert_eq!(direction, PayloadDirection::PlayToServer);
+        assert_eq!(bytes, [0, 255]);
+    }
+
+    #[test]
+    fn rejects_payload_bounds_and_bad_encoding() {
+        let channel = "x".repeat(MAX_PAYLOAD_ID + 1);
+        assert!(parse_payload_command(&["payload", "send", &channel, "00", "client"]).is_err());
+        let too_big = "00".repeat(MAX_PAYLOAD_BYTES + 1);
+        assert!(parse_payload_command(&["payload", "send", "demo:x", &too_big, "client"]).is_err());
+        assert!(parse_payload_command(&["payload", "send", "demo:x", "0", "client"]).is_err());
+        assert!(parse_payload_command(&["payload", "send", "demo:x", "gg", "client"]).is_err());
     }
 }
 

@@ -6027,7 +6027,8 @@ def main():
     (out / 'results.json').write_text(json.dumps({'mode': 'server-thread' if SERVER_THREAD else 'in-frame',
                                                'checks': results}, indent=2) + '\n')
     print(json.dumps(results, indent=1))
-    sys.exit(0 if results and all(r['pass'] for r in results.values()) else 1)
+    # A focused check may self-skip when its optional fixture is absent.
+    sys.exit(0 if results and all(r['pass'] or r.get('skipped') for r in results.values()) else 1)
 
 
 
@@ -9649,15 +9650,26 @@ CHECK_FNS['arrow_pickup'] = check_arrow_pickup
 
 
 def check_payload_chunks(host, guest, out):
-    """Exercise the native mod payload chunk path once a control injection exists.
-
-    The LAN transport is wired through ``LanHost::send_payload`` but the control
-    socket currently exposes no bounded command for a test to enqueue a declared
-    frame.  Do not substitute chat or a vanilla custom payload: that would skip
-    the mod registry, chunk assembler, and the unchanged small-frame path.
-    """
-    return ('skipped (horizon-ctl has no mod-payload injection hook; add a bounded '
-            'host control command at Game::control_command -> LanHost::send_payload)')
+    """Send an oversized and a small declared frame through the LAN payload link."""
+    # ``demo:down`` is the channel used by the native Java payload fixture.  The
+    # command reply includes the guest count and byte count, so an unplaced
+    # guest fails here instead of silently queuing it. Without the fixture jar,
+    # the declared channel is absent and this focused check self-skips.
+    large = bytes((index * 17 + 3) & 0xff for index in range(40 * 1024))
+    try:
+        sent = host.raw('payload', 'send', 'demo:down', f'hex:{large.hex()}', 'client')
+    except Failed as error:
+        if 'payload channel demo:down is not declared' in str(error):
+            return 'skipped (native Java payload fixture is not loaded)'
+        raise
+    assert sent.get('guests') == 1 and sent.get('bytes') == len(large), f'large payload was not queued: {sent}'
+    guest.wait(20)
+    small = b'unchanged'
+    sent_small = host.raw('payload', 'send', 'demo:down', f'hex:{small.hex()}', 'client')
+    assert sent_small.get('guests') == 1 and sent_small.get('bytes') == len(small), \
+        f'small payload was not queued: {sent_small}'
+    guest.wait(10)
+    return {'large_bytes': len(large), 'small_bytes': len(small), 'guest': sent['guests']}
 
 
 CHECKS += ['payload_chunks']
