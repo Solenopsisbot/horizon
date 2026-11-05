@@ -2476,11 +2476,8 @@ impl Game<'_> {
             // The server's declared mod payload channels, then their frames.
             C::CustomPayload(p) if p.channel == payloads::REGISTER_CHANNEL => {
                 if let Some(r) = self.remote.as_mut() {
-                    match receive_registration(
-                        &mut r.payloads,
-                        &mut r.registration_chunks,
-                        &p.data,
-                    ) {
+                    match receive_registration(&mut r.payloads, &mut r.registration_chunks, &p.data)
+                    {
                         Ok(None) => {}
                         Ok(Some(count)) => {
                             log::info!("Horizon: server declared {count} mod payload channel(s)")
@@ -9082,7 +9079,10 @@ mod tests {
         let mut target = PayloadLink::default();
         let mut chunks = payloads::ChunkAssembler::new();
         for envelope in &envelopes[..envelopes.len() - 1] {
-            assert_eq!(receive_registration(&mut target, &mut chunks, envelope).unwrap(), None);
+            assert_eq!(
+                receive_registration(&mut target, &mut chunks, envelope).unwrap(),
+                None
+            );
         }
         assert!(!chunks.is_idle());
         let count = receive_registration(&mut target, &mut chunks, envelopes.last().unwrap())
@@ -9092,8 +9092,14 @@ mod tests {
         assert_eq!(target.registry().declarations().count(), 1100);
 
         let small = PayloadLink::new(PayloadRegistry::default()).registration();
-        assert_eq!(payloads::chunk_envelopes(&small).unwrap(), vec![small.clone()]);
-        assert_eq!(receive_registration(&mut target, &mut chunks, &small).unwrap(), Some(0));
+        assert_eq!(
+            payloads::chunk_envelopes(&small).unwrap(),
+            vec![small.clone()]
+        );
+        assert_eq!(
+            receive_registration(&mut target, &mut chunks, &small).unwrap(),
+            Some(0)
+        );
 
         let mut malformed = envelopes[0].clone();
         malformed[7..9].copy_from_slice(&(payloads::MAX_CHUNKS as u16 + 1).to_be_bytes());
