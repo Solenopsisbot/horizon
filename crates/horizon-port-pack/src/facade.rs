@@ -5171,10 +5171,45 @@ fn support_types(name: &str) -> &'static [&'static str] {
         "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type" => {
             &["net/minecraft/resources/Identifier"]
         }
+        // A bounded `Entity` always carries its level, type and box, even when
+        // the mod only names one position accessor. An entity-only target
+        // otherwise generates a source that names types it never emitted.
+        "net/minecraft/world/entity/Entity" => &[
+            "net/minecraft/world/level/Level",
+            "net/minecraft/world/entity/EntityType",
+            "net/minecraft/world/phys/AABB",
+        ],
+        // A `BlockEntity` names its position, level, state and tag (and, in the
+        // constructor the game declares, its type), so a block-entity-only
+        // target gets the same bounded slice.
+        "net/minecraft/world/level/block/entity/BlockEntity" => &[
+            "net/minecraft/core/BlockPos",
+            "net/minecraft/world/level/Level",
+            "net/minecraft/world/level/block/state/BlockState",
+            "net/minecraft/nbt/CompoundTag",
+            "net/minecraft/world/level/block/entity/BlockEntityType",
+        ],
+        // The level's bounded value names the blocks and block entities it
+        // stores, its dimension key and the positions it keys them by.
+        "net/minecraft/world/level/Level" | "net/minecraft/server/level/ServerLevel" => &[
+            "net/minecraft/core/BlockPos",
+            "net/minecraft/world/level/block/state/BlockState",
+            "net/minecraft/world/level/block/entity/BlockEntity",
+            "net/minecraft/resources/ResourceKey",
+        ],
+        // A block state names its block and the fluid state its accessor
+        // returns; both travel with the state.
+        "net/minecraft/world/level/block/state/BlockState" => &[
+            "net/minecraft/world/level/block/Block",
+            "net/minecraft/world/level/material/FluidState",
+        ],
+        // `ResourceKey`'s bounded value names the identifier it was keyed by.
+        "net/minecraft/resources/ResourceKey" => &["net/minecraft/resources/Identifier"],
         "net/minecraft/world/entity/EntityType"
-        | "net/minecraft/world/entity/EntityType$Builder" => {
-            &["net/minecraft/world/entity/EntityDimensions"]
-        }
+        | "net/minecraft/world/entity/EntityType$Builder" => &[
+            "net/minecraft/world/entity/EntityDimensions",
+            "net/minecraft/world/entity/MobCategory",
+        ],
         "net/minecraft/world/entity/EntityDimensions" => &[
             "net/minecraft/world/phys/AABB",
             "net/minecraft/world/phys/Vec3",
@@ -5587,7 +5622,7 @@ fn render(
     if class.name == "net/minecraft/world/entity/EntityType" {
         let _ = writeln!(
             out,
-            "    protected float horizonWidth = 0.6f;\n    protected float horizonHeight = 1.8f;\n    protected int horizonTrackingRange = 5;\n    protected int horizonUpdateInterval = 3;\n    protected boolean horizonFireImmune;\n    protected boolean horizonCanSpawnFarFromPlayer;\n    protected boolean horizonCanSummon = true;\n    protected boolean horizonSaves = true;\n    protected String horizonDescriptionId = \"entity.minecraft.unknown\";\n    protected net.minecraft.world.entity.MobCategory horizonCategory = net.minecraft.world.entity.MobCategory.MISC;\n    public EntityType() {{}}\n    public EntityType(float width, float height, int trackingRange, int updateInterval, boolean fireImmune) {{ this(width, height, trackingRange, updateInterval, fireImmune, net.minecraft.world.entity.MobCategory.MISC); }}\n    public EntityType(float width, float height, int trackingRange, int updateInterval, boolean fireImmune, net.minecraft.world.entity.MobCategory category) {{ this.horizonWidth = width; this.horizonHeight = height; this.horizonTrackingRange = trackingRange; this.horizonUpdateInterval = updateInterval; this.horizonFireImmune = fireImmune; this.horizonCategory = category == null ? net.minecraft.world.entity.MobCategory.MISC : category; }}"
+            "    protected float horizonWidth = 0.6f;\n    protected float horizonHeight = 1.8f;\n    protected int horizonTrackingRange = 5;\n    protected int horizonUpdateInterval = 3;\n    protected boolean horizonFireImmune;\n    protected boolean horizonCanSpawnFarFromPlayer;\n    protected boolean horizonCanSummon = true;\n    protected boolean horizonSaves = true;\n    protected String horizonDescriptionId = \"entity.minecraft.unknown\";\n    protected net.minecraft.world.entity.MobCategory horizonCategory = net.minecraft.world.entity.MobCategory.MISC;\n    public EntityType(float width, float height, int trackingRange, int updateInterval, boolean fireImmune) {{ this(width, height, trackingRange, updateInterval, fireImmune, net.minecraft.world.entity.MobCategory.MISC); }}\n    public EntityType(float width, float height, int trackingRange, int updateInterval, boolean fireImmune, net.minecraft.world.entity.MobCategory category) {{ this.horizonWidth = width; this.horizonHeight = height; this.horizonTrackingRange = trackingRange; this.horizonUpdateInterval = updateInterval; this.horizonFireImmune = fireImmune; this.horizonCategory = category == null ? net.minecraft.world.entity.MobCategory.MISC : category; }}"
         );
     }
     if class.name == "net/minecraft/world/entity/SpawnPlacements" {
@@ -6042,6 +6077,19 @@ fn render(
                 continue;
             }
             let body = runtime_body_with_descriptor(&class.name, name, ret, descriptor);
+            let _ = writeln!(out, "    public {ret} {name}() {{ {body} }}");
+            methods += 1;
+        }
+    }
+    // A support-only `BlockPos` travels with `Level`, whose bounded
+    // `horizonBlockKey` reads its coordinates. The methods have to exist even
+    // when the mod never names one itself.
+    if class.name == "net/minecraft/core/BlockPos" {
+        for (name, ret) in [("getX", "int"), ("getY", "int"), ("getZ", "int")] {
+            if !seen.insert((name.to_owned(), String::new())) {
+                continue;
+            }
+            let body = runtime_body_with_descriptor(&class.name, name, ret, "()I");
             let _ = writeln!(out, "    public {ret} {name}() {{ {body} }}");
             methods += 1;
         }
@@ -19104,6 +19152,189 @@ public class DatagenProbe {
             report.jar.is_file(),
             "the façade jar was not written: {report:?}"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An entity-only or block-entity-only target is what the support list is
+    /// for: the generated value carries fields and accessors naming `Level`,
+    /// `EntityType`, `AABB`, `BlockState` and `CompoundTag`, none of which the
+    /// mod mentioned itself. Generate both façades from a miniature game jar
+    /// and let javac judge the slice.
+    #[test]
+    fn entity_and_block_entity_only_facades_compile() {
+        use crate::classes::tests_support::PoolBuilder;
+        use std::{path::PathBuf, process::Command};
+
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let tool = |name: &str| {
+            jdk_bin
+                .as_ref()
+                .map(|bin| bin.join(name))
+                .unwrap_or_else(|| PathBuf::from(name))
+        };
+        let Ok(version) = Command::new(tool("javac")).arg("-version").output() else {
+            return;
+        };
+        if !version.status.success() {
+            return;
+        }
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("horizon-port-pack-entity-only-{stamp}"));
+        let _ = fs::remove_dir_all(&root);
+        let game_src = root.join("game-src");
+        let game_classes = root.join("game-classes");
+        let mut game_files = Vec::new();
+        let mut write_game = |relative: &str, text: &str| {
+            let file = game_src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory"))
+                .expect("create the game package");
+            fs::write(&file, text).expect("write the game source");
+            game_files.push(file);
+        };
+        // The real 26.3 shapes are richer; the point here is the type closure,
+        // not the bodies. `MobCategory.MISC` and the six-argument box are the
+        // two values the generated fields construct directly.
+        for (relative, text) in [
+            (
+                "net/minecraft/world/entity/Entity.java",
+                "package net.minecraft.world.entity;\npublic class Entity { public Entity() {} }\n",
+            ),
+            (
+                "net/minecraft/world/entity/EntityType.java",
+                "package net.minecraft.world.entity;\npublic class EntityType { private EntityType() {} }\n",
+            ),
+            (
+                "net/minecraft/world/entity/EntityDimensions.java",
+                "package net.minecraft.world.entity;\npublic class EntityDimensions { public EntityDimensions() {} }\n",
+            ),
+            (
+                "net/minecraft/world/entity/MobCategory.java",
+                "package net.minecraft.world.entity;\npublic enum MobCategory { MISC }\n",
+            ),
+            (
+                "net/minecraft/world/phys/AABB.java",
+                "package net.minecraft.world.phys;\npublic class AABB { public double minX; public double minY; public double minZ; public double maxX; public double maxY; public double maxZ; public AABB() {} public AABB(double a, double b, double c, double d, double e, double f) {} }\n",
+            ),
+            (
+                "net/minecraft/world/phys/Vec3.java",
+                "package net.minecraft.world.phys;\npublic class Vec3 { public Vec3() {} }\n",
+            ),
+            (
+                "net/minecraft/world/level/Level.java",
+                "package net.minecraft.world.level;\npublic class Level { public Level() {} }\n",
+            ),
+            (
+                "net/minecraft/world/level/block/state/BlockState.java",
+                "package net.minecraft.world.level.block.state;\npublic class BlockState { public BlockState() {} }\n",
+            ),
+            (
+                "net/minecraft/world/level/block/Block.java",
+                "package net.minecraft.world.level.block;\npublic class Block { public net.minecraft.world.level.block.state.StateDefinition stateDefinition; public Block() {} }\n",
+            ),
+            (
+                "net/minecraft/world/level/block/state/StateDefinition.java",
+                "package net.minecraft.world.level.block.state;\npublic class StateDefinition { public StateDefinition() {} }\n",
+            ),
+            (
+                "net/minecraft/world/level/material/FluidState.java",
+                "package net.minecraft.world.level.material;\npublic class FluidState { public FluidState() {} }\n",
+            ),
+            (
+                "net/minecraft/world/level/block/entity/BlockEntity.java",
+                "package net.minecraft.world.level.block.entity;\npublic class BlockEntity { public BlockEntity() {} }\n",
+            ),
+            (
+                "net/minecraft/world/level/block/entity/BlockEntityType.java",
+                "package net.minecraft.world.level.block.entity;\npublic class BlockEntityType { public BlockEntityType() {} }\n",
+            ),
+            (
+                "net/minecraft/nbt/CompoundTag.java",
+                "package net.minecraft.nbt;\npublic class CompoundTag { public CompoundTag() {} }\n",
+            ),
+            (
+                "net/minecraft/core/BlockPos.java",
+                "package net.minecraft.core;\npublic class BlockPos { public BlockPos() {} public int getX() { return 0; } public int getY() { return 0; } public int getZ() { return 0; } }\n",
+            ),
+            (
+                "net/minecraft/resources/ResourceKey.java",
+                "package net.minecraft.resources;\npublic class ResourceKey { private ResourceKey() {} }\n",
+            ),
+            (
+                "net/minecraft/resources/Identifier.java",
+                "package net.minecraft.resources;\npublic class Identifier { private Identifier() {} }\n",
+            ),
+        ] {
+            write_game(relative, text);
+        }
+        fs::create_dir_all(&game_classes).expect("create the game classes directory");
+        let status = Command::new(tool("javac"))
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&game_classes)
+            .args(&game_files)
+            .status()
+            .expect("run javac on the game shapes");
+        assert!(
+            status.success(),
+            "the miniature game sources did not compile"
+        );
+        let game_jar = root.join("game-26.3.jar");
+        let status = Command::new(tool("jar"))
+            .arg("--create")
+            .arg("--file")
+            .arg(&game_jar)
+            .arg("-C")
+            .arg(&game_classes)
+            .arg(".")
+            .status()
+            .expect("run jar on the game classes");
+        assert!(status.success(), "the miniature game jar was not written");
+
+        let target = |name: &str, owner: &str, method: &str, descriptor: &str| {
+            let path = root.join(name);
+            let file = fs::File::create(&path).expect("create the target jar");
+            let mut jar = zip::ZipWriter::new(file);
+            let mut pool = PoolBuilder::default();
+            pool.method(owner, method, descriptor);
+            let bytes = pool.build("demo/Probe", "java/lang/Object", &[("run", &[0xb1])]);
+            jar.start_file("demo/Probe.class", zip::write::SimpleFileOptions::default())
+                .expect("start the target class");
+            std::io::Write::write_all(&mut jar, &bytes).expect("write the target class");
+            jar.finish().expect("finish the target jar");
+            path
+        };
+        for (name, owner, method, descriptor) in [
+            (
+                "entity-only.jar",
+                "net/minecraft/world/entity/Entity",
+                "getBlockX",
+                "()I",
+            ),
+            (
+                "block-entity-only.jar",
+                "net/minecraft/world/level/block/entity/BlockEntity",
+                "getBlockPos",
+                "()Lnet/minecraft/core/BlockPos;",
+            ),
+        ] {
+            let target = target(name, owner, method, descriptor);
+            let out = root.join(name.trim_end_matches(".jar"));
+            let report = generate(&target, &game_jar, &[], &out, &tool("javac"), &tool("jar"))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{owner}-only façade did not generate: {e} (sources in {})",
+                        out.display()
+                    )
+                });
+            assert!(
+                report.jar.is_file(),
+                "{owner}-only façade jar was not written: {report:?}"
+            );
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
