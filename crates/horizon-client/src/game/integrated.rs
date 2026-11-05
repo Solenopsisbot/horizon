@@ -1027,13 +1027,33 @@ fn run_server_java_mods(options: &mut Options) -> Result<()> {
             },
         )?
     };
-    let content = std::sync::Arc::make_mut(&mut options.java_content);
+    publish_server_content(&mut options.java_content, additions)
+}
+
+/// Merge the server role's declarations into the server's content and publish
+/// them to the process-wide stores.
+///
+/// `content` stays authoritative for the simulation. The declaration store
+/// only feeds what other parts read: the login-burst manifest a LAN guest
+/// receives and the diagnostics. The window's content-root build filled that
+/// store from the *client* role's batch, so rows only the server role declares
+/// would otherwise never reach a guest; the union adds them. A row the store
+/// holds differently is kept as the window had it and logged on one bounded
+/// line: it never stops startup.
+///
+/// An empty batch with nothing already loaded leaves the store untouched.
+fn publish_server_content(
+    content: &mut std::sync::Arc<Vec<horizon_client::mod_content::ContentMod>>,
+    additions: Vec<horizon_client::mod_content::ContentMod>,
+) -> Result<()> {
+    let content = std::sync::Arc::make_mut(content);
     for mod_content in additions {
         if content.iter().any(|existing| existing.id == mod_content.id) {
             continue;
         }
         content.push(mod_content);
     }
+    union_into_store(content);
     // The server thread owns authoritative potion/effect lookup state. Keep
     // this bounded registry in sync immediately after Java declarations are
     // loaded, even though the broader content/resource tables still rebuild
@@ -1045,6 +1065,38 @@ fn run_server_java_mods(options: &mut Options) -> Result<()> {
         log::info!("Horizon: {line}");
     }
     Ok(())
+}
+
+/// Union `content` into the declaration store and log the conflicts, if any.
+/// Returns the logged line so tests can read it. Split from
+/// [`publish_server_content`] so the store step runs without touching the
+/// process-wide typed registry snapshot.
+fn union_into_store(content: &[horizon_client::mod_content::ContentMod]) -> Option<String> {
+    let line = declared_union_line(&horizon_client::mod_content::union_declared_java_content(
+        content,
+    ));
+    if let Some(line) = &line {
+        log::warn!("Horizon: {line}");
+    }
+    line
+}
+
+/// The one log line for a union that found conflicts: the first rows named
+/// as `registry id`, then how many more there were. `None` when the store and
+/// the batch agreed.
+fn declared_union_line(union: &horizon_client::mod_content::DeclaredUnion) -> Option<String> {
+    if union.conflict_count == 0 {
+        return None;
+    }
+    let more = union.conflict_count - union.conflicts.len();
+    let mut line = format!(
+        "declared Java content conflicts with the content already loaded, keeping the loaded rows for LAN guests: {}",
+        union.conflicts.join(", ")
+    );
+    if more > 0 {
+        line.push_str(&format!(" (+{more} more)"));
+    }
+    Some(line)
 }
 
 /// Select the jars that can execute on the integrated server. A client-only
@@ -1209,6 +1261,164 @@ mod tests {
         );
         assert_eq!(
             server_java_skip_reason(&horizon_native_java::NativeJar::default()),
+            None
+        );
+    }
+
+    /// The declaration store is process-wide: tests that write it take turns.
+    static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn declared_mod(
+        id: &str,
+        declarations: horizon_mods::native::NativeDeclarations,
+    ) -> horizon_client::mod_content::ContentMod {
+        horizon_client::mod_content::ContentMod {
+            id: id.into(),
+            content: horizon_mods::content::Content::from_native(id, declarations).unwrap(),
+        }
+    }
+
+    fn menu_declaration(id: &str, slots: u32) -> horizon_mods::native::MenuDeclaration {
+        horizon_mods::native::MenuDeclaration {
+            id: id.into(),
+            title_key: "container.test".into(),
+            slots,
+            open_blocks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn server_role_declarations_union_into_the_store_beside_the_window_content() {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The window's content root: one menu.
+        let window = declared_mod(
+            "windowmod",
+            horizon_mods::native::NativeDeclarations {
+                menus: vec![menu_declaration("srvtest:window_menu", 9)],
+                ..Default::default()
+            },
+        );
+        horizon_client::mod_content::store_declared_java_content(std::slice::from_ref(&window));
+        let epoch = horizon_client::mod_content::declared_java_content_epoch();
+        // The server role adds a second menu and agrees on the first.
+        let server = declared_mod(
+            "servermod",
+            horizon_mods::native::NativeDeclarations {
+                menus: vec![menu_declaration("srvtest:server_menu", 27)],
+                ..Default::default()
+            },
+        );
+        let both = [window.clone(), server];
+        assert_eq!(union_into_store(&both), None);
+        let stored = horizon_client::mod_content::stored_declared_java_content();
+        assert_eq!(
+            stored.ids.menus,
+            ["srvtest:server_menu", "srvtest:window_menu"]
+        );
+        assert_eq!(stored.menus.len(), 2);
+        assert!(horizon_client::mod_content::declared_java_content_epoch() > epoch);
+        // The same batch again is idempotent and leaves the epoch alone.
+        let epoch = horizon_client::mod_content::declared_java_content_epoch();
+        assert_eq!(union_into_store(&both), None);
+        assert_eq!(
+            horizon_client::mod_content::declared_java_content_epoch(),
+            epoch
+        );
+    }
+
+    #[test]
+    fn conflicting_server_row_logs_one_bounded_line_and_keeps_both_sides() {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let window = declared_mod(
+            "windowmod",
+            horizon_mods::native::NativeDeclarations {
+                menus: vec![menu_declaration("srvtest:shared", 9)],
+                ..Default::default()
+            },
+        );
+        horizon_client::mod_content::store_declared_java_content(std::slice::from_ref(&window));
+        // The server declares the same menu id with another slot count, plus
+        // a menu only it knows.
+        let server = declared_mod(
+            "servermod",
+            horizon_mods::native::NativeDeclarations {
+                menus: vec![
+                    menu_declaration("srvtest:shared", 54),
+                    menu_declaration("srvtest:extra", 3),
+                ],
+                ..Default::default()
+            },
+        );
+        let mut simulation = std::sync::Arc::new(vec![window.clone()]);
+        let line = union_into_store(std::slice::from_ref(&server)).unwrap();
+        assert!(line.contains("minecraft:menu srvtest:shared"), "{line}");
+        assert!(!line.contains('\n') && line.len() < 400, "{line}");
+        let stored = horizon_client::mod_content::stored_declared_java_content();
+        // The store keeps the window's row for the conflicting id and still
+        // gains the server-only menu.
+        assert_eq!(stored.menus["srvtest:shared"].slots, 9);
+        assert_eq!(stored.menus["srvtest:extra"].slots, 3);
+        // The simulation content is the server's own, untouched by the store.
+        std::sync::Arc::make_mut(&mut simulation).push(server);
+        assert_eq!(simulation[1].content.menus[0].slots, 54);
+    }
+
+    #[test]
+    fn many_conflicts_are_counted_but_only_the_first_few_are_named() {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = |slots| {
+            (0..20)
+                .map(|n| menu_declaration(&format!("srvtest:many{n:02}"), slots))
+                .collect::<Vec<_>>()
+        };
+        let window = declared_mod(
+            "windowmod",
+            horizon_mods::native::NativeDeclarations {
+                menus: rows(9),
+                ..Default::default()
+            },
+        );
+        horizon_client::mod_content::store_declared_java_content(std::slice::from_ref(&window));
+        let server = declared_mod(
+            "servermod",
+            horizon_mods::native::NativeDeclarations {
+                menus: rows(10),
+                ..Default::default()
+            },
+        );
+        let line = union_into_store(&[server]).unwrap();
+        assert_eq!(line.matches("minecraft:menu ").count(), 4, "{line}");
+        assert!(line.ends_with("(+16 more)"), "{line}");
+    }
+
+    #[test]
+    fn an_empty_server_batch_leaves_the_store_untouched() {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let window = declared_mod(
+            "windowmod",
+            horizon_mods::native::NativeDeclarations {
+                menus: vec![menu_declaration("srvtest:kept", 9)],
+                ..Default::default()
+            },
+        );
+        horizon_client::mod_content::store_declared_java_content(std::slice::from_ref(&window));
+        let before = horizon_client::mod_content::stored_declared_java_content();
+        let epoch = horizon_client::mod_content::declared_java_content_epoch();
+        assert_eq!(union_into_store(&[]), None);
+        assert_eq!(
+            horizon_client::mod_content::stored_declared_java_content(),
+            before
+        );
+        assert_eq!(
+            horizon_client::mod_content::declared_java_content_epoch(),
+            epoch
+        );
+    }
+
+    #[test]
+    fn declared_union_line_is_silent_without_conflicts() {
+        assert_eq!(
+            declared_union_line(&horizon_client::mod_content::DeclaredUnion::default()),
             None
         );
     }
