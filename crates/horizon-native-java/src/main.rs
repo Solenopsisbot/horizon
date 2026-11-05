@@ -10,6 +10,11 @@ use std::{
     process::ExitCode,
 };
 
+/// Class-parse warnings the `--mixin-plans` report prints. The jar keeps more
+/// than this row count only to answer the total; a hostile jar must not turn
+/// the report into a megabyte of repeated attribute names.
+const MAX_REPORTED_CLASS_ANNOTATION_WARNINGS: usize = 16;
+
 /// Command-line shape: `--json`, `--mixin-plans` and `--weave <out.jar>` may
 /// appear anywhere, the remaining arguments are the jar, an optional loader
 /// kind, and an optional explicit class.
@@ -516,6 +521,7 @@ fn mixin_plan_entries(plans: &[MixinInjectionPlan]) -> Vec<serde_json::Value> {
 fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
     let plans = jar.mixin_injection_plans();
     let unresolved = jar.unresolved_invoke_plans();
+    let class_warnings = jar.class_annotation_warnings();
     let configs = jar
         .mixin_configs()
         .iter()
@@ -543,6 +549,12 @@ fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
             .iter()
             .map(|(path, reason)| serde_json::json!([path, reason]))
             .collect::<Vec<_>>(),
+        "class_annotation_warnings": class_warnings
+            .iter()
+            .take(MAX_REPORTED_CLASS_ANNOTATION_WARNINGS)
+            .cloned()
+            .collect::<Vec<_>>(),
+        "class_annotation_warnings_total": class_warnings.len(),
     })
 }
 
@@ -1036,6 +1048,13 @@ mod tests {
         );
         assert_eq!(configs[0]["required"], false);
         assert_eq!(configs[0]["priority"], 1500);
+        assert_eq!(configs[0]["mixin_priority"], serde_json::Value::Null);
+        assert_eq!(
+            report["class_annotation_warnings"],
+            serde_json::json!([]),
+            "a clean jar has no class-parse warnings"
+        );
+        assert_eq!(report["class_annotation_warnings_total"], 0);
         let errors = report["config_errors"].as_array().unwrap();
         assert_eq!(errors.len(), 1, "unexpected errors: {errors:#?}");
         assert_eq!(errors[0][0], "broken.mixins.json");

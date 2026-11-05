@@ -8330,6 +8330,9 @@ const MAX_MIXIN_CONFIG_BYTES: usize = 1024 * 1024;
 /// Class-parse diagnostics one jar keeps. A hostile jar can repeat the same
 /// malformed attribute across thousands of classes; the first rows say it all.
 const MAX_CLASS_ANNOTATION_WARNINGS: usize = 64;
+/// Root-fallback notices one jar keeps. A jar with a directory full of
+/// undeclared root configs only needs the first rows.
+const MAX_MIXIN_CONFIG_WARNINGS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entrypoint {
@@ -9082,21 +9085,34 @@ impl NativeJar {
 
     /// Read the Mixin JSON configs this jar declares.
     ///
-    /// Config paths come from `fabric.mod.json`'s `mixins` list (bare strings
-    /// and `{config, environment}` objects) and from every root-level
-    /// `*.mixins.json` resource; `nested/x.mixins.json` is read only when the
-    /// metadata names it. Configs are sorted by path, and a malformed,
-    /// oversized or out-of-bound config is skipped and reported by
+    /// Config paths follow the loader declarations, in the order they name
+    /// them: `fabric.mod.json`'s `mixins` list (bare strings and
+    /// `{config, environment}` objects), NeoForge's `[[mixins]]` blocks in
+    /// `META-INF/neoforge.mods.toml`, and the legacy Forge `MixinConfigs`
+    /// key in `META-INF/mods.toml`. A config in a subfolder is read when a
+    /// declaration names it. Only a jar with no loader metadata at all falls
+    /// back to its root-level `*.mixins.json` files, sorted by path, and each
+    /// fallback config is reported by [`Self::mixin_config_warnings`]. A
+    /// malformed, oversized or out-of-bound config is skipped and reported by
     /// [`Self::mixin_config_errors`] so it never hides the rest.
     pub fn mixin_configs(&self) -> Vec<MixinConfig> {
         self.mixin_config_scan().0
     }
 
-    /// Config paths that could not be read, as `(path, reason)`, sorted by
-    /// path. These are diagnostics, not a failure: the remaining configs are
+    /// Config paths that could not be read, as `(path, reason)`, in discovery
+    /// order. These are diagnostics, not a failure: the remaining configs are
     /// still returned by [`Self::mixin_configs`].
     pub fn mixin_config_errors(&self) -> Vec<(String, String)> {
         self.mixin_config_scan().1
+    }
+
+    /// Config-discovery diagnostics that leave the config usable.
+    ///
+    /// Today one row per root-level `*.mixins.json` that was used only because
+    /// the jar carries no loader metadata declaring a config. Bounded to
+    /// [`MAX_MIXIN_CONFIG_WARNINGS`] rows.
+    pub fn mixin_config_warnings(&self) -> Vec<String> {
+        self.mixin_config_paths().1
     }
 
     /// Class-parse diagnostics that were skipped instead of failing the jar.
@@ -9109,19 +9125,7 @@ impl NativeJar {
     }
 
     fn mixin_config_scan(&self) -> (Vec<MixinConfig>, Vec<(String, String)>) {
-        let mut paths = BTreeSet::new();
-        if let Some(text) = self
-            .resource_bytes
-            .get("fabric.mod.json")
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        {
-            paths.extend(fabric_mixin_config_paths(text));
-        }
-        for name in self.resources.keys() {
-            if !name.contains('/') && name.ends_with(".mixins.json") {
-                paths.insert(name.clone());
-            }
-        }
+        let (paths, _warnings) = self.mixin_config_paths();
         let mut configs = Vec::new();
         let mut errors = Vec::new();
         for path in paths {
@@ -9147,6 +9151,102 @@ impl NativeJar {
             }
         }
         (configs, errors)
+    }
+
+    /// The declared Mixin config paths in loader order, plus bounded warnings.
+    ///
+    /// A path a loader declares is followed wherever it lives; root files are
+    /// only a fallback for a jar that carries no loader metadata at all, since
+    /// the loaders above never load an undeclared config.
+    fn mixin_config_paths(&self) -> (Vec<String>, Vec<String>) {
+        let mut paths = Vec::new();
+        let mut declared = false;
+        if let Some(text) = self
+            .resource_bytes
+            .get("fabric.mod.json")
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            && let Some(declared_paths) = fabric_mixin_config_paths(text)
+        {
+            declared = true;
+            push_mixin_config_paths(&mut paths, declared_paths);
+        }
+        for name in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
+            let Some(text) = self
+                .resource_bytes
+                .get(name)
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            else {
+                continue;
+            };
+            let entries = toml_mixin_config_entries(text);
+            if !entries.is_empty() {
+                declared = true;
+                push_mixin_config_paths(
+                    &mut paths,
+                    entries.into_iter().map(|(path, _)| path).collect(),
+                );
+            }
+        }
+        let mut warnings = Vec::new();
+        if !declared && !self.has_loader_metadata() {
+            let mut roots = self
+                .resources
+                .keys()
+                .filter(|name| !name.contains('/') && name.ends_with(".mixins.json"))
+                .cloned()
+                .collect::<Vec<_>>();
+            roots.sort();
+            roots.truncate(MAX_MIXIN_CONFIGS);
+            for path in roots {
+                if warnings.len() < MAX_MIXIN_CONFIG_WARNINGS {
+                    warnings.push(format!(
+                        "{path}: used by the root-level fallback; no loader metadata declares it"
+                    ));
+                }
+                push_mixin_config_path(&mut paths, path);
+            }
+        }
+        (paths, warnings)
+    }
+
+    /// Whether the jar carries any loader metadata file at all.
+    fn has_loader_metadata(&self) -> bool {
+        [
+            "fabric.mod.json",
+            "META-INF/neoforge.mods.toml",
+            "META-INF/mods.toml",
+        ]
+        .into_iter()
+        .any(|name| self.resources.contains_key(name) || self.resource_bytes.contains_key(name))
+    }
+
+    /// The physical side each declared config applies on, by path.
+    ///
+    /// Fabric's `{config, environment}` entries and a NeoForge/Forge mixin
+    /// block's `environment`/`side` key both land here; a config with no such
+    /// declaration applies on both sides.
+    fn mixin_config_sides(&self) -> BTreeMap<String, MixinSide> {
+        let mut sides = self
+            .resource_bytes
+            .get("fabric.mod.json")
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(fabric_mixin_config_sides)
+            .unwrap_or_default();
+        for name in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
+            let Some(text) = self
+                .resource_bytes
+                .get(name)
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            else {
+                continue;
+            };
+            for (path, side) in toml_mixin_config_entries(text) {
+                if let Some(side) = side {
+                    sides.entry(path).or_insert(side);
+                }
+            }
+        }
+        sides
     }
 
     /// Select and validate the discovered plans for one requested target.
@@ -9453,12 +9553,7 @@ impl NativeJar {
         let (mut plans, unresolved) = self.mixin_plan_scan();
         let configs = self.mixin_configs();
         self.sort_mixin_plans_in_apply_order(&mut plans, &configs);
-        let config_sides = self
-            .resource_bytes
-            .get("fabric.mod.json")
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .map(fabric_mixin_config_sides)
-            .unwrap_or_default();
+        let config_sides = self.mixin_config_sides();
         let mut weave = LoadTimeMixinWeave::default();
         weave.skipped.extend(
             unresolved
@@ -15328,29 +15423,121 @@ fn parse_metadata(
 ///
 /// Fabric accepts a bare string or a `{config, environment}` object per entry.
 /// The environment picks which side loads the config and does not change the
-/// classes it lists, so it is not part of the bounded row here.
-fn fabric_mixin_config_paths(text: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Vec::new();
-    };
-    let Some(mixins) = value.get("mixins") else {
-        return Vec::new();
-    };
+/// classes it lists, so it is not part of the bounded row here. `None` means
+/// the metadata does not declare a config list at all, which keeps root-level
+/// files eligible for the fallback; `Some([])` is a declaration that loads
+/// nothing.
+fn fabric_mixin_config_paths(text: &str) -> Option<Vec<String>> {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let mixins = value.get("mixins")?;
     let values = match mixins {
         serde_json::Value::Array(values) => values.clone(),
         value => vec![value.clone()],
     };
-    values
-        .into_iter()
-        .filter_map(|value| match value {
-            serde_json::Value::String(path) => Some(path),
-            serde_json::Value::Object(object) => object
-                .get("config")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            _ => None,
-        })
-        .collect()
+    Some(
+        values
+            .into_iter()
+            .filter_map(|value| match value {
+                serde_json::Value::String(path) => Some(path),
+                serde_json::Value::Object(object) => object
+                    .get("config")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// Mixin config entries a Forge/NeoForge `mods.toml` declares.
+///
+/// NeoForge names each config in a `[[mixins]]` block (`config = "..."`); a
+/// block may also carry `environment` (`client`/`server`), kept even though
+/// NeoForge's own template only writes `config`, because a one-sided
+/// declaration must not be woven on the other side. Legacy Forge exported the
+/// manifest-style `MixinConfigs` list as a TOML key, comma-separated.
+fn toml_mixin_config_entries(text: &str) -> Vec<(String, Option<MixinSide>)> {
+    fn flush(
+        entries: &mut Vec<(String, Option<MixinSide>)>,
+        pending_config: &mut Option<String>,
+        environment: &mut Option<MixinSide>,
+    ) {
+        if let Some(path) = pending_config.take() {
+            if !entries.iter().any(|(known, _)| *known == path) {
+                entries.push((path, environment.take()));
+            } else {
+                *environment = None;
+            }
+        } else {
+            *environment = None;
+        }
+    }
+    let mut entries: Vec<(String, Option<MixinSide>)> = Vec::new();
+    let mut in_mixins = false;
+    let mut pending_config: Option<String> = None;
+    let mut pending_environment = None;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            flush(&mut entries, &mut pending_config, &mut pending_environment);
+            in_mixins = line.starts_with("[[mixins]]");
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if in_mixins {
+            match key {
+                "config" => {
+                    flush(&mut entries, &mut pending_config, &mut pending_environment);
+                    pending_config = Some(value.to_owned());
+                }
+                "environment" | "side" => {
+                    pending_environment = mixin_side(value);
+                }
+                _ => {}
+            }
+        } else if key == "MixinConfigs" {
+            for path in value
+                .split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+            {
+                if !entries.iter().any(|(known, _)| known == path) {
+                    entries.push((path.to_owned(), None));
+                }
+            }
+        }
+    }
+    flush(&mut entries, &mut pending_config, &mut pending_environment);
+    entries
+}
+
+/// Map a loader's environment spelling onto an execution side.
+fn mixin_side(value: &str) -> Option<MixinSide> {
+    match value.to_ascii_lowercase().as_str() {
+        "client" => Some(MixinSide::Client),
+        "server" | "dedicated_server" => Some(MixinSide::Server),
+        _ => None,
+    }
+}
+
+/// Append declared config paths, keeping the first declaration's order.
+fn push_mixin_config_paths(paths: &mut Vec<String>, declared: Vec<String>) {
+    for path in declared {
+        push_mixin_config_path(paths, path);
+    }
+}
+
+fn push_mixin_config_path(paths: &mut Vec<String>, path: String) {
+    if !path.is_empty() && !paths.contains(&path) {
+        paths.push(path);
+    }
 }
 
 /// The configs `fabric.mod.json` limits to one physical side, by path.
@@ -18348,7 +18535,120 @@ mandatory = true
         assert!(configs[0].required);
         assert_eq!(configs[0].priority, None);
         assert!(jar.mixin_config_errors().is_empty());
+        let warnings = jar.mixin_config_warnings();
+        assert_eq!(warnings.len(), 1, "unexpected warnings: {warnings:#?}");
+        assert!(
+            warnings[0].starts_with("auto.mixins.json:")
+                && warnings[0].contains("root-level fallback"),
+            "unexpected warning: {}",
+            warnings[0]
+        );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mixin_configs_follow_declared_loader_order() {
+        let mut jar = NativeJar::default();
+        jar.resource_bytes.insert(
+            "fabric.mod.json".into(),
+            br#"{"id":"ordered","mixins":["zeta.mixins.json","alpha.mixins.json"]}"#.to_vec(),
+        );
+        jar.resource_bytes.insert(
+            "zeta.mixins.json".into(),
+            br#"{"mixins":["demo.ZetaMixin"]}"#.to_vec(),
+        );
+        jar.resource_bytes.insert(
+            "alpha.mixins.json".into(),
+            br#"{"mixins":["demo.AlphaMixin"]}"#.to_vec(),
+        );
+        assert_eq!(
+            jar.mixin_configs()
+                .iter()
+                .map(|config| config.path.as_str())
+                .collect::<Vec<_>>(),
+            ["zeta.mixins.json", "alpha.mixins.json"],
+            "one priority tie is broken by fabric.mod.json order, not path order"
+        );
+        assert!(jar.mixin_config_warnings().is_empty());
+    }
+
+    #[test]
+    fn mixin_configs_follow_neoforge_declarations_and_environment() {
+        let mut jar = NativeJar::default();
+        jar.resources
+            .insert("root.mixins.json".into(), "jar-resource/root".into());
+        jar.resource_bytes.insert(
+            "root.mixins.json".into(),
+            br#"{"mixins":["demo.RootMixin"]}"#.to_vec(),
+        );
+        jar.resources.insert(
+            "META-INF/neoforge.mods.toml".into(),
+            "jar-resource/META-INF/neoforge.mods.toml".into(),
+        );
+        jar.resource_bytes.insert(
+            "META-INF/neoforge.mods.toml".into(),
+            br#"modLoader="javafml"
+license="MIT"
+[[mixins]]
+config="nested/nested.mixins.json"
+environment="client"
+
+[[mixins]]
+config="common.mixins.json"
+"#
+            .to_vec(),
+        );
+        jar.resource_bytes.insert(
+            "nested/nested.mixins.json".into(),
+            br#"{"mixins":["demo.NestedMixin"]}"#.to_vec(),
+        );
+        jar.resource_bytes.insert(
+            "common.mixins.json".into(),
+            br#"{"mixins":["demo.CommonMixin"]}"#.to_vec(),
+        );
+
+        let configs = jar.mixin_configs();
+        assert_eq!(
+            configs
+                .iter()
+                .map(|config| config.path.as_str())
+                .collect::<Vec<_>>(),
+            ["nested/nested.mixins.json", "common.mixins.json"],
+            "a declared subfolder config is read and the undeclared root one is not"
+        );
+        assert!(jar.mixin_config_warnings().is_empty());
+        let sides = jar.mixin_config_sides();
+        assert_eq!(
+            sides.get("nested/nested.mixins.json"),
+            Some(&MixinSide::Client)
+        );
+        assert_eq!(sides.get("common.mixins.json"), None);
+    }
+
+    #[test]
+    fn mixin_configs_read_legacy_toml_and_manifest_style_lists() {
+        let entries = toml_mixin_config_entries(
+            r#"modLoader="javafml"
+[[mods]]
+modId="legacy"
+[[mixins]]
+config = "one.mixins.json"
+[[dependencies.legacy]]
+modId="minecraft"
+"#,
+        );
+        assert_eq!(
+            entries,
+            vec![("one.mixins.json".to_owned(), None)],
+            "a [[mods]] or dependency block ends the mixin block"
+        );
+        assert_eq!(
+            toml_mixin_config_entries("MixinConfigs = \"a.mixins.json, b.mixins.json\"\n"),
+            vec![
+                ("a.mixins.json".to_owned(), None),
+                ("b.mixins.json".to_owned(), None),
+            ]
+        );
     }
 
     #[test]
