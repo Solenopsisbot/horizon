@@ -194,6 +194,13 @@ impl PayloadLink {
         std::mem::take(&mut self.outgoing)
     }
 
+    /// Take at most `max` received frames, oldest first, and keep the rest
+    /// queued: a per-tick drain bounds its work without losing frames.
+    pub fn take_incoming_up_to(&mut self, max: usize) -> Vec<PayloadFrame> {
+        let count = max.min(self.incoming.len());
+        self.incoming.drain(..count).collect()
+    }
+
     pub fn incoming(&self) -> &[PayloadFrame] {
         &self.incoming
     }
@@ -219,6 +226,10 @@ pub fn accepts(declared: PayloadDirection, direction: PayloadDirection) -> bool 
 struct HandlerJar {
     jar: NativeJar,
     registrations: Vec<PayloadRegistration>,
+    /// The host the jar bootstrapped on, when the caller kept it. Its
+    /// payload-type markers are what let a registration's marker resolve to
+    /// a channel id; a handler jar stored without one never matches a frame.
+    host: Option<StdHost>,
 }
 
 static HANDLER_JARS: Mutex<Vec<HandlerJar>> = Mutex::new(Vec::new());
@@ -231,7 +242,33 @@ pub fn store_handler_jar(jar: NativeJar, registrations: Vec<PayloadRegistration>
     HANDLER_JARS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(HandlerJar { jar, registrations });
+        .push(HandlerJar {
+            jar,
+            registrations,
+            host: None,
+        });
+}
+
+/// [`store_handler_jar`] that also keeps the bootstrapped host, so a received
+/// frame's channel id resolves to the registration's payload-type marker.
+/// Registrations come from the host itself. Sends the host had queued are
+/// dropped from the kept copy (the caller already published them).
+pub fn store_handler_host(jar: NativeJar, host: &StdHost) {
+    let registrations = host.payload_registrations().to_vec();
+    if registrations.is_empty() {
+        return;
+    }
+    let mut template = host.clone();
+    let _ = template.take_outgoing_payloads();
+    let _ = template.take_incoming_payloads();
+    HANDLER_JARS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(HandlerJar {
+            jar,
+            registrations,
+            host: Some(template),
+        });
 }
 
 /// Forget the jars of a previous bootstrap.
@@ -246,16 +283,54 @@ pub fn clear_handler_jars() {
 /// channel. Returns whether a handler ran; sends it queues are published for
 /// the next server tick.
 pub fn dispatch_received(frame: &PayloadFrame) -> Result<bool, String> {
+    dispatch_matching(frame, None)
+}
+
+/// [`dispatch_received`] for the side that received the frame: only
+/// registrations that receive in `receiving` (their direction, or a
+/// bidirectional one) can handle it. A client window passes `PlayToClient`,
+/// so a server-side receiver of the same channel never answers its frames.
+pub fn dispatch_received_as(
+    frame: &PayloadFrame,
+    receiving: PayloadDirection,
+) -> Result<bool, String> {
+    dispatch_matching(frame, Some(receiving))
+}
+
+/// Whether a registration's recorded direction receives frames travelling in
+/// `receiving`. An unparseable direction (configuration phase) never does.
+fn registration_receives(direction: &str, receiving: PayloadDirection) -> bool {
+    match PayloadDirection::parse(direction) {
+        Ok(PayloadDirection::PlayBidirectional) => true,
+        Ok(direction) => direction == receiving,
+        Err(_) => false,
+    }
+}
+
+fn dispatch_matching(
+    frame: &PayloadFrame,
+    receiving: Option<PayloadDirection>,
+) -> Result<bool, String> {
     let declarations = declared();
     let declaration = declarations.get(frame.id());
     let (payload, context) = payload_values(declaration, frame);
     let handlers = HANDLER_JARS.lock().unwrap_or_else(|e| e.into_inner());
     for handler in handlers.iter() {
-        let mut host = StdHost::new();
+        let registrations: Vec<PayloadRegistration> = handler
+            .registrations
+            .iter()
+            .filter(|registration| {
+                receiving.is_none_or(|direction| {
+                    registration_receives(&registration.direction, direction)
+                })
+            })
+            .cloned()
+            .collect();
+        let mut host = handler.host.clone().unwrap_or_else(StdHost::new);
         let matched = dispatch_payload_frame_with(
             &handler.jar,
             &mut host,
-            &handler.registrations,
+            &registrations,
             frame.id(),
             payload.clone(),
             context.clone(),
@@ -302,6 +377,14 @@ fn payload_value(value: &PayloadValue, id: &str) -> Value {
 /// Frames a Java host asked to send, waiting for the server's next tick.
 static JAVA_OUTGOING: Mutex<Vec<PayloadFrame>> = Mutex::new(Vec::new());
 
+/// The `PlayToServer` frames of [`JAVA_OUTGOING`], mirrored for a client
+/// window. The hub drains (and ignores) every frame of the shared queue each
+/// tick, so a window cannot read its sends from there without racing it in an
+/// integrated game; this copy is only ever drained by
+/// [`take_java_to_server`]. A process that never drains it (a dedicated
+/// server) drops the oldest frames instead of failing sends.
+static JAVA_TO_SERVER: Mutex<Vec<PayloadFrame>> = Mutex::new(Vec::new());
+
 /// Translate a Java host's queued sends into validated frames. A channel must
 /// be declared, the direction must match, and a supported codec must accept
 /// the bytes; the whole batch stops at the first bad frame.
@@ -338,7 +421,18 @@ pub fn publish_from_host(host: &mut horizon_native_java::StdHost) -> Result<usiz
         if queue.len() + frames.len() > MAX_OUTGOING {
             return Err("Java payload send queue is full".to_owned());
         }
-        queue.extend(frames);
+        queue.extend(frames.iter().cloned());
+        drop(queue);
+        let mut mirror = JAVA_TO_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        mirror.extend(
+            frames
+                .into_iter()
+                .filter(|frame| frame.direction() == PayloadDirection::PlayToServer),
+        );
+        if mirror.len() > MAX_OUTGOING {
+            let excess = mirror.len() - MAX_OUTGOING;
+            mirror.drain(..excess);
+        }
     }
     Ok(count)
 }
@@ -346,6 +440,14 @@ pub fn publish_from_host(host: &mut horizon_native_java::StdHost) -> Result<usiz
 /// Frames Java mods asked to send, drained in order.
 pub fn take_java_outgoing() -> Vec<PayloadFrame> {
     std::mem::take(&mut JAVA_OUTGOING.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Take at most `max` frames Java mods addressed to the server, oldest first;
+/// the rest stay queued for the next call. Each frame is returned once.
+pub fn take_java_to_server(max: usize) -> Vec<PayloadFrame> {
+    let mut queue = JAVA_TO_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+    let count = max.min(queue.len());
+    queue.drain(..count).collect()
 }
 
 /// Hand received frames to a Java host for its bootstrap/bootstrap-time view.
@@ -380,6 +482,10 @@ pub fn store_declared(
     // Frames queued by a previous content root must not be sent using the
     // replacement registry. Drop them atomically with the declaration swap.
     JAVA_OUTGOING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    JAVA_TO_SERVER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
@@ -444,6 +550,13 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The handler-jar store, declarations and Java queues are process-wide,
+    /// so tests that touch them run one at a time.
+    fn global_state() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn declaration(
         id: &str,
@@ -721,6 +834,7 @@ mod tests {
 
     #[test]
     fn without_stored_jars_no_handler_runs() {
+        let _guard = global_state();
         clear_handler_jars();
         let frame =
             PayloadFrame::new("demo:up", PayloadDirection::PlayToServer, b"x".to_vec()).unwrap();
@@ -817,6 +931,7 @@ mod tests {
 
     #[test]
     fn replacing_declarations_discards_queued_java_frames() {
+        let _guard = global_state();
         clear_handler_jars();
         let old = declaration(
             "demo:old",
@@ -837,5 +952,244 @@ mod tests {
         )])
         .unwrap();
         assert!(take_java_outgoing().is_empty());
+    }
+
+    #[test]
+    fn take_incoming_up_to_keeps_the_remainder_queued() {
+        let mut server = PayloadLink::new(registry([declaration(
+            "demo:to_client",
+            PayloadDirection::PlayToClient,
+            None,
+        )]));
+        let mut client = server.clone();
+        for n in 0..5u8 {
+            let data = server
+                .send("demo:to_client", PayloadDirection::PlayToClient, vec![n])
+                .unwrap();
+            client.receive(&data, PayloadDirection::PlayToClient).unwrap();
+        }
+        let first = client.take_incoming_up_to(3);
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0].bytes(), &[0]);
+        assert_eq!(client.incoming().len(), 2);
+        // Oldest first, and the rest comes out exactly once.
+        let rest = client.take_incoming_up_to(100);
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].bytes(), &[3]);
+        assert!(client.take_incoming_up_to(100).is_empty());
+    }
+
+    #[test]
+    fn host_frames_for_the_server_drain_exactly_once_and_stay_bounded() {
+        let _guard = global_state();
+        clear_handler_jars();
+        store_declared([
+            declaration("demo:up", PayloadDirection::PlayToServer, None),
+            declaration("demo:down", PayloadDirection::PlayToClient, None),
+        ])
+        .unwrap();
+        let mut host = horizon_native_java::StdHost::new();
+        host.queue_outgoing_payload("demo:up", "playToServer", vec![1]);
+        host.queue_outgoing_payload("demo:down", "playToClient", vec![2]);
+        host.queue_outgoing_payload("demo:up", "playToServer", vec![3]);
+        assert_eq!(publish_from_host(&mut host).unwrap(), 3);
+
+        // The client drain sees only what travels to the server, in order,
+        // and a bounded call leaves the remainder queued.
+        let first = take_java_to_server(1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].bytes(), &[1]);
+        let rest = take_java_to_server(256);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].bytes(), &[3]);
+        assert!(take_java_to_server(256).is_empty());
+
+        // The shared queue the hub drains is untouched by the client drain.
+        let shared = take_java_outgoing();
+        assert_eq!(shared.len(), 3);
+        assert!(take_java_outgoing().is_empty());
+
+        // Nothing drains the mirror in a process without a client window:
+        // the oldest frames are dropped rather than sends failing.
+        for round in 0..3u8 {
+            let mut host = horizon_native_java::StdHost::new();
+            for n in 0..200u8 {
+                host.queue_outgoing_payload("demo:up", "playToServer", vec![round, n]);
+            }
+            publish_from_host(&mut host).unwrap();
+            take_java_outgoing();
+        }
+        let kept = take_java_to_server(usize::MAX);
+        assert_eq!(kept.len(), MAX_OUTGOING);
+        assert_eq!(kept.last().unwrap().bytes(), &[2, 199]);
+
+        // A new content root discards frames queued under the old one.
+        let mut host = horizon_native_java::StdHost::new();
+        host.queue_outgoing_payload("demo:up", "playToServer", vec![9]);
+        publish_from_host(&mut host).unwrap();
+        store_declared([declaration("demo:up", PayloadDirection::PlayToServer, None)]).unwrap();
+        assert!(take_java_to_server(256).is_empty());
+    }
+
+    // ---- a compiled client mod's handler -------------------------------
+
+    fn javac() -> std::path::PathBuf {
+        std::env::var_os("JAVA_HOME")
+            .map(|home| std::path::PathBuf::from(home).join("bin/javac"))
+            .unwrap_or_else(|| "javac".into())
+    }
+
+    fn class_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .flat_map(|entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    class_files(&path)
+                } else {
+                    vec![path]
+                }
+            })
+            .collect()
+    }
+
+    /// A one-class Fabric client mod: it receives `demo:frame` on
+    /// `ClientPlayNetworking` and answers with a `demo:reply` send. Returns
+    /// `None` (a skip) when no `javac` is installed.
+    fn build_client_mod(root: &std::path::Path) -> Option<std::path::PathBuf> {
+        use std::io::Write;
+        let sources = [
+            (
+                "net/fabricmc/api/ClientModInitializer.java",
+                "package net.fabricmc.api; public interface ClientModInitializer { void onInitializeClient(); }",
+            ),
+            (
+                "net/minecraft/resources/Identifier.java",
+                "package net.minecraft.resources; public final class Identifier { public static Identifier fromNamespaceAndPath(String ns, String path) { return new Identifier(); } }",
+            ),
+            (
+                "net/minecraft/network/codec/StreamCodec.java",
+                "package net.minecraft.network.codec; public interface StreamCodec<B, V> {}",
+            ),
+            (
+                "net/minecraft/network/protocol/common/custom/CustomPacketPayload.java",
+                "package net.minecraft.network.protocol.common.custom; import net.minecraft.network.codec.StreamCodec; public interface CustomPacketPayload { final class Type<T extends CustomPacketPayload> { public Type(net.minecraft.resources.Identifier id, StreamCodec<?, T> codec) {} } }",
+            ),
+            (
+                "net/fabricmc/fabric/api/client/networking/v1/ClientPlayNetworking.java",
+                "package net.fabricmc.fabric.api.client.networking.v1; import net.minecraft.network.protocol.common.custom.CustomPacketPayload; public final class ClientPlayNetworking { public interface PlayPayloadHandler<T extends CustomPacketPayload> { void receive(T payload, Object context); } public static <T extends CustomPacketPayload> boolean registerGlobalReceiver(CustomPacketPayload.Type<T> type, PlayPayloadHandler<T> handler) { return true; } public static void send(CustomPacketPayload payload) {} }",
+            ),
+            (
+                "demo/Mod.java",
+                "package demo; import net.fabricmc.api.ClientModInitializer; import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking; import net.minecraft.network.protocol.common.custom.CustomPacketPayload; import net.minecraft.resources.Identifier; public final class Mod implements ClientModInitializer { public void onInitializeClient() { CustomPacketPayload.Type<CustomPacketPayload> type = new CustomPacketPayload.Type<>(Identifier.fromNamespaceAndPath(\"demo\", \"frame\"), null); ClientPlayNetworking.registerGlobalReceiver(type, this::handle); } private void handle(CustomPacketPayload payload, Object context) { Object reply = new CustomPacketPayload.Type<>(Identifier.fromNamespaceAndPath(\"demo\", \"reply\"), null); ClientPlayNetworking.send((CustomPacketPayload) reply); } }",
+            ),
+        ];
+        let src = root.join("src");
+        let classes = root.join("classes");
+        std::fs::create_dir_all(&classes).unwrap();
+        let mut paths = Vec::new();
+        for (relative, body) in sources {
+            let path = src.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            paths.push(path);
+        }
+        let status = match std::process::Command::new(javac())
+            .args(["--release", "17", "-d"])
+            .arg(&classes)
+            .args(&paths)
+            .status()
+        {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("skipping: javac is unavailable ({error})");
+                return None;
+            }
+        };
+        assert!(status.success(), "javac failed");
+        let jar = root.join("client-payload.jar");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(
+            br#"{"id":"client-payload","version":"1.0","entrypoints":{"client":"demo.Mod"}}"#,
+        )
+        .unwrap();
+        for class in class_files(&classes) {
+            let entry = class
+                .strip_prefix(&classes)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            // Only the mod's class: every stub call must cross the host.
+            if !entry.starts_with("demo/Mod") {
+                continue;
+            }
+            zip.start_file(entry, options).unwrap();
+            zip.write_all(&std::fs::read(class).unwrap()).unwrap();
+        }
+        zip.finish().unwrap();
+        Some(jar)
+    }
+
+    #[test]
+    fn a_client_received_frame_reaches_the_client_handler_and_its_reply_queues() {
+        let _guard = global_state();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-client-payload-handler-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let Some(jar_path) = build_client_mod(&root) else {
+            return;
+        };
+        let jar = NativeJar::from_path(&jar_path).unwrap();
+        let entry = jar.discover_entrypoint("client").unwrap();
+        let mut host = jar.seed_host(StdHost::new());
+        jar.execute(&entry.class, entry.method.as_deref(), "client", &mut host)
+            .unwrap();
+        assert_eq!(host.payload_registrations().len(), 1);
+        assert_eq!(host.payload_registrations()[0].direction, "playToClient");
+
+        clear_handler_jars();
+        store_declared([
+            declaration("demo:frame", PayloadDirection::PlayToClient, None),
+            declaration("demo:reply", PayloadDirection::PlayToServer, None),
+        ])
+        .unwrap();
+        let frame =
+            PayloadFrame::new("demo:frame", PayloadDirection::PlayToClient, b"hi".to_vec())
+                .unwrap();
+
+        // Stored without its host the registration's marker cannot resolve to
+        // a channel id: nothing runs. That is why a host-carrying store exists.
+        store_handler_jar(jar.clone(), host.payload_registrations().to_vec());
+        assert!(!dispatch_received_as(&frame, PayloadDirection::PlayToClient).unwrap());
+        clear_handler_jars();
+
+        store_handler_host(jar, &host);
+        // A client-side receiver does not answer a frame received as the
+        // server's, and an unrelated channel finds no handler.
+        assert!(!dispatch_received_as(&frame, PayloadDirection::PlayToServer).unwrap());
+        let other =
+            PayloadFrame::new("demo:other", PayloadDirection::PlayToClient, Vec::new()).unwrap();
+        assert!(!dispatch_received_as(&other, PayloadDirection::PlayToClient).unwrap());
+        assert!(take_java_to_server(256).is_empty());
+
+        assert!(dispatch_received_as(&frame, PayloadDirection::PlayToClient).unwrap());
+        let replies = take_java_to_server(256);
+        assert_eq!(replies.len(), 1, "the handler's send reaches the client queue");
+        assert_eq!(replies[0].id(), "demo:reply");
+        assert_eq!(replies[0].direction(), PayloadDirection::PlayToServer);
+        // Delivered exactly once.
+        assert!(take_java_to_server(256).is_empty());
+
+        clear_handler_jars();
+        let _ = take_java_outgoing();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
