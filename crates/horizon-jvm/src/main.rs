@@ -63,6 +63,9 @@ import java.util.stream.Collectors;
 @SuppressWarnings({"unchecked", "rawtypes"})
 public final class HorizonLoaderBridge {
   private HorizonLoaderBridge() {}
+  private static boolean testLaunchCalled;
+
+  public static boolean testLaunchCalled() { return testLaunchCalled; }
 
   public static void seed(String id, String version) throws Exception {
     Class<?> impl = Class.forName("net.fabricmc.loader.impl.FabricLoaderImpl");
@@ -121,7 +124,7 @@ public final class HorizonLoaderBridge {
 
   /** Drive the real Fabric loader with the bounded test provider. */
   public static int bootstrap() throws Exception {
-    installLauncher(makeLauncher(ClassLoader.getSystemClassLoader(), false, new String[0], "26.3"));
+    installLauncher(makeLauncher(ClassLoader.getSystemClassLoader(), false, new String[0], "26.3", true, false));
     return finishBootstrap(testProvider());
   }
 
@@ -132,6 +135,11 @@ public final class HorizonLoaderBridge {
    * the caller always reports a bounded outcome instead of a stack trace.
    */
   public static String bootstrapProduction(String[] gameJars, String gameVersion, String side) throws Exception {
+    return bootstrapProduction(gameJars, gameVersion, side, false, false, false);
+  }
+
+  public static String bootstrapProduction(String[] gameJars, String gameVersion, String side,
+      boolean development, boolean realLaunch, boolean discovery) throws Exception {
     if (gameJars == null || gameJars.length == 0) return "test\t0\tno game jar supplied";
     boolean client = "client".equals(side);
     try {
@@ -145,7 +153,7 @@ public final class HorizonLoaderBridge {
       // The game jars are already on the JVM classpath (see `run`), so the
       // system loader sees both the loader and the game; a child URL loader
       // would only hide loader classes from the provider.
-      Object launcher = makeLauncher(ClassLoader.getSystemClassLoader(), client, gameJars, gameVersion);
+      Object launcher = makeLauncher(ClassLoader.getSystemClassLoader(), client, gameJars, gameVersion, development, realLaunch);
       installLauncher(launcher);
       Class<?> providerClass = Class.forName("net.fabricmc.loader.impl.game.minecraft.MinecraftGameProvider");
       Object provider = providerClass.getConstructor().newInstance();
@@ -163,12 +171,42 @@ public final class HorizonLoaderBridge {
       impl.getMethod("setGameProvider", providerIface).invoke(loader, provider);
       providerClass.getMethod("initialize", launcherIface).invoke(provider, launcher);
       impl.getMethod("load").invoke(loader);
+      String freezeReason = "";
       try {
         impl.getMethod("freeze").invoke(loader);
-      } catch (Throwable ignored) {
-        // A loader without freeze still exposes the containers.
+      } catch (Throwable failure) {
+        freezeReason = summarize(failure);
       }
-      return "minecraft\t" + ((Collection<?>) impl.getMethod("getAllMods").invoke(loader)).size();
+      Collection<?> allMods = (Collection<?>) impl.getMethod("getAllMods").invoke(loader);
+      List<String> ids = new ArrayList<>();
+      if (discovery) {
+        // Reflect through the API interfaces: some containers are package
+        // private, so `mod.getClass().getMethod(...)` is not accessible.
+        Method getMetadata = Class.forName("net.fabricmc.loader.api.ModContainer")
+            .getMethod("getMetadata");
+        Method getId = Class.forName("net.fabricmc.loader.api.metadata.ModMetadata")
+            .getMethod("getId");
+        for (Object mod : allMods) {
+          try {
+            ids.add(String.valueOf(getId.invoke(getMetadata.invoke(mod))));
+          } catch (Throwable ignored) { }
+        }
+        Collections.sort(ids);
+        if (ids.size() > 64) ids = new ArrayList<>(ids.subList(0, 64));
+      }
+      if (realLaunch) {
+        // The launcher below names StubEntrypoint as the entrypoint, which is
+        // the hand-off a real Knot launch would take. This probe does not run
+        // Knot's classpath unlock, so invoke the stub directly: the game's own
+        // entrypoint is never touched and the real game never starts.
+        String[] launchArgs = new String[0];
+        try {
+          Object args = providerClass.getMethod("getLaunchArguments", boolean.class).invoke(provider, false);
+          if (args instanceof String[]) launchArgs = (String[]) args;
+        } catch (Throwable ignored) { }
+        StubEntrypoint.main(launchArgs);
+      }
+      return "minecraft\t" + allMods.size() + "\t" + freezeReason + "\t" + development + "\t" + String.join(",", ids);
     } catch (Throwable failure) {
       String reason = summarize(failure);
       try {
@@ -191,7 +229,7 @@ public final class HorizonLoaderBridge {
 
   /** The launcher Fabric's provider sees: the supplied classpath plus game jars. */
   private static Object makeLauncher(ClassLoader target, boolean client, String[] gameJars,
-      String gameVersion) throws Exception {
+      String gameVersion, boolean development, boolean realLaunch) throws Exception {
     Class<?> launcherIface = Class.forName("net.fabricmc.loader.impl.launch.FabricLauncher");
     return Proxy.newProxyInstance(launcherIface.getClassLoader(), new Class<?>[]{launcherIface}, (p, m, a) -> {
       switch (m.getName()) {
@@ -212,10 +250,11 @@ public final class HorizonLoaderBridge {
         }
         case "getEnvironmentType":
           return Enum.valueOf((Class) Class.forName("net.fabricmc.api.EnvType"), client ? "CLIENT" : "SERVER");
-        case "isDevelopment": return true;
+        case "isDevelopment": return development;
         case "getEntrypoint":
-          return client ? "net.fabricmc.loader.impl.launch.knot.KnotClient"
-              : "net.fabricmc.loader.impl.launch.knot.KnotServer";
+          return realLaunch ? "HorizonLoaderBridge$StubEntrypoint"
+              : (client ? "net.fabricmc.loader.impl.launch.knot.KnotClient"
+              : "net.fabricmc.loader.impl.launch.knot.KnotServer");
         case "getManifest": return null;
         case "getMappingConfiguration": return mappingConfiguration(gameVersion);
         case "isClassLoaded": return false;
@@ -223,6 +262,17 @@ public final class HorizonLoaderBridge {
         default: return defaultValue(m.getReturnType());
       }
     });
+  }
+
+  public static final class StubEntrypoint {
+    private static boolean launched;
+
+    public static void main(String[] args) {
+      // Provider launch and the direct fallback may both reach the stub.
+      if (launched) return;
+      launched = true;
+      System.out.println("real-launch: stub-entrypoint-ok " + (args == null ? 0 : args.length));
+    }
   }
 
   /** The bounded reflection provider this probe has always used. */
@@ -239,7 +289,8 @@ public final class HorizonLoaderBridge {
         case "requiresUrlClassLoader": case "isEnabled": case "locateGame":
         case "hasAwtSupport": case "canOpenErrorGui": return true;
         case "getBuiltinTransforms": return Collections.emptySet();
-        case "initialize": case "unlockClassPath": case "launch": return null;
+        case "initialize": case "unlockClassPath": return null;
+        case "launch": testLaunchCalled = true; return null;
         case "getEntrypointTransformer": return null;
         case "getArguments":
           return Class.forName("net.fabricmc.loader.impl.util.Arguments").getConstructor().newInstance();
@@ -399,7 +450,7 @@ fn main() -> ExitCode {
 }
 
 /// The usage line, kept as data so a test can check the kinds it names.
-const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] [--measure [--measure-timeout <secs>] [--measure-sample-ms <ms>] [--measure-repeat <n>]] <jar>...";
+const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--real-launch] [--fabric-discovery] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] [--measure [--measure-timeout <secs>] [--measure-sample-ms <ms>] [--measure-repeat <n>]] <jar>...";
 
 /// The FML listing/report flags, removed from the jar list before anything is
 /// resolved. `--fml-list` is the short spelling of `--list-fml-mods`.
@@ -437,6 +488,10 @@ fn run() -> Result<(), String> {
     // production default, and the flag never reaches the jar list.
     let fabric_development = args.iter().any(|arg| arg == "--fabric-development");
     args.retain(|arg| arg != "--fabric-development");
+    let real_launch = args.iter().any(|arg| arg == "--real-launch");
+    args.retain(|arg| arg != "--real-launch");
+    let fabric_discovery = args.iter().any(|arg| arg == "--fabric-discovery");
+    args.retain(|arg| arg != "--fabric-discovery");
     // Run the real Fabric or NeoForge loader instead of this probe's own scan.
     // A supplied Minecraft jar opts into the production provider, which only
     // the real-loader path can run; a report-only invocation still only reports
@@ -709,11 +764,14 @@ fn run() -> Result<(), String> {
                 .call_static_method(
                     &bridge,
                     "bootstrapProduction",
-                    "([Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                    "([Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZZ)Ljava/lang/String;",
                     &[
                         JValue::Object(&jars),
                         JValue::Object(&JObject::from(version)),
                         JValue::Object(&JObject::from(side)),
+                        JValue::Bool(fabric_development as u8),
+                        JValue::Bool(real_launch as u8),
+                        JValue::Bool(fabric_discovery as u8),
                     ],
                 )
                 .and_then(|value| value.l())
@@ -737,8 +795,21 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("Fabric loader entrypoints: {error}"))?;
         println!("real loader: {mods} mod(s), {entrypoints} {entry_kind} entrypoint(s)");
         match &outcome {
-            ProviderOutcome::Production { .. } => {
+            ProviderOutcome::Production {
+                freeze_reason,
+                development,
+                discovered_ids,
+                ..
+            } => {
                 println!("real loader: entered production game provider");
+                println!("real loader: isDevelopment={development}");
+                if let Some(reason) = freeze_reason {
+                    println!("real loader: freeze failed ({reason})");
+                }
+                if fabric_discovery {
+                    let declared = declared_mod_ids(&supplied_jars);
+                    println!("{}", discovery_line(&declared, discovered_ids));
+                }
             }
             ProviderOutcome::Fallback { reason, .. } => {
                 println!(
@@ -762,7 +833,11 @@ fn run() -> Result<(), String> {
     }
 
     prepare_fabric_loader(env, &nested.root)?;
-    seed_fabric_metadata(env, &classpath)?;
+    // The reflective seed registers each jar's metadata itself. Discovery mode
+    // leaves that to the loader's own `-Dfabric.addMods` hand-off instead.
+    if !fabric_discovery {
+        seed_fabric_metadata(env, &classpath)?;
+    }
 
     println!(
         "jvm up: {} jars on the classpath, {} {} entrypoint(s)",
@@ -1691,6 +1766,39 @@ fn fabric_metadata(path: &Path) -> Option<(String, String)> {
     Some((id, version))
 }
 
+/// Upper bound on the ids a discovery report names, matching the bridge.
+const MAX_DISCOVERED_MOD_IDS: usize = 64;
+
+/// The mod ids the supplied jars declare in `fabric.mod.json`: the same set
+/// the reflective seed registers, sorted, deduplicated and bounded so the
+/// discovery line stays one line.
+fn declared_mod_ids(jars: &[PathBuf]) -> Vec<String> {
+    let mut ids: Vec<String> = jars
+        .iter()
+        .filter_map(|jar| fabric_metadata(jar).map(|(id, _)| id))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids.truncate(MAX_DISCOVERED_MOD_IDS);
+    ids
+}
+
+/// `discovery: N declared, M found, missing=<list>`: declared ids the loader
+/// never reported are named, so the loader's own discovery is checkable.
+fn discovery_line(declared: &[String], found: &[String]) -> String {
+    let missing: Vec<&str> = declared
+        .iter()
+        .filter(|id| !found.contains(id))
+        .map(String::as_str)
+        .collect();
+    format!(
+        "discovery: {} declared, {} found, missing={}",
+        declared.len(),
+        found.len(),
+        missing.join(",")
+    )
+}
+
 /// Fabric's documented developer property for classpath mods, and the loader
 /// flags this probe may forward. The loader reads them before any entrypoint
 /// runs, so they have to be in the JVM options.
@@ -1894,15 +2002,29 @@ impl ProviderStatus {
 /// What the bridge reported after a real-loader bootstrap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProviderOutcome {
-    Production { mods: usize },
-    Fallback { mods: usize, reason: String },
-    Test { mods: usize },
+    Production {
+        mods: usize,
+        freeze_reason: Option<String>,
+        development: bool,
+        /// Mod ids the loader discovered, sorted and bounded by the bridge.
+        /// Empty when discovery was not requested.
+        discovered_ids: Vec<String>,
+    },
+    Fallback {
+        mods: usize,
+        reason: String,
+    },
+    Test {
+        mods: usize,
+    },
 }
 
 impl ProviderOutcome {
     fn mods(&self) -> usize {
         match self {
-            Self::Production { mods } | Self::Fallback { mods, .. } | Self::Test { mods } => *mods,
+            Self::Production { mods, .. } | Self::Fallback { mods, .. } | Self::Test { mods } => {
+                *mods
+            }
         }
     }
 }
@@ -1917,6 +2039,8 @@ struct ProviderReport {
     game_version: String,
     status: ProviderStatus,
     fallback_reason: Option<String>,
+    development: Option<bool>,
+    freeze_reason: Option<String>,
 }
 
 impl ProviderReport {
@@ -1928,6 +2052,8 @@ impl ProviderReport {
             game_version: game_version.to_owned(),
             status: ProviderStatus::NotRun,
             fallback_reason: None,
+            development: None,
+            freeze_reason: None,
         }
     }
 
@@ -1938,13 +2064,19 @@ impl ProviderReport {
         side: ProviderSide,
     ) -> Self {
         match outcome {
-            ProviderOutcome::Production { .. } => Self {
+            ProviderOutcome::Production {
+                development,
+                freeze_reason,
+                ..
+            } => Self {
                 kind: ProviderKind::Minecraft,
                 side,
                 game_jars,
                 game_version: game_version.to_owned(),
                 status: ProviderStatus::Ok,
                 fallback_reason: None,
+                development: Some(*development),
+                freeze_reason: freeze_reason.clone(),
             },
             ProviderOutcome::Fallback { reason, .. } => Self {
                 kind: ProviderKind::Test,
@@ -1953,6 +2085,8 @@ impl ProviderReport {
                 game_version: game_version.to_owned(),
                 status: ProviderStatus::Fallback,
                 fallback_reason: Some(reason.clone()),
+                development: None,
+                freeze_reason: None,
             },
             ProviderOutcome::Test { .. } => Self {
                 kind: ProviderKind::Test,
@@ -1961,6 +2095,8 @@ impl ProviderReport {
                 game_version: game_version.to_owned(),
                 status: ProviderStatus::Ok,
                 fallback_reason: None,
+                development: None,
+                freeze_reason: None,
             },
         }
     }
@@ -1976,6 +2112,12 @@ impl ProviderReport {
         if let Some(reason) = &self.fallback_reason {
             lines.push(format!("fallback: {reason}"));
         }
+        if let Some(development) = self.development {
+            lines.push(format!("isDevelopment: {development}"));
+        }
+        if let Some(reason) = &self.freeze_reason {
+            lines.push(format!("freeze: {reason}"));
+        }
         bound_text(&(lines.join("\n") + "\n"), MAX_PROVIDER_REPORT_BYTES)
     }
 
@@ -1987,6 +2129,8 @@ impl ProviderReport {
             "gameVersion": self.game_version,
             "status": self.status.label(),
             "fallback": self.fallback_reason,
+            "isDevelopment": self.development,
+            "freeze": self.freeze_reason,
         })
         .to_string();
         if text.len() <= MAX_PROVIDER_REPORT_BYTES {
@@ -1999,6 +2143,8 @@ impl ProviderReport {
             "gameVersion": "",
             "status": self.status.label(),
             "fallback": "report truncated",
+            "isDevelopment": self.development,
+            "freeze": self.freeze_reason,
         })
         .to_string()
     }
@@ -2041,17 +2187,36 @@ fn bounded_provider_reason(reason: &str) -> String {
     collapsed.chars().take(MAX_PROVIDER_REASON_CHARS).collect()
 }
 
-/// The bridge returns `minecraft<TAB><mods>` on success and
+/// The bridge returns `minecraft<TAB><mods><TAB><freeze><TAB><development><TAB><ids>` on success and
 /// `test<TAB><mods><TAB><reason>` after falling back.
 fn parse_provider_outcome(text: &str) -> Result<ProviderOutcome, String> {
-    let mut parts = text.splitn(3, '\t');
+    let mut parts = text.splitn(5, '\t');
     let kind = parts.next().unwrap_or_default();
     let mods = parts
         .next()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(0);
     match kind {
-        "minecraft" => Ok(ProviderOutcome::Production { mods }),
+        "minecraft" => {
+            let freeze = parts.next().unwrap_or_default();
+            let development = parts.next().unwrap_or("false") == "true";
+            // The ids field is absent only in the legacy two-field shape.
+            let discovered_ids = parts
+                .next()
+                .map(|ids| {
+                    ids.split(',')
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(ProviderOutcome::Production {
+                mods,
+                freeze_reason: (!freeze.is_empty()).then(|| bounded_provider_reason(freeze)),
+                development,
+                discovered_ids,
+            })
+        }
         "test" => Ok(ProviderOutcome::Fallback {
             mods,
             reason: bounded_provider_reason(parts.next().unwrap_or("")),
@@ -5042,14 +5207,14 @@ mod tests {
         USAGE, bounded_provider_reason, classpath_separator, client_side,
         constructor_only_entry_kind, datagen_jvm_options, datagen_provider_line,
         datagen_providers_line, datagen_shim_unavailable, declared_entrypoint_kinds,
-        discover_entries, discover_mixin_configs, entrypoints_from_metadata, fabric_add_mods,
-        fabric_add_mods_count, fabric_add_mods_line, fabric_entries, fabric_jvm_options,
-        fabric_metadata, fabric_mixin_configs, fallback_label, format_entrypoints,
-        format_mixin_config_property, format_mixin_configs, game_provider_jvm_options,
-        initializer_for_kind, is_datagen_kind, is_minecraft_class, is_minecraft_runtime_jar,
-        link_failure, missing_entry_message, mixin_bootstrap_line, mixin_config_names,
-        mixin_config_property, mixin_configs_line, mixin_jvm_options, mixin_registered_count,
-        mixin_stages, neoforge_constructor, neoforge_constructor_args,
+        declared_mod_ids, discover_entries, discover_mixin_configs, discovery_line,
+        entrypoints_from_metadata, fabric_add_mods, fabric_add_mods_count, fabric_add_mods_line,
+        fabric_entries, fabric_jvm_options, fabric_metadata, fabric_mixin_configs, fallback_label,
+        format_entrypoints, format_mixin_config_property, format_mixin_configs,
+        game_provider_jvm_options, initializer_for_kind, is_datagen_kind, is_minecraft_class,
+        is_minecraft_runtime_jar, link_failure, missing_entry_message, mixin_bootstrap_line,
+        mixin_config_names, mixin_config_property, mixin_configs_line, mixin_jvm_options,
+        mixin_registered_count, mixin_stages, neoforge_constructor, neoforge_constructor_args,
         neoforge_constructor_descriptor, neoforge_ctor_fallback_line, neoforge_ctor_line,
         neoforge_dist, neoforge_dist_fields, neoforge_metadata, nested_jar_name,
         parse_constructors, parse_mixin_config, parse_provider_outcome, pre_launch_entries,
@@ -5807,6 +5972,34 @@ config="demo.mixins.json""#,
     }
 
     #[test]
+    fn reports_declarations_against_what_the_loader_discovered() {
+        // The report names declared ids the loader never reported, and stays
+        // one line even when the lists are long.
+        assert_eq!(
+            discovery_line(&[], &[]),
+            "discovery: 0 declared, 0 found, missing="
+        );
+        let declared = vec!["alpha".to_owned(), "beta".to_owned()];
+        let found = vec!["alpha".to_owned(), "beta".to_owned()];
+        assert_eq!(
+            discovery_line(&declared, &found),
+            "discovery: 2 declared, 2 found, missing="
+        );
+        assert_eq!(
+            discovery_line(&declared, &found[..1]),
+            "discovery: 2 declared, 1 found, missing=beta"
+        );
+        let many: Vec<String> = (0..200).map(|index| format!("mod-{index:03}")).collect();
+        assert_eq!(
+            discovery_line(&many, &many),
+            "discovery: 200 declared, 200 found, missing="
+        );
+        // A jar without metadata declares nothing.
+        assert!(declared_mod_ids(&[]).is_empty());
+        assert!(declared_mod_ids(&[PathBuf::from("missing.jar")]).is_empty());
+    }
+
+    #[test]
     fn builds_the_fabric_developer_options_before_the_jvm_starts() {
         let separator = classpath_separator();
         let mods = format!("mods/a.jar{separator}mods/b.jar");
@@ -5934,8 +6127,38 @@ config="demo.mixins.json""#,
     fn parses_production_provider_outcomes_and_bounds_fallback_reasons() {
         assert_eq!(
             parse_provider_outcome("minecraft\t12").unwrap(),
-            ProviderOutcome::Production { mods: 12 }
+            ProviderOutcome::Production {
+                mods: 12,
+                freeze_reason: None,
+                development: false,
+                discovered_ids: vec![]
+            }
         );
+        assert_eq!(
+            parse_provider_outcome("minecraft\t3\t\ttrue\talpha,beta").unwrap(),
+            ProviderOutcome::Production {
+                mods: 3,
+                freeze_reason: None,
+                development: true,
+                discovered_ids: vec!["alpha".to_owned(), "beta".to_owned()],
+            }
+        );
+        // A freeze failure is whitespace-collapsed and bounded.
+        let freeze = parse_provider_outcome(&format!(
+            "minecraft\t3\t line one\n{}\tfalse\t",
+            "x".repeat(1000)
+        ))
+        .unwrap();
+        let ProviderOutcome::Production {
+            freeze_reason: Some(freeze),
+            ..
+        } = freeze
+        else {
+            panic!("expected a freeze reason");
+        };
+        assert!(freeze.starts_with("line one "));
+        assert!(!freeze.contains('\n'));
+        assert!(freeze.chars().count() <= MAX_PROVIDER_REASON_CHARS);
         assert_eq!(
             parse_provider_outcome("test\t3\tlocateGame returned false").unwrap(),
             ProviderOutcome::Fallback {
@@ -5968,14 +6191,19 @@ config="demo.mixins.json""#,
     #[test]
     fn formats_the_provider_report_as_text_and_json() {
         let report = ProviderReport::from_outcome(
-            &ProviderOutcome::Production { mods: 4 },
+            &ProviderOutcome::Production {
+                mods: 4,
+                freeze_reason: None,
+                development: false,
+                discovered_ids: vec![],
+            },
             1,
             "26.3",
             ProviderSide::Server,
         );
         assert_eq!(
             report.text(),
-            "provider: minecraft\nside: server\ngame jars: 1\ngame version: 26.3\nstatus: ok\n"
+            "provider: minecraft\nside: server\ngame jars: 1\ngame version: 26.3\nstatus: ok\nisDevelopment: false\n"
         );
         let value: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
         assert_eq!(value["provider"], "minecraft");
@@ -5983,6 +6211,7 @@ config="demo.mixins.json""#,
         assert_eq!(value["gameJars"], 1);
         assert_eq!(value["status"], "ok");
         assert!(value["fallback"].is_null());
+        assert_eq!(value["isDevelopment"], false);
 
         let fallback = ProviderReport::from_outcome(
             &ProviderOutcome::Fallback {
@@ -6022,6 +6251,8 @@ config="demo.mixins.json""#,
             game_version: "x".repeat(MAX_PROVIDER_REPORT_BYTES * 2),
             status: ProviderStatus::Ok,
             fallback_reason: Some("y".repeat(MAX_PROVIDER_REPORT_BYTES)),
+            development: Some(false),
+            freeze_reason: None,
         };
         assert!(report.text().len() <= MAX_PROVIDER_REPORT_BYTES);
         assert!(report.json().len() <= MAX_PROVIDER_REPORT_BYTES);
@@ -6850,6 +7081,10 @@ mod real_loader_tests {
             "new java.net.URLClassLoader",
             "fabric.gameJarPath",
             "fabric.gameVersion",
+            "isDevelopment",
+            "StubEntrypoint",
+            "testLaunchCalled",
+            "case \"launch\"",
         ] {
             assert!(LOADER_BRIDGE_SOURCE.contains(needed), "missing {needed}");
         }
@@ -6857,6 +7092,8 @@ mod real_loader_tests {
         assert!(USAGE.contains("--game-jar"));
         assert!(USAGE.contains("--game-version"));
         assert!(USAGE.contains("--provider-report"));
+        assert!(USAGE.contains("--real-launch"));
+        assert!(USAGE.contains("--fabric-discovery"));
     }
 
     #[test]
