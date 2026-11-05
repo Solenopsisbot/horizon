@@ -440,6 +440,11 @@ pub struct SkippedMixinPlan {
 
 impl std::fmt::Display for SkippedMixinPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.reason == MixinSkipReason::ListedWithoutPlan {
+            // A class with no plan has no method on either side to name.
+            let reason = self.reason.label();
+            return write!(f, "{reason} {} {}", self.at, self.callback.owner);
+        }
         write!(
             f,
             "{} {} {}#{}{} <- {}#{}{}",

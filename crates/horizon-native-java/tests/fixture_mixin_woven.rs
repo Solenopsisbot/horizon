@@ -719,7 +719,10 @@ public abstract class RealMixin {
     assert!(weave.woven.is_empty());
     assert_eq!(weave.skipped.len(), 1, "{:#?}", weave.skipped);
     assert_eq!(weave.skipped[0].reason, MixinSkipReason::ListedWithoutPlan);
-    assert_eq!(weave.skipped[0].callback.owner, "demo/RealMixin");
+    assert_eq!(
+        weave.skipped[0].to_string(),
+        "listed-without-plan @Mixin demo/RealMixin"
+    );
     assert_eq!(run_main(&jar), marks(&[("target", 0), ("after", 0)]));
 }
 
