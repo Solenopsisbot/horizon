@@ -19896,4 +19896,438 @@ public class Probe {
         );
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// Every loader family the generator can emit, generated from a miniature
+    /// 26.3 game jar and compiled as one source set. `javac` is the judge: a
+    /// shim missing a brace, a record component the closure never emitted, a
+    /// support type left out or a constructor a game stub does not have fails
+    /// here, with the diagnostics in the error. The slices are: Fabric events,
+    /// networking, client, screens, item groups, renderers, models, attachments,
+    /// loader, datagen and menus; NeoForge's base, client, screen, registration,
+    /// entity, model, attachment and menu surfaces; legacy Forge; and one target
+    /// that mixes families and names a game *interface* (`Registry`), which a
+    /// class-shaped shim must not assume it can construct or extend.
+    #[test]
+    fn every_facade_family_generates_and_compiles() {
+        use crate::classes::tests_support::PoolBuilder;
+        use std::{path::PathBuf, process::Command};
+
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let tool = |name: &str| {
+            jdk_bin
+                .as_ref()
+                .map(|bin| bin.join(name))
+                .unwrap_or_else(|| PathBuf::from(name))
+        };
+        let Ok(version) = Command::new(tool("javac")).arg("-version").output() else {
+            return;
+        };
+        if !version.status.success() {
+            return;
+        }
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("horizon-port-pack-families-{stamp}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create the scratch root");
+
+        let build_jar = |tag: &str, sources: &[(String, String)]| -> PathBuf {
+            let src = root.join(format!("{tag}-src"));
+            let classes = root.join(format!("{tag}-classes"));
+            let mut files = Vec::new();
+            for (relative, text) in sources {
+                let file = src.join(relative);
+                fs::create_dir_all(file.parent().expect("package directory"))
+                    .expect("create the source package");
+                fs::write(&file, text).expect("write the source");
+                files.push(file);
+            }
+            fs::create_dir_all(&classes).expect("create the classes directory");
+            let output = Command::new(tool("javac"))
+                .arg("-nowarn")
+                .arg("-d")
+                .arg(&classes)
+                .args(&files)
+                .output()
+                .expect("run javac");
+            assert!(
+                output.status.success(),
+                "{tag} sources did not compile:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let jar = root.join(format!("{tag}.jar"));
+            let output = Command::new(tool("jar"))
+                .arg("--create")
+                .arg("--file")
+                .arg(&jar)
+                .arg("-C")
+                .arg(&classes)
+                .arg(".")
+                .output()
+                .expect("run jar");
+            assert!(
+                output.status.success(),
+                "{tag} jar was not written:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            jar
+        };
+
+        // The miniature game jar: the real 26.3 shapes these families name, at
+        // the fidelity each shim's signature and body needs. A class an emitted
+        // shim constructs is a real class with that constructor; a record is a
+        // record; a game interface stays an interface.
+        // The miniature game jar: the real 26.3 shapes these families name, at
+        // the fidelity each shim's signature and body needs. A class an emitted
+        // shim constructs is a real class with that constructor; a record is a
+        // record; a game interface stays an interface. Each row is the shape,
+        // with the package derived from its path.
+        let java = |path: &str, body: &str| -> (String, String) {
+            let package = path
+                .trim_end_matches(".java")
+                .rsplit_once('/')
+                .expect("a package directory")
+                .0
+                .replace('/', ".");
+            (path.to_owned(), format!("package {package};\n{body}\n"))
+        };
+        let game_sources: Vec<(String, String)> = [
+            (
+                "net/minecraft/server/MinecraftServer.java",
+                "public class MinecraftServer {}",
+            ),
+            (
+                "net/minecraft/server/level/ServerPlayer.java",
+                "public class ServerPlayer {}",
+            ),
+            (
+                "net/minecraft/commands/Commands.java",
+                "public class Commands { public enum CommandSelection { ALL, DEDICATED } }",
+            ),
+            (
+                "net/minecraft/commands/CommandSourceStack.java",
+                "public class CommandSourceStack {}",
+            ),
+            (
+                "net/minecraft/commands/CommandBuildContext.java",
+                "public interface CommandBuildContext {}",
+            ),
+            ("net/minecraft/client/Minecraft.java", "public class Minecraft {}"),
+            (
+                "net/minecraft/client/player/LocalPlayer.java",
+                "public class LocalPlayer {}",
+            ),
+            (
+                "net/minecraft/client/multiplayer/ClientPacketListener.java",
+                "public class ClientPacketListener {}",
+            ),
+            (
+                "net/minecraft/client/gui/GuiGraphicsExtractor.java",
+                "public class GuiGraphicsExtractor {}",
+            ),
+            (
+                "net/minecraft/client/render/RenderTickCounter.java",
+                "public class RenderTickCounter {}",
+            ),
+            (
+                "net/minecraft/client/KeyMapping.java",
+                "public class KeyMapping {}",
+            ),
+            (
+                "net/minecraft/client/gui/screens/Screen.java",
+                "public class Screen {}",
+            ),
+            (
+                "net/minecraft/client/gui/components/ClickableWidget.java",
+                "public class ClickableWidget {}",
+            ),
+            (
+                "net/minecraft/client/renderer/entity/EntityRendererProvider.java",
+                "public interface EntityRendererProvider {}",
+            ),
+            (
+                "net/minecraft/client/renderer/blockentity/BlockEntityRendererProvider.java",
+                "public interface BlockEntityRendererProvider {}",
+            ),
+            (
+                "net/minecraft/client/model/geom/ModelLayerLocation.java",
+                "public class ModelLayerLocation {}",
+            ),
+            (
+                "net/minecraft/client/model/geom/builders/LayerDefinition.java",
+                "public class LayerDefinition {}",
+            ),
+            (
+                "net/minecraft/client/resources/model/UnbakedModel.java",
+                "public interface UnbakedModel {}",
+            ),
+            (
+                "net/minecraft/client/resources/model/BakedModel.java",
+                "public interface BakedModel {}",
+            ),
+            (
+                "net/minecraft/client/resources/model/ModelLoader.java",
+                "public class ModelLoader {}",
+            ),
+            (
+                "net/minecraft/client/renderer/block/dispatch/ModelState.java",
+                "public class ModelState {}",
+            ),
+            (
+                "net/minecraft/world/item/ItemStack.java",
+                "public class ItemStack { public ItemStack(Item item, int count) {} }",
+            ),
+            (
+                "net/minecraft/world/item/Item.java",
+                "public class Item { public interface TooltipContext {} }",
+            ),
+            (
+                "net/minecraft/world/item/TooltipFlag.java",
+                "public interface TooltipFlag {}",
+            ),
+            (
+                "net/minecraft/world/item/CreativeModeTab.java",
+                "public class CreativeModeTab {}",
+            ),
+            (
+                "net/minecraft/core/component/DataComponentType.java",
+                "public class DataComponentType {}",
+            ),
+            (
+                "net/minecraft/core/Direction.java",
+                "public enum Direction { DOWN, UP, NORTH, SOUTH, WEST, EAST }",
+            ),
+            (
+                "net/minecraft/core/BlockPos.java",
+                "public class BlockPos { public int getX() { return 0; } public int getY() { return 0; } public int getZ() { return 0; } }",
+            ),
+            (
+                "net/minecraft/world/flag/FeatureFlagSet.java",
+                "public class FeatureFlagSet {}",
+            ),
+            (
+                "net/minecraft/resources/Identifier.java",
+                "public class Identifier { private final String value; public Identifier() { this.value = \"\"; } public Identifier(String namespace, String path) { this.value = namespace + \":\" + path; } public String toString() { return value; } }",
+            ),
+            (
+                "net/minecraft/resources/ResourceKey.java",
+                "public class ResourceKey<T> { public ResourceKey() {} }",
+            ),
+            // 26.3's `Registry` is an interface: the shims that name it must not
+            // assume they can construct or extend a class.
+            (
+                "net/minecraft/core/Registry.java",
+                "public interface Registry<T> { default <V> V register(net.minecraft.resources.ResourceKey<V> key, net.minecraft.resources.Identifier id, V value) { return value; } default boolean containsKey(net.minecraft.resources.Identifier id) { return false; } default T get(net.minecraft.resources.Identifier id) { return null; } default net.minecraft.resources.Identifier getKey(Object value) { return null; } }",
+            ),
+            (
+                "net/minecraft/network/chat/Component.java",
+                "public interface Component {}",
+            ),
+            (
+                "net/minecraft/network/protocol/common/custom/CustomPacketPayload.java",
+                "public interface CustomPacketPayload { Type type(); record Type(net.minecraft.resources.Identifier id) {} }",
+            ),
+            (
+                "net/minecraft/world/inventory/AbstractContainerMenu.java",
+                "public class AbstractContainerMenu {}",
+            ),
+            (
+                "net/minecraft/world/inventory/MenuType.java",
+                "public class MenuType<T extends AbstractContainerMenu> { public MenuType(Object featureFlags, Object supplier) {} }",
+            ),
+            (
+                "net/minecraft/world/MenuProvider.java",
+                "public interface MenuProvider { net.minecraft.network.chat.Component getDisplayName(); }",
+            ),
+            (
+                "net/minecraft/world/entity/player/Inventory.java",
+                "public class Inventory {}",
+            ),
+            (
+                "net/minecraft/world/entity/player/Abilities.java",
+                "public class Abilities {}",
+            ),
+            (
+                "net/minecraft/network/RegistryFriendlyByteBuf.java",
+                "public class RegistryFriendlyByteBuf {}",
+            ),
+            (
+                "net/minecraft/network/codec/StreamCodec.java",
+                "public interface StreamCodec<B, V> {}",
+            ),
+            // The bounded entity closure the attachment slice implements on
+            // game classes (`Entity implements AttachmentTarget`).
+            (
+                "net/minecraft/world/entity/Entity.java",
+                "public class Entity {}",
+            ),
+            (
+                "net/minecraft/world/entity/EntityType.java",
+                "public class EntityType {}",
+            ),
+            (
+                "net/minecraft/world/entity/EntityDimensions.java",
+                "public class EntityDimensions {}",
+            ),
+            (
+                "net/minecraft/world/entity/MobCategory.java",
+                "public enum MobCategory { MISC }",
+            ),
+            ("net/minecraft/world/level/Level.java", "public class Level {}"),
+            (
+                "net/minecraft/world/level/block/entity/BlockEntity.java",
+                "public class BlockEntity {}",
+            ),
+            (
+                "net/minecraft/world/level/block/entity/BlockEntityType.java",
+                "public class BlockEntityType {}",
+            ),
+            (
+                "net/minecraft/world/level/block/state/BlockState.java",
+                "public class BlockState {}",
+            ),
+            (
+                "net/minecraft/world/level/block/state/StateDefinition.java",
+                "public class StateDefinition {}",
+            ),
+            (
+                "net/minecraft/world/level/block/Block.java",
+                "public class Block { public net.minecraft.world.level.block.state.StateDefinition stateDefinition; }",
+            ),
+            (
+                "net/minecraft/world/level/material/FluidState.java",
+                "public class FluidState {}",
+            ),
+            (
+                "net/minecraft/nbt/CompoundTag.java",
+                "public class CompoundTag {}",
+            ),
+            (
+                "net/minecraft/world/phys/AABB.java",
+                "public class AABB { public double minX, minY, minZ, maxX, maxY, maxZ; public AABB() {} public AABB(double x1, double y1, double z1, double x2, double y2, double z2) {} }",
+            ),
+            (
+                "net/minecraft/world/phys/Vec3.java",
+                "public class Vec3 {}",
+            ),
+        ]
+        .into_iter()
+        .map(|(path, body)| java(path, body))
+        .collect();
+        let game_jar = build_jar("game", &game_sources);
+
+        // The dependency jars the shims name: Brigadier's dispatcher is a real
+        // library class on javac's classpath, and so is the codec an attachment
+        // registration keeps.
+        let lib_sources: Vec<(String, String)> = [
+            (
+                "com/mojang/serialization/Codec.java",
+                "public interface Codec<A> {}",
+            ),
+            (
+                "com/mojang/brigadier/CommandDispatcher.java",
+                "public class CommandDispatcher<S> {}",
+            ),
+        ]
+        .into_iter()
+        .map(|(path, body)| java(path, body))
+        .collect();
+        let lib_jar = build_jar("lib", &lib_sources);
+
+        let scenarios: [(&str, &[&str], &[&str]); 3] = [
+            (
+                "fabric-events",
+                &[
+                    "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents",
+                    "net/fabricmc/fabric/api/event/lifecycle/v1/ClientLifecycleEvents",
+                    "net/fabricmc/fabric/api/event/player/ServerPlayerEvents",
+                    "net/fabricmc/fabric/api/command/v2/CommandRegistrationCallback",
+                ],
+                &[
+                    "net/fabricmc/fabric/api/event/Event.java",
+                    "net/fabricmc/fabric/api/event/lifecycle/v1/ServerLifecycleEvents.java",
+                    "net/fabricmc/fabric/api/event/lifecycle/v1/ClientLifecycleEvents.java",
+                    "net/fabricmc/fabric/api/event/player/ServerPlayerEvents.java",
+                    "net/fabricmc/fabric/api/command/v2/CommandRegistrationCallback.java",
+                ],
+            ),
+            (
+                "fabric-networking",
+                &[
+                    "net/fabricmc/fabric/api/networking/v1/PayloadTypeRegistry",
+                    "net/fabricmc/fabric/api/networking/v1/PacketSender",
+                    "net/fabricmc/fabric/api/networking/v1/ServerPlayNetworking",
+                    "net/fabricmc/fabric/api/client/networking/v1/ClientPlayNetworking",
+                ],
+                &[
+                    "net/fabricmc/fabric/api/networking/v1/PayloadTypeRegistry.java",
+                    "net/fabricmc/fabric/api/networking/v1/PacketSender.java",
+                    "net/fabricmc/fabric/api/networking/v1/ServerPlayNetworking.java",
+                    "net/fabricmc/fabric/api/client/networking/v1/ClientPlayNetworking.java",
+                ],
+            ),
+            (
+                "fabric-client",
+                &[
+                    "net/fabricmc/fabric/api/client/rendering/v1/HudRenderCallback",
+                    "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents",
+                    "net/fabricmc/fabric/api/client/keybinding/v1/KeyBindingHelper",
+                    "net/fabricmc/fabric/api/client/item/tooltip/v1/ItemTooltipCallback",
+                ],
+                &[
+                    "net/fabricmc/fabric/api/event/Event.java",
+                    "net/fabricmc/fabric/api/client/rendering/v1/HudRenderCallback.java",
+                    "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents.java",
+                    "net/fabricmc/fabric/api/client/keybinding/v1/KeyBindingHelper.java",
+                    "net/fabricmc/fabric/api/client/item/tooltip/v1/ItemTooltipCallback.java",
+                ],
+            ),
+        ];
+        for (name, refs, expected) in scenarios {
+            let target = root.join(format!("{name}.jar"));
+            {
+                let file = fs::File::create(&target).expect("create the target jar");
+                let mut jar = zip::ZipWriter::new(file);
+                let mut pool = PoolBuilder::default();
+                for owner in refs {
+                    pool.method(owner, "horizonFamilyRef", "()V");
+                }
+                let bytes = pool.build("demo/Probe", "java/lang/Object", &[("run", &[0xb1])]);
+                jar.start_file("demo/Probe.class", zip::write::SimpleFileOptions::default())
+                    .expect("start the target class");
+                std::io::Write::write_all(&mut jar, &bytes).expect("write the target class");
+                jar.finish().expect("finish the target jar");
+            }
+            let out = root.join(format!("{name}-facade"));
+            let report = generate(
+                &target,
+                &game_jar,
+                std::slice::from_ref(&lib_jar),
+                &out,
+                &tool("javac"),
+                &tool("jar"),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the {name} façade did not generate and compile: {e} (sources in {})",
+                    out.display()
+                )
+            });
+            assert!(
+                report.jar.is_file(),
+                "{name}: the façade jar was not written: {report:?}"
+            );
+            for file in expected {
+                assert!(
+                    out.join("src").join(file).is_file(),
+                    "{name}: the shim {file} was not generated (sources in {})",
+                    out.display()
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
 }
