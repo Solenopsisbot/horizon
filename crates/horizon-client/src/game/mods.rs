@@ -1234,12 +1234,44 @@ pub(super) fn run_java_mods_with_report(
                 .map_err(|error| error.to_string())?;
             let mut calls = 0;
             for entry in &entrypoints {
-                let report = jar
-                    .execute(&entry.class, entry.method.as_deref(), kind, &mut host)
+                let entry_class = entry.class.replace('.', "/");
+                let entry_method = entry.method.as_deref().unwrap_or(match kind {
+                    "client" => "onInitializeClient",
+                    "server" => "onInitializeServer",
+                    _ => "onInitialize",
+                });
+                let discovered_target = jar.mixin_injection_plans().into_iter().find(|plan| {
+                    plan.target.owner == entry_class
+                        && plan.target.name == entry_method
+                        && plan.target.descriptor == "()V"
+                });
+                let woven_target = discovered_target.as_ref().is_some_and(|target| {
+                    weave.woven.iter().any(|plan| {
+                        plan.target.owner == target.target.owner
+                            && plan.target.name == target.target.name
+                            && plan.target.descriptor == target.target.descriptor
+                    })
+                });
+                if let Some(target) = discovered_target.filter(|_| !woven_target) {
+                    jar.execute_discovered_mixins_on(
+                        mixin_side(role),
+                        &target.target,
+                        None,
+                        &[],
+                        &mut host,
+                    )
                     .map_err(|error| {
                         format!("{} ({kind}, {}): {error}", path.display(), entry.class)
                     })?;
-                calls += report.calls;
+                    calls += 1;
+                } else {
+                    let report = jar
+                        .execute(&entry.class, entry.method.as_deref(), kind, &mut host)
+                        .map_err(|error| {
+                            format!("{} ({kind}, {}): {error}", path.display(), entry.class)
+                        })?;
+                    calls += report.calls;
+                }
             }
             Ok::<(usize, horizon_native_java::StdHost), String>((calls, host))
         });

@@ -9309,7 +9309,12 @@ impl NativeJar {
         // Discovery sorts alphabetically for stable reports; callbacks run in
         // the order real Mixin applies the configs and `@Mixin` priorities.
         let mut ordered = self.mixin_injection_plans();
-        self.sort_mixin_plans_in_apply_order(&mut ordered, &gate.configs);
+        self.sort_mixin_plans_in_apply_order_for_side(
+            &mut ordered,
+            &gate.configs,
+            gate.side,
+            &gate.config_sides,
+        );
         for mut plan in ordered {
             if plan.target.owner != target.owner || plan.target.name != target.name {
                 continue;
@@ -9585,8 +9590,13 @@ impl NativeJar {
     pub fn plan_load_time_weave(&self, side: MixinSide) -> LoadTimeMixinWeave {
         let (mut plans, unresolved) = self.mixin_plan_scan();
         let configs = self.mixin_configs();
-        self.sort_mixin_plans_in_apply_order(&mut plans, &configs);
         let config_sides = self.mixin_config_sides();
+        self.sort_mixin_plans_in_apply_order_for_side(
+            &mut plans,
+            &configs,
+            Some(side),
+            &config_sides,
+        );
         let mut weave = LoadTimeMixinWeave::default();
         weave.skipped.extend(
             unresolved
@@ -9639,6 +9649,16 @@ impl NativeJar {
         plans: &mut [MixinInjectionPlan],
         configs: &[MixinConfig],
     ) {
+        self.sort_mixin_plans_in_apply_order_for_side(plans, configs, None, &BTreeMap::new());
+    }
+
+    fn sort_mixin_plans_in_apply_order_for_side(
+        &self,
+        plans: &mut [MixinInjectionPlan],
+        configs: &[MixinConfig],
+        side: Option<MixinSide>,
+        config_sides: &BTreeMap<String, MixinSide>,
+    ) {
         const DEFAULT_PRIORITY: i32 = 1000;
         plans.sort_by_cached_key(|plan| {
             let class = self.classes.get(&plan.callback.owner);
@@ -9654,11 +9674,25 @@ impl NativeJar {
                 });
             let binary = plan.callback.owner.replace('/', ".");
             let listed = configs.iter().enumerate().find_map(|(index, config)| {
-                config
-                    .mixins
-                    .iter()
-                    .chain(&config.client)
-                    .chain(&config.server)
+                if side.is_some_and(|side| {
+                    config_sides
+                        .get(&config.path)
+                        .is_some_and(|only| *only != side)
+                }) {
+                    return None;
+                }
+                let mut names: Box<dyn Iterator<Item = &String>> = match side {
+                    Some(MixinSide::Client) => Box::new(config.mixins.iter().chain(&config.client)),
+                    Some(MixinSide::Server) => Box::new(config.mixins.iter().chain(&config.server)),
+                    None => Box::new(
+                        config
+                            .mixins
+                            .iter()
+                            .chain(&config.client)
+                            .chain(&config.server),
+                    ),
+                };
+                names
                     .position(|name| *name == binary)
                     .map(|position| (index, position))
             });
@@ -10258,6 +10292,50 @@ impl NativeJar {
         runtime.invoke(&class_name, method, descriptor, receiver, args)
     }
 
+    fn execute_target_without_mixin<H: Host>(
+        &self,
+        target: &MethodRef,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+        skipped: Vec<SkippedMixinPlan>,
+    ) -> Result<MixinExecutionReport, NativeError> {
+        let class = self.classes.get(&target.owner).ok_or_else(|| {
+            NativeError::MissingMethod(format!(
+                "{}#{}{}",
+                target.owner, target.name, target.descriptor
+            ))
+        })?;
+        let method = class
+            .method(&target.name, &target.descriptor)
+            .ok_or_else(|| {
+                NativeError::MissingMethod(format!(
+                    "{}#{}{}",
+                    target.owner, target.name, target.descriptor
+                ))
+            })?;
+        let receiver = (!method.is_static())
+            .then(|| receiver.unwrap_or_else(|| Value::Ref(Some(target.owner.clone()))));
+        let target_result = self.invoke_method_with_args(
+            &target.owner,
+            &target.name,
+            &target.descriptor,
+            receiver,
+            args,
+            host,
+        )?;
+        Ok(MixinExecutionReport {
+            callback_result: Value::Void,
+            target_result,
+            callback_results: Vec::new(),
+            cancelled: false,
+            return_value_overridden: false,
+            matched_invoke_sites: 0,
+            matched_anchor_sites: 0,
+            skipped_plans: skipped,
+        })
+    }
+
     /// Execute one bounded native Mixin translation at a method head.
     ///
     /// The supported shape is the common callback form: a `void` callback
@@ -10273,6 +10351,16 @@ impl NativeJar {
         args: &[Value],
         host: &mut H,
     ) -> Result<MixinExecutionReport, NativeError> {
+        let mut gate = ExecutionConfigGate::new(self, None);
+        if gate.skips(plan) {
+            return self.execute_target_without_mixin(
+                &plan.target,
+                receiver,
+                args,
+                host,
+                gate.skipped,
+            );
+        }
         if plan.at != "HEAD" {
             return Err(NativeError::Metadata(format!(
                 "native Mixin translation supports only @Inject(at = HEAD), got {}",
@@ -10419,6 +10507,26 @@ impl NativeJar {
         let Some(first) = plans.first() else {
             return Err(NativeError::Metadata("native Mixin chain is empty".into()));
         };
+        let mut gate = ExecutionConfigGate::new(self, None);
+        let allowed = plans
+            .iter()
+            .filter(|plan| !gate.skips(plan))
+            .cloned()
+            .collect::<Vec<_>>();
+        if allowed.is_empty() {
+            return self.execute_target_without_mixin(
+                &first.target,
+                receiver,
+                args,
+                host,
+                gate.skipped,
+            );
+        }
+        if allowed.len() != plans.len() {
+            let mut report = self.execute_mixin_chain(&allowed, receiver, args, host)?;
+            report.skipped_plans.extend(gate.skipped);
+            return Ok(report);
+        }
         if plans
             .iter()
             .any(|plan| plan.target != first.target || plan.at != first.at)
@@ -10647,6 +10755,16 @@ impl NativeJar {
         args: &[Value],
         host: &mut H,
     ) -> Result<MixinExecutionReport, NativeError> {
+        let mut gate = ExecutionConfigGate::new(self, None);
+        if gate.skips(plan) {
+            return self.execute_target_without_mixin(
+                &plan.target,
+                receiver,
+                args,
+                host,
+                gate.skipped,
+            );
+        }
         if plan.at != "RETURN" && plan.at != "TAIL" {
             return Err(NativeError::Metadata(format!(
                 "native Mixin return translation supports only @Inject(at = RETURN|TAIL), got {}",
@@ -10823,7 +10941,25 @@ impl NativeJar {
                 "native Mixin @At(INVOKE) chain is empty".into(),
             ));
         };
-        self.execute_invoke_plans(&first.target, plans, receiver, args, host, None)
+        let mut gate = ExecutionConfigGate::new(self, None);
+        let allowed = plans
+            .iter()
+            .filter(|plan| !gate.skips(plan))
+            .cloned()
+            .collect::<Vec<_>>();
+        if allowed.is_empty() {
+            return self.execute_target_without_mixin(
+                &first.target,
+                receiver,
+                args,
+                host,
+                gate.skipped,
+            );
+        }
+        let mut report =
+            self.execute_invoke_plans(&first.target, &allowed, receiver, args, host, None)?;
+        report.skipped_plans = gate.skipped;
+        Ok(report)
     }
 
     /// Run one woven method with the `@At("INVOKE")` hook table its plans
@@ -11474,6 +11610,7 @@ impl NativeJar {
         args: &[Value],
         host: &mut H,
     ) -> Result<MixinExecutionReport, NativeError> {
+        let mut gate = ExecutionConfigGate::new(self, None);
         if self
             .mixin_overwrite_plans()
             .iter()
@@ -11493,10 +11630,13 @@ impl NativeJar {
                     && (plan.target.descriptor.is_empty()
                         || plan.target.descriptor == target.descriptor)
             })
+            .filter(|plan| !gate.skips_ref(&plan.target, &plan.callback, &plan.at))
             .collect::<Vec<_>>();
         let Some(head_redirect) = plans.iter().find(|plan| plan.redirect && plan.at == "HEAD")
         else {
-            return self.execute_anchor_hooks(target, &plans, receiver, args, host);
+            let mut report = self.execute_anchor_hooks(target, &plans, receiver, args, host)?;
+            report.skipped_plans = gate.skipped;
+            return Ok(report);
         };
         if plans.len() != 1 {
             return Err(NativeError::Metadata(format!(
@@ -11504,7 +11644,9 @@ impl NativeJar {
                 target.owner, target.name, target.descriptor
             )));
         }
-        self.execute_anchor_head_redirect(head_redirect, receiver, args, host)
+        let mut report = self.execute_anchor_head_redirect(head_redirect, receiver, args, host)?;
+        report.skipped_plans = gate.skipped;
+        Ok(report)
     }
 
     fn execute_anchor_head_redirect<H: Host>(
@@ -11722,6 +11864,16 @@ impl NativeJar {
         args: &[Value],
         host: &mut H,
     ) -> Result<MixinExecutionReport, NativeError> {
+        let mut gate = ExecutionConfigGate::new(self, None);
+        if gate.skips(plan) {
+            return self.execute_target_without_mixin(
+                &plan.target,
+                receiver,
+                args,
+                host,
+                gate.skipped,
+            );
+        }
         if !plan.at.is_empty() {
             return Err(NativeError::Metadata(
                 "native @Overwrite replacement requires an empty @At anchor".into(),
@@ -28090,6 +28242,32 @@ mandatory = true
     }
 
     #[test]
+    fn pre_resolved_mixin_paths_skip_plans_not_in_config() {
+        let jar = configured_jar(
+            [
+                target_class(),
+                marker_mixin(
+                    "demo/UnlistedMixin",
+                    "run()V",
+                    "HEAD",
+                    false,
+                    "unlisted",
+                    "unlisted",
+                ),
+            ],
+            r#"{"mixins":["demo.OtherMixin"]}"#,
+        );
+        let plan = jar.mixin_injection_plans().pop().unwrap();
+        let mut host = MarkerHost::default();
+        let report = jar
+            .execute_mixin_at_head(&plan, None, &[], &mut host)
+            .unwrap();
+        assert_eq!(host.markers, vec!["demo/Probe#target"]);
+        assert_eq!(report.skipped_plans.len(), 1);
+        assert_eq!(report.skipped_plans[0].reason, MixinSkipReason::NotInConfig);
+    }
+
+    #[test]
     fn discovered_mixins_on_the_other_side_are_skipped_as_other_side() {
         let jar = configured_jar(
             [
@@ -28242,6 +28420,47 @@ mandatory = true
         jar.resources
             .insert("b.mixins.json".into(), "jar-resource/b".into());
         assert_eq!(order(&jar), ["bravo", "zulu"]);
+    }
+
+    #[test]
+    fn mixin_apply_order_ignores_client_only_configs_on_server() {
+        let mut jar = NativeJar::from_classes([
+            target_class(),
+            marker_mixin("demo/ZuluMixin", "run()V", "HEAD", false, "zulu", "zulu"),
+            marker_mixin("demo/BravoMixin", "run()V", "HEAD", false, "bravo", "bravo"),
+        ]);
+        jar.resource_bytes.insert(
+            "fabric.mod.json".into(),
+            br#"{"mixins":[{"config":"client.json","environment":"client"},{"config":"common.json"}]}"#.to_vec(),
+        );
+        jar.resource_bytes.insert(
+            "client.json".into(),
+            br#"{"priority":1,"mixins":["demo.ZuluMixin"]}"#.to_vec(),
+        );
+        jar.resource_bytes.insert(
+            "common.json".into(),
+            br#"{"mixins":["demo.BravoMixin","demo.ZuluMixin"]}"#.to_vec(),
+        );
+        jar.resources.insert("fabric.mod.json".into(), "fabric".into());
+        jar.resources.insert("client.json".into(), "client".into());
+        jar.resources.insert("common.json".into(), "common".into());
+        let mut host = MarkerHost::default();
+        jar.execute_discovered_mixins_on(
+            MixinSide::Server,
+            &MethodRef {
+                owner: "demo/Target".into(),
+                name: "run".into(),
+                descriptor: "()V".into(),
+            },
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+        assert_eq!(
+            host.markers,
+            vec!["demo/Probe#bravo", "demo/Probe#zulu", "demo/Probe#target"]
+        );
     }
 
     #[test]
