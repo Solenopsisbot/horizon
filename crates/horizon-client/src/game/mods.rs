@@ -1117,6 +1117,8 @@ pub(super) fn fml_preflight(
 /// Runs explicitly supplied Java entrypoints through the bounded native
 /// interpreter before resource workers start. Java jars are never discovered
 /// implicitly: a launcher or developer must pass `--java-mod PATH`.
+#[allow(dead_code)] // the strict path the startup tests pin
+#[allow(dead_code)] // the strict path the startup tests pin
 pub(super) fn run_java_mods(
     paths: &[PathBuf],
     role: ExecutionRole,
@@ -1131,6 +1133,25 @@ pub(super) fn run_java_mods_with_report(
     paths: &[PathBuf],
     role: ExecutionRole,
 ) -> Result<(Vec<ContentMod>, Vec<JavaCompatibilityReport>), String> {
+    run_java_mods_with_policy(paths, role, false)
+}
+
+/// [`run_java_mods_with_report`] for the game's own startup: a refused or
+/// malformed jar is logged and skipped so one bad mod cannot stop the client
+/// or its server thread. `HORIZON_JAVA_STRICT=1` restores the hard failure.
+pub(super) fn run_java_mods_tolerant(
+    paths: &[PathBuf],
+    role: ExecutionRole,
+) -> Result<Vec<ContentMod>, String> {
+    run_java_mods_with_policy(paths, role, true).map(|(content, _)| content)
+}
+
+fn run_java_mods_with_policy(
+    paths: &[PathBuf],
+    role: ExecutionRole,
+    tolerant: bool,
+) -> Result<(Vec<ContentMod>, Vec<JavaCompatibilityReport>), String> {
+    let tolerant = tolerant && std::env::var("HORIZON_JAVA_STRICT").as_deref() != Ok("1");
     let mut reports = Vec::new();
     clear_java_runtimes(role);
     if paths.is_empty() {
@@ -1148,8 +1169,17 @@ pub(super) fn run_java_mods_with_report(
     let mut mixin_plannings = Vec::new();
     horizon_client::lan::payloads::clear_handler_jars_as(payload_handler_role(role));
     for path in paths {
-        let jar = horizon_native_java::NativeJar::from_path(path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let jar = match horizon_native_java::NativeJar::from_path(path) {
+            Ok(jar) => jar,
+            Err(error) => {
+                let message = format!("{}: {error}", path.display());
+                if tolerant {
+                    log::warn!("Horizon: Java mod {message} skipped");
+                    continue;
+                }
+                return Err(message);
+            }
+        };
         if jar.client_side_only
             && matches!(
                 role,
@@ -1172,18 +1202,22 @@ pub(super) fn run_java_mods_with_report(
             }
             reports.push(report);
             write_java_runtime_report(&reports);
-            return Err(format!(
+            let message = format!(
                 "{}: clientSideOnly mod cannot run for server execution",
                 path.display()
-            ));
+            );
+            if tolerant {
+                log::warn!("Horizon: Java mod {message} skipped");
+                continue;
+            }
+            return Err(message);
         }
-        let (kind, entrypoints) = kinds
-            .iter()
-            .find_map(|kind| {
-                let entries = jar.discover_entrypoints(kind);
-                (!entries.is_empty()).then_some((*kind, entries))
-            })
-            .ok_or_else(|| {
+        let (kind, entrypoints) = match kinds.iter().find_map(|kind| {
+            let entries = jar.discover_entrypoints(kind);
+            (!entries.is_empty()).then_some((*kind, entries))
+        }) {
+            Some(found) => found,
+            None => {
                 let available = native_entrypoint_kinds(&jar);
                 let available = if available.is_empty() {
                     "none".to_owned()
@@ -1194,16 +1228,27 @@ pub(super) fn run_java_mods_with_report(
                     ExecutionRole::Client => "client",
                     ExecutionRole::IntegratedServer | ExecutionRole::DedicatedServer => "server",
                 };
-                format!(
+                let message = format!(
                     "{}: no native Fabric or NeoForge entrypoint for {execution} execution (available: {available})",
                     path.display(),
-                )
-            })?;
+                );
+                if tolerant {
+                    log::warn!("Horizon: Java mod {message} skipped");
+                    continue;
+                }
+                return Err(message);
+            }
+        };
         if let Some((class, adapter)) = unsupported_fabric_adapter(&entrypoints) {
-            return Err(format!(
+            let message = format!(
                 "{} ({kind}, {class}): Fabric entrypoint adapter {adapter} is not supported by the native path",
                 path.display()
-            ));
+            );
+            if tolerant {
+                log::warn!("Horizon: Java mod {message} skipped");
+                continue;
+            }
+            return Err(message);
         }
         // Weave at load so every later use of this jar, entrypoints and resident
         // callbacks alike, runs the rewritten classes. The weaver parses the
@@ -1282,8 +1327,15 @@ pub(super) fn run_java_mods_with_report(
         });
         let (calls, mut host) = match execution {
             Ok(Ok(run)) => run,
-            // A refused entrypoint stays the startup error it always was.
-            Ok(Err(error)) => return Err(error),
+            // A refused entrypoint aborts a strict run; the default isolates
+            // the jar and keeps the rest of the pack running.
+            Ok(Err(error)) => {
+                if tolerant {
+                    log::warn!("Horizon: Java mod {} skipped: {error}", path.display());
+                    continue;
+                }
+                return Err(error);
+            }
             Err(message) => {
                 reports.push(isolated_jar_report(
                     &jar,
@@ -1442,9 +1494,11 @@ pub(super) fn run_java_mods_with_report(
 /// `HORIZON_HOME` is the game's stable data directory for both integrated and
 /// dedicated runs; a missing variable leaves the report beside the process.
 fn write_java_runtime_report(reports: &[JavaCompatibilityReport]) {
-    let home = std::env::var_os("HORIZON_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // Only a launcher-style run has a game home; tests and bare runs must not
+    // drop diagnostics into the source tree.
+    let Some(home) = std::env::var_os("HORIZON_HOME").map(PathBuf::from) else {
+        return;
+    };
     let jars = reports
         .iter()
         .map(|report| java_runtime_file::RuntimeJar {

@@ -17842,7 +17842,7 @@ pub fn run() -> Result<()> {
         dedicated::load_java_mods(&mut options)?;
     } else {
         options.java_content = Arc::new(
-            mods::run_java_mods(&options.java_mods, options.execution_role)
+            mods::run_java_mods_tolerant(&options.java_mods, options.execution_role)
                 .map_err(|error| format!("native Java mod startup failed: {error}"))?,
         );
     }
