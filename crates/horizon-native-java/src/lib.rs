@@ -349,6 +349,154 @@ impl MixinDiscoveryReport {
     }
 }
 
+/// The side a load-time Mixin weave runs for, which selects a config's `client`
+/// or `server` class list and honours Fabric's per-config `environment`.
+///
+/// A caller passes the side its host reports to the mod, so the jar's code and
+/// its mixins agree on where they run. Real Mixin follows the physical side, but
+/// Horizon's integrated server is its own host that runs `server` entrypoints
+/// and reports `SERVER`, so it takes [`Self::Server`] here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixinSide {
+    Client,
+    Server,
+}
+
+/// Why one discovered Mixin plan stayed out of the load-time weave.
+///
+/// [`Self::label`] is a fixed word a report can sort and count on. Only
+/// [`Self::Weaver`] carries text, bounded by [`MAX_WEAVE_REASON_CHARS`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MixinSkipReason {
+    /// Discovery could not read the plan's selector.
+    Unresolved,
+    /// Work the weave does not apply: a `FIELD`/`NEW`/`JUMP` anchor, a
+    /// `@Redirect`, `@Overwrite`, `@ModifyArg` or `@ModifyVariable`, or a member
+    /// of a `@Mixin` class that real Mixin would merge into its target.
+    UnsupportedFamily,
+    /// A `RETURN`, `TAIL` or `INVOKE` anchor.
+    NonHeadAnchor,
+    /// `cancellable`: the interpreter cannot honour the woven `CallbackInfo` yet.
+    Cancellable,
+    /// A `@Slice` or `shift`/`by`, which a `HEAD` insert would silently ignore.
+    SelectorModifier,
+    /// No readable config lists the `@Mixin` class, so real Mixin never applies it.
+    NotInConfig,
+    /// The class's config only applies it on the other physical side.
+    OtherSide,
+    /// The config names a plugin whose `shouldApplyMixin` could veto the class;
+    /// the bounded runtime never runs plugin code.
+    ConfigPlugin,
+    /// The target class is not in this jar, the case for every Minecraft target.
+    TargetOutsideJar,
+    /// The target class declares no method matching the selector.
+    TargetMissing,
+    /// The selector matches several overloads, or two selectors name one method.
+    AmbiguousTarget,
+    /// `<init>`: a `HEAD` insert would run before the superclass constructor.
+    ConstructorTarget,
+    /// The weaver inserts `invokestatic`, so an instance callback cannot link.
+    CallbackNotStatic,
+    /// The weaver refused the plan; its bounded reason.
+    Weaver(String),
+    /// A config lists the class but discovery found no plan for it. Real Mixin
+    /// jars land here today: `@Mixin` has `CLASS` retention, the parser only
+    /// reads runtime-visible annotations, so nothing about them is applied.
+    ListedWithoutPlan,
+}
+
+impl MixinSkipReason {
+    /// The fixed word for this reason.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Unresolved => "unresolved",
+            Self::UnsupportedFamily => "unsupported-family",
+            Self::NonHeadAnchor => "non-head-anchor",
+            Self::Cancellable => "cancellable",
+            Self::SelectorModifier => "selector-modifier",
+            Self::NotInConfig => "not-in-config",
+            Self::OtherSide => "other-side",
+            Self::ConfigPlugin => "config-plugin",
+            Self::TargetOutsideJar => "target-outside-jar",
+            Self::TargetMissing => "target-missing",
+            Self::AmbiguousTarget => "ambiguous-target",
+            Self::ConstructorTarget => "constructor-target",
+            Self::CallbackNotStatic => "callback-not-static",
+            Self::Weaver(_) => "weaver-rejected",
+            Self::ListedWithoutPlan => "listed-without-plan",
+        }
+    }
+}
+
+/// One discovered Mixin plan the load-time weave left out, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedMixinPlan {
+    pub target: MethodRef,
+    pub callback: MethodRef,
+    /// The plan's anchor, or its annotation for a family that has none.
+    pub at: String,
+    pub reason: MixinSkipReason,
+}
+
+impl std::fmt::Display for SkippedMixinPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {}#{}{} <- {}#{}{}",
+            self.reason.label(),
+            self.at,
+            self.target.owner,
+            self.target.name,
+            self.target.descriptor,
+            self.callback.owner,
+            self.callback.name,
+            self.callback.descriptor,
+        )?;
+        if let MixinSkipReason::Weaver(detail) = &self.reason {
+            write!(f, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+/// What [`NativeJar::plan_load_time_weave`] decided for one jar.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoadTimeMixinWeave {
+    /// The rewritten target classes, for [`NativeJar::with_woven_classes`].
+    pub classes: WovenClasses,
+    /// The plans those bytes carry, in discovery order, with concrete target
+    /// descriptors.
+    pub woven: Vec<MixinInjectionPlan>,
+    /// Everything else the jar's Mixin classes declare.
+    pub skipped: Vec<SkippedMixinPlan>,
+}
+
+/// Longest weaver reason a [`MixinSkipReason::Weaver`] keeps, in characters.
+const MAX_WEAVE_REASON_CHARS: usize = 200;
+
+/// Plans of one class the weave retries one at a time after a rejected pass.
+/// Matches the weaver's per-class bound: past it, every plan fails together for
+/// the same reason, so isolating them would only spend time on a hostile jar.
+const MAX_ISOLATED_WEAVE_PLANS: usize = 32;
+
+/// `plans`, reordered so applying them one after another leaves each method's
+/// callbacks running in the order given.
+///
+/// The weaver inserts every `HEAD` callback at offset 0, so the last one applied
+/// runs first and `HEAD` plans must go in reversed. `RETURN`, `TAIL` and `INVOKE`
+/// inserts land directly before their site, after any earlier insert, so those
+/// plans keep their order; reversing them too would flip them.
+pub fn mixin_plans_in_weave_order(plans: &[MixinInjectionPlan]) -> Vec<MixinInjectionPlan> {
+    let mut ordered = plans
+        .iter()
+        .filter(|plan| plan.at == "HEAD")
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>();
+    ordered.extend(plans.iter().filter(|plan| plan.at != "HEAD").cloned());
+    ordered
+}
+
 /// Results from executing one supported native Mixin translation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MixinExecutionReport {
@@ -16932,6 +17080,23 @@ mod tests {
         };
         let error = jar.with_woven_classes(&renamed).unwrap_err();
         assert!(error.to_string().contains("demo/Other"), "{error}");
+    }
+
+    #[test]
+    fn weave_order_reverses_head_plans_and_keeps_the_rest() {
+        let target = method_ref("demo/T", "m");
+        let plans = [
+            MixinInjectionPlan::inject_at_head(target.clone(), method_ref("demo/Cb", "head1")),
+            MixinInjectionPlan::inject_at_return(target.clone(), method_ref("demo/Cb", "ret1")),
+            MixinInjectionPlan::inject_at_head(target.clone(), method_ref("demo/Cb", "head2")),
+            MixinInjectionPlan::inject_at_tail(target, method_ref("demo/Cb", "tail1")),
+        ];
+        let ordered = mixin_plans_in_weave_order(&plans);
+        let names = ordered
+            .iter()
+            .map(|plan| plan.callback.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["head2", "head1", "ret1", "tail1"]);
     }
 
     #[test]
