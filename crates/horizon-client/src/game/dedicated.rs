@@ -10,7 +10,7 @@ use super::{
     Game, Options,
     execution_role::ExecutionRole,
     lan::LanSettings,
-    mods::{JavaCompatibilityReport, JavaEngine, JavaLoader, MixinPlanning, fml},
+    mods::{JavaCompatibilityReport, JavaEngine, JavaLoader, MixinPlanning, MixinWeave, fml},
     world_loading::WorldRequest,
 };
 use horizon_client::{
@@ -339,6 +339,9 @@ fn refusal_report(
         mixin_unresolved: mixin.unresolved,
         mixin_configs: mixin.configs,
         mixin_config_errors: mixin.config_errors,
+        // The jar was refused before any weave, so nothing was applied and
+        // nothing is claimed: an empty weave is the honest report.
+        mixin_weave: MixinWeave::default(),
         client_side_only_rejected: jar.is_some_and(|jar| jar.client_side_only),
         isolation_failure: None,
         role: ExecutionRole::DedicatedServer,
@@ -1925,7 +1928,7 @@ mod tests {
     use super::JavaEngine;
     use super::status::engine_name;
     use super::{
-        ExecutionRole, JAVA_PREFIX, JavaCompatibilityReport, JavaLoader, capture_log,
+        ExecutionRole, JAVA_PREFIX, JavaCompatibilityReport, JavaLoader, MixinWeave, capture_log,
         java_refusal_lines, loader_name, log, log_from, log_java_reports, refusal_report,
         role_name,
     };
@@ -2186,6 +2189,7 @@ mod tests {
             mixin_unresolved: 0,
             mixin_configs: 0,
             mixin_config_errors: 0,
+            mixin_weave: MixinWeave::default(),
             client_side_only_rejected: false,
             isolation_failure: None,
             role: ExecutionRole::DedicatedServer,

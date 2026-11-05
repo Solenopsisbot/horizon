@@ -65,9 +65,10 @@ const BACKEND_LABELS: [&str; 3] = ["native", "jvm", "none"];
 /// dedicated loader started, each one's engine, backend, loader, role and
 /// entrypoint kind, how its registrations landed, and whether any was refused.
 /// Each entry also carries the work the jar cost — executed entrypoints, native
-/// host calls, listeners and Mixin planning — and the section totals those over
-/// every jar, so the bounded entry list never hides the whole. Sorted by jar
-/// path and bounded, so two servers that started the same jars answer the same.
+/// host calls, listeners, Mixin planning and what the load weave did with those
+/// plans — and the section totals those over every jar, so the bounded entry
+/// list never hides the whole. Sorted by jar path and bounded, so two servers
+/// that started the same jars answer the same.
 pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
     let mut sorted: Vec<&JavaCompatibilityReport> = reports.iter().collect();
     sorted.sort_by(|a, b| a.jar.cmp(&b.jar));
@@ -134,6 +135,15 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
                 "mixin_unresolved": report.mixin_unresolved,
                 "mixin_configs": report.mixin_configs,
                 "mixin_config_errors": report.mixin_config_errors,
+                // One bounded row per jar: the counts the load weave recorded
+                // and the first reason it stayed out, cut like any failure.
+                "mixin_woven": report.mixin_weave.woven,
+                "mixin_skipped": report.mixin_weave.skipped,
+                "mixin_skipped_reason": report
+                    .mixin_weave
+                    .reason
+                    .as_deref()
+                    .map(bounded_error),
                 "mixin_targets": report
                     .mixin_targets
                     .iter()
@@ -166,6 +176,8 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
         "mixin_unresolved": count(|r| r.mixin_unresolved),
         "mixin_configs": count(|r| r.mixin_configs),
         "mixin_config_errors": count(|r| r.mixin_config_errors),
+        "mixin_woven": count(|r| r.mixin_weave.woven),
+        "mixin_skipped": count(|r| r.mixin_weave.skipped),
         "payload_directions": directions,
         "entries": entries,
     })
@@ -363,6 +375,7 @@ impl Game<'_> {
 mod tests {
     use super::*;
     use crate::game::execution_role::ExecutionRole;
+    use crate::game::mods::MixinWeave;
 
     fn report(
         jars: usize,
@@ -486,6 +499,7 @@ mod tests {
             mixin_unresolved: mixin.1,
             mixin_configs: mixin.2,
             mixin_config_errors: mixin.3,
+            mixin_weave: MixinWeave::default(),
             client_side_only_rejected: false,
             isolation_failure: None,
             role: ExecutionRole::DedicatedServer,
@@ -584,6 +598,124 @@ mod tests {
         assert_eq!(entries[3]["engine"], "native-qualified");
         assert_eq!(entries[3]["mixin_unresolved"], 1);
         assert_eq!(entries[3]["mixin_config_errors"], 1);
+    }
+
+    /// The weave's own counts sit beside the planning counts, one bounded row
+    /// per jar: what the load path applied, what it left out and the first
+    /// reason, with totals that survive the entry bound like the other counts.
+    /// The rows are additive, so a reader written before them keeps decoding
+    /// the keys it knows.
+    #[test]
+    fn java_section_reports_the_load_weave_beside_the_planning_counts() {
+        let mut woven = java_report(
+            "/mods/a-woven.jar",
+            JavaEngine::Native,
+            1,
+            6,
+            0,
+            (1, 0, 0, 0),
+        );
+        woven.mixin_weave = MixinWeave {
+            woven: 1,
+            skipped: 0,
+            reason: None,
+        };
+        let mut skipped = java_report(
+            "/mods/b-skipped.jar",
+            JavaEngine::NativeQualified,
+            1,
+            5,
+            0,
+            (2, 0, 0, 0),
+        );
+        skipped.mixin_weave = MixinWeave {
+            woven: 1,
+            skipped: 1,
+            reason: Some("cancellable HEAD demo/Target#other()V".into()),
+        };
+        let refused = java_report(
+            "/mods/c-refused.jar",
+            JavaEngine::Refused,
+            0,
+            0,
+            0,
+            (0, 0, 0, 0),
+        );
+        // A reason from a report that was not built here must still be cut to
+        // the same bound as every other status row.
+        let mut long = java_report(
+            "/mods/d-long.jar",
+            JavaEngine::NativeQualified,
+            1,
+            4,
+            0,
+            (2, 0, 0, 0),
+        );
+        long.mixin_weave = MixinWeave {
+            woven: 0,
+            skipped: 2,
+            reason: Some("x".repeat(MAX_FML_ERROR_CHARS * 2)),
+        };
+        let reports = [
+            skipped.clone(),
+            woven.clone(),
+            refused.clone(),
+            long.clone(),
+        ];
+        let section = java_section(&reports);
+
+        assert_eq!(section["mixin_woven"], 2);
+        assert_eq!(section["mixin_skipped"], 3);
+        let entries = section["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["jar"], "/mods/a-woven.jar");
+        assert_eq!(entries[0]["mixin_woven"], 1);
+        assert_eq!(entries[0]["mixin_skipped"], 0);
+        assert_eq!(entries[0]["mixin_skipped_reason"], Value::Null);
+        assert_eq!(entries[1]["jar"], "/mods/b-skipped.jar");
+        assert_eq!(entries[1]["mixin_woven"], 1);
+        assert_eq!(entries[1]["mixin_skipped"], 1);
+        assert_eq!(
+            entries[1]["mixin_skipped_reason"],
+            "cancellable HEAD demo/Target#other()V"
+        );
+        // A jar the loader never wove claims neither work nor skips.
+        assert_eq!(entries[2]["mixin_woven"], 0);
+        assert_eq!(entries[2]["mixin_skipped"], 0);
+        assert_eq!(entries[2]["mixin_skipped_reason"], Value::Null);
+        assert_eq!(
+            entries[3]["mixin_skipped_reason"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_FML_ERROR_CHARS + 3
+        );
+
+        // The wire keeps the old planning keys exactly as they were, so a
+        // reader that only knows them still decodes its fields.
+        assert_eq!(section["mixin_plans"], 5);
+        assert_eq!(section["mixin_unresolved"], 0);
+        let wire: Value = serde_json::from_str(&section.to_string()).unwrap();
+        assert_eq!(wire["entries"][1]["engine"], "native-qualified");
+        assert_eq!(wire["entries"][1]["mixin_skipped"], 1);
+        let mut old = wire;
+        let object = old.as_object_mut().unwrap();
+        object.remove("mixin_woven");
+        object.remove("mixin_skipped");
+        for entry in object["entries"].as_array_mut().unwrap() {
+            let entry = entry.as_object_mut().unwrap();
+            entry.remove("mixin_woven");
+            entry.remove("mixin_skipped");
+            entry.remove("mixin_skipped_reason");
+        }
+        assert_eq!(old["entries"][1]["engine"], "native-qualified");
+        assert_eq!(old["entries"][1]["mixin_plans"], 2);
+
+        // Deterministic: the same reports give byte-identical JSON.
+        assert_eq!(
+            section.to_string(),
+            java_section(&[skipped, woven, refused, long]).to_string()
+        );
     }
 
     /// A refused jar keeps the report's refusal whatever its other fields say,

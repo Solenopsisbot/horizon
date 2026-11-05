@@ -157,6 +157,11 @@ const MAX_REPORT_ROWS: usize = 12;
 /// must not be able to flood the startup log with its own panic text.
 const MAX_ISOLATION_MESSAGE: usize = 160;
 
+/// How much of one skip reason a report and the status reply keep. The reasons
+/// name classes and methods from the jar, so a pathological name must not be
+/// able to lengthen a line.
+const MAX_WEAVE_REASON: usize = 120;
+
 /// The loader metadata a jar declares. All three run through the same bounded
 /// interpreter; the kind only names which metadata the native path read, so a
 /// server operator can tell a Fabric jar from a NeoForge one in the log.
@@ -304,9 +309,9 @@ fn mixin_side(role: ExecutionRole) -> horizon_native_java::MixinSide {
 /// weave did with all of that. Scanned once per jar, so the window, its server
 /// thread and the dedicated server report the same numbers.
 ///
-/// The weave's counts are logged from here rather than kept on
-/// [`JavaCompatibilityReport`]: the report carries the verdict they earn, as its
-/// stored engine label.
+/// The weave's counts reach the log from here (the per-jar and run lines) and
+/// reach [`JavaCompatibilityReport`] as [`MixinWeave`] plus the stored engine
+/// label the verdict earns.
 #[derive(Debug, Default, Clone)]
 pub(super) struct MixinPlanning {
     pub(super) plans: usize,
@@ -386,6 +391,49 @@ impl MixinPlanning {
     }
 }
 
+/// The load weave's outcome as a [`JavaCompatibilityReport`] keeps it: how many
+/// of the jar's plans reached its bytecode, how many stayed out, and the first
+/// bounded reason one stayed out. Derived from the same [`MixinPlanning`] the
+/// load path logs, so the report, the log and `server-status` never disagree.
+///
+/// A report the loader never wove (a refusal, an isolated panic) keeps
+/// [`Self::default`]: zero woven and zero skipped is what a jar whose bytecode
+/// was never rewritten can honestly say, and `mixin_plans` still says how much
+/// it declared.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct MixinWeave {
+    /// Plans now in the jar's bytecode.
+    pub(super) woven: usize,
+    /// Mixin work that does not run: plans, other plan families and listed
+    /// classes the weave could not apply.
+    pub(super) skipped: usize,
+    /// The first reason in the planning's sorted, bounded skip list.
+    pub(super) reason: Option<String>,
+}
+
+impl MixinWeave {
+    fn of(planning: &MixinPlanning) -> Self {
+        Self {
+            woven: planning.woven,
+            skipped: planning.skipped,
+            reason: planning
+                .skip_reasons
+                .first()
+                .map(|reason| bounded_reason(reason.as_str())),
+        }
+    }
+}
+
+/// One skip reason as a single bounded row, the same shape the status reply's
+/// failures use.
+fn bounded_reason(reason: &str) -> String {
+    let mut bounded: String = reason.chars().take(MAX_WEAVE_REASON).collect();
+    if reason.chars().count() > MAX_WEAVE_REASON {
+        bounded.push_str("...");
+    }
+    bounded
+}
+
 /// One jar's bounded compatibility decision: what the native path read, what it
 /// ran, and what actually reached the typed content tables. Lists are sorted and
 /// truncated at [`MAX_REPORT_ROWS`], so the window, its server thread and the
@@ -426,6 +474,10 @@ pub(super) struct JavaCompatibilityReport {
     pub(super) mixin_configs: usize,
     /// Declared configs that could not be read, counted rather than named.
     pub(super) mixin_config_errors: usize,
+    /// What the load weave did with those plans: the counts and the first
+    /// reason, bounded like every other row. [`MixinWeave::default`] for a jar
+    /// the loader never wove.
+    pub(super) mixin_weave: MixinWeave,
     /// True only for the diagnostics a server role logs when it refuses a jar
     /// marked `clientSideOnly`; an accepted jar is never rejected.
     pub(super) client_side_only_rejected: bool,
@@ -482,6 +534,8 @@ impl JavaCompatibilityReport {
         let mixin = woven
             .cloned()
             .unwrap_or_else(|| MixinPlanning::of(Some(jar)));
+        // Read the weave before the struct literal moves the planning's fields.
+        let mixin_weave = MixinWeave::of(&mixin);
         let mut report = Self {
             jar: path.to_owned(),
             id: native_mod_id(jar, path).map(str::to_owned),
@@ -506,6 +560,10 @@ impl JavaCompatibilityReport {
             mixin_unresolved: mixin.unresolved,
             mixin_configs: mixin.configs,
             mixin_config_errors: mixin.config_errors,
+            // A jar the loader wove carries the weave's own counts; one it
+            // never got to (refused, isolated before the weave) keeps the
+            // empty weave, which never claims work was applied.
+            mixin_weave,
             client_side_only_rejected: facts.rejected,
             isolation_failure: None,
             role,
@@ -805,6 +863,14 @@ fn aggregate_line(reports: &[JavaCompatibilityReport], summary: &DeclarationSumm
         .iter()
         .map(|report| report.mixin_plans)
         .sum::<usize>();
+    let mixin_woven = reports
+        .iter()
+        .map(|report| report.mixin_weave.woven)
+        .sum::<usize>();
+    let mixin_skipped = reports
+        .iter()
+        .map(|report| report.mixin_weave.skipped)
+        .sum::<usize>();
     let mixin_unresolved = reports
         .iter()
         .map(|report| report.mixin_unresolved)
@@ -829,7 +895,7 @@ fn aggregate_line(reports: &[JavaCompatibilityReport], summary: &DeclarationSumm
         format!(", {}", declared.join(", "))
     };
     format!(
-        "Horizon: Java compatibility: {} jar(s), {typed} typed registrations, {opaque} opaque, {payloads} payload directions, {mixin_plans} mixin plan(s), {mixin_unresolved} unresolved, {}{declared}",
+        "Horizon: Java compatibility: {} jar(s), {typed} typed registrations, {opaque} opaque, {payloads} payload directions, {mixin_plans} mixin plan(s), {mixin_woven} woven, {mixin_skipped} skipped, {mixin_unresolved} unresolved, {}{declared}",
         reports.len(),
         engines_line(reports),
     )
@@ -2428,6 +2494,16 @@ clientSideOnly = true
                 .unwrap();
         let report = &reports[0];
         assert_eq!(report.mixin_plans, 1);
+        // The report carries the weave's own counts, not a re-derivation: the
+        // one plan is in the bytecode and nothing stayed out.
+        assert_eq!(
+            (
+                report.mixin_weave.woven,
+                report.mixin_weave.skipped,
+                report.mixin_weave.reason.as_deref()
+            ),
+            (1, 0, None)
+        );
         assert_eq!(report.engine(), JavaEngine::Native, "{report:?}");
         assert!(
             report.summary()[0].contains("role=dedicated-server engine=native loader=fabric"),
@@ -2478,6 +2554,23 @@ clientSideOnly = true
             run_java_mods_with_report(std::slice::from_ref(&path), ExecutionRole::DedicatedServer)
                 .unwrap();
         assert_eq!(reports[0].engine(), JavaEngine::NativeQualified);
+        // The report says one plan wove and one did not, and keeps the first
+        // skip reason the log names rather than dropping it.
+        let weave = &reports[0].mixin_weave;
+        assert_eq!((weave.woven, weave.skipped), (1, 1));
+        assert!(
+            weave
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cancellable HEAD demo/Target#other()V")),
+            "{weave:?}"
+        );
+        // The run's own line carries those numbers beside the plan count.
+        let line = aggregate_line(&reports, &mod_content::declaration_summary(&[]));
+        assert!(
+            line.contains("2 mixin plan(s), 1 woven, 1 skipped, 0 unresolved"),
+            "{line}"
+        );
         assert!(
             reports[0].summary()[0].contains("engine=native-qualified"),
             "{:?}",
@@ -2580,6 +2673,26 @@ clientSideOnly = true
             ..MixinPlanning::default()
         };
         assert!(!unaccounted.fully_applied());
+
+        // The report keeps the same counts and one reason, cut to its bound so
+        // a pathological class name cannot lengthen the line.
+        let verbose = MixinPlanning {
+            plans: 1,
+            skipped: 1,
+            skip_reasons: vec!["x".repeat(MAX_WEAVE_REASON * 2)],
+            ..MixinPlanning::default()
+        };
+        let weave = MixinWeave::of(&verbose);
+        assert_eq!((weave.woven, weave.skipped), (0, 1));
+        assert_eq!(
+            weave.reason.as_ref().map(|reason| reason.chars().count()),
+            Some(MAX_WEAVE_REASON + 3)
+        );
+        assert!(
+            weave.reason.as_deref().is_some_and(|r| r.ends_with("...")),
+            "{weave:?}"
+        );
+        assert_eq!(MixinWeave::of(&quiet), MixinWeave::default());
 
         assert_eq!(
             mixin_weave_line(&[quiet, woven, many]).as_deref(),
@@ -2720,7 +2833,7 @@ clientSideOnly = true
         assert_eq!(
             aggregate_line(&reports, &summary),
             "Horizon: Java compatibility: 2 jar(s), 2 typed registrations, 3 opaque, \
-             0 payload directions, 0 mixin plan(s), 0 unresolved, native=0, \
+             0 payload directions, 0 mixin plan(s), 0 woven, 0 skipped, 0 unresolved, native=0, \
              native-qualified=2, sidecar=0, refused=0, 3 declared item(s)"
         );
         let _ = std::fs::remove_dir_all(root);
@@ -2766,7 +2879,7 @@ clientSideOnly = true
             NativeRunFacts::default(),
         )];
         let legacy = "Horizon: Java compatibility: 1 jar(s), 0 typed registrations, 0 opaque, \
-                      0 payload directions, 0 mixin plan(s), 0 unresolved, native=1, \
+                      0 payload directions, 0 mixin plan(s), 0 woven, 0 skipped, 0 unresolved, native=1, \
                       native-qualified=0, sidecar=0, refused=0";
         for summary in [
             mod_content::declaration_summary(&[]),
@@ -2816,7 +2929,7 @@ clientSideOnly = true
         assert_eq!(
             aggregate_line(&reports, &summary),
             "Horizon: Java compatibility: 1 jar(s), 0 typed registrations, 0 opaque, \
-             0 payload directions, 0 mixin plan(s), 0 unresolved, native=1, \
+             0 payload directions, 0 mixin plan(s), 0 woven, 0 skipped, 0 unresolved, native=1, \
              native-qualified=0, sidecar=0, refused=0, 1 declared item(s), \
              1 other declared row(s)"
         );
@@ -2825,7 +2938,7 @@ clientSideOnly = true
         assert_eq!(
             aggregate_line(&reports, &summary),
             "Horizon: Java compatibility: 1 jar(s), 0 typed registrations, 0 opaque, \
-             0 payload directions, 0 mixin plan(s), 0 unresolved, native=1, \
+             0 payload directions, 0 mixin plan(s), 0 woven, 0 skipped, 0 unresolved, native=1, \
              native-qualified=0, sidecar=0, refused=0, 1 other declared row(s)"
         );
     }
