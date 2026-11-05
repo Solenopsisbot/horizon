@@ -9282,6 +9282,314 @@ impl NativeJar {
         Ok(self)
     }
 
+    /// Decide what can be woven into this jar at load, and weave it.
+    ///
+    /// The bounded subset is a non-cancellable `@Inject` at `HEAD` whose target
+    /// method is in this jar, whose callback is static, and whose `@Mixin` class
+    /// a readable config applies on `side`. Every other plan family and shape is
+    /// a [`SkippedMixinPlan`] with its reason, never an approximation, and so is
+    /// a config-listed class discovery found no plan for.
+    ///
+    /// Callbacks run in the order of [`Self::mixin_plans_in_apply_order`]. A
+    /// rejected plan costs only itself: the rest of its class still weaves. This
+    /// never touches `self`; pass the result's classes to
+    /// [`Self::with_woven_classes`].
+    pub fn plan_load_time_weave(&self, side: MixinSide) -> LoadTimeMixinWeave {
+        let (mut plans, unresolved) = self.mixin_plan_scan();
+        let configs = self.mixin_configs();
+        self.sort_mixin_plans_in_apply_order(&mut plans, &configs);
+        let config_sides = self
+            .resource_bytes
+            .get("fabric.mod.json")
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(fabric_mixin_config_sides)
+            .unwrap_or_default();
+        let mut weave = LoadTimeMixinWeave::default();
+        weave.skipped.extend(
+            unresolved
+                .iter()
+                .map(|plan| skipped_plan(plan, MixinSkipReason::Unresolved)),
+        );
+        self.unwoven_mixin_work(&mut weave.skipped);
+        listed_without_plan(&configs, &plans, &mut weave.skipped);
+        // Grouped by target class so a class the weaver refuses costs only its
+        // own plans. Each group stays in apply order.
+        let mut by_owner: BTreeMap<String, Vec<MixinInjectionPlan>> = BTreeMap::new();
+        for plan in &plans {
+            match self.load_time_head_plan(plan, side, &configs, &config_sides) {
+                Ok(concrete) => {
+                    let group = by_owner.entry(concrete.target.owner.clone()).or_default();
+                    if group.contains(&concrete) {
+                        weave
+                            .skipped
+                            .push(skipped_plan(plan, MixinSkipReason::AmbiguousTarget));
+                    } else {
+                        group.push(concrete);
+                    }
+                }
+                Err(reason) => weave.skipped.push(skipped_plan(plan, reason)),
+            }
+        }
+        for (owner, group) in by_owner {
+            self.weave_head_group(&owner, group, &mut weave);
+        }
+        weave
+    }
+
+    /// [`Self::mixin_injection_plans`] in the order real Mixin applies them,
+    /// which is the order their callbacks run in.
+    ///
+    /// Discovery sorts alphabetically so its reports stay stable. Mixin orders by
+    /// `@Mixin(priority)` (default 1000, lower first), then by config priority
+    /// and position in the config's lists, and a class's injectors keep the order
+    /// of its methods. A class no config lists sorts last.
+    pub fn mixin_plans_in_apply_order(&self) -> Vec<MixinInjectionPlan> {
+        let mut plans = self.mixin_injection_plans();
+        self.sort_mixin_plans_in_apply_order(&mut plans, &self.mixin_configs());
+        plans
+    }
+
+    fn sort_mixin_plans_in_apply_order(
+        &self,
+        plans: &mut [MixinInjectionPlan],
+        configs: &[MixinConfig],
+    ) {
+        const DEFAULT_PRIORITY: i32 = 1000;
+        plans.sort_by_cached_key(|plan| {
+            let class = self.classes.get(&plan.callback.owner);
+            let mixin_priority = class
+                .and_then(|class| {
+                    class.annotations.iter().find(|annotation| {
+                        annotation.descriptor == "Lorg/spongepowered/asm/mixin/Mixin;"
+                    })
+                })
+                .and_then(|mixin| match mixin.values.get("priority") {
+                    Some(AnnotationValue::Int(priority)) => Some(*priority),
+                    _ => None,
+                })
+                .unwrap_or(DEFAULT_PRIORITY);
+            let binary = plan.callback.owner.replace('/', ".");
+            let listed = configs.iter().enumerate().find_map(|(index, config)| {
+                config
+                    .mixins
+                    .iter()
+                    .chain(&config.client)
+                    .chain(&config.server)
+                    .position(|name| *name == binary)
+                    .map(|position| (config.priority.unwrap_or(DEFAULT_PRIORITY), index, position))
+            });
+            let listed = listed.unwrap_or((DEFAULT_PRIORITY, usize::MAX, usize::MAX));
+            let method = class
+                .and_then(|class| {
+                    class.methods.iter().position(|method| {
+                        method.name == plan.callback.name
+                            && method.descriptor == plan.callback.descriptor
+                    })
+                })
+                .unwrap_or(usize::MAX);
+            (mixin_priority, listed, method)
+        });
+    }
+
+    /// One plan as the load-time weave would apply it, with its target
+    /// descriptor made concrete, or why it stays out.
+    fn load_time_head_plan(
+        &self,
+        plan: &MixinInjectionPlan,
+        side: MixinSide,
+        configs: &[MixinConfig],
+        config_sides: &BTreeMap<String, MixinSide>,
+    ) -> Result<MixinInjectionPlan, MixinSkipReason> {
+        if plan.at != "HEAD" {
+            return Err(MixinSkipReason::NonHeadAnchor);
+        }
+        if plan.cancellable {
+            return Err(MixinSkipReason::Cancellable);
+        }
+        if plan.slice.is_some() || plan.shift.is_some() {
+            return Err(MixinSkipReason::SelectorModifier);
+        }
+        mixin_config_gate(configs, config_sides, &plan.callback.owner, side)?;
+        let class = self
+            .classes
+            .get(&plan.target.owner)
+            .ok_or(MixinSkipReason::TargetOutsideJar)?;
+        let mut candidates = class.methods.iter().filter(|method| {
+            method.name == plan.target.name
+                && (plan.target.descriptor.is_empty()
+                    || method.descriptor == plan.target.descriptor)
+        });
+        let target = candidates.next().ok_or(MixinSkipReason::TargetMissing)?;
+        if candidates.next().is_some() {
+            return Err(MixinSkipReason::AmbiguousTarget);
+        }
+        if target.name == "<init>" {
+            return Err(MixinSkipReason::ConstructorTarget);
+        }
+        let callback_is_static = self
+            .classes
+            .get(&plan.callback.owner)
+            .and_then(|class| class.method(&plan.callback.name, &plan.callback.descriptor))
+            .is_some_and(Method::is_static);
+        if !callback_is_static {
+            return Err(MixinSkipReason::CallbackNotStatic);
+        }
+        let mut concrete = plan.clone();
+        concrete.target.descriptor = target.descriptor.clone();
+        Ok(concrete)
+    }
+
+    /// Weave one target class's plans into `weave`, or record why not.
+    ///
+    /// The common case applies them all in one pass. After a rejection each plan
+    /// is tried alone on the original class, so one bad callback does not take
+    /// the rest of the class with it.
+    fn weave_head_group(
+        &self,
+        owner: &str,
+        mut group: Vec<MixinInjectionPlan>,
+        weave: &mut LoadTimeMixinWeave,
+    ) {
+        let Some(class) = self.classes.get(owner) else {
+            return;
+        };
+        let set = BTreeMap::from([(owner.to_owned(), class.clone())]);
+        let apply = |plans: &[MixinInjectionPlan]| -> Result<WovenClasses, String> {
+            let woven = weave_classes_with_extras(&set, &mixin_plans_in_weave_order(plans))?;
+            // Parsed here so `with_woven_classes` cannot fail on planned bytes.
+            for bytes in woven.classes.values().chain(woven.added.values()) {
+                ClassFile::parse(bytes).map_err(|error| error.to_string())?;
+            }
+            Ok(woven)
+        };
+        let outcome = match apply(&group) {
+            Err(_) if group.len() <= MAX_ISOLATED_WEAVE_PLANS => {
+                group.retain(|plan| {
+                    match weave_class_with_extras(class, std::slice::from_ref(plan)) {
+                        Ok(_) => true,
+                        Err(error) => {
+                            let reason = MixinSkipReason::Weaver(bounded_weave_reason(&error));
+                            weave.skipped.push(skipped_plan(plan, reason));
+                            false
+                        }
+                    }
+                });
+                if group.is_empty() {
+                    return;
+                }
+                apply(&group)
+            }
+            outcome => outcome,
+        };
+        match outcome {
+            Ok(woven) => {
+                weave.classes.classes.extend(woven.classes);
+                for (name, bytes) in woven.added {
+                    weave.classes.added.entry(name).or_insert(bytes);
+                }
+                weave.woven.extend(group);
+            }
+            Err(error) => {
+                let reason = MixinSkipReason::Weaver(bounded_weave_reason(&error));
+                weave
+                    .skipped
+                    .extend(group.iter().map(|plan| skipped_plan(plan, reason.clone())));
+            }
+        }
+    }
+
+    /// Record the Mixin work outside the `@Inject` plan set: the other plan
+    /// families, resolved or not, and the members of each `@Mixin` class that
+    /// real Mixin would merge into its target. Static helpers stay, because a
+    /// static callback still reaches them in the Mixin class itself.
+    fn unwoven_mixin_work(&self, skipped: &mut Vec<SkippedMixinPlan>) {
+        const SYNTHETIC: u16 = 0x1000;
+        // Methods these annotate already have a row of their own.
+        const PLANNED: [&str; 5] = [
+            "Lorg/spongepowered/asm/mixin/injection/Inject;",
+            "Lorg/spongepowered/asm/mixin/injection/Redirect;",
+            "Lorg/spongepowered/asm/mixin/injection/ModifyArg;",
+            "Lorg/spongepowered/asm/mixin/injection/ModifyVariable;",
+            "Lorg/spongepowered/asm/mixin/Overwrite;",
+        ];
+        let mut row = |target: &MethodRef, callback: &MethodRef, at: &str, resolved: bool| {
+            skipped.push(SkippedMixinPlan {
+                target: target.clone(),
+                callback: callback.clone(),
+                at: at.to_owned(),
+                reason: if resolved {
+                    MixinSkipReason::UnsupportedFamily
+                } else {
+                    MixinSkipReason::Unresolved
+                },
+            });
+        };
+        let (anchors, unresolved) = self.mixin_anchor_scan();
+        for plan in &anchors {
+            row(&plan.target, &plan.callback, &plan.at, true);
+        }
+        for (plan, _) in &unresolved {
+            row(&plan.target, &plan.callback, &plan.at, false);
+        }
+        let (overwrites, unresolved) = self.mixin_overwrite_scan();
+        for plan in &overwrites {
+            row(&plan.target, &plan.callback, "@Overwrite", true);
+        }
+        for (plan, _) in &unresolved {
+            row(&plan.target, &plan.callback, "@Overwrite", false);
+        }
+        let (modify_args, unresolved) = self.mixin_modify_arg_scan();
+        for plan in &modify_args {
+            row(&plan.target, &plan.callback, "@ModifyArg", true);
+        }
+        for (plan, _) in &unresolved {
+            row(&plan.target, &plan.callback, "@ModifyArg", false);
+        }
+        let (modify_variables, unresolved) = self.mixin_modify_variable_scan();
+        for plan in &modify_variables {
+            row(&plan.target, &plan.callback, "@ModifyVariable", true);
+        }
+        for (plan, _) in &unresolved {
+            row(&plan.target, &plan.callback, "@ModifyVariable", false);
+        }
+        for class in self.classes.values() {
+            if !class
+                .annotations
+                .iter()
+                .any(|annotation| annotation.descriptor == "Lorg/spongepowered/asm/mixin/Mixin;")
+            {
+                continue;
+            }
+            let field = class
+                .fields
+                .iter()
+                .find(|field| field.access & SYNTHETIC == 0)
+                .map(|field| (&field.name, &field.descriptor));
+            let method = class
+                .methods
+                .iter()
+                .find(|method| {
+                    !method.is_static()
+                        && method.name != "<init>"
+                        && method.access & SYNTHETIC == 0
+                        && !method
+                            .annotations
+                            .iter()
+                            .any(|annotation| PLANNED.contains(&annotation.descriptor.as_str()))
+                })
+                .map(|method| (&method.name, &method.descriptor));
+            // One row per class: the first member says the class is not plain.
+            if let Some((name, descriptor)) = field.or(method) {
+                let member = MethodRef {
+                    owner: class.name.clone(),
+                    name: name.clone(),
+                    descriptor: descriptor.clone(),
+                };
+                row(&member, &member, "@Mixin-member", true);
+            }
+        }
+    }
+
     pub fn discover_entrypoint(&self, kind: &str) -> Option<Entrypoint> {
         self.discover_entrypoints(kind).into_iter().next()
     }
@@ -17230,6 +17538,29 @@ mod tests {
             .map(|plan| plan.callback.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, ["head2", "head1", "ret1", "tail1"]);
+    }
+
+    /// `HEAD` inserts at offset 0 whatever the selector says, so a `shift` or
+    /// `@Slice` it cannot honour must keep the plan out instead of moving it.
+    #[test]
+    fn load_time_weave_leaves_head_plans_with_selector_modifiers_out() {
+        let mut plan = MixinInjectionPlan::inject_at_head(
+            method_ref("demo/T", "m"),
+            method_ref("demo/Cb", "cb"),
+        );
+        plan.shift = Some(InvokeShift {
+            direction: Shift::After,
+            by: 1,
+        });
+        assert_eq!(
+            NativeJar::default().load_time_head_plan(
+                &plan,
+                MixinSide::Client,
+                &[],
+                &BTreeMap::new()
+            ),
+            Err(MixinSkipReason::SelectorModifier)
+        );
     }
 
     #[test]
