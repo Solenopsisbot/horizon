@@ -37,9 +37,10 @@ class JavaModServerLedgerTests(unittest.TestCase):
                          {"total": 2, "ran": 1, "aborted": 0, "timeout": 1})
 
     def test_integration_requires_prepared_resources(self):
-        if os.environ.get("HORIZON_LEDGER_INTEGRATION") != "1":
-            self.skipTest("real-server integration is opt-in")
-        self.assertTrue((ROOT / ".local/horizon-client/26.3").is_dir())
+        resources = ROOT / ".local/horizon-client/26.3"
+        if os.environ.get("HORIZON_LEDGER_INTEGRATION") != "1" or not resources.is_dir():
+            self.skipTest("real-server integration is opt-in and needs prepared resources")
+        self.assertTrue(resources.is_dir())
 
 
 if __name__ == "__main__":
