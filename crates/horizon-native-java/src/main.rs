@@ -1,6 +1,6 @@
 use horizon_native_java::{
-    ClassFile, MethodRef, MixinInjectionPlan, NativeJar, StdHost, weave_class_with_extras,
-    weave_classes_with_extras,
+    ClassFile, MethodRef, MixinInjectionPlan, NativeJar, StdHost, mixin_plans_in_weave_order,
+    weave_class_with_extras, weave_classes_with_extras,
 };
 use std::{
     collections::BTreeMap,
@@ -229,15 +229,19 @@ fn weave_one(
 
 /// Write `entries` to `output`, swapping in woven bytes for the classes a plan
 /// reached and copying everything else byte for byte.
+///
+/// `plans` are in the order their callbacks should run; applying them in the
+/// order the weaver needs is this function's job.
 fn write_woven_jar(
     output: &Path,
     entries: &[JarEntry],
     classes: &BTreeMap<String, ClassFile>,
     plans: &[MixinInjectionPlan],
 ) -> Result<WeaveReport, String> {
+    let plans = mixin_plans_in_weave_order(plans);
     let mut by_owner: BTreeMap<&str, Vec<&MixinInjectionPlan>> = BTreeMap::new();
     let mut skipped_plans = 0;
-    for plan in plans {
+    for plan in &plans {
         if classes.contains_key(plan.target.owner.as_str()) {
             by_owner
                 .entry(plan.target.owner.as_str())
@@ -386,7 +390,11 @@ fn weave_jar(input: &Path, output: &Path) -> Result<WeaveReport, String> {
         }
     }
     let (entries, classes) = read_jar(input)?;
-    let plans = NativeJar::from_classes(classes.values().cloned()).mixin_injection_plans();
+    // From the jar rather than its classes alone: the callback order depends on
+    // the Mixin configs, which only the metadata read sees.
+    let plans = NativeJar::from_path(input)
+        .map_err(|error| format!("{}: {error}", input.display()))?
+        .mixin_plans_in_apply_order();
     write_woven_jar(output, &entries, &classes, &plans)
 }
 
@@ -934,6 +942,55 @@ mod tests {
         let woven = read_entry(&mut archive, "demo/T.class");
         assert_ne!(woven, target_bytes, "the HEAD plan must rewrite the class");
         ClassFile::parse(&woven).expect("the woven class still parses");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Executed rather than read back: `demo/Cb` is not in the jar, so each
+    /// inserted call crosses the host boundary, which records the order the
+    /// woven bytecode really runs them in.
+    #[test]
+    fn weave_runs_each_anchors_callbacks_in_the_order_given() {
+        use horizon_native_java::NativeJar;
+
+        let root = scratch("order");
+        let input = root.join("in.jar");
+        let output = root.join("out.jar");
+        let target_bytes = class_bytes("demo/T", 0x0009, "()V", &[0xb1]);
+        write_zip(&input, &[("demo/T.class", &target_bytes)]);
+
+        let (entries, classes) = read_jar(&input).unwrap();
+        let target = MethodRef {
+            owner: "demo/T".into(),
+            name: "m".into(),
+            descriptor: "()V".into(),
+        };
+        let callback = |name: &str| MethodRef {
+            owner: "demo/Cb".into(),
+            name: name.into(),
+            descriptor: "()V".into(),
+        };
+        // Neither anchor's names are alphabetical, and the anchors are mixed, so
+        // reversing or sorting the whole list cannot pass by accident.
+        let plans = [
+            MixinInjectionPlan::inject_at_head(target.clone(), callback("zulu")),
+            MixinInjectionPlan::inject_at_return(target.clone(), callback("yankee")),
+            MixinInjectionPlan::inject_at_head(target.clone(), callback("alpha")),
+            MixinInjectionPlan::inject_at_return(target, callback("bravo")),
+        ];
+        let report = write_woven_jar(&output, &entries, &classes, &plans).unwrap();
+        assert_eq!(report.woven_plans, 4);
+        assert_eq!(report.skipped_plans, 0);
+
+        let jar = NativeJar::from_path(&output).unwrap();
+        let mut host = horizon_native_java::StdHost::new();
+        jar.execute("demo.T", Some("m"), "main", &mut host).unwrap();
+        let ran = host
+            .invocations()
+            .iter()
+            .filter(|invocation| invocation.method.owner == "demo/Cb")
+            .map(|invocation| invocation.method.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ran, ["zulu", "alpha", "yankee", "bravo"]);
         let _ = std::fs::remove_dir_all(root);
     }
 
