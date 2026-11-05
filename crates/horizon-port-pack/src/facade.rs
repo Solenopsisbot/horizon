@@ -19,6 +19,25 @@ use std::{
     process::Command,
 };
 
+/// One generated shim member that stays object-shaped because the real
+/// descriptor names a type this compilation cannot provide (a legacy name the
+/// 26.3 game jar replaced, a loader type absent from the target's classpath, or
+/// a game-free slice that must not name a game class). A caller can surface
+/// the row instead of discovering the bound as a `NoSuchMethodError` at load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyBound {
+    /// The shim class, as a binary name (`net/minecraftforge/...`).
+    pub class: String,
+    /// The kept member (`newSimpleChannel`, `playToServer/...`).
+    pub member: String,
+    /// Why the parameters cannot carry the real descriptor.
+    pub reason: String,
+}
+
+/// Enough rows for every surface one compilation can emit; the cap keeps a
+/// pathological target from turning the report into an unbounded log.
+const MAX_LEGACY_BOUNDS: usize = 64;
+
 #[derive(Debug, Default, Clone)]
 pub struct Report {
     pub classes: usize,
@@ -27,8 +46,36 @@ pub struct Report {
     /// Named by the mod but not in the game jar (a library, or a version
     /// mismatch), and nested classes deeper than one level.
     pub missing: Vec<String>,
+    /// Shim members emitted with `Object` parameters where the real API is
+    /// typed. Deduplicated in emission order and capped at
+    /// `MAX_LEGACY_BOUNDS`; empty when every emitted signature carries its real
+    /// descriptor.
+    pub legacy: Vec<LegacyBound>,
     pub sources: PathBuf,
     pub jar: PathBuf,
+}
+
+impl Report {
+    /// Records one bounded legacy shim. Repeated emission of the same member
+    /// (a mixed target naming a family twice) yields one row.
+    fn bound_legacy(
+        &mut self,
+        class: impl Into<String>,
+        member: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        if self.legacy.len() >= MAX_LEGACY_BOUNDS {
+            return;
+        }
+        let row = LegacyBound {
+            class: class.into(),
+            member: member.into(),
+            reason: reason.into(),
+        };
+        if !self.legacy.contains(&row) {
+            self.legacy.push(row);
+        }
+    }
 }
 
 pub fn generate(
@@ -978,6 +1025,11 @@ pub fn generate_many(
         fs::write(&payload_registry_file, FABRIC_PAYLOAD_TYPE_REGISTRY)
             .map_err(|e| format!("{}: {e}", payload_registry_file.display()))?;
         files.push(payload_registry_file);
+        report.bound_legacy(
+            payload_registry,
+            "PayloadTypeRegistrar.register",
+            "the jar-only slice must not name CustomPacketPayload.Type/StreamCodec, so the payload and codec stay Object",
+        );
     }
     // Fabric API's play-stage networking: the receiver maps are real (they key
     // handlers by payload type id and `canSend` reads them), while `send` and
@@ -1279,10 +1331,24 @@ pub fn generate_many(
             ),
             (
                 "net/fabricmc/fabric/api/client/rendering/v1/ColorProviderRegistry",
-                &["item", "item_stack", "block", "block_state", "block_pos"][..],
+                &[
+                    "item",
+                    "item_stack",
+                    "block",
+                    "block_state",
+                    "block_pos",
+                    "block_and_tint_getter",
+                ][..],
                 FABRIC_COLOR_PROVIDER_REGISTRY,
             ),
         ] {
+            // The model-layer registry names model roles a target that only
+            // touches another renderer registry never seeds; emit it only for
+            // a target that names it, or javac sees classes this source set
+            // does not carry.
+            if class.ends_with("ModelLayerRegistry") && !uses_model_layers {
+                continue;
+            }
             client_shims.emit(&mut files, &mut report, class, roles, || {
                 fill_client(template)
             })?;
@@ -1921,23 +1987,11 @@ pub fn generate_many(
             ),
             (
                 "net/minecraftforge/network/simple/SimpleChannel.java",
-                concat!(
-                    "package net.minecraftforge.network.simple;\n",
-                    "public class SimpleChannel {\n",
-                    "    public SimpleChannel registerMessage(int id, Class type, java.util.function.BiFunction encoder, java.util.function.BiFunction decoder, java.util.function.BiConsumer handler) { return this; }\n",
-                    "}\n",
-                ),
+                LEGACY_FORGE_SIMPLE_CHANNEL_SOURCE,
             ),
             (
                 "net/minecraftforge/network/NetworkRegistry.java",
-                concat!(
-                    "package net.minecraftforge.network;\n",
-                    "import net.minecraftforge.network.simple.SimpleChannel;\n",
-                    "public final class NetworkRegistry {\n",
-                    "    private NetworkRegistry() {}\n",
-                    "    public static SimpleChannel newSimpleChannel(Object name, Object protocol, Object clientAccepted, Object serverAccepted) { return new SimpleChannel(); }\n",
-                    "}\n",
-                ),
+                LEGACY_FORGE_NETWORK_REGISTRY_SOURCE,
             ),
         ];
         for (relative, source) in shims {
@@ -1991,7 +2045,8 @@ pub fn generate_many(
             if let Some(parent) = file.parent() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            let source = if relative == format!("{NEOFORGE_BIOME_MODIFIER}.java")
+            let mut source = source;
+            if relative == format!("{NEOFORGE_BIOME_MODIFIER}.java")
                 && ![
                     "net/minecraft/core/RegistryAccess",
                     "net/minecraft/core/Holder",
@@ -2001,12 +2056,31 @@ pub fn generate_many(
                 .iter()
                 .all(|name| game.contains_key(*name))
             {
-                NEOFORGE_BIOME_MODIFIER_OBJECT_SOURCE
-            } else {
-                source
-            };
+                source = NEOFORGE_BIOME_MODIFIER_OBJECT_SOURCE;
+                report.bound_legacy(
+                    NEOFORGE_BIOME_MODIFIER,
+                    "modify/codec",
+                    "game jar lacks BiomeModifier's typed RegistryAccess/Holder/Biome/BiomeGenerationSettings",
+                );
+            }
             fs::write(&file, source).map_err(|e| format!("{}: {e}", file.display()))?;
             files.push(file);
+            // Legacy Forge's channel factory is the one shim in this array that
+            // cannot carry its real descriptor; name it in the report.
+            if relative == "net/minecraftforge/network/NetworkRegistry.java" {
+                report.bound_legacy(
+                    "net/minecraftforge/network/NetworkRegistry",
+                    "newSimpleChannel",
+                    "legacy Forge names ResourceLocation/NetworkProtocolVersion, absent from 26.3",
+                );
+            }
+            if relative == format!("{NEOFORGE_PAYLOAD_REGISTRAR_CLASS}.java") {
+                report.bound_legacy(
+                    NEOFORGE_PAYLOAD_REGISTRAR_CLASS,
+                    "play*/configuration*",
+                    "legacy Object overloads keep a payload type outside CustomPacketPayload linking; the typed overloads serve the real descriptor",
+                );
+            }
         }
         // NeoForge's client bootstrap surface: key-mapping registration keeps
         // the mappings it was handed, and the tick/render events stay markers
@@ -2107,6 +2181,18 @@ pub fn generate_many(
                     .all(|name| game.contains_key(*name))
                 {
                     source = NEOFORGE_BIOME_MODIFIER_OBJECT_SOURCE;
+                    report.bound_legacy(
+                        class,
+                        "modify/codec",
+                        "game jar lacks BiomeModifier's typed RegistryAccess/Holder/Biome/BiomeGenerationSettings",
+                    );
+                }
+                if class == NEOFORGE_ISTORAGE {
+                    report.bound_legacy(
+                        class,
+                        "readNBT/writeNBT",
+                        "IStorage is a legacy marker; its Capability/Direction/CompoundTag descriptors are not 26.3 classes",
+                    );
                 }
                 write_shim(&mut files, &src, class, source)?;
             }
@@ -2844,6 +2930,8 @@ public interface StreamCodecOperation<B, S, T> {
 ///
 /// `id()` is read reflectively so this shim has no game-class dependency and
 /// stays compilable on a jar-only classpath.
+const NEOFORGE_PAYLOAD_REGISTRAR_CLASS: &str =
+    "net/neoforged/neoforge/network/registration/PayloadRegistrar";
 const NEOFORGE_PAYLOAD_REGISTRAR: &str = r#"package net.neoforged.neoforge.network.registration;
 
 import net.minecraft.network.RegistryFriendlyByteBuf;
@@ -2927,6 +3015,11 @@ public class PayloadRegistrar {
     public <T extends CustomPacketPayload> PayloadRegistrar configurationToServer(CustomPacketPayload.Type type, StreamCodec codec, IPayloadHandler<T> handler) { return horizonRetain("configurationToServer", type, codec); }
     public <T extends CustomPacketPayload> PayloadRegistrar configurationToClient(CustomPacketPayload.Type type, StreamCodec codec, IPayloadHandler<T> handler) { return horizonRetain("configurationToClient", type, codec); }
     public <T extends CustomPacketPayload> PayloadRegistrar configurationBidirectional(CustomPacketPayload.Type type, StreamCodec codec, IPayloadHandler<T> handler) { return horizonRetain("configurationBidirectional", type, codec); }
+    // Bounded legacy overloads: a payload marker that is not a
+    // CustomPacketPayload.Type (a pre-1.20.5 codec shape, or the native
+    // probe's hand-written Type) has no typed overload to bind to. The typed
+    // overloads above carry the real API's descriptor; these keep the old call
+    // site linkable and are listed in Report::legacy.
     public PayloadRegistrar playToServer(Object type, Object codec, Object handler) { return horizonRetainLegacy("playToServer", type, codec); }
     public PayloadRegistrar playToClient(Object type, Object codec, Object handler) { return horizonRetainLegacy("playToClient", type, codec); }
     public PayloadRegistrar playBidirectional(Object type, Object codec, Object handler) { return horizonRetainLegacy("playBidirectional", type, codec); }
@@ -2991,6 +3084,11 @@ public final class PayloadTypeRegistry {
         public int horizonRegistrationCount() { return horizonRegistrationCount; }
         public String horizonDirection() { return horizonDirection; }
 
+        // Bounded on purpose: the real signature is
+        // (CustomPacketPayload.Type<T>, StreamCodec<? super RegistryFriendlyByteBuf, T>),
+        // but this class is the jar-only slice and must stay compilable without
+        // a game jar, so both parameters stay Object. A source call links; a
+        // precompiled call site is named in Report::legacy.
         public PayloadTypeRegistrar<T> register(Object type, Object codec) {
             horizonPayloads.computeIfAbsent(horizonDirection, key -> new java.util.ArrayList<>()).add(type);
             horizonPayloadCodecs.computeIfAbsent(horizonDirection, key -> new java.util.ArrayList<>()).add(codec);
@@ -3707,7 +3805,7 @@ import java.util.List;
 public final class ColorProviderRegistry {
     public interface ColorProvider {}
     @FunctionalInterface public interface BlockColorProvider extends ColorProvider {
-        int getColor({block_state} state, Object world, {block_pos} pos, int tintIndex);
+        int getColor({block_state} state, {block_and_tint_getter} world, {block_pos} pos, int tintIndex);
     }
     @FunctionalInterface public interface ItemColorProvider extends ColorProvider {
         int getColor({item_stack} stack, int tintIndex);
@@ -3719,13 +3817,21 @@ public final class ColorProviderRegistry {
     private static final List<ColorProvider> HORIZON_PROVIDERS = new ArrayList<>();
 
     private ColorProviderRegistry() {}
+    // The provider interfaces keep the real 26.3 descriptors (`BlockState`,
+    // `BlockAndTintGetter`, `BlockPos`); the single-target overloads are typed
+    // per role rather than `Object`, so a call site's invoke names a resolvable
+    // game class on both registries.
     public void register(BlockColorProvider provider, {block}... blocks) {
         if (provider != null) HORIZON_PROVIDERS.add(provider);
     }
     public void register(ItemColorProvider provider, {item}... items) {
         if (provider != null) HORIZON_PROVIDERS.add(provider);
     }
-    public ColorProvider register(Object target, ColorProvider provider) {
+    public ColorProvider register({block} target, ColorProvider provider) {
+        if (provider != null) HORIZON_PROVIDERS.add(provider);
+        return provider;
+    }
+    public ColorProvider register({item} target, ColorProvider provider) {
         if (provider != null) HORIZON_PROVIDERS.add(provider);
         return provider;
     }
@@ -4771,12 +4877,43 @@ public interface BiomeModifier {
 }
 "#;
 
+// Legacy marker, kept object-shaped on purpose: NeoForge's `IStorage` (a
+// capability shape from before the 26.3 transfer API) names `Capability<T>`
+// from `net.neoforged.neoforge.common.capabilities`, `Direction` and
+// `CompoundTag`. The first is not a 26.3 class at all, so typing these
+// parameters would make the shim uncompilable for the very jars it serves; a
+// caller sees the bound through `Report::legacy` instead.
 const NEOFORGE_ISTORAGE_SOURCE: &str = r#"package net.neoforged.neoforge.common.capabilities;
 public interface IStorage<T> {
     default Object readNBT(Object capability, T instance, Object side) { return null; }
     default void writeNBT(Object capability, T instance, Object side, Object nbt) {}
 }
 "#;
+
+/// Legacy Forge's channel factory. `newSimpleChannel` takes `ResourceLocation`
+/// (renamed `Identifier` in 26.3) and `NetworkProtocolVersion` (a Forge API
+/// type, not a game class), so every parameter stays `Object`: the shim keeps
+/// a *source* call linkable, and a jar precompiled against real Forge is
+/// reported through `Report::legacy` rather than failing silently.
+const LEGACY_FORGE_NETWORK_REGISTRY_SOURCE: &str = concat!(
+    "package net.minecraftforge.network;\n",
+    "import net.minecraftforge.network.simple.SimpleChannel;\n",
+    "public final class NetworkRegistry {\n",
+    "    private NetworkRegistry() {}\n",
+    "    public static SimpleChannel newSimpleChannel(Object name, Object protocol, Object clientAccepted, Object serverAccepted) { return new SimpleChannel(); }\n",
+    "}\n",
+);
+
+/// Legacy Forge's channel. The encoder/decoder/handler carry the JDK types a
+/// compiled call site erases to (`BiFunction`/`BiConsumer`); the message id and
+/// decoder remain opaque markers, and byte encoding plus sends are still
+/// outside this boundary.
+const LEGACY_FORGE_SIMPLE_CHANNEL_SOURCE: &str = concat!(
+    "package net.minecraftforge.network.simple;\n",
+    "public class SimpleChannel {\n",
+    "    public SimpleChannel registerMessage(int id, Class type, java.util.function.BiFunction encoder, java.util.function.BiFunction decoder, java.util.function.BiConsumer handler) { return this; }\n",
+    "}\n",
+);
 
 /// Bounded NeoForge `AttachmentType`: `builder(Supplier)` keeps the default
 /// supplier, `serialize(Codec, Supplier)` the codec and its default,
@@ -17003,7 +17140,11 @@ public final class CodecProbe {
             ),
             (
                 FABRIC_COLOR_PROVIDER_REGISTRY,
-                &["public ColorProvider register(Object target, ColorProvider provider) {"][..],
+                &[
+                    "public ColorProvider register({block} target, ColorProvider provider) {",
+                    "public ColorProvider register({item} target, ColorProvider provider) {",
+                    "int getColor({block_state} state, {block_and_tint_getter} world, {block_pos} pos, int tintIndex);",
+                ][..],
             ),
             (
                 NEOFORGE_BUILD_CREATIVE_MODE_TAB_CONTENTS,
@@ -19168,6 +19309,37 @@ public class DatagenProbe {
         assert!(NEOFORGE_BIOME_MODIFIER_SOURCE.contains("codec"));
         assert!(NEOFORGE_ISTORAGE_SOURCE.contains("readNBT"));
         assert!(NEOFORGE_ISTORAGE_SOURCE.contains("writeNBT"));
+        // `IStorage` is a legacy marker (no 26.3 class) whose real descriptor
+        // names `Capability<T>`/`Direction`/`CompoundTag`; its three Object
+        // parameters are the bound, not an oversight.
+        assert!(
+            NEOFORGE_ISTORAGE_SOURCE
+                .contains("default Object readNBT(Object capability, T instance, Object side)")
+        );
+        assert!(NEOFORGE_ISTORAGE_SOURCE.contains(
+            "default void writeNBT(Object capability, T instance, Object side, Object nbt)"
+        ));
+        assert!(NEOFORGE_BIOME_MODIFIER_OBJECT_SOURCE.contains("modify(Object registryAccess"));
+    }
+
+    /// A bounded row is one per member, and the list cannot grow without a cap.
+    #[test]
+    fn legacy_bounds_are_deduplicated_and_capped() {
+        let mut report = Report::default();
+        report.bound_legacy("a/B", "m", "why");
+        report.bound_legacy("a/B", "m", "why");
+        assert_eq!(
+            report.legacy,
+            vec![LegacyBound {
+                class: "a/B".to_owned(),
+                member: "m".to_owned(),
+                reason: "why".to_owned(),
+            }]
+        );
+        for index in 0..MAX_LEGACY_BOUNDS + 8 {
+            report.bound_legacy(format!("a/C{index}"), "m", "why");
+        }
+        assert_eq!(report.legacy.len(), MAX_LEGACY_BOUNDS);
     }
 
     /// The entity/attribute/synched-data/damage slice through the generator and
@@ -20635,6 +20807,12 @@ public class Probe {
                 "public enum MobCategory { MISC }",
             ),
             ("net/minecraft/world/level/Level.java", "public class Level {}"),
+            // Fabric's `BlockColorProvider` names this view, not `Level`; the
+            // colour shim's `world` parameter must carry the real descriptor.
+            (
+                "net/minecraft/world/level/BlockAndTintGetter.java",
+                "public interface BlockAndTintGetter {}",
+            ),
             (
                 "net/minecraft/world/level/block/entity/BlockEntity.java",
                 "public class BlockEntity {}",
@@ -20695,7 +20873,7 @@ public class Probe {
         .collect();
         let lib_jar = build_jar("lib", &lib_sources);
 
-        let scenarios: [(&str, &[&str], &[&str]); 14] = [
+        let scenarios: [(&str, &[&str], &[&str]); 15] = [
             (
                 "fabric-events",
                 &[
@@ -20941,6 +21119,27 @@ public class Probe {
                     "net/minecraftforge/network/simple/SimpleChannel.java",
                 ],
             ),
+            // The three legacy surfaces named in the shim audit, in one target:
+            // a Forge channel factory, NeoForge's removed `IStorage` marker and
+            // Fabric's colour registry. Two stay object-shaped on purpose and
+            // must appear in `Report::legacy`; the colour registry must carry
+            // its typed descriptors. javac is the judge that they still compile
+            // together on a partial game jar.
+            (
+                "legacy-shims",
+                &[
+                    "net/minecraftforge/network/NetworkRegistry",
+                    "net/minecraftforge/network/simple/SimpleChannel",
+                    "net/neoforged/neoforge/common/capabilities/IStorage",
+                    "net/fabricmc/fabric/api/client/rendering/v1/ColorProviderRegistry",
+                ],
+                &[
+                    "net/minecraftforge/network/NetworkRegistry.java",
+                    "net/minecraftforge/network/simple/SimpleChannel.java",
+                    "net/neoforged/neoforge/common/capabilities/IStorage.java",
+                    "net/fabricmc/fabric/api/client/rendering/v1/ColorProviderRegistry.java",
+                ],
+            ),
             (
                 "mixed",
                 &[
@@ -21059,6 +21258,94 @@ public class Probe {
                         "java.util.function.BiFunction encoder, java.util.function.BiFunction decoder, java.util.function.BiConsumer handler"
                     ),
                     "{name}: the channel registration lost its JDK descriptors"
+                );
+            }
+            if name == "legacy-shims" {
+                // The colour registry links: its provider and single-target
+                // overloads name real 26.3 game classes, never `Object`.
+                let colors =
+                    read("net/fabricmc/fabric/api/client/rendering/v1/ColorProviderRegistry.java");
+                for member in [
+                    "int getColor(net.minecraft.world.level.block.state.BlockState state, net.minecraft.world.level.BlockAndTintGetter world, net.minecraft.core.BlockPos pos, int tintIndex);",
+                    "public ColorProvider register(net.minecraft.world.level.block.Block target, ColorProvider provider) {",
+                    "public ColorProvider register(net.minecraft.world.item.Item target, ColorProvider provider) {",
+                ] {
+                    assert!(
+                        colors.contains(member),
+                        "{name}: the colour registry lost {member}"
+                    );
+                }
+                assert!(
+                    !colors.contains("Object target") && !colors.contains("Object world"),
+                    "{name}: the colour registry kept an Object parameter"
+                );
+                // The bounded legacy surfaces stayed bounded, and each is named
+                // in the report instead of only in a comment.
+                let registry = read("net/minecraftforge/network/NetworkRegistry.java");
+                assert!(
+                    registry.contains(
+                        "newSimpleChannel(Object name, Object protocol, Object clientAccepted, Object serverAccepted)"
+                    ),
+                    "{name}: NetworkRegistry no longer carries the bounded legacy descriptor"
+                );
+                let storage = read("net/neoforged/neoforge/common/capabilities/IStorage.java");
+                assert!(
+                    storage.contains("readNBT(Object capability, T instance, Object side)")
+                        && storage.contains(
+                            "writeNBT(Object capability, T instance, Object side, Object nbt)"
+                        ),
+                    "{name}: IStorage no longer carries the bounded legacy descriptor"
+                );
+                let rows: Vec<(&str, &str)> = report
+                    .legacy
+                    .iter()
+                    .map(|row| (row.class.as_str(), row.member.as_str()))
+                    .collect();
+                for row in [
+                    (
+                        "net/minecraftforge/network/NetworkRegistry",
+                        "newSimpleChannel",
+                    ),
+                    (
+                        "net/neoforged/neoforge/common/capabilities/IStorage",
+                        "readNBT/writeNBT",
+                    ),
+                ] {
+                    assert!(
+                        rows.contains(&row),
+                        "{name}: the bounded shim {row:?} is missing from Report::legacy ({rows:?})"
+                    );
+                }
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|(class, _)| class.contains("ColorProviderRegistry")),
+                    "{name}: a typed shim was reported as bounded"
+                );
+                // `IEventBus.register(Object)` is genuinely Object in the real
+                // bus API; leaving it erased is the correct descriptor.
+                let bus = read("net/neoforged/bus/api/IEventBus.java");
+                assert!(
+                    bus.contains("default IEventBus register(Object object)")
+                        && bus.contains("default IEventBus unregister(Object object)"),
+                    "{name}: the event bus lost its real Object listeners"
+                );
+                // `Capability#orEmpty(R, Object)` is genuinely Object in the
+                // real Forge API; typing it would change the invoke descriptor.
+                let capability = read("net/minecraftforge/common/capabilities/Capability.java");
+                assert!(
+                    capability.contains("orEmpty(R value, Object requested)"),
+                    "{name}: Capability lost its real Object request marker"
+                );
+            }
+            if name == "mixed" {
+                // `Registry<T>#getKey(T)` erases to Object on the real class;
+                // typing this would change the descriptor a jar invokes.
+                let registry = read("net/minecraft/core/Registry.java");
+                assert!(
+                    registry.contains("getKey(java.lang.Object")
+                        || registry.contains("getKey(Object value)"),
+                    "{name}: Registry lost its erased getKey descriptor"
                 );
             }
         }
