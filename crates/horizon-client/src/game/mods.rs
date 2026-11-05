@@ -1189,10 +1189,10 @@ pub(super) fn run_java_mods_with_report(
                 path.display()
             );
         }
-        horizon_client::lan::payloads::store_handler_jar(
-            jar.clone(),
-            host.payload_registrations().to_vec(),
-        );
+        // Keep the bootstrapped host, not just its registrations: dispatch
+        // resolves a registration's payload-type marker through the host's
+        // channel map, and a jar stored without one never matches a frame.
+        horizon_client::lan::payloads::store_handler_host(jar.clone(), &host);
         java_runtimes()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
