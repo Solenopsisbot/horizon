@@ -7428,6 +7428,11 @@ mod real_loader_tests {
             "StubEntrypoint",
             "testLaunchCalled",
             "case \"launch\"",
+            "unlockClassPath",
+            "KnotClassLoaderInterface",
+            "addCodeSource",
+            "setAllowedPrefixes",
+            "classPathOutcome",
         ] {
             assert!(LOADER_BRIDGE_SOURCE.contains(needed), "missing {needed}");
         }
@@ -7437,6 +7442,7 @@ mod real_loader_tests {
         assert!(USAGE.contains("--provider-report"));
         assert!(USAGE.contains("--real-launch"));
         assert!(USAGE.contains("--fabric-discovery"));
+        assert!(USAGE.contains("--classpath-unlock"));
     }
 
     #[test]
