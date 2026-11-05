@@ -19,8 +19,13 @@
 //! ```text
 //! aload_0                         (only when the callback takes the receiver)
 //! <load every argument from its local slot>
+//! new CallbackInfo; dup; invokespecial <init>()V   (only with a trailing CallbackInfo)
 //! invokestatic callback
 //! ```
+//!
+//! The `CallbackInfo` is built after the arguments so it is the last value the
+//! callback consumes, and it lives only on the operand stack: no fresh local,
+//! no `max_locals` growth and no verifier frame changes.
 //!
 //! [`weave_return`] inserts a callback immediately before every return-family
 //! instruction (`return`, `ireturn`, `areturn`, `freturn`, `dreturn`,
@@ -141,12 +146,15 @@
 //! The callback descriptor must consume exactly the target's arguments and
 //! return `void`.  An instance target's callback may instead take the target
 //! instance as an extra first parameter, which the inserted `aload_0` supplies.
-//! A non-void `RETURN`/`TAIL` callback must end with a
-//! `CallbackInfoReturnable`, which the insert supplies.  A cancellable `void`
-//! `HEAD` callback ends with a `CallbackInfo` instead: the insert constructs
-//! [`callback_info_class`], passes it, and emits
-//! `if (!ci.isCancelled()) goto body; return`, so a cancelled callback skips the
-//! target body and the method answers with the `void` default.
+//! A non-cancellable callback may end with a plain `CallbackInfo`, which the
+//! insert constructs and passes; nothing reads `isCancelled` on it, so a
+//! `cancel()` from a non-cancellable callback changes nothing.  A non-void
+//! `RETURN`/`TAIL` callback must end with a `CallbackInfoReturnable`, which the
+//! insert supplies.  A cancellable `void` `HEAD` callback ends with a
+//! `CallbackInfo` instead: the insert constructs [`callback_info_class`], passes
+//! it, and emits `if (!ci.isCancelled()) goto body; return`, so a cancelled
+//! callback skips the target body and the method answers with the `void`
+//! default.
 //!
 //! [`weave_class`] applies every matching `HEAD` plan first, then every
 //! `RETURN`/`TAIL` plan, re-parsing the class between edits and skipping plans
@@ -155,6 +163,14 @@
 //! unchanged.  [`weave_classes_with_extras`] additionally reports the synthetic
 //! classes a rewrite references ([`WovenClasses::added`]), which is what a jar
 //! writer has to add beside the rewritten class.
+//!
+//! A callback that is an *instance* method of its owner cannot be the target of
+//! an `invokestatic`.  [`weave_classes_with_extras`] detects those from the
+//! class set and routes them through one synthetic static bridge class per
+//! (target, callback owner) pair: the woven insert still calls `invokestatic`,
+//! the bridge holds the instance in a static field and delegates with
+//! `invokevirtual`.  See [`weave_classes_with_extras_and_instance_callbacks`]
+//! for the explicit form a caller with a partial class set uses.
 //!
 //! # What it does not support
 //!
@@ -3399,16 +3415,31 @@ enum Injected {
     Cancellable,
 }
 
+/// The callback shape one insert emits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CallbackShape {
+    /// The callback takes the target instance as an extra first parameter,
+    /// which the inserted `aload_0` supplies.
+    takes_receiver: bool,
+    /// The callback ends with a plain `CallbackInfo`, which the insert
+    /// constructs before the call and passes as the last argument.
+    callback_info: bool,
+}
+
 /// Check a callback descriptor against the weave shape.
 ///
-/// Returns whether the callback takes the target instance as an extra first
-/// parameter (which the inserted `aload_0` supplies).  A static target's
-/// callback must take exactly the target's arguments; an instance target's
-/// callback may take them with or without the receiver.
+/// Returns the loads the insert has to push.  A static target's callback must
+/// take exactly the target's arguments; an instance target's callback may take
+/// them with or without the receiver.
 ///
 /// `injected` names the object the callback must end with, if any: the
 /// `CallbackInfoReturnable` a non-void return insert builds, or the
 /// `CallbackInfo` a cancellable `void` `HEAD` insert builds.
+///
+/// A non-cancellable insert also accepts a trailing plain `CallbackInfo`: it
+/// builds [`callback_info_class`] and passes it, which is the object real Mixin
+/// hands every `@Inject` callback.  Nothing reads `isCancelled` on that object,
+/// so a `cancel()` from a non-cancellable callback changes nothing.
 fn callback_arguments(
     class_name: &str,
     is_static: bool,
@@ -3416,7 +3447,7 @@ fn callback_arguments(
     callback_descriptor: &str,
     anchor: &str,
     injected: Injected,
-) -> Result<bool, String> {
+) -> Result<CallbackShape, String> {
     if !crate::valid_method_descriptor(callback_descriptor) {
         return Err(format!(
             "callback descriptor {callback_descriptor:?} is not a method descriptor"
@@ -3424,17 +3455,16 @@ fn callback_arguments(
     }
     let callback_arguments = crate::descriptor_arguments(callback_descriptor);
     let last = callback_arguments.last().map(String::as_str);
-    let trailing_desc = match injected {
-        Injected::None => {
-            if let Some(last) = last
-                && crate::is_callback_info_descriptor(last)
-            {
+    let (trailing_desc, callback_info) = match injected {
+        Injected::None => match last {
+            Some(last) if last == CALLBACK_INFO_DESC => (Some(CALLBACK_INFO_DESC), true),
+            Some(last) if last == CALLBACK_INFO_RETURNABLE_DESC => {
                 return Err(format!(
-                    "callback {callback_descriptor} takes a trailing CallbackInfo; {anchor} weaving with CallbackInfo needs the interpreter path"
+                    "callback {callback_descriptor} takes a trailing CallbackInfoReturnable; only a non-void RETURN/TAIL insert carries a result"
                 ));
             }
-            None
-        }
+            _ => (None, false),
+        },
         Injected::Returnable => {
             if last != Some(CALLBACK_INFO_RETURNABLE_DESC) {
                 let detail = if last.is_some_and(crate::is_callback_info_descriptor) {
@@ -3446,7 +3476,7 @@ fn callback_arguments(
                     "{anchor} weaving a non-void target needs the callback's last argument to be {CALLBACK_INFO_RETURNABLE_DESC}: the insert boxes the target's result into that object and returns getReturnValue(), so no override branch and no synthesised StackMapTable frame is needed; {detail}, so {callback_descriptor} cannot observe or replace the result and stays on the interpreter path"
                 ));
             }
-            Some(CALLBACK_INFO_RETURNABLE_DESC)
+            (Some(CALLBACK_INFO_RETURNABLE_DESC), false)
         }
         Injected::Cancellable => {
             if last != Some(CALLBACK_INFO_DESC) {
@@ -3459,7 +3489,7 @@ fn callback_arguments(
                     "{anchor} weaving a cancellable void target needs the callback's last argument to be {CALLBACK_INFO_DESC}, which the insert constructs and cancels with; {detail}, so {callback_descriptor} cannot cancel and stays on the interpreter path"
                 ));
             }
-            Some(CALLBACK_INFO_DESC)
+            (Some(CALLBACK_INFO_DESC), true)
         }
     };
     if crate::return_desc(callback_descriptor) != "V" {
@@ -3486,7 +3516,10 @@ fn callback_arguments(
     };
     let plain = descriptor(None);
     if callback_descriptor == plain {
-        return Ok(false);
+        return Ok(CallbackShape {
+            takes_receiver: false,
+            callback_info,
+        });
     }
     if is_static {
         return Err(format!(
@@ -3495,7 +3528,10 @@ fn callback_arguments(
     }
     let with_receiver = descriptor(Some(class_name));
     if callback_descriptor == with_receiver {
-        return Ok(true);
+        return Ok(CallbackShape {
+            takes_receiver: true,
+            callback_info,
+        });
     }
     Err(format!(
         "callback descriptor {callback_descriptor} does not match the woven arguments {plain} or {with_receiver}"
@@ -4675,6 +4711,52 @@ fn callback_call(
     })
 }
 
+/// Emit the loads for one non-cancellable callback whose last argument is a
+/// plain `CallbackInfo`.
+///
+/// The object is constructed after the arguments, because it has to be the
+/// topmost value at the call: the stack ends as `[..., receiver?, args..., ci]`
+/// and `invokestatic` consumes it.  Nothing keeps a reference to the object
+/// afterwards, so it lives only on the operand stack: no fresh local, no
+/// `max_locals` growth and no verifier frame changes, which is what lets the
+/// same insert sit in front of a `return` without disturbing its result.
+fn plain_callback_info_call(
+    target: &Target<'_>,
+    callback: &MethodRef,
+    takes_receiver: bool,
+    pool: &mut PoolBuilder<'_>,
+) -> Result<CallbackCall, String> {
+    let mut inserted = Vec::new();
+    let mut slots = 0u16;
+    let mut local_slots = if target.is_static { 0 } else { 1 };
+    for load in argument_loads(target, takes_receiver)? {
+        load.emit(&mut inserted);
+        let (slot, width) = load.span();
+        local_slots = local_slots.max(slot.checked_add(width).ok_or("local slot overflow")?);
+        slots = slots.checked_add(width).ok_or("argument slot overflow")?;
+    }
+    let info = pool.class(CALLBACK_INFO_CLASS)?;
+    inserted.push(0xbb); // new CallbackInfo
+    inserted.extend_from_slice(&info.to_be_bytes());
+    inserted.push(0x59); // dup
+    let init = pool.method_ref(&MethodRef {
+        owner: CALLBACK_INFO_CLASS.to_owned(),
+        name: "<init>".to_owned(),
+        descriptor: "()V".to_owned(),
+    })?;
+    inserted.push(0xb7); // invokespecial CallbackInfo.<init>()V
+    inserted.extend_from_slice(&init.to_be_bytes());
+    let callback_index = pool.method_ref(callback)?;
+    inserted.push(0xb8); // invokestatic callback
+    inserted.extend_from_slice(&callback_index.to_be_bytes());
+    Ok(CallbackCall {
+        bytes: inserted,
+        // The arguments and the constructed object.
+        stack_slots: slots.saturating_add(1),
+        local_slots,
+    })
+}
+
 /// The wrapper class, `valueOf` descriptor and unboxing method that move one
 /// primitive return descriptor through a `CallbackInfoReturnable`.
 fn primitive_wrapper(descriptor: &str) -> Option<(&'static str, &'static str, &'static str)> {
@@ -4996,7 +5078,10 @@ fn resolve_slice(
 /// callback takes the target's arguments in order and returns `void`.  An
 /// instance target's callback may take the target instance first, which is
 /// what the inserted `aload_0` supplies; a callback that does not declare it
-/// gets the arguments only, and no receiver is pushed.
+/// gets the arguments only, and no receiver is pushed.  A trailing plain
+/// `CallbackInfo` is constructed by the insert and passed as the last
+/// argument; [`weave_classes_with_extras`] is how an instance callback (which
+/// cannot be `invokestatic`ed) gets the synthetic bridge that reaches it.
 ///
 /// The insert moves every branch target, switch table, exception range,
 /// stack-map frame and debug-table offset after it; see [`crate::weaver`] for
@@ -5004,8 +5089,9 @@ fn resolve_slice(
 ///
 /// Errors name the reason a method is outside the subset instead of guessing:
 /// malformed condy, abstract/native methods, a mismatched callback descriptor,
-/// `CallbackInfo` parameters, a `wide` prefix that is not a local-variable
-/// instruction, or a conditional branch the split cannot express.
+/// a trailing `CallbackInfoReturnable` on a non-return anchor, a `wide` prefix
+/// that is not a local-variable instruction, or a conditional branch the split
+/// cannot express.
 pub fn weave_head(
     class: &ClassFile,
     target: &MethodRef,
@@ -5024,7 +5110,7 @@ fn weave_head_shape(
 ) -> Result<Vec<u8>, String> {
     let target = prepare_target(class, target)?;
     let label = target.label();
-    let takes_receiver = callback_arguments(
+    let shape = callback_arguments(
         &target.class_name,
         target.is_static,
         &target.descriptor,
@@ -5034,7 +5120,11 @@ fn weave_head_shape(
     )?;
 
     let mut pool = PoolBuilder::new(&class.pool);
-    let call = callback_call(&target, callback, takes_receiver, &mut pool)?;
+    let call = if shape.callback_info {
+        plain_callback_info_call(&target, callback, shape.takes_receiver, &mut pool)?
+    } else {
+        callback_call(&target, callback, shape.takes_receiver, &mut pool)?
+    };
     let code = target.code()?;
     let scan = scan_code(&label, code.code)?;
     let insert_at = match shift {
@@ -5156,16 +5246,19 @@ pub fn weave_head_shifted(
 ///
 /// The callback is invoked with `invokestatic`.  A callback takes the target's
 /// arguments in order and returns `void`.  An instance target's callback may
-/// take the target instance first, which the inserted `aload_0` supplies.
-/// Each insert relocates the offsets after it exactly as [`weave_head`] does,
-/// so a branchy method, a loop, a `tableswitch`/`lookupswitch` (whose padding is
-/// re-derived from its new offset), a `wide` local and an exception handler
-/// keep their targets and frames.  Unlike a `HEAD` insert, a `RETURN` insert is
-/// entered by the branches and switch cases that named the `return`.
+/// take the target instance first, which the inserted `aload_0` supplies.  A
+/// trailing plain `CallbackInfo` is constructed by the insert and passed; the
+/// result stays on the operand stack underneath the inserted values, so the
+/// target still returns its own value.  Each insert relocates the offsets after
+/// it exactly as [`weave_head`] does, so a branchy method, a loop, a
+/// `tableswitch`/`lookupswitch` (whose padding is re-derived from its new
+/// offset), a `wide` local and an exception handler keep their targets and
+/// frames.  Unlike a `HEAD` insert, a `RETURN` insert is entered by the
+/// branches and switch cases that named the `return`.
 /// Every other rejection matches
 /// [`weave_head`]: malformed condy, abstract/native methods, a mismatched
-/// callback descriptor, or a `void` target whose callback asks for a
-/// `CallbackInfo`.
+/// callback descriptor, or a non-void target whose callback ends with a plain
+/// `CallbackInfo` instead of a `CallbackInfoReturnable`.
 pub fn weave_return(
     class: &ClassFile,
     target: &MethodRef,
@@ -5266,7 +5359,7 @@ fn weave_return_shape(
             target.descriptor
         ));
     }
-    let takes_receiver = callback_arguments(
+    let shape = callback_arguments(
         &target.class_name,
         target.is_static,
         &target.descriptor,
@@ -5321,11 +5414,14 @@ fn weave_return_shape(
     // local.
     let (call, frame_sites) = if observes_result {
         let slot = code.max_locals.max(argument_slots(&target)?);
-        let call = returnable_call(&target, callback, takes_receiver, slot, &mut pool)?;
+        let call = returnable_call(&target, callback, shape.takes_receiver, slot, &mut pool)?;
         let sites = FrameSites::InsertOnly;
         (call, sites)
+    } else if shape.callback_info {
+        let call = plain_callback_info_call(&target, callback, shape.takes_receiver, &mut pool)?;
+        (call, FrameSites::Both)
     } else {
-        let call = callback_call(&target, callback, takes_receiver, &mut pool)?;
+        let call = callback_call(&target, callback, shape.takes_receiver, &mut pool)?;
         (call, FrameSites::Both)
     };
     if code.code.len() + call.bytes.len() * sites.len() > MAX_CODE_LENGTH {
@@ -5494,7 +5590,7 @@ pub fn weave_head_cancellable(
             "{label}: cancellable HEAD weaving is bounded to void targets; a non-void target needs a CallbackInfoReturnable and stays on the interpreter path"
         ));
     }
-    let takes_receiver = callback_arguments(
+    let shape = callback_arguments(
         &target.class_name,
         target.is_static,
         &target.descriptor,
@@ -5507,7 +5603,7 @@ pub fn weave_head_cancellable(
     let scan = scan_code(&label, code.code)?;
     let slot = code.max_locals.max(argument_slots(&target)?);
     let mut pool = PoolBuilder::new(&class.pool);
-    let call = cancellable_head_call(&target, callback, takes_receiver, slot, &mut pool)?;
+    let call = cancellable_head_call(&target, callback, shape.takes_receiver, slot, &mut pool)?;
     if code.code.len() + call.bytes.len() > MAX_CODE_LENGTH {
         return Err(format!(
             "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
@@ -5815,9 +5911,10 @@ fn push_goto(out: &mut Vec<u8>) {
 ///
 /// The callback shape is the one the interpreter validates for an INVOKE plan:
 /// it mirrors the woven method's arguments, may take the woven method's
-/// receiver first, may end with a `CallbackInfo` when `cancellable`, and
-/// returns `void`.  The callback therefore sees the method the call site lives
-/// in, not the callee's arguments.
+/// receiver first, may end with a `CallbackInfo` (always for `cancellable`,
+/// and as a plain constructed marker otherwise), and returns `void`.  The
+/// callback therefore sees the method the call site lives in, not the callee's
+/// arguments.
 ///
 /// A non-cancellable insert is stack-neutral: it is the same load-arguments and
 /// `invokestatic` sequence a `HEAD` insert emits, placed before each matching
@@ -5978,7 +6075,7 @@ fn weave_invoke_shape(
             "{label}: a cancellable INVOKE insert cannot be shifted; its cancellation branch has to sit on the call it skips"
         ));
     }
-    let takes_receiver = callback_arguments(
+    let shape = callback_arguments(
         &target.class_name,
         target.is_static,
         &target.descriptor,
@@ -6000,7 +6097,14 @@ fn weave_invoke_shape(
                 sites.len()
             ));
         };
-        return weave_cancellable_invoke(&target, callback, takes_receiver, site, code, &scan);
+        return weave_cancellable_invoke(
+            &target,
+            callback,
+            shape.takes_receiver,
+            site,
+            code,
+            &scan,
+        );
     }
 
     let offsets = match shift {
@@ -6021,7 +6125,11 @@ fn weave_invoke_shape(
     };
 
     let mut pool = PoolBuilder::new(&class.pool);
-    let call = callback_call(&target, callback, takes_receiver, &mut pool)?;
+    let call = if shape.callback_info {
+        plain_callback_info_call(&target, callback, shape.takes_receiver, &mut pool)?
+    } else {
+        callback_call(&target, callback, shape.takes_receiver, &mut pool)?
+    };
     if code.code.len() + call.bytes.len() * offsets.len() > MAX_CODE_LENGTH {
         return Err(format!(
             "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
@@ -6241,6 +6349,20 @@ pub fn weave_class_with_extras(
     class: &ClassFile,
     plans: &[MixinInjectionPlan],
 ) -> Result<(Vec<u8>, BTreeMap<String, Vec<u8>>), String> {
+    weave_class_with_extras_inner(class, plans, &[])
+}
+
+/// The shared body of [`weave_class_with_extras`] and
+/// [`weave_classes_with_extras_and_instance_callbacks`].
+///
+/// `instance_callbacks` names the callback methods that are instance methods on
+/// their owner; each one is reached through a synthetic bridge class (see
+/// [`bridge_instance_callbacks`]) instead of an `invokestatic` that cannot link.
+fn weave_class_with_extras_inner(
+    class: &ClassFile,
+    plans: &[MixinInjectionPlan],
+    instance_callbacks: &[MethodRef],
+) -> Result<(Vec<u8>, BTreeMap<String, Vec<u8>>), String> {
     let matching = plans
         .iter()
         .filter(|plan| plan.target.owner == class.name)
@@ -6282,10 +6404,22 @@ pub fn weave_class_with_extras(
         }
     }
 
+    let mut resolved = matching
+        .iter()
+        .map(|plan| (*plan).clone())
+        .collect::<Vec<_>>();
+    let bridges = bridge_instance_callbacks(class, &mut resolved, instance_callbacks)?;
+
     let mut current = class.write()?;
     let mut needs_returnable = false;
-    let mut needs_callback_info = false;
-    for plan in matching.iter().filter(|plan| plan.at == "HEAD") {
+    // A plain `CallbackInfo` argument means the insert constructs the synthetic
+    // class, cancellation aside: a non-cancellable callback still receives one.
+    let mut needs_callback_info = resolved.iter().any(|plan| {
+        crate::descriptor_arguments(&plan.callback.descriptor)
+            .last()
+            .is_some_and(|argument| argument == CALLBACK_INFO_DESC)
+    });
+    for plan in resolved.iter().filter(|plan| plan.at == "HEAD") {
         let next = ClassFile::parse(&current)
             .map_err(|error| format!("rewritten class did not parse again: {error}"))?;
         current = if plan.cancellable {
@@ -6303,7 +6437,7 @@ pub fn weave_class_with_extras(
             weave_head_selected(&next, &plan.target, &plan.callback, plan.ordinal)?
         };
     }
-    for plan in matching
+    for plan in resolved
         .iter()
         .filter(|plan| plan.at == "RETURN" || plan.at == "TAIL")
     {
@@ -6332,7 +6466,7 @@ pub fn weave_class_with_extras(
             weave_return(&next, &plan.target, &plan.callback, mode)?
         };
     }
-    for plan in matching.iter().filter(|plan| plan.at == "INVOKE") {
+    for plan in resolved.iter().filter(|plan| plan.at == "INVOKE") {
         let next = ClassFile::parse(&current)
             .map_err(|error| format!("rewritten class did not parse again: {error}"))?;
         // A cancellable INVOKE constructs the same runtime-owned `CallbackInfo`
@@ -6350,7 +6484,239 @@ pub fn weave_class_with_extras(
     if needs_callback_info {
         added.insert(CALLBACK_INFO_CLASS.to_owned(), callback_info_class()?);
     }
+    added.extend(bridges);
     Ok((current, added))
+}
+
+/// One `invokevirtual` bridge method and its installer, as the pool indices
+/// and code bytes [`bridge_class`] writes.
+struct BridgeMethod {
+    /// The static field holding the callback owner's instance.  The callback
+    /// method uses the same name: fields and methods are separate namespaces.
+    name: u16,
+    descriptor: u16,
+    install_name: u16,
+    install_descriptor: u16,
+    callback_body: Vec<u8>,
+    callback_max_stack: u16,
+    callback_max_locals: u16,
+    install_body: Vec<u8>,
+}
+
+/// Whether `callback` is one of the instance callbacks the caller named.
+fn is_instance_callback(instance_callbacks: &[MethodRef], callback: &MethodRef) -> bool {
+    instance_callbacks
+        .iter()
+        .any(|candidate| candidate == callback)
+}
+
+/// The name of the synthetic bridge that reaches `callback_owner`'s instance
+/// callbacks from `target`.
+///
+/// The bridge stays in the callback owner's package, so a package-visible
+/// callback method is invocable from it; the target is hashed into the name so
+/// two targets that share one mixin class get their own bridge (and therefore
+/// their own instance) instead of colliding in the jar.
+fn bridge_class_name(callback_owner: &str, target: &str) -> String {
+    format!(
+        "{callback_owner}$$HorizonBridge${:08x}",
+        fnv1a_32(target.as_bytes())
+    )
+}
+
+/// FNV-1a, only to make the bridge name deterministic and target-specific.
+fn fnv1a_32(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Replace every instance-callback plan's callback with a static method on a
+/// synthetic bridge class, and return those bridge classes.
+///
+/// The weaver only emits `invokestatic`, which cannot link an instance method.
+/// A bridge is the smallest correct indirection: one synthetic class per
+/// (target, callback owner) pair, holding one static field per distinct
+/// callback method, plus
+///
+/// - `callback<i>(<callback descriptor>)`, which loads the field, loads the
+///   callback's own arguments and `invokevirtual`s it - exactly the descriptor
+///   the woven insert already knows how to call;
+/// - `install<i>(L<callback owner>;)V`, the static setter the host calls at
+///   load to give the bridge the instance the woven code runs callbacks on.
+///
+/// The woven class therefore keeps calling `invokestatic`; only the callee is
+/// the bridge.  A bridge field starts `null`, so a host that never installs the
+/// instance fails loudly with a `NullPointerException` rather than running some
+/// other object's state.  The bridge is placed in the callback owner's package
+/// so a package-visible callback is reachable; a `private` callback is rejected
+/// by [`weave_classes_with_extras_and_instance_callbacks`] because no separate
+/// class can invoke it.
+fn bridge_instance_callbacks(
+    class: &ClassFile,
+    plans: &mut [MixinInjectionPlan],
+    instance_callbacks: &[MethodRef],
+) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut by_owner: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    for plan in plans.iter() {
+        if is_instance_callback(instance_callbacks, &plan.callback) {
+            by_owner
+                .entry(plan.callback.owner.clone())
+                .or_default()
+                .insert((plan.callback.name.clone(), plan.callback.descriptor.clone()));
+        }
+    }
+    let mut added = BTreeMap::new();
+    let mut bridges = BTreeMap::new();
+    for (owner, methods) in &by_owner {
+        let bridge_name = bridge_class_name(owner, &class.name);
+        added.insert(
+            bridge_name.clone(),
+            bridge_class(&bridge_name, owner, methods)?,
+        );
+        for (index, (name, descriptor)) in methods.iter().enumerate() {
+            bridges.insert(
+                (owner.clone(), name.clone(), descriptor.clone()),
+                MethodRef {
+                    owner: bridge_name.clone(),
+                    name: format!("callback{index}"),
+                    descriptor: descriptor.clone(),
+                },
+            );
+        }
+    }
+    for plan in plans.iter_mut() {
+        let key = (
+            plan.callback.owner.clone(),
+            plan.callback.name.clone(),
+            plan.callback.descriptor.clone(),
+        );
+        if let Some(bridge) = bridges.get(&key) {
+            plan.callback = bridge.clone();
+        }
+    }
+    Ok(added)
+}
+
+/// The class file [`bridge_instance_callbacks`] adds beside a woven target.
+fn bridge_class(
+    bridge_name: &str,
+    callback_owner: &str,
+    methods: &BTreeSet<(String, String)>,
+) -> Result<Vec<u8>, String> {
+    if methods.is_empty() {
+        return Err(format!(
+            "{bridge_name}: a callback bridge needs at least one callback method"
+        ));
+    }
+    let owner_descriptor = format!("L{callback_owner};");
+    let install_descriptor_text = format!("({owner_descriptor})V");
+    let mut pool: Vec<Cp> = vec![Cp::Empty];
+    let this_class = pool_class(&mut pool, bridge_name);
+    let super_class = pool_class(&mut pool, "java/lang/Object");
+    let code_name = pool_utf8(&mut pool, "Code");
+    let owner_descriptor = pool_utf8(&mut pool, &owner_descriptor);
+    let install_descriptor = pool_utf8(&mut pool, &install_descriptor_text);
+    let mut bridge_methods = Vec::with_capacity(methods.len());
+    for (index, (name, descriptor_text)) in methods.iter().enumerate() {
+        if !crate::valid_method_descriptor(descriptor_text) {
+            return Err(format!(
+                "{bridge_name}: callback descriptor {descriptor_text:?} is not a method descriptor"
+            ));
+        }
+        if crate::return_desc(descriptor_text) != "V" {
+            return Err(format!(
+                "{bridge_name}: a callback bridge only calls void callbacks, but {name}{descriptor_text} returns a value"
+            ));
+        }
+        let method_name = pool_utf8(&mut pool, &format!("callback{index}"));
+        let install_name = pool_utf8(&mut pool, &format!("install{index}"));
+        let callback_name = pool_utf8(&mut pool, name);
+        let descriptor = pool_utf8(&mut pool, descriptor_text);
+        let field = pool_field_ref(&mut pool, bridge_name, method_name, owner_descriptor);
+        let call = pool_method_ref(&mut pool, callback_owner, callback_name, descriptor);
+        let mut callback_body = vec![0xb2]; // getstatic <field>
+        callback_body.extend_from_slice(&field.to_be_bytes());
+        let mut slot = 0u16;
+        for argument in crate::descriptor_arguments(descriptor_text) {
+            let (opcode, width) = load_opcode(&argument)?;
+            local_opcode(&mut callback_body, opcode, slot);
+            slot = slot.checked_add(width).ok_or("local slot overflow")?;
+        }
+        callback_body.push(0xb6); // invokevirtual <callback>
+        callback_body.extend_from_slice(&call.to_be_bytes());
+        callback_body.push(0xb1); // return
+        let mut install_body = vec![0x2a, 0xb3]; // aload_0; putstatic <field>
+        install_body.extend_from_slice(&field.to_be_bytes());
+        install_body.push(0xb1); // return
+        bridge_methods.push(BridgeMethod {
+            name: method_name,
+            descriptor,
+            install_name,
+            install_descriptor,
+            callback_body,
+            // The receiver and every argument.
+            callback_max_stack: slot.saturating_add(1),
+            callback_max_locals: slot,
+            install_body,
+        });
+    }
+
+    let mut out = Vec::new();
+    push_u4(&mut out, 0xCAFE_BABE);
+    push_u2(&mut out, 0); // minor_version
+    push_u2(&mut out, SYNTHETIC_CLASS_MAJOR);
+    push_u2(&mut out, pool.len() as u16);
+    for constant in &pool[1..] {
+        encode_constant(&mut out, constant)?;
+    }
+    push_u2(&mut out, ACC_PUBLIC | ACC_SUPER);
+    push_u2(&mut out, this_class);
+    push_u2(&mut out, super_class);
+    push_u2(&mut out, 0); // interfaces
+    push_u2(&mut out, bridge_methods.len() as u16); // fields
+    for method in &bridge_methods {
+        push_synthetic_field(
+            &mut out,
+            ACC_PRIVATE | ACC_STATIC,
+            method.name,
+            owner_descriptor,
+        );
+    }
+    push_u2(&mut out, (bridge_methods.len() * 2) as u16); // methods
+    for method in &bridge_methods {
+        push_synthetic_method(
+            &mut out,
+            code_name,
+            ACC_PUBLIC | ACC_STATIC,
+            method.install_name,
+            method.install_descriptor,
+            SyntheticCode {
+                max_stack: 1,
+                max_locals: 1,
+                bytes: &method.install_body,
+            },
+        );
+    }
+    for method in &bridge_methods {
+        push_synthetic_method(
+            &mut out,
+            code_name,
+            ACC_PUBLIC | ACC_STATIC,
+            method.name,
+            method.descriptor,
+            SyntheticCode {
+                max_stack: method.callback_max_stack,
+                max_locals: method.callback_max_locals,
+                bytes: &method.callback_body,
+            },
+        );
+    }
+    push_u2(&mut out, 0); // class attributes
+    Ok(out)
 }
 
 /// Whether a `HEAD` plan targets a method whose descriptor returns a value.
@@ -6387,12 +6753,14 @@ fn plan_returns_value(class: &ClassFile, plan: &MixinInjectionPlan) -> bool {
 /// cannot weave instead of skipping them.
 ///
 /// Not supported here, and left to the interpreter: `RETURN`, `TAIL` and
-/// `INVOKE` anchors (the last is [`weave_invoke_plan`]); cancellation; and
-/// `CallbackInfo`/`CallbackInfoReturnable` parameters.  Errors from a matching
-/// plan (ambiguous target descriptor, callback mismatch, a malformed condy
-/// pool, a `wide` prefix that is not a local-variable instruction, a
-/// conditional branch the split cannot express) propagate rather than being
-/// silently skipped.
+/// `INVOKE` anchors (the last is [`weave_invoke_plan`]), cancellation, and
+/// instance callbacks (this entry point has no bridge class to add).  A
+/// trailing plain `CallbackInfo` is accepted, but the bytes reference
+/// [`callback_info_class`], which a caller that writes a jar has to add itself.
+/// Errors from a matching plan (ambiguous target descriptor, callback mismatch,
+/// a malformed condy pool, a `wide` prefix that is not a local-variable
+/// instruction, a conditional branch the split cannot express) propagate rather
+/// than being silently skipped.
 ///
 /// Every insert lands at offset 0, so when several plans match one method the
 /// last plan applied is the first callback to run.  Callers that need Mixin's
@@ -6443,12 +6811,80 @@ pub fn weave_classes(
 /// [`weave_classes`], plus the synthetic classes the rewrites reference.
 ///
 /// [`WovenClasses::added`] holds `CallbackInfoReturnable` when a non-void
-/// `RETURN`/`TAIL` insert landed, unless the input already declares it - a jar
-/// that ships its own copy keeps it.
+/// `RETURN`/`TAIL` insert landed and `CallbackInfo` when any insert passes one,
+/// unless the input already declares the class - a jar that ships its own copy
+/// keeps it.  It also holds one bridge class per (target, callback owner) pair
+/// whose callbacks are instance methods; those are detected from `classes`
+/// here, because the class set knows which callback methods are static.
 pub fn weave_classes_with_extras(
     classes: &BTreeMap<String, ClassFile>,
     plans: &[MixinInjectionPlan],
 ) -> Result<WovenClasses, String> {
+    let instance_callbacks = detect_instance_callbacks(classes, plans);
+    weave_classes_with_extras_and_instance_callbacks(classes, plans, &instance_callbacks)
+}
+
+/// The instance methods among the plans' callbacks that `classes` declares.
+fn detect_instance_callbacks(
+    classes: &BTreeMap<String, ClassFile>,
+    plans: &[MixinInjectionPlan],
+) -> Vec<MethodRef> {
+    let mut seen = BTreeSet::new();
+    let mut instance = Vec::new();
+    for plan in plans {
+        if let Some(method) = classes
+            .get(&plan.callback.owner)
+            .and_then(|class| class.method(&plan.callback.name, &plan.callback.descriptor))
+            && !method.is_static()
+        {
+            let key = (
+                plan.callback.owner.clone(),
+                plan.callback.name.clone(),
+                plan.callback.descriptor.clone(),
+            );
+            if seen.insert(key) {
+                instance.push(plan.callback.clone());
+            }
+        }
+    }
+    instance
+}
+
+/// [`weave_classes_with_extras`] with the instance callbacks named explicitly.
+///
+/// This is the entry point for a caller that has a *partial* class set (for
+/// example the load-time weave, which reads callback staticness from the jar
+/// but weaves one target class at a time): pass every plan callback that is an
+/// instance method.  Each one is reached through a synthetic bridge class the
+/// rewrite adds, so the woven code keeps its `invokestatic`:
+///
+/// ```text
+/// getstatic bridge.callback<i> : L<callback owner>;
+/// <load the callback's arguments>
+/// invokevirtual <callback owner>.<callback name><descriptor>
+/// ```
+///
+/// The host installs the instance the bridge delegates to with the bridge's
+/// `install<i>(L<callback owner>;)V` static method.  A `private` callback is a
+/// reason: a separate class cannot invoke it, and the bounded weave does not
+/// rewrite the callback owner to add an accessor.
+pub fn weave_classes_with_extras_and_instance_callbacks(
+    classes: &BTreeMap<String, ClassFile>,
+    plans: &[MixinInjectionPlan],
+    instance_callbacks: &[MethodRef],
+) -> Result<WovenClasses, String> {
+    for callback in instance_callbacks {
+        if let Some(method) = classes
+            .get(&callback.owner)
+            .and_then(|class| class.method(&callback.name, &callback.descriptor))
+            && method.access & ACC_PRIVATE != 0
+        {
+            return Err(format!(
+                "Mixin callback {}.{}{} is private; a synthetic bridge class cannot invoke it, so the bounded weave needs it public or package-visible",
+                callback.owner, callback.name, callback.descriptor
+            ));
+        }
+    }
     let mut by_owner: BTreeMap<&str, Vec<&MixinInjectionPlan>> = BTreeMap::new();
     for plan in plans {
         by_owner
@@ -6472,7 +6908,8 @@ pub fn weave_classes_with_extras(
                     .iter()
                     .map(|plan| (*plan).clone())
                     .collect::<Vec<_>>();
-                let (bytes, added) = weave_class_with_extras(class, &owned)?;
+                let (bytes, added) =
+                    weave_class_with_extras_inner(class, &owned, instance_callbacks)?;
                 for (name, bytes) in added {
                     woven.added.entry(name).or_insert(bytes);
                 }
@@ -6753,17 +7190,58 @@ mod tests {
         assert!(error.contains("does not match"), "{error}");
     }
 
+    const TEST_CALLBACK_INFO_DESC: &str =
+        "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;";
+
     #[test]
-    fn head_rejects_a_callback_info_parameter() {
+    fn head_weaves_a_static_callback_info_argument() {
         let bytes = fixture(0x0001, "(II)I", 3, &[0x1a, 0x1b, 0x60, 0xac], &[]);
         let class = ClassFile::parse(&bytes).unwrap();
-        let error = weave_head(
-            &class,
-            &target(),
-            &callback("(Ldemo/T;IILorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;)V"),
-        )
-        .unwrap_err();
-        assert!(error.contains("CallbackInfo"), "{error}");
+        let descriptor = format!("(II{TEST_CALLBACK_INFO_DESC})V");
+        let plan = MixinInjectionPlan::inject_at_head(target(), callback(&descriptor));
+        let (woven, added) = weave_class_with_extras(&class, std::slice::from_ref(&plan)).unwrap();
+        assert!(
+            added.contains_key(CALLBACK_INFO_CLASS),
+            "{:?}",
+            added.keys()
+        );
+        let (code, max_stack, _) = woven_code(&woven, "m", "(II)I");
+        // iload_1; iload_2; new; dup; invokespecial; invokestatic.
+        assert_eq!(&code[..4], &[0x15, 0x01, 0x15, 0x02]);
+        assert_eq!(code[4], 0xbb);
+        assert_eq!(code[7], 0x59);
+        assert_eq!(code[8], 0xb7);
+        assert_eq!(code[11], 0xb8);
+        assert_eq!(&code[14..], &[0x1a, 0x1b, 0x60, 0xac]);
+        assert_eq!(max_stack, 2 + 3 + 1);
+        // The bytes-only entry point emits the same insert; the caller just
+        // has to add `CallbackInfo` to the jar.
+        assert_eq!(
+            weave_head(&class, &target(), &callback(&descriptor)).unwrap(),
+            woven
+        );
+    }
+
+    #[test]
+    fn return_weaves_a_static_callback_info_argument() {
+        let bytes = fixture(0x0009, "(I)V", 1, &[0xb1], &[]);
+        let class = ClassFile::parse(&bytes).unwrap();
+        let descriptor = format!("(I{TEST_CALLBACK_INFO_DESC})V");
+        let target = MethodRef {
+            descriptor: "(I)V".into(),
+            ..target()
+        };
+        let woven =
+            weave_return(&class, &target, &callback(&descriptor), ReturnMode::Return).unwrap();
+        let (code, _, max_locals) = woven_code(&woven, "m", "(I)V");
+        // iload_0; new; dup; invokespecial; invokestatic; return.
+        assert_eq!(&code[..2], &[0x15, 0x00]);
+        assert_eq!(code[2], 0xbb);
+        assert_eq!(code[5], 0x59);
+        assert_eq!(code[6], 0xb7);
+        assert_eq!(code[9], 0xb8);
+        assert_eq!(code[12], 0xb1);
+        assert_eq!(max_locals, 1, "the marker lives only on the stack");
     }
 
     /// Parse `Code` out of a woven class so the assertions read the written
