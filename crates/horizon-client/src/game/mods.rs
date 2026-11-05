@@ -2357,8 +2357,10 @@ clientSideOnly = true
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
         let options = zip::write::SimpleFileOptions::default();
         zip.start_file("fabric.mod.json", options).unwrap();
-        zip.write_all(br#"{"id":"demo","version":"1.0","mixins":["demo.mixins.json"]}"#)
-            .unwrap();
+        zip.write_all(
+            br#"{"id":"demo","version":"1.0","mixins":["demo.mixins.json","broken.mixins.json"]}"#,
+        )
+        .unwrap();
         zip.start_file("demo.mixins.json", options).unwrap();
         zip.write_all(br#"{"required":true,"package":"demo.mixin","mixins":["DemoMixin"]}"#)
             .unwrap();
