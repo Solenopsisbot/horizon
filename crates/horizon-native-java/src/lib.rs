@@ -9089,6 +9089,51 @@ impl NativeJar {
         Ok(jar)
     }
 
+    /// This jar with the class bytes a weave produced installed.
+    ///
+    /// Consumes the jar [`Self::from_path`] read, so its metadata, entrypoints,
+    /// resources and declarations stay exactly what that read saw; the zip is
+    /// not opened a second time, and a file replaced in between cannot end up
+    /// with another jar's bytes.  Only [`ClassFile`]s change:
+    ///
+    /// - A class in [`WovenClasses::classes`] replaces the jar's class of that
+    ///   name.  The weaver re-encodes classes it did not touch, and those bytes
+    ///   are identical, so they are not parsed again.
+    /// - A class in [`WovenClasses::added`] is inserted only when the jar does
+    ///   not already hold that name: a jar that ships its own copy keeps it, as
+    ///   the `--weave` jar writer does.
+    ///
+    /// Mixin discovery reads the mixin classes, which weaving leaves alone, so
+    /// the rebuilt jar reports the same plans.  Bytes that do not parse, a name
+    /// the bytes disagree with, or a replacement for a class this jar does not
+    /// have are errors rather than a partly woven jar.
+    pub fn with_woven_classes(mut self, woven: &WovenClasses) -> Result<Self, NativeError> {
+        fn parse_named(name: &str, bytes: &[u8]) -> Result<ClassFile, NativeError> {
+            let class = ClassFile::parse(bytes)?;
+            if class.name != name {
+                return Err(NativeError::Metadata(format!(
+                    "woven class {name} holds the bytes of {}",
+                    class.name
+                )));
+            }
+            Ok(class)
+        }
+        for (name, bytes) in &woven.classes {
+            let existing = self.classes.get(name).ok_or_else(|| {
+                NativeError::Metadata(format!("woven class {name} is not in this jar"))
+            })?;
+            if existing.raw != *bytes {
+                self.classes.insert(name.clone(), parse_named(name, bytes)?);
+            }
+        }
+        for (name, bytes) in &woven.added {
+            if !self.classes.contains_key(name) {
+                self.classes.insert(name.clone(), parse_named(name, bytes)?);
+            }
+        }
+        Ok(self)
+    }
+
     pub fn discover_entrypoint(&self, kind: &str) -> Option<Entrypoint> {
         self.discover_entrypoints(kind).into_iter().next()
     }
@@ -16762,6 +16807,132 @@ fn split_dynamic_captures(captures: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A class with one static `m()V` that returns, the smallest shape the
+    /// weaver accepts. Pool: 1 name, 2 Class 1, 3 `java/lang/Object`, 4 Class 3,
+    /// 5 `m`, 6 `()V`, 7 `Code`.
+    fn weavable_class_bytes(name: &str) -> Vec<u8> {
+        fn utf8(out: &mut Vec<u8>, value: &str) {
+            out.push(1);
+            out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52, 0, 8];
+        utf8(&mut out, name);
+        out.extend_from_slice(&[7, 0, 1]);
+        utf8(&mut out, "java/lang/Object");
+        out.extend_from_slice(&[7, 0, 3]);
+        utf8(&mut out, "m");
+        utf8(&mut out, "()V");
+        utf8(&mut out, "Code");
+        // access, this, super, no interfaces or fields, one method.
+        out.extend_from_slice(&[0, 0x21, 0, 2, 0, 4, 0, 0, 0, 0, 0, 1]);
+        // public static m()V with one attribute, Code.
+        out.extend_from_slice(&[0, 0x09, 0, 5, 0, 6, 0, 1, 0, 7]);
+        // length 13: stacks, one-byte body, no tables.
+        out.extend_from_slice(&[0, 0, 0, 13, 0, 1, 0, 0, 0, 0, 0, 1, 0xb1, 0, 0, 0, 0]);
+        out.extend_from_slice(&[0, 0]); // class attributes
+        out
+    }
+
+    fn method_ref(owner: &str, name: &str) -> MethodRef {
+        MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: "()V".into(),
+        }
+    }
+
+    #[test]
+    fn with_woven_classes_keeps_metadata_and_installs_the_new_classes() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-native-java-woven-metadata-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("woven.jar");
+        let original = weavable_class_bytes("demo/T");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(
+            br#"{"id":"woven","version":"2.0","depends":{"dep":"*"},"entrypoints":{"main":["demo.T"]}}"#,
+        )
+        .unwrap();
+        zip.start_file("assets/demo.txt", options).unwrap();
+        zip.write_all(b"payload").unwrap();
+        zip.start_file("demo/T.class", options).unwrap();
+        zip.write_all(&original).unwrap();
+        zip.finish().unwrap();
+
+        let jar = NativeJar::from_path(&path).unwrap();
+        let class = ClassFile::parse(&original).unwrap();
+        let rewritten = weave_head(
+            &class,
+            &method_ref("demo/T", "m"),
+            &method_ref("demo/Cb", "cb"),
+        )
+        .unwrap();
+        let added = weavable_class_bytes("demo/Added");
+        let woven = jar
+            .clone()
+            .with_woven_classes(&WovenClasses {
+                classes: BTreeMap::from([("demo/T".to_owned(), rewritten.clone())]),
+                added: BTreeMap::from([("demo/Added".to_owned(), added.clone())]),
+            })
+            .unwrap();
+
+        assert_eq!(woven.classes["demo/T"].write().unwrap(), rewritten);
+        assert_eq!(woven.classes["demo/Added"].write().unwrap(), added);
+        assert_eq!(woven.fabric_id.as_deref(), Some("woven"));
+        assert_eq!(woven.fabric_version.as_deref(), Some("2.0"));
+        assert_eq!(woven.required_mods, jar.required_mods);
+        assert_eq!(woven.fabric_entrypoints, jar.fabric_entrypoints);
+        assert_eq!(woven.resources, jar.resources);
+        assert_eq!(woven.resource_bytes, jar.resource_bytes);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn with_woven_classes_keeps_the_jars_own_copy_of_an_added_class() {
+        let own = weavable_class_bytes("demo/Own");
+        let jar = NativeJar::from_classes([ClassFile::parse(&own).unwrap()]);
+        let other = ClassFile::parse(&own).unwrap();
+        let replacement = weave_head(
+            &other,
+            &method_ref("demo/Own", "m"),
+            &method_ref("demo/Cb", "cb"),
+        )
+        .unwrap();
+        let woven = jar
+            .with_woven_classes(&WovenClasses {
+                classes: BTreeMap::new(),
+                added: BTreeMap::from([("demo/Own".to_owned(), replacement)]),
+            })
+            .unwrap();
+        assert_eq!(woven.classes["demo/Own"].write().unwrap(), own);
+    }
+
+    #[test]
+    fn with_woven_classes_rejects_classes_that_do_not_belong() {
+        let own = weavable_class_bytes("demo/Own");
+        let jar = NativeJar::from_classes([ClassFile::parse(&own).unwrap()]);
+        // A replacement must name a class of the jar...
+        let stranger = WovenClasses {
+            classes: BTreeMap::from([("demo/Stranger".to_owned(), own.clone())]),
+            added: BTreeMap::new(),
+        };
+        let error = jar.clone().with_woven_classes(&stranger).unwrap_err();
+        assert!(error.to_string().contains("demo/Stranger"), "{error}");
+        // ...and its bytes must be the class its key says.
+        let renamed = WovenClasses {
+            classes: BTreeMap::new(),
+            added: BTreeMap::from([("demo/Other".to_owned(), own)]),
+        };
+        let error = jar.with_woven_classes(&renamed).unwrap_err();
+        assert!(error.to_string().contains("demo/Other"), "{error}");
+    }
 
     #[test]
     fn descriptor_argument_count_cache_is_exact_and_bounded() {
