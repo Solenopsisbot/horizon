@@ -552,6 +552,21 @@ impl Hub {
             .collect())
     }
 
+    /// The channel registration travels as one custom-payload frame when it
+    /// fits, and as the same bounded chunks as mod payload frames otherwise.
+    fn registration_packets(data: Vec<u8>) -> Result<Vec<C>, String> {
+        let envelopes = payloads::chunk_envelopes(&data)?;
+        Ok(envelopes
+            .into_iter()
+            .map(|data| {
+                C::CustomPayload(CustomPayload {
+                    channel: payloads::REGISTER_CHANNEL.to_owned(),
+                    data,
+                })
+            })
+            .collect())
+    }
+
     /// Send one frame to every guest that accepts it; frames Java mods queued
     /// at bootstrap go out on the next tick after a player joins.
     pub fn broadcast_payload(&mut self, frame: &PayloadFrame) {
@@ -1031,10 +1046,13 @@ impl Hub {
         let registration = self.payloads.registration();
         let declared_content = java_content::JavaContentManifest::from_stored();
         let g = &self.guests[i];
-        g.send(&C::CustomPayload(CustomPayload {
-            channel: payloads::REGISTER_CHANNEL.to_owned(),
-            data: registration,
-        }));
+        if let Ok(packets) = Self::registration_packets(registration) {
+            for packet in packets {
+                g.send(&packet);
+            }
+        } else {
+            log::warn!("Horizon: mod payload registration was too large to send");
+        }
         // The declared ids travel with the channel registration, so the guest
         // can resolve menus, items and block entities before the first chunk.
         if let Some(packet) = Self::java_content_packet(&declared_content) {
@@ -3688,6 +3706,36 @@ mod tests {
             panic!("a payload travels on the payload channel only");
         };
         assert_eq!(payload.data, small, "unchanged on the wire");
+        assert!(!payloads::is_chunk_envelope(&payload.data));
+    }
+
+    #[test]
+    fn a_registration_above_the_envelope_travels_as_chunks() {
+        let registration = vec![0x42; 40 * 1024];
+        let packets = Hub::registration_packets(registration.clone()).unwrap();
+        assert!(packets.len() > 1);
+        let mut assembler = payloads::ChunkAssembler::new();
+        let mut joined = None;
+        for packet in &packets {
+            let C::CustomPayload(payload) = packet else {
+                panic!("a registration travels as a custom payload");
+            };
+            assert_eq!(payload.channel, payloads::REGISTER_CHANNEL);
+            assert!(payload.data.len() <= payloads::MAX_ENVELOPE);
+            assert!(payloads::is_chunk_envelope(&payload.data));
+            if let Some(data) = assembler.push(&payload.data).unwrap() {
+                joined = Some(data);
+            }
+        }
+        assert_eq!(joined.as_deref(), Some(registration.as_slice()));
+
+        let small = vec![1, 2, 3];
+        let packets = Hub::registration_packets(small.clone()).unwrap();
+        assert_eq!(packets.len(), 1);
+        let C::CustomPayload(payload) = &packets[0] else {
+            panic!("a registration travels as a custom payload");
+        };
+        assert_eq!(payload.data, small);
         assert!(!payloads::is_chunk_envelope(&payload.data));
     }
 

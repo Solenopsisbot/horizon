@@ -327,6 +327,9 @@ pub(super) struct Remote {
     /// Joins the chunks of an oversized mod payload frame the server sends
     /// ([`payloads::chunk_envelopes`]); one transfer is in flight at a time.
     chunks: payloads::ChunkAssembler,
+    /// Joins an oversized channel registration from the server. Registration
+    /// has its own assembler because chunk envelopes do not carry a channel id.
+    registration_chunks: payloads::ChunkAssembler,
     state_id: i32,
     use_target: Option<[i32; 3]>,
     entities: HashMap<i32, Tracked>,
@@ -727,6 +730,7 @@ impl Game<'_> {
             menu_title: None,
             payloads: PayloadLink::from_declared(),
             chunks: payloads::ChunkAssembler::new(),
+            registration_chunks: payloads::ChunkAssembler::new(),
             state_id: 0,
             use_target: None,
             entities: HashMap::new(),
@@ -2472,8 +2476,13 @@ impl Game<'_> {
             // The server's declared mod payload channels, then their frames.
             C::CustomPayload(p) if p.channel == payloads::REGISTER_CHANNEL => {
                 if let Some(r) = self.remote.as_mut() {
-                    match r.payloads.apply_registration(&p.data) {
-                        Ok(count) => {
+                    match receive_registration(
+                        &mut r.payloads,
+                        &mut r.registration_chunks,
+                        &p.data,
+                    ) {
+                        Ok(None) => {}
+                        Ok(Some(count)) => {
                             log::info!("Horizon: server declared {count} mod payload channel(s)")
                         }
                         Err(error) => {
@@ -8938,6 +8947,38 @@ fn receive_payload(
     Ok(true)
 }
 
+/// One channel-registration packet from the server. Small registrations are
+/// applied directly; oversized ones use the same ordered chunk envelopes as
+/// payload frames, with an assembler dedicated to this channel.
+fn receive_registration(
+    link: &mut PayloadLink,
+    chunks: &mut payloads::ChunkAssembler,
+    data: &[u8],
+) -> std::result::Result<Option<usize>, String> {
+    if !payloads::is_chunk_envelope(data) {
+        if !chunks.is_idle() {
+            *chunks = payloads::ChunkAssembler::new();
+            return Err("a whole registration arrived mid-transfer".to_owned());
+        }
+        return link.apply_registration(data).map(Some);
+    }
+    let joined = match chunks.push(data) {
+        Ok(Some(joined)) => joined,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            *chunks = payloads::ChunkAssembler::new();
+            return Err(error);
+        }
+    };
+    match link.apply_registration(&joined) {
+        Ok(count) => Ok(Some(count)),
+        Err(error) => {
+            *chunks = payloads::ChunkAssembler::new();
+            Err(error)
+        }
+    }
+}
+
 /// One client tick of mod payload traffic over `link`. First up to `cap`
 /// received frames go to `dispatch` (their receivers may queue sends), then up
 /// to `send_cap` server-bound frames from `outgoing` are checked against the
@@ -8992,7 +9033,7 @@ fn pump_client_payloads(
 
 #[cfg(test)]
 mod tests {
-    use super::{pump_client_payloads, receive_payload, synced_local_use};
+    use super::{pump_client_payloads, receive_payload, receive_registration, synced_local_use};
     use horizon_client::lan::payloads;
     use horizon_client::lan::payloads::PayloadLink;
     use horizon_mods::payloads::{
@@ -9020,6 +9061,44 @@ mod tests {
 
     fn frame(id: &str, direction: PayloadDirection) -> PayloadFrame {
         PayloadFrame::new(id, direction, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn registration_chunks_join_and_malformed_sequences_reset() {
+        let mut source_registry = PayloadRegistry::default();
+        for n in 0..1100 {
+            source_registry
+                .register(PayloadDeclaration {
+                    id: format!("demo:channel_{n:04}_with_a_long_name"),
+                    direction: PayloadDirection::PlayToClient,
+                    codec: None,
+                })
+                .unwrap();
+        }
+        let source = PayloadLink::new(source_registry);
+        let encoded = source.registration();
+        assert!(encoded.len() > 40 * 1024);
+        let envelopes = payloads::chunk_envelopes(&encoded).unwrap();
+        let mut target = PayloadLink::default();
+        let mut chunks = payloads::ChunkAssembler::new();
+        for envelope in &envelopes[..envelopes.len() - 1] {
+            assert_eq!(receive_registration(&mut target, &mut chunks, envelope).unwrap(), None);
+        }
+        assert!(!chunks.is_idle());
+        let count = receive_registration(&mut target, &mut chunks, envelopes.last().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 1100);
+        assert_eq!(target.registry().declarations().count(), 1100);
+
+        let small = PayloadLink::new(PayloadRegistry::default()).registration();
+        assert_eq!(payloads::chunk_envelopes(&small).unwrap(), vec![small.clone()]);
+        assert_eq!(receive_registration(&mut target, &mut chunks, &small).unwrap(), Some(0));
+
+        let mut malformed = envelopes[0].clone();
+        malformed[7..9].copy_from_slice(&(payloads::MAX_CHUNKS as u16 + 1).to_be_bytes());
+        assert!(receive_registration(&mut target, &mut chunks, &malformed).is_err());
+        assert!(chunks.is_idle());
     }
 
     fn receive_down(link: &mut PayloadLink, count: usize) {
