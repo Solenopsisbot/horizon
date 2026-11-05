@@ -8914,7 +8914,10 @@ fn pump_client_payloads(
         ) {
             link.send(frame.id(), frame.direction(), frame.bytes().to_vec())
         } else {
-            Err(format!("{} is not a server-bound frame", frame.direction().name()))
+            Err(format!(
+                "{} is not a server-bound frame",
+                frame.direction().name()
+            ))
         };
         match result {
             Ok(data) => pump.encoded.push(data),
@@ -8999,13 +9002,9 @@ mod tests {
         }
         assert!(link.outgoing().is_empty());
         // The next tick continues where this one stopped.
-        let pump = pump_client_payloads(
-            &mut link,
-            128,
-            16,
-            &mut |_| Ok(true),
-            &mut |max| pending.drain(..max.min(pending.len())).collect(),
-        );
+        let pump = pump_client_payloads(&mut link, 128, 16, &mut |_| Ok(true), &mut |max| {
+            pending.drain(..max.min(pending.len())).collect()
+        });
         assert_eq!(pump.dispatched, 72);
         assert_eq!(pump.encoded.len(), 14);
         assert!(link.incoming().is_empty() && pending.is_empty());
@@ -9047,7 +9046,10 @@ mod tests {
             &mut |_| Err("boom".to_owned()),
             &mut |_| std::mem::take(&mut bad),
         );
-        assert_eq!(pump.failed, vec![("demo:down".to_owned(), "boom".to_owned())]);
+        assert_eq!(
+            pump.failed,
+            vec![("demo:down".to_owned(), "boom".to_owned())]
+        );
         assert_eq!(pump.rejected.len(), 1, "the undeclared channel is refused");
         assert_eq!(pump.encoded.len(), 1, "the declared one still goes out");
     }
