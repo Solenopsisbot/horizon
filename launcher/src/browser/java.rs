@@ -8,6 +8,7 @@
 //! Installing copies the carried-over folder mod into `horizon-mods/<mod id>/` beside
 //! `options.txt` and turns it on in `horizon-mods.txt`, where the game's Options > Mods reads it.
 use super::{installed::Entry, pick, FileRef, Kind, Project, Source, Support, Version};
+use crate::i18n::{self, Language};
 use horizon_mods::java_artifact;
 use horizon_port_pack::check::{self, Check, Verdict};
 use horizon_port_pack::classes::Feature;
@@ -98,30 +99,42 @@ const LISTED_ENTRYPOINTS: usize = 2;
 
 /// Reads `check` into [`Diagnostics`]. Every line is bounded, so a hostile jar can't grow the
 /// panel: the probe's message is cut to [`bounded`] and entrypoints are counted past two.
+/// The labels are said in the launcher's language; [`diagnostics_in`] takes it as an argument.
 pub fn diagnostics(check: &Check) -> Diagnostics {
-    let mut lines = vec![format!(
-        "Loader: {}",
-        match check.loader.as_str() {
-            "" => "plain zip",
-            "neoforge" => "NeoForge",
-            "forge" => "Forge",
-            "fabric" => "Fabric",
-            "quilt" => "Quilt",
-            other => other,
-        }
-    )];
+    diagnostics_in(i18n::current(), check)
+}
+
+/// [`diagnostics`] in `language`, so the page and its tests needn't depend on the global setting.
+pub fn diagnostics_in(language: Language, check: &Check) -> Diagnostics {
+    let loader = match check.loader.as_str() {
+        "" => i18n::tr_in(language, "plain zip"),
+        "neoforge" => "NeoForge",
+        "forge" => "Forge",
+        "fabric" => "Fabric",
+        "quilt" => "Quilt",
+        other => other,
+    };
+    let mut lines = vec![say(language, "Loader: {loader}", &[("loader", loader)])];
     let (verdict, failed) = match &check.native {
         None => ("Not probed", false),
         Some(native) if native.error.is_some() => ("Partial", true),
         Some(_) => ("Works", false),
     };
-    lines.push(format!("Probe: {verdict}"));
+    let verdict_said = i18n::tr_in(language, verdict);
+    lines.push(say(
+        language,
+        "Probe: {verdict}",
+        &[("verdict", verdict_said)],
+    ));
     if let Some(native) = &check.native {
         let mut names: Vec<&str> = native.entrypoints.iter().map(String::as_str).collect();
         if names.is_empty() {
             names.extend(native.entrypoint.as_deref());
         }
-        let kind = native.kind.as_deref().unwrap_or("unknown");
+        let kind = native
+            .kind
+            .as_deref()
+            .unwrap_or_else(|| i18n::tr_in(language, "unknown"));
         let listed = names
             .iter()
             .take(LISTED_ENTRYPOINTS)
@@ -129,16 +142,35 @@ pub fn diagnostics(check: &Check) -> Diagnostics {
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(match names.len() {
-            0 => format!("Entrypoint: {kind}, none found"),
-            n if n > LISTED_ENTRYPOINTS => format!(
-                "Entrypoint: {kind} · {listed} (+{} more)",
-                n - LISTED_ENTRYPOINTS
+            0 => say(
+                language,
+                "Entrypoint: {kind}, none found",
+                &[("kind", kind)],
             ),
-            _ => format!("Entrypoint: {kind} · {listed}"),
+            n if n > LISTED_ENTRYPOINTS => say(
+                language,
+                "Entrypoint: {kind} · {listed} (+{count} more)",
+                &[
+                    ("kind", kind),
+                    ("listed", &listed),
+                    ("count", &(n - LISTED_ENTRYPOINTS).to_string()),
+                ],
+            ),
+            _ => say(
+                language,
+                "Entrypoint: {kind} · {listed}",
+                &[("kind", kind), ("listed", &listed)],
+            ),
         });
-        lines.push(format!(
-            "Host calls: {} · registrations: {} · listeners: {} · payloads: {}",
-            native.calls, native.registrations, native.listeners, native.payloads
+        lines.push(say(
+            language,
+            "Host calls: {calls} · registrations: {registrations} · listeners: {listeners} · payloads: {payloads}",
+            &[
+                ("calls", &native.calls.to_string()),
+                ("registrations", &native.registrations.to_string()),
+                ("listeners", &native.listeners.to_string()),
+                ("payloads", &native.payloads.to_string()),
+            ],
         ));
     }
     let mixins = check
@@ -148,15 +180,18 @@ pub fn diagnostics(check: &Check) -> Diagnostics {
         .copied()
         .unwrap_or(0);
     if mixins > 0 {
-        lines.push(format!(
-            "Mixins: {mixins} class{} not applied by the native probe; behaviour they change may be missing",
-            if mixins == 1 { "" } else { "es" }
-        ));
+        let key = if mixins == 1 {
+            "Mixins: {count} class not applied by the native probe; behaviour they change may be missing"
+        } else {
+            "Mixins: {count} classes not applied by the native probe; behaviour they change may be missing"
+        };
+        lines.push(say(language, key, &[("count", &mixins.to_string())]));
     }
     if let Some(error) = check.native.as_ref().and_then(|n| n.error.as_deref()) {
-        lines.push(format!(
-            "Stopped: {} (the embedded JVM fallback may be needed)",
-            bounded(error)
+        lines.push(say(
+            language,
+            "Stopped: {error} (the embedded JVM fallback may be needed)",
+            &[("error", &bounded(error))],
         ));
     }
     Diagnostics {
@@ -164,6 +199,15 @@ pub fn diagnostics(check: &Check) -> Diagnostics {
         failed,
         lines,
     }
+}
+
+/// `key` as `language` says it, its `{name}` holes filled with `args`.
+fn say(language: Language, key: &str, args: &[(&str, &str)]) -> String {
+    let mut out = i18n::tr_in(language, key).to_string();
+    for (name, value) in args {
+        out = out.replace(&format!("{{{name}}}"), value);
+    }
+    out
 }
 
 /// Which mod's diagnostics come first: a probe that stopped, then more Mixins, then more host
@@ -693,7 +737,7 @@ mod tests {
 
     #[test]
     fn diagnostics_report_a_clean_probe() {
-        let d = diagnostics(&demo_check(Some(probe(None))));
+        let d = diagnostics_in(Language::English, &demo_check(Some(probe(None))));
         assert_eq!(d.verdict, "Works");
         assert!(!d.failed);
         assert_eq!(
@@ -705,14 +749,17 @@ mod tests {
                 "Host calls: 12 · registrations: 3 · listeners: 1 · payloads: 0",
             ]
         );
-        assert_eq!(diagnostics(&demo_check(None)).verdict, "Not probed");
+        assert_eq!(
+            diagnostics_in(Language::English, &demo_check(None)).verdict,
+            "Not probed"
+        );
     }
 
     #[test]
     fn diagnostics_bound_the_failure_and_warn_about_mixins() {
         let mut check = demo_check(Some(probe(Some(&format!("boom\n{}", "x".repeat(500))))));
         check.code.features.insert(Feature::Mixin, 2);
-        let d = diagnostics(&check);
+        let d = diagnostics_in(Language::English, &check);
         assert_eq!((d.verdict, d.failed), ("Partial", true));
         assert!(d
             .lines
@@ -721,6 +768,54 @@ mod tests {
         let stopped = d.lines.last().unwrap();
         assert!(stopped.starts_with("Stopped: boom x"));
         assert!(!stopped.contains('\n'));
+        assert!(stopped.chars().count() < 320, "{}", stopped.chars().count());
+    }
+
+    /// The panel's body and badge are said in the launcher's language, and the `{name}` holes
+    /// translate with their line: a translated string keeps the values the probe found.
+    #[test]
+    fn diagnostics_are_said_in_the_launchers_language() {
+        let check = demo_check(Some(probe(None)));
+        let german = diagnostics_in(Language::German, &check);
+        assert_eq!(german.lines[0], "Lader: Fabric");
+        assert_eq!(german.lines[1], "Prüfung: Funktioniert");
+        assert_eq!(
+            german.lines[2],
+            "Einstiegspunkt: main · a.A, b.B (+2 weitere)"
+        );
+        assert_eq!(
+            german.lines[3],
+            "Host-Aufrufe: 12 · Registrierungen: 3 · Listener: 1 · Nutzlasten: 0"
+        );
+        for line in &german.lines {
+            assert!(!line.contains(['{', '}']), "unfilled hole: {line}");
+        }
+
+        // The badge is drawn through `tr`, so the same verdict key reaches the player.
+        assert_eq!(
+            i18n::tr_in(Language::German, german.verdict),
+            "Funktioniert"
+        );
+        assert_eq!(i18n::tr_in(Language::German, "Not probed"), "Nicht geprüft");
+
+        // Singular and plural Mixins are separate sentences, each keeping its count.
+        let mut one = demo_check(Some(probe(None)));
+        one.code.features.insert(Feature::Mixin, 1);
+        let french = diagnostics_in(Language::French, &one);
+        assert!(french
+            .lines
+            .iter()
+            .any(|l| l == "Mixins : 1 classe non appliquée par la sonde native ; le comportement qu'elles modifient peut manquer"));
+
+        // A stopped probe is still bounded after translation.
+        let mut failed = demo_check(Some(probe(Some(&"é".repeat(500)))));
+        failed.code.features.insert(Feature::Mixin, 1);
+        let stopped = diagnostics_in(Language::French, &failed)
+            .lines
+            .pop()
+            .unwrap();
+        assert!(stopped.starts_with("Arrêté : é"), "{stopped}");
+        assert!(stopped.ends_with(')'), "{stopped}");
         assert!(stopped.chars().count() < 320, "{}", stopped.chars().count());
     }
 

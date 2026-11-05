@@ -406,5 +406,17 @@
   "Clear compatibility cache": "清除兼容性缓存",
   "(+{count} more)": "（+{count} 个）",
   "Cleared the compatibility cache for {name}. It is checked again the next time it is installed, updated or listed in a search.": "已清除 {name} 的兼容性缓存。下次安装、更新或在搜索中列出时将再次检查。",
-  "Jars: {summary}.": "Jars: {summary}."
+  "Jars: {summary}.": "Jars: {summary}.",
+  "Loader: {loader}": "加载器：{loader}",
+  "Probe: {verdict}": "探测：{verdict}",
+  "Entrypoint: {kind}, none found": "入口点：{kind}，未找到",
+  "Entrypoint: {kind} · {listed}": "入口点：{kind} · {listed}",
+  "Entrypoint: {kind} · {listed} (+{count} more)": "入口点：{kind} · {listed}（+{count} 个）",
+  "Host calls: {calls} · registrations: {registrations} · listeners: {listeners} · payloads: {payloads}": "宿主调用：{calls} · 注册：{registrations} · 监听器：{listeners} · 载荷：{payloads}",
+  "Mixins: {count} class not applied by the native probe; behaviour they change may be missing": "Mixins：{count} 个类未被原生探测应用；它们改变的行为可能缺失",
+  "Mixins: {count} classes not applied by the native probe; behaviour they change may be missing": "Mixins：{count} 个类未被原生探测应用；它们改变的行为可能缺失",
+  "Stopped: {error} (the embedded JVM fallback may be needed)": "已停止：{error}（可能需要内嵌 JVM 回退）",
+  "Not probed": "未探测",
+  "plain zip": "普通 zip",
+  "unknown": "未知"
 }

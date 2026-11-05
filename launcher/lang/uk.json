@@ -406,5 +406,17 @@
   "Clear compatibility cache": "Очистити кеш сумісності",
   "(+{count} more)": "(+{count} ще)",
   "Cleared the compatibility cache for {name}. It is checked again the next time it is installed, updated or listed in a search.": "Кеш сумісності для {name} очищено. Перевірка повториться під час наступного встановлення, оновлення або появи в пошуку.",
-  "Jars: {summary}.": "Jars: {summary}."
+  "Jars: {summary}.": "Jars: {summary}.",
+  "Loader: {loader}": "Завантажувач: {loader}",
+  "Probe: {verdict}": "Перевірка: {verdict}",
+  "Entrypoint: {kind}, none found": "Точка входу: {kind}, не знайдено",
+  "Entrypoint: {kind} · {listed}": "Точка входу: {kind} · {listed}",
+  "Entrypoint: {kind} · {listed} (+{count} more)": "Точка входу: {kind} · {listed} (+{count} ще)",
+  "Host calls: {calls} · registrations: {registrations} · listeners: {listeners} · payloads: {payloads}": "Виклики хоста: {calls} · реєстрації: {registrations} · слухачі: {listeners} · корисні навантаження: {payloads}",
+  "Mixins: {count} class not applied by the native probe; behaviour they change may be missing": "Міксини: {count} клас не застосовано нативною перевіркою; поведінка, яку вони змінюють, може бути відсутня",
+  "Mixins: {count} classes not applied by the native probe; behaviour they change may be missing": "Міксини: {count} класів не застосовано нативною перевіркою; поведінка, яку вони змінюють, може бути відсутня",
+  "Stopped: {error} (the embedded JVM fallback may be needed)": "Зупинено: {error} (може знадобитися вбудований резервний JVM)",
+  "Not probed": "Не перевірено",
+  "plain zip": "простий zip",
+  "unknown": "невідомо"
 }

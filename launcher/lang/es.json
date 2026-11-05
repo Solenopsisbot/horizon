@@ -406,5 +406,17 @@
   "Clear compatibility cache": "Borrar la caché de compatibilidad",
   "(+{count} more)": "(+{count} más)",
   "Cleared the compatibility cache for {name}. It is checked again the next time it is installed, updated or listed in a search.": "Se borró la caché de compatibilidad de {name}. Se volverá a comprobar la próxima vez que se instale, actualice o aparezca en una búsqueda.",
-  "Jars: {summary}.": "Jars: {summary}."
+  "Jars: {summary}.": "Jars: {summary}.",
+  "Loader: {loader}": "Cargador: {loader}",
+  "Probe: {verdict}": "Sonda: {verdict}",
+  "Entrypoint: {kind}, none found": "Punto de entrada: {kind}, ninguno encontrado",
+  "Entrypoint: {kind} · {listed}": "Punto de entrada: {kind} · {listed}",
+  "Entrypoint: {kind} · {listed} (+{count} more)": "Punto de entrada: {kind} · {listed} (+{count} más)",
+  "Host calls: {calls} · registrations: {registrations} · listeners: {listeners} · payloads: {payloads}": "Llamadas al host: {calls} · registros: {registrations} · oyentes: {listeners} · cargas útiles: {payloads}",
+  "Mixins: {count} class not applied by the native probe; behaviour they change may be missing": "Mixins: {count} clase no aplicada por la sonda nativa; el comportamiento que cambian puede faltar",
+  "Mixins: {count} classes not applied by the native probe; behaviour they change may be missing": "Mixins: {count} clases no aplicadas por la sonda nativa; el comportamiento que cambian puede faltar",
+  "Stopped: {error} (the embedded JVM fallback may be needed)": "Detenido: {error} (puede que se necesite el respaldo JVM integrado)",
+  "Not probed": "Sin sondear",
+  "plain zip": "zip simple",
+  "unknown": "desconocido"
 }

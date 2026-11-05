@@ -406,5 +406,17 @@
   "Clear compatibility cache": "Kompatibilitäts-Cache leeren",
   "(+{count} more)": "(+{count} weitere)",
   "Cleared the compatibility cache for {name}. It is checked again the next time it is installed, updated or listed in a search.": "Kompatibilitäts-Cache für {name} geleert. Die Prüfung erfolgt erneut, wenn der Mod installiert, aktualisiert oder in einer Suche aufgeführt wird.",
-  "Jars: {summary}.": "Jars: {summary}."
+  "Jars: {summary}.": "Jars: {summary}.",
+  "Loader: {loader}": "Lader: {loader}",
+  "Probe: {verdict}": "Prüfung: {verdict}",
+  "Entrypoint: {kind}, none found": "Einstiegspunkt: {kind}, keiner gefunden",
+  "Entrypoint: {kind} · {listed}": "Einstiegspunkt: {kind} · {listed}",
+  "Entrypoint: {kind} · {listed} (+{count} more)": "Einstiegspunkt: {kind} · {listed} (+{count} weitere)",
+  "Host calls: {calls} · registrations: {registrations} · listeners: {listeners} · payloads: {payloads}": "Host-Aufrufe: {calls} · Registrierungen: {registrations} · Listener: {listeners} · Nutzlasten: {payloads}",
+  "Mixins: {count} class not applied by the native probe; behaviour they change may be missing": "Mixins: {count} Klasse nicht von der nativen Prüfung angewendet; das geänderte Verhalten kann fehlen",
+  "Mixins: {count} classes not applied by the native probe; behaviour they change may be missing": "Mixins: {count} Klassen nicht von der nativen Prüfung angewendet; das geänderte Verhalten kann fehlen",
+  "Stopped: {error} (the embedded JVM fallback may be needed)": "Gestoppt: {error} (der eingebettete JVM-Fallback kann nötig sein)",
+  "Not probed": "Nicht geprüft",
+  "plain zip": "einfache Zip",
+  "unknown": "unbekannt"
 }

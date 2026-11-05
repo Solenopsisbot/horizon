@@ -406,5 +406,17 @@
   "Clear compatibility cache": "Wyczyść pamięć podręczną zgodności",
   "(+{count} more)": "(+{count} więcej)",
   "Cleared the compatibility cache for {name}. It is checked again the next time it is installed, updated or listed in a search.": "Wyczyszczono pamięć podręczną zgodności dla {name}. Zostanie sprawdzona ponownie przy następnej instalacji, aktualizacji lub pojawieniu się w wyszukiwaniu.",
-  "Jars: {summary}.": "Jars: {summary}."
+  "Jars: {summary}.": "Jars: {summary}.",
+  "Loader: {loader}": "Ładowacz: {loader}",
+  "Probe: {verdict}": "Sonda: {verdict}",
+  "Entrypoint: {kind}, none found": "Punkt wejścia: {kind}, nie znaleziono",
+  "Entrypoint: {kind} · {listed}": "Punkt wejścia: {kind} · {listed}",
+  "Entrypoint: {kind} · {listed} (+{count} more)": "Punkt wejścia: {kind} · {listed} (+{count} więcej)",
+  "Host calls: {calls} · registrations: {registrations} · listeners: {listeners} · payloads: {payloads}": "Wywołania hosta: {calls} · rejestracje: {registrations} · nasłuchy: {listeners} · ładunki: {payloads}",
+  "Mixins: {count} class not applied by the native probe; behaviour they change may be missing": "Miksiny: {count} klasa nie została zastosowana przez natywną sondę; zachowanie, które zmieniają, może być nieobecne",
+  "Mixins: {count} classes not applied by the native probe; behaviour they change may be missing": "Miksiny: {count} klasy nie zostały zastosowane przez natywną sondę; zachowanie, które zmieniają, może być nieobecne",
+  "Stopped: {error} (the embedded JVM fallback may be needed)": "Zatrzymano: {error} (może być potrzebny wbudowany zapasowy JVM)",
+  "Not probed": "Niesprawdzone",
+  "plain zip": "zwykły zip",
+  "unknown": "nieznany"
 }
