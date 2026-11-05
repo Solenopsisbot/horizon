@@ -8130,6 +8130,28 @@ fn describe_value(value: &Value) -> String {
     }
 }
 
+/// Name the array operation and the frame that ran it on an operand the
+/// runtime does not own.
+///
+/// The array opcodes are far from the call that produced the operand, so a bare
+/// "expected a native array marker" says nothing about which call should have
+/// answered an array. The frame and the bytecode offset make the corpus report
+/// point at that call.
+fn array_operand_error(
+    error: NativeError,
+    opcode: &str,
+    class: &str,
+    method: &str,
+    at: usize,
+) -> NativeError {
+    match error {
+        NativeError::Metadata(message) => {
+            NativeError::Metadata(format!("{message} ({opcode} at {class}#{method} +{at})"))
+        }
+        other => other,
+    }
+}
+
 fn array_length(value: i32) -> Result<usize, NativeError> {
     usize::try_from(value)
         .ok()
@@ -14963,13 +14985,17 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 0xbe => {
                     let array = pop(&mut stack, class, method)?;
-                    let values = self.array(&array)?;
+                    let values = self.array(&array).map_err(|error| {
+                        array_operand_error(error, "arraylength", class, method, at)
+                    })?;
                     stack.push(Value::Int(values.len() as i32));
                 }
                 0x2e..=0x35 => {
                     let index = array_index(pop_int(&mut stack, class, method)?)?;
                     let array = pop(&mut stack, class, method)?;
-                    let values = self.array(&array)?;
+                    let values = self
+                        .array(&array)
+                        .map_err(|error| array_operand_error(error, "xaload", class, method, at))?;
                     let value = values.get(index).cloned().ok_or_else(|| {
                         NativeError::Metadata(format!("array index {index} out of bounds"))
                     })?;
@@ -14979,7 +15005,9 @@ impl<H: Host> Runtime<'_, H> {
                     let value = pop(&mut stack, class, method)?;
                     let index = array_index(pop_int(&mut stack, class, method)?)?;
                     let array = pop(&mut stack, class, method)?;
-                    let marker = expect_array_marker(&array)?;
+                    let marker = expect_array_marker(&array).map_err(|error| {
+                        array_operand_error(error, "xastore", class, method, at)
+                    })?;
                     let values = self.arrays.get_mut(marker).ok_or_else(|| {
                         NativeError::Metadata("array is not owned by this invocation".into())
                     })?;
