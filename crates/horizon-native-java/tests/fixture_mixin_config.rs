@@ -36,7 +36,7 @@ fn reads_fabric_declared_and_root_configs() {
             ),
             (
                 "demo.mixins.json",
-                br#"{"required":false,"package":"demo.mixin","plugin":"demo.Plugin","refmap":"demo.refmap.json","priority":1500,"mixins":["AlphaMixin","beta.GammaMixin"],"client":["client.ClientMixin"],"server":["server.ServerMixin"]}"#,
+                br#"{"required":false,"package":"demo.mixin","plugin":"demo.Plugin","refmap":"demo.refmap.json","priority":1500,"mixinPriority":1200,"mixins":["AlphaMixin","beta.GammaMixin"],"client":["client.ClientMixin"],"server":["server.ServerMixin"]}"#,
             ),
             (
                 "extra.mixins.json",
@@ -74,6 +74,7 @@ fn reads_fabric_declared_and_root_configs() {
             server: vec!["demo.mixin.server.ServerMixin".into()],
             required: false,
             priority: Some(1500),
+            mixin_priority: Some(1200),
             plugin: Some("demo.Plugin".into()),
             refmap: Some("demo.refmap.json".into()),
         }
@@ -81,6 +82,7 @@ fn reads_fabric_declared_and_root_configs() {
     // An auto-discovered config keeps Mixin's defaults.
     assert!(configs[1].required);
     assert_eq!(configs[1].priority, None);
+    assert_eq!(configs[1].mixin_priority, None);
     assert!(jar.mixin_config_errors().is_empty());
 
     let _ = fs::remove_dir_all(root);

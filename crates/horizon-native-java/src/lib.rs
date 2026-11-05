@@ -8370,6 +8370,10 @@ pub struct MixinConfig {
     pub required: bool,
     /// Mixin's `priority`; absent when the config omits it.
     pub priority: Option<i32>,
+    /// Mixin's `mixinPriority`: the default priority of every `@Mixin` class
+    /// this config lists whose annotation omits `priority`. Absent when the
+    /// config omits it.
+    pub mixin_priority: Option<i32>,
     /// Optional Mixin config plugin class.
     pub plugin: Option<String>,
     /// Optional refmap resource name.
@@ -9175,7 +9179,11 @@ impl NativeJar {
         let mut before = Vec::new();
         let mut after = Vec::new();
         let mut invoke = Vec::new();
-        for mut plan in self.mixin_injection_plans() {
+        // Discovery sorts alphabetically for stable reports; callbacks run in
+        // the order real Mixin applies the configs and `@Mixin` priorities.
+        let mut ordered = self.mixin_injection_plans();
+        self.sort_mixin_plans_in_apply_order(&mut ordered, &self.mixin_configs());
+        for mut plan in ordered {
             if plan.target.owner != target.owner || plan.target.name != target.name {
                 continue;
             }
@@ -9487,9 +9495,11 @@ impl NativeJar {
     /// which is the order their callbacks run in.
     ///
     /// Discovery sorts alphabetically so its reports stay stable. Mixin orders by
-    /// `@Mixin(priority)` (default 1000, lower first), then by config priority
-    /// and position in the config's lists, and a class's injectors keep the order
-    /// of its methods. A class no config lists sorts last.
+    /// `@Mixin(priority)` (default 1000, lower first, then the config's
+    /// `mixinPriority` for a class whose annotation omits it), then by config
+    /// priority and declaration order, then by position in the config's lists,
+    /// and a class's injectors keep the order of its methods. A class no config
+    /// lists sorts last.
     pub fn mixin_plans_in_apply_order(&self) -> Vec<MixinInjectionPlan> {
         let mut plans = self.mixin_injection_plans();
         self.sort_mixin_plans_in_apply_order(&mut plans, &self.mixin_configs());
@@ -9504,7 +9514,7 @@ impl NativeJar {
         const DEFAULT_PRIORITY: i32 = 1000;
         plans.sort_by_cached_key(|plan| {
             let class = self.classes.get(&plan.callback.owner);
-            let mixin_priority = class
+            let annotation_priority = class
                 .and_then(|class| {
                     class.annotations.iter().find(|annotation| {
                         annotation.descriptor == "Lorg/spongepowered/asm/mixin/Mixin;"
@@ -9513,8 +9523,7 @@ impl NativeJar {
                 .and_then(|mixin| match mixin.values.get("priority") {
                     Some(AnnotationValue::Int(priority)) => Some(*priority),
                     _ => None,
-                })
-                .unwrap_or(DEFAULT_PRIORITY);
+                });
             let binary = plan.callback.owner.replace('/', ".");
             let listed = configs.iter().enumerate().find_map(|(index, config)| {
                 config
@@ -9523,9 +9532,28 @@ impl NativeJar {
                     .chain(&config.client)
                     .chain(&config.server)
                     .position(|name| *name == binary)
-                    .map(|position| (config.priority.unwrap_or(DEFAULT_PRIORITY), index, position))
+                    .map(|position| (index, position))
             });
-            let listed = listed.unwrap_or((DEFAULT_PRIORITY, usize::MAX, usize::MAX));
+            let mixin_priority = annotation_priority
+                .or_else(|| {
+                    // `mixinPriority` is the config's default for a class whose
+                    // annotation omits `priority`; an explicit one still wins.
+                    listed.and_then(|(index, _)| configs[index].mixin_priority)
+                })
+                .unwrap_or(DEFAULT_PRIORITY);
+            // Configs are parsed in declaration order, so `index` breaks a
+            // priority tie the way the loader registered them; within one
+            // config, the position in `mixins`/`client`/`server` does. A class
+            // no config lists sorts after every listed one.
+            let listed = listed
+                .map(|(index, position)| {
+                    (
+                        configs[index].priority.unwrap_or(DEFAULT_PRIORITY),
+                        index,
+                        position,
+                    )
+                })
+                .unwrap_or((DEFAULT_PRIORITY, usize::MAX, usize::MAX));
             let method = class
                 .and_then(|class| {
                     class.methods.iter().position(|method| {
@@ -15508,6 +15536,10 @@ fn parse_mixin_config(path: &str, bytes: &[u8]) -> Result<MixinConfig, String> {
             .get("priority")
             .and_then(serde_json::Value::as_i64)
             .and_then(|priority| i32::try_from(priority).ok()),
+        mixin_priority: object
+            .get("mixinPriority")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|priority| i32::try_from(priority).ok()),
         plugin: object
             .get("plugin")
             .and_then(serde_json::Value::as_str)
@@ -17904,6 +17936,7 @@ mod tests {
             server: Vec::new(),
             required: true,
             priority: None,
+            mixin_priority: None,
             plugin: None,
             refmap: None,
         };
@@ -17944,6 +17977,7 @@ mod tests {
                 server: Vec::new(),
                 required: true,
                 priority: None,
+                mixin_priority: None,
                 plugin: plugin.map(str::to_owned),
                 refmap: None,
             }
@@ -27243,6 +27277,88 @@ mandatory = true
             vec!["demo/Probe#alpha", "demo/Probe#beta", "demo/Probe#target"],
             "HEAD callbacks run in plan order before the target, once"
         );
+    }
+
+    #[test]
+    fn discovered_mixins_use_mixin_apply_order_not_alphabetical_order() {
+        let mut jar = NativeJar::from_classes([
+            target_class(),
+            // `ZuluMixin` sorts after `BravoMixin`, but the config registers it
+            // first, and Mixin applies a config's list in declaration order.
+            marker_mixin("demo/ZuluMixin", "run()V", "HEAD", false, "zulu", "zulu"),
+            marker_mixin("demo/BravoMixin", "run()V", "HEAD", false, "bravo", "bravo"),
+        ]);
+        jar.resource_bytes.insert(
+            "demo.mixins.json".into(),
+            br#"{"mixins":["demo.ZuluMixin","demo.BravoMixin"]}"#.to_vec(),
+        );
+        jar.resources
+            .insert("demo.mixins.json".into(), "jar-resource/demo".into());
+
+        let mut host = MarkerHost::default();
+        jar.execute_discovered_mixins(
+            &MethodRef {
+                owner: "demo/Target".into(),
+                name: "run".into(),
+                descriptor: "()V".into(),
+            },
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+        assert_eq!(
+            host.markers,
+            vec!["demo/Probe#zulu", "demo/Probe#bravo", "demo/Probe#target"],
+            "the interpreter runs HEAD callbacks in Mixin apply order"
+        );
+    }
+
+    #[test]
+    fn mixin_apply_order_uses_the_config_mixin_priority() {
+        let mut zulu = marker_mixin("demo/ZuluMixin", "run()V", "HEAD", false, "zulu", "zulu");
+        let bravo = marker_mixin("demo/BravoMixin", "run()V", "HEAD", false, "bravo", "bravo");
+        let mut jar = NativeJar::from_classes([target_class(), zulu.clone(), bravo.clone()]);
+        // `mixinPriority` is the config's default for its `@Mixin` classes; the
+        // class with no annotation priority must sort before the default 1000.
+        jar.resource_bytes.insert(
+            "a.mixins.json".into(),
+            br#"{"mixinPriority":200,"mixins":["demo.ZuluMixin"]}"#.to_vec(),
+        );
+        jar.resource_bytes.insert(
+            "b.mixins.json".into(),
+            br#"{"mixins":["demo.BravoMixin"]}"#.to_vec(),
+        );
+        jar.resources
+            .insert("a.mixins.json".into(), "jar-resource/a".into());
+        jar.resources
+            .insert("b.mixins.json".into(), "jar-resource/b".into());
+        let order = |jar: &NativeJar| {
+            jar.mixin_plans_in_apply_order()
+                .iter()
+                .map(|plan| plan.callback.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&jar), ["zulu", "bravo"]);
+
+        // An explicit `@Mixin(priority)` still wins over the config default.
+        zulu.annotations[0]
+            .values
+            .insert("priority".into(), AnnotationValue::Int(1500));
+        let mut jar = NativeJar::from_classes([target_class(), zulu, bravo]);
+        jar.resource_bytes.insert(
+            "a.mixins.json".into(),
+            br#"{"mixinPriority":200,"mixins":["demo.ZuluMixin"]}"#.to_vec(),
+        );
+        jar.resource_bytes.insert(
+            "b.mixins.json".into(),
+            br#"{"mixins":["demo.BravoMixin"]}"#.to_vec(),
+        );
+        jar.resources
+            .insert("a.mixins.json".into(), "jar-resource/a".into());
+        jar.resources
+            .insert("b.mixins.json".into(), "jar-resource/b".into());
+        assert_eq!(order(&jar), ["bravo", "zulu"]);
     }
 
     #[test]

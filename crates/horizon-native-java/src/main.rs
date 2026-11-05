@@ -528,6 +528,7 @@ fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
                 "server": config.server,
                 "required": config.required,
                 "priority": config.priority,
+                "mixin_priority": config.mixin_priority,
             })
         })
         .collect::<Vec<_>>();

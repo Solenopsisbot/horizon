@@ -263,13 +263,13 @@ fn executes_discovered_head_callbacks_in_plan_order_once() {
         vec![Value::Void, Value::Void, Value::Void, Value::Void]
     );
     assert_eq!(report.callback_result, Value::Void);
-    // Plans sort by target descriptor first, so the descriptor-less injection
-    // precedes the concrete ones; then by callback name.
+    // Mixin applies one class's injectors in method declaration order, so
+    // `first` (declared before the descriptor-less `generic`) runs first.
     assert_eq!(
         mark_order(&host),
         vec![
-            "head-generic",
             "head-first",
+            "head-generic",
             "head-second",
             "head-info",
             "target"
