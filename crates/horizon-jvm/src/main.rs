@@ -98,6 +98,9 @@ public final class HorizonLoaderBridge {
   private static boolean knotLaunch;
   private static ClassLoader knotLoader;
   private static String knotLaunchOutcome;
+  private static String knotTransformedClass;
+  private static final String PROBE_MARKER = "KNOT-RAW";
+  private static final String PROBE_REPLACEMENT = "KNOT-OK!";
 
   public static boolean testLaunchCalled() { return testLaunchCalled; }
 
@@ -107,6 +110,7 @@ public final class HorizonLoaderBridge {
     knotLaunch = launch;
     knotLoader = null;
     knotLaunchOutcome = null;
+    knotTransformedClass = null;
     classPath = null;
     classPathType = null;
     classPathJars.clear();
@@ -216,15 +220,26 @@ public final class HorizonLoaderBridge {
   }
 
   /**
-   * Hand the Knot loader to the launcher.
+   * Hand the Knot loader to the launcher and prove its transformer chain runs.
    *
    * Fabric has no `setTargetClassLoader`: `FabricLauncher.getTargetClassLoader`
    * is the only hand-off a provider/entrypoint uses, and the real
    * `Knot.init(String[])` returns `KnotClassLoaderInterface.getClassLoader()` as
    * the game's loader. This probe owns the launcher, so it stores that loader
    * and answers every target read with it (`targetLoader`).
+   *
+   * The chain itself is proven the way `KnotClassDelegate.loadClass` exercises
+   * it. The installed `IMixinTransformer` (the delegate's `mixinTransformer`
+   * field) is wrapped by a probe transformer that rewrites one marker constant
+   * in any class carrying it, then a class from a registered mod jar is loaded
+   * through the loader (`loadIntoTarget` -> `tryLoadClass` ->
+   * `getPostMixinClassByteArray` -> `transformClassBytes`). The loaded class's
+   * `message()` returning the rewritten value means the bytes the JVM defined
+   * were not the raw jar bytes; the raw bytes on disk still carry the marker.
+   * Mixin's own `getTransformers()` cannot stand in for this proof: Fabric's
+   * `MixinServiceKnot.getTransformers()` returns `Collections.emptyList()`.
    */
-  private static synchronized String handOffKnotLoader() {
+  private static synchronized String probeTransformChain() {
     if (classPath == null) return "failed Knot class loader was not created";
     try {
       Method getLoader = classPathType.getDeclaredMethod("getClassLoader");
@@ -235,10 +250,107 @@ public final class HorizonLoaderBridge {
       // `Knot.init` also makes its loader the thread's context class loader;
       // the hand-off is the same one a real launch makes.
       Thread.currentThread().setContextClassLoader(knotLoader);
-      return "ok 1 transformers";
+
+      Field transformerField = classPath.getClass().getDeclaredField("mixinTransformer");
+      transformerField.setAccessible(true);
+      Object transformer = transformerField.get(classPath);
+      if (transformer == null) return "failed Knot installed no mixin transformer";
+      Class<?> transformerType =
+          Class.forName("org.spongepowered.asm.mixin.transformer.IMixinTransformer");
+      if (!transformerType.isInstance(transformer)) {
+        return "failed Knot transformer is not an IMixinTransformer";
+      }
+      Object probe = Proxy.newProxyInstance(transformerType.getClassLoader(),
+          new Class<?>[]{transformerType}, (p, m, a) -> invokeTransformProbe(transformer, m, a));
+      transformerField.set(classPath, probe);
+
+      String className = findMarkerClass();
+      if (className == null) {
+        return "failed no class carrying " + PROBE_MARKER + " in the unlocked jars";
+      }
+      Method load = classPathType.getDeclaredMethod("loadIntoTarget", String.class);
+      load.setAccessible(true);
+      // `loadIntoTarget` takes a binary (dot) name; the transformer reports the
+      // internal (slash) one.
+      Class<?> loaded = (Class<?>) load.invoke(classPath, className.replace('/', '.'));
+      Object value = loaded.getMethod("message").invoke(null);
+      if (!PROBE_REPLACEMENT.equals(value)) {
+        return "failed the loaded class returned " + value;
+      }
+      if (knotTransformedClass == null) {
+        return "failed the transformer never saw " + className.replace('/', '.');
+      }
+      return "ok 1 transformers, transformed=" + knotTransformedClass.replace('/', '.');
     } catch (Throwable failure) {
       return bound("failed " + summarize(failure));
     }
+  }
+
+  /** The probe transformer: rewrite the marker, delegate everything else. */
+  private static Object invokeTransformProbe(Object transformer, Method method, Object[] args)
+      throws Throwable {
+    if ("transformClassBytes".equals(method.getName()) && args != null && args.length == 3
+        && args[2] instanceof byte[]) {
+      byte[] rewritten = rewriteMarker((byte[]) args[2]);
+      if (rewritten != null) {
+        knotTransformedClass = String.valueOf(args[0]);
+        return rewritten;
+      }
+    }
+    try {
+      return method.invoke(transformer, args);
+    } catch (java.lang.reflect.InvocationTargetException failure) {
+      throw failure.getCause();
+    }
+  }
+
+  /** Replace the marker constant in place, or null when the class has none. */
+  private static byte[] rewriteMarker(byte[] classBytes) {
+    byte[] marker = PROBE_MARKER.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+    byte[] replacement =
+        PROBE_REPLACEMENT.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+    for (int at = 0; at <= classBytes.length - marker.length; at++) {
+      boolean match = true;
+      for (int i = 0; i < marker.length; i++) {
+        if (classBytes[at + i] != marker[i]) {
+          match = false;
+          break;
+        }
+      }
+      if (!match) continue;
+      // Equal-length constants keep the class file valid: only the UTF8 bytes
+      // the string constant points at change.
+      byte[] out = classBytes.clone();
+      System.arraycopy(replacement, 0, out, at, replacement.length);
+      return out;
+    }
+    return null;
+  }
+
+  /** The first registered class whose bytes carry the probe marker. */
+  private static String findMarkerClass() {
+    for (String jar : classPathJars) {
+      Path path = Paths.get(jar);
+      if (!Files.isRegularFile(path)) continue;
+      try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(path.toFile())) {
+        Enumeration<? extends java.util.zip.ZipEntry> entries = zip.entries();
+        while (entries.hasMoreElements()) {
+          java.util.zip.ZipEntry entry = entries.nextElement();
+          String name = entry.getName();
+          if (name.startsWith("META-INF/") || !name.endsWith(".class")) continue;
+          try (InputStream in = zip.getInputStream(entry)) {
+            if (rewriteMarker(in.readAllBytes()) != null) {
+              return name.substring(0, name.length() - 6);
+            }
+          } catch (Throwable ignored) {
+            // An entry the probe cannot read simply is not the fixture.
+          }
+        }
+      } catch (Throwable ignored) {
+        // A jar the probe cannot open simply does not carry the fixture.
+      }
+    }
+    return null;
   }
 
   private static String bound(String text) {
@@ -434,7 +546,7 @@ public final class HorizonLoaderBridge {
         } else {
           knotInitOutcome = initializeKnotTransformers();
         }
-        if (knotLaunch) knotLaunchOutcome = handOffKnotLoader();
+        if (knotLaunch) knotLaunchOutcome = probeTransformChain();
       }
       Collection<?> allMods = (Collection<?>) impl.getMethod("getAllMods").invoke(loader);
       List<String> ids = new ArrayList<>();
@@ -6795,7 +6907,7 @@ config="demo.mixins.json""#,
     }
 
     #[test]
-    fn reports_the_knot_launch_hand_off() {
+    fn reports_the_knot_launch_hand_off_and_transform_proof() {
         let outcome = ProviderOutcome::Production {
             mods: 1,
             freeze_reason: None,
@@ -6803,17 +6915,17 @@ config="demo.mixins.json""#,
             discovered_ids: vec![],
             classpath_unlock: Some("ok 2 jars".to_owned()),
             knot_init: Some("ok 1 transformers".to_owned()),
-            knot_launch: Some("ok 1 transformers".to_owned()),
+            knot_launch: Some("ok 1 transformers, transformed=knotprobe.Marker".to_owned()),
         };
         // Off by default: nothing is printed or reported.
         assert_eq!(knot_launch_value(false, &outcome), None);
         assert_eq!(
             knot_launch_value(true, &outcome).as_deref(),
-            Some("ok 1 transformers")
+            Some("ok 1 transformers, transformed=knotprobe.Marker")
         );
         assert_eq!(
-            knot_launch_line("ok 1 transformers"),
-            "knot-launch: ok 1 transformers"
+            knot_launch_line("ok 1 transformers, transformed=knotprobe.Marker"),
+            "knot-launch: ok 1 transformers, transformed=knotprobe.Marker"
         );
         // A production result without the field is a failure, not an `ok`, and
         // a run that never reached the provider says so.
@@ -6838,7 +6950,7 @@ config="demo.mixins.json""#,
         // The bridge's eighth field carries the outcome; the older seven-field
         // shape still parses and stays `None`.
         let parsed = parse_provider_outcome(
-            "minecraft\t2\t\tfalse\t\tok 7 jars\tok 1 transformers\tok 1 transformers",
+            "minecraft\t2\t\tfalse\t\tok 7 jars\tok 1 transformers\tok 1 transformers, transformed=knotprobe.Marker",
         )
         .unwrap();
         let ProviderOutcome::Production {
@@ -6848,7 +6960,7 @@ config="demo.mixins.json""#,
         else {
             panic!("expected a knot-launch value");
         };
-        assert_eq!(launch, "ok 1 transformers");
+        assert_eq!(launch, "ok 1 transformers, transformed=knotprobe.Marker");
         assert_eq!(
             knot_launch_value(
                 true,
@@ -6861,10 +6973,19 @@ config="demo.mixins.json""#,
 
         // The report carries the same one line, and nothing when unasked.
         let report = ProviderReport::from_outcome(&outcome, 1, "26.3", ProviderSide::Server)
-            .with_knot_launch(Some("ok 1 transformers".to_owned()));
-        assert!(report.text().contains("knot-launch: ok 1 transformers\n"));
+            .with_knot_launch(Some(
+                "ok 1 transformers, transformed=knotprobe.Marker".to_owned(),
+            ));
+        assert!(
+            report
+                .text()
+                .contains("knot-launch: ok 1 transformers, transformed=knotprobe.Marker\n")
+        );
         let json: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
-        assert_eq!(json["knotLaunch"], "ok 1 transformers");
+        assert_eq!(
+            json["knotLaunch"],
+            "ok 1 transformers, transformed=knotprobe.Marker"
+        );
     }
 
     #[test]
@@ -7775,10 +7896,11 @@ mod real_loader_tests {
             "addCodeSource",
             "setAllowedPrefixes",
             "classPathOutcome",
-            "handOffKnotLoader",
+            "probeTransformChain",
             "getTargetClassLoader",
             "targetLoader",
             "loadIntoTarget",
+            "mixinTransformer",
         ] {
             assert!(LOADER_BRIDGE_SOURCE.contains(needed), "missing {needed}");
         }
