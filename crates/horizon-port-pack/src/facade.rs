@@ -395,7 +395,7 @@ pub fn generate_many(
             }
         }
     }
-    if uses_neoforge {
+    if uses_neoforge || uses_legacy_forge {
         for name in [
             "net/minecraft/network/RegistryFriendlyByteBuf",
             "net/minecraft/network/FriendlyByteBuf",
@@ -520,7 +520,14 @@ pub fn generate_many(
         ]);
     }
     if uses_fabric_renderers {
-        needed_roles.extend(["item", "item_stack", "block", "block_state", "block_pos", "block_and_tint_getter"]);
+        needed_roles.extend([
+            "item",
+            "item_stack",
+            "block",
+            "block_state",
+            "block_pos",
+            "block_and_tint_getter",
+        ]);
     }
     if uses_model_layers {
         needed_roles.extend(["model_layer_location", "textured_model_data"]);
@@ -1946,9 +1953,22 @@ pub fn generate_many(
                 continue;
             }
             if relative == format!("{NEOFORGE_REGISTER_CAPABILITIES_EVENT}.java")
-                && !["net/minecraft/world/level/Level", "net/minecraft/core/BlockPos", "net/minecraft/world/level/block/Block", "net/minecraft/world/level/block/state/BlockState", "net/minecraft/world/level/block/entity/BlockEntity", "net/minecraft/world/level/block/entity/BlockEntityType", "net/minecraft/world/entity/Entity", "net/minecraft/world/entity/EntityType"].iter().all(|name| available.contains(*name))
+                && ![
+                    "net/minecraft/world/level/Level",
+                    "net/minecraft/core/BlockPos",
+                    "net/minecraft/world/level/block/Block",
+                    "net/minecraft/world/level/block/state/BlockState",
+                    "net/minecraft/world/level/block/entity/BlockEntity",
+                    "net/minecraft/world/level/block/entity/BlockEntityType",
+                    "net/minecraft/world/entity/Entity",
+                    "net/minecraft/world/entity/EntityType",
+                ]
+                .iter()
+                .all(|name| available.contains(*name))
             {
-                report.missing.push(format!("{NEOFORGE_REGISTER_CAPABILITIES_EVENT} (needs capability provider game types)"));
+                report.missing.push(format!(
+                    "{NEOFORGE_REGISTER_CAPABILITIES_EVENT} (needs capability provider game types)"
+                ));
                 continue;
             }
             let game_value = match relative {
@@ -1972,8 +1992,19 @@ pub fn generate_many(
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             let source = if relative == format!("{NEOFORGE_BIOME_MODIFIER}.java")
-                && !game.contains_key("net/minecraft/world/level/biome/BiomeGenerationSettings")
-            { NEOFORGE_BIOME_MODIFIER_OBJECT_SOURCE } else { source };
+                && ![
+                    "net/minecraft/core/RegistryAccess",
+                    "net/minecraft/core/Holder",
+                    "net/minecraft/world/level/biome/Biome",
+                    "net/minecraft/world/level/biome/BiomeGenerationSettings",
+                ]
+                .iter()
+                .all(|name| game.contains_key(*name))
+            {
+                NEOFORGE_BIOME_MODIFIER_OBJECT_SOURCE
+            } else {
+                source
+            };
             fs::write(&file, source).map_err(|e| format!("{}: {e}", file.display()))?;
             files.push(file);
         }
@@ -2061,6 +2092,21 @@ pub fn generate_many(
                         "{class} (needs net/minecraft/world/entity/Entity, net/minecraft/world/level/Level)"
                     ));
                     continue;
+                }
+                // The biome modifier's typed shape names four game types; a
+                // partial game jar keeps the Object-shaped copy instead.
+                let mut source = source;
+                if class == NEOFORGE_BIOME_MODIFIER
+                    && ![
+                        "net/minecraft/core/RegistryAccess",
+                        "net/minecraft/core/Holder",
+                        "net/minecraft/world/level/biome/Biome",
+                        "net/minecraft/world/level/biome/BiomeGenerationSettings",
+                    ]
+                    .iter()
+                    .all(|name| game.contains_key(*name))
+                {
+                    source = NEOFORGE_BIOME_MODIFIER_OBJECT_SOURCE;
                 }
                 write_shim(&mut files, &src, class, source)?;
             }
@@ -4857,11 +4903,38 @@ const CLIENT_TYPE_CANDIDATES: &[(&str, &[&str])] = &[
             "net/minecraft/item/ItemStack",
         ],
     ),
-    ("item", &["net/minecraft/world/item/Item", "net/minecraft/item/Item"]),
-    ("block", &["net/minecraft/world/level/block/Block", "net/minecraft/block/Block"]),
-    ("block_state", &["net/minecraft/world/level/block/state/BlockState", "net/minecraft/block/BlockState"]),
-    ("block_pos", &["net/minecraft/core/BlockPos", "net/minecraft/util/math/BlockPos"]),
-    ("block_and_tint_getter", &["net/minecraft/world/level/BlockAndTintGetter", "net/minecraft/world/world/BlockRenderView"]),
+    (
+        "item",
+        &["net/minecraft/world/item/Item", "net/minecraft/item/Item"],
+    ),
+    (
+        "block",
+        &[
+            "net/minecraft/world/level/block/Block",
+            "net/minecraft/block/Block",
+        ],
+    ),
+    (
+        "block_state",
+        &[
+            "net/minecraft/world/level/block/state/BlockState",
+            "net/minecraft/block/BlockState",
+        ],
+    ),
+    (
+        "block_pos",
+        &[
+            "net/minecraft/core/BlockPos",
+            "net/minecraft/util/math/BlockPos",
+        ],
+    ),
+    (
+        "block_and_tint_getter",
+        &[
+            "net/minecraft/world/level/BlockAndTintGetter",
+            "net/minecraft/world/world/BlockRenderView",
+        ],
+    ),
     (
         "tooltip_context",
         &[
@@ -9942,13 +10015,34 @@ mod tests {
             FABRIC_PAYLOAD_TYPE_REGISTRY,
         );
         for (path, source) in [
-            ("net/minecraft/network/RegistryFriendlyByteBuf.java", "package net.minecraft.network; public class RegistryFriendlyByteBuf {}\n"),
-            ("net/minecraft/network/FriendlyByteBuf.java", "package net.minecraft.network; public class FriendlyByteBuf {}\n"),
-            ("net/minecraft/network/codec/StreamCodec.java", "package net.minecraft.network.codec; public class StreamCodec {}\n"),
-            ("net/minecraft/resources/Identifier.java", "package net.minecraft.resources; public class Identifier {}\n"),
-            ("net/minecraft/network/protocol/common/custom/CustomPacketPayload.java", "package net.minecraft.network.protocol.common.custom; public interface CustomPacketPayload { class Type {} }\n"),
-            ("net/neoforged/neoforge/network/handling/IPayloadContext.java", "package net.neoforged.neoforge.network.handling; public interface IPayloadContext {}\n"),
-            ("net/neoforged/neoforge/network/handling/IPayloadHandler.java", "package net.neoforged.neoforge.network.handling; public interface IPayloadHandler<T> { void handle(T payload, IPayloadContext context); }\n"),
+            (
+                "net/minecraft/network/RegistryFriendlyByteBuf.java",
+                "package net.minecraft.network; public class RegistryFriendlyByteBuf {}\n",
+            ),
+            (
+                "net/minecraft/network/FriendlyByteBuf.java",
+                "package net.minecraft.network; public class FriendlyByteBuf {}\n",
+            ),
+            (
+                "net/minecraft/network/codec/StreamCodec.java",
+                "package net.minecraft.network.codec; public class StreamCodec {}\n",
+            ),
+            (
+                "net/minecraft/resources/Identifier.java",
+                "package net.minecraft.resources; public class Identifier {}\n",
+            ),
+            (
+                "net/minecraft/network/protocol/common/custom/CustomPacketPayload.java",
+                "package net.minecraft.network.protocol.common.custom; public interface CustomPacketPayload { class Type {} }\n",
+            ),
+            (
+                "net/neoforged/neoforge/network/handling/IPayloadContext.java",
+                "package net.neoforged.neoforge.network.handling; public interface IPayloadContext {}\n",
+            ),
+            (
+                "net/neoforged/neoforge/network/handling/IPayloadHandler.java",
+                "package net.neoforged.neoforge.network.handling; public interface IPayloadHandler<T> { void handle(T payload, IPayloadContext context); }\n",
+            ),
         ] {
             write(path, source);
         }
@@ -19927,29 +20021,86 @@ public class DatagenProbe {
             "package net.minecraft.world.level;\npublic class Level {}\n",
         );
         for (path, source) in [
-            ("net/minecraft/core/RegistryAccess.java", "package net.minecraft.core; public class RegistryAccess {}\n"),
-            ("net/minecraft/core/Holder.java", "package net.minecraft.core; public class Holder<T> {}\n"),
-            ("net/minecraft/world/level/biome/Biome.java", "package net.minecraft.world.level.biome; public class Biome {}\n"),
-            ("net/minecraft/world/level/biome/BiomeGenerationSettings.java", "package net.minecraft.world.level.biome; public class BiomeGenerationSettings { public static class Builder {} }\n"),
+            (
+                "net/minecraft/core/RegistryAccess.java",
+                "package net.minecraft.core; public class RegistryAccess {}\n",
+            ),
+            (
+                "net/minecraft/core/Holder.java",
+                "package net.minecraft.core; public class Holder<T> {}\n",
+            ),
+            (
+                "net/minecraft/world/level/biome/Biome.java",
+                "package net.minecraft.world.level.biome; public class Biome {}\n",
+            ),
+            (
+                "net/minecraft/world/level/biome/BiomeGenerationSettings.java",
+                "package net.minecraft.world.level.biome; public class BiomeGenerationSettings { public static class Builder {} }\n",
+            ),
         ] {
             write(path, source);
         }
         for (path, source) in [
-            ("net/minecraft/core/BlockPos.java", "package net.minecraft.core; public class BlockPos {}\n"),
-            ("net/minecraft/world/level/block/Block.java", "package net.minecraft.world.level.block; public class Block {}\n"),
-            ("net/minecraft/world/level/block/entity/BlockEntity.java", "package net.minecraft.world.level.block.entity; public class BlockEntity {}\n"),
-            ("net/minecraft/world/level/block/entity/BlockEntityType.java", "package net.minecraft.world.level.block.entity; public class BlockEntityType<T> {}\n"),
-            ("net/minecraft/world/level/block/state/BlockState.java", "package net.minecraft.world.level.block.state; public class BlockState {}\n"),
-            ("net/minecraft/world/entity/EntityType.java", "package net.minecraft.world.entity; public class EntityType<T> {}\n"),
-            ("net/minecraft/world/item/Item.java", "package net.minecraft.world.item; public class Item {}\n"),
-            ("net/minecraft/world/item/ItemStack.java", "package net.minecraft.world.item; public class ItemStack {}\n"),
-            ("net/neoforged/neoforge/capabilities/Capability.java", "package net.neoforged.neoforge.capabilities; public class Capability<T> {}\n"),
-            ("net/neoforged/neoforge/capabilities/BlockCapability.java", "package net.neoforged.neoforge.capabilities; public class BlockCapability<T,C> extends Capability<T> {}\n"),
-            ("net/neoforged/neoforge/capabilities/ItemCapability.java", "package net.neoforged.neoforge.capabilities; public class ItemCapability<T,C> extends Capability<T> {}\n"),
-            ("net/neoforged/neoforge/capabilities/EntityCapability.java", "package net.neoforged.neoforge.capabilities; public class EntityCapability<T,C> extends Capability<T> {}\n"),
-            ("net/neoforged/neoforge/capabilities/BlockCapabilityCache.java", "package net.neoforged.neoforge.capabilities; public class BlockCapabilityCache { @FunctionalInterface public interface Provider<T,C> { T getCapability(net.minecraft.world.level.Level l, net.minecraft.core.BlockPos p, net.minecraft.world.level.block.state.BlockState s, net.minecraft.world.level.block.entity.BlockEntity e, C c); } }\n"),
-            ("net/neoforged/neoforge/capabilities/ItemCapabilityCache.java", "package net.neoforged.neoforge.capabilities; public class ItemCapabilityCache { @FunctionalInterface public interface Provider<T,C> { T getCapability(net.minecraft.world.item.ItemStack s, C c); } }\n"),
-            ("net/neoforged/neoforge/capabilities/EntityCapabilityCache.java", "package net.neoforged.neoforge.capabilities; public class EntityCapabilityCache { @FunctionalInterface public interface Provider<T,C> { T getCapability(net.minecraft.world.entity.Entity e, C c); } }\n"),
+            (
+                "net/minecraft/core/BlockPos.java",
+                "package net.minecraft.core; public class BlockPos {}\n",
+            ),
+            (
+                "net/minecraft/world/level/block/Block.java",
+                "package net.minecraft.world.level.block; public class Block {}\n",
+            ),
+            (
+                "net/minecraft/world/level/block/entity/BlockEntity.java",
+                "package net.minecraft.world.level.block.entity; public class BlockEntity {}\n",
+            ),
+            (
+                "net/minecraft/world/level/block/entity/BlockEntityType.java",
+                "package net.minecraft.world.level.block.entity; public class BlockEntityType<T> {}\n",
+            ),
+            (
+                "net/minecraft/world/level/block/state/BlockState.java",
+                "package net.minecraft.world.level.block.state; public class BlockState {}\n",
+            ),
+            (
+                "net/minecraft/world/entity/EntityType.java",
+                "package net.minecraft.world.entity; public class EntityType<T> {}\n",
+            ),
+            (
+                "net/minecraft/world/item/Item.java",
+                "package net.minecraft.world.item; public class Item {}\n",
+            ),
+            (
+                "net/minecraft/world/item/ItemStack.java",
+                "package net.minecraft.world.item; public class ItemStack {}\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/Capability.java",
+                "package net.neoforged.neoforge.capabilities; public class Capability<T> {}\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/BlockCapability.java",
+                "package net.neoforged.neoforge.capabilities; public class BlockCapability<T,C> extends Capability<T> {}\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/ItemCapability.java",
+                "package net.neoforged.neoforge.capabilities; public class ItemCapability<T,C> extends Capability<T> {}\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/EntityCapability.java",
+                "package net.neoforged.neoforge.capabilities; public class EntityCapability<T,C> extends Capability<T> {}\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/BlockCapabilityCache.java",
+                "package net.neoforged.neoforge.capabilities; public class BlockCapabilityCache { @FunctionalInterface public interface Provider<T,C> { T getCapability(net.minecraft.world.level.Level l, net.minecraft.core.BlockPos p, net.minecraft.world.level.block.state.BlockState s, net.minecraft.world.level.block.entity.BlockEntity e, C c); } }\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/ItemCapabilityCache.java",
+                "package net.neoforged.neoforge.capabilities; public class ItemCapabilityCache { @FunctionalInterface public interface Provider<T,C> { T getCapability(net.minecraft.world.item.ItemStack s, C c); } }\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/EntityCapabilityCache.java",
+                "package net.neoforged.neoforge.capabilities; public class EntityCapabilityCache { @FunctionalInterface public interface Provider<T,C> { T getCapability(net.minecraft.world.entity.Entity e, C c); } }\n",
+            ),
         ] {
             write(path, source);
         }
@@ -20063,18 +20214,62 @@ public class Probe {
             class("net/minecraft/core/Direction", "java/lang/Object", &[]);
             class("net/minecraft/core/BlockPos", "java/lang/Object", &[]);
             class("net/minecraft/world/level/Level", "java/lang/Object", &[]);
-            class("net/minecraft/world/level/block/Block", "java/lang/Object", &[]);
-            class("net/minecraft/world/level/block/state/BlockState", "java/lang/Object", &[]);
-            class("net/minecraft/world/level/block/entity/BlockEntity", "java/lang/Object", &[]);
-            class("net/minecraft/world/level/block/entity/BlockEntityType", "java/lang/Object", &[]);
+            class(
+                "net/minecraft/world/level/block/Block",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/world/level/block/state/BlockState",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/world/level/block/entity/BlockEntity",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/world/level/block/entity/BlockEntityType",
+                "java/lang/Object",
+                &[],
+            );
             class("net/minecraft/world/entity/Entity", "java/lang/Object", &[]);
-            class("net/minecraft/world/entity/EntityType", "java/lang/Object", &[]);
-            class("net/minecraft/resources/Identifier", "java/lang/Object", &[]);
-            class("net/minecraft/network/RegistryFriendlyByteBuf", "java/lang/Object", &[]);
-            class("net/minecraft/network/FriendlyByteBuf", "java/lang/Object", &[]);
-            class("net/minecraft/network/codec/StreamCodec", "java/lang/Object", &[]);
-            class("net/minecraft/network/protocol/common/custom/CustomPacketPayload", "java/lang/Object", &[]);
-            class("net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type", "java/lang/Object", &[("id", "()Lnet/minecraft/resources/Identifier;", 0x0001)]);
+            class(
+                "net/minecraft/world/entity/EntityType",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/resources/Identifier",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/network/RegistryFriendlyByteBuf",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/network/FriendlyByteBuf",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/network/codec/StreamCodec",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/network/protocol/common/custom/CustomPacketPayload",
+                "java/lang/Object",
+                &[],
+            );
+            class(
+                "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type",
+                "java/lang/Object",
+                &[("id", "()Lnet/minecraft/resources/Identifier;", 0x0001)],
+            );
             jar.finish().expect("finish the game jar");
         }
 
