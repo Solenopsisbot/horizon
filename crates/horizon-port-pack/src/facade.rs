@@ -2147,6 +2147,8 @@ const FRIENDLY_BYTE_BUF_STATE: &str = r#"    protected java.util.List<Object> ho
     protected byte[] horizonBytes = new byte[0];
     protected int horizonWriteIndex;
     protected int horizonByteReadIndex;
+    // Index views never grow the bounded buffer: requested positions are clamped
+    // to the existing written window, preserving the façade's zero-copy shape.
     protected static final int HORIZON_MAX_BYTES = 1048576;
     protected void horizonEnsure(int extra) {
         if (extra < 0 || extra > HORIZON_MAX_BYTES) throw new IllegalArgumentException("Invalid payload length: " + extra);
@@ -2191,6 +2193,23 @@ const FRIENDLY_BYTE_BUF_STATE: &str = r#"    protected java.util.List<Object> ho
         }
         horizonWriteIndex = limit;
         if (horizonByteReadIndex > limit) horizonByteReadIndex = limit;
+    }
+    protected int horizonSetReaderIndexView(int index) {
+        int previous = horizonByteReadIndex;
+        horizonByteReadIndex = Math.max(0, Math.min(index, horizonWriteIndex));
+        return previous;
+    }
+    protected int horizonSetWriterIndexView(int index) {
+        int previous = horizonWriteIndex;
+        int limit = Math.max(0, Math.min(index, horizonWriteIndex));
+        horizonWriteIndex = limit;
+        if (horizonByteReadIndex > limit) horizonByteReadIndex = limit;
+        return previous;
+    }
+    protected void horizonSetIndexView(int index) {
+        int limit = Math.max(0, Math.min(index, horizonWriteIndex));
+        horizonByteReadIndex = limit;
+        horizonWriteIndex = limit;
     }
     protected void horizonPutShort(int value) {
         horizonPut(value >> 8);
@@ -2316,6 +2335,83 @@ const FRIENDLY_BYTE_BUF_STATE: &str = r#"    protected java.util.List<Object> ho
         byte[] data = new byte[length];
         for (int i = 0; i < length; i++) data[i] = (byte) horizonGet();
         return data;
+    }
+    protected int horizonGetArrayLength() {
+        int length = horizonGetVarInt();
+        if (length < 0 || length > HORIZON_MAX_BYTES) throw new IllegalArgumentException("Invalid array length: " + length);
+        return length;
+    }
+    protected void horizonPutBooleanArray(boolean[] value) {
+        int length = value == null ? 0 : value.length;
+        horizonPutVarInt(length);
+        if (value != null) for (boolean item : value) horizonPut(item ? 1 : 0);
+    }
+    protected boolean[] horizonGetBooleanArray() {
+        int length = horizonGetArrayLength();
+        if (length > horizonReadable()) return new boolean[0];
+        boolean[] value = new boolean[length];
+        for (int i = 0; i < length; i++) value[i] = horizonGet() != 0;
+        return value;
+    }
+    protected void horizonPutIntArray(int[] value) {
+        int length = value == null ? 0 : value.length;
+        horizonPutVarInt(length);
+        if (value != null) for (int item : value) horizonPutInt(item);
+    }
+    protected int[] horizonGetIntArray() {
+        int length = horizonGetArrayLength();
+        if (length > horizonReadable() / 4) return new int[0];
+        int[] value = new int[length];
+        for (int i = 0; i < length; i++) value[i] = horizonGetInt();
+        return value;
+    }
+    protected void horizonPutLongArray(long[] value) {
+        int length = value == null ? 0 : value.length;
+        horizonPutVarInt(length);
+        if (value != null) for (long item : value) horizonPutLong(item);
+    }
+    protected long[] horizonGetLongArray() {
+        int length = horizonGetArrayLength();
+        if (length > horizonReadable() / 8) return new long[0];
+        long[] value = new long[length];
+        for (int i = 0; i < length; i++) value[i] = horizonGetLong();
+        return value;
+    }
+    protected void horizonPutFloatArray(float[] value) {
+        int length = value == null ? 0 : value.length;
+        horizonPutVarInt(length);
+        if (value != null) for (float item : value) horizonPutInt(Float.floatToRawIntBits(item));
+    }
+    protected float[] horizonGetFloatArray() {
+        int length = horizonGetArrayLength();
+        if (length > horizonReadable() / 4) return new float[0];
+        float[] value = new float[length];
+        for (int i = 0; i < length; i++) value[i] = Float.intBitsToFloat(horizonGetInt());
+        return value;
+    }
+    protected void horizonPutDoubleArray(double[] value) {
+        int length = value == null ? 0 : value.length;
+        horizonPutVarInt(length);
+        if (value != null) for (double item : value) horizonPutLong(Double.doubleToRawLongBits(item));
+    }
+    protected double[] horizonGetDoubleArray() {
+        int length = horizonGetArrayLength();
+        if (length > horizonReadable() / 8) return new double[0];
+        double[] value = new double[length];
+        for (int i = 0; i < length; i++) value[i] = Double.longBitsToDouble(horizonGetLong());
+        return value;
+    }
+    protected void horizonPutStringArray(String[] value) {
+        int length = value == null ? 0 : value.length;
+        horizonPutVarInt(length);
+        if (value != null) for (String item : value) horizonPutUtf(item, 32767);
+    }
+    protected String[] horizonGetStringArray() {
+        int length = horizonGetArrayLength();
+        if (length > horizonReadable()) return new String[0];
+        String[] value = new String[length];
+        for (int i = 0; i < length; i++) value[i] = horizonGetUtf(32767);
+        return value;
     }
 "#;
 
@@ -6235,6 +6331,15 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("readUtf", "java.lang.String", "(I)Ljava/lang/String;") => {
                 return "return horizonGetUtf(p0);".to_owned();
             }
+            ("writeString", _, "(Ljava/lang/String;)V") => {
+                return "horizonPutUtf(p0, 32767);".to_owned();
+            }
+            ("writeString", _, "(Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutUtf(p0, 32767); return this;".to_owned();
+            }
+            ("readString", "java.lang.String", "()Ljava/lang/String;") => {
+                return "return horizonGetUtf(32767);".to_owned();
+            }
             // Identifiers (`ResourceLocation` before the 26.3 rename).
             (
                 "writeResourceLocation" | "writeIdentifier",
@@ -6298,6 +6403,82 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
             ("readByteArray", "byte[]", "(I)[B") => {
                 return "return horizonGetByteArray(p0);".to_owned();
             }
+            ("writeBooleanArray", _, "([Z)V") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (boolean value : p0) horizonPut(value ? 1 : 0);".to_owned();
+            }
+            ("writeBooleanArray", _, "([Z)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (boolean value : p0) horizonPut(value ? 1 : 0); return this;".to_owned();
+            }
+            ("readBooleanArray", "boolean[]", "()[Z") => {
+                return "int length = horizonGetVarInt(); if (length < 0 || length > HORIZON_MAX_BYTES) throw new IllegalArgumentException(\"Invalid boolean array length: \" + length); if (length > horizonReadable()) return new boolean[0]; boolean[] data = new boolean[length]; for (int i = 0; i < length; i++) data[i] = horizonGet() != 0; return data;".to_owned();
+            }
+            ("writeIntArray", _, "([I)V") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (int value : p0) horizonPutInt(value);".to_owned();
+            }
+            ("writeIntArray", _, "([I)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (int value : p0) horizonPutInt(value); return this;".to_owned();
+            }
+            ("readIntArray", "int[]", "()[I") => {
+                return "int length = horizonGetVarInt(); if (length < 0 || length > HORIZON_MAX_BYTES / 4) throw new IllegalArgumentException(\"Invalid int array length: \" + length); if (length * 4 > horizonReadable()) return new int[0]; int[] data = new int[length]; for (int i = 0; i < length; i++) data[i] = horizonGetInt(); return data;".to_owned();
+            }
+            ("writeLongArray", _, "([J)V") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (long value : p0) horizonPutLong(value);".to_owned();
+            }
+            ("writeLongArray", _, "([J)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (long value : p0) horizonPutLong(value); return this;".to_owned();
+            }
+            ("readLongArray", "long[]", "()[J") => {
+                return "int length = horizonGetVarInt(); if (length < 0 || length > HORIZON_MAX_BYTES / 8) throw new IllegalArgumentException(\"Invalid long array length: \" + length); if (length * 8 > horizonReadable()) return new long[0]; long[] data = new long[length]; for (int i = 0; i < length; i++) data[i] = horizonGetLong(); return data;".to_owned();
+            }
+            ("writeFloatArray", _, "([F)V") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (float value : p0) horizonPutInt(Float.floatToRawIntBits(value));".to_owned();
+            }
+            ("writeFloatArray", _, "([F)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (float value : p0) horizonPutInt(Float.floatToRawIntBits(value)); return this;".to_owned();
+            }
+            ("readFloatArray", "float[]", "()[F") => {
+                return "int length = horizonGetVarInt(); if (length < 0 || length > HORIZON_MAX_BYTES / 4) throw new IllegalArgumentException(\"Invalid float array length: \" + length); if (length * 4 > horizonReadable()) return new float[0]; float[] data = new float[length]; for (int i = 0; i < length; i++) data[i] = Float.intBitsToFloat(horizonGetInt()); return data;".to_owned();
+            }
+            ("writeDoubleArray", _, "([D)V") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (double value : p0) horizonPutLong(Double.doubleToRawLongBits(value));".to_owned();
+            }
+            ("writeDoubleArray", _, "([D)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (double value : p0) horizonPutLong(Double.doubleToRawLongBits(value)); return this;".to_owned();
+            }
+            ("readDoubleArray", "double[]", "()[D") => {
+                return "int length = horizonGetVarInt(); if (length < 0 || length > HORIZON_MAX_BYTES / 8) throw new IllegalArgumentException(\"Invalid double array length: \" + length); if (length * 8 > horizonReadable()) return new double[0]; double[] data = new double[length]; for (int i = 0; i < length; i++) data[i] = Double.longBitsToDouble(horizonGetLong()); return data;".to_owned();
+            }
+            ("writeStringArray", _, "([Ljava/lang/String;)V") => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (String value : p0) horizonPutUtf(value, 32767);".to_owned();
+            }
+            (
+                "writeStringArray",
+                _,
+                "([Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;",
+            ) => {
+                return "horizonPutVarInt(p0 == null ? 0 : p0.length); if (p0 != null) for (String value : p0) horizonPutUtf(value, 32767); return this;".to_owned();
+            }
+            ("readStringArray", "java.lang.String[]", "()[Ljava/lang/String;") => {
+                return "int length = horizonGetVarInt(); if (length < 0 || length > HORIZON_MAX_BYTES) throw new IllegalArgumentException(\"Invalid string array length: \" + length); String[] data = new String[length]; for (int i = 0; i < length; i++) data[i] = horizonGetUtf(32767); return data;".to_owned();
+            }
+            ("writeFloatLE", _, "(F)V") => {
+                return "horizonPutIntLE(Float.floatToRawIntBits(p0));".to_owned();
+            }
+            ("writeFloatLE", _, "(F)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutIntLE(Float.floatToRawIntBits(p0)); return this;".to_owned();
+            }
+            ("readFloatLE", "float", "()F") => {
+                return "return Float.intBitsToFloat(horizonGetIntLE());".to_owned();
+            }
+            ("writeDoubleLE", _, "(D)V") => {
+                return "horizonPutLongLE(Double.doubleToRawLongBits(p0));".to_owned();
+            }
+            ("writeDoubleLE", _, "(D)Lnet/minecraft/network/FriendlyByteBuf;") => {
+                return "horizonPutLongLE(Double.doubleToRawLongBits(p0)); return this;".to_owned();
+            }
+            ("readDoubleLE", "double", "()D") => {
+                return "return Double.longBitsToDouble(horizonGetLongLE());".to_owned();
+            }
             // Enums travel as their ordinal VarInt, like vanilla.
             ("writeEnum", _, "(Ljava/lang/Enum;)Lnet/minecraft/network/FriendlyByteBuf;") => {
                 return "horizonPutVarInt(p0 == null ? -1 : p0.ordinal()); return this;".to_owned();
@@ -6354,9 +6535,18 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
                 return "horizonByteReadIndex = Math.max(0, Math.min(p0, horizonWriteIndex)); return this;"
                     .to_owned();
             }
+            ("readerIndex", "int", "(I)I") => {
+                return "return horizonSetReaderIndexView(p0);".to_owned();
+            }
             ("writerIndex", "int", "()I") => return "return horizonWriteIndex;".to_owned(),
             ("writerIndex", _, "(I)Lnet/minecraft/network/FriendlyByteBuf;") => {
                 return "horizonSetWriterIndex(p0); return this;".to_owned();
+            }
+            ("writerIndex", "int", "(I)I") => {
+                return "return horizonSetWriterIndexView(p0);".to_owned();
+            }
+            ("setIndex", "void", "(I)V") => {
+                return "horizonSetIndexView(p0);".to_owned();
             }
             ("readableBytes", "int", "()I") | ("remaining", "int", "()I") => {
                 return "return horizonReadable();".to_owned();
@@ -9849,6 +10039,12 @@ mod tests {
         ),
         ("readUtf", "()Ljava/lang/String;"),
         ("readUtf", "(I)Ljava/lang/String;"),
+        ("writeString", "(Ljava/lang/String;)V"),
+        (
+            "writeString",
+            "(Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readString", "()Ljava/lang/String;"),
         (
             "writeResourceLocation",
             "(Lnet/minecraft/resources/Identifier;)Lnet/minecraft/network/FriendlyByteBuf;",
@@ -9884,6 +10080,51 @@ mod tests {
         ("readByteArray", "()[B"),
         ("readByteArray", "(I)[B"),
         ("writeBytes", "([B)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("writeBooleanArray", "([Z)V"),
+        (
+            "writeBooleanArray",
+            "([Z)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readBooleanArray", "()[Z"),
+        ("writeIntArray", "([I)V"),
+        (
+            "writeIntArray",
+            "([I)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readIntArray", "()[I"),
+        ("writeLongArray", "([J)V"),
+        (
+            "writeLongArray",
+            "([J)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readLongArray", "()[J"),
+        ("writeFloatArray", "([F)V"),
+        (
+            "writeFloatArray",
+            "([F)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readFloatArray", "()[F"),
+        ("writeDoubleArray", "([D)V"),
+        (
+            "writeDoubleArray",
+            "([D)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readDoubleArray", "()[D"),
+        ("writeStringArray", "([Ljava/lang/String;)V"),
+        (
+            "writeStringArray",
+            "([Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readStringArray", "()[Ljava/lang/String;"),
+        ("writeFloatLE", "(F)V"),
+        ("writeFloatLE", "(F)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readFloatLE", "()F"),
+        ("writeDoubleLE", "(D)V"),
+        (
+            "writeDoubleLE",
+            "(D)Lnet/minecraft/network/FriendlyByteBuf;",
+        ),
+        ("readDoubleLE", "()D"),
         (
             "writeEnum",
             "(Ljava/lang/Enum;)Lnet/minecraft/network/FriendlyByteBuf;",
@@ -9907,8 +10148,11 @@ mod tests {
         ),
         ("readerIndex", "()I"),
         ("readerIndex", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("readerIndex", "(I)I"),
         ("writerIndex", "()I"),
         ("writerIndex", "(I)Lnet/minecraft/network/FriendlyByteBuf;"),
+        ("writerIndex", "(I)I"),
+        ("setIndex", "(I)V"),
         ("readableBytes", "()I"),
         ("remaining", "()I"),
         ("isReadable", "()Z"),
@@ -9993,6 +10237,53 @@ mod tests {
             ),
             "horizonPutUtf(p0, p1); return this;"
         );
+        assert_eq!(
+            friendly_byte_buf_body("writeString", "(Ljava/lang/String;)V"),
+            "horizonPutUtf(p0, 32767);"
+        );
+        assert_eq!(
+            friendly_byte_buf_body("readString", "()Ljava/lang/String;"),
+            "return horizonGetUtf(32767);"
+        );
+        assert_eq!(
+            friendly_byte_buf_body(
+                "writeString",
+                "(Ljava/lang/String;)Lnet/minecraft/network/FriendlyByteBuf;"
+            ),
+            "horizonPutUtf(p0, 32767); return this;"
+        );
+        assert_eq!(
+            friendly_byte_buf_body(
+                "writeDoubleLE",
+                "(D)Lnet/minecraft/network/FriendlyByteBuf;"
+            ),
+            "horizonPutLongLE(Double.doubleToRawLongBits(p0)); return this;"
+        );
+        assert!(
+            friendly_byte_buf_body(
+                "writeIntArray",
+                "([I)Lnet/minecraft/network/FriendlyByteBuf;"
+            )
+            .ends_with("return this;")
+        );
+        assert!(friendly_byte_buf_body("writeIntArray", "([I)V").contains("horizonPutInt(value)"));
+        assert!(friendly_byte_buf_body("readDoubleArray", "()[D").contains("horizonGetLong()"));
+        assert_eq!(
+            friendly_byte_buf_body("writeFloatLE", "(F)V"),
+            "horizonPutIntLE(Float.floatToRawIntBits(p0));"
+        );
+        assert_eq!(
+            friendly_byte_buf_body("readDoubleLE", "()D"),
+            "return Double.longBitsToDouble(horizonGetLongLE());"
+        );
+        assert_eq!(
+            friendly_byte_buf_body("readerIndex", "(I)I"),
+            "return horizonSetReaderIndexView(p0);"
+        );
+        assert_eq!(
+            friendly_byte_buf_body("setIndex", "(I)V"),
+            "horizonSetIndexView(p0);"
+        );
         assert!(
             friendly_byte_buf_body(
                 "readResourceLocation",
@@ -10075,11 +10366,25 @@ mod tests {
         buf.writeLong(-9007199254740993L).writeVarLong(1234567890123L);
         buf.writeFloat(1.5f).writeDouble(-2.25d).writeBoolean(true).writeChar('Z');
         buf.writeUtf("h\u00e9llo").writeUtf("bounded", 16);
+        buf.writeString("native string");
         buf.writeResourceLocation(new net.minecraft.resources.Identifier("mod", "payload"));
         buf.writeUUID(new java.util.UUID(1L, 2L));
         buf.writeBlockPos(new net.minecraft.core.BlockPos(-1000, 64, 2000));
         buf.writeChunkPos(new net.minecraft.core.ChunkPos(-5, 6));
         buf.writeByteArray(new byte[] {1, 2, 3});
+        buf.writeString("string alias");
+        buf.writeBooleanArray(new boolean[] {true, false, true});
+        buf.writeIntArray(new int[] {-7, 42});
+        buf.writeLongArray(new long[] {9L, -11L});
+        buf.writeFloatArray(new float[] {1.25f, -2.5f});
+        buf.writeDoubleArray(new double[] {3.5d, -4.75d});
+        buf.writeStringArray(new String[] {"one", "two"});
+        buf.writeBooleanArray(new boolean[] {true, false, true});
+        buf.writeIntArray(new int[] {-1, 2, 3});
+        buf.writeLongArray(new long[] {4L, -5L});
+        buf.writeFloatArray(new float[] {6.5f, -7.25f});
+        buf.writeDoubleArray(new double[] {8.5d, -9.25d});
+        buf.writeStringArray(new String[] {"a", "b"});
         if (buf.readByte() != -7) throw new AssertionError("byte");
         if (buf.readShort() != -300) throw new AssertionError("short");
         if (buf.readInt() != -123456789) throw new AssertionError("int");
@@ -10092,6 +10397,7 @@ mod tests {
         if (buf.readChar() != 'Z') throw new AssertionError("char");
         if (!"h\u00e9llo".equals(buf.readUtf())) throw new AssertionError("utf");
         if (!"bounded".equals(buf.readUtf(16))) throw new AssertionError("utf max");
+        if (!"native string".equals(buf.readString())) throw new AssertionError("string");
         if (!"mod:payload".equals(buf.readResourceLocation().toString())) throw new AssertionError("identifier");
         java.util.UUID id = buf.readUUID();
         if (id.getMostSignificantBits() != 1L || id.getLeastSignificantBits() != 2L) throw new AssertionError("uuid");
@@ -10101,15 +10407,42 @@ mod tests {
         if (chunk.x != -5 || chunk.z != 6) throw new AssertionError("chunkpos");
         byte[] raw = buf.readByteArray();
         if (raw.length != 3 || raw[2] != 3) throw new AssertionError("byte array");
+        if (!"string alias".equals(buf.readString())) throw new AssertionError("string alias");
+        if (!java.util.Arrays.equals(buf.readBooleanArray(), new boolean[] {true, false, true})) throw new AssertionError("boolean array");
+        if (!java.util.Arrays.equals(buf.readIntArray(), new int[] {-7, 42})) throw new AssertionError("int array");
+        if (!java.util.Arrays.equals(buf.readLongArray(), new long[] {9L, -11L})) throw new AssertionError("long array");
+        if (!java.util.Arrays.equals(buf.readFloatArray(), new float[] {1.25f, -2.5f})) throw new AssertionError("float array");
+        if (!java.util.Arrays.equals(buf.readDoubleArray(), new double[] {3.5d, -4.75d})) throw new AssertionError("double array");
+        if (!java.util.Arrays.equals(buf.readStringArray(), new String[] {"one", "two"})) throw new AssertionError("string array");
+        boolean[] booleans = buf.readBooleanArray();
+        if (booleans.length != 3 || !booleans[0] || booleans[1] || !booleans[2]) throw new AssertionError("boolean array");
+        int[] ints = buf.readIntArray();
+        if (ints.length != 3 || ints[0] != -1 || ints[2] != 3) throw new AssertionError("int array");
+        long[] longs = buf.readLongArray();
+        if (longs.length != 2 || longs[1] != -5L) throw new AssertionError("long array");
+        float[] floats = buf.readFloatArray();
+        if (floats.length != 2 || floats[0] != 6.5f || floats[1] != -7.25f) throw new AssertionError("float array");
+        double[] doubles = buf.readDoubleArray();
+        if (doubles.length != 2 || doubles[0] != 8.5d || doubles[1] != -9.25d) throw new AssertionError("double array");
+        String[] strings = buf.readStringArray();
+        if (strings.length != 2 || !"a".equals(strings[0]) || !"b".equals(strings[1])) throw new AssertionError("string array");
         if (buf.readableBytes() != 0 || buf.isReadable()) throw new AssertionError("drained " + buf.readableBytes());
         FriendlyByteBuf little = new FriendlyByteBuf();
         little.writeShortLE(-300).writeMedium(-0x12345).writeMediumLE(-0x12345);
         little.writeIntLE(0x01020304).writeLongLE(-9007199254740993L);
+        little.writeFloatLE(1.25f);
+        little.writeDoubleLE(-4.5d);
+        little.writeFloatLE(1.25f);
+        little.writeDoubleLE(-3.5d);
         if (little.readShortLE() != -300) throw new AssertionError("short le");
         if (little.readMedium() != -0x12345) throw new AssertionError("medium");
         if (little.readMediumLE() != -0x12345) throw new AssertionError("medium le");
         if (little.readIntLE() != 0x01020304) throw new AssertionError("int le");
         if (little.readLongLE() != -9007199254740993L) throw new AssertionError("long le");
+        if (little.readFloatLE() != 1.25f) throw new AssertionError("float le");
+        if (little.readDoubleLE() != -4.5d) throw new AssertionError("double le");
+        if (little.readFloatLE() != 1.25f) throw new AssertionError("float le");
+        if (little.readDoubleLE() != -3.5d) throw new AssertionError("double le");
         java.util.function.BiConsumer<FriendlyByteBuf, String> writeString = (b, value) -> b.writeUtf(value);
         java.util.function.Function<FriendlyByteBuf, Object> readString = b -> b.readUtf();
         FriendlyByteBuf second = new FriendlyByteBuf();
@@ -10136,6 +10469,14 @@ mod tests {
         if (cursor.readInt() != 42) throw new AssertionError("compact read");
         cursor.clear();
         if (cursor.writerIndex() != 0 || cursor.readerIndex() != 0) throw new AssertionError("clear");
+        FriendlyByteBuf indexed = new FriendlyByteBuf();
+        indexed.writeInt(99);
+        if (indexed.readerIndex(2) != 0) throw new AssertionError("reader previous");
+        if (indexed.readerIndex() != 2) throw new AssertionError("reader view");
+        if (indexed.writerIndex(99) != 4) throw new AssertionError("writer previous");
+        if (indexed.writerIndex() != 4) throw new AssertionError("writer view");
+        indexed.setIndex(1);
+        if (indexed.readerIndex() != 1 || indexed.writerIndex() != 1) throw new AssertionError("set index");
         System.out.println("horizon FriendlyByteBuf round-trip ok");
     }
 "#;
@@ -10730,6 +11071,32 @@ public final class CodecProbe {
             String::from("package net.minecraft.network;\n\npublic class FriendlyByteBuf {\n");
         source.push_str(FRIENDLY_BYTE_BUF_STATE);
         for (method, descriptor) in FRIENDLY_BYTE_BUF_PAIRS {
+            // JVM descriptors may distinguish methods by return type, while
+            // Java source cannot overload `readerIndex(int)`/`writerIndex(int)`
+            // on that basis. Keep both ABI spellings in the body table, but
+            // compile the requested int-returning view in the source probe.
+            // The fluent and void write spellings are the same erasure for the
+            // same reason, so the probe compiles the void one.
+            if matches!(
+                (*method, *descriptor),
+                ("readerIndex", "(I)Lnet/minecraft/network/FriendlyByteBuf;")
+                    | ("writerIndex", "(I)Lnet/minecraft/network/FriendlyByteBuf;")
+            ) || (descriptor.ends_with(")Lnet/minecraft/network/FriendlyByteBuf;")
+                && matches!(
+                    *method,
+                    "writeString"
+                        | "writeBooleanArray"
+                        | "writeIntArray"
+                        | "writeLongArray"
+                        | "writeFloatArray"
+                        | "writeDoubleArray"
+                        | "writeStringArray"
+                        | "writeFloatLE"
+                        | "writeDoubleLE"
+                ))
+            {
+                continue;
+            }
             let (ret, params) = signature(descriptor);
             let body = runtime_body_with_descriptor(
                 "net/minecraft/network/FriendlyByteBuf",
