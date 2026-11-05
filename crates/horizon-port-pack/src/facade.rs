@@ -5258,11 +5258,14 @@ fn support_types(name: &str) -> &'static [&'static str] {
             "net/minecraft/world/entity/ai/goal/GoalSelector",
         ],
         // The bounded `LivingEntity` carries health, hands and effects; a mod
-        // that only names `getHealth` still needs those value types present.
+        // that only names `getHealth` still needs those value types present,
+        // plus the attribute instance and map its own fields construct.
         "net/minecraft/world/entity/LivingEntity" => &[
             "net/minecraft/world/item/ItemStack",
             "net/minecraft/world/effect/MobEffect",
             "net/minecraft/world/effect/MobEffectInstance",
+            "net/minecraft/world/entity/ai/attributes/AttributeInstance",
+            "net/minecraft/world/entity/ai/attributes/AttributeMap",
         ],
         // An `ItemStack` value names the item it holds and the component map it
         // carries; both must exist wherever the stack is generated.
@@ -20194,10 +20197,47 @@ public class Probe {
                 "public interface StreamCodec<B, V> {}",
             ),
             // The bounded entity closure the attachment slice implements on
-            // game classes (`Entity implements AttachmentTarget`).
+            // game classes (`Entity implements AttachmentTarget`), plus the
+            // living-entity value its health/attribute/hand accessors name.
             (
                 "net/minecraft/world/entity/Entity.java",
                 "public class Entity {}",
+            ),
+            (
+                "net/minecraft/world/entity/LivingEntity.java",
+                "public class LivingEntity extends Entity {}",
+            ),
+            (
+                "net/minecraft/world/entity/Mob.java",
+                "public class Mob extends LivingEntity {}",
+            ),
+            (
+                "net/minecraft/world/entity/SpawnGroupData.java",
+                "public interface SpawnGroupData {}",
+            ),
+            (
+                "net/minecraft/world/effect/MobEffect.java",
+                "public class MobEffect {}",
+            ),
+            (
+                "net/minecraft/world/effect/MobEffectInstance.java",
+                "public class MobEffectInstance {}",
+            ),
+            (
+                "net/minecraft/world/entity/ai/attributes/AttributeInstance.java",
+                "public class AttributeInstance {}",
+            ),
+            (
+                "net/minecraft/world/entity/ai/attributes/AttributeMap.java",
+                "public class AttributeMap {}",
+            ),
+            (
+                "net/minecraft/world/entity/ai/navigation/PathNavigation.java",
+                "public class PathNavigation {}",
+            ),
+            (
+                "net/minecraft/world/entity/ai/goal/GoalSelector.java",
+                "public class GoalSelector {}",
             ),
             (
                 "net/minecraft/world/entity/EntityType.java",
@@ -20534,6 +20574,8 @@ public class Probe {
                     // the seeded Entity/Level are exercised on that path too.
                     "net/neoforged/neoforge/capabilities/RegisterCapabilitiesEvent",
                     "net/minecraft/world/entity/Entity",
+                    "net/minecraft/world/entity/LivingEntity",
+                    "net/minecraft/world/entity/Mob",
                     "net/minecraft/core/Registry",
                 ],
                 &[
@@ -20551,6 +20593,8 @@ public class Probe {
                     "net/minecraft/core/Registry.java",
                     "net/minecraft/core/DefaultedRegistry.java",
                     "net/minecraft/world/entity/Entity.java",
+                    "net/minecraft/world/entity/LivingEntity.java",
+                    "net/minecraft/world/entity/Mob.java",
                 ],
             ),
         ];
