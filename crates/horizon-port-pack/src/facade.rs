@@ -1608,6 +1608,7 @@ pub fn generate_many(
                     "    default ItemStack getStackInSlot(int slot) { HorizonSlot value = horizonSlot(this, slot); return value == null || value.count <= 0 ? new ItemStack() : horizonCopy(value.stack, value.count); }\n",
                     "    default ItemStack insertItem(int slot, ItemStack stack, boolean simulate) { HorizonSlot value = horizonSlot(this, slot); int incoming = horizonCount(stack); if (value == null || incoming <= 0) return incoming <= 0 ? new ItemStack() : stack; Item existing = horizonItem(value.stack); Item incomingItem = horizonItem(stack); if (value.count > 0 && existing != incomingItem) return horizonCopy(stack, incoming); int amount = Math.min(incoming, Math.max(0, 64 - value.count)); if (!simulate && amount > 0) { if (value.count == 0) value.stack = stack; value.count += amount; } return amount == incoming ? new ItemStack() : horizonCopy(stack, incoming - amount); }\n",
                     "    default ItemStack extractItem(int slot, int amount, boolean simulate) { HorizonSlot value = horizonSlot(this, slot); if (value == null || amount <= 0 || value.count <= 0) return new ItemStack(); int moved = Math.min(amount, value.count); ItemStack result = horizonCopy(value.stack, moved); if (!simulate) { value.count -= moved; if (value.count == 0) value.stack = null; } return result; }\n",
+                    "}\n",
                 ),
             ),
             (
@@ -19242,6 +19243,115 @@ public class Probe {
             .status()
             .expect("run javac");
         assert!(status.success(), "javac rejected the NeoForge entity shims");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The whole NeoForge shim slice, not just the four entity events: a target
+    /// that names the item-handler capability generates the loader, event,
+    /// registry and capability files together, and `javac` compiles them as one
+    /// source set. A shim missing its closing brace (or naming a game type the
+    /// façade never emitted) fails here instead of in every NeoForge port.
+    #[test]
+    fn neoforge_facade_generates_and_compiles() {
+        use crate::classes::tests_support::PoolBuilder;
+        use std::{path::PathBuf, process::Command};
+
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let tool = |name: &str| {
+            jdk_bin
+                .as_ref()
+                .map(|bin| bin.join(name))
+                .unwrap_or_else(|| PathBuf::from(name))
+        };
+        let Ok(version) = Command::new(tool("javac")).arg("-version").output() else {
+            return;
+        };
+        if !version.status.success() {
+            return;
+        }
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("horizon-port-pack-neoforge-full-{stamp}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create the scratch root");
+
+        // The game jar carries only the shapes the shim slice names: the item
+        // handler reads `ItemStack`, `Item` and `Direction`, and the stack's
+        // bounded value names its component type.
+        let game_jar = root.join("game-26.3.jar");
+        {
+            let file = fs::File::create(&game_jar).expect("create the game jar");
+            let mut jar = zip::ZipWriter::new(file);
+            let mut class = |name: &str, superclass: &str, members: &[(&str, &str, u16)]| {
+                let mut pool = PoolBuilder::default();
+                let bytes = pool.build_with_members(name, superclass, members, &[]);
+                jar.start_file(
+                    format!("{name}.class"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .expect("start the game class");
+                std::io::Write::write_all(&mut jar, &bytes).expect("write the game class");
+            };
+            class(
+                "net/minecraft/world/item/ItemStack",
+                "java/lang/Object",
+                &[("<init>", "(Lnet/minecraft/world/item/Item;I)V", 0x0001)],
+            );
+            class("net/minecraft/world/item/Item", "java/lang/Object", &[]);
+            class(
+                "net/minecraft/core/component/DataComponentType",
+                "java/lang/Object",
+                &[],
+            );
+            class("net/minecraft/core/Direction", "java/lang/Object", &[]);
+            jar.finish().expect("finish the game jar");
+        }
+
+        // The target names the NeoForge capability plus the game types the
+        // emitted shims construct, so `generate` has to materialize both.
+        let target = root.join("demo-mod.jar");
+        {
+            let file = fs::File::create(&target).expect("create the target jar");
+            let mut jar = zip::ZipWriter::new(file);
+            let mut pool = PoolBuilder::default();
+            pool.method(
+                "net/neoforged/neoforge/items/IItemHandler",
+                "getSlots",
+                "()I",
+            );
+            pool.method("net/minecraft/world/item/ItemStack", "getCount", "()I");
+            pool.method(
+                "net/neoforged/neoforge/items/IItemHandler",
+                "horizonUsesDirection",
+                "(Lnet/minecraft/core/Direction;)V",
+            );
+            let bytes = pool.build("demo/Probe", "java/lang/Object", &[("run", &[0xb1])]);
+            jar.start_file("demo/Probe.class", zip::write::SimpleFileOptions::default())
+                .expect("start the target class");
+            std::io::Write::write_all(&mut jar, &bytes).expect("write the target class");
+            jar.finish().expect("finish the target jar");
+        }
+
+        let out = root.join("facade");
+        let report = generate(&target, &game_jar, &[], &out, &tool("javac"), &tool("jar"))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the NeoForge façade did not generate: {e} (sources in {})",
+                    out.display()
+                )
+            });
+        assert!(
+            report.jar.is_file(),
+            "the façade jar was not written: {report:?}"
+        );
+        assert!(
+            out.join("src/net/neoforged/neoforge/items/IItemHandler.java")
+                .is_file(),
+            "the item-handler shim was not generated"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
