@@ -6946,9 +6946,11 @@ mod tests {
         out.extend_from_slice(value.as_bytes());
     }
 
-    /// A minimal class with one method.  Pool: 1 `demo/T`, 2 Class 1,
-    /// 3 `java/lang/Object`, 4 Class 3, 5 `m`, 6 descriptor, 7 `Code`.
-    fn fixture(
+    /// A minimal class with one method.  Pool: 1 `<class>`, 2 Class 1,
+    /// 3 `java/lang/Object`, 4 Class 3, 5 `<method>`, 6 descriptor, 7 `Code`.
+    fn named_fixture(
+        class_name: &str,
+        method_name: &str,
         access: u16,
         descriptor: &str,
         max_locals: u16,
@@ -6960,11 +6962,11 @@ mod tests {
         u2(&mut out, 0);
         u2(&mut out, 52);
         u2(&mut out, 8);
-        utf8(&mut out, "demo/T");
+        utf8(&mut out, class_name);
         out.extend_from_slice(&[7, 0, 1]);
         utf8(&mut out, "java/lang/Object");
         out.extend_from_slice(&[7, 0, 3]);
-        utf8(&mut out, "m");
+        utf8(&mut out, method_name);
         utf8(&mut out, descriptor);
         utf8(&mut out, "Code");
         u2(&mut out, 0x0021); // access
@@ -6990,6 +6992,25 @@ mod tests {
         out.extend_from_slice(&body);
         u2(&mut out, 0); // class attributes
         out
+    }
+
+    /// A minimal `demo/T` with one method named `m`.
+    fn fixture(
+        access: u16,
+        descriptor: &str,
+        max_locals: u16,
+        code: &[u8],
+        exception_table: &[u8],
+    ) -> Vec<u8> {
+        named_fixture(
+            "demo/T",
+            "m",
+            access,
+            descriptor,
+            max_locals,
+            code,
+            exception_table,
+        )
     }
 
     fn callback(descriptor: &str) -> MethodRef {
@@ -7244,6 +7265,111 @@ mod tests {
         assert_eq!(max_locals, 1, "the marker lives only on the stack");
     }
 
+    #[test]
+    fn an_instance_callback_is_reached_through_a_bridge() {
+        let target_bytes = fixture(0x0001, "(II)I", 3, &[0x1a, 0x1b, 0x60, 0xac], &[]);
+        let callback_descriptor = format!("(II{TEST_CALLBACK_INFO_DESC})V");
+        let callback_bytes = named_fixture(
+            "demo/Cb",
+            "cb",
+            0x0001,
+            &callback_descriptor,
+            4,
+            &[0xb1],
+            &[],
+        );
+        let mut classes = BTreeMap::new();
+        classes.insert(
+            "demo/T".to_owned(),
+            ClassFile::parse(&target_bytes).unwrap(),
+        );
+        classes.insert(
+            "demo/Cb".to_owned(),
+            ClassFile::parse(&callback_bytes).unwrap(),
+        );
+        let plan = MixinInjectionPlan::inject_at_head(
+            target(),
+            MethodRef {
+                owner: "demo/Cb".into(),
+                name: "cb".into(),
+                descriptor: callback_descriptor.clone(),
+            },
+        );
+        let woven = weave_classes_with_extras(&classes, &[plan]).unwrap();
+        assert!(woven.added.contains_key(CALLBACK_INFO_CLASS));
+        let bridge_name = woven
+            .added
+            .keys()
+            .find(|name| name.contains("HorizonBridge"))
+            .expect("a bridge class")
+            .clone();
+        let bridge = ClassFile::parse(&woven.added[&bridge_name]).unwrap();
+        assert_eq!(bridge.name, bridge_name);
+        let field = bridge
+            .fields
+            .iter()
+            .find(|field| field.name == "callback0")
+            .expect("callback0 field");
+        assert!(field.is_static());
+        assert_eq!(field.descriptor, "Ldemo/Cb;");
+        let callback = bridge.method("callback0", &callback_descriptor).unwrap();
+        assert!(callback.is_static());
+        let code = callback.code.as_ref().unwrap();
+        assert_eq!(code[0], 0xb2, "getstatic the callback instance");
+        assert_eq!(code[code.len() - 1], 0xb1);
+        let install = bridge.method("install0", "(Ldemo/Cb;)V").unwrap();
+        assert!(install.is_static());
+
+        // The woven target calls the static bridge, not the instance method.
+        let (code, _, _) = woven_code(&woven.classes["demo/T"], "m", "(II)I");
+        let invoke = code
+            .iter()
+            .position(|byte| *byte == 0xb8)
+            .expect("an invokestatic");
+        let index = u16::from_be_bytes([code[invoke + 1], code[invoke + 2]]);
+        let target_class = ClassFile::parse(&woven.classes["demo/T"]).unwrap();
+        match &target_class.pool[index as usize] {
+            Cp::MethodRef { class, nt } => {
+                assert_eq!(
+                    pool_class_at(&target_class.pool, *class),
+                    Some(bridge_name.as_str())
+                );
+                let (name, descriptor) = pool_name_type_at(&target_class.pool, *nt).unwrap();
+                assert_eq!(name, "callback0");
+                assert_eq!(descriptor, callback_descriptor);
+            }
+            other => panic!("expected a MethodRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_private_instance_callback_is_a_reason() {
+        let target_bytes = fixture(0x0009, "(I)V", 1, &[0xb1], &[]);
+        let callback_bytes = named_fixture("demo/Cb", "cb", 0x0002, "(I)V", 2, &[0xb1], &[]);
+        let mut classes = BTreeMap::new();
+        classes.insert(
+            "demo/T".to_owned(),
+            ClassFile::parse(&target_bytes).unwrap(),
+        );
+        classes.insert(
+            "demo/Cb".to_owned(),
+            ClassFile::parse(&callback_bytes).unwrap(),
+        );
+        let plan = MixinInjectionPlan::inject_at_head(
+            MethodRef {
+                descriptor: "(I)V".into(),
+                ..target()
+            },
+            MethodRef {
+                owner: "demo/Cb".into(),
+                name: "cb".into(),
+                descriptor: "(I)V".into(),
+            },
+        );
+        let error = weave_classes_with_extras(&classes, &[plan]).unwrap_err();
+        assert!(error.contains("private"), "{error}");
+    }
+
     /// Parse `Code` out of a woven class so the assertions read the written
     /// bytes, not the in-memory patch.
     fn woven_code(woven: &[u8], name: &str, descriptor: &str) -> (Vec<u8>, u16, u16) {
@@ -7255,6 +7381,192 @@ mod tests {
             method.max_stack,
             method.max_locals,
         )
+    }
+
+    fn jdk_tool(name: &str) -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("JAVA_HOME")
+            .map(|home| std::path::PathBuf::from(home).join("bin").join(name))
+            .unwrap_or_else(|| name.into());
+        let output = std::process::Command::new(&path)
+            .arg("-version")
+            .output()
+            .ok()?;
+        output.status.success().then_some(path)
+    }
+
+    fn write_class_file(dir: &std::path::Path, name: &str, bytes: &[u8]) {
+        let path = dir.join(format!("{name}.class"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Compile the fixtures and load the woven classes on a real classloader.
+    ///
+    /// Structural byte checks cannot catch verifier errors in a shape that
+    /// constructs an object and a bridge; this runs both the instance callback
+    /// (through its bridge) and the static plain-`CallbackInfo` callback on a
+    /// JVM.  A machine without a JDK skips cleanly.
+    #[test]
+    fn woven_callbacks_load_on_a_real_classloader() {
+        let (Some(javac), Some(java)) = (jdk_tool("javac"), jdk_tool("java")) else {
+            eprintln!("skipping: no JDK on PATH or JAVA_HOME");
+            return;
+        };
+        let root = std::env::temp_dir().join(format!(
+            "horizon-native-java-weaver-bridge-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        std::fs::create_dir_all(src.join("demo")).unwrap();
+        std::fs::create_dir_all(&classes).unwrap();
+        write_class_file(
+            &classes,
+            CALLBACK_INFO_CLASS,
+            &callback_info_class().unwrap(),
+        );
+        std::fs::write(
+            src.join("demo/Target.java"),
+            r#"package demo;
+public class Target {
+    public static int calls = 0;
+    public static void run(int x) { calls += 1; }
+    public static void runStatic(int x) { calls += 1; }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("demo/MixinCb.java"),
+            r#"package demo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+public final class MixinCb {
+    public void onRun(int x, CallbackInfo ci) { Target.calls += x; }
+    public static void onRunStatic(int x, CallbackInfo ci) { Target.calls += 10 + x; }
+}
+"#,
+        )
+        .unwrap();
+        let output = std::process::Command::new(&javac)
+            .args(["--release", "17", "-nowarn", "-cp"])
+            .arg(&classes)
+            .arg("-d")
+            .arg(&classes)
+            .arg(src.join("demo/Target.java"))
+            .arg(src.join("demo/MixinCb.java"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "javac: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut set = BTreeMap::new();
+        for name in ["demo/Target", "demo/MixinCb"] {
+            let bytes = std::fs::read(classes.join(format!("{name}.class"))).unwrap();
+            set.insert(name.to_owned(), ClassFile::parse(&bytes).unwrap());
+        }
+        let callback_descriptor = format!("(I{TEST_CALLBACK_INFO_DESC})V");
+        let plans = [
+            MixinInjectionPlan::inject_at_head(
+                MethodRef {
+                    owner: "demo/Target".into(),
+                    name: "run".into(),
+                    descriptor: "(I)V".into(),
+                },
+                MethodRef {
+                    owner: "demo/MixinCb".into(),
+                    name: "onRun".into(),
+                    descriptor: callback_descriptor.clone(),
+                },
+            ),
+            MixinInjectionPlan::inject_at_head(
+                MethodRef {
+                    owner: "demo/Target".into(),
+                    name: "runStatic".into(),
+                    descriptor: "(I)V".into(),
+                },
+                MethodRef {
+                    owner: "demo/MixinCb".into(),
+                    name: "onRunStatic".into(),
+                    descriptor: callback_descriptor,
+                },
+            ),
+        ];
+        let woven = weave_classes_with_extras(&set, &plans).unwrap();
+        let bridge_name = woven
+            .added
+            .keys()
+            .find(|name| name.contains("HorizonBridge"))
+            .expect("a bridge class")
+            .clone();
+        let runner = root.join("runner");
+        std::fs::create_dir_all(&runner).unwrap();
+        for (name, bytes) in &woven.classes {
+            write_class_file(&runner, name, bytes);
+        }
+        for (name, bytes) in &woven.added {
+            write_class_file(&runner, name, bytes);
+        }
+
+        let driver_src = root.join("driver-src/driven/Driver.java");
+        std::fs::create_dir_all(driver_src.parent().unwrap()).unwrap();
+        std::fs::write(
+            &driver_src,
+            r#"package driven;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.Paths;
+public final class Driver {
+    public static void main(String[] args) throws Exception {
+        URL[] urls = { Paths.get(args[0]).toUri().toURL() };
+        try (URLClassLoader loader = new URLClassLoader(urls, ClassLoader.getPlatformClassLoader())) {
+            Class<?> mixin = Class.forName("demo.MixinCb", true, loader);
+            Object instance = mixin.getDeclaredConstructor().newInstance();
+            Class<?> bridge = Class.forName(args[1], true, loader);
+            bridge.getMethod("install0", mixin).invoke(null, instance);
+            Class<?> target = Class.forName("demo.Target", true, loader);
+            target.getMethod("run", int.class).invoke(null, Integer.valueOf(17));
+            target.getMethod("runStatic", int.class).invoke(null, Integer.valueOf(5));
+            System.out.println("calls=" + target.getField("calls").getInt(null));
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let driver = root.join("driver");
+        std::fs::create_dir_all(&driver).unwrap();
+        let output = std::process::Command::new(&javac)
+            .args(["--release", "17", "-nowarn", "-d"])
+            .arg(&driver)
+            .arg(&driver_src)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "javac driver: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = std::process::Command::new(&java)
+            .arg("-cp")
+            .arg(&driver)
+            .arg("driven.Driver")
+            .arg(&runner)
+            .arg(bridge_name.replace('/', "."))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "java: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // run: 1 + 17; runStatic: 1 + 10 + 5.
+        assert!(stdout.contains("calls=34"), "{stdout}");
     }
 
     #[test]
