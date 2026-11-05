@@ -86,6 +86,7 @@ public final class HorizonLoaderBridge {
   private static Class<?> classPathType;
   private static final List<String> classPathJars = new ArrayList<>();
   private static String classPathFailure;
+  private static String knotInitOutcome;
 
   public static boolean testLaunchCalled() { return testLaunchCalled; }
 
@@ -96,6 +97,7 @@ public final class HorizonLoaderBridge {
     classPathType = null;
     classPathJars.clear();
     classPathFailure = null;
+    knotInitOutcome = null;
   }
 
   /** Build the Knot class loader/registry `unlockClassPath` writes into. */
@@ -153,6 +155,21 @@ public final class HorizonLoaderBridge {
     String probe = verifyClassPath();
     if (probe != null) return bound("failed " + probe);
     return "ok " + classPathJars.size() + " jars";
+  }
+
+  /** Initialize Fabric's Mixin transformer through Knot's loader API. */
+  private static synchronized String initializeKnotTransformers() {
+    if (classPath == null) return "failed Knot class loader was not created";
+    try {
+      Method initialize = classPathType.getDeclaredMethod("initializeTransformers");
+      initialize.setAccessible(true);
+      initialize.invoke(classPath);
+      // KnotClassDelegate installs one IMixinTransformer; the API is void, so
+      // this is the number of transformers that this initialization call owns.
+      return "ok 1 transformers";
+    } catch (Throwable failure) {
+      return bound("failed " + summarize(failure));
+    }
   }
 
   private static String bound(String text) {
@@ -331,6 +348,9 @@ public final class HorizonLoaderBridge {
         freezeReason = summarize(failure);
       }
       String unlock = classpathUnlock ? classPathOutcome() : "";
+      if (classpathUnlock) {
+        knotInitOutcome = initializeKnotTransformers();
+      }
       Collection<?> allMods = (Collection<?>) impl.getMethod("getAllMods").invoke(loader);
       List<String> ids = new ArrayList<>();
       if (discovery) {
@@ -362,7 +382,7 @@ public final class HorizonLoaderBridge {
         StubEntrypoint.main(launchArgs);
       }
       return "minecraft\t" + allMods.size() + "\t" + freezeReason + "\t" + development + "\t"
-          + String.join(",", ids) + "\t" + unlock;
+          + String.join(",", ids) + "\t" + unlock + "\t" + (knotInitOutcome == null ? "" : knotInitOutcome);
     } catch (Throwable failure) {
       String reason = summarize(failure);
       try {
@@ -1001,6 +1021,10 @@ fn run() -> Result<(), String> {
         if let Some(value) = &unlock {
             println!("{}", classpath_unlock_line(value));
         }
+        let knot_init = knot_init_value(classpath_unlock, &outcome);
+        if let Some(value) = &knot_init {
+            println!("{}", knot_init_line(value));
+        }
         if provider_report {
             let report = ProviderReport::from_outcome(
                 &outcome,
@@ -1008,7 +1032,8 @@ fn run() -> Result<(), String> {
                 &game_provider.version,
                 ProviderSide::for_entry_kind(&entry_kind),
             )
-            .with_classpath_unlock(unlock);
+            .with_classpath_unlock(unlock)
+            .with_knot_init(knot_init);
             print_provider_report(&report, fml_flags.json);
         }
         return Ok(());
@@ -2194,6 +2219,8 @@ enum ProviderOutcome {
         /// The bridge's bounded `classpath-unlock` outcome, only when the run
         /// asked for it. `None` keeps an unflagged run byte-identical.
         classpath_unlock: Option<String>,
+        /// The bounded result of KnotClassLoaderInterface.initializeTransformers.
+        knot_init: Option<String>,
     },
     Fallback {
         mods: usize,
@@ -2227,6 +2254,7 @@ struct ProviderReport {
     development: Option<bool>,
     freeze_reason: Option<String>,
     classpath_unlock: Option<String>,
+    knot_init: Option<String>,
 }
 
 impl ProviderReport {
@@ -2241,6 +2269,7 @@ impl ProviderReport {
             development: None,
             freeze_reason: None,
             classpath_unlock: None,
+            knot_init: None,
         }
     }
 
@@ -2248,6 +2277,11 @@ impl ProviderReport {
     /// was before the flag existed.
     fn with_classpath_unlock(mut self, value: Option<String>) -> Self {
         self.classpath_unlock = value.map(|value| bounded_classpath_unlock(&value));
+        self
+    }
+
+    fn with_knot_init(mut self, value: Option<String>) -> Self {
+        self.knot_init = value.map(|value| bounded_classpath_unlock(&value));
         self
     }
 
@@ -2261,6 +2295,7 @@ impl ProviderReport {
             ProviderOutcome::Production {
                 development,
                 freeze_reason,
+                knot_init,
                 ..
             } => Self {
                 kind: ProviderKind::Minecraft,
@@ -2272,6 +2307,7 @@ impl ProviderReport {
                 development: Some(*development),
                 freeze_reason: freeze_reason.clone(),
                 classpath_unlock: None,
+                knot_init: knot_init.clone(),
             },
             ProviderOutcome::Fallback { reason, .. } => Self {
                 kind: ProviderKind::Test,
@@ -2283,6 +2319,7 @@ impl ProviderReport {
                 development: None,
                 freeze_reason: None,
                 classpath_unlock: None,
+                knot_init: None,
             },
             ProviderOutcome::Test { .. } => Self {
                 kind: ProviderKind::Test,
@@ -2294,6 +2331,7 @@ impl ProviderReport {
                 development: None,
                 freeze_reason: None,
                 classpath_unlock: None,
+                knot_init: None,
             },
         }
     }
@@ -2318,6 +2356,9 @@ impl ProviderReport {
         if let Some(unlock) = &self.classpath_unlock {
             lines.push(classpath_unlock_line(unlock));
         }
+        if let Some(init) = &self.knot_init {
+            lines.push(knot_init_line(init));
+        }
         bound_text(&(lines.join("\n") + "\n"), MAX_PROVIDER_REPORT_BYTES)
     }
 
@@ -2332,6 +2373,7 @@ impl ProviderReport {
             "isDevelopment": self.development,
             "freeze": self.freeze_reason,
             "classpathUnlock": self.classpath_unlock,
+            "knotInit": self.knot_init,
         })
         .to_string();
         if text.len() <= MAX_PROVIDER_REPORT_BYTES {
@@ -2347,6 +2389,7 @@ impl ProviderReport {
             "isDevelopment": self.development,
             "freeze": self.freeze_reason,
             "classpathUnlock": self.classpath_unlock,
+            "knotInit": self.knot_init,
         })
         .to_string()
     }
@@ -2428,11 +2471,33 @@ fn classpath_unlock_line(value: &str) -> String {
     format!("classpath-unlock: {value}")
 }
 
-/// The bridge returns `minecraft<TAB><mods><TAB><freeze><TAB><development><TAB><ids><TAB><unlock>` on success and
+/// `knot-init: <value>`, the one bounded stdout and report line.
+fn knot_init_line(value: &str) -> String {
+    format!("knot-init: {value}")
+}
+
+/// The Knot transformer initialization outcome for a real-loader run.
+fn knot_init_value(requested: bool, outcome: &ProviderOutcome) -> Option<String> {
+    if !requested {
+        return None;
+    }
+    match outcome {
+        ProviderOutcome::Production { knot_init, .. } => Some(match knot_init {
+            Some(value) => bounded_classpath_unlock(value),
+            None => "failed no knot-init result".to_owned(),
+        }),
+        ProviderOutcome::Fallback { .. } => {
+            Some("skipped (production game provider unavailable)".to_owned())
+        }
+        ProviderOutcome::Test { .. } => Some("skipped (no --game-jar)".to_owned()),
+    }
+}
+
+/// The bridge returns `minecraft<TAB><mods><TAB><freeze><TAB><development><TAB><ids><TAB><unlock><TAB><knot-init>` on success and
 /// `test<TAB><mods><TAB><reason>` after falling back. The unlock field is only
 /// present when `--classpath-unlock` was passed.
 fn parse_provider_outcome(text: &str) -> Result<ProviderOutcome, String> {
-    let mut parts = text.splitn(6, '\t');
+    let mut parts = text.splitn(7, '\t');
     let kind = parts.next().unwrap_or_default();
     let mods = parts
         .next()
@@ -2458,12 +2523,18 @@ fn parse_provider_outcome(text: &str) -> Result<ProviderOutcome, String> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(bounded_classpath_unlock);
+            let knot_init = parts
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(bounded_classpath_unlock);
             Ok(ProviderOutcome::Production {
                 mods,
                 freeze_reason: (!freeze.is_empty()).then(|| bounded_provider_reason(freeze)),
                 development,
                 discovered_ids,
                 classpath_unlock,
+                knot_init,
             })
         }
         "test" => Ok(ProviderOutcome::Fallback {
@@ -5462,16 +5533,16 @@ mod tests {
         fabric_add_mods_line, fabric_entries, fabric_jvm_options, fabric_metadata,
         fabric_mixin_configs, fallback_label, format_entrypoints, format_mixin_config_property,
         format_mixin_configs, game_provider_jvm_options, initializer_for_kind, is_datagen_kind,
-        is_minecraft_class, is_minecraft_runtime_jar, link_failure, missing_entry_message,
-        mixin_bootstrap_line, mixin_config_names, mixin_config_property, mixin_configs_line,
-        mixin_jvm_options, mixin_registered_count, mixin_stages, neoforge_constructor,
-        neoforge_constructor_args, neoforge_constructor_descriptor, neoforge_ctor_fallback_line,
-        neoforge_ctor_line, neoforge_dist, neoforge_dist_fields, neoforge_metadata,
-        nested_jar_name, parse_constructors, parse_mixin_config, parse_provider_outcome,
-        pre_launch_entries, quilt_entrypoint_kind, quilt_mixin_configs, register_mixin_configs,
-        report_mixin_configs, run_mixin_phase, select_mixin_configs, should_retry_no_arg,
-        skip_mc_provider_requested, skipped_mixin_configs, split_entrypoint,
-        take_game_provider_args,
+        is_minecraft_class, is_minecraft_runtime_jar, knot_init_line, knot_init_value,
+        link_failure, missing_entry_message, mixin_bootstrap_line, mixin_config_names,
+        mixin_config_property, mixin_configs_line, mixin_jvm_options, mixin_registered_count,
+        mixin_stages, neoforge_constructor, neoforge_constructor_args,
+        neoforge_constructor_descriptor, neoforge_ctor_fallback_line, neoforge_ctor_line,
+        neoforge_dist, neoforge_dist_fields, neoforge_metadata, nested_jar_name,
+        parse_constructors, parse_mixin_config, parse_provider_outcome, pre_launch_entries,
+        quilt_entrypoint_kind, quilt_mixin_configs, register_mixin_configs, report_mixin_configs,
+        run_mixin_phase, select_mixin_configs, should_retry_no_arg, skip_mc_provider_requested,
+        skipped_mixin_configs, split_entrypoint, take_game_provider_args,
     };
     use std::{
         fs::File,
@@ -6384,6 +6455,7 @@ config="demo.mixins.json""#,
                 development: false,
                 discovered_ids: vec![],
                 classpath_unlock: None,
+                knot_init: None,
             }
         );
         assert_eq!(
@@ -6394,6 +6466,7 @@ config="demo.mixins.json""#,
                 development: true,
                 discovered_ids: vec!["alpha".to_owned(), "beta".to_owned()],
                 classpath_unlock: None,
+                knot_init: None,
             }
         );
         // A freeze failure is whitespace-collapsed and bounded.
@@ -6449,6 +6522,7 @@ config="demo.mixins.json""#,
             development: false,
             discovered_ids: vec![],
             classpath_unlock: Some("ok 7 jars".to_owned()),
+            knot_init: None,
         };
         // Off by default: no value, so nothing is printed or reported.
         assert_eq!(classpath_unlock_value(false, &unlocked), None);
@@ -6483,6 +6557,7 @@ config="demo.mixins.json""#,
             development: false,
             discovered_ids: vec![],
             classpath_unlock: None,
+            knot_init: None,
         };
         assert_eq!(
             classpath_unlock_value(true, &missing).as_deref(),
@@ -6530,6 +6605,32 @@ config="demo.mixins.json""#,
     }
 
     #[test]
+    fn reports_knot_transformer_initialization_in_text_and_json() {
+        let outcome = ProviderOutcome::Production {
+            mods: 1,
+            freeze_reason: None,
+            development: false,
+            discovered_ids: vec![],
+            classpath_unlock: Some("ok 2 jars".to_owned()),
+            knot_init: Some("ok 1 transformers".to_owned()),
+        };
+        assert_eq!(
+            knot_init_value(true, &outcome).as_deref(),
+            Some("ok 1 transformers")
+        );
+        assert_eq!(
+            knot_init_line("ok 1 transformers"),
+            "knot-init: ok 1 transformers"
+        );
+        let report = ProviderReport::from_outcome(&outcome, 1, "26.3", ProviderSide::Server)
+            .with_classpath_unlock(Some("ok 2 jars".to_owned()))
+            .with_knot_init(Some("ok 1 transformers".to_owned()));
+        assert!(report.text().contains("knot-init: ok 1 transformers\n"));
+        let json: serde_json::Value = serde_json::from_str(&report.json()).unwrap();
+        assert_eq!(json["knotInit"], "ok 1 transformers");
+    }
+
+    #[test]
     fn formats_the_provider_report_as_text_and_json() {
         let report = ProviderReport::from_outcome(
             &ProviderOutcome::Production {
@@ -6538,6 +6639,7 @@ config="demo.mixins.json""#,
                 development: false,
                 discovered_ids: vec![],
                 classpath_unlock: None,
+                knot_init: None,
             },
             1,
             "26.3",
@@ -6596,6 +6698,7 @@ config="demo.mixins.json""#,
             development: Some(false),
             freeze_reason: None,
             classpath_unlock: None,
+            knot_init: None,
         };
         assert!(report.text().len() <= MAX_PROVIDER_REPORT_BYTES);
         assert!(report.json().len() <= MAX_PROVIDER_REPORT_BYTES);
