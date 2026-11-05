@@ -5160,6 +5160,17 @@ fn support_types(name: &str) -> &'static [&'static str] {
             "net/minecraft/world/item/Item",
             "net/minecraft/core/component/DataComponentType",
         ],
+        // `TagKey` is a 26.3 record: its components are private, so the
+        // generate closure does not see their types through the field list.
+        "net/minecraft/tags/TagKey" => &[
+            "net/minecraft/resources/ResourceKey",
+            "net/minecraft/resources/Identifier",
+        ],
+        // The payload type is a one-component record (`Identifier id`) for the
+        // same reason.
+        "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type" => {
+            &["net/minecraft/resources/Identifier"]
+        }
         "net/minecraft/world/entity/EntityType"
         | "net/minecraft/world/entity/EntityType$Builder" => {
             &["net/minecraft/world/entity/EntityDimensions"]
@@ -5392,7 +5403,6 @@ fn render(
     }
     let identifier = class.name == "net/minecraft/resources/Identifier";
     let resource_key = class.name == "net/minecraft/resources/ResourceKey";
-    let tag_key = class.name == "net/minecraft/tags/TagKey";
     if identifier {
         let _ = writeln!(
             out,
@@ -5407,12 +5417,6 @@ fn render(
         let _ = writeln!(
             out,
             "    private net.minecraft.resources.Identifier horizonRegistryName = new net.minecraft.resources.Identifier();\n    private net.minecraft.resources.Identifier horizonIdentifier = new net.minecraft.resources.Identifier();\n    public ResourceKey() {{}}\n    public ResourceKey(net.minecraft.resources.Identifier registryName, net.minecraft.resources.Identifier identifier) {{ this.horizonRegistryName = registryName; this.horizonIdentifier = identifier; }}"
-        );
-    }
-    if tag_key {
-        let _ = writeln!(
-            out,
-            "    private net.minecraft.resources.ResourceKey horizonRegistry = new net.minecraft.resources.ResourceKey();\n    private net.minecraft.resources.Identifier horizonLocation = new net.minecraft.resources.Identifier();\n    public TagKey() {{}}\n    public TagKey(net.minecraft.resources.ResourceKey registry, net.minecraft.resources.Identifier location) {{ this.horizonRegistry = registry; this.horizonLocation = location; }}"
         );
     }
     if matches!(
@@ -5524,12 +5528,6 @@ fn render(
         let _ = writeln!(
             out,
             "    protected net.minecraft.world.item.Item horizonItem = new net.minecraft.world.item.Item();\n    protected int horizonCount;\n    protected int horizonDamage;\n    protected java.util.Map<net.minecraft.core.component.DataComponentType, Object> horizonComponents = new java.util.HashMap<>();"
-        );
-    }
-    if class.name == "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type" {
-        let _ = writeln!(
-            out,
-            "    protected net.minecraft.resources.Identifier horizonId = new net.minecraft.resources.Identifier();"
         );
     }
     if class.name == "net/minecraft/network/FriendlyByteBuf" {
@@ -5729,7 +5727,7 @@ fn render(
         fields += 1;
     }
     // Constructors, so a mod's `super(...)` links.
-    let mut no_arg = identifier || resource_key || tag_key;
+    let mut no_arg = identifier || resource_key;
     for method in class
         .declared
         .iter()
@@ -7280,26 +7278,27 @@ fn runtime_body_with_descriptor(class: &str, method: &str, ret: &str, descriptor
         return "return new net.minecraft.tags.TagKey(p0, p1);".to_owned();
     }
     if class == "net/minecraft/tags/TagKey" {
+        // 26.3 makes `TagKey` a record with `registry` and `location`
+        // components, so the bounded bodies read the components a record
+        // accessor already supplies rather than something the façade declares.
         match (method, ret) {
             ("location", "net.minecraft.resources.Identifier") => {
-                return "return horizonLocation;".to_owned();
+                return "return location;".to_owned();
             }
             ("registry", "net.minecraft.resources.ResourceKey") => {
-                return "return horizonRegistry;".to_owned();
+                return "return registry;".to_owned();
             }
             ("isFor", "boolean") => {
-                return "return java.util.Objects.equals(horizonRegistry, p0);".to_owned();
+                return "return java.util.Objects.equals(registry, p0);".to_owned();
             }
             ("hashCode", "int") => {
-                return "return java.util.Objects.hash(horizonRegistry, horizonLocation);"
-                    .to_owned();
+                return "return java.util.Objects.hash(registry, location);".to_owned();
             }
             ("equals", "boolean") => {
-                return "return p0 instanceof TagKey other && java.util.Objects.equals(horizonRegistry, other.horizonRegistry) && java.util.Objects.equals(horizonLocation, other.horizonLocation);".to_owned();
+                return "return p0 instanceof TagKey other && java.util.Objects.equals(registry, other.registry) && java.util.Objects.equals(location, other.location);".to_owned();
             }
             ("toString", "java.lang.String") => {
-                return "return \"TagKey[\" + horizonRegistry + \" / \" + horizonLocation + \"]\";"
-                    .to_owned();
+                return "return \"TagKey[\" + registry + \" / \" + location + \"]\";".to_owned();
             }
             _ => {}
         }
@@ -12053,7 +12052,7 @@ public final class CodecProbe {
                 "location",
                 "net.minecraft.resources.Identifier"
             ),
-            "return horizonLocation;"
+            "return location;"
         );
         assert_eq!(
             runtime_body(
@@ -12061,11 +12060,11 @@ public final class CodecProbe {
                 "registry",
                 "net.minecraft.resources.ResourceKey"
             ),
-            "return horizonRegistry;"
+            "return registry;"
         );
         assert_eq!(
             runtime_body("net/minecraft/tags/TagKey", "isFor", "boolean"),
-            "return java.util.Objects.equals(horizonRegistry, p0);"
+            "return java.util.Objects.equals(registry, p0);"
         );
         assert_eq!(
             runtime_body(
@@ -13000,10 +12999,25 @@ public final class CodecProbe {
 
     #[test]
     fn tag_key_facade_preserves_registry_and_location() {
+        // 26.3 makes `TagKey` a record. Its components carry the two values,
+        // the canonical accessors come from the record itself, and the bounded
+        // `isFor` body reads the component rather than a shadow field.
         let class = Class {
             name: "net/minecraft/tags/TagKey".to_owned(),
-            superclass: "java/lang/Object".to_owned(),
+            superclass: "java/lang/Record".to_owned(),
             declared: vec![
+                Declared {
+                    name: "registry".to_owned(),
+                    descriptor: "Lnet/minecraft/resources/ResourceKey;".to_owned(),
+                    access: 0x0012,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "location".to_owned(),
+                    descriptor: "Lnet/minecraft/resources/Identifier;".to_owned(),
+                    access: 0x0012,
+                    kind: MemberKind::Field,
+                },
                 Declared {
                     name: "location".to_owned(),
                     descriptor: "()Lnet/minecraft/resources/Identifier;".to_owned(),
@@ -13013,6 +13027,12 @@ public final class CodecProbe {
                 Declared {
                     name: "registry".to_owned(),
                     descriptor: "()Lnet/minecraft/resources/ResourceKey;".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+                Declared {
+                    name: "isFor".to_owned(),
+                    descriptor: "(Lnet/minecraft/resources/ResourceKey;)Z".to_owned(),
                     access: 0x0001,
                     kind: MemberKind::Method,
                 },
@@ -13031,6 +13051,10 @@ public final class CodecProbe {
                     "registry".to_owned(),
                     "()Lnet/minecraft/resources/ResourceKey;".to_owned(),
                 ),
+                (
+                    "isFor".to_owned(),
+                    "(Lnet/minecraft/resources/ResourceKey;)Z".to_owned(),
+                ),
             ])),
             &BTreeMap::new(),
             &BTreeSet::new(),
@@ -13039,12 +13063,72 @@ public final class CodecProbe {
             false,
             &[],
         );
-        assert!(source.contains("horizonRegistry"));
-        assert!(source.contains("horizonLocation"));
-        assert!(source.contains("public TagKey(net.minecraft.resources.ResourceKey registry"));
-        assert!(source.contains(
-            "public net.minecraft.resources.Identifier location() { return horizonLocation; }"
-        ));
+        assert!(
+            source.contains(
+                "public record TagKey(net.minecraft.resources.ResourceKey registry, net.minecraft.resources.Identifier location)"
+            ),
+            "TagKey is not a record: {source}"
+        );
+        assert!(!source.contains("horizonRegistry"), "{source}");
+        assert!(!source.contains("horizonLocation"), "{source}");
+        // The record synthesizes both component accessors; redeclaring either
+        // one is a javac error.
+        assert!(
+            !source.contains("public net.minecraft.resources.Identifier location()"),
+            "{source}"
+        );
+        assert!(
+            !source.contains("public net.minecraft.resources.ResourceKey registry()"),
+            "{source}"
+        );
+        assert!(
+            source.contains("public boolean isFor(net.minecraft.resources.ResourceKey p0) { return java.util.Objects.equals(registry, p0); }"),
+            "{source}"
+        );
+        assert!(source.contains("public TagKey() { this("), "{source}");
+        // `javac` is the judge: a record that redeclared a field or an
+        // accessor would be rejected here, not at mod load.
+        use std::process::Command;
+        let root =
+            std::env::temp_dir().join(format!("horizon-facade-tag-key-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write the java source");
+            file
+        };
+        let files = [
+            write(
+                "net/minecraft/resources/Identifier.java",
+                "package net.minecraft.resources;\npublic class Identifier {}\n",
+            ),
+            write(
+                "net/minecraft/resources/ResourceKey.java",
+                "package net.minecraft.resources;\npublic class ResourceKey {}\n",
+            ),
+            write("net/minecraft/tags/TagKey.java", &source),
+        ];
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(status) = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(status.success(), "javac rejected the TagKey record");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -18498,7 +18582,34 @@ public class DatagenProbe {
             }],
             ..Class::default()
         };
-        for (class, forbidden) in [(&damage_type, "horizonMsgId"), (&accessor, "horizonId")] {
+        // `CustomPacketPayload$Type` is a one-component record in 26.3. The
+        // `id()` accessor comes from the component, so a `horizonId` field
+        // would fail javac exactly like the two above.
+        let payload_type = Class {
+            name: "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type"
+                .to_owned(),
+            superclass: "java/lang/Record".to_owned(),
+            declared: vec![
+                Declared {
+                    name: "id".to_owned(),
+                    descriptor: "Lnet/minecraft/resources/Identifier;".to_owned(),
+                    access: 0x0012,
+                    kind: MemberKind::Field,
+                },
+                Declared {
+                    name: "id".to_owned(),
+                    descriptor: "()Lnet/minecraft/resources/Identifier;".to_owned(),
+                    access: 0x0001,
+                    kind: MemberKind::Method,
+                },
+            ],
+            ..Class::default()
+        };
+        for (class, forbidden) in [
+            (&damage_type, "horizonMsgId"),
+            (&accessor, "horizonId"),
+            (&payload_type, "horizonId"),
+        ] {
             let source = render(
                 class,
                 None,
@@ -18516,6 +18627,72 @@ public class DatagenProbe {
                 class.name
             );
         }
+        let payload_source = render(
+            &payload_type,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &mut Report::default(),
+            false,
+            &[],
+        );
+        assert!(
+            payload_source
+                .contains("record CustomPacketPayload$Type(net.minecraft.resources.Identifier id)"),
+            "{payload_source}"
+        );
+        assert!(
+            !payload_source.contains("public net.minecraft.resources.Identifier id()"),
+            "the record already supplies id(): {payload_source}"
+        );
+        // Compile it: a record carrying a `horizonId` field or a second `id()`
+        // fails javac, and this is the exact source the façade writes.
+        use std::{path::PathBuf, process::Command};
+        let root = std::env::temp_dir().join(format!(
+            "horizon-facade-payload-type-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        let write = |relative: &str, text: &str| {
+            let file = src.join(relative);
+            fs::create_dir_all(file.parent().expect("package directory")).expect("create package");
+            fs::write(&file, text).expect("write the java source");
+            file
+        };
+        let files = [
+            write(
+                "net/minecraft/resources/Identifier.java",
+                "package net.minecraft.resources;\npublic class Identifier {}\n",
+            ),
+            write(
+                "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type.java",
+                &payload_source,
+            ),
+        ];
+        fs::create_dir_all(&classes).expect("create classes directory");
+        let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
+        let javac = jdk_bin
+            .as_ref()
+            .map(|bin| bin.join("javac"))
+            .unwrap_or_else(|| PathBuf::from("javac"));
+        let Ok(status) = Command::new(&javac)
+            .arg("-nowarn")
+            .arg("-d")
+            .arg(&classes)
+            .args(&files)
+            .status()
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(
+            status.success(),
+            "javac rejected the CustomPacketPayload$Type record"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
