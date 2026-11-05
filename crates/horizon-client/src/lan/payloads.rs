@@ -456,6 +456,14 @@ pub fn clear_handler_jars() {
         .clear();
 }
 
+/// Forget only the jars belonging to one execution role.
+pub fn clear_handler_jars_as(role: HandlerRole) {
+    HANDLER_JARS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&role);
+}
+
 /// Dispatch one received frame to the first registered handler that names its
 /// channel. Returns whether a handler ran; sends it queues are published for
 /// the next server tick.

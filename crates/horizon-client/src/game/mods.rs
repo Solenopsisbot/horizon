@@ -1143,7 +1143,7 @@ pub(super) fn run_java_mods_with_report(
     let mut native_content = Vec::new();
     let mut payload_declarations = Vec::new();
     let mut mixin_plannings = Vec::new();
-    horizon_client::lan::payloads::clear_handler_jars();
+    horizon_client::lan::payloads::clear_handler_jars_as(payload_handler_role(role));
     for path in paths {
         let jar = horizon_native_java::NativeJar::from_path(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
