@@ -366,7 +366,7 @@ fn class_for_name_fields_and_methods_use_local_markers() {
     assert_eq!(fixture.text("classLookup"), "demo.Model,absent");
     assert_eq!(
         fixture.text("fieldFacts"),
-        "3|LIMIT,label|LIMIT=I:25,label=java.lang.String:17,count=I:2"
+        "3|LIMIT,label|LIMIT=int:25,label=java.lang.String:17,count=int:2"
     );
     assert_eq!(
         fixture.text("methodFacts"),

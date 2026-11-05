@@ -3464,9 +3464,62 @@ impl Host for StdHost {
             | ("java/lang/String", "valueOf", "(F)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 format_java_float32(expect_float(r, Self::argument(r, args, 0)?)?),
             ))),
-            ("java/nio/file/Paths", "get", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
+            ("java/nio/file/Paths", "get", "(Ljava/lang/String;)Ljava/nio/file/Path;")
+            | (
+                "java/nio/file/Path",
+                "of",
+                "(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",
+            )
+            | ("java/nio/file/Path", "of", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
                 Ok(path_value(expect_string(Self::argument(r, args, 0)?)))
             }
+            // The virtual filesystem keeps no files of its own: a path is
+            // readable only when the caller seeded the same resource name.
+            // A read of anything else reports Java's `IOException`, which a
+            // config bootstrap catches and answers by writing defaults; it
+            // never becomes a null that a later `String.split` NPEs on.
+            ("java/nio/file/Files", "exists" | "notExists", descriptor)
+                if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+            {
+                let path = path_text(Self::argument(r, args, 0)?);
+                let exists = self.resource(path.trim_start_matches('/')).is_some();
+                Ok(Value::Int(i32::from(if r.name == "exists" {
+                    exists
+                } else {
+                    !exists
+                })))
+            }
+            ("java/nio/file/Files", "readString", descriptor)
+                if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+            {
+                let path = path_text(Self::argument(r, args, 0)?);
+                match self.resource(path.trim_start_matches('/')) {
+                    Some(text) => Ok(Value::Ref(Some(text.to_owned()))),
+                    None => Err(NativeError::UncaughtException {
+                        class: "java/io/IOException".into(),
+                        message: Some(format!("{path}: no such file")),
+                        frame: None,
+                    }),
+                }
+            }
+            (
+                "java/nio/file/Files",
+                "createDirectories" | "createFile" | "write" | "writeString" | "delete"
+                | "deleteIfExists",
+                descriptor,
+            ) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
+                Ok(Self::argument(r, args, 0)?.clone())
+            }
+            ("java/nio/file/Files", "move" | "copy", descriptor)
+                if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+            {
+                Ok(Self::argument(r, args, 1)?.clone())
+            }
+            (
+                "java/nio/file/Files",
+                "isDirectory" | "isRegularFile" | "isSymbolicLink" | "isExecutable",
+                descriptor,
+            ) if descriptor.starts_with("(Ljava/nio/file/Path;") => Ok(Value::Int(0)),
             (
                 "net/minecraft/resources/Identifier" | "net/minecraft/resources/ResourceLocation",
                 name,
@@ -4003,11 +4056,7 @@ impl Host for StdHost {
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some(name.to_owned()))),
                 ("getType", "()Ljava/lang/Class;") => {
-                    let class_name = descriptor
-                        .strip_prefix('L')
-                        .and_then(|value| value.strip_suffix(';'))
-                        .unwrap_or(descriptor);
-                    Ok(Value::Ref(Some(class_name.to_owned())))
+                    Ok(Value::Ref(Some(erased_field_type(descriptor))))
                 }
                 ("getModifiers", "()I") => Ok(Value::Int(i32::from(access))),
                 ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(marker.to_owned()))),
@@ -5113,6 +5162,13 @@ impl Host for StdHost {
             ("java/nio/file/Path", "getFileName", "()Ljava/nio/file/Path;") => {
                 let name = path_text(receiver).rsplit('/').next().unwrap_or_default();
                 Ok(path_value(name))
+            }
+            ("java/nio/file/Path", "getParent", "()Ljava/nio/file/Path;") => {
+                let path = path_text(receiver);
+                Ok(path
+                    .rsplit_once('/')
+                    .filter(|(parent, _)| !parent.is_empty())
+                    .map_or(Value::Ref(None), |(parent, _)| path_value(parent)))
             }
             ("java/lang/Class", "getName", "()Ljava/lang/String;")
             | ("java/lang/Class", "getTypeName", "()Ljava/lang/String;")
@@ -8656,6 +8712,654 @@ fn instance_field_key(receiver: &Value, field: &MethodRef) -> Option<String> {
 ///
 /// A lookup that found no declared field keeps only the name, so the
 /// descriptor and the access flags are optional here.
+/// How deep a declared generic type may nest before the bounded reflection
+/// surface stops reading it. Real signatures are a handful of levels deep.
+const MAX_GENERIC_TYPE_DEPTH: usize = 32;
+/// Type arguments one `ParameterizedType` may declare.
+const MAX_GENERIC_TYPE_ARGUMENTS: usize = 64;
+/// A field signature larger than this is not one javac writes.
+const MAX_GENERIC_SIGNATURE_BYTES: usize = 64 * 1024;
+/// Marker namespace of a `java.lang.reflect.Type` node the interpreter built.
+const GENERIC_TYPE_PREFIX: &str = "type/";
+
+/// One node of a field's generic type, as the class file's `Signature`
+/// attribute declares it.
+///
+/// `java.lang.reflect.Type` is an interface with four concrete shapes in the
+/// JDK. The interpreter keeps them as data and hands out markers: a plain
+/// class is the class marker `Field.getType` already uses, so identity with
+/// `SomeClass.class` holds, while the parameterized/variable/wildcard shapes
+/// carry a self-describing [`GENERIC_TYPE_PREFIX`] marker. Encoding every node
+/// means `getRawType`, `getActualTypeArguments` and structural `equals` need no
+/// side table, and a marker stays meaningful across host hand-offs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GenericType {
+    /// A class or array type: the internal name (`java/util/List`) or the
+    /// array descriptor (`[Ljava/lang/String;`), exactly the marker
+    /// `Field.getType` answers.
+    Class(String),
+    Parameterized {
+        raw: String,
+        owner: Option<Box<GenericType>>,
+        args: Vec<GenericType>,
+    },
+    Variable {
+        name: String,
+        bounds: Vec<GenericType>,
+    },
+    Wildcard {
+        upper: Vec<GenericType>,
+        lower: Vec<GenericType>,
+    },
+}
+
+/// Parse a field `Signature` attribute, refusing anything that is not exactly
+/// one complete type signature.
+fn parse_generic_signature(text: &str) -> Option<GenericType> {
+    if text.is_empty() || text.len() > MAX_GENERIC_SIGNATURE_BYTES {
+        return None;
+    }
+    let mut parser = GenericSignatureParser {
+        bytes: text.as_bytes(),
+        pos: 0,
+        depth: 0,
+    };
+    let value = parser.parse_reference()?;
+    (parser.pos == parser.bytes.len()).then_some(value)
+}
+
+struct GenericSignatureParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    depth: usize,
+}
+
+impl GenericSignatureParser<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn parse_reference(&mut self) -> Option<GenericType> {
+        if self.depth >= MAX_GENERIC_TYPE_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let value = match self.peek()? {
+            b'L' => self.parse_class(),
+            b'T' => self.parse_variable(),
+            b'[' => self.parse_array(),
+            _ => None,
+        };
+        self.depth -= 1;
+        value
+    }
+
+    fn parse_java_type(&mut self) -> Option<GenericType> {
+        let primitive = match self.peek()? {
+            b'B' => Some("byte"),
+            b'C' => Some("char"),
+            b'D' => Some("double"),
+            b'F' => Some("float"),
+            b'I' => Some("int"),
+            b'J' => Some("long"),
+            b'S' => Some("short"),
+            b'Z' => Some("boolean"),
+            _ => None,
+        };
+        if let Some(name) = primitive {
+            self.pos += 1;
+            return Some(GenericType::Class(name.to_owned()));
+        }
+        self.parse_reference()
+    }
+
+    fn parse_array(&mut self) -> Option<GenericType> {
+        // At '['. Only an element with a descriptor (class, primitive or a
+        // nested array) can be written as an array descriptor; an array of a
+        // type variable has no class marker, so it is refused rather than
+        // guessed.
+        self.pos += 1;
+        let element = self.parse_java_type()?;
+        let descriptor = type_descriptor(&element)?;
+        Some(GenericType::Class(format!("[{descriptor}")))
+    }
+
+    fn parse_class(&mut self) -> Option<GenericType> {
+        // At 'L'.
+        self.pos += 1;
+        let mut name = String::new();
+        let mut owner: Option<Box<GenericType>> = None;
+        let mut pending: Option<Vec<GenericType>> = None;
+        loop {
+            let start = self.pos;
+            while let Some(byte) = self.peek() {
+                if matches!(byte, b'<' | b';' | b'.') {
+                    break;
+                }
+                self.pos += 1;
+            }
+            if self.pos == start {
+                return None;
+            }
+            name.push_str(std::str::from_utf8(&self.bytes[start..self.pos]).ok()?);
+            match self.peek()? {
+                b'<' => {
+                    self.pos += 1;
+                    let args = self.parse_arguments()?;
+                    match self.peek()? {
+                        b'.' => {
+                            // `Outer<T>.Inner`: the typed prefix is the owner,
+                            // and the inner class keeps the outer binary name.
+                            self.pos += 1;
+                            let prefix = std::mem::take(&mut name);
+                            owner = Some(Box::new(GenericType::Parameterized {
+                                raw: prefix.clone(),
+                                owner: owner.take(),
+                                args,
+                            }));
+                            name = prefix;
+                            name.push('$');
+                            pending = None;
+                        }
+                        b';' => {
+                            self.pos += 1;
+                            return Some(GenericType::Parameterized {
+                                raw: name,
+                                owner,
+                                args,
+                            });
+                        }
+                        _ => return None,
+                    }
+                }
+                b'.' => {
+                    self.pos += 1;
+                    name.push('$');
+                }
+                b';' => {
+                    self.pos += 1;
+                    return Some(match pending {
+                        Some(args) => GenericType::Parameterized {
+                            raw: name,
+                            owner,
+                            args,
+                        },
+                        None if owner.is_some() => GenericType::Parameterized {
+                            raw: name,
+                            owner,
+                            args: Vec::new(),
+                        },
+                        None => GenericType::Class(name),
+                    });
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn parse_arguments(&mut self) -> Option<Vec<GenericType>> {
+        let mut args = Vec::new();
+        loop {
+            if args.len() >= MAX_GENERIC_TYPE_ARGUMENTS {
+                return None;
+            }
+            args.push(self.parse_type_argument()?);
+            // Class-file signatures concatenate type arguments with no
+            // separator (`<Ljava/lang/String;Ljava/lang/Integer;>`), unlike
+            // the source syntax.
+            if self.peek()? == b'>' {
+                self.pos += 1;
+                return Some(args);
+            }
+        }
+    }
+
+    fn parse_type_argument(&mut self) -> Option<GenericType> {
+        match self.peek()? {
+            b'*' => {
+                self.pos += 1;
+                Some(GenericType::Wildcard {
+                    upper: Vec::new(),
+                    lower: Vec::new(),
+                })
+            }
+            b'+' => {
+                self.pos += 1;
+                Some(GenericType::Wildcard {
+                    upper: vec![self.parse_reference()?],
+                    lower: Vec::new(),
+                })
+            }
+            b'-' => {
+                self.pos += 1;
+                Some(GenericType::Wildcard {
+                    upper: Vec::new(),
+                    lower: vec![self.parse_reference()?],
+                })
+            }
+            _ => self.parse_reference(),
+        }
+    }
+
+    fn parse_variable(&mut self) -> Option<GenericType> {
+        // At 'T'.
+        self.pos += 1;
+        let start = self.pos;
+        while let Some(byte) = self.peek() {
+            if matches!(byte, b';' | b':') {
+                break;
+            }
+            self.pos += 1;
+        }
+        let name = std::str::from_utf8(&self.bytes[start..self.pos])
+            .ok()?
+            .to_owned();
+        let mut bounds = Vec::new();
+        // A field signature is just `TName;`; class and method declarations
+        // add `:LBound;` interface bounds, which the same parser accepts.
+        if self.peek() == Some(b':') {
+            self.pos += 1;
+            if !matches!(self.peek(), Some(b':' | b';') | None) {
+                bounds.push(self.parse_reference()?);
+            }
+            while self.peek() == Some(b':') {
+                self.pos += 1;
+                bounds.push(self.parse_reference()?);
+            }
+        }
+        if self.peek() != Some(b';') {
+            return None;
+        }
+        self.pos += 1;
+        Some(GenericType::Variable { name, bounds })
+    }
+}
+
+/// The class-file descriptor of a node that can appear inside an array
+/// descriptor.
+fn type_descriptor(value: &GenericType) -> Option<String> {
+    let GenericType::Class(name) = value else {
+        return None;
+    };
+    if name.starts_with('[') {
+        return Some(name.clone());
+    }
+    let primitive = match name.as_str() {
+        "byte" => Some('B'),
+        "char" => Some('C'),
+        "double" => Some('D'),
+        "float" => Some('F'),
+        "int" => Some('I'),
+        "long" => Some('J'),
+        "short" => Some('S'),
+        "boolean" => Some('Z'),
+        _ => None,
+    };
+    Some(match primitive {
+        Some(primitive) => primitive.to_string(),
+        None => format!("L{name};"),
+    })
+}
+
+fn write_generic_node(tag: char, body: &str, out: &mut String) {
+    out.push(tag);
+    out.push_str(&body.len().to_string());
+    out.push(':');
+    out.push_str(body);
+}
+
+fn push_length_field(out: &mut String, value: &str) {
+    out.push_str(&value.len().to_string());
+    out.push(':');
+    out.push_str(value);
+}
+
+fn encode_generic_type(value: &GenericType) -> String {
+    let mut out = String::from(GENERIC_TYPE_PREFIX);
+    encode_generic_node(value, &mut out);
+    out
+}
+
+fn encode_generic_node(value: &GenericType, out: &mut String) {
+    match value {
+        GenericType::Class(name) => {
+            let mut body = String::new();
+            push_length_field(&mut body, name);
+            write_generic_node('C', &body, out);
+        }
+        GenericType::Variable { name, bounds } => {
+            let mut body = String::new();
+            push_length_field(&mut body, name);
+            body.push_str(&bounds.len().to_string());
+            body.push(':');
+            for bound in bounds {
+                encode_generic_node(bound, &mut body);
+            }
+            write_generic_node('V', &body, out);
+        }
+        GenericType::Parameterized { raw, owner, args } => {
+            let mut body = String::new();
+            push_length_field(&mut body, raw);
+            body.push_str(&args.len().to_string());
+            body.push(':');
+            for arg in args {
+                encode_generic_node(arg, &mut body);
+            }
+            match owner {
+                Some(owner) => encode_generic_node(owner, &mut body),
+                None => body.push('-'),
+            }
+            write_generic_node('P', &body, out);
+        }
+        GenericType::Wildcard { upper, lower } => {
+            let mut body = String::new();
+            body.push_str(&upper.len().to_string());
+            body.push(':');
+            for bound in upper {
+                encode_generic_node(bound, &mut body);
+            }
+            body.push_str(&lower.len().to_string());
+            body.push(':');
+            for bound in lower {
+                encode_generic_node(bound, &mut body);
+            }
+            write_generic_node('W', &body, out);
+        }
+    }
+}
+
+fn decode_generic_type(marker: &str) -> Option<GenericType> {
+    let rest = marker.strip_prefix(GENERIC_TYPE_PREFIX)?;
+    let mut cursor = 0;
+    let value = decode_generic_node(rest, &mut cursor, 0)?;
+    (cursor == rest.len()).then_some(value)
+}
+
+fn decode_generic_node(bytes: &str, cursor: &mut usize, depth: usize) -> Option<GenericType> {
+    if depth >= MAX_GENERIC_TYPE_DEPTH {
+        return None;
+    }
+    let tag = *bytes.as_bytes().get(*cursor)? as char;
+    *cursor += 1;
+    let length = decode_length(bytes, cursor)?;
+    let end = cursor.checked_add(length)?;
+    if end > bytes.len() {
+        return None;
+    }
+    let body = &bytes[*cursor..end];
+    *cursor = end;
+    match tag {
+        'C' => {
+            let mut at = 0;
+            let name = decode_length_field(body, &mut at)?;
+            (at == body.len()).then_some(GenericType::Class(name))
+        }
+        'V' => {
+            let mut at = 0;
+            let name = decode_length_field(body, &mut at)?;
+            let count = decode_length(body, &mut at)?;
+            if count > MAX_GENERIC_TYPE_ARGUMENTS {
+                return None;
+            }
+            let mut bounds = Vec::with_capacity(count);
+            for _ in 0..count {
+                bounds.push(decode_generic_node(body, &mut at, depth + 1)?);
+            }
+            (at == body.len()).then_some(GenericType::Variable { name, bounds })
+        }
+        'P' => {
+            let mut at = 0;
+            let raw = decode_length_field(body, &mut at)?;
+            let count = decode_length(body, &mut at)?;
+            if count > MAX_GENERIC_TYPE_ARGUMENTS {
+                return None;
+            }
+            let mut args = Vec::with_capacity(count);
+            for _ in 0..count {
+                args.push(decode_generic_node(body, &mut at, depth + 1)?);
+            }
+            let owner = if body.as_bytes().get(at) == Some(&b'-') {
+                at += 1;
+                None
+            } else {
+                Some(Box::new(decode_generic_node(body, &mut at, depth + 1)?))
+            };
+            (at == body.len()).then_some(GenericType::Parameterized { raw, owner, args })
+        }
+        'W' => {
+            let mut at = 0;
+            let upper_count = decode_length(body, &mut at)?;
+            if upper_count > MAX_GENERIC_TYPE_ARGUMENTS {
+                return None;
+            }
+            let mut upper = Vec::with_capacity(upper_count);
+            for _ in 0..upper_count {
+                upper.push(decode_generic_node(body, &mut at, depth + 1)?);
+            }
+            let lower_count = decode_length(body, &mut at)?;
+            if lower_count > MAX_GENERIC_TYPE_ARGUMENTS {
+                return None;
+            }
+            let mut lower = Vec::with_capacity(lower_count);
+            for _ in 0..lower_count {
+                lower.push(decode_generic_node(body, &mut at, depth + 1)?);
+            }
+            (at == body.len()).then_some(GenericType::Wildcard { upper, lower })
+        }
+        _ => None,
+    }
+}
+
+fn decode_length(bytes: &str, cursor: &mut usize) -> Option<usize> {
+    let start = *cursor;
+    while bytes
+        .as_bytes()
+        .get(*cursor)
+        .is_some_and(u8::is_ascii_digit)
+    {
+        *cursor += 1;
+    }
+    if *cursor == start || bytes.as_bytes().get(*cursor) != Some(&b':') {
+        return None;
+    }
+    let length = bytes[start..*cursor].parse().ok()?;
+    *cursor += 1;
+    Some(length)
+}
+
+fn decode_length_field(bytes: &str, cursor: &mut usize) -> Option<String> {
+    let length = decode_length(bytes, cursor)?;
+    let start = *cursor;
+    let end = start.checked_add(length)?;
+    let text = bytes.get(start..end)?.to_owned();
+    *cursor = end;
+    Some(text)
+}
+
+/// Materialize one type node as the value `Field.getGenericType` and friends
+/// hand back. A plain class is the class marker itself, so
+/// `getGenericType() == String.class` and `getRawType() == List.class` hold.
+fn generic_type_value(value: &GenericType) -> Value {
+    match value {
+        GenericType::Class(name) => Value::Ref(Some(name.clone())),
+        other => Value::Ref(Some(encode_generic_type(other))),
+    }
+}
+
+fn generic_type_marker(value: &Value) -> Option<GenericType> {
+    decode_generic_type(expect_string(value))
+}
+
+/// Whether a marker is a `java.lang.reflect` type node of the named runtime
+/// type. Only markers this runtime built are claimed; every other `instanceof`
+/// keeps the interpreter's previous neutral answer.
+fn generic_type_instance_of(marker: &str, class: &str) -> bool {
+    let Some(rest) = marker.strip_prefix(GENERIC_TYPE_PREFIX) else {
+        return false;
+    };
+    match rest.as_bytes().first() {
+        Some(b'P') => matches!(
+            class,
+            "java/lang/reflect/ParameterizedType" | "java/lang/reflect/Type" | "java/lang/Object"
+        ),
+        Some(b'V') => matches!(
+            class,
+            "java/lang/reflect/TypeVariable" | "java/lang/reflect/Type" | "java/lang/Object"
+        ),
+        Some(b'W') => matches!(
+            class,
+            "java/lang/reflect/WildcardType" | "java/lang/reflect/Type" | "java/lang/Object"
+        ),
+        _ => false,
+    }
+}
+
+/// Whether a marker is one of the class markers the interpreter hands out.
+///
+/// Class values are deliberately ordinary marker strings (so `String.class`
+/// and a field's erased type compare equal), which leaves `instanceof Class`
+/// without a runtime tag. A jar's own classes are in `classes`; a JDK or game
+/// class is a slash-qualified name; and the interpreter's other marker
+/// namespaces (`@fn`, `list/`, `type/`, ...) are not classes.
+fn class_marker_like(marker: &str, classes: &BTreeMap<String, ClassFile>) -> bool {
+    if classes.contains_key(marker) {
+        return true;
+    }
+    if matches!(
+        marker,
+        "boolean" | "byte" | "char" | "double" | "float" | "int" | "long" | "short" | "void"
+    ) || marker.starts_with('[')
+    {
+        return true;
+    }
+    const NON_CLASS_PREFIXES: [&str; 14] = [
+        "@",
+        "array/",
+        "capability/",
+        "enum/",
+        "fabric-",
+        "item-handler/",
+        "list",
+        "map",
+        "number-format/",
+        "optional",
+        "path:",
+        "reflect-",
+        "resource-",
+        "type/",
+    ];
+    if NON_CLASS_PREFIXES
+        .iter()
+        .any(|prefix| marker.starts_with(prefix))
+    {
+        return false;
+    }
+    marker.contains('/')
+}
+
+/// The name `Type.getTypeName` reports. It mirrors {@link Class#getName} for
+/// classes and the JDK's own rendering for parameterized and wildcard nodes.
+fn generic_type_display(value: &GenericType) -> String {
+    match value {
+        GenericType::Class(name) => class_type_display(name),
+        GenericType::Parameterized { raw, args, .. } => {
+            let mut text = class_type_display(raw);
+            if !args.is_empty() {
+                text.push('<');
+                for (index, arg) in args.iter().enumerate() {
+                    if index > 0 {
+                        text.push_str(", ");
+                    }
+                    text.push_str(&generic_type_display(arg));
+                }
+                text.push('>');
+            }
+            text
+        }
+        GenericType::Variable { name, .. } => name.clone(),
+        GenericType::Wildcard { upper, lower } => {
+            if let Some(lower) = lower.first() {
+                format!("? super {}", generic_type_display(lower))
+            } else if let Some(upper) = upper.first() {
+                if matches!(upper, GenericType::Class(name) if name == "java/lang/Object") {
+                    "?".into()
+                } else {
+                    format!("? extends {}", generic_type_display(upper))
+                }
+            } else {
+                "?".into()
+            }
+        }
+    }
+}
+
+fn class_type_display(name: &str) -> String {
+    if let Some(element) = name.strip_prefix('[') {
+        return format!("{}[]", class_type_display_descriptor(element));
+    }
+    match name {
+        "byte" | "char" | "double" | "float" | "int" | "long" | "short" | "boolean" => {
+            name.to_owned()
+        }
+        other => other.replace('/', "."),
+    }
+}
+
+fn class_type_display_descriptor(descriptor: &str) -> String {
+    if let Some(element) = descriptor.strip_prefix('[') {
+        return format!("{}[]", class_type_display_descriptor(element));
+    }
+    match descriptor {
+        "B" => "byte".into(),
+        "C" => "char".into(),
+        "D" => "double".into(),
+        "F" => "float".into(),
+        "I" => "int".into(),
+        "J" => "long".into(),
+        "S" => "short".into(),
+        "Z" => "boolean".into(),
+        other => other
+            .strip_prefix('L')
+            .and_then(|value| value.strip_suffix(';'))
+            .unwrap_or(other)
+            .replace('/', "."),
+    }
+}
+
+/// The class marker `Field.getType` answers for an erased descriptor.
+///
+/// A primitive's class marker is the primitive name (`int.class` reads
+/// `Integer.TYPE`, which the host already answers as `"int"`), an array keeps
+/// its descriptor, and a reference strips the `L...;` wrapper.
+fn erased_field_type(descriptor: &str) -> String {
+    match descriptor {
+        "B" => "byte",
+        "C" => "char",
+        "D" => "double",
+        "F" => "float",
+        "I" => "int",
+        "J" => "long",
+        "S" => "short",
+        "Z" => "boolean",
+        "V" => "void",
+        other => other
+            .strip_prefix('L')
+            .and_then(|value| value.strip_suffix(';'))
+            .unwrap_or(other),
+    }
+    .to_owned()
+}
+
+/// The bounds array `TypeVariable.getBounds` and `WildcardType.getUpperBounds`
+/// answer: an unbounded wildcard or variable is bounded by `Object`.
+fn generic_type_bounds(bounds: &[GenericType]) -> Vec<GenericType> {
+    if bounds.is_empty() {
+        vec![GenericType::Class("java/lang/Object".into())]
+    } else {
+        bounds.to_vec()
+    }
+}
+
 fn parse_field_marker(member: &str) -> (&str, Option<(&str, u16)>) {
     let mut parts = member.split(':');
     let name = parts.next().unwrap_or(member);
@@ -8946,6 +9650,51 @@ impl ClassFile {
             }
         }
         Ok(Vec::new())
+    }
+
+    /// The generic `Signature` attribute of one field, when the class file
+    /// carries one.
+    ///
+    /// [`Field`] keeps the erased descriptor the rest of the loader needs, so
+    /// `Field.getGenericType` re-reads the attribute table from the raw bytes
+    /// on demand, the same way [`Self::exception_handlers`] reads its table.
+    /// The walk stops at the matching field, and a malformed class file only
+    /// makes this query answer `None`; the caller then falls back to the
+    /// erased descriptor exactly as the JVM does for a non-generic field.
+    fn field_signature(&self, field_name: &str, field_descriptor: &str) -> Option<String> {
+        let mut r = Reader::new(&self.raw);
+        if r.u4().ok()? != 0xCAFE_BABE {
+            return None;
+        }
+        r.skip(4).ok()?;
+        let pool = read_pool(&mut r).ok()?;
+        let _access = r.u2().ok()?;
+        let _this = r.u2().ok()?;
+        let _super = r.u2().ok()?;
+        let interfaces = r.u2().ok()? as usize;
+        r.skip(interfaces.checked_mul(2)?).ok()?;
+        let fields = r.u2().ok()? as usize;
+        for _ in 0..fields {
+            let _access = r.u2().ok()?;
+            let name = utf8(&pool, r.u2().ok()?).ok()?;
+            let descriptor = utf8(&pool, r.u2().ok()?).ok()?;
+            let attributes = r.u2().ok()? as usize;
+            let matching = name == field_name && descriptor == field_descriptor;
+            let mut signature = None;
+            for _ in 0..attributes {
+                let attribute = utf8(&pool, r.u2().ok()?).ok()?;
+                let length = r.u4().ok()? as usize;
+                if matching && attribute == "Signature" && length == 2 {
+                    signature = utf8(&pool, r.u2().ok()?).ok();
+                } else {
+                    r.skip(length).ok()?;
+                }
+            }
+            if matching {
+                return signature;
+            }
+        }
+        None
     }
 
     fn method_ref(&self, index: u16) -> Result<MethodRef, NativeError> {
@@ -11066,6 +11815,7 @@ impl NativeJar {
             next_stream: 0,
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_readers: BTreeMap::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -11272,6 +12022,7 @@ impl NativeJar {
             next_stream: 0,
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_readers: BTreeMap::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos,
@@ -13147,6 +13898,310 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
     )))
 }
 
+/// Largest JSON document the bounded Gson surface accepts. Config files in
+/// the wild are kilobytes; a crafted one must not grow host memory.
+const MAX_GSON_JSON_BYTES: usize = 1024 * 1024;
+/// Deepest JSON nesting `Gson.fromJson` materializes.
+const MAX_GSON_DEPTH: usize = 32;
+
+/// Parse one JSON document and materialize it for `Gson.fromJson`.
+///
+/// The target class decides between a primitive, a modelled `String`, and the
+/// collection/map markers the interpreter already understands. A document
+/// that nests past [`MAX_GSON_DEPTH`] or measures over
+/// [`MAX_GSON_JSON_BYTES`] is refused with a bounded reason, never replaced by
+/// an empty value.
+fn gson_from_json(text: &str, class: &str) -> Result<Value, NativeError> {
+    if text.len() > MAX_GSON_JSON_BYTES {
+        return Err(NativeError::Metadata(format!(
+            "Gson.fromJson document is {} bytes; the bounded parser reads at most {MAX_GSON_JSON_BYTES}",
+            text.len()
+        )));
+    }
+    let json: serde_json::Value = serde_json::from_str(text).map_err(|error| {
+        NativeError::Metadata(format!("Gson.fromJson rejected the document: {error}"))
+    })?;
+    let depth = gson_json_depth(&json, 0);
+    if depth > MAX_GSON_DEPTH {
+        return Err(NativeError::Metadata(format!(
+            "Gson.fromJson document nests {depth} levels; the bounded parser reads at most {MAX_GSON_DEPTH}"
+        )));
+    }
+    gson_json_value(&json, &class.replace('.', "/"))
+}
+
+fn gson_json_depth(json: &serde_json::Value, depth: usize) -> usize {
+    if depth > MAX_GSON_DEPTH {
+        return depth;
+    }
+    match json {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| gson_json_depth(value, depth + 1))
+            .max()
+            .unwrap_or(depth),
+        serde_json::Value::Object(values) => values
+            .values()
+            .map(|value| gson_json_depth(value, depth + 1))
+            .max()
+            .unwrap_or(depth),
+        _ => depth,
+    }
+}
+
+fn gson_json_value(json: &serde_json::Value, class: &str) -> Result<Value, NativeError> {
+    if matches!(json, serde_json::Value::Null) {
+        return Ok(Value::Ref(None));
+    }
+    if class.starts_with('[') {
+        return match json {
+            serde_json::Value::Array(values) => Ok(gson_json_collection(values, class, "list")?),
+            other => Err(NativeError::Metadata(format!(
+                "Gson.fromJson expected a JSON array for {class}, got {}",
+                gson_json_kind(other)
+            ))),
+        };
+    }
+    if gson_list_target(class) {
+        return match json {
+            serde_json::Value::Array(values) => Ok(gson_json_collection(
+                values,
+                class,
+                if gson_set_target(class) {
+                    "set"
+                } else {
+                    "list"
+                },
+            )?),
+            other => Err(NativeError::Metadata(format!(
+                "Gson.fromJson expected a JSON array for {class}, got {}",
+                gson_json_kind(other)
+            ))),
+        };
+    }
+    if gson_map_target(class) {
+        return match json {
+            serde_json::Value::Object(values) => Ok(gson_json_map(values)?),
+            other => Err(NativeError::Metadata(format!(
+                "Gson.fromJson expected a JSON object for {class}, got {}",
+                gson_json_kind(other)
+            ))),
+        };
+    }
+    match json {
+        serde_json::Value::Bool(value) => Ok(match class {
+            "java/lang/String" => Value::Ref(Some(value.to_string())),
+            _ => Value::Int(i32::from(*value)),
+        }),
+        serde_json::Value::Number(number) => Ok(gson_json_number(number, class)),
+        serde_json::Value::String(value) => Ok(Value::Ref(Some(value.clone()))),
+        serde_json::Value::Array(values) => Ok(gson_json_collection(values, class, "list")?),
+        serde_json::Value::Object(values) => Ok(gson_json_map(values)?),
+        serde_json::Value::Null => Ok(Value::Ref(None)),
+    }
+}
+
+fn gson_list_target(class: &str) -> bool {
+    matches!(
+        class,
+        "java/lang/Iterable"
+            | "java/util/Collection"
+            | "java/util/List"
+            | "java/util/Queue"
+            | "java/util/Deque"
+            | "java/util/ArrayList"
+            | "java/util/LinkedList"
+            | "java/util/AbstractList"
+            | "java/util/Set"
+            | "java/util/HashSet"
+            | "java/util/LinkedHashSet"
+            | "java/util/AbstractSet"
+    )
+}
+
+fn gson_set_target(class: &str) -> bool {
+    matches!(
+        class,
+        "java/util/Set" | "java/util/HashSet" | "java/util/LinkedHashSet" | "java/util/AbstractSet"
+    )
+}
+
+fn gson_map_target(class: &str) -> bool {
+    matches!(
+        class,
+        "java/util/Map"
+            | "java/util/HashMap"
+            | "java/util/LinkedHashMap"
+            | "java/util/AbstractMap"
+            | "java/util/Properties"
+    )
+}
+
+fn gson_json_number(number: &serde_json::Number, class: &str) -> Value {
+    match class {
+        "int"
+        | "java/lang/Integer"
+        | "short"
+        | "java/lang/Short"
+        | "byte"
+        | "java/lang/Byte"
+        | "char"
+        | "java/lang/Character" => number.as_i64().map_or_else(
+            || Value::Float(number.as_f64().unwrap_or(0.0)),
+            |value| Value::Int(value as i32),
+        ),
+        "long" | "java/lang/Long" => number
+            .as_i64()
+            .map_or_else(|| Value::Float(number.as_f64().unwrap_or(0.0)), Value::Long),
+        "float" | "java/lang/Float" | "double" | "java/lang/Double" => {
+            Value::Float(number.as_f64().unwrap_or(0.0))
+        }
+        _ => {
+            if let Some(value) = number.as_i64() {
+                if let Ok(value) = i32::try_from(value) {
+                    Value::Int(value)
+                } else {
+                    Value::Long(value)
+                }
+            } else if let Some(value) = number.as_u64() {
+                match i32::try_from(value) {
+                    Ok(value) => Value::Int(value),
+                    Err(_) => Value::Float(number.as_f64().unwrap_or(0.0)),
+                }
+            } else {
+                Value::Float(number.as_f64().unwrap_or(0.0))
+            }
+        }
+    }
+}
+
+fn gson_json_collection(
+    values: &[serde_json::Value],
+    class: &str,
+    kind: &str,
+) -> Result<Value, NativeError> {
+    let mut materialized = Vec::with_capacity(values.len());
+    for value in values {
+        materialized.push(gson_json_value(value, "java/lang/Object")?);
+    }
+    // The target element type is not resolved (that needs the declared type
+    // arguments); the JSON shape still round-trips through the collection
+    // markers. Keep the array's own class visible in the error path only.
+    let _ = class;
+    Ok(collection_value(kind, &materialized))
+}
+
+fn gson_json_map(
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Value, NativeError> {
+    let mut materialized = Vec::with_capacity(values.len() * 2);
+    for (key, value) in values {
+        materialized.push(Value::Ref(Some(key.clone())));
+        materialized.push(gson_json_value(value, "java/lang/Object")?);
+    }
+    Ok(collection_value("map", &materialized))
+}
+
+fn gson_json_kind(json: &serde_json::Value) -> &'static str {
+    match json {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Serialize one modelled value back to JSON text.
+fn gson_json_text(value: &Value) -> String {
+    match value {
+        Value::Ref(None) | Value::Void => "null".into(),
+        Value::Int(value) => value.to_string(),
+        Value::Long(value) => value.to_string(),
+        Value::Float(value) => {
+            if value.is_finite() {
+                format!("{value}")
+            } else {
+                "null".into()
+            }
+        }
+        Value::Ref(Some(marker)) => match gson_collection_kind(marker) {
+            Some("map") => gson_json_object(marker),
+            Some(_) => gson_json_array(marker),
+            None => format!("\"{}\"", gson_json_escape(marker)),
+        },
+    }
+}
+
+fn gson_collection_kind(marker: &str) -> Option<&str> {
+    let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
+    let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
+    matches!(kind, "list" | "set" | "map").then_some(kind)
+}
+
+fn gson_json_array(marker: &str) -> String {
+    let values = collection_values(&Value::Ref(Some(marker.to_owned()))).unwrap_or_default();
+    let mut out = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&gson_json_text(
+            &parse_value_marker(value).unwrap_or(Value::Ref(None)),
+        ));
+    }
+    out.push(']');
+    out
+}
+
+fn gson_json_object(marker: &str) -> String {
+    let values = collection_values(&Value::Ref(Some(marker.to_owned()))).unwrap_or_default();
+    let mut out = String::from("{");
+    let mut first = true;
+    for pair in values.chunks(2) {
+        let Some(key) = pair.first() else {
+            continue;
+        };
+        let Some(value) = pair.get(1) else {
+            continue;
+        };
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        let key = parse_value_marker(key).unwrap_or(Value::Ref(None));
+        out.push('"');
+        out.push_str(&gson_json_escape(&value_text(&key)));
+        out.push_str("\":");
+        out.push_str(&gson_json_text(
+            &parse_value_marker(value).unwrap_or(Value::Ref(None)),
+        ));
+    }
+    out.push('}');
+    out
+}
+
+fn gson_json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            ch if (ch as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", ch as u32));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
 struct Runtime<'a, H> {
     classes: &'a BTreeMap<String, ClassFile>,
     host: &'a mut H,
@@ -13168,6 +14223,9 @@ struct Runtime<'a, H> {
     /// so a later `toString` sees every earlier append — the JDK's contract,
     /// and what a value-chain marker would lose.
     string_builders: BTreeMap<String, String>,
+    /// Text each `java.io.StringReader` this invocation built exposes to
+    /// `Gson.fromJson(Reader, Class)`, keyed by the reader's marker.
+    string_readers: BTreeMap<String, String>,
     /// Annotation values `Class#getAnnotation`/`Method#getAnnotation` handed
     /// out, keyed by the proxy marker a member query answers from.
     annotations: BTreeMap<String, Annotation>,
@@ -13996,6 +15054,16 @@ impl<H: Host> Runtime<'_, H> {
         marker
     }
 
+    /// Materialize a `java.lang.reflect.Type[]` for the generic reflection
+    /// surface. The array is owned by this invocation, like every other array
+    /// the interpreter builds.
+    fn generic_type_array(&mut self, method: &str, values: &[GenericType]) -> Value {
+        let marker = self.new_array("java/lang/reflect/Type", method);
+        let values = values.iter().map(generic_type_value).collect();
+        self.arrays.insert(marker.clone(), values);
+        Value::Ref(Some(marker))
+    }
+
     fn new_object(&mut self, class: &str) -> Value {
         let marker = format!("{class}#{}", self.next_object);
         self.next_object = self.next_object.saturating_add(1);
@@ -14160,6 +15228,155 @@ impl<H: Host> Runtime<'_, H> {
             && let Some(annotation) = self.annotations.get(marker).cloned()
         {
             return Ok(Some(self.annotation_member(&annotation, r)?));
+        }
+        // Every object the interpreter owns is a marker, so `Object.equals`
+        // compares markers. A mod predicate such as
+        // `type.equals(List.class)` asks this question before any generic
+        // reflection runs, and the neutral `false` an unmodelled call returned
+        // made it reject a field it declares as `List<...>`.
+        if r.owner == "java/lang/Object"
+            && r.name == "equals"
+            && r.descriptor == "(Ljava/lang/Object;)Z"
+        {
+            let receiver = receiver.unwrap_or(&Value::Ref(None));
+            let other = StdHost::argument(r, args, 0)?;
+            return Ok(Some(Value::Int(
+                (value_marker(receiver) == value_marker(other)) as i32,
+            )));
+        }
+        // `Field.getGenericType` reads the field's `Signature` attribute; a
+        // field without one answers the erased class, exactly as the JVM does.
+        if r.owner == "java/lang/reflect/Field"
+            && r.name == "getGenericType"
+            && r.descriptor == "()Ljava/lang/reflect/Type;"
+        {
+            let marker = receiver.and_then(expect_ref).ok_or_else(|| {
+                NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
+            })?;
+            let (class, member) = marker
+                .strip_prefix("reflect-field/")
+                .and_then(|marker| marker.split_once('#'))
+                .ok_or_else(|| {
+                    NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
+                })?;
+            let (name, declared) = parse_field_marker(member);
+            let descriptor = declared
+                .map(|(descriptor, _)| descriptor.to_owned())
+                .or_else(|| {
+                    self.classes.get(class).and_then(|file| {
+                        file.fields
+                            .iter()
+                            .find(|field| field.name == name)
+                            .map(|field| field.descriptor.clone())
+                    })
+                });
+            let signature = descriptor.as_deref().and_then(|descriptor| {
+                self.classes
+                    .get(class)
+                    .and_then(|file| file.field_signature(name, descriptor))
+            });
+            let value = signature
+                .as_deref()
+                .and_then(parse_generic_signature)
+                .map_or_else(
+                    || {
+                        Value::Ref(Some(
+                            descriptor
+                                .as_deref()
+                                .map(erased_field_type)
+                                .unwrap_or_default(),
+                        ))
+                    },
+                    |value| generic_type_value(&value),
+                );
+            return Ok(Some(value));
+        }
+        if matches!(
+            r.owner.as_str(),
+            "java/lang/reflect/ParameterizedType"
+                | "java/lang/reflect/TypeVariable"
+                | "java/lang/reflect/WildcardType"
+                | "java/lang/reflect/Type"
+        ) {
+            let marker = receiver.and_then(expect_ref);
+            let decoded = marker.and_then(|marker| decode_generic_type(marker));
+            let Some(decoded) = decoded else {
+                // A raw type handed out by `getRawType` is an ordinary class
+                // marker; only its name is a `Type` question this surface owns.
+                if r.name == "getTypeName" && r.descriptor == "()Ljava/lang/String;" {
+                    return Ok(marker
+                        .filter(|marker| !marker.is_empty())
+                        .map(|marker| Value::Ref(Some(class_type_display(marker)))));
+                }
+                return Ok(None);
+            };
+            return match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getRawType", "()Ljava/lang/reflect/Type;") => match decoded {
+                    GenericType::Parameterized { raw, .. } => Ok(Some(Value::Ref(Some(raw)))),
+                    other => Err(NativeError::Metadata(format!(
+                        "getRawType needs a parameterized type, got {}",
+                        generic_type_display(&other)
+                    ))),
+                },
+                ("getActualTypeArguments", "()[Ljava/lang/reflect/Type;") => match decoded {
+                    GenericType::Parameterized { args, .. } => Ok(Some(
+                        self.generic_type_array("getActualTypeArguments", &args),
+                    )),
+                    other => Err(NativeError::Metadata(format!(
+                        "getActualTypeArguments needs a parameterized type, got {}",
+                        generic_type_display(&other)
+                    ))),
+                },
+                ("getOwnerType", "()Ljava/lang/reflect/Type;") => match decoded {
+                    GenericType::Parameterized { owner, .. } => Ok(Some(
+                        owner
+                            .as_deref()
+                            .map_or(Value::Ref(None), generic_type_value),
+                    )),
+                    other => Err(NativeError::Metadata(format!(
+                        "getOwnerType needs a parameterized type, got {}",
+                        generic_type_display(&other)
+                    ))),
+                },
+                ("getName", "()Ljava/lang/String;") => match decoded {
+                    GenericType::Variable { name, .. } => Ok(Some(Value::Ref(Some(name)))),
+                    other => Err(NativeError::Metadata(format!(
+                        "getName needs a type variable, got {}",
+                        generic_type_display(&other)
+                    ))),
+                },
+                ("getBounds", "()[Ljava/lang/reflect/Type;") => match decoded {
+                    GenericType::Variable { bounds, .. } => Ok(Some(
+                        self.generic_type_array("getBounds", &generic_type_bounds(&bounds)),
+                    )),
+                    other => Err(NativeError::Metadata(format!(
+                        "getBounds needs a type variable, got {}",
+                        generic_type_display(&other)
+                    ))),
+                },
+                ("getUpperBounds", "()[Ljava/lang/reflect/Type;") => match decoded {
+                    GenericType::Wildcard { upper, .. } => Ok(Some(
+                        self.generic_type_array("getUpperBounds", &generic_type_bounds(&upper)),
+                    )),
+                    other => Err(NativeError::Metadata(format!(
+                        "getUpperBounds needs a wildcard type, got {}",
+                        generic_type_display(&other)
+                    ))),
+                },
+                ("getLowerBounds", "()[Ljava/lang/reflect/Type;") => match decoded {
+                    GenericType::Wildcard { lower, .. } => {
+                        Ok(Some(self.generic_type_array("getLowerBounds", &lower)))
+                    }
+                    other => Err(NativeError::Metadata(format!(
+                        "getLowerBounds needs a wildcard type, got {}",
+                        generic_type_display(&other)
+                    ))),
+                },
+                ("getTypeName" | "toString", "()Ljava/lang/String;") => {
+                    Ok(Some(Value::Ref(Some(generic_type_display(&decoded)))))
+                }
+                _ => Ok(None),
+            };
         }
         if r.owner == "java/lang/Class"
             && matches!(r.name.as_str(), "getFields" | "getDeclaredFields")
@@ -14669,6 +15886,137 @@ impl<H: Host> Runtime<'_, H> {
                     String::from_utf16(&units).unwrap_or_else(|_| String::from_utf16_lossy(&units));
                 Ok(Some(Value::Void))
             }
+            _ => Ok(None),
+        }
+    }
+
+    /// Answer the bounded `com.google.gson` surface config code reaches.
+    ///
+    /// The adapter models the two calls that make a config bootstrap work:
+    /// `Gson.fromJson` for primitives, `String` and JSON-shaped collections and
+    /// maps, and `Gson.toJson` back to text. The parsed document is bounded by
+    /// [`MAX_GSON_JSON_BYTES`] and [`MAX_GSON_DEPTH`]; a malformed document is
+    /// rejected with a named reason instead of answering `null` or an empty
+    /// string. Objects of a jar's own class are not instantiated (that needs
+    /// field injection the native path does not model), so their JSON shape is
+    /// returned as a modelled map, never as a masked empty value.
+    fn invoke_gson(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        // `java.io.StringReader` is the Reader a config bootstrap builds for
+        // `Gson.fromJson(Reader, Class)`; its text lives beside the reader
+        // marker for that call.
+        if r.owner == "java/io/StringReader" {
+            let Some(marker) = receiver.and_then(expect_ref) else {
+                return Ok(None);
+            };
+            return match (r.name.as_str(), r.descriptor.as_str()) {
+                ("<init>", "(Ljava/lang/String;)V") => {
+                    let text = args.first().map(expect_string).unwrap_or_default();
+                    self.string_readers
+                        .insert(marker.to_owned(), text.to_owned());
+                    Ok(Some(Value::Void))
+                }
+                ("close", "()V") => Ok(Some(Value::Void)),
+                _ => Ok(None),
+            };
+        }
+        match r.owner.as_str() {
+            "com/google/gson/GsonBuilder" => match (r.name.as_str(), r.descriptor.as_str()) {
+                ("<init>", "()V") => Ok(Some(Value::Void)),
+                ("create", "()Lcom/google/gson/Gson;") => {
+                    Ok(Some(self.new_object("com/google/gson/Gson")))
+                }
+                // Builder options the bounded writer ignores. Answering the
+                // receiver keeps the chain on the modelled path; none of them
+                // changes the JSON text of a modelled value.
+                (
+                    "setPrettyPrinting"
+                    | "disableHtmlEscaping"
+                    | "serializeNulls"
+                    | "setLenient"
+                    | "enableComplexMapKeySerialization"
+                    | "disableInnerClassSerialization"
+                    | "excludeFieldsWithoutExposeAnnotation"
+                    | "setFieldNamingPolicy"
+                    | "setFieldNamingStrategy"
+                    | "setExclusionStrategies"
+                    | "setDateFormat"
+                    | "registerTypeAdapter"
+                    | "registerTypeHierarchyAdapter",
+                    _,
+                ) => Ok(receiver.cloned().map(Ok).transpose()?),
+                _ => Ok(None),
+            },
+            "com/google/gson/Gson" => match (r.name.as_str(), r.descriptor.as_str()) {
+                ("<init>", "()V") => Ok(Some(Value::Void)),
+                ("newBuilder", "()Lcom/google/gson/GsonBuilder;") => {
+                    Ok(Some(self.new_object("com/google/gson/GsonBuilder")))
+                }
+                ("toJson", "(Ljava/lang/Object;)Ljava/lang/String;") => Ok(Some(Value::Ref(Some(
+                    gson_json_text(args.first().unwrap_or(&Value::Ref(None))),
+                )))),
+                ("toJson", "(Ljava/lang/Object;Ljava/lang/reflect/Type;)Ljava/lang/String;") => {
+                    Ok(Some(Value::Ref(Some(gson_json_text(
+                        args.first().unwrap_or(&Value::Ref(None)),
+                    )))))
+                }
+                ("toJson", "(Ljava/lang/Object;Ljava/lang/Appendable;)V") => {
+                    let text = gson_json_text(args.first().unwrap_or(&Value::Ref(None)));
+                    let target = args.get(1).and_then(expect_ref).ok_or_else(|| {
+                        NativeError::Metadata("Gson.toJson needs an Appendable receiver".into())
+                    })?;
+                    let builder = self.string_builders.get_mut(target).ok_or_else(|| {
+                        NativeError::Metadata(format!(
+                            "Gson.toJson Appendable {target} is not a modelled StringBuilder"
+                        ))
+                    })?;
+                    builder.push_str(&text);
+                    Ok(Some(Value::Void))
+                }
+                ("fromJson", "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;") => {
+                    let text = args.first().map(expect_string).ok_or_else(|| {
+                        NativeError::Metadata("Gson.fromJson needs a JSON string".into())
+                    })?;
+                    let class = args.get(1).and_then(expect_ref).ok_or_else(|| {
+                        NativeError::Metadata("Gson.fromJson needs a Class".into())
+                    })?;
+                    Ok(Some(gson_from_json(text, class)?))
+                }
+                ("fromJson", "(Ljava/io/Reader;Ljava/lang/Class;)Ljava/lang/Object;") => {
+                    let reader = args.first().and_then(expect_ref).ok_or_else(|| {
+                        NativeError::Metadata("Gson.fromJson needs a Reader".into())
+                    })?;
+                    let text = self.string_readers.get(reader).ok_or_else(|| {
+                        NativeError::Metadata(format!(
+                            "Gson.fromJson Reader {reader} is not a modelled StringReader"
+                        ))
+                    })?;
+                    let class = args.get(1).and_then(expect_ref).ok_or_else(|| {
+                        NativeError::Metadata("Gson.fromJson needs a Class".into())
+                    })?;
+                    Ok(Some(gson_from_json(text, class)?))
+                }
+                ("fromJson", "(Ljava/lang/String;Ljava/lang/reflect/Type;)Ljava/lang/Object;") => {
+                    let text = args.first().map(expect_string).ok_or_else(|| {
+                        NativeError::Metadata("Gson.fromJson needs a JSON string".into())
+                    })?;
+                    let raw = args
+                        .get(1)
+                        .and_then(generic_type_marker)
+                        .and_then(|value| match value {
+                            GenericType::Class(name) => Some(name),
+                            GenericType::Parameterized { raw, .. } => Some(raw),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "java/lang/Object".into());
+                    Ok(Some(gson_from_json(text, &raw)?))
+                }
+                _ => Ok(None),
+            },
             _ => Ok(None),
         }
     }
@@ -15997,9 +17345,19 @@ impl<H: Host> Runtime<'_, H> {
                         .ok_or_else(|| underflow(class, method))?;
                 }
                 0xc1 => {
-                    let _ = read_u16(code, &mut pc)?;
-                    let _ = pop(&mut stack, class, method)?;
-                    stack.push(Value::Int(0));
+                    let index = read_u16(code, &mut pc)?;
+                    let wanted = class_name(&file.pool, index)?;
+                    let value = pop(&mut stack, class, method)?;
+                    // The `java.lang.reflect.Type` nodes the generic
+                    // reflection surface builds answer their own runtime type,
+                    // and a class marker answers `Class`. Every other marker
+                    // keeps the interpreter's previous neutral answer.
+                    let matches = expect_ref(&value).is_some_and(|marker| {
+                        generic_type_instance_of(marker, &wanted)
+                            || (wanted == "java/lang/Class"
+                                && class_marker_like(marker, self.classes))
+                    });
+                    stack.push(Value::Int(i32::from(matches)));
                 }
                 0xc2 | 0xc3 => {
                     // The bounded runtime is single-threaded; monitorenter
@@ -16175,6 +17533,8 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         self.invoke_stream(&r, receiver.as_ref(), &args, class, method)?
                     {
+                        value
+                    } else if let Some(value) = self.invoke_gson(&r, receiver.as_ref(), &args)? {
                         value
                     } else if let Some(value) =
                         self.invoke_reflect_method(&r, receiver.as_ref(), &args)?
@@ -20173,6 +21533,7 @@ mod tests {
             next_stream: 0,
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_readers: BTreeMap::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -20215,6 +21576,7 @@ mod tests {
             next_stream: 0,
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_readers: BTreeMap::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -26377,6 +27739,7 @@ mandatory = true
             next_stream: 0,
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_readers: BTreeMap::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -26524,6 +27887,7 @@ mandatory = true
             next_stream: 0,
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_readers: BTreeMap::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -26724,6 +28088,7 @@ mandatory = true
             next_stream: 0,
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_readers: BTreeMap::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -27028,6 +28393,7 @@ mandatory = true
             next_stream: 0,
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_readers: BTreeMap::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -27252,6 +28618,7 @@ mandatory = true
             next_stream: 0,
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_readers: BTreeMap::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -27325,7 +28692,9 @@ mandatory = true
             std_host
                 .invoke_instance(&field_type, &declared[0], &[])
                 .unwrap(),
-            Value::Ref(Some("I".into()))
+            // A primitive field's class is the primitive's own class
+            // (`int.class`), whose marker is its name, not its descriptor.
+            Value::Ref(Some("int".into()))
         );
     }
 
