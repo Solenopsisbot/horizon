@@ -354,6 +354,7 @@ fn refusal_report(
 /// The compatibility lines for a startup the loader refused. The loader's error
 /// starts with the jar it stopped at; that jar's report says why in the same
 /// shape an accepted one logs, and the error itself follows it unchanged.
+#[cfg(test)]
 fn java_refusal_lines(paths: &[PathBuf], error: &str) -> Vec<String> {
     let Some(path) = paths
         .iter()
@@ -388,15 +389,131 @@ fn load_java_mod_paths(
     Vec<horizon_client::mod_content::ContentMod>,
     Vec<JavaCompatibilityReport>,
 )> {
-    super::mods::run_java_mods_with_report(paths, ExecutionRole::DedicatedServer).map_err(|error| {
-        // The loader stops before it can hand its reports back, so the
-        // refused jar's lines are rebuilt here: the console still names the
-        // role, and the error text stays the dedicated startup one.
-        for line in java_refusal_lines(paths, &error) {
-            log("ERROR", &format!("{JAVA_PREFIX}{line}"));
+    let strict = std::env::var("HORIZON_JAVA_STRICT").is_ok_and(|value| value == "1");
+    load_java_mod_paths_with_policy(paths, strict)
+}
+
+fn load_java_mod_paths_with_policy(
+    paths: &[PathBuf],
+    strict: bool,
+) -> Result<(
+    Vec<horizon_client::mod_content::ContentMod>,
+    Vec<JavaCompatibilityReport>,
+)> {
+    let mut content = Vec::new();
+    let mut reports = Vec::new();
+    let mut accepted_reports = Vec::new();
+    let mut accepted_paths = Vec::new();
+    for path in paths {
+        if let Some(error) = dedicated_java_refusal(path) {
+            record_dedicated_java_refusal(path, &error, strict, &mut reports)?;
+        } else {
+            accepted_paths.push(path.clone());
         }
-        format!("dedicated Java mod startup failed: {error}").into()
+    }
+    if !accepted_paths.is_empty() {
+        match super::mods::run_java_mods_with_report(&accepted_paths, ExecutionRole::DedicatedServer)
+        {
+            Ok((loaded, mut loaded_reports)) => {
+                content.extend(loaded);
+                accepted_reports.append(&mut loaded_reports);
+            }
+            Err(error) => {
+                // This is an execution or declaration failure after the
+                // metadata refusal pass. Preserve strict mode's old abort;
+                // non-strict mode records the named jar and continues.
+                let path = accepted_paths
+                    .iter()
+                    .find(|path| error.starts_with(&path.display().to_string()))
+                    .cloned()
+                    .unwrap_or_else(|| accepted_paths[0].clone());
+                record_dedicated_java_refusal(&path, &error, strict, &mut reports)?;
+            }
+        }
+    }
+    reports.extend(accepted_reports.iter().cloned());
+    log_java_reports(&accepted_reports, "INFO");
+    Ok((content, reports))
+}
+
+fn dedicated_java_refusal(path: &std::path::Path) -> Option<String> {
+    let jar = match horizon_native_java::NativeJar::from_path(path) {
+        Ok(jar) => jar,
+        Err(error) => return Some(format!("{}: {error}", path.display())),
+    };
+    if jar.client_side_only {
+        return Some(format!(
+            "{}: clientSideOnly mod cannot run for server execution",
+            path.display()
+        ));
+    }
+    let entrypoints = ["server", "main", "neoforge"]
+        .iter()
+        .find_map(|kind| {
+            let entries = jar.discover_entrypoints(kind);
+            (!entries.is_empty()).then_some((*kind, entries))
+        });
+    let Some((kind, entries)) = entrypoints else {
+        let mut available: Vec<String> = jar.fabric_entrypoints.keys().cloned().collect();
+        if !jar.neoforge_entrypoints.is_empty() {
+            available.push("neoforge".to_owned());
+        }
+        available.sort();
+        available.dedup();
+        let available = if available.is_empty() {
+            "none".to_owned()
+        } else {
+            available.join(", ")
+        };
+        return Some(format!(
+            "{}: no native Fabric or NeoForge entrypoint for server execution (available: {available})",
+            path.display(),
+        ));
+    };
+    entries.iter().find_map(|entry| {
+        entry.adapter.as_deref().map(|adapter| {
+            format!(
+                "{} ({kind}, {}): Fabric entrypoint adapter {adapter} is not supported by the native path",
+                path.display(), entry.class
+            )
+        })
     })
+}
+
+fn record_dedicated_java_refusal(
+    path: &std::path::Path,
+    error: &str,
+    strict: bool,
+    reports: &mut Vec<JavaCompatibilityReport>,
+) -> Result<()> {
+    let jar = horizon_native_java::NativeJar::from_path(path).ok();
+    reports.push(refusal_report(path, jar.as_ref()));
+    log(
+        "ERROR",
+        &format!(
+            "{JAVA_PREFIX}skipping {}: {}",
+            path.display(),
+            bounded_java_failure(error),
+        ),
+    );
+    if strict {
+        return Err(format!("dedicated Java mod startup failed: {error}").into());
+    }
+    Ok(())
+}
+
+const MAX_JAVA_FAILURE: usize = 160;
+
+fn bounded_java_failure(error: &str) -> String {
+    let one_line = error
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let mut bounded = one_line.chars().take(MAX_JAVA_FAILURE).collect::<String>();
+    if one_line.chars().count() > MAX_JAVA_FAILURE {
+        bounded.push_str("...");
+    }
+    bounded
 }
 
 pub(super) fn load_java_mods(options: &mut Options) -> Result<()> {
@@ -1929,8 +2046,8 @@ mod tests {
     use super::status::engine_name;
     use super::{
         ExecutionRole, JAVA_PREFIX, JavaCompatibilityReport, JavaLoader, MixinWeave, capture_log,
-        java_refusal_lines, loader_name, log, log_from, log_java_reports, refusal_report,
-        role_name,
+        java_refusal_lines, load_java_mod_paths_with_policy, loader_name, log, log_from,
+        log_java_reports, refusal_report, role_name,
     };
     use std::{
         fs,
@@ -2133,32 +2250,40 @@ mod tests {
     #[test]
     fn dedicated_java_loader_names_role_in_failure() {
         let path = PathBuf::from("/tmp/horizon-missing-dedicated-java-mod.jar");
-        let mut error = String::new();
-        let lines = capture_log(|| {
-            error = super::load_java_mod_paths(&[path]).unwrap_err().to_string();
-        });
-        // The error the startup was always refused with is unchanged.
-        assert!(
-            error.contains("dedicated Java mod startup failed"),
-            "{error}"
-        );
-        assert!(
-            error.contains("horizon-missing-dedicated-java-mod.jar"),
-            "{error}"
-        );
-        // And the console still says which role refused the jar, in the shape an
-        // accepted jar logs.
-        let summary = lines.join("\n");
-        assert!(summary.contains("role=dedicated-server"), "{summary}");
-        assert!(
-            summary.contains("horizon-missing-dedicated-java-mod.jar"),
-            "{summary}"
-        );
-        assert!(summary.contains("refused: "), "{summary}");
-        assert!(
-            lines.iter().any(|line| line.starts_with(JAVA_PREFIX)),
-            "{lines:?}"
-        );
+        let (content, reports) = {
+            let mut result = None;
+            let lines = capture_log(|| {
+                result = Some(
+                    load_java_mod_paths_with_policy(std::slice::from_ref(&path), false).unwrap(),
+                );
+            });
+            let (content, reports) = result.unwrap();
+            assert!(content.is_empty());
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].engine(), JavaEngine::Refused);
+            let summary = lines.join("\n");
+            assert!(summary.contains("skipping /tmp/horizon-missing-dedicated-java-mod.jar:"));
+            assert!(summary.len() < 240, "{summary}");
+            (content, reports)
+        };
+        assert!(content.is_empty());
+        assert_eq!(reports.len(), 1);
+
+        let error = load_java_mod_paths_with_policy(std::slice::from_ref(&path), true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dedicated Java mod startup failed"), "{error}");
+        assert!(error.contains("horizon-missing-dedicated-java-mod.jar"), "{error}");
+    }
+
+    #[test]
+    fn dedicated_java_loader_strict_failure_keeps_the_original_error() {
+        let path = PathBuf::from("/tmp/horizon-missing-dedicated-java-mod-strict.jar");
+        let error = load_java_mod_paths_with_policy(std::slice::from_ref(&path), true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("dedicated Java mod startup failed: "), "{error}");
+        assert!(error.contains(path.to_string_lossy().as_ref()), "{error}");
     }
 
     /// A compatibility report built in memory: the same fields the loader fills
