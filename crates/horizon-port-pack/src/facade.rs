@@ -376,11 +376,33 @@ pub fn generate_many(
     // The capability-provider and item-handler shims name the side a capability
     // is queried for and the stacks a handler moves, and a mod that only
     // registers a token or listens on the bus never mentions them.
-    if uses_neoforge || uses_legacy_forge {
+    if uses_neoforge_entity_events || uses_legacy_forge {
         for name in [
             "net/minecraft/core/Direction",
+            "net/minecraft/core/BlockPos",
+            "net/minecraft/world/level/block/Block",
+            "net/minecraft/world/level/block/entity/BlockEntity",
+            "net/minecraft/world/level/block/entity/BlockEntityType",
+            "net/minecraft/world/level/block/state/BlockState",
+            "net/minecraft/world/level/Level",
+            "net/minecraft/world/entity/Entity",
+            "net/minecraft/world/entity/EntityType",
             "net/minecraft/world/item/ItemStack",
             "net/minecraft/world/item/Item",
+        ] {
+            if game.contains_key(name) && !lib_names.contains(name) && !own.contains(name) {
+                wanted.insert(name.to_owned());
+            }
+        }
+    }
+    if uses_neoforge {
+        for name in [
+            "net/minecraft/network/RegistryFriendlyByteBuf",
+            "net/minecraft/network/FriendlyByteBuf",
+            "net/minecraft/network/codec/StreamCodec",
+            "net/minecraft/network/protocol/common/custom/CustomPacketPayload",
+            "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type",
+            "net/minecraft/resources/Identifier",
         ] {
             if game.contains_key(name) && !lib_names.contains(name) && !own.contains(name) {
                 wanted.insert(name.to_owned());
@@ -394,6 +416,11 @@ pub fn generate_many(
         for name in [
             "net/minecraft/world/entity/Entity",
             "net/minecraft/world/level/Level",
+            "net/minecraft/core/RegistryAccess",
+            "net/minecraft/core/Holder",
+            "net/minecraft/world/level/biome/Biome",
+            "net/minecraft/world/level/biome/BiomeGenerationSettings",
+            "net/minecraft/world/level/biome/BiomeGenerationSettings$Builder",
         ] {
             if game.contains_key(name) && !lib_names.contains(name) && !own.contains(name) {
                 wanted.insert(name.to_owned());
@@ -491,6 +518,9 @@ pub fn generate_many(
             "entity_renderer_provider",
             "entity_type",
         ]);
+    }
+    if uses_fabric_renderers {
+        needed_roles.extend(["item", "item_stack", "block", "block_state", "block_pos", "block_and_tint_getter"]);
     }
     if uses_model_layers {
         needed_roles.extend(["model_layer_location", "textured_model_data"]);
@@ -1242,7 +1272,7 @@ pub fn generate_many(
             ),
             (
                 "net/fabricmc/fabric/api/client/rendering/v1/ColorProviderRegistry",
-                &[][..],
+                &["item", "item_stack", "block", "block_state", "block_pos"][..],
                 FABRIC_COLOR_PROVIDER_REGISTRY,
             ),
         ] {
@@ -1831,6 +1861,14 @@ pub fn generate_many(
                 NEOFORGE_PAYLOAD_REGISTRAR,
             ),
             (
+                "net/neoforged/neoforge/network/handling/IPayloadContext.java",
+                "package net.neoforged.neoforge.network.handling;\npublic interface IPayloadContext {}\n",
+            ),
+            (
+                "net/neoforged/neoforge/network/handling/IPayloadHandler.java",
+                "package net.neoforged.neoforge.network.handling;\n@FunctionalInterface public interface IPayloadHandler<T> { void handle(T payload, IPayloadContext context); }\n",
+            ),
+            (
                 "net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent.java",
                 concat!(
                     "package net.neoforged.neoforge.network.event;\n",
@@ -1841,6 +1879,38 @@ pub fn generate_many(
                     "    public PayloadRegistrar registrar(String version) { return horizonRegistrar; }\n",
                     "}\n",
                 ),
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/Capability.java",
+                "package net.neoforged.neoforge.capabilities;\npublic class Capability<T> {}\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/BlockCapability.java",
+                "package net.neoforged.neoforge.capabilities;\npublic class BlockCapability<T, C> extends Capability<T> {}\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/ItemCapability.java",
+                "package net.neoforged.neoforge.capabilities;\npublic class ItemCapability<T, C> extends Capability<T> {}\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/EntityCapability.java",
+                "package net.neoforged.neoforge.capabilities;\npublic class EntityCapability<T, C> extends Capability<T> {}\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/BlockCapabilityCache.java",
+                "package net.neoforged.neoforge.capabilities;\npublic final class BlockCapabilityCache { private BlockCapabilityCache() {} @FunctionalInterface public interface Provider<T, C> { T getCapability(net.minecraft.world.level.Level level, net.minecraft.core.BlockPos pos, net.minecraft.world.level.block.state.BlockState state, net.minecraft.world.level.block.entity.BlockEntity blockEntity, C context); } }\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/ItemCapabilityCache.java",
+                "package net.neoforged.neoforge.capabilities;\npublic final class ItemCapabilityCache { private ItemCapabilityCache() {} @FunctionalInterface public interface Provider<T, C> { T getCapability(net.minecraft.world.item.ItemStack stack, C context); } }\n",
+            ),
+            (
+                "net/neoforged/neoforge/capabilities/EntityCapabilityCache.java",
+                "package net.neoforged.neoforge.capabilities;\npublic final class EntityCapabilityCache { private EntityCapabilityCache() {} @FunctionalInterface public interface Provider<T, C> { T getCapability(net.minecraft.world.entity.Entity entity, C context); } }\n",
+            ),
+            (
+                "net/neoforged/neoforge/transfer/ResourceHandler.java",
+                "package net.neoforged.neoforge.transfer;\npublic interface ResourceHandler<R> { int size(); R getResource(); long getAmount(); long getCapacity(); }\n",
             ),
             (
                 "net/minecraftforge/network/simple/SimpleChannel.java",
@@ -1869,6 +1939,18 @@ pub fn generate_many(
             if source.is_empty() {
                 continue;
             }
+            if !uses_neoforge_entity_events
+                && (relative.starts_with("net/neoforged/neoforge/capabilities/")
+                    || relative == "net/neoforged/neoforge/transfer/ResourceHandler.java")
+            {
+                continue;
+            }
+            if relative == format!("{NEOFORGE_REGISTER_CAPABILITIES_EVENT}.java")
+                && !["net/minecraft/world/level/Level", "net/minecraft/core/BlockPos", "net/minecraft/world/level/block/Block", "net/minecraft/world/level/block/state/BlockState", "net/minecraft/world/level/block/entity/BlockEntity", "net/minecraft/world/level/block/entity/BlockEntityType", "net/minecraft/world/entity/Entity", "net/minecraft/world/entity/EntityType"].iter().all(|name| available.contains(*name))
+            {
+                report.missing.push(format!("{NEOFORGE_REGISTER_CAPABILITIES_EVENT} (needs capability provider game types)"));
+                continue;
+            }
             let game_value = match relative {
                 "net/minecraft/core/Registry.java" => Some("net/minecraft/core/Registry"),
                 "net/minecraft/core/DefaultedRegistry.java" => {
@@ -1889,6 +1971,9 @@ pub fn generate_many(
             if let Some(parent) = file.parent() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
+            let source = if relative == format!("{NEOFORGE_BIOME_MODIFIER}.java")
+                && !game.contains_key("net/minecraft/world/level/biome/BiomeGenerationSettings")
+            { NEOFORGE_BIOME_MODIFIER_OBJECT_SOURCE } else { source };
             fs::write(&file, source).map_err(|e| format!("{}: {e}", file.display()))?;
             files.push(file);
         }
@@ -2715,34 +2800,48 @@ public interface StreamCodecOperation<B, S, T> {
 /// stays compilable on a jar-only classpath.
 const NEOFORGE_PAYLOAD_REGISTRAR: &str = r#"package net.neoforged.neoforge.network.registration;
 
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.neoforged.neoforge.network.handling.IPayloadContext;
+import net.neoforged.neoforge.network.handling.IPayloadHandler;
+
 public class PayloadRegistrar {
-    private static final java.util.Map<String, java.util.List<Object>> horizonPayloads = new java.util.LinkedHashMap<>();
-    private static final java.util.Map<String, java.util.List<Object>> horizonPayloadCodecs = new java.util.LinkedHashMap<>();
+    private static final java.util.Map<String, java.util.List<CustomPacketPayload.Type>> horizonPayloads = new java.util.LinkedHashMap<>();
+    private static final java.util.Map<String, java.util.List<StreamCodec>> horizonPayloadCodecs = new java.util.LinkedHashMap<>();
     private static final java.util.Map<String, java.util.List<String>> horizonPayloadVersions = new java.util.LinkedHashMap<>();
     private static final java.util.Map<String, java.util.List<Boolean>> horizonPayloadOptional = new java.util.LinkedHashMap<>();
+    private static final java.util.Map<String, java.util.List<Object>> horizonLegacyPayloads = new java.util.LinkedHashMap<>();
     private int horizonRegistrationCount;
     private String horizonVersion;
     private boolean horizonIsOptional;
 
     public int horizonRegistrationCount() { return horizonRegistrationCount; }
 
-    public static java.util.List<Object> horizonPayloadTypes(String direction) {
-        java.util.List<Object> values = horizonPayloads.get(direction);
+    public static java.util.List<CustomPacketPayload.Type> horizonPayloadTypes(String direction) {
+        java.util.List<CustomPacketPayload.Type> values = horizonPayloads.get(direction);
         return values == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(values);
     }
 
     public static java.util.List<Object> horizonPayloadIds(String direction) {
         java.util.List<Object> ids = new java.util.ArrayList<>();
-        for (Object type : horizonPayloadTypes(direction)) {
+        for (CustomPacketPayload.Type type : horizonPayloadTypes(direction)) {
             Object id = horizonPayloadId(type);
             if (id != null) ids.add(id);
         }
+        java.util.List<Object> legacy = horizonLegacyPayloads.get(direction);
+        if (legacy != null) for (Object type : legacy) { Object id = horizonPayloadId(type); if (id != null) ids.add(id); }
         return ids;
     }
 
-    public static java.util.List<Object> horizonPayloadCodecs(String direction) {
-        java.util.List<Object> values = horizonPayloadCodecs.get(direction);
+    public static java.util.List<StreamCodec> horizonPayloadCodecs(String direction) {
+        java.util.List<StreamCodec> values = horizonPayloadCodecs.get(direction);
         return values == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(values);
+    }
+
+    private static Object horizonPayloadId(Object type) {
+        if (type == null) return null;
+        try { java.lang.reflect.Method method = type.getClass().getMethod("id"); method.setAccessible(true); return method.invoke(type); } catch (Throwable ignored) { return null; }
     }
 
     public static java.util.List<String> horizonPayloadVersions(String direction) {
@@ -2755,12 +2854,7 @@ public class PayloadRegistrar {
         return values == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(values);
     }
 
-    private static Object horizonPayloadId(Object type) {
-        if (type == null) return null;
-        try { return type.getClass().getMethod("id").invoke(type); } catch (Throwable ignored) { return null; }
-    }
-
-    private PayloadRegistrar horizonRetain(String direction, Object type, Object codec) {
+    private <T extends CustomPacketPayload> PayloadRegistrar horizonRetain(String direction, CustomPacketPayload.Type type, StreamCodec codec) {
         horizonPayloads.computeIfAbsent(direction, key -> new java.util.ArrayList<>()).add(type);
         horizonPayloadCodecs.computeIfAbsent(direction, key -> new java.util.ArrayList<>()).add(codec);
         horizonPayloadVersions.computeIfAbsent(direction, key -> new java.util.ArrayList<>()).add(horizonVersion);
@@ -2771,12 +2865,28 @@ public class PayloadRegistrar {
         return this;
     }
 
-    public PayloadRegistrar playToServer(Object type, Object codec, Object handler) { return horizonRetain("playToServer", type, codec); }
-    public PayloadRegistrar playToClient(Object type, Object codec, Object handler) { return horizonRetain("playToClient", type, codec); }
-    public PayloadRegistrar playBidirectional(Object type, Object codec, Object handler) { return horizonRetain("playBidirectional", type, codec); }
-    public PayloadRegistrar configurationToServer(Object type, Object codec, Object handler) { return horizonRetain("configurationToServer", type, codec); }
-    public PayloadRegistrar configurationToClient(Object type, Object codec, Object handler) { return horizonRetain("configurationToClient", type, codec); }
-    public PayloadRegistrar configurationBidirectional(Object type, Object codec, Object handler) { return horizonRetain("configurationBidirectional", type, codec); }
+    private PayloadRegistrar horizonRetainLegacy(String direction, Object type, Object codec) {
+        horizonLegacyPayloads.computeIfAbsent(direction, key -> new java.util.ArrayList<>()).add(type);
+        horizonPayloadCodecs.computeIfAbsent(direction, key -> new java.util.ArrayList<>()).add(null);
+        horizonPayloadVersions.computeIfAbsent(direction, key -> new java.util.ArrayList<>()).add(horizonVersion);
+        horizonPayloadOptional.computeIfAbsent(direction, key -> new java.util.ArrayList<>()).add(horizonIsOptional);
+        horizonRegistrationCount++;
+        horizonVersion = null; horizonIsOptional = false;
+        return this;
+    }
+
+    public <T extends CustomPacketPayload> PayloadRegistrar playToServer(CustomPacketPayload.Type type, StreamCodec codec, IPayloadHandler<T> handler) { return horizonRetain("playToServer", type, codec); }
+    public <T extends CustomPacketPayload> PayloadRegistrar playToClient(CustomPacketPayload.Type type, StreamCodec codec, IPayloadHandler<T> handler) { return horizonRetain("playToClient", type, codec); }
+    public <T extends CustomPacketPayload> PayloadRegistrar playBidirectional(CustomPacketPayload.Type type, StreamCodec codec, IPayloadHandler<T> handler) { return horizonRetain("playBidirectional", type, codec); }
+    public <T extends CustomPacketPayload> PayloadRegistrar configurationToServer(CustomPacketPayload.Type type, StreamCodec codec, IPayloadHandler<T> handler) { return horizonRetain("configurationToServer", type, codec); }
+    public <T extends CustomPacketPayload> PayloadRegistrar configurationToClient(CustomPacketPayload.Type type, StreamCodec codec, IPayloadHandler<T> handler) { return horizonRetain("configurationToClient", type, codec); }
+    public <T extends CustomPacketPayload> PayloadRegistrar configurationBidirectional(CustomPacketPayload.Type type, StreamCodec codec, IPayloadHandler<T> handler) { return horizonRetain("configurationBidirectional", type, codec); }
+    public PayloadRegistrar playToServer(Object type, Object codec, Object handler) { return horizonRetainLegacy("playToServer", type, codec); }
+    public PayloadRegistrar playToClient(Object type, Object codec, Object handler) { return horizonRetainLegacy("playToClient", type, codec); }
+    public PayloadRegistrar playBidirectional(Object type, Object codec, Object handler) { return horizonRetainLegacy("playBidirectional", type, codec); }
+    public PayloadRegistrar configurationToServer(Object type, Object codec, Object handler) { return horizonRetainLegacy("configurationToServer", type, codec); }
+    public PayloadRegistrar configurationToClient(Object type, Object codec, Object handler) { return horizonRetainLegacy("configurationToClient", type, codec); }
+    public PayloadRegistrar configurationBidirectional(Object type, Object codec, Object handler) { return horizonRetainLegacy("configurationBidirectional", type, codec); }
     public PayloadRegistrar optional() { horizonIsOptional = true; return this; }
     public PayloadRegistrar versioned(String version) { horizonVersion = version; return this; }
 }
@@ -3550,6 +3660,12 @@ import java.util.List;
 
 public final class ColorProviderRegistry {
     public interface ColorProvider {}
+    @FunctionalInterface public interface BlockColorProvider extends ColorProvider {
+        int getColor({block_state} state, Object world, {block_pos} pos, int tintIndex);
+    }
+    @FunctionalInterface public interface ItemColorProvider extends ColorProvider {
+        int getColor({item_stack} stack, int tintIndex);
+    }
 
     public static final ColorProviderRegistry BLOCK = new ColorProviderRegistry();
     public static final ColorProviderRegistry ITEM = new ColorProviderRegistry();
@@ -3557,6 +3673,12 @@ public final class ColorProviderRegistry {
     private static final List<ColorProvider> HORIZON_PROVIDERS = new ArrayList<>();
 
     private ColorProviderRegistry() {}
+    public void register(BlockColorProvider provider, {block}... blocks) {
+        if (provider != null) HORIZON_PROVIDERS.add(provider);
+    }
+    public void register(ItemColorProvider provider, {item}... items) {
+        if (provider != null) HORIZON_PROVIDERS.add(provider);
+    }
     public ColorProvider register(Object target, ColorProvider provider) {
         if (provider != null) HORIZON_PROVIDERS.add(provider);
         return provider;
@@ -4574,20 +4696,28 @@ const NEOFORGE_REGISTER_CAPABILITIES_EVENT_SOURCE: &str = r#"package net.neoforg
 public class RegisterCapabilitiesEvent extends net.neoforged.bus.api.Event {
     private final java.util.List<Object> horizonRegistrations = new java.util.ArrayList<>();
     private void horizonKeep(Object capability, Object target, Object provider) { horizonRegistrations.add(new Object[] { capability, target, provider }); }
-    public <T> void registerBlock(Object capability, Object provider, Object... blocks) { horizonKeep(capability, blocks, provider); }
-    public <T> void registerBlockEntity(Object capability, Object type, Object provider) { horizonKeep(capability, type, provider); }
-    public <T> void registerItem(Object capability, Object provider, Object... items) { horizonKeep(capability, items, provider); }
-    public <T> void registerEntity(Object capability, Object type, Object provider) { horizonKeep(capability, type, provider); }
-    public boolean isBlockRegistered(Object capability, Object block) { return false; }
-    public boolean isEntityRegistered(Object capability, Object type) { return false; }
-    public boolean isItemRegistered(Object capability, Object item) { return false; }
-    public void setProxyable(Object capability) {}
-    public void setNonProxyable(Object capability) {}
+    public <T, C> void registerBlock(net.neoforged.neoforge.capabilities.BlockCapability<T, C> capability, net.neoforged.neoforge.capabilities.BlockCapabilityCache.Provider<T, C> provider, net.minecraft.world.level.block.Block... blocks) { horizonKeep(capability, blocks, provider); }
+    public <T, C> void registerBlockEntity(net.neoforged.neoforge.capabilities.BlockCapability<T, C> capability, net.minecraft.world.level.block.entity.BlockEntityType type, net.neoforged.neoforge.capabilities.BlockCapabilityCache.Provider<T, C> provider) { horizonKeep(capability, type, provider); }
+    public <T, C> void registerItem(net.neoforged.neoforge.capabilities.ItemCapability<T, C> capability, net.neoforged.neoforge.capabilities.ItemCapabilityCache.Provider<T, C> provider, net.minecraft.world.item.Item... items) { horizonKeep(capability, items, provider); }
+    public <T, C> void registerEntity(net.neoforged.neoforge.capabilities.EntityCapability<T, C> capability, net.neoforged.neoforge.capabilities.EntityCapabilityCache.Provider<T, C> provider, net.minecraft.world.entity.EntityType... types) { horizonKeep(capability, types, provider); }
+    public boolean isBlockRegistered(net.neoforged.neoforge.capabilities.BlockCapability<?, ?> capability, net.minecraft.world.level.block.Block block) { return false; }
+    public boolean isEntityRegistered(net.neoforged.neoforge.capabilities.EntityCapability<?, ?> capability, net.minecraft.world.entity.EntityType type) { return false; }
+    public boolean isItemRegistered(net.neoforged.neoforge.capabilities.ItemCapability<?, ?> capability, net.minecraft.world.item.Item item) { return false; }
+    public void setProxyable(net.neoforged.neoforge.capabilities.Capability<?> capability) {}
+    public void setNonProxyable(net.neoforged.neoforge.capabilities.Capability<?> capability) {}
     public java.util.List<Object> horizonRegistrations() { return java.util.Collections.unmodifiableList(horizonRegistrations); }
 }
 "#;
 
 const NEOFORGE_BIOME_MODIFIER_SOURCE: &str = r#"package net.neoforged.neoforge.common.world;
+public interface BiomeModifier {
+    default void modify(net.minecraft.core.RegistryAccess registryAccess, net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome> biome, BiomeModifier.Phase phase, net.minecraft.world.level.biome.BiomeGenerationSettings.Builder builder) {}
+    default void modify(net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome> biome, BiomeModifier.Phase phase, net.minecraft.world.level.biome.BiomeGenerationSettings.Builder builder) { modify(null, biome, phase, builder); }
+    default Object codec() { return null; }
+    enum Phase { BEFORE_EVERYTHING, ADD, REMOVE, MODIFY, AFTER_EVERYTHING }
+}
+"#;
+const NEOFORGE_BIOME_MODIFIER_OBJECT_SOURCE: &str = r#"package net.neoforged.neoforge.common.world;
 public interface BiomeModifier {
     default void modify(Object registryAccess, Object biome, BiomeModifier.Phase phase, Object builder) {}
     default Object codec() { return null; }
@@ -4727,6 +4857,11 @@ const CLIENT_TYPE_CANDIDATES: &[(&str, &[&str])] = &[
             "net/minecraft/item/ItemStack",
         ],
     ),
+    ("item", &["net/minecraft/world/item/Item", "net/minecraft/item/Item"]),
+    ("block", &["net/minecraft/world/level/block/Block", "net/minecraft/block/Block"]),
+    ("block_state", &["net/minecraft/world/level/block/state/BlockState", "net/minecraft/block/BlockState"]),
+    ("block_pos", &["net/minecraft/core/BlockPos", "net/minecraft/util/math/BlockPos"]),
+    ("block_and_tint_getter", &["net/minecraft/world/level/BlockAndTintGetter", "net/minecraft/world/world/BlockRenderView"]),
     (
         "tooltip_context",
         &[
@@ -9743,7 +9878,8 @@ mod tests {
         // No game class is required for the id lookup, so the shim stays
         // compilable against a jar-only target.
         assert!(!FABRIC_PAYLOAD_TYPE_REGISTRY.contains("net.minecraft."));
-        assert!(!NEOFORGE_PAYLOAD_REGISTRAR.contains("net.minecraft."));
+        assert!(NEOFORGE_PAYLOAD_REGISTRAR.contains("CustomPacketPayload.Type"));
+        assert!(NEOFORGE_PAYLOAD_REGISTRAR.contains("StreamCodec"));
         assert!(FABRIC_PAYLOAD_TYPE_REGISTRY.contains("public final class PayloadTypeRegistry {"));
     }
 
@@ -9805,6 +9941,17 @@ mod tests {
             "net/fabricmc/fabric/api/networking/v1/PayloadTypeRegistry.java",
             FABRIC_PAYLOAD_TYPE_REGISTRY,
         );
+        for (path, source) in [
+            ("net/minecraft/network/RegistryFriendlyByteBuf.java", "package net.minecraft.network; public class RegistryFriendlyByteBuf {}\n"),
+            ("net/minecraft/network/FriendlyByteBuf.java", "package net.minecraft.network; public class FriendlyByteBuf {}\n"),
+            ("net/minecraft/network/codec/StreamCodec.java", "package net.minecraft.network.codec; public class StreamCodec {}\n"),
+            ("net/minecraft/resources/Identifier.java", "package net.minecraft.resources; public class Identifier {}\n"),
+            ("net/minecraft/network/protocol/common/custom/CustomPacketPayload.java", "package net.minecraft.network.protocol.common.custom; public interface CustomPacketPayload { class Type {} }\n"),
+            ("net/neoforged/neoforge/network/handling/IPayloadContext.java", "package net.neoforged.neoforge.network.handling; public interface IPayloadContext {}\n"),
+            ("net/neoforged/neoforge/network/handling/IPayloadHandler.java", "package net.neoforged.neoforge.network.handling; public interface IPayloadHandler<T> { void handle(T payload, IPayloadContext context); }\n"),
+        ] {
+            write(path, source);
+        }
         write("PayloadProbe.java", probe);
         fs::create_dir_all(&classes).expect("create classes directory");
         let jdk_bin = std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"));
@@ -19779,6 +19926,33 @@ public class DatagenProbe {
             "net/minecraft/world/level/Level.java",
             "package net.minecraft.world.level;\npublic class Level {}\n",
         );
+        for (path, source) in [
+            ("net/minecraft/core/RegistryAccess.java", "package net.minecraft.core; public class RegistryAccess {}\n"),
+            ("net/minecraft/core/Holder.java", "package net.minecraft.core; public class Holder<T> {}\n"),
+            ("net/minecraft/world/level/biome/Biome.java", "package net.minecraft.world.level.biome; public class Biome {}\n"),
+            ("net/minecraft/world/level/biome/BiomeGenerationSettings.java", "package net.minecraft.world.level.biome; public class BiomeGenerationSettings { public static class Builder {} }\n"),
+        ] {
+            write(path, source);
+        }
+        for (path, source) in [
+            ("net/minecraft/core/BlockPos.java", "package net.minecraft.core; public class BlockPos {}\n"),
+            ("net/minecraft/world/level/block/Block.java", "package net.minecraft.world.level.block; public class Block {}\n"),
+            ("net/minecraft/world/level/block/entity/BlockEntity.java", "package net.minecraft.world.level.block.entity; public class BlockEntity {}\n"),
+            ("net/minecraft/world/level/block/entity/BlockEntityType.java", "package net.minecraft.world.level.block.entity; public class BlockEntityType<T> {}\n"),
+            ("net/minecraft/world/level/block/state/BlockState.java", "package net.minecraft.world.level.block.state; public class BlockState {}\n"),
+            ("net/minecraft/world/entity/EntityType.java", "package net.minecraft.world.entity; public class EntityType<T> {}\n"),
+            ("net/minecraft/world/item/Item.java", "package net.minecraft.world.item; public class Item {}\n"),
+            ("net/minecraft/world/item/ItemStack.java", "package net.minecraft.world.item; public class ItemStack {}\n"),
+            ("net/neoforged/neoforge/capabilities/Capability.java", "package net.neoforged.neoforge.capabilities; public class Capability<T> {}\n"),
+            ("net/neoforged/neoforge/capabilities/BlockCapability.java", "package net.neoforged.neoforge.capabilities; public class BlockCapability<T,C> extends Capability<T> {}\n"),
+            ("net/neoforged/neoforge/capabilities/ItemCapability.java", "package net.neoforged.neoforge.capabilities; public class ItemCapability<T,C> extends Capability<T> {}\n"),
+            ("net/neoforged/neoforge/capabilities/EntityCapability.java", "package net.neoforged.neoforge.capabilities; public class EntityCapability<T,C> extends Capability<T> {}\n"),
+            ("net/neoforged/neoforge/capabilities/BlockCapabilityCache.java", "package net.neoforged.neoforge.capabilities; public class BlockCapabilityCache { @FunctionalInterface public interface Provider<T,C> { T getCapability(net.minecraft.world.level.Level l, net.minecraft.core.BlockPos p, net.minecraft.world.level.block.state.BlockState s, net.minecraft.world.level.block.entity.BlockEntity e, C c); } }\n"),
+            ("net/neoforged/neoforge/capabilities/ItemCapabilityCache.java", "package net.neoforged.neoforge.capabilities; public class ItemCapabilityCache { @FunctionalInterface public interface Provider<T,C> { T getCapability(net.minecraft.world.item.ItemStack s, C c); } }\n"),
+            ("net/neoforged/neoforge/capabilities/EntityCapabilityCache.java", "package net.neoforged.neoforge.capabilities; public class EntityCapabilityCache { @FunctionalInterface public interface Provider<T,C> { T getCapability(net.minecraft.world.entity.Entity e, C c); } }\n"),
+        ] {
+            write(path, source);
+        }
         for (class, source) in [
             (
                 NEOFORGE_ENTITY_JOIN_LEVEL_EVENT,
@@ -19887,6 +20061,20 @@ public class Probe {
                 &[],
             );
             class("net/minecraft/core/Direction", "java/lang/Object", &[]);
+            class("net/minecraft/core/BlockPos", "java/lang/Object", &[]);
+            class("net/minecraft/world/level/Level", "java/lang/Object", &[]);
+            class("net/minecraft/world/level/block/Block", "java/lang/Object", &[]);
+            class("net/minecraft/world/level/block/state/BlockState", "java/lang/Object", &[]);
+            class("net/minecraft/world/level/block/entity/BlockEntity", "java/lang/Object", &[]);
+            class("net/minecraft/world/level/block/entity/BlockEntityType", "java/lang/Object", &[]);
+            class("net/minecraft/world/entity/Entity", "java/lang/Object", &[]);
+            class("net/minecraft/world/entity/EntityType", "java/lang/Object", &[]);
+            class("net/minecraft/resources/Identifier", "java/lang/Object", &[]);
+            class("net/minecraft/network/RegistryFriendlyByteBuf", "java/lang/Object", &[]);
+            class("net/minecraft/network/FriendlyByteBuf", "java/lang/Object", &[]);
+            class("net/minecraft/network/codec/StreamCodec", "java/lang/Object", &[]);
+            class("net/minecraft/network/protocol/common/custom/CustomPacketPayload", "java/lang/Object", &[]);
+            class("net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type", "java/lang/Object", &[("id", "()Lnet/minecraft/resources/Identifier;", 0x0001)]);
             jar.finish().expect("finish the game jar");
         }
 
