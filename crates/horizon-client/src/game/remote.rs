@@ -4808,12 +4808,47 @@ impl Game<'_> {
         // Client mods tick on any server, single player's own included.
         self.native_tick();
         self.tell_native_now();
+        self.tick_remote_payloads();
         // Minecraft.tick sends this even when the player cannot tick yet,
         // including while waiting for chunks. Keep it outside early returns.
         if self.remote.as_ref().is_some_and(|r| r.joined) {
             self.send(S::ClientTickEnd(Empty));
         }
         Ok(())
+    }
+
+    /// Move this window's mod payload frames both ways, at most
+    /// [`PAYLOAD_TICK_CAP`] each: frames the server sent run the client's own
+    /// receivers, and frames its Java mods queued for the server go out as
+    /// `horizon:payload`. A remainder stays queued for the next tick.
+    fn tick_remote_payloads(&mut self) {
+        let Some(r) = self.remote.as_mut() else {
+            return;
+        };
+        // Frames wait in the queue until the connection has joined.
+        let send_cap = if r.joined { PAYLOAD_TICK_CAP } else { 0 };
+        let pump = pump_client_payloads(
+            &mut r.payloads,
+            PAYLOAD_TICK_CAP,
+            send_cap,
+            &mut |frame| payloads::dispatch_received_as(frame, PayloadDirection::PlayToClient),
+            &mut payloads::take_java_to_server,
+        );
+        for id in &pump.unhandled {
+            log::warn!("Horizon: no Java handler for payload {id}");
+        }
+        for (id, error) in &pump.failed {
+            log::warn!("Horizon: Java payload {id} handler failed: {error}");
+        }
+        for (id, error) in &pump.rejected {
+            log::warn!("Horizon: mod payload {id} was not sent: {error}");
+        }
+        for data in pump.encoded {
+            self.send(S::CustomPayload(CustomPayload {
+                channel: payloads::CHANNEL.to_owned(),
+                data,
+            }));
+        }
     }
 
     fn tick_remote_level(&mut self) -> Result<()> {
@@ -7536,6 +7571,9 @@ impl Game<'_> {
             return Err("not connected to a server".to_owned());
         };
         let data = r.payloads.send(id, direction, bytes)?;
+        // The frame goes out right here; the link's own copy would only pile
+        // up against its queue cap.
+        r.payloads.take_outgoing();
         self.send(S::CustomPayload(CustomPayload {
             channel: payloads::CHANNEL.to_owned(),
             data,
@@ -8825,9 +8863,194 @@ mod declared_block_entity_tests {
     }
 }
 
+/// Frames a client window moves per tick in each direction, bounding the
+/// work one frame can spend on mod payloads.
+const PAYLOAD_TICK_CAP: usize = 256;
+
+/// What one tick of [`pump_client_payloads`] did, for the caller to log and
+/// send. Ids are the channel ids of the frames concerned.
+#[derive(Debug, Default)]
+struct PayloadPump {
+    /// Received frames a Java handler ran for.
+    dispatched: usize,
+    /// Received frames no handler claimed.
+    unhandled: Vec<String>,
+    /// Received frames whose handler errored: `(id, error)`.
+    failed: Vec<(String, String)>,
+    /// Frames Java mods queued that were refused before sending.
+    rejected: Vec<(String, String)>,
+    /// Encoded `horizon:payload` bodies to send to the server.
+    encoded: Vec<Vec<u8>>,
+}
+
+/// One client tick of mod payload traffic over `link`. First up to `cap`
+/// received frames go to `dispatch` (their receivers may queue sends), then up
+/// to `send_cap` server-bound frames from `outgoing` are checked against the
+/// server's declarations and encoded. Both directions are bounded and leave a
+/// remainder queued; a frame that no handler claims is consumed, not retried.
+fn pump_client_payloads(
+    link: &mut PayloadLink,
+    cap: usize,
+    send_cap: usize,
+    dispatch: &mut dyn FnMut(&PayloadFrame) -> std::result::Result<bool, String>,
+    outgoing: &mut dyn FnMut(usize) -> Vec<PayloadFrame>,
+) -> PayloadPump {
+    let mut pump = PayloadPump::default();
+    for frame in link.take_incoming_up_to(cap) {
+        match dispatch(&frame) {
+            Ok(true) => pump.dispatched += 1,
+            Ok(false) => pump.unhandled.push(frame.id().to_owned()),
+            Err(error) => pump.failed.push((frame.id().to_owned(), error)),
+        }
+    }
+    if send_cap == 0 {
+        return pump;
+    }
+    for frame in outgoing(send_cap) {
+        // A client only originates frames that travel to the server.
+        let result = if matches!(
+            frame.direction(),
+            PayloadDirection::PlayToServer | PayloadDirection::PlayBidirectional
+        ) {
+            link.send(frame.id(), frame.direction(), frame.bytes().to_vec())
+        } else {
+            Err(format!("{} is not a server-bound frame", frame.direction().name()))
+        };
+        match result {
+            Ok(data) => pump.encoded.push(data),
+            Err(error) => pump.rejected.push((frame.id().to_owned(), error)),
+        }
+    }
+    // The frames go out through the caller; the link's queue copy would only
+    // fill toward its cap.
+    link.take_outgoing();
+    pump
+}
+
 #[cfg(test)]
 mod tests {
-    use super::synced_local_use;
+    use super::{pump_client_payloads, synced_local_use};
+    use horizon_client::lan::payloads::PayloadLink;
+    use horizon_mods::payloads::{
+        PayloadDeclaration, PayloadDirection, PayloadFrame, PayloadRegistry,
+    };
+
+    /// A client link over `demo:down` (to the client) and `demo:up` (to the
+    /// server), both empty-codec so the frames validate.
+    fn client_link() -> PayloadLink {
+        let mut registry = PayloadRegistry::default();
+        for (id, direction) in [
+            ("demo:down", PayloadDirection::PlayToClient),
+            ("demo:up", PayloadDirection::PlayToServer),
+        ] {
+            registry
+                .register(PayloadDeclaration {
+                    id: id.into(),
+                    direction,
+                    codec: Some("minecraft:unit".into()),
+                })
+                .unwrap();
+        }
+        PayloadLink::new(registry)
+    }
+
+    fn frame(id: &str, direction: PayloadDirection) -> PayloadFrame {
+        PayloadFrame::new(id, direction, Vec::new()).unwrap()
+    }
+
+    fn receive_down(link: &mut PayloadLink, count: usize) {
+        let data = frame("demo:down", PayloadDirection::PlayToClient).encode();
+        for _ in 0..count {
+            link.receive(&data, PayloadDirection::PlayToClient).unwrap();
+        }
+    }
+
+    /// The tick drain is bounded in both directions: a cap's worth of received
+    /// frames is dispatched and sent, and the remainder stays queued.
+    #[test]
+    fn the_client_payload_drain_is_bounded_per_tick() {
+        let mut link = client_link();
+        receive_down(&mut link, 200);
+        let mut dispatched = 0;
+        let mut pending: Vec<PayloadFrame> = (0..30)
+            .map(|_| frame("demo:up", PayloadDirection::PlayToServer))
+            .collect();
+        let pump = pump_client_payloads(
+            &mut link,
+            128,
+            16,
+            &mut |_| {
+                dispatched += 1;
+                Ok(true)
+            },
+            &mut |max| pending.drain(..max.min(pending.len())).collect(),
+        );
+        assert_eq!(pump.dispatched, 128);
+        assert_eq!(dispatched, 128);
+        assert_eq!(link.incoming().len(), 72, "the remainder is retained");
+        assert_eq!(pump.encoded.len(), 16);
+        assert_eq!(pending.len(), 14, "unsent frames stay for the next tick");
+        // Every encoded frame is a valid server-bound frame, and the link's
+        // own send queue does not accumulate.
+        for data in &pump.encoded {
+            let (decoded, used) = PayloadFrame::decode(data).unwrap();
+            assert_eq!(used, data.len());
+            assert_eq!(decoded.direction(), PayloadDirection::PlayToServer);
+        }
+        assert!(link.outgoing().is_empty());
+        // The next tick continues where this one stopped.
+        let pump = pump_client_payloads(
+            &mut link,
+            128,
+            16,
+            &mut |_| Ok(true),
+            &mut |max| pending.drain(..max.min(pending.len())).collect(),
+        );
+        assert_eq!(pump.dispatched, 72);
+        assert_eq!(pump.encoded.len(), 14);
+        assert!(link.incoming().is_empty() && pending.is_empty());
+    }
+
+    /// With no handler jar the frame is consumed and recorded as unhandled;
+    /// a failing handler and an undeclared send are recorded, not fatal.
+    #[test]
+    fn a_window_without_handlers_records_the_no_handler_state() {
+        let mut link = client_link();
+        receive_down(&mut link, 2);
+        // The real dispatcher with no stored jar for this channel.
+        let pump = pump_client_payloads(
+            &mut link,
+            256,
+            256,
+            &mut |frame| {
+                horizon_client::lan::payloads::dispatch_received_as(
+                    frame,
+                    PayloadDirection::PlayToClient,
+                )
+            },
+            &mut |_| Vec::new(),
+        );
+        assert_eq!(pump.dispatched, 0);
+        assert_eq!(pump.unhandled, vec!["demo:down", "demo:down"]);
+        assert!(pump.failed.is_empty() && pump.encoded.is_empty());
+        assert!(link.incoming().is_empty(), "unhandled frames are consumed");
+
+        receive_down(&mut link, 1);
+        let mut bad = vec![
+            frame("demo:undeclared", PayloadDirection::PlayToServer),
+            frame("demo:up", PayloadDirection::PlayToServer),
+        ];
+        let pump = pump_client_payloads(
+            &mut link,
+            256,
+            256,
+            &mut |_| Err("boom".to_owned()),
+            &mut |_| std::mem::take(&mut bad),
+        );
+        assert_eq!(pump.failed, vec![("demo:down".to_owned(), "boom".to_owned())]);
+        assert_eq!(pump.rejected.len(), 1, "the undeclared channel is refused");
+        assert_eq!(pump.encoded.len(), 1, "the declared one still goes out");
+    }
 
     /// A malformed login manifest is rejected before it can touch the shared
     /// declaration stores; apply/merge/conflict live in `lan::java_content`.

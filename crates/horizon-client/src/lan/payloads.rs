@@ -966,7 +966,9 @@ mod tests {
             let data = server
                 .send("demo:to_client", PayloadDirection::PlayToClient, vec![n])
                 .unwrap();
-            client.receive(&data, PayloadDirection::PlayToClient).unwrap();
+            client
+                .receive(&data, PayloadDirection::PlayToClient)
+                .unwrap();
         }
         let first = client.take_incoming_up_to(3);
         assert_eq!(first.len(), 3);
@@ -1161,9 +1163,8 @@ mod tests {
             declaration("demo:reply", PayloadDirection::PlayToServer, None),
         ])
         .unwrap();
-        let frame =
-            PayloadFrame::new("demo:frame", PayloadDirection::PlayToClient, b"hi".to_vec())
-                .unwrap();
+        let frame = PayloadFrame::new("demo:frame", PayloadDirection::PlayToClient, b"hi".to_vec())
+            .unwrap();
 
         // Stored without its host the registration's marker cannot resolve to
         // a channel id: nothing runs. That is why a host-carrying store exists.
@@ -1182,7 +1183,11 @@ mod tests {
 
         assert!(dispatch_received_as(&frame, PayloadDirection::PlayToClient).unwrap());
         let replies = take_java_to_server(256);
-        assert_eq!(replies.len(), 1, "the handler's send reaches the client queue");
+        assert_eq!(
+            replies.len(),
+            1,
+            "the handler's send reaches the client queue"
+        );
         assert_eq!(replies[0].id(), "demo:reply");
         assert_eq!(replies[0].direction(), PayloadDirection::PlayToServer);
         // Delivered exactly once.
