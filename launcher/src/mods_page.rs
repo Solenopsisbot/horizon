@@ -1155,11 +1155,9 @@ impl Launcher {
     fn mods_clear_check(&mut self, entry: &installed::Entry) {
         let home = self.mods.home();
         self.mods.message = Some(java::clear_check(&home, &entry.checksum).map(|_| {
-            // Plain English like the probe lines: the language tables are not extended for the
-            // diagnostics panel yet.
-            format!(
-                "Cleared the compatibility cache for {}. It is checked again the next time it is installed, updated or listed in a search.",
-                entry.title
+            trf(
+                "Cleared the compatibility cache for {name}. It is checked again the next time it is installed, updated or listed in a search.",
+                &[("name", &entry.title)],
             )
         }));
         self.mods
@@ -1192,7 +1190,7 @@ impl Launcher {
             .flex()
             .flex_col()
             .gap(px(8.))
-            .child(caps("Java compatibility").text_color(t.muted));
+            .child(caps(tr("Java compatibility")).text_color(t.muted));
         for (e, check) in found.into_iter().take(DIAGNOSED) {
             let d = java::diagnostics(check);
             let color = if d.failed { t.warn } else { t.success };
@@ -1241,7 +1239,7 @@ impl Launcher {
             panel = panel.child(
                 text(theme::CAPTION)
                     .text_color(t.muted)
-                    .child(format!("(+{more} more)")),
+                    .child(trf("(+{count} more)", &[("count", &more.to_string())])),
             );
         }
         Some(panel)

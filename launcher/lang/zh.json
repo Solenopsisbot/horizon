@@ -402,5 +402,9 @@
   "only on CurseForge (CurseForge downloads coming soon: choose your installed instance instead)": "only on CurseForge (CurseForge downloads coming soon: choose your installed instance instead)",
   "not found": "not found",
   "failed": "failed",
+  "Java compatibility": "Java 兼容性",
+  "Clear compatibility cache": "清除兼容性缓存",
+  "(+{count} more)": "（+{count} 个）",
+  "Cleared the compatibility cache for {name}. It is checked again the next time it is installed, updated or listed in a search.": "已清除 {name} 的兼容性缓存。下次安装、更新或在搜索中列出时将再次检查。",
   "Jars: {summary}.": "Jars: {summary}."
 }

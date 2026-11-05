@@ -402,5 +402,9 @@
   "only on CurseForge (CurseForge downloads coming soon: choose your installed instance instead)": "only on CurseForge (CurseForge downloads coming soon: choose your installed instance instead)",
   "not found": "not found",
   "failed": "failed",
+  "Java compatibility": "Java-Kompatibilität",
+  "Clear compatibility cache": "Kompatibilitäts-Cache leeren",
+  "(+{count} more)": "(+{count} weitere)",
+  "Cleared the compatibility cache for {name}. It is checked again the next time it is installed, updated or listed in a search.": "Kompatibilitäts-Cache für {name} geleert. Die Prüfung erfolgt erneut, wenn der Mod installiert, aktualisiert oder in einer Suche aufgeführt wird.",
   "Jars: {summary}.": "Jars: {summary}."
 }

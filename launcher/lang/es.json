@@ -402,5 +402,9 @@
   "only on CurseForge (CurseForge downloads coming soon: choose your installed instance instead)": "solo en CurseForge (las descargas de CurseForge llegarán pronto: elige tu instancia instalada en su lugar)",
   "not found": "no encontrados",
   "failed": "fallaron",
+  "Java compatibility": "Compatibilidad con Java",
+  "Clear compatibility cache": "Borrar la caché de compatibilidad",
+  "(+{count} more)": "(+{count} más)",
+  "Cleared the compatibility cache for {name}. It is checked again the next time it is installed, updated or listed in a search.": "Se borró la caché de compatibilidad de {name}. Se volverá a comprobar la próxima vez que se instale, actualice o aparezca en una búsqueda.",
   "Jars: {summary}.": "Jars: {summary}."
 }
