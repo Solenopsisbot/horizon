@@ -676,11 +676,12 @@ public abstract class MemberMixin {
     );
 }
 
-/// Real `@Mixin` is `CLASS` retention, so discovery sees no plan at all. Such a
-/// jar must not read as fully applied: that is the difference between `native`
-/// and a mod whose mixins silently never ran.
+/// Real `@Mixin` is `CLASS` retention, so javac writes it into
+/// `RuntimeInvisibleAnnotations`. Discovery must still find it: the class is
+/// woven exactly like a runtime-visible one, rather than reading as a mod whose
+/// mixins silently never ran.
 #[test]
-fn a_class_retention_mixin_is_listed_without_a_plan() {
+fn a_class_retention_mixin_is_discovered_and_woven() {
     let fixture = Fixture::build(
         "retention",
         "CLASS",
@@ -715,15 +716,19 @@ public abstract class RealMixin {
         )],
     );
     let (jar, weave) = woven(fixture.load(), MixinSide::Server);
-    assert!(jar.mixin_injection_plans().is_empty());
-    assert!(weave.woven.is_empty());
-    assert_eq!(weave.skipped.len(), 1, "{:#?}", weave.skipped);
-    assert_eq!(weave.skipped[0].reason, MixinSkipReason::ListedWithoutPlan);
     assert_eq!(
-        weave.skipped[0].to_string(),
-        "listed-without-plan @Mixin demo/RealMixin"
+        jar.mixin_injection_plans().len(),
+        1,
+        "{:?}",
+        jar.mixin_injection_plans()
     );
-    assert_eq!(run_main(&jar), marks(&[("target", 0), ("after", 0)]));
+    assert_eq!(weave.woven.len(), 1, "{:#?}", weave.woven);
+    assert_eq!(weave.woven[0].callback.owner, "demo/RealMixin");
+    assert!(weave.skipped.is_empty(), "{:#?}", weave.skipped);
+    assert_eq!(
+        run_main(&jar),
+        marks(&[("never", 0), ("target", 0), ("after", 0)])
+    );
 }
 
 /// `HORIZON_REAL_MIXIN_JAR` names a real mod jar that lists Mixin classes. It
