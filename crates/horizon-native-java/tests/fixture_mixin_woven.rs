@@ -485,3 +485,267 @@ public abstract class CancelMixin {
     assert_eq!(weave.classes.classes.len(), 1);
     assert!(weave.classes.classes.contains_key("demo/Target"));
 }
+
+const REASONS_MAIN: &str = r#"package demo;
+public final class Main {
+    public void onInitialize() {
+        Target.good();
+        Target.both();
+    }
+}
+"#;
+
+const REASONS_TARGET: &str = r#"package demo;
+public final class Target {
+    public Target() {}
+    public static void good() { Probe.mark("good-target", 0); }
+    public static void both() { Probe.mark("both-target", 0); }
+    public static void returned() {}
+    public static void over(int value) {}
+    public static void over(long value) {}
+    public static void takesInfo() {}
+    public static void instanceCallback() {}
+    public static void sided() {}
+}
+"#;
+
+const REASONS_MIXIN: &str = r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+@Mixin(Target.class)
+public abstract class ReasonsMixin {
+    // A name with no descriptor, resolved because only one method answers it.
+    @Inject(method = "good", at = @At("HEAD"))
+    private static void good() { Probe.mark("good", 0); }
+    @Inject(method = "returned()V", at = @At("RETURN"))
+    private static void onReturned() {}
+    @Inject(method = "over", at = @At("HEAD"))
+    private static void onOver() {}
+    @Inject(method = "missing()V", at = @At("HEAD"))
+    private static void onMissing() {}
+    @Inject(method = "<init>()V", at = @At("HEAD"))
+    private static void onConstructor() {}
+    // The shape real mods use for a plain HEAD, which the weaver cannot express.
+    @Inject(method = "takesInfo()V", at = @At("HEAD"))
+    private static void onTakesInfo(CallbackInfo info) {}
+    @Inject(method = "instanceCallback()V", at = @At("HEAD"))
+    private void onInstance() {}
+    // Two selectors naming one method apply once, not twice.
+    @Inject(method = {"both", "both()V"}, at = @At("HEAD"))
+    private static void onBoth() { Probe.mark("both", 0); }
+}
+"#;
+
+fn single_inject(class: &str, mixin_target: &str, method: &str) -> String {
+    format!(
+        r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+@Mixin(targets = "{mixin_target}")
+public abstract class {class} {{
+    @Inject(method = "{method}", at = @At("HEAD"))
+    private static void callback() {{}}
+}}
+"#
+    )
+}
+
+/// Every label a jar in this fixture's shape earns, sorted, with its count.
+fn skip_labels(weave: &horizon_native_java::LoadTimeMixinWeave) -> BTreeMap<&'static str, usize> {
+    let mut labels = BTreeMap::new();
+    for row in &weave.skipped {
+        *labels.entry(row.reason.label()).or_insert(0) += 1;
+    }
+    labels
+}
+
+#[test]
+fn every_shape_outside_the_subset_is_skipped_with_its_reason() {
+    let outside = single_inject("OutsideMixin", "Lnet/minecraft/Elsewhere;", "tick()V");
+    let client = single_inject("ClientMixin", "Ldemo/Target;", "sided()V");
+    let unlisted = single_inject("UnlistedMixin", "Ldemo/Target;", "sided()V");
+    let plugged = single_inject("PluggedMixin", "Ldemo/Target;", "sided()V");
+    let fixture = Fixture::build(
+        "reasons",
+        "RUNTIME",
+        &[
+            ("demo/Main.java", REASONS_MAIN),
+            ("demo/Target.java", REASONS_TARGET),
+            ("demo/ReasonsMixin.java", REASONS_MIXIN),
+            ("demo/OutsideMixin.java", &outside),
+            ("demo/ClientMixin.java", &client),
+            ("demo/UnlistedMixin.java", &unlisted),
+            ("demo/PluggedMixin.java", &plugged),
+            (
+                "demo/MemberMixin.java",
+                r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+@Mixin(Target.class)
+public abstract class MemberMixin {
+    private int merged;
+}
+"#,
+            ),
+            (
+                "demo/Listed.java",
+                "package demo;\npublic final class Listed {}\n",
+            ),
+        ],
+        &[
+            (
+                "demo.mixins.json",
+                r#"{"package":"demo","mixins":["ReasonsMixin","OutsideMixin","MemberMixin","Listed"],"client":["ClientMixin"]}"#,
+            ),
+            (
+                "plugged.mixins.json",
+                r#"{"package":"demo","plugin":"demo.Plugin","mixins":["PluggedMixin"]}"#,
+            ),
+        ],
+    );
+
+    let (jar, weave) = woven(fixture.load(), MixinSide::Server);
+    let expected = BTreeMap::from([
+        // The `over` overloads, and `both`'s second selector for a method the
+        // first one already wove.
+        ("ambiguous-target", 2),
+        ("callback-not-static", 1),
+        ("config-plugin", 1),
+        ("constructor-target", 1),
+        ("listed-without-plan", 1),
+        ("non-head-anchor", 1),
+        ("not-in-config", 1),
+        ("other-side", 1),
+        ("target-missing", 1),
+        ("target-outside-jar", 1),
+        ("unsupported-family", 1),
+        ("weaver-rejected", 1),
+    ]);
+    assert_eq!(skip_labels(&weave), expected, "{:#?}", weave.skipped);
+
+    // A rejected plan costs only itself: the same class's good plans still run.
+    let woven_names = weave
+        .woven
+        .iter()
+        .map(|plan| plan.callback.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(woven_names, ["good", "onBoth"]);
+    assert_eq!(weave.woven[0].target.descriptor, "()V", "resolved overload");
+    assert_eq!(
+        run_main(&jar),
+        marks(&[
+            ("good", 0),
+            ("good-target", 0),
+            ("both", 0),
+            ("both-target", 0)
+        ]),
+        "each callback runs exactly once"
+    );
+
+    // Every weaver reason a report might print stays one bounded line.
+    let rejected = weave
+        .skipped
+        .iter()
+        .find_map(|row| match &row.reason {
+            MixinSkipReason::Weaver(detail) => Some(detail),
+            _ => None,
+        })
+        .expect("the CallbackInfo callback is the weaver's to refuse");
+    assert!(rejected.contains("CallbackInfo"), "{rejected}");
+    assert!(rejected.chars().count() <= 203, "{rejected}");
+
+    // The same class list on the other side applies the `client` mixin.
+    let (_, client_weave) = woven(fixture.load(), MixinSide::Client);
+    assert!(
+        client_weave
+            .woven
+            .iter()
+            .any(|plan| plan.callback.owner == "demo/ClientMixin"),
+        "{:#?}",
+        client_weave.woven
+    );
+    assert!(
+        client_weave
+            .skipped
+            .iter()
+            .all(|row| row.reason != MixinSkipReason::OtherSide),
+        "{:#?}",
+        client_weave.skipped
+    );
+}
+
+/// Real `@Mixin` is `CLASS` retention, so discovery sees no plan at all. Such a
+/// jar must not read as fully applied: that is the difference between `native`
+/// and a mod whose mixins silently never ran.
+#[test]
+fn a_class_retention_mixin_is_listed_without_a_plan() {
+    let fixture = Fixture::build(
+        "retention",
+        "CLASS",
+        &[
+            ("demo/Main.java", MAIN_RUNS_TARGET),
+            ("demo/Counter.java", COUNTER),
+            (
+                "demo/Target.java",
+                r#"package demo;
+public final class Target {
+    public static void run() { Probe.mark("target", 0); }
+}
+"#,
+            ),
+            (
+                "demo/RealMixin.java",
+                r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+@Mixin(Target.class)
+public abstract class RealMixin {
+    @Inject(method = "run()V", at = @At("HEAD"))
+    private static void onRun() { Probe.mark("never", 0); }
+}
+"#,
+            ),
+        ],
+        &[(
+            "demo.mixins.json",
+            r#"{"package":"demo","mixins":["RealMixin"]}"#,
+        )],
+    );
+    let (jar, weave) = woven(fixture.load(), MixinSide::Server);
+    assert!(jar.mixin_injection_plans().is_empty());
+    assert!(weave.woven.is_empty());
+    assert_eq!(weave.skipped.len(), 1, "{:#?}", weave.skipped);
+    assert_eq!(weave.skipped[0].reason, MixinSkipReason::ListedWithoutPlan);
+    assert_eq!(weave.skipped[0].callback.owner, "demo/RealMixin");
+    assert_eq!(run_main(&jar), marks(&[("target", 0), ("after", 0)]));
+}
+
+/// `HORIZON_REAL_MIXIN_JAR` names a real mod jar that lists Mixin classes. It
+/// is opened read-only and never executed; without the variable the test skips,
+/// because a real jar cannot live in this tree.
+#[test]
+fn a_real_mixin_jar_never_reads_as_fully_applied() {
+    let Some(path) = std::env::var_os("HORIZON_REAL_MIXIN_JAR") else {
+        println!("skip: HORIZON_REAL_MIXIN_JAR is not set");
+        return;
+    };
+    let jar = NativeJar::from_path(Path::new(&path)).unwrap();
+    let listed = jar
+        .mixin_configs()
+        .iter()
+        .map(|config| config.mixins.len() + config.client.len() + config.server.len())
+        .sum::<usize>();
+    assert!(listed > 0, "{path:?} lists no Mixin classes");
+    let weave = jar.plan_load_time_weave(MixinSide::Server);
+    println!(
+        "{path:?}: {listed} listed, {} plan(s), {} woven, {} skipped: {:?}",
+        jar.mixin_injection_plans().len(),
+        weave.woven.len(),
+        weave.skipped.len(),
+        skip_labels(&weave),
+    );
+    assert!(!weave.skipped.is_empty());
+}
