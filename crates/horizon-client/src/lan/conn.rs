@@ -9,6 +9,7 @@
 use super::{
     Joined, NetEvent, Out, Shared,
     data::{CORE_PACK, SyncData},
+    payloads,
 };
 use horizon_protocol::{
     PROTOCOL_VERSION,
@@ -1235,6 +1236,7 @@ fn read_loop(
     rate_limit: i32,
 ) -> Ended {
     let mut rate = PacketRate::new(rate_limit, Instant::now());
+    let mut chunks = payloads::ChunkAssembler::new();
     loop {
         let (id, payload) = match reader.recv() {
             Ok(p) => p,
@@ -1252,16 +1254,24 @@ fn read_loop(
         if let Some(average) = rate.as_mut().and_then(|r| r.received(Instant::now())) {
             return Ended::RateExceeded(average);
         }
-        match play::Serverbound::decode(id, &payload).and_then(checked_play) {
-            Ok(play::Serverbound::KeepAlive(k)) => alive.store(k.id, Ordering::Relaxed),
-            Ok(play::Serverbound::ResourcePack(r))
+        match decode_play(id, &payload, &mut chunks) {
+            // More chunks of an oversized mod payload are still due.
+            Ok(None) => {}
+            Ok(Some(play::Serverbound::KeepAlive(k))) => alive.store(k.id, Ordering::Relaxed),
+            Ok(Some(play::Serverbound::ResourcePack(r)))
                 if r.action == PACK_DECLINED && required_pack =>
             {
                 return Ended::PackDeclined(r.id);
             }
-            Ok(p) => {
+            Ok(Some(p)) => {
+                // A joined payload is charged at its whole size, not the last
+                // chunk's, so the inbox bound sees an oversized frame.
+                let bytes = match &p {
+                    play::Serverbound::CustomPayload(p) => p.data.len(),
+                    _ => payload.len(),
+                };
                 if events
-                    .send(NetEvent::Packet(conn, Box::new(p), payload.len()))
+                    .send(NetEvent::Packet(conn, Box::new(p), bytes))
                     .is_err()
                 {
                     return Ended::Closed("server closed".to_owned());
@@ -1307,6 +1317,37 @@ fn decode_config(id: i32, payload: &[u8]) -> horizon_protocol::Result<cfg::Serve
             Err(horizon_protocol::Error::new(too_large()))
         }
         packet => Ok(packet),
+    }
+}
+
+/// A play packet as the hub receives it, joining a chunked mod payload first.
+///
+/// A `horizon:payload` frame above the CustomPayload envelope arrives as
+/// several chunks ([`payloads::chunk_envelopes`]); each is a small packet, and
+/// the assembler hands the hub the whole frame. `Ok(None)` means the transfer
+/// is not finished. Every other packet keeps vanilla's decoder and its
+/// 32767-byte limit, so a v1 sender's small frames are unchanged.
+fn decode_play(
+    id: i32,
+    payload: &[u8],
+    chunks: &mut payloads::ChunkAssembler,
+) -> horizon_protocol::Result<Option<play::Serverbound>> {
+    let packet = play::Serverbound::decode(id, payload)?;
+    let play::Serverbound::CustomPayload(p) = &packet else {
+        return checked_play(packet).map(Some);
+    };
+    if p.channel != payloads::CHANNEL || !payloads::is_chunk_envelope(&p.data) {
+        return checked_play(packet).map(Some);
+    }
+    match chunks.push(&p.data) {
+        Ok(None) => Ok(None),
+        // The joined frame is the payload the sender encoded; it still goes
+        // through the frame model's own 1 MiB cap in the hub.
+        Ok(Some(data)) => Ok(Some(play::Serverbound::CustomPayload(cfg::CustomPayload {
+            channel: p.channel.clone(),
+            data,
+        }))),
+        Err(error) => Err(horizon_protocol::Error::new(error)),
     }
 }
 
@@ -1529,6 +1570,62 @@ mod tests {
         };
         assert!(checked_play(suggestion(32500)).is_ok());
         assert!(checked_play(suggestion(32501)).is_err());
+    }
+
+    #[test]
+    fn chunked_mod_payloads_join_before_the_hub_sees_them() {
+        use horizon_mods::payloads::{PayloadDirection, PayloadFrame};
+        let id = horizon_protocol::ids::play::serverbound::CUSTOM_PAYLOAD;
+        let body = |data: Vec<u8>| {
+            let encoded = play::Serverbound::CustomPayload(cfg::CustomPayload {
+                channel: payloads::CHANNEL.into(),
+                data,
+            })
+            .encode();
+            assert_eq!(encoded[0] as i32, id, "the packet id is one VarInt byte");
+            encoded[1..].to_vec()
+        };
+
+        // A frame above the envelope is several chunks; the hub only sees it
+        // once the last one lands.
+        let frame = PayloadFrame::new(
+            "demo:big",
+            PayloadDirection::PlayToServer,
+            vec![0xab; payloads::MAX_ENVELOPE * 2],
+        )
+        .unwrap();
+        let encoded = frame.encode();
+        let envelopes = payloads::chunk_envelopes(&encoded).unwrap();
+        assert!(envelopes.len() > 1);
+        let mut chunks = payloads::ChunkAssembler::new();
+        for (index, envelope) in envelopes.iter().enumerate() {
+            let packet = decode_play(id, &body(envelope.clone()), &mut chunks).unwrap();
+            if index + 1 < envelopes.len() {
+                assert!(packet.is_none(), "chunk {index} is not a whole frame");
+            } else {
+                match packet {
+                    Some(play::Serverbound::CustomPayload(p)) => {
+                        assert_eq!(p.channel, payloads::CHANNEL);
+                        assert_eq!(p.data, encoded);
+                    }
+                    other => panic!("expected the joined payload, got {other:?}"),
+                }
+            }
+        }
+
+        // A frame inside the envelope is one packet, exactly as before.
+        let small = PayloadFrame::new("demo:small", PayloadDirection::PlayToServer, vec![1; 100])
+            .unwrap()
+            .encode();
+        match decode_play(id, &body(small.clone()), &mut chunks).unwrap() {
+            Some(play::Serverbound::CustomPayload(p)) => assert_eq!(p.data, small),
+            other => panic!("expected the small payload, got {other:?}"),
+        }
+
+        // A sender that still puts an oversized frame in one packet is
+        // malformed, as vanilla reads it.
+        let oversized = body(vec![0; MAX_PAYLOAD + 1]);
+        assert!(decode_play(id, &oversized, &mut chunks).is_err());
     }
 
     #[test]
