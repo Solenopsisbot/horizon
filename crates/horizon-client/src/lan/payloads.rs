@@ -383,16 +383,35 @@ struct HandlerJar {
     host: Option<StdHost>,
 }
 
-static HANDLER_JARS: Mutex<Vec<HandlerJar>> = Mutex::new(Vec::new());
+/// The execution role whose Java payload handlers own a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HandlerRole {
+    Client,
+    IntegratedServer,
+    DedicatedServer,
+}
+
+static HANDLER_JARS: Mutex<BTreeMap<HandlerRole, Vec<HandlerJar>>> = Mutex::new(BTreeMap::new());
 
 /// Remember one mod jar's payload registrations; called after its bootstrap.
 pub fn store_handler_jar(jar: NativeJar, registrations: Vec<PayloadRegistration>) {
+    store_handler_jar_as(HandlerRole::Client, jar, registrations);
+}
+
+/// Remember one mod jar's payload registrations for a specific execution role.
+pub fn store_handler_jar_as(
+    role: HandlerRole,
+    jar: NativeJar,
+    registrations: Vec<PayloadRegistration>,
+) {
     if registrations.is_empty() {
         return;
     }
     HANDLER_JARS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .entry(role)
+        .or_default()
         .push(HandlerJar {
             jar,
             registrations,
@@ -405,6 +424,11 @@ pub fn store_handler_jar(jar: NativeJar, registrations: Vec<PayloadRegistration>
 /// Registrations come from the host itself. Sends the host had queued are
 /// dropped from the kept copy (the caller already published them).
 pub fn store_handler_host(jar: NativeJar, host: &StdHost) {
+    store_handler_host_as(HandlerRole::Client, jar, host);
+}
+
+/// [`store_handler_host`] for a specific execution role.
+pub fn store_handler_host_as(role: HandlerRole, jar: NativeJar, host: &StdHost) {
     let registrations = host.payload_registrations().to_vec();
     if registrations.is_empty() {
         return;
@@ -415,6 +439,8 @@ pub fn store_handler_host(jar: NativeJar, host: &StdHost) {
     HANDLER_JARS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .entry(role)
+        .or_default()
         .push(HandlerJar {
             jar,
             registrations,
@@ -434,7 +460,7 @@ pub fn clear_handler_jars() {
 /// channel. Returns whether a handler ran; sends it queues are published for
 /// the next server tick.
 pub fn dispatch_received(frame: &PayloadFrame) -> Result<bool, String> {
-    dispatch_matching(frame, None)
+    dispatch_received_as_role(frame, PayloadDirection::PlayToServer, HandlerRole::IntegratedServer)
 }
 
 /// [`dispatch_received`] for the side that received the frame: only
@@ -445,7 +471,25 @@ pub fn dispatch_received_as(
     frame: &PayloadFrame,
     receiving: PayloadDirection,
 ) -> Result<bool, String> {
-    dispatch_matching(frame, Some(receiving))
+    let role = match receiving {
+        PayloadDirection::PlayToClient => HandlerRole::Client,
+        PayloadDirection::PlayToServer => HandlerRole::IntegratedServer,
+        PayloadDirection::PlayBidirectional
+        | PayloadDirection::ConfigurationToClient
+        | PayloadDirection::ConfigurationToServer => {
+            HandlerRole::Client
+        }
+    };
+    dispatch_received_as_role(frame, receiving, role)
+}
+
+/// [`dispatch_received_as`] with an explicit execution role.
+pub fn dispatch_received_as_role(
+    frame: &PayloadFrame,
+    receiving: PayloadDirection,
+    role: HandlerRole,
+) -> Result<bool, String> {
+    dispatch_matching(frame, Some(receiving), role)
 }
 
 /// Whether a registration's recorded direction receives frames travelling in
@@ -461,11 +505,15 @@ fn registration_receives(direction: &str, receiving: PayloadDirection) -> bool {
 fn dispatch_matching(
     frame: &PayloadFrame,
     receiving: Option<PayloadDirection>,
+    role: HandlerRole,
 ) -> Result<bool, String> {
     let declarations = declared();
     let declaration = declarations.get(frame.id());
     let (payload, context) = payload_values(declaration, frame);
     let handlers = HANDLER_JARS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(handlers) = handlers.get(&role) else {
+        return Ok(false);
+    };
     for handler in handlers.iter() {
         let registrations: Vec<PayloadRegistration> = handler
             .registrations
@@ -1371,6 +1419,15 @@ mod tests {
         assert_eq!(replies[0].direction(), PayloadDirection::PlayToServer);
         // Delivered exactly once.
         assert!(take_java_to_server(256).is_empty());
+
+        // A handler registered for the client role never answers a server
+        // role dispatch, even when the channel and direction are identical.
+        assert!(!dispatch_received_as_role(
+            &frame,
+            PayloadDirection::PlayToClient,
+            HandlerRole::IntegratedServer,
+        )
+        .unwrap());
 
         clear_handler_jars();
         let _ = take_java_outgoing();

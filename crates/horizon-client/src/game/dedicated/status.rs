@@ -142,8 +142,7 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport]) -> Value {
                 "mixin_skipped_reason": report
                     .mixin_weave
                     .reason
-                    .as_deref()
-                    .map(bounded_error),
+                    .as_deref(),
                 "mixin_targets": report
                     .mixin_targets
                     .iter()
@@ -375,7 +374,7 @@ impl Game<'_> {
 mod tests {
     use super::*;
     use crate::game::execution_role::ExecutionRole;
-    use crate::game::mods::MixinWeave;
+    use crate::game::mods::{MAX_WEAVE_REASON, MixinWeave};
 
     fn report(
         jars: usize,
@@ -654,7 +653,7 @@ mod tests {
         long.mixin_weave = MixinWeave {
             woven: 0,
             skipped: 2,
-            reason: Some("x".repeat(MAX_FML_ERROR_CHARS * 2)),
+            reason: Some(format!("{}...", "x".repeat(MAX_WEAVE_REASON))),
         };
         let reports = [
             skipped.clone(),
@@ -688,7 +687,7 @@ mod tests {
                 .unwrap()
                 .chars()
                 .count(),
-            MAX_FML_ERROR_CHARS + 3
+            MAX_WEAVE_REASON + 3
         );
 
         // The wire keeps the old planning keys exactly as they were, so a

@@ -160,7 +160,7 @@ const MAX_ISOLATION_MESSAGE: usize = 160;
 /// How much of one skip reason a report and the status reply keep. The reasons
 /// name classes and methods from the jar, so a pathological name must not be
 /// able to lengthen a line.
-const MAX_WEAVE_REASON: usize = 120;
+pub(super) const MAX_WEAVE_REASON: usize = 120;
 
 /// The loader metadata a jar declares. All three run through the same bounded
 /// interpreter; the kind only names which metadata the native path read, so a
@@ -287,6 +287,18 @@ fn role_name(role: ExecutionRole) -> &'static str {
         ExecutionRole::Client => "client",
         ExecutionRole::IntegratedServer => "integrated-server",
         ExecutionRole::DedicatedServer => "dedicated-server",
+    }
+}
+
+fn payload_handler_role(role: ExecutionRole) -> horizon_client::lan::payloads::HandlerRole {
+    match role {
+        ExecutionRole::Client => horizon_client::lan::payloads::HandlerRole::Client,
+        ExecutionRole::IntegratedServer => {
+            horizon_client::lan::payloads::HandlerRole::IntegratedServer
+        }
+        ExecutionRole::DedicatedServer => {
+            horizon_client::lan::payloads::HandlerRole::DedicatedServer
+        }
     }
 }
 
@@ -1002,6 +1014,7 @@ fn isolated_jar_report(
     role: ExecutionRole,
     kind: &str,
     message: &str,
+    mixin: Option<&MixinPlanning>,
 ) -> JavaCompatibilityReport {
     let mut report = JavaCompatibilityReport::new(
         jar,
@@ -1009,10 +1022,12 @@ fn isolated_jar_report(
         role,
         NativeRunFacts {
             kind,
+            mixin,
             ..NativeRunFacts::default()
         },
     );
     report.isolation_failure = Some(bounded_isolation_message(message));
+    report.engine = Some(JavaEngine::of_report(&report));
     for line in report.summary() {
         log::warn!("{line}");
     }
@@ -1191,7 +1206,15 @@ pub(super) fn run_java_mods_with_report(
         let weave = match isolate_jar(|| jar.plan_load_time_weave(mixin_side(role))) {
             Ok(weave) => weave,
             Err(message) => {
-                reports.push(isolated_jar_report(&jar, path, role, kind, &message));
+                let planning = MixinPlanning::of(Some(&jar));
+                reports.push(isolated_jar_report(
+                    &jar,
+                    path,
+                    role,
+                    kind,
+                    &message,
+                    Some(&planning),
+                ));
                 continue;
             }
         };
@@ -1225,7 +1248,14 @@ pub(super) fn run_java_mods_with_report(
             // A refused entrypoint stays the startup error it always was.
             Ok(Err(error)) => return Err(error),
             Err(message) => {
-                reports.push(isolated_jar_report(&jar, path, role, kind, &message));
+                reports.push(isolated_jar_report(
+                    &jar,
+                    path,
+                    role,
+                    kind,
+                    &message,
+                    Some(&mixin),
+                ));
                 continue;
             }
         };
@@ -1260,7 +1290,11 @@ pub(super) fn run_java_mods_with_report(
         // Keep the bootstrapped host, not just its registrations: dispatch
         // resolves a registration's payload-type marker through the host's
         // channel map, and a jar stored without one never matches a frame.
-        horizon_client::lan::payloads::store_handler_host(jar.clone(), &host);
+        horizon_client::lan::payloads::store_handler_host_as(
+            payload_handler_role(role),
+            jar.clone(),
+            &host,
+        );
         java_runtimes()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3021,6 +3055,34 @@ clientSideOnly = true
             )
         );
         assert_eq!(isolation_summary(&[]), None);
+    }
+
+    #[test]
+    fn isolated_jar_report_keeps_pre_panic_mixin_weave_counts() {
+        let planning = MixinPlanning {
+            plans: 2,
+            woven: 1,
+            skipped: 1,
+            skip_reasons: vec!["cancellable HEAD demo/Target#run()V".to_owned()],
+            ..MixinPlanning::default()
+        };
+        let jar = horizon_native_java::NativeJar::default();
+        let report = isolated_jar_report(
+            &jar,
+            std::path::Path::new("/mods/panicked.jar"),
+            ExecutionRole::DedicatedServer,
+            "main",
+            "boom",
+            Some(&planning),
+        );
+        assert_eq!(report.mixin_weave.woven, 1);
+        assert_eq!(report.mixin_weave.skipped, 1);
+        assert_eq!(
+            report.mixin_weave.reason.as_deref(),
+            Some("cancellable HEAD demo/Target#run()V")
+        );
+        assert_eq!(report.engine(), JavaEngine::NativeQualified);
+        assert_eq!(report.isolation_failure.as_deref(), Some("boom"));
     }
 
     #[test]
