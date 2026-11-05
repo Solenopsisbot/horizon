@@ -10,6 +10,7 @@
 use super::{installed::Entry, pick, FileRef, Kind, Project, Source, Support, Version};
 use horizon_mods::java_artifact;
 use horizon_port_pack::check::{self, Check, Verdict};
+use horizon_port_pack::classes::Feature;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,18 +26,24 @@ const MAX_DEPTH: usize = 3;
 /// The loaders whose jars port-pack reads.
 pub const LOADERS: [&str; 4] = ["neoforge", "fabric", "forge", "quilt"];
 
+/// A probe message on one line, cut to a player-sized length.
+fn bounded(text: &str) -> String {
+    const MAX_DETAIL: usize = 240;
+    let mut detail = text.replace(['\n', '\r'], " ");
+    if detail.chars().count() > MAX_DETAIL {
+        detail = detail.chars().take(MAX_DETAIL - 1).collect();
+        detail.push('…');
+    }
+    detail
+}
+
 /// Adds the bounded native-probe result to the browser verdict. A probe failure does not
 /// change what content can be carried, but it tells the player that Java compatibility will
 /// need the embedded JVM path once that runtime is enabled.
 fn compatibility_note(check: &Check) -> Option<String> {
     let native = check.native.as_ref()?;
     let error = native.error.as_deref()?;
-    let mut detail = error.replace(['\n', '\r'], " ");
-    const MAX_DETAIL: usize = 240;
-    if detail.chars().count() > MAX_DETAIL {
-        detail = detail.chars().take(MAX_DETAIL - 1).collect();
-        detail.push('…');
-    }
+    let detail = bounded(error);
     let entry = native
         .entrypoint
         .as_deref()
@@ -74,6 +81,104 @@ pub fn support_of(check: &Check) -> Support {
     }
 }
 
+/// What an installed Java mod's cached check says about how it runs, as lines the Mods page
+/// shows: the loader, the probe's verdict, which entrypoint it tried, how many host calls it
+/// made, what it registered, whether Mixins went unapplied and why it stopped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Diagnostics {
+    /// `Works`, `Partial` (the probe stopped: the embedded JVM may be needed) or `Not probed`.
+    pub verdict: &'static str,
+    /// Whether the probe stopped on an error.
+    pub failed: bool,
+    pub lines: Vec<String>,
+}
+
+/// The most entrypoint names listed before "+N more".
+const LISTED_ENTRYPOINTS: usize = 2;
+
+/// Reads `check` into [`Diagnostics`]. Every line is bounded, so a hostile jar can't grow the
+/// panel: the probe's message is cut to [`bounded`] and entrypoints are counted past two.
+pub fn diagnostics(check: &Check) -> Diagnostics {
+    let mut lines = vec![format!(
+        "Loader: {}",
+        match check.loader.as_str() {
+            "" => "plain zip",
+            "neoforge" => "NeoForge",
+            "forge" => "Forge",
+            "fabric" => "Fabric",
+            "quilt" => "Quilt",
+            other => other,
+        }
+    )];
+    let (verdict, failed) = match &check.native {
+        None => ("Not probed", false),
+        Some(native) if native.error.is_some() => ("Partial", true),
+        Some(_) => ("Works", false),
+    };
+    lines.push(format!("Probe: {verdict}"));
+    if let Some(native) = &check.native {
+        let mut names: Vec<&str> = native.entrypoints.iter().map(String::as_str).collect();
+        if names.is_empty() {
+            names.extend(native.entrypoint.as_deref());
+        }
+        let kind = native.kind.as_deref().unwrap_or("unknown");
+        let listed = names
+            .iter()
+            .take(LISTED_ENTRYPOINTS)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(match names.len() {
+            0 => format!("Entrypoint: {kind}, none found"),
+            n if n > LISTED_ENTRYPOINTS => format!(
+                "Entrypoint: {kind} · {listed} (+{} more)",
+                n - LISTED_ENTRYPOINTS
+            ),
+            _ => format!("Entrypoint: {kind} · {listed}"),
+        });
+        lines.push(format!(
+            "Host calls: {} · registrations: {} · listeners: {} · payloads: {}",
+            native.calls, native.registrations, native.listeners, native.payloads
+        ));
+    }
+    let mixins = check
+        .code
+        .features
+        .get(&Feature::Mixin)
+        .copied()
+        .unwrap_or(0);
+    if mixins > 0 {
+        lines.push(format!(
+            "Mixins: {mixins} class{} not applied by the native probe; behaviour they change may be missing",
+            if mixins == 1 { "" } else { "es" }
+        ));
+    }
+    if let Some(error) = check.native.as_ref().and_then(|n| n.error.as_deref()) {
+        lines.push(format!(
+            "Stopped: {} (the embedded JVM fallback may be needed)",
+            bounded(error)
+        ));
+    }
+    Diagnostics {
+        verdict,
+        failed,
+        lines,
+    }
+}
+
+/// Which mod's diagnostics come first: a probe that stopped, then more Mixins, then more host
+/// calls. The page breaks ties by name.
+pub fn most_relevant_first(a: &Check, b: &Check) -> std::cmp::Ordering {
+    let key = |c: &Check| {
+        (
+            c.native.as_ref().is_some_and(|n| n.error.is_some()),
+            c.code.features.get(&Feature::Mixin).copied().unwrap_or(0),
+            c.native.as_ref().map_or(0, |n| n.calls),
+        )
+    };
+    key(b).cmp(&key(a))
+}
+
 fn checks(home: &Path) -> PathBuf {
     home.join(CHECKS)
 }
@@ -81,12 +186,26 @@ fn checks(home: &Path) -> PathBuf {
 /// The folder a file's check is kept in, by its checksum.
 fn checked_dir(home: &Path, file: &FileRef) -> Option<PathBuf> {
     let (_, hash) = file.checksum()?;
+    checked_dir_of(home, hash)
+}
+
+/// The folder for a checksum's hex digits. Only hex survives and the name is cut to 40 digits,
+/// so a hostile value can't leave the checks folder.
+fn checked_dir_of(home: &Path, hash: &str) -> Option<PathBuf> {
     let hash: String = hash
         .chars()
         .filter(char::is_ascii_hexdigit)
         .take(40)
         .collect();
     (hash.len() >= 32).then(|| checks(home).join(hash))
+}
+
+/// The folder for an installed entry's `ALGO:hex` checksum (`installed::Entry::checksum`).
+fn checked_dir_for_entry(home: &Path, checksum: &str) -> Option<PathBuf> {
+    checked_dir_of(
+        home,
+        checksum.split_once(':').map_or(checksum, |(_, hex)| hex),
+    )
 }
 
 fn read_check(dir: &Path) -> Option<Check> {
@@ -110,6 +229,28 @@ fn read_check(dir: &Path) -> Option<Check> {
 /// The check of `file` if it was made before.
 pub fn cached(home: &Path, file: &FileRef) -> Option<Check> {
     read_check(&checked_dir(home, file)?)
+}
+
+/// The cached check of an installed mod, by the `ALGO:hex` checksum its entry keeps.
+pub fn cached_for_entry(home: &Path, checksum: &str) -> Option<Check> {
+    read_check(&checked_dir_for_entry(home, checksum)?)
+}
+
+/// Forgets one installed mod's cached check (and any half-written copy of it) so the next
+/// check of that jar reads it again. Only that checksum's folder goes; every other mod's
+/// check, and the `.downloads` scratch folder, stay. Returns whether anything was removed.
+pub fn clear_check(home: &Path, checksum: &str) -> Result<bool, String> {
+    let dir = checked_dir_for_entry(home, checksum)
+        .ok_or_else(|| format!("{checksum} isn't a checksum a check is kept under."))?;
+    let mut removed = false;
+    for path in [dir.clone(), dir.with_extension("part")] {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    Ok(removed)
 }
 
 /// Checks `file`: the cached answer, else its jar downloaded, carried over and read. The jar
@@ -515,6 +656,113 @@ mod tests {
             fs::write(dir.join("check.provenance.json"), text).unwrap();
             assert_eq!(cached(&home, &file), None, "{text}");
         }
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    fn demo_check(native: Option<horizon_port_pack::check::NativeProbe>) -> Check {
+        Check {
+            mod_id: "demo".into(),
+            name: "Demo".into(),
+            version: "1".into(),
+            loader: "fabric".into(),
+            license: "MIT".into(),
+            verdict: Verdict::Works,
+            summary: "Content ports cleanly.".into(),
+            ports: Vec::new(),
+            skipped: Vec::new(),
+            depends: Vec::new(),
+            namespaces: vec!["demo".into()],
+            code: Default::default(),
+            native,
+        }
+    }
+
+    fn probe(error: Option<&str>) -> horizon_port_pack::check::NativeProbe {
+        horizon_port_pack::check::NativeProbe {
+            kind: Some("main".into()),
+            entrypoint: Some("demo.Main".into()),
+            entrypoints: vec!["a.A".into(), "b.B".into(), "c.C".into(), "d.D".into()],
+            seeded_mods: vec!["demo".into()],
+            calls: 12,
+            registrations: 3,
+            listeners: 1,
+            payloads: 0,
+            error: error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn diagnostics_report_a_clean_probe() {
+        let d = diagnostics(&demo_check(Some(probe(None))));
+        assert_eq!(d.verdict, "Works");
+        assert!(!d.failed);
+        assert_eq!(
+            d.lines,
+            [
+                "Loader: Fabric",
+                "Probe: Works",
+                "Entrypoint: main · a.A, b.B (+2 more)",
+                "Host calls: 12 · registrations: 3 · listeners: 1 · payloads: 0",
+            ]
+        );
+        assert_eq!(diagnostics(&demo_check(None)).verdict, "Not probed");
+    }
+
+    #[test]
+    fn diagnostics_bound_the_failure_and_warn_about_mixins() {
+        let mut check = demo_check(Some(probe(Some(&format!("boom\n{}", "x".repeat(500))))));
+        check.code.features.insert(Feature::Mixin, 2);
+        let d = diagnostics(&check);
+        assert_eq!((d.verdict, d.failed), ("Partial", true));
+        assert!(d
+            .lines
+            .iter()
+            .any(|l| l.starts_with("Mixins: 2 classes not applied")));
+        let stopped = d.lines.last().unwrap();
+        assert!(stopped.starts_with("Stopped: boom x"));
+        assert!(!stopped.contains('\n'));
+        assert!(stopped.chars().count() < 320, "{}", stopped.chars().count());
+    }
+
+    #[test]
+    fn failed_and_mixin_heavy_mods_sort_first() {
+        let clean = demo_check(Some(probe(None)));
+        let failed = demo_check(Some(probe(Some("no"))));
+        let mut mixed = demo_check(Some(probe(None)));
+        mixed.code.features.insert(Feature::Mixin, 1);
+        let mut order = [clean.clone(), mixed.clone(), failed.clone()];
+        order.sort_by(most_relevant_first);
+        assert_eq!(order, [failed, mixed, clean]);
+    }
+
+    /// Clearing one mod's check leaves the others (and the download scratch folder) alone, and
+    /// the cache still answers for what remains.
+    #[test]
+    fn clearing_a_check_keeps_the_others() {
+        let home = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("java-clear-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let (a, b) = ("ab".repeat(64), "cd".repeat(64));
+        let check = demo_check(None);
+        for hex in [&a, &b] {
+            let dir = checked_dir_of(&home, hex).unwrap();
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("check.json"), serde_json::to_vec(&check).unwrap()).unwrap();
+        }
+        fs::create_dir_all(checks(&home).join(".downloads")).unwrap();
+        let (key_a, key_b) = (format!("SHA-512:{a}"), format!("SHA-512:{b}"));
+        assert_eq!(cached_for_entry(&home, &key_a), Some(check.clone()));
+
+        assert_eq!(clear_check(&home, &key_a), Ok(true));
+        assert_eq!(cached_for_entry(&home, &key_a), None);
+        assert_eq!(cached_for_entry(&home, &key_b), Some(check));
+        assert!(checks(&home).join(".downloads").exists());
+        // Already gone: nothing to remove, and not an error.
+        assert_eq!(clear_check(&home, &key_a), Ok(false));
+        // A value that isn't a checksum never reaches the file system.
+        assert!(clear_check(&home, "SHA-512:../..").is_err());
+        assert!(checks(&home).exists());
         fs::remove_dir_all(&home).unwrap();
     }
 }
