@@ -65,7 +65,142 @@ public final class HorizonLoaderBridge {
   private HorizonLoaderBridge() {}
   private static boolean testLaunchCalled;
 
+  // ---- Optional Knot classpath unlock -----------------------------------
+  //
+  // Fabric's own launch registers the game jars and every discovered mod's
+  // code sources on Knot's class loader: `GameProvider.unlockClassPath(...)`
+  // for the game (`MinecraftGameProvider` adds its `gameJars`,
+  // `realmsJar` and `miscGameLibraries`) and `FabricLoaderImpl.freeze()` ->
+  // `finishModLoading()` for the mods. Both funnel into
+  // `Knot.addToClassPath(Path, String...)`, which is
+  // `KnotClassLoaderInterface.setAllowedPrefixes(path, ...)` followed by
+  // `KnotClassLoaderInterface.addCodeSource(path)`. This probe is not Knot,
+  // so it builds that same `KnotClassLoaderInterface` through
+  // `KnotClassLoaderInterface.create(useParentClassLoader, isDevelopment,
+  // envType, provider)` and routes the launcher's `addToClassPath` /
+  // `setAllowedPrefixes` into it. `ok` is only reported after a real class is
+  // read back out of a registered jar through the Knot loader, so it means
+  // the classpath resolves classes rather than that a method returned.
+  private static boolean classPathUnlock;
+  private static Object classPath;
+  private static Class<?> classPathType;
+  private static final List<String> classPathJars = new ArrayList<>();
+  private static String classPathFailure;
+
   public static boolean testLaunchCalled() { return testLaunchCalled; }
+
+  /** Reset the unlock state; called once at the start of a production run. */
+  private static void resetClassPathState(boolean unlock) {
+    classPathUnlock = unlock;
+    classPath = null;
+    classPathType = null;
+    classPathJars.clear();
+    classPathFailure = null;
+  }
+
+  /** Build the Knot class loader/registry `unlockClassPath` writes into. */
+  private static synchronized void initClassPath(Object provider, Class<?> providerClass,
+      boolean client, boolean development) {
+    try {
+      Class<?> type = Class.forName("net.fabricmc.loader.impl.launch.knot.KnotClassLoaderInterface");
+      Class<?> envType = Class.forName("net.fabricmc.api.EnvType");
+      Object side = Enum.valueOf((Class) envType, client ? "CLIENT" : "SERVER");
+      // Knot's own choice: `provider.requiresUrlClassLoader()` or the
+      // compatibility-class-loader property.
+      boolean compatibility = System.getProperty("fabric.loader.useCompatibilityClassLoader") != null
+          || Boolean.TRUE.equals(providerClass.getMethod("requiresUrlClassLoader").invoke(provider));
+      Method create = type.getDeclaredMethod("create", boolean.class, boolean.class, envType,
+          Class.forName("net.fabricmc.loader.impl.game.GameProvider"));
+      create.setAccessible(true);
+      classPath = create.invoke(null, compatibility, development, side, provider);
+      classPathType = type;
+    } catch (Throwable failure) {
+      classPathFailure = "Knot class loader unavailable: " + summarize(failure);
+    }
+  }
+
+  /**
+   * What `FabricLauncher.addToClassPath`/`setAllowedPrefixes` do with the flag
+   * on. `allowedPrefixes` is the first half of `Knot.addToClassPath`; the code
+   * source is the half that makes the jar loadable.
+   */
+  private static synchronized void addClassPathEntry(Object path, String[] prefixes, boolean codeSource) {
+    if (!classPathUnlock || path == null) return;
+    if (classPath == null) {
+      if (classPathFailure == null) classPathFailure = "Knot class loader was not created";
+      return;
+    }
+    try {
+      Path entry = Paths.get(String.valueOf(path));
+      Method setPrefixes = classPathType.getDeclaredMethod("setAllowedPrefixes", Path.class, String[].class);
+      setPrefixes.setAccessible(true);
+      setPrefixes.invoke(classPath, entry, prefixes == null ? new String[0] : prefixes);
+      if (!codeSource) return;
+      Method add = classPathType.getDeclaredMethod("addCodeSource", Path.class);
+      add.setAccessible(true);
+      add.invoke(classPath, entry);
+      String name = entry.toAbsolutePath().normalize().toString();
+      if (!classPathJars.contains(name)) classPathJars.add(name);
+    } catch (Throwable failure) {
+      if (classPathFailure == null) classPathFailure = summarize(failure);
+    }
+  }
+
+  /** `ok <n> jars`, or `failed <reason>`; never more than 400 characters. */
+  private static synchronized String classPathOutcome() {
+    if (classPathFailure != null) return bound("failed " + classPathFailure);
+    if (classPath == null) return "failed Knot class loader was not created";
+    String probe = verifyClassPath();
+    if (probe != null) return bound("failed " + probe);
+    return "ok " + classPathJars.size() + " jars";
+  }
+
+  private static String bound(String text) {
+    if (text.length() <= 400) return text;
+    return text.substring(0, 400);
+  }
+
+  /**
+   * Read one class back through the Knot loader: proof the registered code
+   * source is loadable, not merely recorded. Reads bytes only; no class is
+   * initialized and the game never starts.
+   */
+  private static String verifyClassPath() {
+    int checked = 0;
+    for (String name : classPathJars) {
+      Path path = Paths.get(name);
+      String className = firstClassName(path);
+      if (className == null) continue;
+      checked++;
+      try {
+        Method raw = classPathType.getDeclaredMethod("getRawClassBytes", String.class);
+        raw.setAccessible(true);
+        byte[] bytes = (byte[]) raw.invoke(classPath, className);
+        if (bytes != null && bytes.length > 0) return null;
+      } catch (Throwable failure) {
+        return "classpath probe: " + summarize(failure);
+      }
+    }
+    return checked == 0 ? null : "registered jars did not resolve their own classes";
+  }
+
+  /** The first ordinary class entry in a jar, as an internal name. */
+  private static String firstClassName(Path path) {
+    if (!Files.isRegularFile(path)) return null;
+    try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(path.toFile())) {
+      Enumeration<? extends java.util.zip.ZipEntry> entries = zip.entries();
+      while (entries.hasMoreElements()) {
+        String entry = entries.nextElement().getName();
+        if (entry.startsWith("META-INF/") || !entry.endsWith(".class")) continue;
+        if (entry.equals("module-info.class") || entry.endsWith("/module-info.class")) continue;
+        if (entry.endsWith("/package-info.class") || entry.equals("package-info.class")) continue;
+        return entry.substring(0, entry.length() - 6);
+      }
+    } catch (Throwable ignored) {
+      // A jar the probe cannot open simply does not verify; the next one can.
+    }
+    return null;
+  }
 
   public static void seed(String id, String version) throws Exception {
     Class<?> impl = Class.forName("net.fabricmc.loader.impl.FabricLoaderImpl");
@@ -135,11 +270,17 @@ public final class HorizonLoaderBridge {
    * the caller always reports a bounded outcome instead of a stack trace.
    */
   public static String bootstrapProduction(String[] gameJars, String gameVersion, String side) throws Exception {
-    return bootstrapProduction(gameJars, gameVersion, side, false, false, false);
+    return bootstrapProduction(gameJars, gameVersion, side, false, false, false, false);
   }
 
   public static String bootstrapProduction(String[] gameJars, String gameVersion, String side,
       boolean development, boolean realLaunch, boolean discovery) throws Exception {
+    return bootstrapProduction(gameJars, gameVersion, side, development, realLaunch, discovery, false);
+  }
+
+  public static String bootstrapProduction(String[] gameJars, String gameVersion, String side,
+      boolean development, boolean realLaunch, boolean discovery, boolean classpathUnlock) throws Exception {
+    resetClassPathState(classpathUnlock);
     if (gameJars == null || gameJars.length == 0) return "test\t0\tno game jar supplied";
     boolean client = "client".equals(side);
     try {
@@ -165,18 +306,31 @@ public final class HorizonLoaderBridge {
       if (!(Boolean) located) {
         throw new IllegalStateException("MinecraftGameProvider.locateGame returned false");
       }
+      // The provider is resolved: build the Knot class loader that
+      // `unlockClassPath` and `freeze()` will extend, matching Knot's order.
+      if (classpathUnlock) initClassPath(provider, providerClass, client, development);
       Class<?> providerIface = Class.forName("net.fabricmc.loader.impl.game.GameProvider");
       Class<?> impl = Class.forName("net.fabricmc.loader.impl.FabricLoaderImpl");
       Object loader = impl.getField("INSTANCE").get(null);
       impl.getMethod("setGameProvider", providerIface).invoke(loader, provider);
       providerClass.getMethod("initialize", launcherIface).invoke(provider, launcher);
       impl.getMethod("load").invoke(loader);
+      // Knot unlocks the game classpath after loading and before freezing; the
+      // freeze that follows is what adds every discovered mod's code sources.
+      if (classpathUnlock) {
+        try {
+          providerIface.getMethod("unlockClassPath", launcherIface).invoke(provider, launcher);
+        } catch (Throwable failure) {
+          if (classPathFailure == null) classPathFailure = "unlockClassPath: " + summarize(failure);
+        }
+      }
       String freezeReason = "";
       try {
         impl.getMethod("freeze").invoke(loader);
       } catch (Throwable failure) {
         freezeReason = summarize(failure);
       }
+      String unlock = classpathUnlock ? classPathOutcome() : "";
       Collection<?> allMods = (Collection<?>) impl.getMethod("getAllMods").invoke(loader);
       List<String> ids = new ArrayList<>();
       if (discovery) {
@@ -196,9 +350,10 @@ public final class HorizonLoaderBridge {
       }
       if (realLaunch) {
         // The launcher below names StubEntrypoint as the entrypoint, which is
-        // the hand-off a real Knot launch would take. This probe does not run
-        // Knot's classpath unlock, so invoke the stub directly: the game's own
-        // entrypoint is never touched and the real game never starts.
+        // the hand-off a real Knot launch would take. This probe never runs the
+        // game's own entrypoint — a requested classpath unlock only extends the
+        // loader's registry — so invoke the stub directly: the real game never
+        // starts.
         String[] launchArgs = new String[0];
         try {
           Object args = providerClass.getMethod("getLaunchArguments", boolean.class).invoke(provider, false);
@@ -206,7 +361,8 @@ public final class HorizonLoaderBridge {
         } catch (Throwable ignored) { }
         StubEntrypoint.main(launchArgs);
       }
-      return "minecraft\t" + allMods.size() + "\t" + freezeReason + "\t" + development + "\t" + String.join(",", ids);
+      return "minecraft\t" + allMods.size() + "\t" + freezeReason + "\t" + development + "\t"
+          + String.join(",", ids) + "\t" + unlock;
     } catch (Throwable failure) {
       String reason = summarize(failure);
       try {
@@ -237,7 +393,23 @@ public final class HorizonLoaderBridge {
           List<Path> paths = Arrays.stream(System.getProperty("java.class.path").split(File.pathSeparator))
               .map(Paths::get).collect(Collectors.toList());
           for (String jar : gameJars) paths.add(Paths.get(jar));
+          if (classPathUnlock) {
+            for (String jar : classPathJars) {
+              Path path = Paths.get(jar);
+              if (!paths.contains(path)) paths.add(path);
+            }
+          }
           return paths;
+        }
+        case "addToClassPath": {
+          String[] prefixes = a.length > 1 && a[1] instanceof String[] ? (String[]) a[1] : new String[0];
+          addClassPathEntry(a[0], prefixes, true);
+          return null;
+        }
+        case "setAllowedPrefixes": {
+          String[] prefixes = a.length > 1 && a[1] instanceof String[] ? (String[]) a[1] : new String[0];
+          addClassPathEntry(a[0], prefixes, false);
+          return null;
         }
         case "getTargetClassLoader": return target;
         case "getResourceAsStream": return target.getResourceAsStream((String) a[0]);
