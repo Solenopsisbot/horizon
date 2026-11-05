@@ -835,6 +835,155 @@ pub fn apply_declared_java_content(
     Ok(count)
 }
 
+/// Most conflict lines [`union_declared_java_content`] names. A hostile or
+/// broken batch can disagree on thousands of rows; the log gets the first few
+/// and a count.
+pub const MAX_UNION_CONFLICTS: usize = 4;
+
+/// What [`union_declared_java_content`] did: how many declarations the store
+/// gained, how many same-key rows disagreed with it, and the first
+/// [`MAX_UNION_CONFLICTS`] of those named as `registry id` lines.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeclaredUnion {
+    pub added: usize,
+    pub conflict_count: usize,
+    pub conflicts: Vec<String>,
+}
+
+/// Fold a second content batch (the server role's) into the declaration
+/// stores the first (the window's) already filled, so a guest's login
+/// manifest carries both.
+///
+/// Unlike [`apply_declared_java_content`], which treats any difference as a
+/// conflict, this is a union: ids are unioned and rows with a new key are
+/// added. A row whose key the store already holds with different content keeps
+/// the store's row and is reported as a conflict, so neither side is rewritten.
+/// An id table that would pass [`MAX_DECLARED_IDS`] keeps its previous
+/// contents and reports the overflow. An empty batch changes nothing and does
+/// not bump the epoch.
+pub fn union_declared_java_content(mods: &[ContentMod]) -> DeclaredUnion {
+    let ids = declared_ids(mods);
+    let extra = declared_extra_ids(mods);
+    let block_entities = declared_block_entity_map(mods);
+    let menus = declared_menu_rows(mods);
+    let entities = declared_entity_rows(mods);
+    let mut report = DeclaredUnion::default();
+    let conflict = |report: &mut DeclaredUnion, line: String| {
+        report.conflict_count += 1;
+        if report.conflicts.len() < MAX_UNION_CONFLICTS {
+            report.conflicts.push(line);
+        }
+    };
+    let _guard = DECLARED_JAVA_CONTENT_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let current = DeclaredJavaContent {
+        ids: stored_declared_ids(),
+        extra: stored_declared_extra_ids(),
+        block_entities: stored_declared_block_entities(),
+        menus: stored_declared_menus(),
+        entities: stored_declared_entities(),
+    };
+    let before = current.count();
+    let mut next = current.clone();
+    let mut union_ids = |registry: &str, mine: &mut Vec<String>, theirs: Vec<String>| {
+        let mut merged = mine.clone();
+        merged.extend(theirs);
+        match bounded_ids(merged) {
+            Ok(merged) => *mine = merged,
+            Err(_) => conflict(
+                &mut report,
+                format!("{registry} ids exceed {MAX_DECLARED_IDS}"),
+            ),
+        }
+    };
+    union_ids("minecraft:block", &mut next.ids.blocks, ids.blocks);
+    union_ids("minecraft:item", &mut next.ids.items, ids.items);
+    union_ids("minecraft:mob_effect", &mut next.ids.effects, ids.effects);
+    union_ids(
+        "minecraft:entity_type",
+        &mut next.ids.entity_types,
+        ids.entity_types,
+    );
+    union_ids("minecraft:menu", &mut next.ids.menus, ids.menus);
+    union_ids(
+        "minecraft:block_entity_type",
+        &mut next.ids.block_entity_types,
+        ids.block_entity_types,
+    );
+    union_ids(
+        "horizon:data_component",
+        &mut next.extra.data_components,
+        extra.data_components,
+    );
+    union_ids(
+        "horizon:attachment",
+        &mut next.extra.attachments,
+        extra.attachments,
+    );
+    for (block, row) in block_entities {
+        match next.block_entities.get(&block) {
+            Some(held)
+                if held.id == row.id
+                    && held.template == row.template
+                    && held.ticker == row.ticker => {}
+            Some(_) => conflict(
+                &mut report,
+                format!("minecraft:block_entity_type block {block}"),
+            ),
+            None if next.block_entities.len() >= MAX_DECLARED_BLOCK_ENTITIES => conflict(
+                &mut report,
+                format!("minecraft:block_entity_type rows exceed {MAX_DECLARED_BLOCK_ENTITIES}"),
+            ),
+            None => {
+                next.block_entities.insert(block, row);
+            }
+        }
+    }
+    // Rows were keyed by block; rebuild each declaration's block list so a
+    // block the union added to a known declaration is listed on it.
+    next.block_entities = normalize_block_entity_map(next.block_entities);
+    for (id, row) in menus {
+        match next.menus.get(&id) {
+            Some(held) if held == &row => {}
+            Some(_) => conflict(&mut report, format!("minecraft:menu {id}")),
+            None if next.menus.len() >= MAX_DECLARED_MENUS => conflict(
+                &mut report,
+                format!("minecraft:menu rows exceed {MAX_DECLARED_MENUS}"),
+            ),
+            None => {
+                next.menus.insert(id, row);
+            }
+        }
+    }
+    for (id, row) in entities {
+        match next.entities.get(&id) {
+            Some(held) if held == &row => {}
+            Some(_) => conflict(&mut report, format!("minecraft:entity_type {id}")),
+            None if next.entities.len() >= MAX_DECLARED_ENTITIES => conflict(
+                &mut report,
+                format!("minecraft:entity_type rows exceed {MAX_DECLARED_ENTITIES}"),
+            ),
+            None => {
+                next.entities.insert(id, row);
+            }
+        }
+    }
+    if next == current {
+        return report;
+    }
+    report.added = next.count().saturating_sub(before);
+    *DECLARED_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(next.ids);
+    *DECLARED_EXTRA_IDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(next.extra);
+    *DECLARED_BLOCK_ENTITIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(next.block_entities);
+    *DECLARED_MENUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(next.menus);
+    *DECLARED_ENTITIES.lock().unwrap_or_else(|e| e.into_inner()) = Some(next.entities);
+    DECLARED_JAVA_CONTENT_EPOCH.fetch_add(1, Ordering::Release);
+    report
+}
+
 /// Reset every declaration store; tests that write the process-wide stores
 /// start from here.
 #[cfg(test)]
