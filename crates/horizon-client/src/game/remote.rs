@@ -2455,8 +2455,11 @@ impl Game<'_> {
             C::CustomPayload(p) if p.channel == java_content::CHANNEL => {
                 if self.remote.is_some() {
                     match receive_java_content(&p.data) {
-                        Ok(count) => {
+                        Ok(java_content::Outcome::Applied(count)) => {
                             log::info!("Horizon: server declared {count} Java content id(s)")
+                        }
+                        Ok(java_content::Outcome::Refused(reason)) => {
+                            java_content::warn_refused_once(&reason)
                         }
                         Err(error) => java_content::warn_once(&error),
                     }
@@ -8758,11 +8761,13 @@ fn snapshot_value(s: &play::AttributeSnapshot) -> f64 {
     value
 }
 
-/// The client's handler for the host's login manifest: decode it (v1 ids and
-/// block entities, or v2 with the bounded menu and entity templates), then
-/// store it for the menu, item, entity and block-entity paths. A malformed or
-/// conflicting manifest changes nothing.
-fn receive_java_content(data: &[u8]) -> std::result::Result<usize, String> {
+/// The client's handler for the host's login manifest: decode one frame (v1
+/// ids and block entities, v2 with the bounded menu and entity templates, or
+/// v3 carrying the host's declared-content epoch and content hash), then store
+/// it for the menu, item, entity and block-entity paths. A malformed manifest
+/// changes nothing; a v3 manifest that conflicts with the declarations this
+/// client already holds is refused and the local content kept.
+fn receive_java_content(data: &[u8]) -> std::result::Result<java_content::Outcome, String> {
     java_content::apply(data)
 }
 
