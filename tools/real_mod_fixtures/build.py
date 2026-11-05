@@ -43,17 +43,29 @@ def _compile(source: dict[str, str], work: Path) -> Path:
 
 def _jar(path: Path, classes: Path, resources: dict[str, bytes | str]) -> None:
     """Create a stable zip/jar with sorted entries and a fixed DOS timestamp."""
+    jar = shutil.which("jar")
+    if not jar:
+        raise RuntimeError("jar is required to build the real-mod fixtures")
+    subprocess.run(
+        [jar, "--create", "--file", str(path), "--date=1980-01-01T00:00:02+00:00", "-C", str(classes), "."],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     entries: dict[str, bytes] = {}
     for file in sorted(classes.rglob("*.class")):
         entries[file.relative_to(classes).as_posix()] = file.read_bytes()
     for name, value in resources.items():
         entries[name] = value.encode() if isinstance(value, str) else value
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    normalized = path.with_suffix(path.suffix + ".normalized")
+    with zipfile.ZipFile(normalized, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name in sorted(entries):
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
             archive.writestr(info, entries[name])
+    normalized.replace(path)
 
 
 FABRIC_SOURCES = {
