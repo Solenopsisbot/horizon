@@ -18,6 +18,7 @@ use crate::{
     collisions::SceneCollisions,
     effects::{EffectInstance, PlayerEffects},
     items::ItemStack,
+    mod_content,
     world::World,
 };
 use horizon_core::{
@@ -185,12 +186,41 @@ pub enum HostEvent {
     Error(String),
 }
 
+/// What a guest's recorded manifest means for the current store snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContentSend {
+    /// The guest already holds this content.
+    Skip,
+    /// The store's epoch moved but the content is identical: record the new
+    /// epoch without sending.
+    Absorb,
+    /// The content differs from what the guest holds: send the manifest.
+    Send,
+}
+
+/// The send decision for one guest: `sent` is the `(epoch, hash)` it last
+/// received, `epoch`/`hash` the current store snapshot.
+fn content_action(sent: Option<(u64, u64)>, epoch: u64, hash: u64) -> ContentSend {
+    match sent {
+        Some((sent_epoch, _)) if sent_epoch == epoch => ContentSend::Skip,
+        Some((_, sent_hash)) if sent_hash == hash => ContentSend::Absorb,
+        _ => ContentSend::Send,
+    }
+}
+
 pub struct Hub {
     /// Clicks on and closings of native mods' menus, for the game.
     pub native_menu_events: Vec<super::menu::NativeMenuEvent>,
     /// Registered mod payload channels, and frames received from guests.
     pub payloads: PayloadLink,
     pub payload_inbox: Vec<(u32, PayloadFrame)>,
+    /// The store epoch and content hash of the last declared-content snapshot
+    /// the hub looked at; a change means the manifest moved on.
+    content_snapshot: (u64, u64),
+    /// The manifest each guest last received, by connection: the store epoch
+    /// and content hash. A guest gets one send per epoch, and an epoch bump
+    /// that leaves the content identical is absorbed instead of re-sent.
+    content_sent: Vec<(u32, u64, u64)>,
     pub lan: Lan,
     pub config: HubConfig,
     pub encoder: ChunkEncoder,
@@ -415,6 +445,10 @@ impl Hub {
         let clock_ids = (0..sync.dynamic.len("minecraft:world_clock") as i32).collect();
         let mut encoder = encoder;
         encoder.set_dimension(config.levels.get(&config.dimension));
+        let content_snapshot = {
+            let stored = java_content::JavaContentManifest::from_stored();
+            (stored.epoch, stored.content_hash().unwrap_or(0))
+        };
         Self {
             lan,
             config,
@@ -451,6 +485,8 @@ impl Hub {
             native_menu_events: Vec::new(),
             payloads: PayloadLink::from_declared(),
             payload_inbox: Vec::new(),
+            content_snapshot,
+            content_sent: Vec::new(),
             teams: Vec::new(),
         }
     }
@@ -900,6 +936,69 @@ impl Hub {
         }
     }
 
+    /// The manifest epoch and content hash this guest last received, if any.
+    fn guest_content(&self, conn: u32) -> Option<(u64, u64)> {
+        self.content_sent
+            .iter()
+            .find(|(c, _, _)| *c == conn)
+            .map(|&(_, epoch, hash)| (epoch, hash))
+    }
+
+    /// Record the manifest a guest now holds.
+    fn remember_content(&mut self, conn: u32, epoch: u64, hash: u64) {
+        match self.content_sent.iter_mut().find(|(c, _, _)| *c == conn) {
+            Some(entry) => {
+                entry.1 = epoch;
+                entry.2 = hash;
+            }
+            None => self.content_sent.push((conn, epoch, hash)),
+        }
+    }
+
+    /// One send per declared-content epoch per guest. `place_new_player` covers
+    /// a guest at login; a store that moves on afterwards would leave the
+    /// players already in the world with stale ids, so this re-sends the v3
+    /// manifest. A guest applying the manifest bumps the same process-wide
+    /// epoch, so an epoch change with an identical content hash is absorbed:
+    /// only a real content change sends, once per guest.
+    fn resend_java_content(&mut self) {
+        let epoch = mod_content::declared_java_content_epoch();
+        if epoch == self.content_snapshot.0 {
+            return;
+        }
+        let manifest = java_content::JavaContentManifest::from_stored();
+        let hash = match manifest.content_hash() {
+            Ok(hash) => hash,
+            Err(error) => {
+                log::warn!("Horizon: declared Java content was not re-sent: {error}");
+                return;
+            }
+        };
+        // Record the snapshot before the sends: the epoch is the trigger, and
+        // every guest is compared against the snapshot, not the trigger.
+        self.content_snapshot = (manifest.epoch, hash);
+        let frame = Self::java_content_packet(&manifest);
+        for i in 0..self.guests.len() {
+            let (conn, placed) = {
+                let g = &self.guests[i];
+                (g.conn, g.placed && g.left_reason.is_empty())
+            };
+            if !placed {
+                continue;
+            }
+            match content_action(self.guest_content(conn), manifest.epoch, hash) {
+                ContentSend::Skip => {}
+                ContentSend::Absorb => self.remember_content(conn, manifest.epoch, hash),
+                ContentSend::Send => {
+                    if let Some(packet) = &frame {
+                        self.guests[i].send(packet);
+                    }
+                    self.remember_content(conn, manifest.epoch, hash);
+                }
+            }
+        }
+    }
+
     /// PlayerList.placeNewPlayer for a guest whose saved state is loaded.
     pub fn place_new_player(&mut self, conn: u32, ctx: &mut TickCtx) {
         let Some(i) = self.guests.iter().position(|g| g.conn == conn) else {
@@ -965,6 +1064,12 @@ impl Hub {
                 overlay: false,
             }),
         );
+        // The joining guest holds this manifest; a later epoch change is what
+        // the post-login re-send watches for. The snapshot itself is left to
+        // `resend_java_content`, so content that changed before this join
+        // still reaches the guests already in the world.
+        let content_hash = declared_content.content_hash().unwrap_or(0);
+        self.remember_content(conn, declared_content.epoch, content_hash);
         self.guests[i].placed = true;
         self.resend_teleport(i, None);
         let g = &self.guests[i];
@@ -1458,6 +1563,9 @@ impl Hub {
         for frame in payloads::take_java_to_clients(PAYLOAD_TICK_CAP) {
             self.broadcast_payload(&frame);
         }
+        // A content root that replaced its declarations after the login burst
+        // re-sends the manifest, once per guest per epoch.
+        self.resend_java_content();
         events
     }
 
@@ -1547,6 +1655,7 @@ impl Hub {
 
     fn remove_guest(&mut self, i: usize, reason: &str) -> Guest {
         let mut g = self.guests.remove(i);
+        self.content_sent.retain(|(conn, _, _)| *conn != g.conn);
         if let Some(m) = g
             .menu
             .as_ref()
@@ -3539,6 +3648,30 @@ mod tests {
         let ids: Vec<&str> = kept.iter().map(|frame| frame.id()).collect();
         assert_eq!(ids, ["demo:down", "demo:both"]);
         assert!(Hub::client_bound(Vec::new()).is_empty());
+    }
+
+    /// A declared-content epoch bump reaches each guest once: the first send, a
+    /// real content change, and nothing for a bump that left the content
+    /// identical (a guest applying the manifest bumps the same epoch).
+    #[test]
+    fn a_content_epoch_bump_sends_once_per_guest() {
+        assert_eq!(content_action(None, 4, 0x11), ContentSend::Send);
+        assert_eq!(content_action(Some((4, 0x11)), 4, 0x11), ContentSend::Skip);
+        assert_eq!(
+            content_action(Some((4, 0x11)), 5, 0x11),
+            ContentSend::Absorb
+        );
+        assert_eq!(content_action(Some((4, 0x11)), 5, 0x22), ContentSend::Send);
+        assert_eq!(content_action(Some((5, 0x22)), 5, 0x22), ContentSend::Skip);
+        assert_eq!(
+            content_action(Some((5, 0x22)), 6, 0x22),
+            ContentSend::Absorb
+        );
+        // Absorbed, the guest is up to date and the next bump is absorbed too.
+        assert_eq!(
+            content_action(Some((6, 0x22)), 7, 0x22),
+            ContentSend::Absorb
+        );
     }
 
     /// The declared Java content frame goes out only when there is something
