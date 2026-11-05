@@ -468,7 +468,11 @@ pub fn clear_handler_jars_as(role: HandlerRole) {
 /// channel. Returns whether a handler ran; sends it queues are published for
 /// the next server tick.
 pub fn dispatch_received(frame: &PayloadFrame) -> Result<bool, String> {
-    dispatch_received_as_role(frame, PayloadDirection::PlayToServer, HandlerRole::IntegratedServer)
+    dispatch_received_as_role(
+        frame,
+        PayloadDirection::PlayToServer,
+        HandlerRole::IntegratedServer,
+    )
 }
 
 /// [`dispatch_received`] for the side that received the frame: only
@@ -484,9 +488,7 @@ pub fn dispatch_received_as(
         PayloadDirection::PlayToServer => HandlerRole::IntegratedServer,
         PayloadDirection::PlayBidirectional
         | PayloadDirection::ConfigurationToClient
-        | PayloadDirection::ConfigurationToServer => {
-            HandlerRole::Client
-        }
+        | PayloadDirection::ConfigurationToServer => HandlerRole::Client,
     };
     dispatch_received_as_role(frame, receiving, role)
 }
@@ -1430,12 +1432,14 @@ mod tests {
 
         // A handler registered for the client role never answers a server
         // role dispatch, even when the channel and direction are identical.
-        assert!(!dispatch_received_as_role(
-            &frame,
-            PayloadDirection::PlayToClient,
-            HandlerRole::IntegratedServer,
-        )
-        .unwrap());
+        assert!(
+            !dispatch_received_as_role(
+                &frame,
+                PayloadDirection::PlayToClient,
+                HandlerRole::IntegratedServer,
+            )
+            .unwrap()
+        );
 
         clear_handler_jars();
         let _ = take_java_outgoing();
