@@ -382,7 +382,9 @@ pub enum MixinSkipReason {
     UnsupportedFamily,
     /// A `RETURN`, `TAIL` or `INVOKE` anchor.
     NonHeadAnchor,
-    /// `cancellable`: the interpreter cannot honour the woven `CallbackInfo` yet.
+    /// `cancellable`: a `HEAD` on a non-void target, which would need a
+    /// `CallbackInfoReturnable` carrying the descriptor's default value. A
+    /// cancellable `HEAD` on a `void` target is woven.
     Cancellable,
     /// A `@Slice` or `shift`/`by`, which a `HEAD` insert would silently ignore.
     SelectorModifier,
@@ -9749,9 +9751,11 @@ impl NativeJar {
 
     /// Decide what can be woven into this jar at load, and weave it.
     ///
-    /// The bounded subset is a non-cancellable `@Inject` at `HEAD` whose target
-    /// method is in this jar and whose `@Mixin` class a readable config applies
-    /// on `side`. A static callback is called directly; an instance callback is
+    /// The bounded subset is an `@Inject` at `HEAD` whose target method is in
+    /// this jar and whose `@Mixin` class a readable config applies on `side`.
+    /// A `cancellable` plan is woven too when the target is `void`; a `void`
+    /// callback may cancel it, and the woven method returns without running the
+    /// body. A static callback is called directly; an instance callback is
     /// reached through the synthetic bridge class the weaver adds. Every other
     /// plan family and shape is a [`SkippedMixinPlan`] with its reason, never an
     /// approximation, and so is a config-listed class discovery found no plan
@@ -9914,9 +9918,6 @@ impl NativeJar {
         if plan.at != "HEAD" {
             return Err(MixinSkipReason::NonHeadAnchor);
         }
-        if plan.cancellable {
-            return Err(MixinSkipReason::Cancellable);
-        }
         if plan.slice.is_some() || plan.shift.is_some() {
             return Err(MixinSkipReason::SelectorModifier);
         }
@@ -9936,6 +9937,12 @@ impl NativeJar {
         }
         if target.name == "<init>" {
             return Err(MixinSkipReason::ConstructorTarget);
+        }
+        // A `void` target takes the woven `CallbackInfo` + `if (isCancelled())
+        // return` shape; a non-void one would also need the descriptor's default
+        // value in the target's shape, which the bounded weaver does not emit.
+        if plan.cancellable && crate::return_desc(&target.descriptor) != "V" {
+            return Err(MixinSkipReason::Cancellable);
         }
         let callback = self
             .classes
@@ -12423,27 +12430,30 @@ impl<H: Host> Runtime<'_, H> {
         if !is_callback_info_class(&r.owner) {
             return Ok(None);
         }
+        let owned = callback_info_receiver(receiver)?;
+        if !is_interpreter_callback_info(owned) {
+            // A woven class constructs the synthetic `CallbackInfo` itself, so
+            // its own `cancelled` field is authoritative and the call runs
+            // against the class.  Nothing here is table state, which is also
+            // why a hot woven target does not spend the injection-point bound.
+            return Ok(None);
+        }
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("cancel", "()V") => {
-                self.callback_infos
-                    .cancel(callback_info_receiver(receiver)?)?;
+                self.callback_infos.cancel(owned)?;
                 Ok(Some(Value::Void))
             }
             ("isCancelled", "()Z") => {
-                let cancelled = self
-                    .callback_infos
-                    .flag(callback_info_receiver(receiver)?)?;
+                let cancelled = self.callback_infos.flag(owned)?;
                 Ok(Some(Value::Int(i32::from(cancelled))))
             }
             ("setReturnValue", "(Ljava/lang/Object;)V") => {
-                let marker = callback_info_receiver(receiver)?;
                 self.callback_infos
-                    .set_return(marker, args.first().cloned().unwrap_or(Value::Ref(None)))?;
+                    .set_return(owned, args.first().cloned().unwrap_or(Value::Ref(None)))?;
                 Ok(Some(Value::Void))
             }
             ("getReturnValue", "()Ljava/lang/Object;") => {
-                let marker = callback_info_receiver(receiver)?;
-                self.callback_infos.current(marker).map(Some)
+                self.callback_infos.current(owned).map(Some)
             }
             _ => Ok(None),
         }
@@ -15718,6 +15728,18 @@ fn is_callback_info_class(owner: &str) -> bool {
 /// to a later one and stops the target body.
 fn callback_info_marker(target: &MethodRef) -> String {
     format!("mixin/callback-info/{}#{}", target.owner, target.name)
+}
+
+/// The marker prefix of the `CallbackInfo` objects the interpreter opens per
+/// injection point.
+///
+/// A marker with this prefix is table state the interpreter owns; any other
+/// `CallbackInfo` receiver was constructed by woven bytecode, whose synthetic
+/// class keeps the `cancelled` field itself.
+const INTERPRETER_CALLBACK_INFO_PREFIX: &str = "mixin/callback-info/";
+
+fn is_interpreter_callback_info(marker: &str) -> bool {
+    marker.starts_with(INTERPRETER_CALLBACK_INFO_PREFIX)
 }
 
 /// The marker a `CallbackInfo` call acts on: the receiver value the plan passed

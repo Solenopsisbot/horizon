@@ -555,24 +555,27 @@ public abstract class CancelMixin {
     );
     let (jar, weave) = woven(fixture.load(), MixinSide::Server);
     assert_eq!(jar.mixin_injection_plans().len(), 2);
-    assert_eq!(weave.woven.len(), 1);
-    assert_eq!(weave.woven[0].callback.name, "woven");
-    assert_eq!(weave.skipped.len(), 1);
-    assert_eq!(weave.skipped[0].reason, MixinSkipReason::Cancellable);
-    assert_eq!(weave.skipped[0].callback.name, "cancels");
     assert_eq!(
-        weave.skipped[0].to_string(),
-        "cancellable HEAD demo/Other#run()V <- demo/CancelMixin#cancels\
-         (Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;)V"
+        weave
+            .woven
+            .iter()
+            .map(|plan| plan.callback.name.as_str())
+            .collect::<Vec<_>>(),
+        ["cancels", "woven"]
     );
-    // The skipped target runs untouched, its cancel never applied, rather than
-    // half woven.
-    assert_eq!(
-        run_main(&jar),
-        marks(&[("woven", 0), ("target", 0), ("other", 0)])
-    );
-    assert_eq!(weave.classes.classes.len(), 1);
+    assert_eq!(weave.skipped, [], "both shapes are inside the subset");
+    // The cancellable target's body never runs: its callback cancelled at HEAD,
+    // and the woven `if (isCancelled()) return` took the early answer.
+    assert_eq!(run_main(&jar), marks(&[("woven", 0), ("target", 0)]));
+    assert_eq!(weave.classes.classes.len(), 2);
     assert!(weave.classes.classes.contains_key("demo/Target"));
+    assert!(weave.classes.classes.contains_key("demo/Other"));
+    assert!(
+        weave
+            .classes
+            .added
+            .contains_key("org/spongepowered/asm/mixin/injection/callback/CallbackInfo")
+    );
 }
 
 const REASONS_MAIN: &str = r#"package demo;
@@ -842,4 +845,217 @@ fn a_real_mixin_jar_never_reads_as_fully_applied() {
         skip_labels(&weave),
     );
     assert!(!weave.skipped.is_empty());
+}
+
+/// A `void` cancellable `HEAD` plan is woven, and its `CallbackInfo` is the
+/// synthetic class the weaver adds: not cancelling keeps the body.
+#[test]
+fn a_woven_cancellable_head_that_does_not_cancel_runs_the_body() {
+    let fixture = Fixture::build(
+        "cancellable-keeps",
+        "RUNTIME",
+        &[
+            ("demo/Main.java", MAIN_RUNS_TARGET),
+            ("demo/Counter.java", COUNTER),
+            (
+                "demo/Target.java",
+                r#"package demo;
+public final class Target {
+    public static void run() { Counter.value++; Probe.mark("target", Counter.value); }
+}
+"#,
+            ),
+            (
+                "demo/KeepMixin.java",
+                r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+@Mixin(Target.class)
+public abstract class KeepMixin {
+    @Inject(method = "run()V", at = @At("HEAD"), cancellable = true)
+    private static void keeps(CallbackInfo info) {
+        Counter.value += 10;
+        Probe.mark("callback", Counter.value);
+    }
+}
+"#,
+            ),
+        ],
+        &[(
+            "demo.mixins.json",
+            r#"{"package":"demo","mixins":["KeepMixin"]}"#,
+        )],
+    );
+    let (jar, weave) = woven(fixture.load(), MixinSide::Server);
+    assert_eq!(weave.woven.len(), 1, "{:#?}", weave.woven);
+    assert!(weave.skipped.is_empty(), "{:#?}", weave.skipped);
+    assert_eq!(
+        run_main(&jar),
+        marks(&[("callback", 10), ("target", 11), ("after", 11)])
+    );
+}
+
+/// The cancelling case: the target body never runs, so neither its mark nor its
+/// write is visible after the call.
+#[test]
+fn a_woven_cancellable_head_that_cancels_skips_the_body() {
+    let fixture = Fixture::build(
+        "cancellable-cancels",
+        "RUNTIME",
+        &[
+            ("demo/Main.java", MAIN_RUNS_TARGET),
+            ("demo/Counter.java", COUNTER),
+            (
+                "demo/Target.java",
+                r#"package demo;
+public final class Target {
+    public static void run() { Counter.value += 5; Probe.mark("target", Counter.value); }
+}
+"#,
+            ),
+            (
+                "demo/CancelMixin.java",
+                r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+@Mixin(Target.class)
+public abstract class CancelMixin {
+    @Inject(method = "run()V", at = @At("HEAD"), cancellable = true)
+    private static void cancels(CallbackInfo info) {
+        info.cancel();
+        Probe.mark("callback", 0);
+    }
+}
+"#,
+            ),
+        ],
+        &[(
+            "demo.mixins.json",
+            r#"{"package":"demo","mixins":["CancelMixin"]}"#,
+        )],
+    );
+    let (jar, weave) = woven(fixture.load(), MixinSide::Server);
+    assert_eq!(weave.woven.len(), 1, "{:#?}", weave.woven);
+    assert!(weave.skipped.is_empty(), "{:#?}", weave.skipped);
+    assert_eq!(run_main(&jar), marks(&[("callback", 0), ("after", 0)]));
+}
+
+/// A woven target called in a loop constructs a `CallbackInfo` per call; the
+/// woven shape keeps that object on the stack, not in the interpreter's
+/// injection-point table, so the loop does not spend a bound.
+#[test]
+fn a_woven_cancellable_head_survives_a_hot_loop() {
+    let fixture = Fixture::build(
+        "cancellable-loop",
+        "RUNTIME",
+        &[
+            (
+                "demo/Main.java",
+                r#"package demo;
+public final class Main {
+    public void onInitialize() {
+        for (int i = 0; i < 100; i++) {
+            Target.run();
+        }
+        Probe.mark("after", Counter.value);
+    }
+}
+"#,
+            ),
+            ("demo/Counter.java", COUNTER),
+            (
+                "demo/Target.java",
+                r#"package demo;
+public final class Target {
+    public static void run() { Counter.value -= 1000; Probe.mark("target", Counter.value); }
+}
+"#,
+            ),
+            (
+                "demo/CancelMixin.java",
+                r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+@Mixin(Target.class)
+public abstract class CancelMixin {
+    @Inject(method = "run()V", at = @At("HEAD"), cancellable = true)
+    private static void cancels(CallbackInfo info) {
+        Counter.value++;
+        info.cancel();
+    }
+}
+"#,
+            ),
+        ],
+        &[(
+            "demo.mixins.json",
+            r#"{"package":"demo","mixins":["CancelMixin"]}"#,
+        )],
+    );
+    let (jar, weave) = woven(fixture.load(), MixinSide::Server);
+    assert_eq!(weave.woven.len(), 1, "{:#?}", weave.woven);
+    assert_eq!(run_main(&jar), marks(&[("after", 100)]));
+}
+
+/// A non-void target would need a `CallbackInfoReturnable` carrying the
+/// descriptor's default value; it stays out with its reason and runs untouched.
+#[test]
+fn a_cancellable_head_on_a_non_void_target_stays_out() {
+    let fixture = Fixture::build(
+        "cancellable-value",
+        "RUNTIME",
+        &[
+            (
+                "demo/Main.java",
+                r#"package demo;
+public final class Main {
+    public void onInitialize() {
+        Probe.mark("after", Target.number());
+    }
+}
+"#,
+            ),
+            (
+                "demo/Target.java",
+                r#"package demo;
+public final class Target {
+    public static int number() { Probe.mark("target", 0); return 7; }
+}
+"#,
+            ),
+            (
+                "demo/ValueMixin.java",
+                r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+@Mixin(Target.class)
+public abstract class ValueMixin {
+    @Inject(method = "number()I", at = @At("HEAD"), cancellable = true)
+    private static void cancels(CallbackInfo info) { info.cancel(); }
+}
+"#,
+            ),
+        ],
+        &[(
+            "demo.mixins.json",
+            r#"{"package":"demo","mixins":["ValueMixin"]}"#,
+        )],
+    );
+    let (jar, weave) = woven(fixture.load(), MixinSide::Server);
+    assert!(weave.woven.is_empty(), "{:#?}", weave.woven);
+    assert_eq!(weave.skipped.len(), 1);
+    assert_eq!(weave.skipped[0].reason, MixinSkipReason::Cancellable);
+    assert_eq!(
+        run_main(&jar),
+        marks(&[("target", 0), ("after", 7)]),
+        "the unwoven target keeps its own answer"
+    );
 }
