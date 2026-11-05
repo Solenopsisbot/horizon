@@ -625,9 +625,9 @@ pub struct MixinExecutionReport {
     /// Discovered plans this execution left out because the jar's readable
     /// Mixin configs do not apply their class on the selected side.
     ///
-    /// Only [`NativeJar::execute_discovered_mixins_on`] fills this: a plan
-    /// whose `@Mixin` class no config lists is skipped with
-    /// [`MixinSkipReason::NotInConfig`], one whose config applies it only on
+    /// The two discovered-plan entry points fill this, with or without a
+    /// selected side: a plan whose `@Mixin` class no config lists is skipped
+    /// with [`MixinSkipReason::NotInConfig`], one whose config applies it only on
     /// the other physical side with [`MixinSkipReason::OtherSide`], and one
     /// whose config names a plugin with [`MixinSkipReason::ConfigPlugin`]. The
     /// single-plan entry points, and a jar with no readable config at all,
@@ -15721,9 +15721,19 @@ fn fabric_mixin_config_sides(text: &str) -> BTreeMap<String, MixinSide> {
 
 /// Whether the jar's readable configs apply one `@Mixin` class on `side`.
 ///
-/// `class` is an internal name; a config lists Java binary names. The first
-/// config that applies the class decides, so a config plugin only vetoes what
-/// its own config would have applied.
+/// `class` is an internal name; a config lists Java binary names. Configs are
+/// consulted in declaration order, the same order
+/// [`NativeJar::mixin_plans_in_apply_order`] uses. The first config that lists
+/// the class on this side *and* loads on this side decides: its common/on-side
+/// list admits the class, and if that config declares a plugin the class is
+/// refused because the bounded runtime never runs plugin code. A later config
+/// that also lists the class cannot override that first decision. A config
+/// that loads only on the other physical side is not a match at all, so the
+/// next config's list applies.
+///
+/// That is Mixin's first-matching-config rule for the bounded subset: the
+/// first config to prepare the class also owns its `mixinPriority` and list
+/// position, so it is the one whose plugin would have been consulted.
 fn mixin_config_gate(
     configs: &[MixinConfig],
     config_sides: &BTreeMap<String, MixinSide>,
@@ -18449,6 +18459,54 @@ mod tests {
         )];
         assert_eq!(
             gate(&plugin, "{}", MixinSide::Client),
+            Err(MixinSkipReason::ConfigPlugin)
+        );
+    }
+
+    fn gate_config(path: &str, mixins: &[&str], plugin: Option<&str>) -> MixinConfig {
+        MixinConfig {
+            path: path.into(),
+            package: None,
+            mixins: mixins.iter().map(|name| (*name).to_owned()).collect(),
+            client: Vec::new(),
+            server: Vec::new(),
+            required: true,
+            priority: None,
+            mixin_priority: None,
+            plugin: plugin.map(str::to_owned),
+            refmap: None,
+        }
+    }
+
+    #[test]
+    fn mixin_config_gate_lets_the_first_matching_config_decide() {
+        let gate = |configs: &[MixinConfig], text: &str, side| {
+            mixin_config_gate(configs, &fabric_mixin_config_sides(text), "demo/M", side)
+        };
+        // A plugin in a later config cannot veto a class the first config
+        // applies, and the first matching config owns the class's order.
+        let later_plugin = [
+            gate_config("a.mixins.json", &["demo.M"], None),
+            gate_config("b.mixins.json", &["demo.M"], Some("demo.Plugin")),
+        ];
+        assert_eq!(gate(&later_plugin, "{}", MixinSide::Server), Ok(()));
+        // A plugin in the first config that applies the class vetoes it even
+        // though a later config lists the class without a plugin.
+        let first_plugin = [
+            gate_config("a.mixins.json", &["demo.M"], Some("demo.Plugin")),
+            gate_config("b.mixins.json", &["demo.M"], None),
+        ];
+        assert_eq!(
+            gate(&first_plugin, "{}", MixinSide::Server),
+            Err(MixinSkipReason::ConfigPlugin)
+        );
+        // A first config that loads on the other side only is not a match, so
+        // the later plugin-free config applies the class.
+        let other_side = r#"{"mixins":[{"config":"a.mixins.json","environment":"client"}]}"#;
+        assert_eq!(gate(&first_plugin, other_side, MixinSide::Server), Ok(()));
+        // When every config that lists the class names a plugin, it stays out.
+        assert_eq!(
+            gate(&first_plugin[..1], "{}", MixinSide::Server),
             Err(MixinSkipReason::ConfigPlugin)
         );
     }
