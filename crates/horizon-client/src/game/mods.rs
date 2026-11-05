@@ -2649,7 +2649,7 @@ clientSideOnly = true
             WEAVE_PLAIN_MIXIN,
             (
                 "demo/CancelMixin.java",
-                r#"package demo; import org.spongepowered.asm.mixin.Mixin; import org.spongepowered.asm.mixin.injection.At; import org.spongepowered.asm.mixin.injection.Inject; import org.spongepowered.asm.mixin.injection.callback.CallbackInfo; @Mixin(Target.class) public abstract class CancelMixin { @Inject(method = "other()V", at = @At("HEAD"), cancellable = true) private static void onOther(CallbackInfo info) {} }"#,
+                r#"package demo; import org.spongepowered.asm.mixin.Mixin; import org.spongepowered.asm.mixin.injection.At; import org.spongepowered.asm.mixin.injection.Inject; @Mixin(Target.class) public abstract class CancelMixin { @Inject(method = "missing()V", at = @At("HEAD")) private static void onMissing() {} }"#,
             ),
         ];
         let (root, path) = weave_fixture_jar(
@@ -2666,7 +2666,7 @@ clientSideOnly = true
         assert!(line.contains("1 woven, 1 skipped"), "{line}");
         assert!(line.contains("skipped Mixin work does not run"), "{line}");
         assert!(
-            line.contains("cancellable HEAD demo/Target#other()V"),
+            line.contains("target-missing HEAD demo/Target#missing()V"),
             "{line}"
         );
 
@@ -2682,7 +2682,7 @@ clientSideOnly = true
             weave
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("cancellable HEAD demo/Target#other()V")),
+                .is_some_and(|reason| reason.contains("target-missing HEAD demo/Target#missing()V")),
             "{weave:?}"
         );
         // The run's own line carries those numbers beside the plan count.

@@ -31,6 +31,8 @@ EXEMPT = {
     "pr_ready.py": "runs cargo checks and parity.py",
     "test_friends_integration_parity.py": "builds binaries; test_friends.Game isolates every game through integration_env",
     "port_harness.py": "ports Java code, starts no game",
+    "java_mod_loader_ledger.py": "starts the real loader in fresh homes and passes HORIZON_NO_AUDIO through its own child env",
+    "java_mod_server_ledger.py": "starts the game in fresh per-jar homes and sets HORIZON_NO_AUDIO itself",
 }
 
 

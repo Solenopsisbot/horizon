@@ -1225,38 +1225,6 @@ fn parse_payload_command(
     Ok(Some((id.to_owned(), direction, bytes)))
 }
 
-#[cfg(test)]
-mod payload_control_tests {
-    use super::{PayloadDirection, parse_payload_command};
-    use horizon_mods::payloads::{MAX_PAYLOAD_BYTES, MAX_PAYLOAD_ID};
-
-    #[test]
-    fn parses_payload_forms_and_roles() {
-        let (_, direction, bytes) =
-            parse_payload_command(&["payload", "send", "demo:down", "utf8:hello", "client"])
-                .unwrap()
-                .unwrap();
-        assert_eq!(direction, PayloadDirection::PlayToClient);
-        assert_eq!(bytes, b"hello");
-        let (_, direction, bytes) =
-            parse_payload_command(&["payload", "send", "demo:up", "hex:00ff", "server"])
-                .unwrap()
-                .unwrap();
-        assert_eq!(direction, PayloadDirection::PlayToServer);
-        assert_eq!(bytes, [0, 255]);
-    }
-
-    #[test]
-    fn rejects_payload_bounds_and_bad_encoding() {
-        let channel = "x".repeat(MAX_PAYLOAD_ID + 1);
-        assert!(parse_payload_command(&["payload", "send", &channel, "00", "client"]).is_err());
-        let too_big = "00".repeat(MAX_PAYLOAD_BYTES + 1);
-        assert!(parse_payload_command(&["payload", "send", "demo:x", &too_big, "client"]).is_err());
-        assert!(parse_payload_command(&["payload", "send", "demo:x", "0", "client"]).is_err());
-        assert!(parse_payload_command(&["payload", "send", "demo:x", "gg", "client"]).is_err());
-    }
-}
-
 /// PCI vendor IDs of the GPU makers players have (Apple's is wgpu's Metal value).
 fn vendor_name(id: u32) -> String {
     match id {
@@ -1347,4 +1315,36 @@ fn key_code(name: &str) -> Option<KeyCode> {
         "down" => KeyCode::ArrowDown,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod payload_control_tests {
+    use super::{PayloadDirection, parse_payload_command};
+    use horizon_mods::payloads::{MAX_PAYLOAD_BYTES, MAX_PAYLOAD_ID};
+
+    #[test]
+    fn parses_payload_forms_and_roles() {
+        let (_, direction, bytes) =
+            parse_payload_command(&["payload", "send", "demo:down", "utf8:hello", "client"])
+                .unwrap()
+                .unwrap();
+        assert_eq!(direction, PayloadDirection::PlayToClient);
+        assert_eq!(bytes, b"hello");
+        let (_, direction, bytes) =
+            parse_payload_command(&["payload", "send", "demo:up", "hex:00ff", "server"])
+                .unwrap()
+                .unwrap();
+        assert_eq!(direction, PayloadDirection::PlayToServer);
+        assert_eq!(bytes, [0, 255]);
+    }
+
+    #[test]
+    fn rejects_payload_bounds_and_bad_encoding() {
+        let channel = "x".repeat(MAX_PAYLOAD_ID + 1);
+        assert!(parse_payload_command(&["payload", "send", &channel, "00", "client"]).is_err());
+        let too_big = "00".repeat(MAX_PAYLOAD_BYTES + 1);
+        assert!(parse_payload_command(&["payload", "send", "demo:x", &too_big, "client"]).is_err());
+        assert!(parse_payload_command(&["payload", "send", "demo:x", "0", "client"]).is_err());
+        assert!(parse_payload_command(&["payload", "send", "demo:x", "gg", "client"]).is_err());
+    }
 }

@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import sys
 import unittest
@@ -5,8 +6,12 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-sys.path.insert(0, str(ROOT / "tools"))
-import java_mod_server_ledger as LEDGER
+_SPEC = importlib.util.spec_from_file_location(
+    "java_mod_server_ledger_tool", ROOT / "tools" / "java_mod_server_ledger.py"
+)
+LEDGER = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = LEDGER
+_SPEC.loader.exec_module(LEDGER)
 
 
 class JavaModServerLedgerTests(unittest.TestCase):
