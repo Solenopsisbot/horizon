@@ -161,6 +161,40 @@ class HybridPackTests(unittest.TestCase):
         self.assertEqual([jar.name for jar in part.loader], ["proven.jar"])
         self.assertEqual([jar.name for jar in part.excluded], ["refused.jar"])
 
+    def test_a_failure_naming_the_mod_keeps_a_booted_listing_unproven(self):
+        log = "\n".join([
+            "[10:00:00] [Thread-0/INFO]: Mixing ExceptionMixin from jei.mixins.json into a.B",
+            "[10:00:01] [Thread-0/WARN]: Reference map 'peek.refmap.json' could not be read",
+            "[10:00:02] [Worker-Main-1/ERROR]: Failed to load jei plugin mezz.jei.Plugin",
+            "java.lang.IllegalStateException: objects registry is frozen",
+            "[10:00:03] [Server thread/INFO]: Done (1.0s)! For help, type \"help\"",
+        ])
+        lines = HYBRID.crash_lines(log)
+        # INFO lines (Mixin's audit) and warnings without a failure word drop out.
+        self.assertEqual(len(lines), 2)
+        self.assertIn("jei plugin", HYBRID.exception_naming("jei", lines))
+        self.assertEqual(HYBRID.exception_naming("peek", lines), "")
+        # A whole-word match: `objects` in a line does not name a mod called `object`.
+        self.assertEqual(HYBRID.exception_naming("object", lines), "")
+        with tempfile.TemporaryDirectory() as tmp:
+            _jar(tmp, "jei.jar", fabric={"id": "jei", "version": "1"})
+            rows = HYBRID.read_ledger(_ledger(tmp, {"jei.jar": "needs-loader"}))
+            jar = HYBRID.load_pack(Path(tmp), rows)[0]
+            clean = HYBRID.LoaderRow("jei.jar", "jei", "listed", 0, True)
+            named = HYBRID.LoaderRow("jei.jar", "jei", "listed", 0, True,
+                                     exception=HYBRID.exception_naming("jei", lines))
+            ledger = Path(tmp) / "proof.txt"
+            ledger.write_text(HYBRID.proof_ledger_text([named]), encoding="utf-8")
+            read_back = HYBRID.read_loader_ledger(ledger)
+            merged = HYBRID.merge_loader_evidence([named, clean])
+            proven = HYBRID.classify_jar("c", jar, "d", {"jei.jar": clean})
+            unproven = HYBRID.classify_jar("c", jar, "d", {"jei.jar": named})
+        self.assertEqual(read_back[0].exception, named.exception)
+        self.assertIs(merged["jei.jar"], clean)
+        self.assertEqual((proven.tier, proven.proof), ("needs-loader", "proven"))
+        self.assertEqual((unproven.tier, unproven.proof), ("needs-loader", "partial"))
+        self.assertIn("a failure names it", unproven.reason)
+
     def test_declaration_skips_a_byte_order_mark(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bom.jar"

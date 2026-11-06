@@ -705,6 +705,9 @@ class RunResult:
     log: Path | None = None
     note: str = ""
     failure: str = ""
+    # Non-INFO log lines that name an exception, a crash or an error (see
+    # `crash_lines`); a proof row looks for its own mod id in them.
+    exceptions: tuple[str, ...] = ()
 
 
 def _kill(proc: subprocess.Popen[bytes]) -> None:
@@ -792,6 +795,41 @@ def parse_native(text: str, home: Path, requested: int) -> dict[str, object]:
 
 HARD_DEP = re.compile(r"Immediate reason: \[HARD_DEP\w* (\S+)(?: \S+)? \{depends ([\w-]+) @ \[([^\]]+)\]")
 CLIENT_CLASS = re.compile(r"net/minecraft/client/|net\.minecraft\.client\.")
+
+
+# A log line at INFO level (`[time] [thread/INFO]: ...`): Mixin's own audit
+# lines name classes such as `...ExceptionHandlerMixin`, which are not failures.
+INFO_LINE = re.compile(r"^\[[^\]]*\] \[[^\]]*/INFO\]")
+CRASH_WORD = re.compile(r"exception|crash|fatal|error", re.I)
+MAX_CRASH_LINES = 400
+
+
+def crash_lines(text: str) -> tuple[str, ...]:
+    """The run's failure lines, the way `java_mod_loader_ledger.py` scans them.
+
+    Every non-INFO line that says exception, crash, fatal or error (an ERROR
+    level counts by itself), without Mixin's `Mixing`/`Renaming` audit lines.
+    """
+    out: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or INFO_LINE.search(stripped) or "Mixing " in stripped \
+                or "Renaming " in stripped or not CRASH_WORD.search(stripped):
+            continue
+        if stripped not in out:
+            out.append(stripped)
+        if len(out) >= MAX_CRASH_LINES:
+            break
+    return tuple(out)
+
+
+def exception_naming(mod_id: str, lines: tuple[str, ...]) -> str:
+    """The first failure line naming `mod_id` as a whole word, bounded."""
+    pattern = re.compile(rf"(?<![a-z0-9_]){re.escape(mod_id.lower())}(?![a-z0-9_])")
+    for line in lines:
+        if pattern.search(line.lower()):
+            return bounded(line)
+    return ""
 
 
 def failure_hint(text: str) -> str:
@@ -917,7 +955,8 @@ def run_loader(part: Partition, *, binary: Path, loader: Path, libs: Path, game:
     text = _append_child_log(text, work)
     parsed = parse_loader(text, part.loader, len(part.loader))
     return RunResult("loader", command, seconds, code, timed_out, len(part.loader),
-                     log=log, failure=failure_hint(text), **parsed)
+                     log=log, failure=failure_hint(text), exceptions=crash_lines(text),
+                     **parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -1022,13 +1061,23 @@ class LoaderRow:
     done: bool = False
     source: str = ""
     error: str = ""
+    # The first failure line of the run that names this mod id (phase 1's
+    # "names no exception against it"); empty when none does.
+    exception: str = ""
 
     @property
     def listed(self) -> bool:
         return self.status == "listed"
 
     @property
+    def proven(self) -> bool:
+        """Listed by a launch that reached `Done (` with no failure naming it."""
+        return self.listed and self.done and not self.exception
+
+    @property
     def rank(self) -> int:
+        if self.proven:
+            return 4
         if self.listed and self.done:
             return 3
         if self.listed:
@@ -1067,6 +1116,7 @@ def read_loader_ledger(path: Path) -> list[LoaderRow]:
             values.get("jar", ""), mod_id, values.get("status", ""), mixins,
             done if row_done is None else row_done.lower() == "true", str(path),
             values.get("error", ""),
+            values.get("exception", "") or values.get("first_exception", ""),
         ))
     if not rows:
         raise ValueError(f"{path}: no loader rows")
@@ -1161,9 +1211,11 @@ def classify_jar(corpus: str, jar: PackJar, digest: str,
                            NOT_NEEDED, proof_row.mod_id if proof_row else "", 0, "client-only",
                            "client-only (`environment: client`); the dedicated server loads nothing of it")
     if proof_row is not None and proof_row.listed:
-        proof = PROVEN if proof_row.done else PARTIAL
-        if proof_row.done:
+        proof = PROVEN if proof_row.proven else PARTIAL
+        if proof_row.proven:
             note = "the real Fabric loader lists it and reached Done"
+        elif proof_row.done:
+            note = f"the real Fabric loader lists it and reached Done, but a failure names it: {proof_row.exception}"
         else:
             note = "the real Fabric loader lists it but the run did not boot"
             if proof_row.error:
@@ -1360,7 +1412,8 @@ def _loader_proof_rows(batch: list[PackJar], run: RunResult) -> list[LoaderRow]:
     for jar in batch:
         status = "listed" if jar.mod_id.lower() in listed else "unlisted"
         rows.append(LoaderRow(jar.name, jar.mod_id, status, 0, done,
-                              str(run.log.parent) if run.log else "", run.failure))
+                              str(run.log.parent) if run.log else "", run.failure,
+                              exception_naming(jar.mod_id, run.exceptions)))
     return rows
 
 
@@ -1371,6 +1424,8 @@ def measure_proof(corpus: str, targets: list[PackJar], universe: list[PackJar], 
     """Launch the real loader for each batch, splitting a batch that cannot boot."""
     index = _provider_index(universe)
     results: list[LoaderRow] = []
+    # Targets that already had a run of their own (a batch of one).
+    solo: set[tuple[str, str]] = set()
     runs = 0
     stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
 
@@ -1387,6 +1442,8 @@ def measure_proof(corpus: str, targets: list[PackJar], universe: list[PackJar], 
                          work=work, timeout=timeout)
         rows = _loader_proof_rows(batch, run)
         results.extend(rows)
+        if len(batch) == 1:
+            solo.add((batch[0].name, batch[0].mod_id))
         print(f"{corpus} run {runs}: {len(batch)} target(s) in {len(members)} jars, "
               f"{run.note}, {run.seconds:.1f}s [{', '.join(jar.mod_id for jar in batch)[:90]}]",
               flush=True)
@@ -1400,13 +1457,43 @@ def measure_proof(corpus: str, targets: list[PackJar], universe: list[PackJar], 
         attempt(chunk)
     # A target that shared a batch with an incompatible version of a dependency
     # never gets a clean listing; give each of those one run of its own.
-    listed = {(row.jar, row.mod_id) for row in results if row.listed}
+    proven = {(row.jar, row.mod_id) for row in results if row.proven}
     for jar in targets:
         if runs >= max_runs:
             break
-        if (jar.name, jar.mod_id) not in listed:
+        key = (jar.name, jar.mod_id)
+        if key not in proven and key not in solo:
             attempt([jar])
     return results
+
+
+PROOF_LEDGER_HEADER = (
+    "# Horizon loader proof ledger\n"
+    "# One row per corpus jar that native execution refused or that needs the loader;\n"
+    "# done= is the run's own outcome (a real Fabric loader launch of its pack), and\n"
+    "# exception= is the first failure line of that run naming the jar's mod id.\n"
+    "# Written by `tools/hybrid_pack.py --coverage --measure-proof --proof-ledger NAME=PATH`.\n"
+)
+
+
+def proof_ledger_text(rows: list[LoaderRow], *, with_runs: bool = False) -> str:
+    """The proof ledger `read_loader_ledger` reads back, one row per jar.
+
+    `with_runs` adds each row's run folder, which only means something on the
+    machine that measured it, so the committed ledgers leave it out.
+    """
+    lines = [PROOF_LEDGER_HEADER.rstrip("\n")]
+    for row in sorted(rows, key=lambda item: (item.jar, item.mod_id)):
+        line = (f"mod={row.mod_id}\tstatus={row.status}\tjar={row.jar}"
+                f"\tdone={str(row.done).lower()}")
+        if row.error:
+            line += f"\terror={bounded(row.error)}"
+        if row.exception:
+            line += f"\texception={bounded(row.exception)}"
+        if with_runs and row.source:
+            line += f"\trun={row.source}"
+        lines.append(line)
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1479,11 +1566,10 @@ def coverage_docs(rows: list[CoverageRow], sources: list[Path]) -> str:
     lines.append(f"| union (SHA-256) | {_counts_cell(merged)} |")
     lines += [
         "",
-        f"**Loader proof.** All {total[NEEDS_LOADER] - total[UNPROVEN]} of "
-        f"{total[NEEDS_LOADER]} `needs-loader` rows are demonstrated by a real Fabric loader "
-        f"launch: {total[PROVEN]} reached `Done (`, {total[PARTIAL]} were listed by a launch "
-        f"that did not boot (client-only code in the server role), and "
-        f"{total[UNPROVEN]} have no loader evidence.",
+        f"**Loader proof.** {total[PROVEN]} of {total[NEEDS_LOADER]} `needs-loader` rows are "
+        f"proven: a real Fabric loader launch lists the jar, reaches `Done (` and no failure "
+        f"line of that run names its mod id. {total[PARTIAL]} are listed without that proof "
+        f"(below), and {total[UNPROVEN]} have no loader evidence.",
         "",
     ]
     moved = [row for row in rows if row.native_label == NATIVE_GAP and row.tier == NEEDS_LOADER]
@@ -1520,12 +1606,13 @@ def coverage_docs(rows: list[CoverageRow], sources: list[Path]) -> str:
         lines.append("")
     partial = [row for row in rows if row.proof == PARTIAL]
     if partial:
-        lines.append(f"**Listed but not booted ({len(partial)}).** The loader discovered these "
-                     "jars, but the launch did not reach `Done (`.")
+        lines.append(f"**Listed but not proven ({len(partial)}).** The loader discovered these "
+                     "jars, but the launch did not reach `Done (` or a failure line names them.")
         lines.append("")
-        lines += ["| Jar | Corpus | Loader id |", "|---|---|---|"]
+        lines += ["| Jar | Corpus | Loader id | Why |", "|---|---|---|---|"]
         for row in sorted(partial, key=lambda item: item.jar)[:40]:
-            lines.append(f"| `{row.jar}` | `{row.corpus}` | `{row.loader_mod_id}` |")
+            why = row.reason.replace("|", "\\|")
+            lines.append(f"| `{row.jar}` | `{row.corpus}` | `{row.loader_mod_id}` | {why} |")
         if len(partial) > 40:
             lines.append(f"\n_{len(partial) - 40} more row(s) are in the coverage report._")
         lines.append("")
@@ -1576,6 +1663,13 @@ def coverage_main(args: argparse.Namespace) -> int:
         rows.update(read_ledger(ledger))
         sources.append(ledger)
     evidence: list[LoaderRow] = []
+    proof_outputs: dict[str, Path] = {}
+    for spec in args.proof_ledger or []:
+        name, _, target = spec.partition("=")
+        if not _ or not name or not target:
+            print(f"hybrid_pack: --proof-ledger wants NAME=PATH, got {spec!r}", file=sys.stderr)
+            return 2
+        proof_outputs[name] = Path(target).resolve()
     for ledger in args.loader_ledger or []:
         if not ledger.is_file():
             print(f"hybrid_pack: loader ledger does not exist: {ledger}", file=sys.stderr)
@@ -1609,10 +1703,14 @@ def coverage_main(args: argparse.Namespace) -> int:
                 universe_by_path[jar.path] = jar
         universe = sorted(universe_by_path.values(), key=lambda jar: jar.name)
         loaders = args.proof_loader or [args.loader]
+        fresh_evidence: list[LoaderRow] = []
         for name, directory in corpora:
             corpus_rows: list[LoaderRow] = []
             for loader in loaders:
-                by_jar = merge_loader_evidence(evidence)
+                # `--reprove` measures every row again with this binary instead
+                # of trusting a committed listing (a later loop over
+                # `--proof-loader` still only retries what this one left).
+                by_jar = merge_loader_evidence(fresh_evidence if args.reprove else evidence)
 
                 def needs_proof(jar: PackJar) -> bool:
                     if jar.row is None or jar.row.label in (NEEDS_LOADER, NATIVE_GAP):
@@ -1621,7 +1719,7 @@ def coverage_main(args: argparse.Namespace) -> int:
                         if jar.row is not None and jar.row.reason.startswith("no native entrypoint"):
                             return False
                         found = _loader_evidence(jar.name, by_jar)
-                        return found is None or not found.listed
+                        return found is None or not found.proven
                     return False
 
                 targets = [jar for jar in load_pack(directory, rows) if needs_proof(jar)]
@@ -1636,21 +1734,29 @@ def coverage_main(args: argparse.Namespace) -> int:
                     batch_size=args.batch_size, max_runs=args.max_runs,
                 )
                 evidence.extend(fresh)
+                fresh_evidence.extend(fresh)
                 corpus_rows.extend(fresh)
             names = {jar.name for jar in load_pack(directory, rows)}
-            corpus_rows = [row for row in merge_loader_evidence(evidence).values()
-                           if row.jar in names]
+            corpus_rows = [row for row in merge_loader_evidence(
+                fresh_evidence if args.reprove else evidence).values() if row.jar in names]
             if not corpus_rows:
                 continue
             proof_log = work_root / name / f"{name}-proof-ledger.txt"
             proof_log.parent.mkdir(parents=True, exist_ok=True)
-            with proof_log.open("w", encoding="utf-8") as stream:
-                stream.write("# Horizon corpus loader proof ledger\n")
-                for row in sorted(corpus_rows, key=lambda item: (item.jar, item.mod_id)):
-                    stream.write(f"mod={row.mod_id}\tstatus={row.status}\tjar={row.jar}"
-                                 f"\tdone={str(row.done).lower()}\trun={row.source}\n")
-            sources.append(proof_log)
+            proof_log.write_text(proof_ledger_text(corpus_rows, with_runs=True), encoding="utf-8")
             print(f"{name}: proof ledger {proof_log}", flush=True)
+            if name in proof_outputs:
+                proof_outputs[name].write_text(proof_ledger_text(corpus_rows), encoding="utf-8")
+                proof_log = proof_outputs[name]
+                print(f"{name}: proof ledger {proof_log}", flush=True)
+            sources.append(proof_log)
+        if args.reprove:
+            # The fresh runs replace the committed listings outright: a row
+            # that now names an exception must not be outranked by an older,
+            # cleaner-looking listing of the same jar.
+            sources = [source for source in sources
+                       if source not in (args.loader_ledger or [])]
+            evidence = fresh_evidence
         measured = coverage_rows(corpora, rows, evidence, digests=digests)
 
     union = union_rows(measured)
@@ -2423,6 +2529,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="loader ledger or proof ledger that demonstrates needs-loader rows")
     parser.add_argument("--measure-proof", action="store_true",
                         help="launch the real loader for rows that have no proof yet")
+    parser.add_argument("--reprove", action="store_true",
+                        help="with --measure-proof, launch every row again instead of trusting "
+                             "the --loader-ledger listings")
+    parser.add_argument("--proof-ledger", action="append", metavar="NAME=PATH",
+                        help="with --measure-proof, also write corpus NAME's proof ledger to PATH "
+                             "(the committed LAST_LOADER_PROOF_*.txt format, no run folders)")
     parser.add_argument("--proof-work", type=Path,
                         help="scratch root for --measure-proof (default: ~/horizon-corpus/coverage-runs)")
     parser.add_argument("--proof-universe", type=Path, action="append",
