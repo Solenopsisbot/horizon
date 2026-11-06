@@ -118,6 +118,59 @@ class HybridPackTests(unittest.TestCase):
         self.assertEqual([jar.name for jar in full.excluded], [])
         self.assertEqual([jar.name for jar in full.loader], ["gap.jar"])
 
+    def test_a_native_jar_follows_a_dependency_only_the_loader_runs(self):
+        # The Helix shape: an add-on the server runs natively (`native-ok`)
+        # requires a library native execution refuses or cannot carry, and a
+        # second native jar requires that add-on in turn.
+        with tempfile.TemporaryDirectory() as tmp:
+            _jar(tmp, "lib.jar", fabric={"id": "lib", "version": "1"})
+            _jar(tmp, "addon.jar", fabric={"id": "addon", "version": "1",
+                                           "depends": {"lib": "*"}})
+            _jar(tmp, "printer.jar", fabric={"id": "printer", "version": "1",
+                                             "depends": {"addon": "*", "minecraft": "*"}})
+            _jar(tmp, "alone.jar", fabric={"id": "alone", "version": "1"})
+            _jar(tmp, "gap.jar", fabric={"id": "gap", "version": "1"})
+            _jar(tmp, "gapuser.jar", fabric={"id": "gapuser", "version": "1",
+                                             "depends": {"gap": "*"}})
+            rows = HYBRID.read_ledger(_ledger(tmp, {
+                "lib.jar": "needs-loader",
+                "addon.jar": "native-ok",
+                "printer.jar": "native-ok",
+                "alone.jar": "native-ok",
+                "gap.jar": "native-gap",
+                "gapuser.jar": "native-ok",
+            }))
+            part = HYBRID.partition_pack(Path(tmp), rows)
+            issues = HYBRID.check_compatibility(part)
+        self.assertEqual([jar.name for jar in part.native], ["alone.jar"])
+        # The excluded library comes along with its dependent.
+        self.assertEqual([jar.name for jar in part.loader],
+                         ["addon.jar", "gap.jar", "gapuser.jar", "lib.jar", "printer.jar"])
+        self.assertEqual([jar.name for jar in part.dependents],
+                         ["addon.jar", "gapuser.jar", "printer.jar"])
+        self.assertEqual(part.excluded, [])
+        self.assertNotIn("cross-partition-dependency", [issue.code for issue in issues])
+
+    def test_a_loader_proven_gap_jar_joins_the_loader_half(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _jar(tmp, "proven.jar", fabric={"id": "proven", "version": "1"})
+            _jar(tmp, "refused.jar", fabric={"id": "refused", "version": "1"})
+            rows = HYBRID.read_ledger(_ledger(tmp, {
+                "proven.jar": "native-gap", "refused.jar": "native-gap"}))
+            part = HYBRID.partition_pack(Path(tmp), rows, loader_proven={"proven.jar"})
+        self.assertEqual([jar.name for jar in part.loader], ["proven.jar"])
+        self.assertEqual([jar.name for jar in part.excluded], ["refused.jar"])
+
+    def test_declaration_skips_a_byte_order_mark(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bom.jar"
+            with zipfile.ZipFile(path, "w") as jar:
+                jar.writestr("fabric.mod.json", "﻿" + json.dumps(
+                    {"id": "bom", "version": "1", "environment": "client"}))
+            declaration = HYBRID.read_declaration(path)
+        self.assertEqual((declaration.mod_id, declaration.error, declaration.client_only),
+                         ("bom", "", True))
+
     def test_compatibility_reports_a_dependency_split_between_halves(self):
         with tempfile.TemporaryDirectory() as tmp:
             _jar(tmp, "app.jar", fabric={"id": "app", "version": "1", "depends": {"lib": "*"}})

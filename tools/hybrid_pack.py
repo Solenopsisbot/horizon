@@ -289,7 +289,7 @@ def _nested_ids(jar: zipfile.ZipFile) -> tuple[str, ...]:
         try:
             with zipfile.ZipFile(io.BytesIO(jar.read(name))) as nested:
                 raw = nested.read("fabric.mod.json")
-                value = json.loads(_lenient_json(raw.decode("utf-8", errors="replace")))
+                value = json.loads(_lenient_json(raw.decode("utf-8-sig", errors="replace")))
                 if isinstance(value, dict) and isinstance(value.get("id"), str):
                     ids.append(value["id"])
         except (KeyError, ValueError, OSError, zipfile.BadZipFile):
@@ -310,7 +310,9 @@ def read_declaration(path: Path) -> Declaration:
                     content = ()
             nested = _nested_ids(jar)
             if "fabric.mod.json" in names:
-                raw = jar.read("fabric.mod.json").decode("utf-8", errors="replace")
+                # `utf-8-sig`: a metadata file may start with a byte-order mark
+                # (macos-input-fixes' does), which Fabric's own reader skips.
+                raw = jar.read("fabric.mod.json").decode("utf-8-sig", errors="replace")
                 value = json.loads(_lenient_json(raw))
                 if not isinstance(value, dict):
                     raise ValueError("fabric.mod.json root is not an object")
@@ -374,6 +376,9 @@ class Partition:
     loader: list[PackJar] = field(default_factory=list)
     excluded: list[PackJar] = field(default_factory=list)
     unlabelled: list[PackJar] = field(default_factory=list)
+    # `native-ok` jars moved to the loader half because a dependency of theirs
+    # runs only there (see `partition_pack`).
+    dependents: list[PackJar] = field(default_factory=list)
 
     @property
     def shared(self) -> list[PackJar]:
@@ -401,16 +406,61 @@ def _dependency_targets(jar: PackJar, pack_by_id: dict[str, list[PackJar]]) -> l
     return targets
 
 
+def _close_loader_half(result: Partition, jars: list[PackJar],
+                       pack_by_id: dict[str, list[PackJar]]) -> None:
+    """Add every pack jar the loader half's members require to that half."""
+    chosen = {jar.path for jar in result.loader}
+    queue = list(result.loader)
+    while queue:
+        jar = queue.pop(0)
+        for target in _dependency_targets(jar, pack_by_id):
+            if target.path in chosen:
+                continue
+            chosen.add(target.path)
+            queue.append(target)
+            result.excluded = [item for item in result.excluded if item.path != target.path]
+            result.unlabelled = [item for item in result.unlabelled if item.path != target.path]
+    by_path = {jar.path: jar for jar in jars}
+    result.loader = sorted((by_path[path] for path in chosen), key=lambda jar: jar.name)
+
+
+def _stranded_native(result: Partition, pack_by_id: dict[str, list[PackJar]]) -> list[PackJar]:
+    """Native-half jars that require a pack id the native half does not run.
+
+    The native half is its own process: a jar there whose dependency only the
+    loader half (or nobody, because the ledger left it out) runs has nothing
+    to link against, which is what `check_compatibility` reports as a
+    `cross-partition-dependency` conflict.
+    """
+    provided = _half_provides(result.native)
+    stranded = []
+    for jar in result.native:
+        for dependency in jar.declaration.depends:
+            key = dependency.lower()
+            if key not in provided and key in pack_by_id:
+                stranded.append(jar)
+                break
+    return stranded
+
+
 def partition_pack(pack: Path, rows: dict[str, LedgerRow], *,
                    closure: bool = True, gap_to_loader: bool = False,
-                   hash_index: dict[str, LedgerRow] | None = None) -> Partition:
+                   hash_index: dict[str, LedgerRow] | None = None,
+                   loader_proven: set[str] | None = None) -> Partition:
     """Route each jar by its ledger label, then close the loader half's deps.
 
     A jar whose required dependency sits in the native half is added to the
     loader half too (the halves are separate processes, so the dependency must
-    physically be there). With `gap_to_loader`, the jars native execution
-    refuses are routed to the loader as well; otherwise only the closure can
-    pull one in.
+    physically be there). The other direction moves rather than copies: a
+    native jar that requires a jar only the loader half runs (litematica-printer
+    on litematica, a `native-ok` add-on on a `needs-loader` library) cannot run
+    natively at all, so it leaves the native half for the loader half, which
+    can cascade to the native jars that required it; the loop runs until no
+    native jar is stranded. With `gap_to_loader`, the jars native execution
+    refuses are routed to the loader as well. `loader_proven` is narrower: the
+    corpus file names (the ledger row's `file`) of `native-gap` jars a real
+    loader launch lists, which the tier coverage already counts as
+    `needs-loader`, so they join the loader half instead of staying out.
     """
     jars = load_pack(pack, rows)
     if hash_index:
@@ -432,25 +482,23 @@ def partition_pack(pack: Path, rows: dict[str, LedgerRow], *,
             result.unlabelled.append(jar)
         elif jar.row.label == NATIVE_OK:
             result.native.append(jar)
-        elif jar.row.label == NEEDS_LOADER or (gap_to_loader and jar.row.label == NATIVE_GAP):
+        elif jar.row.label == NEEDS_LOADER or (jar.row.label == NATIVE_GAP and (
+                gap_to_loader or jar.row.file in (loader_proven or ()))):
             result.loader.append(jar)
         else:
             result.excluded.append(jar)
 
     if closure:
-        chosen = {jar.path for jar in result.loader}
-        queue = list(result.loader)
-        while queue:
-            jar = queue.pop(0)
-            for target in _dependency_targets(jar, pack_by_id):
-                if target.path in chosen:
-                    continue
-                chosen.add(target.path)
-                queue.append(target)
-                result.excluded = [item for item in result.excluded if item.path != target.path]
-                result.unlabelled = [item for item in result.unlabelled if item.path != target.path]
-        by_path = {jar.path: jar for jar in jars}
-        result.loader = sorted((by_path[path] for path in chosen), key=lambda jar: jar.name)
+        _close_loader_half(result, jars, pack_by_id)
+        # Bounded by the pack: every pass moves at least one jar out of the
+        # native half, and no jar ever moves back.
+        while stranded := _stranded_native(result, pack_by_id):
+            moved = {jar.path for jar in stranded}
+            result.native = [jar for jar in result.native if jar.path not in moved]
+            result.dependents.extend(stranded)
+            result.loader.extend(jar for jar in stranded if jar not in result.loader)
+            _close_loader_half(result, jars, pack_by_id)
+        result.dependents.sort(key=lambda jar: jar.name)
     return result
 
 
@@ -885,6 +933,8 @@ def partition_lines(part: Partition) -> list[str]:
             tags = [jar.label]
             if name == "loader" and jar in part.native:
                 tags.append("shared")
+            if name == "loader" and jar in part.dependents:
+                tags.append("follows-dependency")
             reason = bounded(jar.row.reason) if jar.row and jar.row.reason else ""
             rows.append(f"  {jar.name}\t{jar.mod_id}\t{'/'.join(tags)}" + (f"\t{reason}" if reason else ""))
     return rows
@@ -2472,8 +2522,22 @@ def main(argv: list[str] | None = None) -> int:
         directories = args.ledger_dir or [
             CORPUS / "corpus-xl", CORPUS / "mega", CORPUS / "mega-packs"]
         hash_index = build_hash_index(rows, directories)
+    # The proof ledgers name corpus files; a `native-gap` row they list is a
+    # `needs-loader` jar in the tier coverage, so the pack runs it there too.
+    # Only a listing whose launch reached `Done (` counts: a jar the server
+    # role lists but cannot boot (sway's common mixin config targets the
+    # client's `LevelRenderer`) would stop the whole loader half.
+    loader_proven: set[str] = set()
+    for ledger in args.loader_ledger or []:
+        try:
+            evidence = read_loader_ledger(ledger.resolve())
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        loader_proven |= {name for name, row in merge_loader_evidence(evidence).items()
+                          if row.listed and row.done}
     part = partition_pack(args.pack, rows, closure=not args.no_closure,
-                          gap_to_loader=args.gap_to_loader, hash_index=hash_index)
+                          gap_to_loader=args.gap_to_loader, hash_index=hash_index,
+                          loader_proven=loader_proven)
     if not part.native and not part.loader:
         parser.error("the ledger routes no jar in this pack to either half")
     issues = check_compatibility(part)
