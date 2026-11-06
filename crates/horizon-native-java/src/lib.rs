@@ -554,8 +554,12 @@ pub enum GameHookReceiver {
 /// Adding a site is a host change, not a parser change: the hook must already
 /// be in `native-hooks.json` with the same contract word, side and cancellation,
 /// and it must be able to hand the interpreter the target's receiver and every
-/// target argument. Today only the receiver-carrying, argument-free and
-/// single-argument hooks qualify (see `game_hook_sites`).
+/// target argument. The table below is the result of ranking the plans the
+/// phase-2 loader tier still skips: each entry names a vanilla method the host
+/// already fires a named hook at, in the same population. Hooks whose point is
+/// inside a method (a `RETURN` or `INVOKE` in the middle of a tick) and hooks
+/// the host batches per entity family are deliberately absent, because a named
+/// hook cannot promise their position or population.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GameHookSite {
     /// The census hook name (`native-hooks.json`'s `name`).
@@ -593,10 +597,23 @@ pub struct GameHookSite {
 /// [`MixinSkipReason::GameHookMismatch`], and a target with no site at all
 /// keeps [`MixinSkipReason::TargetOutsideJar`].
 ///
-/// Only two sites qualify today because the rule is strict on purpose: the hook
-/// must fire at the same position and for the same population as the vanilla
-/// method. `entity_tick_pre`/`_post` are batched per family and exclude
-/// players and projectiles, so `Entity#tick` does not map onto them.
+/// Each entry is one vanilla method whose whole body the host already brackets
+/// with a named hook. A site whose vanilla method returns a value is absent:
+/// a named hook carries no result to override (`ServerPlayer#openMenu`,
+/// `Entity#startRiding`, `ServerLevel#addEntity` and `LivingEntity#hurtServer`
+/// are the common ones). So is a hook that fires inside a method rather than
+/// at its `HEAD`/`RETURN`/`TAIL` (`item_expire` inside `ItemEntity.tick`,
+/// `player_container_close` inside `doCloseContainer`), and a hook the host
+/// batches per entity family (`entity_tick_pre`/`_post` excludes players and
+/// projectiles, so `Entity#tick` does not map onto them).
+///
+/// The receiver column says what the host hands an instance callback as
+/// `this`. It is the target object's marker where the host models that object
+/// (`player`, `entity`, `item`, `level`); `server` is the server's marker, and
+/// the entries for a container, a tracker and a player list hand the player
+/// the hook names, because the host models the player rather than those
+/// objects. Those callbacks are most often static and only use their
+/// arguments, but the note says so rather than pretending otherwise.
 pub const GAME_HOOK_SITES: &[GameHookSite] = &[
     GameHookSite {
         hook: "player_tick",
@@ -621,6 +638,210 @@ pub const GAME_HOOK_SITES: &[GameHookSite] = &[
         side: Some(MixinSide::Server),
         receiver: GameHookReceiver::Named("item"),
         note: "at ItemEntity.playerTouch, before the stack is taken, on the authoritative server",
+    },
+    GameHookSite {
+        hook: "living_death",
+        version: 1,
+        target_owner: "net/minecraft/world/entity/LivingEntity",
+        target_name: "die",
+        target_descriptor: "(Lnet/minecraft/world/damagesource/DamageSource;)V",
+        anchors: &["HEAD"],
+        contract: GameHookContract::Cancel { out: "cancel" },
+        side: Some(MixinSide::Server),
+        receiver: GameHookReceiver::Named("entity"),
+        note: "at LivingEntity.die, with health run out and before loot, experience and the death message, on the authoritative server",
+    },
+    GameHookSite {
+        hook: "player_died",
+        version: 1,
+        target_owner: "net/minecraft/server/level/ServerPlayer",
+        target_name: "die",
+        target_descriptor: "(Lnet/minecraft/world/damagesource/DamageSource;)V",
+        anchors: &["HEAD"],
+        contract: GameHookContract::Listen,
+        side: Some(MixinSide::Server),
+        receiver: GameHookReceiver::Named("player"),
+        note: "at the start of ServerPlayer.die, before the death message, on the authoritative server",
+    },
+    GameHookSite {
+        hook: "player_clone",
+        version: 1,
+        target_owner: "net/minecraft/server/level/ServerPlayer",
+        target_name: "restoreFrom",
+        target_descriptor: "(Lnet/minecraft/server/level/ServerPlayer;Z)V",
+        anchors: &["RETURN", "TAIL"],
+        contract: GameHookContract::Listen,
+        side: Some(MixinSide::Server),
+        receiver: GameHookReceiver::Named("player"),
+        note: "at the end of ServerPlayer.restoreFrom, before the new player is placed, on the authoritative server",
+    },
+    GameHookSite {
+        hook: "player_logged_in",
+        version: 1,
+        target_owner: "net/minecraft/server/players/PlayerList",
+        target_name: "placeNewPlayer",
+        target_descriptor: "(Lnet/minecraft/network/Connection;Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/server/network/CommonListenerCookie;)V",
+        anchors: &["RETURN", "TAIL"],
+        contract: GameHookContract::Listen,
+        side: Some(MixinSide::Server),
+        receiver: GameHookReceiver::Named("player"),
+        note: "at the end of PlayerList.placeNewPlayer, once the player is placed and listed; the host hands the joined player, on the authoritative server",
+    },
+    GameHookSite {
+        hook: "living_jump",
+        version: 1,
+        target_owner: "net/minecraft/world/entity/LivingEntity",
+        target_name: "jumpFromGround",
+        target_descriptor: "()V",
+        anchors: &["TAIL"],
+        contract: GameHookContract::Listen,
+        side: None,
+        receiver: GameHookReceiver::Named("entity"),
+        note: "at the end of LivingEntity.jumpFromGround, after the jump impulse, on both sides",
+    },
+    GameHookSite {
+        hook: "living_jump",
+        version: 1,
+        target_owner: "net/minecraft/world/entity/monster/cubemob/MagmaCube",
+        target_name: "jumpFromGround",
+        target_descriptor: "()V",
+        anchors: &["TAIL"],
+        contract: GameHookContract::Listen,
+        side: None,
+        receiver: GameHookReceiver::Named("entity"),
+        note: "at the end of MagmaCube.jumpFromGround, after the cube's own jump, on both sides",
+    },
+    GameHookSite {
+        hook: "level_unload",
+        version: 1,
+        target_owner: "net/minecraft/server/level/ServerLevel",
+        target_name: "close",
+        target_descriptor: "()V",
+        anchors: &["TAIL"],
+        contract: GameHookContract::Listen,
+        side: Some(MixinSide::Server),
+        receiver: GameHookReceiver::Named("level"),
+        note: "at the end of ServerLevel.close, after the level's last save, on the authoritative server",
+    },
+    GameHookSite {
+        hook: "server_stopping",
+        version: 1,
+        target_owner: "net/minecraft/server/MinecraftServer",
+        target_name: "stopServer",
+        target_descriptor: "()V",
+        anchors: &["HEAD"],
+        contract: GameHookContract::Listen,
+        side: Some(MixinSide::Server),
+        receiver: GameHookReceiver::Named("server"),
+        note: "at the start of MinecraftServer.stopServer, with worlds loaded and players connected, on the authoritative server",
+    },
+    GameHookSite {
+        hook: "entity_mount",
+        version: 1,
+        target_owner: "net/minecraft/world/entity/Entity",
+        target_name: "removeVehicle",
+        target_descriptor: "()V",
+        anchors: &["HEAD"],
+        contract: GameHookContract::Cancel { out: "canceled" },
+        side: Some(MixinSide::Server),
+        receiver: GameHookReceiver::Named("entity"),
+        note: "at the start of Entity.removeVehicle, before the rider leaves the vehicle, on the authoritative server",
+    },
+    GameHookSite {
+        hook: "living_knockback",
+        version: 1,
+        target_owner: "net/minecraft/world/entity/LivingEntity",
+        target_name: "knockback",
+        target_descriptor: "(DDDLnet/minecraft/world/damagesource/DamageSource;FZ)V",
+        anchors: &["HEAD"],
+        contract: GameHookContract::Cancel { out: "canceled" },
+        side: None,
+        receiver: GameHookReceiver::Named("entity"),
+        note: "at the start of LivingEntity.knockback, on the raw push before resistance and motion, on both sides",
+    },
+    GameHookSite {
+        hook: "living_entity_use_item_stop",
+        version: 1,
+        target_owner: "net/minecraft/world/entity/LivingEntity",
+        target_name: "releaseUsingItem",
+        target_descriptor: "()V",
+        anchors: &["HEAD"],
+        contract: GameHookContract::Cancel { out: "canceled" },
+        side: None,
+        receiver: GameHookReceiver::Named("entity"),
+        note: "at the start of LivingEntity.releaseUsingItem, before the item's release, on both sides",
+    },
+    GameHookSite {
+        hook: "living_entity_use_item_tick",
+        version: 1,
+        target_owner: "net/minecraft/world/entity/LivingEntity",
+        target_name: "updatingUsingItem",
+        target_descriptor: "()V",
+        anchors: &["HEAD"],
+        contract: GameHookContract::Cancel { out: "canceled" },
+        side: None,
+        receiver: GameHookReceiver::Named("entity"),
+        note: "at the start of LivingEntity.updatingUsingItem, each tick of a use before its time is spent, on both sides",
+    },
+    GameHookSite {
+        hook: "left_click_block",
+        version: 1,
+        target_owner: "net/minecraft/server/level/ServerPlayerGameMode",
+        target_name: "handleBlockBreakAction",
+        target_descriptor: "(Lnet/minecraft/core/BlockPos;Lnet/minecraft/network/protocol/game/ServerboundPlayerActionPacket$Action;Lnet/minecraft/core/Direction;II)V",
+        anchors: &["HEAD"],
+        contract: GameHookContract::Cancel { out: "canceled" },
+        side: Some(MixinSide::Server),
+        receiver: GameHookReceiver::Named("player"),
+        note: "at the start of ServerPlayerGameMode.handleBlockBreakAction, after its reach, spawn-protection and border checks; the host hands the acting player, on the authoritative server",
+    },
+    GameHookSite {
+        hook: "player_container_open",
+        version: 1,
+        target_owner: "net/minecraft/server/level/ServerPlayer",
+        target_name: "openHorseInventory",
+        target_descriptor: "(Lnet/minecraft/world/entity/animal/equine/AbstractHorse;Lnet/minecraft/world/Container;)V",
+        anchors: &["RETURN", "TAIL"],
+        contract: GameHookContract::Listen,
+        side: Some(MixinSide::Server),
+        receiver: GameHookReceiver::Named("player"),
+        note: "when ServerPlayer.openHorseInventory sets a mount's menu, after the packet and before the menu's first tick, on the authoritative server",
+    },
+    GameHookSite {
+        hook: "item_damaged",
+        version: 1,
+        target_owner: "net/minecraft/world/item/ItemStack",
+        target_name: "hurtAndBreak",
+        target_descriptor: "(ILnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/entity/EquipmentSlot;)V",
+        anchors: &["HEAD"],
+        contract: GameHookContract::Cancel { out: "cancel" },
+        side: Some(MixinSide::Server),
+        receiver: GameHookReceiver::Named("item"),
+        note: "at the start of ItemStack.hurtAndBreak, before durability is lost, on the authoritative server for a server player's item",
+    },
+    GameHookSite {
+        hook: "attack_entity",
+        version: 1,
+        target_owner: "net/minecraft/world/entity/player/Player",
+        target_name: "attack",
+        target_descriptor: "(Lnet/minecraft/world/entity/Entity;)V",
+        anchors: &["HEAD"],
+        contract: GameHookContract::Cancel { out: "canceled" },
+        side: Some(MixinSide::Server),
+        receiver: GameHookReceiver::Named("player"),
+        note: "at the start of Player.attack, before damage and knockback, on the authoritative server",
+    },
+    GameHookSite {
+        hook: "player_start_tracking",
+        version: 1,
+        target_owner: "net/minecraft/server/level/ServerEntity",
+        target_name: "addPairing",
+        target_descriptor: "(Lnet/minecraft/server/level/ServerPlayer;)V",
+        anchors: &["RETURN", "TAIL"],
+        contract: GameHookContract::Listen,
+        side: Some(MixinSide::Server),
+        receiver: GameHookReceiver::Named("entity"),
+        note: "at the end of ServerEntity.addPairing, once the client is sent the entity; the host hands the tracked entity, on the authoritative server",
     },
 ];
 
@@ -39410,5 +39631,155 @@ mandatory = true
             )
             .unwrap();
         assert_eq!(class, Value::Ref(Some("demo/Model".into())));
+    }
+
+    /// Every site names one distinct vanilla method, a position the hook can
+    /// answer, and a `void` target. Two hooks may name one method (`living_jump`
+    /// covers a living entity and a magma cube's own override), but no target
+    /// may appear twice, because `game_hook_site_for` answers the first match.
+    #[test]
+    fn game_hook_sites_name_distinct_void_targets_at_real_positions() {
+        let mut targets = BTreeMap::new();
+        for site in game_hook_sites() {
+            assert!(!site.anchors.is_empty(), "{} names no position", site.hook);
+            for anchor in site.anchors {
+                assert!(
+                    matches!(*anchor, "HEAD" | "RETURN" | "TAIL"),
+                    "{} names {anchor}, which a named hook cannot answer",
+                    site.hook
+                );
+            }
+            assert_eq!(
+                return_desc(site.target_descriptor),
+                "V",
+                "{} names {}#{}{}, which returns a value",
+                site.hook,
+                site.target_owner,
+                site.target_name,
+                site.target_descriptor
+            );
+            let key = (site.target_owner, site.target_name, site.target_descriptor);
+            if let Some(previous) = targets.insert(key, site.hook) {
+                panic!(
+                    "{} and {} both name {}#{}{}",
+                    previous,
+                    site.hook,
+                    site.target_owner,
+                    site.target_name,
+                    site.target_descriptor
+                );
+            }
+        }
+    }
+
+    /// The measured question this table answers: of the phase-2 loader tier's
+    /// server-side game-class plans, how many name a target a host hook maps?
+    ///
+    /// `HORIZON_JAVA_LOADER_SET` is a text file of one jar path per line, the
+    /// unique jars of `tools/real_mod_fixtures/LAST_NATIVE_SCORE.txt`'s
+    /// `status=loader` rows (deduplicated by SHA-256). `server_plans` uses the
+    /// same rule as `tools/hybrid_pack.py --native-score`: a plan is a
+    /// server-side game plan when its callback's config is not client-only and
+    /// its target class is outside the jar. `mapped` additionally applies the
+    /// tier's shape rule (site, side, anchor, cancellation, selector and
+    /// callback arguments) but not the config-family gate, so it measures the
+    /// table's coverage of that set; `bound` is what the runtime actually
+    /// binds through every gate, and is the number a host will fire.
+    ///
+    /// ```sh
+    /// HORIZON_JAVA_LOADER_SET=~/horizon-corpus/loader-set.txt \
+    ///   cargo test -p horizon-native-java --lib -- --ignored game_hook_tier_measures --nocapture
+    /// ```
+    #[test]
+    #[ignore = "reads a real mod corpus outside the repository"]
+    fn game_hook_tier_measures_the_phase_two_loader_set() {
+        let Ok(list) = std::env::var("HORIZON_JAVA_LOADER_SET") else {
+            eprintln!("skipping: set HORIZON_JAVA_LOADER_SET");
+            return;
+        };
+        let paths = std::fs::read_to_string(&list).expect("read the loader set");
+        let mut jars = 0usize;
+        let mut server_plans = 0usize;
+        let mut mapped = 0usize;
+        let mut bound = 0usize;
+        let mut by_hook: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut failures = Vec::new();
+        for path in paths.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let jar = match NativeJar::from_path(std::path::Path::new(path)) {
+                Ok(jar) => jar,
+                Err(error) => {
+                    failures.push(format!("{path}: {error}"));
+                    continue;
+                }
+            };
+            let configs = jar.mixin_configs();
+            for plan in jar.mixin_injection_plans() {
+                let callback = plan.callback.owner.replace('/', ".");
+                let mut server = false;
+                let mut client = false;
+                for config in &configs {
+                    let common = config.mixins.contains(&callback);
+                    server |= common || config.server.contains(&callback);
+                    client |= common || config.client.contains(&callback);
+                }
+                // Unlisted stays on both sides, exactly as the score's
+                // `mixin_sides` defaults, so the two numbers are comparable.
+                if client && !server {
+                    continue;
+                }
+                if jar.classes.contains_key(&plan.target.owner) {
+                    continue;
+                }
+                server_plans += 1;
+                let Some(site) = game_hook_site_for(&plan.target) else {
+                    continue;
+                };
+                if plan.shift.is_some() || plan.slice.is_some() || plan.ordinal.is_some() {
+                    continue;
+                }
+                let anchor = if plan.at.is_empty() {
+                    "HEAD"
+                } else {
+                    plan.at.as_str()
+                };
+                if game_hook_site_fits(site, anchor, plan.cancellable, MixinSide::Server).is_err() {
+                    continue;
+                }
+                if game_hook_callback(&jar.classes, &plan.callback, site).is_err() {
+                    continue;
+                }
+                mapped += 1;
+                *by_hook.entry(site.hook).or_default() += 1;
+            }
+            bound += jar
+                .plan_load_time_weave_with_game_hooks(MixinSide::Server)
+                .game_hooks
+                .len();
+            jars += 1;
+        }
+        println!(
+            "{jars} jar(s), {server_plans} server-side game plan(s): {mapped} name a mapped hook,              {bound} bind through the runtime's gates, {} still skip",
+            server_plans.saturating_sub(mapped)
+        );
+        for (hook, count) in &by_hook {
+            println!("  {count:4} {hook}");
+        }
+        for failure in &failures {
+            eprintln!("{failure}");
+        }
+        assert!(
+            failures.is_empty(),
+            "{} jar(s) failed to load",
+            failures.len()
+        );
+        assert_eq!(
+            server_plans, 1285,
+            "the loader set changed; re-run tools/hybrid_pack.py --native-score first"
+        );
+        assert!(mapped > 0 && mapped < server_plans, "coverage is partial");
+        assert!(
+            bound > 0 && bound <= mapped,
+            "the runtime cannot bind more than the table maps"
+        );
     }
 }
