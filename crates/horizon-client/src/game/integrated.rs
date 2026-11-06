@@ -1288,12 +1288,12 @@ where
     // The window and its server thread share one process and one
     // `server-status` store: this role's rows answer from it too.
     super::java_mods::record_java_reports(&batch.reports);
+    super::java_mods::record_java_failures(&batch.failures);
     // The window built its root before this thread: the declarations wait in
     // the content store for the reload `poll_integrated_start` asks for.
     super::java_mods::publish_server_declarations(batch.declarations);
     Ok(())
 }
-    super::java_mods::record_java_failures(&batch.failures);
 
 /// The server thread: a game of its own over the shared resources.
 #[allow(clippy::too_many_arguments)]

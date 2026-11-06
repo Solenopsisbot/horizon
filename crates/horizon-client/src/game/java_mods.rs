@@ -526,8 +526,6 @@ pub(super) fn publish_java_game_hooks(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry(role)
-            plans: entry.skip_plans.clone(),
-            skipped_by_reason: entry.skipped_by_reason.clone(),
         .or_default()
         .push(JavaGameHookJar {
             jar,
@@ -572,8 +570,6 @@ pub(super) fn run_java_game_hook(
         outcome.ran += run.ran;
         if run.cancelled {
             outcome.cancelled = true;
-        skip_plans: report.mixin.plans.clone(),
-        skipped_by_reason: report.mixin.skipped_by_reason.clone(),
             break;
         }
     }
@@ -627,6 +623,8 @@ fn run_from_cache(path: &std::path::Path, entry: &java_cache::Entry) -> Result<J
             woven: entry.woven,
             skipped: entry.skipped,
             first_skip_reason: entry.first_skip_reason.clone(),
+            plans: entry.skip_plans.clone(),
+            skipped_by_reason: entry.skipped_by_reason.clone(),
         },
     };
     Ok(JavaJarRun {
@@ -671,6 +669,8 @@ fn cache_entry(
         woven: report.mixin.woven,
         skipped: report.mixin.skipped,
         first_skip_reason: report.mixin.first_skip_reason.clone(),
+        skip_plans: report.mixin.plans.clone(),
+        skipped_by_reason: report.mixin.skipped_by_reason.clone(),
         isolation_failure: report.isolation_failure.clone(),
         rows,
         metadata_rows,
@@ -804,7 +804,6 @@ fn bootstrap_jar(
     game_hooks: bool,
 ) -> Result<JavaJarRun, String> {
     let kinds = if role.is_client() {
-    let (plans, skipped_by_reason) = super::java_runtime_file::plan_rows(&weave.skipped);
         ["client", "main", "neoforge"]
     } else {
         ["server", "main", "neoforge"]
@@ -828,8 +827,6 @@ fn bootstrap_jar(
         horizon_native_java::MixinSide::Client
     } else {
         horizon_native_java::MixinSide::Server
-            plans,
-            skipped_by_reason,
     };
     // The opt-in tier claims a game-class `@Inject` only when a host hook point
     // will fire it; the default weave keeps every such plan a skip.
@@ -914,6 +911,7 @@ fn bootstrap_jar(
         .into_iter()
         .map(|(id, content)| ContentMod { id, content })
         .collect();
+    let (plans, skipped_by_reason) = super::java_runtime_file::plan_rows(&weave.skipped);
     let report = JavaCompatibilityReport {
         jar: path.to_path_buf(),
         loader: loader(&jar),
@@ -937,6 +935,8 @@ fn bootstrap_jar(
                 + weave.woven_modify_variables.len(),
             skipped: weave.skipped.len(),
             first_skip_reason: first_game_skip_reason(&weave.skipped),
+            plans,
+            skipped_by_reason,
         },
     };
     // The jar and its host go back to the batch's serial adoption step, which
@@ -1801,9 +1801,6 @@ mod tests {
         assert!(text.contains("demo/Mixin#hook"), "{text}");
         assert!(
             first_game_skip_reason(&[own]).is_none(),
-        // Through the entry's on-disk form, as a later start reads it.
-        let entry: java_cache::Entry =
-            serde_json::from_slice(&serde_json::to_vec(&entry).unwrap()).unwrap();
             "an in-jar skip needs no loader"
         );
         let unsupported = skipped_plan("demo/Target", MixinSkipReason::UnsupportedFamily, "INVOKE");
@@ -1814,6 +1811,71 @@ mod tests {
             Some("unsupported-family")
         );
         let long = skipped_plan(
+            "net/minecraft/A",
+            MixinSkipReason::Weaver("x".repeat(1000)),
+            "HEAD",
+        );
+        let bounded = first_game_skip_reason(&[long]).unwrap();
+        assert_eq!(bounded.chars().count(), MAX_SKIP_REASON_CHARS);
+        assert!(!bounded.contains(['\n', '\r']));
+    }
+
+    fn report_for(path: &str) -> JavaCompatibilityReport {
+        JavaCompatibilityReport {
+            jar: PathBuf::from(path),
+            loader: Some(JavaLoader::Fabric),
+            engine: JavaEngine::Native,
+            entrypoints: 1,
+            registrations: 1,
+            opaque: 0,
+            isolation_failure: None,
+            mixin: Default::default(),
+        }
+    }
+
+    /// A jar stored on one start replays exactly the declarations it recorded,
+    /// through the same converter the live path uses: the content root of a
+    /// warm start is the one the cold start built.
+    #[test]
+    fn a_cached_run_replays_the_rows_it_recorded() {
+        let _guard = test_lock();
+        let entries = [block_entry("fixture:ruby_block", "minecraft:stone")];
+        let live = declarations_from_entries(&entries).unwrap();
+        let identity = java_cache::Identity {
+            sha256: "a".repeat(64),
+            size: 1024,
+        };
+        let mut report = report_for("/mods/fixture.jar");
+        // The skipped-plan list survives the cache too, so a replayed jar
+        // still explains its `needs-loader` label.
+        let skipped = [skipped_plan(
+            "net/minecraft/world/level/Level",
+            horizon_native_java::MixinSkipReason::TargetOutsideJar,
+            "HEAD",
+        )];
+        report.mixin.skipped = 1;
+        (report.mixin.plans, report.mixin.skipped_by_reason) =
+            super::super::java_runtime_file::plan_rows(&skipped);
+        let entry = cache_entry(
+            &identity,
+            ExecutionRole::DedicatedServer,
+            &entries,
+            &[],
+            &report,
+        );
+        // Through the entry's on-disk form, as a later start reads it.
+        let entry: java_cache::Entry =
+            serde_json::from_slice(&serde_json::to_vec(&entry).unwrap()).unwrap();
+        let cached = run_from_cache(std::path::Path::new("/mods/fixture.jar"), &entry).unwrap();
+        assert_eq!(cached.declarations, live);
+        assert_eq!(cached.content.len(), 1);
+        assert_eq!(cached.content[0].id, "fixture");
+        assert_eq!(cached.content[0].content.blocks.len(), 1);
+        assert_eq!(cached.report, report);
+        assert!(cached.jar.is_none() && cached.host.is_none());
+        assert!(!cacheable(&cached), "a replayed run has no host to adopt");
+    }
+
     /// `java-runtime.json` lists every jar the batch was given in path order:
     /// a refused jar is a row of its own with the runner's whole cause, beside
     /// the started jars and their plan lists.
@@ -1870,70 +1932,6 @@ mod tests {
         assert_eq!(started.skipped_by_reason["cancellable"], 1);
     }
 
-            "net/minecraft/A",
-            MixinSkipReason::Weaver("x".repeat(1000)),
-            "HEAD",
-        );
-        let bounded = first_game_skip_reason(&[long]).unwrap();
-        assert_eq!(bounded.chars().count(), MAX_SKIP_REASON_CHARS);
-        assert!(!bounded.contains(['\n', '\r']));
-    }
-
-    fn report_for(path: &str) -> JavaCompatibilityReport {
-        JavaCompatibilityReport {
-            jar: PathBuf::from(path),
-            loader: Some(JavaLoader::Fabric),
-            engine: JavaEngine::Native,
-            entrypoints: 1,
-            registrations: 1,
-            opaque: 0,
-            isolation_failure: None,
-            mixin: Default::default(),
-        }
-    }
-
-    /// A jar stored on one start replays exactly the declarations it recorded,
-            skip_plans: Vec::new(),
-            skipped_by_reason: BTreeMap::new(),
-    /// through the same converter the live path uses: the content root of a
-    /// warm start is the one the cold start built.
-    #[test]
-    fn a_cached_run_replays_the_rows_it_recorded() {
-        let _guard = test_lock();
-        let entries = [block_entry("fixture:ruby_block", "minecraft:stone")];
-        let live = declarations_from_entries(&entries).unwrap();
-        let identity = java_cache::Identity {
-            sha256: "a".repeat(64),
-            size: 1024,
-        };
-        let mut report = report_for("/mods/fixture.jar");
-        // The skipped-plan list survives the cache too, so a replayed jar
-        // still explains its `needs-loader` label.
-        let skipped = [skipped_plan(
-            "net/minecraft/world/level/Level",
-            horizon_native_java::MixinSkipReason::TargetOutsideJar,
-            "HEAD",
-        )];
-        report.mixin.skipped = 1;
-        (report.mixin.plans, report.mixin.skipped_by_reason) =
-            super::super::java_runtime_file::plan_rows(&skipped);
-        let entry = cache_entry(
-            &identity,
-            ExecutionRole::DedicatedServer,
-            &entries,
-            &[],
-            &report,
-        );
-        let cached = run_from_cache(std::path::Path::new("/mods/fixture.jar"), &entry).unwrap();
-        assert_eq!(cached.declarations, live);
-        assert_eq!(cached.content.len(), 1);
-        assert_eq!(cached.content[0].id, "fixture");
-        assert_eq!(cached.content[0].content.blocks.len(), 1);
-        assert_eq!(cached.report, report);
-        assert!(cached.jar.is_none() && cached.host.is_none());
-        assert!(!cacheable(&cached), "a replayed run has no host to adopt");
-    }
-
     /// The rows are the declaration input, so a cache entry that cannot rebuild
     /// them is a miss rather than a partly applied mod.
     #[test]
@@ -1957,6 +1955,8 @@ mod tests {
             woven: 0,
             skipped: 0,
             first_skip_reason: None,
+            skip_plans: Vec::new(),
+            skipped_by_reason: BTreeMap::new(),
             isolation_failure: None,
             rows: Vec::new(),
             metadata_rows: Vec::new(),
