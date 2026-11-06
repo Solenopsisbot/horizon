@@ -21,6 +21,7 @@ use jni::{
     objects::{JClass, JObject, JObjectArray, JValue, JValueOwned},
 };
 use std::{
+    collections::HashSet,
     ffi::OsString,
     fs::{self, File},
     io::Read,
@@ -1544,6 +1545,15 @@ fn run() -> Result<(), String> {
         return report_measure(&plan);
     }
     let nested = expand_nested_jars(&mut classpath, launch_game_flag)?;
+    // Knot's code sources keep the platform logging jars off (the bridge's
+    // `isLoggingJar`), so a mod that shades them would win Knot's child-first
+    // lookup; see `shadow_platform_logging`. Only a Knot-backed run has that
+    // lookup, so every other probe keeps its jars byte-identical.
+    if knot_launch {
+        for line in shadow_platform_logging(&mut args, &mut classpath, &nested.root)? {
+            eprintln!("{line}");
+        }
+    }
     if let Some(bridge) = nested.compile_loader_bridge() {
         classpath.insert(0, bridge);
     }
@@ -7666,6 +7676,194 @@ fn is_duplicate_log4j_jar(name: &str, classpath: &[PathBuf]) -> bool {
             .and_then(|value| value.to_str())
             .is_some_and(|value| value.eq_ignore_ascii_case(name))
     })
+}
+
+/// Whether a classpath entry is one of the platform logging jars the bridge
+/// keeps parent-visible only (its `isLoggingJar`: `log4j-*`, `slf4j-*`).
+fn is_platform_logging_jar(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase())
+        .is_some_and(|name| {
+            name.ends_with(".jar") && (name.starts_with("log4j-") || name.starts_with("slf4j-"))
+        })
+}
+
+/// Hide a supplied mod's own copy of the platform logging classes from Knot.
+///
+/// Fabric's real launch registers the game's logging jars as Knot code
+/// sources before any mod (`MinecraftGameProvider.initialize` adds every log
+/// jar with `addToClassPath`, and mods only follow in `finishModLoading`), and
+/// Knot's URL loader searches code sources in that order, so a class both a
+/// logging jar and a mod carry resolves to the game's copy. This launch keeps
+/// those jars parent-visible only, because registering them beside the
+/// already-loaded parent copy breaks Log4j's `UpperLookup` cast. Without this
+/// step a mod that shades the API therefore wins Knot's child-first lookup:
+/// Axiom ships slf4j 1.x's `org/slf4j/LoggerFactory`, SLF4J falls back to its
+/// NOP logger, and every Minecraft log line (`Done (` included) vanishes while
+/// the server keeps running, so the launch looked like a hang at the last
+/// line Mixin logged through Log4j.
+///
+/// A jar with such classes is replaced, in `args` and `classpath`, by a copy
+/// under `root` that drops exactly the class files a logging jar on the
+/// classpath already provides; everything else (its other classes, the
+/// metadata, nested jars, resources) is copied unchanged, and the copy keeps
+/// the original file name. A jar with no overlap is untouched. Returns one
+/// line per rewritten jar for the run's stderr.
+fn shadow_platform_logging(
+    args: &mut [String],
+    classpath: &mut [PathBuf],
+    root: &Path,
+) -> Result<Vec<String>, String> {
+    let mut provided: HashSet<String> = HashSet::new();
+    for path in classpath
+        .iter()
+        .filter(|path| is_platform_logging_jar(path))
+    {
+        let Ok(file) = File::open(path) else {
+            continue;
+        };
+        let Ok(archive) = zip::ZipArchive::new(file) else {
+            continue;
+        };
+        provided.extend(
+            archive
+                .file_names()
+                .filter(|name| name.ends_with(".class") && !name.starts_with("META-INF/"))
+                .map(str::to_owned),
+        );
+    }
+    let mut lines = Vec::new();
+    if provided.is_empty() {
+        return Ok(lines);
+    }
+    for (index, arg) in args.iter_mut().enumerate() {
+        let source = PathBuf::from(arg.as_str());
+        let Ok(file) = File::open(&source) else {
+            continue;
+        };
+        let Ok(mut archive) = zip::ZipArchive::new(file) else {
+            continue;
+        };
+        let hidden = archive
+            .file_names()
+            .filter(|name| provided.contains(*name))
+            .count();
+        if hidden == 0 {
+            continue;
+        }
+        let name = source
+            .file_name()
+            .ok_or_else(|| format!("{}: no file name", source.display()))?;
+        let folder = root.join(format!("logging-shadow-{index}"));
+        fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+        let target = folder.join(name);
+        let out = File::create(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+        let mut writer = zip::ZipWriter::new(out);
+        for entry_index in 0..archive.len() {
+            let entry = archive
+                .by_index_raw(entry_index)
+                .map_err(|e| format!("{}: reading zip entry: {e}", source.display()))?;
+            if provided.contains(entry.name()) {
+                continue;
+            }
+            writer
+                .raw_copy_file(entry)
+                .map_err(|e| format!("{}: {e}", target.display()))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| format!("{}: {e}", target.display()))?;
+        for entry in classpath.iter_mut() {
+            if *entry == source {
+                *entry = target.clone();
+            }
+        }
+        lines.push(format!(
+            "horizon-jvm: hid {hidden} platform logging class(es) {} shades; the game's logging jars serve them, as in Fabric's own class path order",
+            name.to_string_lossy()
+        ));
+        *arg = target.to_string_lossy().into_owned();
+    }
+    Ok(lines)
+}
+
+#[cfg(test)]
+mod logging_shadow_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn jar(path: &Path, entries: &[&str]) {
+        let mut zip = zip::ZipWriter::new(File::create(path).unwrap());
+        for name in entries {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(name.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn names(path: &Path) -> Vec<String> {
+        let archive = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let mut out: Vec<String> = archive.file_names().map(str::to_owned).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_mod_loses_the_logging_classes_the_platform_jar_provides() {
+        let dir = std::env::temp_dir().join(format!("horizon-jvm-shadow-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("out")).unwrap();
+        let api = dir.join("slf4j-api-2.0.17.jar");
+        jar(
+            &api,
+            &["org/slf4j/LoggerFactory.class", "org/slf4j/Logger.class"],
+        );
+        let shading = dir.join("shading-mod.jar");
+        jar(
+            &shading,
+            &[
+                "fabric.mod.json",
+                "org/slf4j/LoggerFactory.class",
+                "org/slf4j/impl/StaticLoggerBinder.class",
+                "com/example/Mod.class",
+            ],
+        );
+        let plain = dir.join("plain-mod.jar");
+        jar(&plain, &["fabric.mod.json", "com/example/Other.class"]);
+        let mut args = vec![
+            shading.to_string_lossy().into_owned(),
+            plain.to_string_lossy().into_owned(),
+        ];
+        let mut classpath = vec![api.clone(), shading.clone(), plain.clone()];
+
+        let lines = shadow_platform_logging(&mut args, &mut classpath, &dir.join("out")).unwrap();
+
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let copy = PathBuf::from(&args[0]);
+        assert_ne!(copy, shading);
+        assert_eq!(copy.file_name(), shading.file_name());
+        assert_eq!(classpath[1], copy);
+        // Only the class the platform jar also has is gone; a class only the
+        // mod carries (slf4j 1.x's binder) still resolves from the mod.
+        assert_eq!(
+            names(&copy),
+            [
+                "com/example/Mod.class",
+                "fabric.mod.json",
+                "org/slf4j/impl/StaticLoggerBinder.class"
+            ]
+        );
+        assert_eq!(PathBuf::from(&args[1]), plain);
+        assert_eq!(classpath[2], plain);
+        assert_eq!(
+            names(&shading).len(),
+            4,
+            "the supplied jar is never modified"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 fn nested_jar_name(entry: &str) -> Option<&str> {
