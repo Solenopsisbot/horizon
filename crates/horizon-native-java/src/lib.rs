@@ -14,6 +14,8 @@ use std::{
 };
 
 pub mod weaver;
+mod java_regex;
+mod stack_walk;
 
 use weaver::{
     InvokeShift, Shift, SiteSelector, SliceBounds, weave_extended_classes_with_instance_callbacks,
@@ -2344,6 +2346,19 @@ impl StdHost {
         if result_descriptor(descriptor).starts_with('[') {
             return Value::Ref(Some("array/empty".into()));
         }
+        // Codecs are immutable values the game builds from other codecs
+        // (`StreamCodec.composite(ByteBufCodecs.INT, ...)`,
+        // `RecordCodecBuilder.create`); no factory or constant of the game
+        // answers null for one, and payload records `requireNonNull` theirs.
+        // An opaque marker of the declared type keeps the chain honest: it
+        // names no behaviour, it is just not null.
+        if let Some(codec) = result_descriptor(descriptor)
+            .strip_prefix('L')
+            .and_then(|name| name.strip_suffix(';'))
+            .filter(|name| is_codec_type(name))
+        {
+            return Value::Ref(Some(format!("{codec}#codec")));
+        }
         Value::default_for(descriptor)
     }
 
@@ -4138,6 +4153,23 @@ impl Host for StdHost {
             | ("java/util/Collections", "unmodifiableSet", "(Ljava/util/Set;)Ljava/util/Set;")
             | ("java/util/Collections", "unmodifiableMap", "(Ljava/util/Map;)Ljava/util/Map;") => {
                 Ok(Self::argument(r, args, 0)?.clone())
+            }
+            // `Pattern.matches(regex, input)` is `String.matches` spelled
+            // statically; the same bounded subset answers it.
+            (
+                "java/util/regex/Pattern",
+                "matches",
+                "(Ljava/lang/String;Ljava/lang/CharSequence;)Z",
+            ) => {
+                let pattern = expect_string(Self::argument(r, args, 0)?);
+                let input = expect_string(Self::argument(r, args, 1)?);
+                java_regex::full_match(pattern, input)
+                    .map(|matched| Value::Int(i32::from(matched)))
+                    .ok_or_else(|| {
+                        NativeError::Metadata(format!(
+                            "Pattern.matches pattern {pattern:?} is outside the native regex subset"
+                        ))
+                    })
             }
             ("java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => Ok(
                 Value::Int((Self::argument(r, args, 0)? == Self::argument(r, args, 1)?) as i32),
@@ -6739,6 +6771,18 @@ impl Host for StdHost {
             }
             ("java/lang/String", "isBlank", "()Z") => {
                 Ok(Value::Int(expect_string(receiver).trim().is_empty() as i32))
+            }
+            // Whole-input regex validation (`id.matches("[a-z0-9_.-]*")`).
+            // A pattern outside the bounded subset is named, never guessed.
+            ("java/lang/String", "matches", "(Ljava/lang/String;)Z") => {
+                let pattern = expect_string(Self::argument(r, args, 0)?);
+                java_regex::full_match(pattern, expect_string(receiver))
+                    .map(|matched| Value::Int(i32::from(matched)))
+                    .ok_or_else(|| {
+                        NativeError::Metadata(format!(
+                            "String.matches pattern {pattern:?} is outside the native regex subset"
+                        ))
+                    })
             }
             ("java/lang/String", "substring", "(I)Ljava/lang/String;") => {
                 let start = expect_int(r, Self::argument(r, args, 0)?)?;
@@ -9696,6 +9740,19 @@ fn java_float_text(scientific: String) -> String {
 
 /// The collection kind a reference return descriptor declares, when it is one
 /// of the `java.util` collections the host models.
+/// The game's codec value types: a call or constant declared to answer one
+/// never answers null in the game.
+fn is_codec_type(name: &str) -> bool {
+    matches!(
+        name,
+        "net/minecraft/network/codec/StreamCodec"
+            | "com/mojang/serialization/Codec"
+            | "com/mojang/serialization/MapCodec"
+            | "com/mojang/serialization/codecs/PrimitiveCodec"
+            | "com/mojang/serialization/codecs/RecordCodecBuilder"
+    )
+}
+
 fn empty_collection_kind(descriptor: &str) -> Option<&'static str> {
     let name = descriptor.strip_prefix('L')?.strip_suffix(';')?;
     if is_map_owner(name) {
@@ -11128,6 +11185,55 @@ impl ClassFile {
             }
             if matching {
                 return signature;
+            }
+        }
+        None
+    }
+
+    /// The runtime-visible annotations of one field.
+    ///
+    /// [`Field`] keeps only what linking needs, so `Field.getAnnotation` and
+    /// `isAnnotationPresent` re-read the field's attribute table on demand,
+    /// the way [`Self::field_signature`] does. Only `RuntimeVisibleAnnotations`
+    /// is read: a `CLASS`-retention annotation is invisible to reflection on
+    /// the JVM too. A malformed table answers no annotations.
+    fn field_annotations(&self, field_name: &str, field_descriptor: &str) -> Vec<Annotation> {
+        self.read_field_annotations(field_name, field_descriptor)
+            .unwrap_or_default()
+    }
+
+    fn read_field_annotations(
+        &self,
+        field_name: &str,
+        field_descriptor: &str,
+    ) -> Option<Vec<Annotation>> {
+        let mut r = Reader::new(&self.raw);
+        if r.u4().ok()? != 0xCAFE_BABE {
+            return None;
+        }
+        r.skip(4).ok()?;
+        let pool = read_pool(&mut r).ok()?;
+        r.skip(6).ok()?; // access, this, super
+        let interfaces = r.u2().ok()? as usize;
+        r.skip(interfaces.checked_mul(2)?).ok()?;
+        let fields = r.u2().ok()? as usize;
+        for _ in 0..fields {
+            let _access = r.u2().ok()?;
+            let name = utf8(&pool, r.u2().ok()?).ok()?;
+            let descriptor = utf8(&pool, r.u2().ok()?).ok()?;
+            let attributes = r.u2().ok()? as usize;
+            let matching = name == field_name && descriptor == field_descriptor;
+            let mut annotations = Vec::new();
+            for _ in 0..attributes {
+                let attribute = utf8(&pool, r.u2().ok()?).ok()?;
+                let length = r.u4().ok()? as usize;
+                let bytes = r.bytes(length).ok()?;
+                if matching && attribute == "RuntimeVisibleAnnotations" {
+                    annotations.extend(read_annotations(&mut Reader::new(bytes), &pool).ok()?);
+                }
+            }
+            if matching {
+                return Some(annotations);
             }
         }
         None
@@ -13298,6 +13404,13 @@ impl NativeJar {
                 classes.push(class);
             }
         }
+        // Fabric's `"environment": "client"` keeps a mod off the dedicated
+        // server entirely: the real loader never loads it there, so neither its
+        // Fabric entrypoints nor a NeoForge `@Mod` class a multi-loader jar
+        // also carries may run in a server role.
+        let fabric_client_only = metadata
+            .as_deref()
+            .is_some_and(fabric_environment_is_client);
         let (fabric_id, fabric_version, fabric_entrypoints, required_mods) = metadata
             .map(|m| parse_metadata(&m))
             .transpose()?
@@ -13319,7 +13432,7 @@ impl NativeJar {
         jar.fabric_version = fabric_version;
         jar.neoforge_id = neoforge_id;
         jar.neoforge_version = neoforge_version;
-        jar.client_side_only = client_side_only;
+        jar.client_side_only = client_side_only || fabric_client_only;
         if !neoforge_required_mods.is_empty() {
             let mut required = required_mods;
             required.extend(neoforge_required_mods);
@@ -18092,9 +18205,10 @@ impl<H: Host> Runtime<'_, H> {
             let Some(declared) = file.method(method, desc) else {
                 return Ok(None);
             };
-            if declared.code.is_some() {
-                return Ok(None);
-            }
+            // Real Mixin replaces the member's body whatever it is: an
+            // interface accessor is abstract, but a `static` one must carry a
+            // placeholder body (`throw new AssertionError()`), and running that
+            // body is exactly the failure the generated code exists to avoid.
             let Some(plan) = resolve_mixin_accessor(file, declared) else {
                 return Ok(None);
             };
@@ -18119,9 +18233,36 @@ impl<H: Host> Runtime<'_, H> {
                         .and_then(|receiver| instance_field_key(receiver, &target))
                         .and_then(|key| self.fields.get(&key).cloned())
                 };
-                Ok(Some(
-                    value.unwrap_or_else(|| Value::default_for(&target.descriptor)),
-                ))
+                // A field the jar never wrote belongs to the game: ask the
+                // host, exactly as a `getstatic`/`getfield` on that class does,
+                // so a game registry map answers its modelled (empty) table
+                // rather than a null the caller's next `put` dereferences.
+                // The answer is kept in the field table: the game's field holds
+                // one object, so a second read must see the entries the first
+                // caller put into it.
+                let value = match value {
+                    Some(value) => value,
+                    None if !self.has_class(&target.owner) => {
+                        let value = self.host.get_static(&target)?;
+                        if value != Value::Ref(None) {
+                            if plan.static_target {
+                                self.static_fields
+                                    .insert(Self::static_field_key(&target), value.clone());
+                            } else if let Some(key) =
+                                receiver.and_then(|receiver| instance_field_key(receiver, &target))
+                            {
+                                self.fields.insert(key, value.clone());
+                            }
+                        }
+                        value
+                    }
+                    None => Value::Ref(None),
+                };
+                Ok(Some(if value == Value::Ref(None) {
+                    Value::default_for(&target.descriptor)
+                } else {
+                    value
+                }))
             }
             MixinAccessorKind::Setter => {
                 let value = args.first().cloned().unwrap_or(Value::Void);
@@ -18217,13 +18358,24 @@ impl<H: Host> Runtime<'_, H> {
             // body. The host's own surface answers it; a collection's `stream`
             // is the interpreter's, and the host's identity `Function.apply`
             // would otherwise hand the receiver back unchanged.
-            let (receiver, rest) = if let Some((receiver, rest)) = callback.captures.split_first() {
-                (receiver.clone(), rest.to_vec())
-            } else if let Some((receiver, rest)) = args.split_first() {
-                (receiver.clone(), rest.to_vec())
-            } else {
+            //
+            // The marker does not record the handle kind, so the arity tells
+            // the shapes apart: the callback's values are the captures followed
+            // by the call's own arguments, exactly the JVM's argument order. One
+            // more value than the target declares is a receiver
+            // (`Enum.class::isAssignableFrom` bound, `String::length`
+            // unbound); exactly as many is a static reference
+            // (`Integer::parseInt`).
+            let mut values = callback.captures.clone();
+            values.extend_from_slice(args);
+            let expected = arg_count(&callback.target.descriptor);
+            if values.len() == expected && callback.target.name != "<init>" {
+                return self.host.invoke(&callback.target, &values).map(Some);
+            }
+            let Some((receiver, rest)) = values.split_first() else {
                 return Ok(None);
             };
+            let (receiver, rest) = (receiver.clone(), rest.to_vec());
             // A constructor reference (`GameClass::new`) is a factory whose
             // effective result is the constructed object, even though `<init>`
             // itself returns void. The class is outside the jar, so there is no
@@ -18240,6 +18392,15 @@ impl<H: Host> Runtime<'_, H> {
                     .map(|value| parse_collection_value(&value))
                     .collect::<Result<Vec<_>, _>>()?;
                 return Ok(Some(self.new_stream("callback", "stream", values)));
+            }
+            // Reflection is the interpreter's own surface (it knows the jar's
+            // hierarchy, annotations and fields); the host only answers it
+            // nominally. A method reference such as `Enum.class::isAssignableFrom`
+            // must get the same answer the direct call would.
+            if let Some(value) =
+                self.invoke_reflect_method(&callback.target, Some(&receiver), &rest)?
+            {
+                return Ok(Some(value));
             }
             return self
                 .host
@@ -18926,6 +19087,44 @@ impl<H: Host> Runtime<'_, H> {
                 _ => Ok(None),
             };
         }
+        // `isAssignableFrom` walks the jar's hierarchy, so a predicate such as
+        // `Enum.class::isAssignableFrom` accepts a jar enum. Names the runtime
+        // does not hold keep the host's nominal answer (identity, `Object`).
+        if r.owner == "java/lang/Class"
+            && r.name == "isAssignableFrom"
+            && r.descriptor == "(Ljava/lang/Class;)Z"
+        {
+            let target = reflection_class_name(receiver, r)?.replace('.', "/");
+            let source = reflection_class_name(args.first(), r)?.replace('.', "/");
+            let assignable = target == source
+                || target == "java/lang/Object"
+                || (!class_is_primitive(&Value::Ref(Some(source.clone())))
+                    && self.class(&source).is_some()
+                    && self.class_is_instance(&source, &target));
+            if assignable || self.class(&source).is_some() {
+                return Ok(Some(Value::Int(i32::from(assignable))));
+            }
+        }
+        // `getSuperclass` walks the jar's own hierarchy: a config scanner that
+        // recurses until it reaches `Object.class` must reach it. A class the
+        // runtime does not hold (a game or JDK class) answers `Object`, the one
+        // ancestor every class shares, so the walk still terminates; `Object`
+        // itself, primitives and `void` answer null as on the JVM.
+        if r.owner == "java/lang/Class"
+            && r.name == "getSuperclass"
+            && r.descriptor == "()Ljava/lang/Class;"
+        {
+            let class = reflection_class_name(receiver, r)?.replace('.', "/");
+            if class == "java/lang/Object" || class_is_primitive(&Value::Ref(Some(class.clone()))) {
+                return Ok(Some(Value::Ref(None)));
+            }
+            let parent = self
+                .class(&class)
+                .map(|file| file.super_name.clone())
+                .filter(|parent| !parent.is_empty())
+                .unwrap_or_else(|| "java/lang/Object".to_owned());
+            return Ok(Some(Value::Ref(Some(parent))));
+        }
         if r.owner == "java/lang/Class"
             && matches!(r.name.as_str(), "getFields" | "getDeclaredFields")
             && r.descriptor == "()[Ljava/lang/reflect/Field;"
@@ -19033,6 +19232,41 @@ impl<H: Host> Runtime<'_, H> {
                     |descriptor| format!("reflect-constructor/{class}#{descriptor}"),
                 );
             return Ok(Some(Value::Ref(Some(marker))));
+        }
+        // `AnnotatedElement` queries the class-file model answers for classes,
+        // fields and methods alike: whether an annotation is present, and a
+        // field's (or a class's declared) annotation. Config libraries ask
+        // `isAnnotationPresent(Config.class)` before reading anything, so a
+        // neutral `false` made them reject their own config holders.
+        if matches!(
+            r.owner.as_str(),
+            "java/lang/Class"
+                | "java/lang/reflect/Field"
+                | "java/lang/reflect/Method"
+                | "java/lang/reflect/Constructor"
+                | "java/lang/reflect/Executable"
+                | "java/lang/reflect/AccessibleObject"
+                | "java/lang/reflect/AnnotatedElement"
+        ) && matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            ("isAnnotationPresent", "(Ljava/lang/Class;)Z")
+                | (
+                    "getAnnotation" | "getDeclaredAnnotation",
+                    "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
+                )
+        ) && !(r.owner == "java/lang/Class" && r.name == "getAnnotation")
+            && !(r.owner == "java/lang/reflect/Method" && r.name == "getAnnotation")
+            && let Some(annotations) =
+                receiver.and_then(|receiver| self.element_annotations(receiver))
+        {
+            let wanted = expect_string(StdHost::argument(r, args, 0)?).replace('.', "/");
+            let found = annotations
+                .into_iter()
+                .find(|annotation| annotation_is(annotation, &wanted));
+            if r.name == "isAnnotationPresent" {
+                return Ok(Some(Value::Int(i32::from(found.is_some()))));
+            }
+            return Ok(Some(self.annotation_proxy(found)));
         }
         if r.owner == "java/lang/Class"
             && r.name == "getAnnotation"
@@ -19282,6 +19516,50 @@ impl<H: Host> Runtime<'_, H> {
 
     /// Hand out one runtime annotation a class or method already declares.
     /// Absence is Java's `null`, never an invented empty annotation.
+    /// The visible annotations of one reflected element: a class marker, a
+    /// `reflect-field/` marker or a `reflect-method/` (or constructor) marker
+    /// naming a class the runtime holds. `None` when the element is not one
+    /// the class-file model knows, so the call keeps its host answer.
+    fn element_annotations(&self, receiver: &Value) -> Option<Vec<Annotation>> {
+        let marker = expect_ref(receiver)?;
+        if let Some(rest) = marker.strip_prefix("reflect-field/") {
+            let (class, member) = rest.split_once('#')?;
+            let (name, declared) = parse_field_marker(member);
+            let file = self.class(class)?;
+            let descriptor = match declared {
+                Some((descriptor, _)) => descriptor.to_owned(),
+                None => file
+                    .fields
+                    .iter()
+                    .find(|field| field.name == name)?
+                    .descriptor
+                    .clone(),
+            };
+            return Some(file.field_annotations(name, &descriptor));
+        }
+        if let Some(rest) = marker
+            .strip_prefix("reflect-method/")
+            .or_else(|| marker.strip_prefix("reflect-constructor/"))
+        {
+            let (class, member) = rest.split_once('#')?;
+            let (name, descriptor) = if marker.starts_with("reflect-constructor/") {
+                ("<init>", (!member.is_empty()).then_some(member))
+            } else {
+                member
+                    .find('(')
+                    .map_or((member, None), |at| (&member[..at], Some(&member[at..])))
+            };
+            let file = self.class(class)?;
+            let method = file.methods.iter().find(|candidate| {
+                candidate.name == name
+                    && descriptor.is_none_or(|descriptor| candidate.descriptor == descriptor)
+            })?;
+            return Some(method.annotations.clone());
+        }
+        let class = marker.replace('.', "/");
+        self.class(&class).map(|file| file.annotations.clone())
+    }
+
     fn annotation_proxy(&mut self, annotation: Option<Annotation>) -> Value {
         let Some(annotation) = annotation else {
             return Value::Ref(None);
@@ -20933,18 +21211,32 @@ impl<H: Host> Runtime<'_, H> {
         opcode: u8,
         receiver: Option<&Value>,
     ) -> Option<(String, bool)> {
-        // Only an abstract/interface declaration needs the receiver's class to
-        // find the body. A concrete inherited method keeps its symbolic owner,
-        // which avoids re-running an override whose class state the bounded
-        // interpreter may not have initialized.
-        let symbolic_is_abstract = self
+        // An abstract/interface declaration needs the receiver's class to find
+        // the body.
+        let symbolic = self
             .class(&r.owner)
-            .and_then(|file| file.method(&r.name, &r.descriptor))
-            .is_some_and(|method| method.code.is_none());
+            .and_then(|file| file.method(&r.name, &r.descriptor));
+        let symbolic_is_abstract = symbolic.is_some_and(|method| method.code.is_none());
         if symbolic_is_abstract
             && matches!(opcode, 0xb6 | 0xb9)
             && let Some(class) = receiver.and_then(|value| self.receiver_class(value))
             && class != r.owner
+            && let Some((owner, true)) = self.member_owner(class, &r.name, &r.descriptor)
+        {
+            return Some((owner, true));
+        }
+        // A concrete method is overridable too: a platform probe calls
+        // `platform.name()` on a subclass whose override is the answer, while
+        // the base body only throws. The receiver must be an object this run
+        // constructed (`class#n`, so `new` already initialized its class) of a
+        // jar subclass of the symbolic owner; a private member is never
+        // overridden (nestmates reach one with `invokevirtual`).
+        if matches!(opcode, 0xb6 | 0xb9)
+            && symbolic.is_some_and(|method| method.access & 0x0002 == 0 && method.code.is_some())
+            && let Some(marker) = receiver.and_then(expect_ref)
+            && let Some((class, _)) = marker.split_once('#')
+            && class != r.owner
+            && self.class_is_instance(class, &r.owner)
             && let Some((owner, true)) = self.member_owner(class, &r.name, &r.descriptor)
         {
             return Some((owner, true));
@@ -21234,12 +21526,15 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 self.new_stream(class, method, distinct)
             }
+            // Both take a `long` (`ldc2_w 2L`), not an `int`.
             ("limit", "(J)Ljava/util/stream/Stream;") => {
-                let limit = expect_int(r, StdHost::argument(r, args, 0)?)?.max(0) as usize;
+                let limit = usize::try_from(expect_long(r, StdHost::argument(r, args, 0)?)?.max(0))
+                    .unwrap_or(usize::MAX);
                 self.new_stream(class, method, values.into_iter().take(limit).collect())
             }
             ("skip", "(J)Ljava/util/stream/Stream;") => {
-                let skip = expect_int(r, StdHost::argument(r, args, 0)?)?.max(0) as usize;
+                let skip = usize::try_from(expect_long(r, StdHost::argument(r, args, 0)?)?.max(0))
+                    .unwrap_or(usize::MAX);
                 self.new_stream(class, method, values.into_iter().skip(skip).collect())
             }
             ("anyMatch", "(Ljava/util/function/Predicate;)Z") => {
@@ -21417,7 +21712,9 @@ impl<H: Host> Runtime<'_, H> {
             return Err(self.budget_exceeded(class, method));
         }
         self.depth += 1;
+        stack_walk::enter(class, method);
         let result = self.invoke_frame(class, method, desc, receiver, args);
+        stack_walk::leave();
         self.depth -= 1;
         result
     }
@@ -21462,6 +21759,19 @@ impl<H: Host> Runtime<'_, H> {
             .method(method, desc)
             .cloned()
             .ok_or_else(|| NativeError::MissingMethod(format!("{class}#{method}{desc}")))?;
+        // A `static` accessor in a Mixin interface has a placeholder body that
+        // only throws; Mixin generates the real one. Run the generated contract
+        // instead of the placeholder.
+        if target.code.is_some()
+            && target.annotations.iter().any(|annotation| {
+                annotation.descriptor == MIXIN_ACCESSOR_DESCRIPTOR
+                    || annotation.descriptor == MIXIN_INVOKER_DESCRIPTOR
+            })
+            && let Some(value) =
+                self.invoke_mixin_accessor(receiver.as_ref(), class, method, desc, args)?
+        {
+            return Ok(value);
+        }
         let Some(ref code) = target.code else {
             // An `@Accessor`/`@Invoker` member also has no body of its own:
             // real Mixin generates the getter, setter or forwarding call. The
@@ -22529,6 +22839,10 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         value
                     } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_stack_walker(&r, receiver.as_ref(), &args))
+                    {
+                        value
+                    } else if let Some(value) =
                         self.invoke_callback_info(&r, receiver.as_ref(), &args)?
                     {
                         value
@@ -23430,6 +23744,22 @@ fn lenient_json_text(text: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(text)
     }
+}
+
+/// Whether a `fabric.mod.json` declares the mod for the client environment
+/// only. A string `"client"` is the only client-only form; `"*"`, `"server"`, a
+/// missing key or unreadable metadata keep the mod loadable on a server (the
+/// last is diagnosed by [`parse_metadata`] itself).
+fn fabric_environment_is_client(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(&lenient_json_text(text))
+        .ok()
+        .and_then(|value| {
+            value
+                .get("environment")
+                .and_then(serde_json::Value::as_str)
+                .map(|environment| environment == "client")
+        })
+        .unwrap_or(false)
 }
 
 fn parse_metadata(

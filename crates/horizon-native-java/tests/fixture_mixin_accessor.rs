@@ -350,3 +350,94 @@ public final class PlayerFactory {
         BTreeMap::from([("default".to_owned(), true), ("roundtrip".to_owned(), true),])
     );
 }
+
+/// A `static` accessor and invoker in a Mixin interface carry a placeholder
+/// body (`throw new AssertionError()`) because Java requires one; Mixin
+/// replaces it. CreativeCore's `ArgumentTypeInfosAccessor.getByClass()` is this
+/// shape against a game registry map. The run must take the generated
+/// contract, not the placeholder, and the game map must keep its identity
+/// across reads, as the one field it is.
+#[test]
+fn static_accessor_placeholder_body_is_replaced_by_the_generated_contract() {
+    let mut sources = annotation_sources();
+    sources.insert(
+        "net/minecraft/commands/synchronization/ArgumentTypeInfos.java",
+        r#"package net.minecraft.commands.synchronization;
+public class ArgumentTypeInfos {}
+"#,
+    );
+    sources.insert(
+        "demo/Probe.java",
+        r#"package demo;
+public final class Probe {
+    public static void check(String label, boolean value) {}
+}
+"#,
+    );
+    sources.insert(
+        "demo/InfosAccessor.java",
+        r#"package demo;
+import java.util.Map;
+import net.minecraft.commands.synchronization.ArgumentTypeInfos;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.gen.Accessor;
+import org.spongepowered.asm.mixin.gen.Invoker;
+
+@Mixin(ArgumentTypeInfos.class)
+public interface InfosAccessor {
+    @Accessor("BY_CLASS")
+    static Map<Class<?>, Object> getByClass() { throw new AssertionError(); }
+    @Invoker("bootstrap")
+    static Object callBootstrap(Object registry) { throw new AssertionError(); }
+}
+"#,
+    );
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import java.util.Map;
+public final class Main {
+    public static void main() {
+        Map<Class<?>, Object> first = InfosAccessor.getByClass();
+        Probe.check("map", first != null);
+        first.put(String.class, "info");
+        Probe.check("same-map", InfosAccessor.getByClass().get(String.class) == "info");
+        InfosAccessor.callBootstrap(null);
+        Probe.check("invoker", true);
+    }
+}
+"#,
+    );
+    let jar_path = build_jar(
+        "static-placeholder",
+        sources,
+        &[(
+            "demo.mixins.json",
+            r#"{"required":true,"package":"demo","mixins":["InfosAccessor"]}"#,
+        )],
+        &[
+            "demo/Probe.class",
+            "net/minecraft/commands/synchronization/ArgumentTypeInfos.class",
+            "org/spongepowered/asm/mixin/Mixin.class",
+            "org/spongepowered/asm/mixin/gen/Accessor.class",
+            "org/spongepowered/asm/mixin/gen/Invoker.class",
+        ],
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let mut host = StdHost::new();
+    jar.execute("demo.Main", Some("main"), "main", &mut host)
+        .unwrap();
+    assert_eq!(
+        checks(&host),
+        BTreeMap::from([
+            ("invoker".to_owned(), true),
+            ("map".to_owned(), true),
+            ("same-map".to_owned(), true),
+        ])
+    );
+    // The invoker reached the game target through the host, not the body.
+    assert!(host.invocations().iter().any(|invocation| {
+        invocation.method.owner == "net/minecraft/commands/synchronization/ArgumentTypeInfos"
+            && invocation.method.name == "bootstrap"
+    }));
+}
