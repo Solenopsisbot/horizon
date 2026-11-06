@@ -1779,6 +1779,18 @@ pub trait Host {
         None
     }
 
+    /// Whether the host itself answers `name`, so a linked jar's copy of that
+    /// class must not shadow it.
+    ///
+    /// The default `false` keeps a host with no modelled surface exactly as
+    /// before: every name it does not own comes from the linked table. A host
+    /// that models the game, the loader APIs or the JDK answers `true`, and
+    /// linked resolution skips those names the same way it skips a class the
+    /// running jar declares itself.
+    fn models_class(&self, _name: &str) -> bool {
+        false
+    }
+
     /// Message a host recorded for one bounded Throwable marker.
     ///
     /// The interpreter keeps objects as markers, so a host that answers
@@ -3201,6 +3213,13 @@ impl Host for StdHost {
 
     fn linked_class_table(&self) -> Option<&Arc<LinkedClassTable>> {
         Some(&self.linked_classes)
+    }
+
+    /// The standard host answers the JDK, the game and the loader/platform
+    /// APIs itself, so a pack jar's copy of one of those classes never takes
+    /// the host's place.
+    fn models_class(&self, name: &str) -> bool {
+        host_models_class(name)
     }
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
@@ -11246,6 +11265,51 @@ fn member_is_kotlin_runtime(member: &str) -> bool {
         .starts_with("kotlin/")
 }
 
+/// Package roots the platform supplies itself: the Fabric loader, the Kotlin
+/// runtime a language adapter loads as its own mod, and the two logging
+/// backends a pack commonly bundles.
+///
+/// A JVM reaches these classes through the loader before any pack jar, so a
+/// pack's copies are never the definitions the game runs. The pack class path
+/// leaves them out instead of letting a jar shadow the platform with a copy
+/// whose static initializer or service surface differs from the host's.
+const PLATFORM_CLASS_ROOTS: &[&str] = &[
+    "net/fabricmc/",
+    "kotlin/",
+    "org/slf4j/",
+    "org/apache/logging/log4j/",
+];
+
+/// Whether `name` belongs to a package the platform provides.
+fn is_platform_class(name: &str) -> bool {
+    PLATFORM_CLASS_ROOTS
+        .iter()
+        .any(|root| name.starts_with(root))
+}
+
+/// Whether the bounded host answers `name` itself: the platform packages,
+/// the JDK, the game, Gson and Mixin's callback-info types.
+///
+/// These are the roots the host matches by name in its own call surface. A
+/// linked jar's copy of any of them resolves to the host first, exactly as a
+/// JVM would load the platform's or the game's definition before a jar on the
+/// class path.
+fn host_models_class(name: &str) -> bool {
+    const ROOTS: &[&str] = &[
+        "java/",
+        "javax/",
+        "jdk/",
+        "sun/",
+        "com/sun/",
+        "net/minecraft/",
+        "net/neoforged/",
+        "net/minecraftforge/",
+        "com/google/gson/",
+        "org/spongepowered/asm/mixin/injection/callback/",
+    ];
+    is_platform_class(name) || ROOTS.iter().any(|root| name.starts_with(root))
+}
+
 /// The sibling-jar class sources one execution may link against.
 ///
 /// A Fabric or Forge pack puts a mod's library on the same class path as a
@@ -11258,7 +11322,8 @@ fn member_is_kotlin_runtime(member: &str) -> bool {
 ///
 /// Bounds: [`Self::MAX_JARS`] registered jars and [`Self::MAX_CLASSES`] class
 /// names across them. A name another jar already supplied keeps that jar's
-/// class, which is the class-path precedence a JVM applies.
+/// class, which is the class-path precedence a JVM applies. Platform packages
+/// ([`PLATFORM_CLASS_ROOTS`]) are never registered: the host answers those.
 #[derive(Debug, Clone, Default)]
 pub struct LinkedClassTable {
     /// Every linked class in class-path order: the first jar that declares a
@@ -11321,6 +11386,9 @@ impl LinkedClassTable {
                 continue;
             };
             let service = service.replace('.', "/");
+            if is_platform_class(&service) {
+                continue;
+            }
             for line in String::from_utf8_lossy(bytes).lines() {
                 if self.providers >= Self::MAX_PROVIDERS {
                     return;
@@ -11331,6 +11399,9 @@ impl LinkedClassTable {
                 }
                 let providers = self.services.entry(service.clone()).or_default();
                 let provider = provider.replace('.', "/");
+                if is_platform_class(&provider) {
+                    continue;
+                }
                 if !providers.contains(&provider) {
                     providers.push(provider);
                     self.providers += 1;
@@ -11358,6 +11429,7 @@ impl LinkedClassTable {
         }
         let table = classes
             .into_iter()
+            .filter(|class| !is_platform_class(&class.name))
             .map(|class| (class.name.clone(), class))
             .collect::<BTreeMap<_, _>>();
         let added = table
@@ -17071,17 +17143,28 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Resolve a class this execution may link: the running jar's own classes
-    /// first, then the host's sibling-jar tables in jar-id order.
+    /// first, then the host's own modelled surface, then the host's
+    /// sibling-jar tables in jar-id order.
     ///
-    /// This is the native path's class path. A class neither source declares
-    /// stays unknown, so the caller keeps the host fallback it always had.
+    /// This is the native path's class path, with the platform in front: a
+    /// class the host answers (the JDK, the game, the loader APIs) is never
+    /// replaced by a pack jar's copy of the same name. A class neither source
+    /// declares stays unknown, so the caller keeps the host fallback it always
+    /// had.
     fn class(&self, name: &str) -> Option<&ClassFile> {
-        self.classes.get(name).or_else(|| self.linked.get(name))
+        self.classes.get(name).or_else(|| {
+            if self.host.models_class(name) {
+                None
+            } else {
+                self.linked.get(name)
+            }
+        })
     }
 
     /// Whether this execution can link `name` from its own or a sibling jar.
     fn has_class(&self, name: &str) -> bool {
-        self.classes.contains_key(name) || self.linked.contains_key(name)
+        self.classes.contains_key(name)
+            || (!self.host.models_class(name) && self.linked.contains_key(name))
     }
 
     /// Run a jar-owned class initializer once before the first active use.
@@ -17898,13 +17981,17 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         };
         // The callback target may live in a linked library jar, so resolve it
-        // the same way a frame resolves its own class.
+        // the same way a frame resolves its own class: the host's modelled
+        // surface wins over a lookalike class in the pack.
         let linked = Arc::clone(&self.linked);
-        let Some(class) = self
-            .classes
-            .get(&callback.target.owner)
-            .or_else(|| linked.get(&callback.target.owner))
-        else {
+        let host_models = self.host.models_class(&callback.target.owner);
+        let Some(class) = self.classes.get(&callback.target.owner).or_else(|| {
+            if host_models {
+                None
+            } else {
+                linked.get(&callback.target.owner)
+            }
+        }) else {
             // A method reference to a JDK method (`List::stream`) has no jar
             // body. The host's own surface answers it; a collection's `stream`
             // is the interpreter's, and the host's identity `Function.apply`
@@ -21138,11 +21225,17 @@ impl<H: Host> Runtime<'_, H> {
         // Snapshot the table so the frame's class reference outlives the
         // `&mut self` calls the instruction loop makes.
         let linked = Arc::clone(&self.linked);
+        let host_models = self.host.models_class(class);
         let file = match self.classes.get(class) {
             Some(file) => file,
-            None => linked
+            None if !host_models => linked
                 .get(class)
                 .ok_or_else(|| NativeError::MissingMethod(format!("{class}#{method}{desc}")))?,
+            None => {
+                return Err(NativeError::MissingMethod(format!(
+                    "{class}#{method}{desc}"
+                )));
+            }
         };
         let target = file
             .method(method, desc)
@@ -35772,6 +35865,101 @@ mandatory = true
             .expect_err("the jar bound must hold");
         assert!(overflow.to_string().contains("256 jars"), "{overflow}");
         assert_eq!(full.jar_count(), LinkedClassTable::MAX_JARS);
+    }
+
+    #[test]
+    fn a_linked_table_does_not_hold_platform_packages() {
+        let mut table = LinkedClassTable::default();
+        let classes = [
+            ClassFile::parse(&weavable_class_bytes("net/fabricmc/api/EnvType")).unwrap(),
+            ClassFile::parse(&weavable_class_bytes("kotlin/jvm/internal/Intrinsics")).unwrap(),
+            ClassFile::parse(&weavable_class_bytes("org/slf4j/LoggerFactory")).unwrap(),
+            ClassFile::parse(&weavable_class_bytes("org/apache/logging/log4j/LogManager")).unwrap(),
+            ClassFile::parse(&weavable_class_bytes("com/example/Library")).unwrap(),
+        ];
+        assert_eq!(
+            table.link_classes("mixed", classes).unwrap(),
+            1,
+            "only the jar's own library class joins the table"
+        );
+        assert!(table.contains_key("com/example/Library"));
+        for platform in [
+            "net/fabricmc/api/EnvType",
+            "kotlin/jvm/internal/Intrinsics",
+            "org/slf4j/LoggerFactory",
+            "org/apache/logging/log4j/LogManager",
+        ] {
+            assert!(
+                !table.contains_key(platform),
+                "{platform} is the platform's, not the pack's"
+            );
+        }
+        assert_eq!(table.class_count(), 1);
+        assert_eq!(
+            table.jar_count(),
+            1,
+            "a jar whose classes are all platform still has its row"
+        );
+    }
+
+    /// A pack jar can carry a copy of a class the host models (a development
+    /// environment's game classes, a vendored loader API). The host's
+    /// definition wins, exactly as a JVM loads the game before a class path
+    /// entry: the jar's throwing initializer never runs.
+    const HOST_SHADOW_LIBRARY: &[(&str, &str)] = &[(
+        "net/minecraft/world/item/Rarity.java",
+        "package net.minecraft.world.item;\n\
+         public final class Rarity {\n\
+             public static final Rarity COMMON = make();\n\
+             private static Rarity make() {\n\
+                 throw new IllegalStateException(\"linked Rarity initialised\");\n\
+             }\n\
+         }\n",
+    )];
+
+    const HOST_SHADOW_APP: &[(&str, &str)] = &[(
+        "demo/Entry.java",
+        "package demo;\n\
+         import net.minecraft.world.item.Rarity;\n\
+         public class Entry {\n\
+             public static boolean linked() {\n\
+                 Object rarity = Rarity.COMMON;\n\
+                 return rarity == null;\n\
+             }\n\
+         }\n",
+    )];
+
+    #[test]
+    fn the_hosts_modelled_class_wins_over_a_linked_copy() {
+        let root = scratch_root("host-first");
+        let Some((library_dir, library)) =
+            compile_java_classes(&root, "fake-game", HOST_SHADOW_LIBRARY, &[])
+        else {
+            return;
+        };
+        let Some((_, app)) = compile_java_classes(&root, "app", HOST_SHADOW_APP, &[&library_dir])
+        else {
+            return;
+        };
+        let entry = NativeJar::from_classes(app);
+        let mut host = StdHost::new();
+        host.link_classes("fake-game", library).unwrap();
+        assert!(
+            host.linked_classes()
+                .contains_key("net/minecraft/world/item/Rarity"),
+            "the table still holds the copy; precedence, not exclusion, decides"
+        );
+        assert!(Host::models_class(&host, "net/minecraft/world/item/Rarity"));
+        assert!(Host::models_class(&host, "kotlin/jvm/internal/Intrinsics"));
+        assert!(!Host::models_class(&host, "com/example/Library"));
+        assert_eq!(
+            entry
+                .invoke_method("demo/Entry", "linked", "()Z", None, &mut host)
+                .unwrap(),
+            Value::Int(0),
+            "the host's Rarity answers, so the jar's throwing initializer never runs"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
