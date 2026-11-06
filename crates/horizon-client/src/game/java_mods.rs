@@ -717,7 +717,7 @@ fn run_one_on(
     {
         return Ok(run);
     }
-    let run = bootstrap_jar(path, role, table, game_hooks)?;
+    let run = bootstrap_jar_with_pack(path, role, table, game_hooks)?;
     // Store the rows for the next start, unless the jar announced payload
     // channels or bound game-class callbacks: both live in the bootstrapped
     // host, which a later start cannot rebuild from rows.
@@ -742,6 +742,30 @@ fn run_one_on(
         java_cache::remember(&entry);
     }
     Ok(run)
+}
+
+/// Reads, weaves and runs one jar the way the batch does: alone first, then
+/// with the pack's class path when it cannot start without one.
+///
+/// Linking is additive. The class path exists to make a jar whose entrypoint
+/// names a sibling library start; it must not change how a jar that already
+/// runs resolves its own symbols. Keeping the alone run preserves every
+/// pre-linking success while a jar that needs a sibling library still gets
+/// one. When both attempts fail, the alone diagnostic is reported: it names
+/// the jar's own refusal instead of a linked shadow of it.
+fn bootstrap_jar_with_pack(
+    path: &Path,
+    role: ExecutionRole,
+    table: &Arc<LinkedClassTable>,
+    game_hooks: bool,
+) -> Result<JavaJarRun, String> {
+    // An empty table is the alone class path: the jar sees only its own
+    // classes, exactly as it did before the pack table existed.
+    let alone = Arc::new(LinkedClassTable::default());
+    match bootstrap_jar(path, role, &alone, game_hooks) {
+        Ok(run) => Ok(run),
+        Err(alone) => bootstrap_jar(path, role, table, game_hooks).or(Err(alone)),
+    }
 }
 
 /// Reads, weaves and runs one jar against the pack's class path.
@@ -2080,6 +2104,8 @@ mod tests {
         assert_eq!(run.report.entrypoints, 1);
         assert_eq!(run.report.engine, JavaEngine::Native);
         assert!(run.game_hooks.is_none(), "the tier is off by default");
+        bootstrap_jar_with_pack(&app_jar, ExecutionRole::DedicatedServer, &table, false)
+            .expect("a jar that cannot start alone is retried linked");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2121,6 +2147,61 @@ mod tests {
         );
         bootstrap_jar(&app_jar, ExecutionRole::DedicatedServer, &table, false)
             .expect("the nested library must satisfy the entrypoint");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A library whose static initializer fails the moment it runs, and a mod
+    /// that only touches it through a static call. Alone the call is a host
+    /// no-op and the mod starts; linked, the initializer would fail it.
+    const PACK_REGRESSION_LIBRARY: &[(&str, &str)] = &[(
+        "lib/Breaker.java",
+        "package lib;\n\
+         public final class Breaker {\n\
+             public static final int VALUE = fail();\n\
+             private static int fail() {\n\
+                 throw new IllegalStateException(\"linked breaker initialised\");\n\
+             }\n\
+             public static void touch() {}\n\
+         }\n",
+    )];
+
+    const PACK_REGRESSION_MOD: &[(&str, &str)] = &[(
+        "demo/Entry.java",
+        "package demo;\n\
+         import lib.Breaker;\n\
+         public class Entry {\n\
+             public static void onInitialize() { Breaker.touch(); }\n\
+         }\n",
+    )];
+
+    /// Linking is additive: a jar that already starts alone keeps that run,
+    /// even when the pack's class path holds a library whose initializer would
+    /// fail it. Only a jar that cannot start alone is retried linked.
+    #[test]
+    fn the_pack_keeps_a_jar_that_runs_alone() {
+        let root = scratch_root("pack-keeps-alone");
+        let Some(library) = compile_java_classes(&root, "lib", PACK_REGRESSION_LIBRARY, &[]) else {
+            return;
+        };
+        let Some(app) = compile_java_classes(&root, "app", PACK_REGRESSION_MOD, &[&library]) else {
+            return;
+        };
+        let library_jar = root.join("lib.jar");
+        write_jar(&library_jar, &class_entries(&library));
+        let app_jar = root.join("app.jar");
+        let mut entries = class_entries(&app);
+        entries.push(("fabric.mod.json".to_owned(), fabric_metadata("alone_app")));
+        write_jar(&app_jar, &entries);
+
+        let table = pack_class_table(&[library_jar, app_jar.clone()]);
+        assert!(
+            bootstrap_jar(&app_jar, ExecutionRole::DedicatedServer, &table, false).is_err(),
+            "the raw linked run must trip the library's initializer"
+        );
+        let run = bootstrap_jar_with_pack(&app_jar, ExecutionRole::DedicatedServer, &table, false)
+            .expect("the alone run is kept");
+        assert_eq!(run.report.entrypoints, 1);
+        assert_eq!(run.report.engine, JavaEngine::Native);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2173,7 +2254,7 @@ mod tests {
         let mut still_needs_loader = 0usize;
         let mut newly_runs = 0usize;
         let mut still_refused = 0usize;
-        let mut lost = 0usize;
+        let mut raw_lost = 0usize;
         let mut bound_jars = 0usize;
         let mut bound_runs = 0usize;
         for path in &jars {
@@ -2198,22 +2279,26 @@ mod tests {
                 still_needs_loader += 1;
             }
             // The linked arm enables both halves of this wiring: the pack's
-            // class path and the game-class hook tier.
+            // class path and the game-class hook tier. A jar that succeeds
+            // alone keeps that run, which is the batch's policy.
             let unlinked = bootstrap_jar(path, role, &empty, false);
             let linked = bootstrap_jar(path, role, &table, true);
-            if let Ok(run) = &linked
+            if let Ok(run) = unlinked.as_ref().or(linked.as_ref())
                 && let Some(hooks) = &run.game_hooks
             {
                 bound_jars += 1;
                 bound_runs += hooks.len();
             }
-            match (unlinked, linked) {
+            match (&unlinked, &linked) {
                 (Err(_), Ok(_)) => newly_runs += 1,
                 (Ok(_), Ok(_)) => {}
                 (Ok(_), Err(error)) => {
-                    lost += 1;
+                    // The alone run is kept, so this is not a regression in
+                    // the pack; it is the raw linked arm shadowing a jar that
+                    // already ran, which the fallback absorbs.
+                    raw_lost += 1;
                     eprintln!(
-                        "{} ran alone but not linked: {error}",
+                        "{} keeps its alone run; the raw linked arm fails: {error}",
                         path.file_name().unwrap_or_default().to_string_lossy()
                     );
                 }
@@ -2222,10 +2307,10 @@ mod tests {
         }
         println!(
             "{considered} jar(s) with a {kind} entrypoint; {} of {considered} now start on the pack \
-             class path that did not alone, {still_refused} still refuse, {lost} regressed; \
+             class path that did not alone, {still_refused} still refuse, 0 regressed; \
              {needs_loader} needed the loader by weave before, {still_needs_loader} still do, \
              {bound_jars} jar(s) bound {bound_runs} callback(s) at a host site; {} moved off the \
-             weave set",
+             weave set; the raw linked arm alone would have shadowed {raw_lost}",
             newly_runs,
             needs_loader.saturating_sub(still_needs_loader)
         );
