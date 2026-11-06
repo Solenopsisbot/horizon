@@ -3072,13 +3072,80 @@ impl StdHost {
         } else {
             "playToServer"
         };
-        self.payload_registrations.push(PayloadRegistration {
-            direction: direction.to_owned(),
-            payload_type: args[0].clone(),
-            codec: Value::Ref(None),
-            handler: args[1].clone(),
-        });
+        // A type the payload type registry already recorded for this direction
+        // gets its handler; otherwise the receiver opens the row.
+        let (payload_type, handler) = (args[0].clone(), args[1].clone());
+        match self.payload_registrations.iter_mut().find(|row| {
+            row.direction == direction
+                && row.payload_type == payload_type
+                && matches!(row.handler, Value::Ref(None))
+        }) {
+            Some(row) => row.handler = handler,
+            None => self.payload_registrations.push(PayloadRegistration {
+                direction: direction.to_owned(),
+                payload_type,
+                codec: Value::Ref(None),
+                handler,
+            }),
+        }
         Some(Value::Int(1))
+    }
+
+    /// Fabric's `PayloadTypeRegistry` (fabric-networking-api-v1 for 26.3): the
+    /// four static accessors name a direction, and `register`/`registerLarge`
+    /// on one record the type and its codec into that direction's row, which a
+    /// later `registerGlobalReceiver` for the same type completes with its
+    /// handler. The codec stays the value the jar passed; nothing is encoded.
+    fn payload_type_registry_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Option<Value> {
+        const OWNER: &str = "net/fabricmc/fabric/api/networking/v1/PayloadTypeRegistry";
+        if r.owner != OWNER {
+            return None;
+        }
+        let Some(receiver) = receiver else {
+            if !r.descriptor.starts_with("()") {
+                return None;
+            }
+            let direction = match r.name.as_str() {
+                "clientboundPlay" => "playToClient",
+                "serverboundPlay" => "playToServer",
+                "clientboundConfiguration" => "configurationToClient",
+                "serverboundConfiguration" => "configurationToServer",
+                _ => return None,
+            };
+            return Some(Value::Ref(Some(format!(
+                "fabric-payload-types/{direction}"
+            ))));
+        };
+        let direction = expect_ref(receiver)?
+            .strip_prefix("fabric-payload-types/")?
+            .to_owned();
+        if !matches!(r.name.as_str(), "register" | "registerLarge") || args.len() < 2 {
+            return None;
+        }
+        let (payload_type, codec) = (args[0].clone(), args[1].clone());
+        match self.payload_registrations.iter_mut().find(|row| {
+            row.direction == direction
+                && row.payload_type == payload_type
+                && matches!(row.codec, Value::Ref(None))
+        }) {
+            Some(row) => row.codec = codec,
+            None => self.payload_registrations.push(PayloadRegistration {
+                direction,
+                payload_type: payload_type.clone(),
+                codec,
+                handler: Value::Ref(None),
+            }),
+        }
+        // `CustomPacketPayload.TypeAndCodec`: a non-null pair marker.
+        Some(Value::Ref(Some(format!(
+            "net/minecraft/network/protocol/common/custom/CustomPacketPayload$TypeAndCodec#{}",
+            value_marker(&payload_type)
+        ))))
     }
 
     /// A Fabric networking send: queue the declared channel's frame with the
@@ -3596,6 +3663,9 @@ impl Host for StdHost {
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
+        if let Some(value) = self.payload_type_registry_call(r, None, args) {
+            return Ok(value);
+        }
         if let Some(value) = self.networking_register(r, args) {
             return Ok(value);
         }
@@ -4656,6 +4726,9 @@ impl Host for StdHost {
             return Ok(
                 class_of_value(receiver).map_or(Value::Ref(None), |class| Value::Ref(Some(class)))
             );
+        }
+        if let Some(value) = self.payload_type_registry_call(r, Some(receiver), args) {
+            return Ok(value);
         }
         if let Some(value) = self.networking_register(r, args) {
             return Ok(value);
@@ -26249,11 +26322,14 @@ pub fn dispatch_payload_frame_with(
     payload: Value,
     context: Value,
 ) -> Result<bool, NativeError> {
+    // A type can have a row per direction, and only the receiving side's row
+    // has a handler (the payload type registry records the others).
     let Some(registration) = registrations.iter().find(|registration| {
-        matches!(
-            &registration.payload_type,
-            Value::Ref(Some(marker)) if host.packet_types.get(marker).is_some_and(|known| known == id)
-        )
+        matches!(registration.handler, Value::Ref(Some(_)))
+            && matches!(
+                &registration.payload_type,
+                Value::Ref(Some(marker)) if host.packet_types.get(marker).is_some_and(|known| known == id)
+            )
     }) else {
         return Ok(false);
     };
