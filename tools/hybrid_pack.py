@@ -173,6 +173,9 @@ class Declaration:
     depends: tuple[str, ...] = ()
     breaks: tuple[str, ...] = ()
     content: tuple[tuple[str, str, str], ...] = ()
+    # Ids the jar satisfies besides its own: jar-in-jar modules' ids and every
+    # `provides` alias (balm provides `balm-fabric`, cloth-config
+    # `cloth-config2`), which Fabric's resolver accepts for a `depends`.
     nested_ids: tuple[str, ...] = ()
     client_only: bool = False
     error: str = ""
@@ -292,6 +295,7 @@ def _nested_ids(jar: zipfile.ZipFile) -> tuple[str, ...]:
                 value = json.loads(_lenient_json(raw.decode("utf-8-sig", errors="replace")))
                 if isinstance(value, dict) and isinstance(value.get("id"), str):
                     ids.append(value["id"])
+                    ids.extend(_id_list(value.get("provides", [])))
         except (KeyError, ValueError, OSError, zipfile.BadZipFile):
             continue
     return tuple(sorted(set(ids)))
@@ -319,6 +323,7 @@ def read_declaration(path: Path) -> Declaration:
                 ident = value.get("id")
                 if not isinstance(ident, str):
                     raise ValueError("fabric.mod.json has no string id")
+                nested = tuple(sorted(set(nested) | set(_id_list(value.get("provides", [])))))
                 depends = _id_list(value.get("depends", {})) + _id_list(value.get("requires", {}))
                 breaks = _id_list(value.get("breaks", {})) + _id_list(value.get("conflicts", {}))
                 return Declaration(
@@ -801,6 +806,9 @@ CLIENT_CLASS = re.compile(r"net/minecraft/client/|net\.minecraft\.client\.")
 # lines name classes such as `...ExceptionHandlerMixin`, which are not failures.
 INFO_LINE = re.compile(r"^\[[^\]]*\] \[[^\]]*/INFO\]")
 CRASH_WORD = re.compile(r"exception|crash|fatal|error", re.I)
+# Fabric's `Loading N mods` listing (`- id version`, `\-- id`, `|-- id`):
+# `notenoughcrashes` is a mod id, not a crash.
+MOD_LISTING_LINE = re.compile(r"^(?:-|\\--|\|--)\s+\S+")
 MAX_CRASH_LINES = 400
 
 
@@ -814,7 +822,8 @@ def crash_lines(text: str) -> tuple[str, ...]:
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or INFO_LINE.search(stripped) or "Mixing " in stripped \
-                or "Renaming " in stripped or not CRASH_WORD.search(stripped):
+                or "Renaming " in stripped or MOD_LISTING_LINE.match(stripped) \
+                or not CRASH_WORD.search(stripped):
             continue
         if stripped not in out:
             out.append(stripped)
@@ -1442,6 +1451,12 @@ def measure_proof(corpus: str, targets: list[PackJar], universe: list[PackJar], 
                          work=work, timeout=timeout)
         rows = _loader_proof_rows(batch, run)
         results.extend(rows)
+        # A sweep is 100+ launches and each extracts the game's libraries,
+        # its server jar, a world and Fabric's processed mods (~150 MB); keep
+        # the logs the rows point at and drop the rest once it is parsed.
+        for bulky in ("libraries", "versions", "world", ".fabric"):
+            shutil.rmtree(work / "launch" / "game" / bulky, ignore_errors=True)
+        shutil.rmtree(work / "tmp", ignore_errors=True)
         if len(batch) == 1:
             solo.add((batch[0].name, batch[0].mod_id))
         print(f"{corpus} run {runs}: {len(batch)} target(s) in {len(members)} jars, "

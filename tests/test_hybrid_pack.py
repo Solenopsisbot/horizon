@@ -168,6 +168,9 @@ class HybridPackTests(unittest.TestCase):
             "[10:00:02] [Worker-Main-1/ERROR]: Failed to load jei plugin mezz.jei.Plugin",
             "java.lang.IllegalStateException: objects registry is frozen",
             "[10:00:03] [Server thread/INFO]: Done (1.0s)! For help, type \"help\"",
+            # Fabric's mod listing: an id with `crash` in it is not a crash.
+            "\t- notenoughcrashes 4.5.1+26.3",
+            "\t   \\-- errorlib 1.0",
         ])
         lines = HYBRID.crash_lines(log)
         # INFO lines (Mixin's audit) and warnings without a failure word drop out.
@@ -194,6 +197,21 @@ class HybridPackTests(unittest.TestCase):
         self.assertEqual((proven.tier, proven.proof), ("needs-loader", "proven"))
         self.assertEqual((unproven.tier, unproven.proof), ("needs-loader", "partial"))
         self.assertIn("a failure names it", unproven.reason)
+
+    def test_a_provides_alias_satisfies_a_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _jar(tmp, "balm.jar", fabric={"id": "balm", "version": "1",
+                                          "provides": ["balm-fabric"]})
+            _jar(tmp, "inv.jar", fabric={"id": "inv", "version": "1",
+                                         "depends": {"balm-fabric": "*"}})
+            rows = HYBRID.read_ledger(_ledger(tmp, {
+                "balm.jar": "native-ok", "inv.jar": "needs-loader"}))
+            part = HYBRID.partition_pack(Path(tmp), rows)
+            pack = HYBRID.load_pack(Path(tmp), rows)
+            closure = HYBRID._closure([jar for jar in pack if jar.name == "inv.jar"],
+                                      HYBRID._provider_index(pack))
+        self.assertEqual([jar.name for jar in part.loader], ["balm.jar", "inv.jar"])
+        self.assertEqual([jar.name for jar in closure], ["balm.jar", "inv.jar"])
 
     def test_declaration_skips_a_byte_order_mark(self):
         with tempfile.TemporaryDirectory() as tmp:
