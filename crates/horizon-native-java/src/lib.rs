@@ -14,6 +14,7 @@ use std::{
 };
 
 pub mod weaver;
+mod declarations_content;
 mod game_hooks;
 mod java_regex;
 mod stack_walk;
@@ -27,6 +28,7 @@ use weaver::{
     InvokeShift, Shift, SiteSelector, SliceBounds, weave_extended_classes_with_instance_callbacks,
 };
 
+pub use declarations_content::{ATTACHMENT_REGISTRY, ContentBuilderEvent, ContentBuilderKind};
 pub use weaver::{
     ReturnMode, ShiftBy, WovenClasses, callback_info_class, callback_info_returnable_class,
     weave_class, weave_class_with_extras, weave_classes, weave_classes_with_extras, weave_head,
@@ -1998,6 +2000,12 @@ pub trait Host {
         None
     }
 
+    /// A content builder step the interpreter answered itself: a data
+    /// component or attachment builder flag, a built component type, or an
+    /// attachment registration (`declarations_content`). A host that keeps
+    /// no declaration table ignores it.
+    fn note_content_builder(&mut self, _event: ContentBuilderEvent) {}
+
     /// Sibling-jar classes this host lets the executing jar link against.
     ///
     /// `None` keeps single-jar behavior exactly as before: a symbol the
@@ -2196,6 +2204,9 @@ pub struct StdHost {
     /// builder calls a registration's value carries. An explicit adapter may
     /// replace these; every other declaration stays all-or-nothing.
     inferred_declarations: BTreeSet<String>,
+    /// The data-component and attachment builder steps the interpreter
+    /// reported (`declarations_content`), so a registration can be typed.
+    content_builders: declarations_content::ContentBuilders,
     /// Registry keys the jar's own `META-INF/horizon-native.json` declares.
     /// Those rows are recorded opaque so the metadata merge stays the one
     /// authority for them, exactly as before inference existed.
@@ -2295,6 +2306,7 @@ impl StdHost {
             posted_events: Vec::new(),
             registrations: Vec::new(),
             inferred_declarations: BTreeSet::new(),
+            content_builders: Default::default(),
             declared_registrations: BTreeSet::new(),
             item_property_builders: BTreeMap::new(),
             block_property_builders: BTreeMap::new(),
@@ -3205,9 +3217,11 @@ impl StdHost {
     /// Infer a typed declaration from the builder chain a registration's
     /// value carries.
     ///
-    /// Only items and blocks have a template vocabulary here; every other
-    /// registry stays opaque, because the host has no template for it and an
-    /// invented one would be content the mod never declared.
+    /// Items and blocks have a template vocabulary here, and a data component
+    /// type the interpreter built names its builder flags
+    /// (`declarations_content`); every other registry stays opaque, because
+    /// the host has no template for it and an invented one would be content
+    /// the mod never declared.
     fn inferred_declaration(&self, registry: &str, value: &Value) -> Option<RegistryDeclaration> {
         let marker = expect_ref(value)?;
         match registry {
@@ -3219,6 +3233,7 @@ impl StdHost {
                         properties: item_declaration_properties(builder),
                     })
             }
+            "minecraft:data_component_type" => self.content_builders.component_declaration(marker),
             "minecraft:block" => {
                 self.block_property_builders
                     .get(marker)
@@ -3460,6 +3475,24 @@ impl StdHost {
 }
 
 impl Host for StdHost {
+    fn note_content_builder(&mut self, event: ContentBuilderEvent) {
+        if let Some(entry) = self.content_builders.note(event) {
+            // An attachment registers itself; a metadata row for the same key
+            // stays the authority, as for every inferred declaration.
+            let key = entry.key();
+            let entry = if self.declared_registrations.contains(&key) {
+                RegistryEntry {
+                    declaration: None,
+                    ..entry
+                }
+            } else {
+                self.inferred_declarations.insert(key);
+                entry
+            };
+            self.registrations.push(entry);
+        }
+    }
+
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<String>> {
         self.mutable_values(value)
     }
@@ -13453,6 +13486,10 @@ impl NativeJar {
             .map(|text| parse_native_metadata(&text))
             .transpose()?
             .unwrap_or((None, Vec::new()));
+        // The jar's data recipes load like a datapack's, as declarations
+        // beside the metadata's own (`declarations_content`).
+        let native_declarations =
+            declarations_content::with_data_recipes(&mut zip, native_declarations);
         let mut jar = Self::from_classes(classes);
         jar.resources = resources;
         jar.resource_bytes = resource_bytes;
@@ -19594,31 +19631,12 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Value>, NativeError> {
         // A value-component builder is a fluent game object. Bootstrap code
         // only needs the builder to exist (`Objects.requireNonNull` refuses a
-        // null one) and every setter to answer itself; the component value is
-        // recorded by the registry declaration table, not by this marker.
-        if r.owner == "net/minecraft/core/component/DataComponentType"
-            && r.name == "builder"
-            && r.descriptor == "()Lnet/minecraft/core/component/DataComponentType$Builder;"
-        {
-            return Ok(Some(self.new_object(
-                "net/minecraft/core/component/DataComponentType$Builder",
-            )));
-        }
-        if r.owner == "net/minecraft/core/component/DataComponentType$Builder"
-            && let Some(receiver) = receiver.and_then(expect_ref)
-        {
-            if r.name == "build"
-                && r.descriptor == "()Lnet/minecraft/core/component/DataComponentType;"
-            {
-                return Ok(Some(
-                    self.new_object("net/minecraft/core/component/DataComponentType"),
-                ));
-            }
-            if return_desc(&r.descriptor)
-                == "Lnet/minecraft/core/component/DataComponentType$Builder;"
-            {
-                return Ok(Some(Value::Ref(Some(receiver.to_owned()))));
-            }
+        // null one) and every setter to answer itself; the steps it takes are
+        // reported to the host, which types the registration
+        // (`declarations_content`). Fabric's attachment registry is answered
+        // the same way.
+        if let Some(value) = self.content_builder_call(r, receiver, args)? {
+            return Ok(Some(value));
         }
         // `BlockPos.betweenClosedStream` is the game's own bounding-box stream.
         // A mod filters and maps it for a shape offset table; the bounded host
