@@ -4,7 +4,7 @@
 //! so a channel is known with its codec even before (or without) a receiver.
 //! Signatures follow fabric-networking-api-v1 6.4.1 (Apache-2.0) for 26.3.
 
-use horizon_native_java::{NativeJar, StdHost, Value};
+use horizon_native_java::{NativeJar, StdHost, Value, dispatch_payload_frame};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 use zip::write::SimpleFileOptions;
 
@@ -205,4 +205,67 @@ fn payload_type_registry_records_direction_type_and_codec() {
         .filter(|(method, _)| method.contains("PayloadTypeRegistry"))
         .collect::<Vec<_>>();
     assert!(unknown.is_empty(), "{unknown:?}");
+}
+
+/// A type registered in both play directions has a row for each, and only the
+/// server's receiver gives one a handler: a frame for that channel reaches it.
+#[test]
+fn a_frame_reaches_the_row_with_the_receiver() {
+    let mut sources = sources();
+    sources.insert(
+        "net/fabricmc/fabric/api/networking/v1/ServerPlayNetworking.java",
+        r#"package net.fabricmc.fabric.api.networking.v1;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+public final class ServerPlayNetworking {
+    public interface PlayPayloadHandler<T> { void receive(T payload, Object context); }
+    public static <T extends CustomPacketPayload> boolean registerGlobalReceiver(CustomPacketPayload.Type<T> type, PlayPayloadHandler<T> handler) { return true; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/Probe.java",
+        "package demo; public final class Probe { public static void seen(Object payload) {} }",
+    );
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.resources.Identifier;
+public final class Main {
+    static final FrameCodec FRAME = new FrameCodec();
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public static void main() {
+        CustomPacketPayload.Type sync = new CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("demo", "sync"));
+        PayloadTypeRegistry.clientboundPlay().register(sync, FRAME);
+        PayloadTypeRegistry.serverboundPlay().register(sync, FRAME);
+        ServerPlayNetworking.registerGlobalReceiver(sync, (payload, context) -> Probe.seen(payload));
+    }
+}
+"#,
+    );
+    let mut stubs = STUBS.to_vec();
+    stubs.extend([
+        "net/fabricmc/fabric/api/networking/v1/ServerPlayNetworking.class",
+        "demo/Probe.class",
+    ]);
+    let jar_path = build_jar("payload-dispatch-two-rows", sources, &[], &stubs);
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let mut host = jar.seed_host(StdHost::new());
+    jar.execute("demo.Main", Some("main"), "main", &mut host)
+        .unwrap();
+    let rows = host.payload_registrations().to_vec();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    // The clientbound row, recorded first, has no handler.
+    assert_eq!(rows[0].direction, "playToClient");
+    assert_eq!(rows[0].handler, Value::Ref(None));
+    let dispatched = dispatch_payload_frame(&jar, &mut host, &rows, "demo:sync", b"hi").unwrap();
+    assert!(dispatched, "the server receiver should have run");
+    assert!(
+        host.invocations()
+            .iter()
+            .any(|call| call.method.owner == "demo/Probe" && call.method.name == "seen"),
+        "Probe.seen was called"
+    );
 }

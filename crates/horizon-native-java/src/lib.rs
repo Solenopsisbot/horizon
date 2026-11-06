@@ -5953,9 +5953,12 @@ impl Host for StdHost {
                 NativeError::Metadata("malformed packet payload type marker".into())
             })?;
             match (r.name.as_str(), r.descriptor.as_str()) {
+                // 26.3's `record Type(Identifier id)`; the two-argument shape
+                // is kept for older fixtures.
                 (
                     "<init>",
-                    "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/network/codec/StreamCodec;)V",
+                    "(Lnet/minecraft/resources/Identifier;)V"
+                    | "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/network/codec/StreamCodec;)V",
                 ) => {
                     let (namespace, path) = identifier_parts(Self::argument(r, args, 0)?);
                     self.packet_types
@@ -26460,6 +26463,36 @@ mod tests {
             name: name.into(),
             descriptor: "()V".into(),
         }
+    }
+
+    /// `CustomPacketPayload.Type` is `record Type(Identifier id)` in 26.3: two
+    /// types built with different ids keep them, and are different keys.
+    #[test]
+    fn payload_types_built_with_the_26_3_constructor_keep_their_ids() {
+        let type_ref = |name: &str, descriptor: &str| MethodRef {
+            owner: "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type".into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let mut host = StdHost::new();
+        let init = type_ref("<init>", "(Lnet/minecraft/resources/Identifier;)V");
+        let first = Value::Ref(Some("type/first".into()));
+        let second = Value::Ref(Some("type/second".into()));
+        host.invoke_instance(&init, &first, &[identifier_parse("demo:one")])
+            .unwrap();
+        host.invoke_instance(&init, &second, &[identifier_parse("demo:two")])
+            .unwrap();
+        let id = type_ref("id", "()Lnet/minecraft/resources/Identifier;");
+        assert_eq!(
+            host.invoke_instance(&id, &first, &[]).unwrap(),
+            identifier_parse("demo:one")
+        );
+        let equals = type_ref("equals", "(Ljava/lang/Object;)Z");
+        assert_eq!(
+            host.invoke_instance(&equals, &first, std::slice::from_ref(&second))
+                .unwrap(),
+            Value::Int(0)
+        );
     }
 
     #[test]
