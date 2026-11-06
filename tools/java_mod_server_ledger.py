@@ -36,6 +36,10 @@ import lab  # noqa: E402
 
 MAX_OUTPUT = 512 * 1024
 MAX_REASON = 240
+# A refused jar's `java-runtime.json` row carries the runner's whole cause up to the
+# game's own bound (`MAX_CAUSE_CHARS` in game/java_runtime_file.rs); the ledger keeps
+# all of it, where the log line it used to read stops at 160 characters.
+MAX_CAUSE = 2048
 MAX_TABLE_REASON = 80
 
 # The three answers a row can give. `native-ok` runs natively; `needs-loader` runs
@@ -320,8 +324,10 @@ def parse_log(text: str, filename: str, *, seconds: float = 0.0, timed_out: bool
               runtime: dict | None = None, game_plans: int = 0) -> Row:
     """Extract the stable fields the dedicated role's log and runtime report carry.
 
-    `runtime` is the jar's `java-runtime.json` row when it started; it carries the
-    engine and the weave's woven/skipped counts, which the log no longer prints.
+    `runtime` is the jar's `java-runtime.json` row: a started jar's carries the
+    engine, the weave's woven/skipped counts (which the log no longer prints) and
+    its skips counted by reason; a refused jar's carries `engine = "refused"` and
+    the runner's whole cause in `refusal`, which wins over the clipped log line.
     `game_plans` is the plan report's `target-outside-jar` count.
     """
     ident, version = "?", "?"
@@ -355,8 +361,14 @@ def parse_log(text: str, filename: str, *, seconds: float = 0.0, timed_out: bool
     skip_reasons = tuple(re.findall(
         r"\b(target-outside-jar|target-missing|game-class)\b", text, re.I
     ))
+    by_reason = runtime.get("skipped_by_reason") if runtime is not None else None
+    if isinstance(by_reason, dict) and not skip_reasons:
+        # Every skipped plan, counted by its label: one entry per plan.
+        skip_reasons = tuple(label for label, count in sorted(by_reason.items())
+                             if isinstance(count, int) and count > 0
+                             for _ in range(count))
     if runtime is not None and not skip_reasons:
-        # The runtime report keeps only the first game-class skip, not the list.
+        # An older report keeps only the first game-class skip, not the list.
         first = str(runtime.get("first_skip_reason") or "")
         label = first.split(" ", 1)[0] if first else ""
         if label in {"target-outside-jar", "target-missing", "game-class",
@@ -372,7 +384,13 @@ def parse_log(text: str, filename: str, *, seconds: float = 0.0, timed_out: bool
     refused_line = next((line for line in text.splitlines()
                          if "skipping " in line and filename in line), None)
     reason = ""
-    if refused_line:
+    refusal = runtime.get("refusal") if runtime is not None else None
+    whole = isinstance(refusal, str) and bool(refusal.strip())
+    if whole:
+        # The runner's whole cause, not the log's clipped copy of it.
+        reason = bounded(refusal, MAX_CAUSE)
+        refused_line = refused_line or reason
+    if refused_line and not reason:
         reason = bounded(refused_line.rsplit(f"{filename}:", 1)[-1].strip())
     if not reason:
         for pattern in (r"skipping .*?\.jar:\s*([^\n]+)", r"startup failed:\s*([^\n]+)",
@@ -381,7 +399,8 @@ def parse_log(text: str, filename: str, *, seconds: float = 0.0, timed_out: bool
             if failure:
                 reason = bounded(failure.group(1) if failure.lastindex else failure.group(0))
                 break
-    if not re.search(r"no native Fabric or NeoForge entrypoint|no native entrypoint", reason, re.I):
+    if not whole and not re.search(r"no native Fabric or NeoForge entrypoint|no native entrypoint",
+                                   reason, re.I):
         entrypoint_line = next((line for line in text.splitlines()
                                 if re.search(r"no native Fabric or NeoForge entrypoint"
                                              r"|no native entrypoint", line, re.I)), None)
@@ -750,7 +769,9 @@ def run_one(binary: Path, resources: Path, jar: Path, *, timeout: float, port: i
         text = output.decode("utf-8", errors="replace")
         report = read_runtime_report(home)
         runtime = runtime_row(report, jar)
-        plans = outside_plans(probe, jar, report) if runtime is not None else 0
+        # A refused jar ran no weave, so its plans say nothing about the label.
+        started = runtime is not None and runtime.get("engine") != "refused"
+        plans = outside_plans(probe, jar, report) if started else 0
         return parse_log(text, jar.name, seconds=time.monotonic() - start,
                          timed_out=timed_out, exit_code=proc.returncode, jar=jar,
                          runtime=runtime, game_plans=plans)
@@ -760,7 +781,7 @@ def format_row(row: Row) -> str:
     values = [row.file, f"id={row.id}", f"version={row.version}", f"verdict={row.verdict}",
               f"subtype={row.subtype}",
               f"engine={row.engine}", f"woven={row.woven}", f"skipped={row.skipped}",
-              f"reason={bounded(row.reason)}", f"recommend={label(row)}",
+              f"reason={bounded(row.reason, MAX_CAUSE)}", f"recommend={label(row)}",
               f"seconds={row.seconds:.3f}"]
     return "\t".join(value.replace("\t", " ") for value in values)
 

@@ -133,6 +133,43 @@ class JavaModServerLedgerTests(unittest.TestCase):
         self.assertEqual(LEDGER.recommendation(client), "native-ok")
         self.assertEqual(LEDGER.recommendation(refused), "native-gap")
 
+    def test_runtime_refusal_is_the_whole_cause_and_survives_the_text_ledger(self):
+        cause = ("uncaught exception java/lang/NullPointerException: Tried to register a listener "
+                 "for a null phase (at " + "com/example/collective/events/" * 6 + "Listener#init)")
+        self.assertGreater(len(cause), 160)
+        # The log line stops at 160 characters; the runtime row does not.
+        log = (f"Horizon: dedicated Java compatibility: skipping /mods/collective.jar: "
+               f"{cause[:120]}...\nDone (1s)")
+        runtime = {"file": "collective.jar", "engine": "refused", "loader": "unknown",
+                   "woven": 0, "skipped": 0, "registrations": 0, "opaque": 0, "refusal": cause}
+        row = LEDGER.parse_log(log, "collective.jar", runtime=runtime)
+        self.assertEqual((row.verdict, row.engine, row.recommend), ("refused", "refused", "native-gap"))
+        self.assertEqual(row.reason, cause)
+        with tempfile.TemporaryDirectory() as scratch:
+            ledger = Path(scratch) / "ledger.txt"
+            ledger.write_text(LEDGER.format_row(row) + "\n", encoding="utf-8")
+            [back] = LEDGER.read_ledger(ledger)
+        self.assertEqual(back.reason, cause)
+        self.assertEqual(back.recommend, "native-gap")
+
+    def test_runtime_refusal_wins_over_a_bare_server_done(self):
+        # The vanilla server reaches Done without the jar: the row is the refusal.
+        runtime = {"file": "balm.jar", "engine": "refused", "refusal": "Metadata(\"bad range\")"}
+        row = LEDGER.parse_log("Done (1s)", "balm.jar", runtime=runtime)
+        self.assertEqual((row.verdict, row.reason), ("refused", 'Metadata("bad range")'))
+
+    def test_runtime_counts_by_reason_label_a_jar_needs_loader(self):
+        # No skip list in the log and no first reason: the counts alone decide.
+        runtime = {"file": "gamefix.jar", "engine": "native-qualified", "woven": 1, "skipped": 4,
+                   "skipped_by_reason": {"target-outside-jar": 3, "cancellable": 1},
+                   "plans": [{"mixin": "demo/M", "target": "net/minecraft/A", "injector": "HEAD",
+                              "reason": "target-outside-jar"}]}
+        row = LEDGER.parse_log("Done (1s)", "gamefix.jar", runtime=runtime)
+        self.assertEqual((row.verdict, row.skipped), ("ran", 4))
+        self.assertEqual(row.recommend, "needs-loader")
+        own = dict(runtime, skipped_by_reason={"cancellable": 4})
+        self.assertEqual(LEDGER.parse_log("Done (1s)", "own.jar", runtime=own).recommend, "native-ok")
+
     def test_recommendation_prefers_loader_engine(self):
         row = LEDGER.Row("knot.jar", verdict="refused", engine="knot")
         self.assertEqual(LEDGER.recommendation(row), "needs-loader")
