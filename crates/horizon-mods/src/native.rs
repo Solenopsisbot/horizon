@@ -5,19 +5,23 @@
 //! `horizon_native_java::RegistryEntry` with a typed declaration, then this
 //! sink validates the small declaration vocabulary used by the content loader
 //! and turns it into the current [`crate::content`] model: blocks, items, mob
-//! effects, entity types and menu types. Block entities, recipes, ingredients
-//! and custom registrations are retained for diagnostics, since the content
-//! model has no table for them yet.
+//! effects, entity types, menu types, block entity types and recipes (as
+//! generated `data/<ns>/recipe/` files). Data components and attachments are
+//! typed tables ([`crate::native_content`]) the registry snapshot and the
+//! login manifest carry; ingredients and custom registrations are retained for
+//! diagnostics, since no vanilla data folder reads an ingredient file.
 //!
 //! The module deliberately names no `horizon-native-java` type: the loader
 //! adapter in the game matches on the Java declaration and calls the `add_*`
 //! methods here, so this crate keeps depending on nothing but its content
 //! model.
 
+pub use crate::content::MAX_BLOCK_ENTITY_BLOCKS;
 use crate::content::{
-    Block, BlockProperties, Content, ENTITY_TEMPLATES, EffectCategory, EntityType, Item, MenuType,
-    MobEffect, Rarity, RenderShape,
+    Block, BlockEntityType, BlockProperties, Content, ENTITY_TEMPLATES, EffectCategory, EntityType,
+    Item, MenuType, MobEffect, Rarity, RenderShape,
 };
+pub use crate::native_content::{AttachmentDeclaration, DataComponentDeclaration};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Native declarations are metadata, not an unbounded Java object graph.
@@ -33,9 +37,6 @@ pub const MAX_ENTITY_ATTRIBUTE: f64 = 1.0e6;
 /// by a handful of blocks; 64 keeps the row bounded and matches
 /// [`MAX_BLOCK_ENTITY_BLOCKS`].
 pub const MAX_MENU_OPEN_BLOCKS: usize = 64;
-/// `BlockEntityType.validBlocks` for one declared type. Vanilla's longest
-/// list (the signs') stays far below this.
-pub const MAX_BLOCK_ENTITY_BLOCKS: usize = 64;
 
 /// A custom registration kind whose concrete Horizon adapter is not available
 /// yet. It is retained so diagnostics can name the registration precisely.
@@ -47,8 +48,10 @@ pub struct CustomDeclaration {
     pub properties: BTreeMap<String, String>,
 }
 
-/// A recipe declaration that would become a data-pack JSON file. The current
-/// content model has no code-declared data files, so it is retained only.
+/// A recipe declaration: a data-pack JSON file the content root writes as
+/// `data/<ns>/recipe/<path>.json` when every item it names resolves
+/// ([`NativeDeclarations::recipe_report`]). A jar's own data recipes arrive
+/// as these rows too.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipeDeclaration {
     pub id: String,
@@ -181,9 +184,9 @@ impl MenuDeclaration {
 }
 
 /// A typed block-entity registration: a vanilla `BlockEntityType` template
-/// under a new id, the blocks that carry it and whether it ticks. The content
-/// model has no block-entity table yet, so this row stays a declaration the
-/// registry snapshot exposes.
+/// under a new id, the blocks that carry it and whether it ticks. It becomes a
+/// [`BlockEntityType`] of the content when its blocks are declared in the same
+/// namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockEntityDeclaration {
     pub id: String,
@@ -270,7 +273,17 @@ pub struct NativeDeclarations {
     pub block_entities: Vec<BlockEntityDeclaration>,
     pub recipes: Vec<RecipeDeclaration>,
     pub ingredients: Vec<IngredientDeclaration>,
+    pub data_components: Vec<DataComponentDeclaration>,
+    pub attachments: Vec<AttachmentDeclaration>,
     pub custom: Vec<CustomDeclaration>,
+}
+
+/// What [`NativeDeclarations::content_mods`] does with the declared recipes:
+/// the ids written into the content root, and the ids left out with why.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecipeReport {
+    pub applied: Vec<String>,
+    pub refused: Vec<(String, String)>,
 }
 
 impl NativeDeclarations {
@@ -303,6 +316,18 @@ impl NativeDeclarations {
             "ingredient",
             &mut staged.ingredients,
             incoming.ingredients,
+            |row| &row.id,
+        )?;
+        merge_rows(
+            "data component",
+            &mut staged.data_components,
+            incoming.data_components,
+            |row| &row.id,
+        )?;
+        merge_rows(
+            "attachment",
+            &mut staged.attachments,
+            incoming.attachments,
             |row| &row.id,
         )?;
         for row in incoming.custom {
@@ -347,6 +372,8 @@ impl NativeDeclarations {
             + self.block_entities.len()
             + self.recipes.len()
             + self.ingredients.len()
+            + self.data_components.len()
+            + self.attachments.len()
             + self.custom.len();
         if count > MAX_NATIVE_DECLARATIONS {
             return Err(format!(
@@ -360,7 +387,7 @@ impl NativeDeclarations {
     /// Purely informational: it validates nothing and changes nothing.
     pub fn diagnostics(&self) -> Vec<String> {
         vec![format!(
-            "native declarations: {} blocks, {} items, {} mob effects, {} entities, {} menus, {} block entities, {} recipes, {} ingredients, {} custom",
+            "native declarations: {} blocks, {} items, {} mob effects, {} entities, {} menus, {} block entities, {} recipes, {} ingredients, {} data components, {} attachments, {} custom",
             self.blocks.len(),
             self.items.len(),
             self.effects.len(),
@@ -369,6 +396,8 @@ impl NativeDeclarations {
             self.block_entities.len(),
             self.recipes.len(),
             self.ingredients.len(),
+            self.data_components.len(),
+            self.attachments.len(),
             self.custom.len(),
         )]
     }
@@ -714,6 +743,92 @@ impl NativeDeclarations {
         self.check_count()
     }
 
+    /// Adds one typed data component type (`DataComponentType`).
+    pub fn add_data_component(
+        &mut self,
+        id: &str,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        Self::ensure_registration_id(id)?;
+        Self::check_properties("data component", properties)?;
+        if self.data_components.iter().any(|row| row.id == id) {
+            return Err(format!("duplicate native data component {id}"));
+        }
+        self.data_components
+            .push(DataComponentDeclaration::from_registry_properties(
+                id, properties,
+            )?);
+        self.check_count()
+    }
+
+    /// Adds one typed attachment type (Fabric `AttachmentType`, NeoForge
+    /// `AttachmentType`).
+    pub fn add_attachment(
+        &mut self,
+        id: &str,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        Self::ensure_registration_id(id)?;
+        Self::check_properties("attachment", properties)?;
+        if self.attachments.iter().any(|row| row.id == id) {
+            return Err(format!("duplicate native attachment {id}"));
+        }
+        self.attachments
+            .push(AttachmentDeclaration::from_registry_properties(
+                id, properties,
+            )?);
+        self.check_count()
+    }
+
+    /// The item ids this set declares: its items and its blocks that have one.
+    fn item_ids(&self) -> BTreeSet<&str> {
+        self.items
+            .iter()
+            .map(|item| item.id.as_str())
+            .chain(
+                self.blocks
+                    .iter()
+                    .filter(|block| block.item)
+                    .map(|block| block.id.as_str()),
+            )
+            .collect()
+    }
+
+    /// Which declared recipes [`Self::content_mods`] writes into the content
+    /// root and which it leaves out, sorted by id. A recipe loads when its
+    /// type is vanilla's and every item it names is vanilla or one of this
+    /// set's ([`crate::native_content::recipe_refusal`]); a recipe naming
+    /// another jar's item is left out, since one set is checked alone.
+    pub fn recipe_report(&self) -> RecipeReport {
+        let items = self.item_ids();
+        let mut report = RecipeReport::default();
+        for recipe in &self.recipes {
+            let refusal = match serde_json::from_slice::<serde_json::Value>(&recipe.json) {
+                Ok(value) => crate::native_content::recipe_refusal(&value, &items),
+                Err(error) => Some(format!("is invalid JSON: {error}")),
+            };
+            match refusal {
+                None => report.applied.push(recipe.id.clone()),
+                Some(reason) => report.refused.push((recipe.id.clone(), reason)),
+            }
+        }
+        report
+    }
+
+    /// Why a declared block entity type stays out of the content, or `None`
+    /// when it joins it: every block it names must be one of this set's
+    /// blocks in the type's own namespace, since the content model gives a
+    /// block entity only to a block it declares.
+    pub fn block_entity_refusal(&self, row: &BlockEntityDeclaration) -> Option<String> {
+        let namespace = row.id.split_once(':').map_or("", |(ns, _)| ns);
+        row.valid_blocks.iter().find_map(|block| {
+            let declared = block.split_once(':').is_some_and(|(ns, _)| ns == namespace)
+                && self.blocks.iter().any(|known| &known.id == block);
+            (!declared)
+                .then(|| format!("block {block} is not one of {namespace}'s declared blocks"))
+        })
+    }
+
     /// Adds one registration kind this build has no adapter for, so
     /// diagnostics can name it.
     pub fn add_custom(
@@ -743,9 +858,15 @@ impl NativeDeclarations {
     /// types and menu types are checked here because the content model has no
     /// declaration files for them.
     ///
+    /// Block entity types join their namespace's content
+    /// ([`Content::declare_block_entity_types`]: the blocks they name are
+    /// that namespace's own), and each recipe [`Self::recipe_report`] applies
+    /// becomes the generated file `data/<ns>/recipe/<path>.json`.
+    ///
     /// Rows the content model cannot hold are left out of the content and
-    /// stay available on the declaration set: block entities, recipes,
-    /// ingredients, and the menus' title key and open blocks. Any custom
+    /// stay available on the declaration set: recipes the report refuses,
+    /// ingredients, data components, attachments, and the menus' title key and
+    /// open blocks. Any custom
     /// registration is an error, as it was before the port: a Java mod that
     /// registers something Horizon has no adapter for must not half-load.
     pub fn content_mods(&self) -> Result<Vec<(String, Content)>, String> {
@@ -772,6 +893,8 @@ impl NativeDeclarations {
             effects: Vec<MobEffect>,
             entities: Vec<EntityType>,
             menus: Vec<MenuDeclaration>,
+            block_entities: Vec<BlockEntityType>,
+            recipes: Vec<(String, Vec<u8>)>,
         }
         let namespace = |id: &str| id.split_once(':').map_or("", |(ns, _)| ns).to_owned();
         let mut groups: BTreeMap<String, Group> = BTreeMap::new();
@@ -794,6 +917,25 @@ impl NativeDeclarations {
         }
         for row in &self.menus {
             group!(row).menus.push(row.clone());
+        }
+        for row in &self.block_entities {
+            if self.block_entity_refusal(row).is_some() {
+                continue;
+            }
+            group!(row).block_entities.push(BlockEntityType {
+                id: row.id.clone(),
+                template: row.template.clone(),
+                ticker: row.ticker,
+                blocks: {
+                    let mut blocks = row.valid_blocks.clone();
+                    blocks.sort();
+                    blocks
+                },
+            });
+        }
+        let applied: BTreeSet<String> = self.recipe_report().applied.into_iter().collect();
+        for row in self.recipes.iter().filter(|row| applied.contains(&row.id)) {
+            group!(row).recipes.push((row.id.clone(), row.json.clone()));
         }
         let mut out = Vec::with_capacity(groups.len());
         for (ns, mut group) in groups {
@@ -846,6 +988,16 @@ impl NativeDeclarations {
             }
             for menu in group.menus {
                 content.menu_types.push(menu.menu_type());
+            }
+            group.block_entities.sort_by(|a, b| a.id.cmp(&b.id));
+            content
+                .declare_block_entity_types(&group.block_entities)
+                .map_err(|e| format!("native declarations of {ns}: {e}"))?;
+            for (id, json) in group.recipes {
+                let path = id.split_once(':').map_or(id.as_str(), |(_, path)| path);
+                content
+                    .add_data_file(&format!("data/{ns}/recipe/{path}.json"), json)
+                    .map_err(|e| format!("native recipe {id}: {e}"))?;
             }
             out.push((ns, content));
         }
@@ -1026,6 +1178,112 @@ mod tests {
         assert_eq!(content.items[0].id, "ruby:gem");
         assert_eq!(content.items[0].max_stack_size, Some(16));
         assert_eq!(content.items[0].rarity, Some(Rarity::Rare));
+    }
+
+    #[test]
+    fn resolvable_recipes_and_block_entities_reach_the_content() {
+        let mut declarations = NativeDeclarations::default();
+        declarations
+            .add_block("ruby:safe", "minecraft:chest", &BTreeMap::new(), true)
+            .unwrap();
+        declarations
+            .add_item("ruby:gem", "minecraft:diamond", &BTreeMap::new())
+            .unwrap();
+        declarations
+            .add_block_entity(
+                "ruby:safe",
+                &properties(&[
+                    ("template", "minecraft:chest"),
+                    ("valid_blocks", "ruby:safe"),
+                    ("ticker", "true"),
+                ]),
+            )
+            .unwrap();
+        // Names a block nobody declared: kept as a row, left out of content.
+        declarations
+            .add_block_entity(
+                "ruby:pedestal",
+                &properties(&[
+                    ("template", "minecraft:lectern"),
+                    ("valid_blocks", "ruby:pedestal"),
+                ]),
+            )
+            .unwrap();
+        declarations
+            .add_recipe(
+                "ruby:safe",
+                r##"{"type":"minecraft:crafting_shaped","pattern":["GGG","G G","GGG"],"key":{"G":"ruby:gem"},"result":{"id":"ruby:safe"}}"##,
+            )
+            .unwrap();
+        declarations
+            .add_recipe(
+                "ruby:nested/gem_from_ore",
+                r#"{"type":"minecraft:smelting","ingredient":"ruby:ore","result":{"id":"ruby:gem"}}"#,
+            )
+            .unwrap();
+
+        let report = declarations.recipe_report();
+        assert_eq!(report.applied, ["ruby:safe"]);
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(report.refused[0].0, "ruby:nested/gem_from_ore");
+
+        let mods = declarations.content_mods().unwrap();
+        let (_, content) = &mods[0];
+        assert_eq!(content.files, ["data/ruby/recipe/safe.json"]);
+        let recipe: serde_json::Value =
+            serde_json::from_slice(&content.file("data/ruby/recipe/safe.json").unwrap()).unwrap();
+        assert_eq!(recipe["result"]["id"], "ruby:safe");
+        assert_eq!(
+            content.block_entity_types,
+            [BlockEntityType {
+                id: "ruby:safe".into(),
+                template: "minecraft:chest".into(),
+                ticker: true,
+                blocks: vec!["ruby:safe".into()],
+            }]
+        );
+        assert!(
+            declarations
+                .block_entity_refusal(&declarations.block_entities[1])
+                .is_some_and(|reason| reason.contains("ruby:pedestal"))
+        );
+    }
+
+    #[test]
+    fn data_components_and_attachments_are_typed_rows() {
+        let mut declarations = NativeDeclarations::default();
+        declarations
+            .add_data_component(
+                "ruby:charge",
+                &properties(&[("persistent", "true"), ("network", "true")]),
+            )
+            .unwrap();
+        declarations
+            .add_attachment("ruby:mana", &properties(&[("copy_on_death", "true")]))
+            .unwrap();
+        assert!(
+            declarations
+                .add_data_component("ruby:charge", &BTreeMap::new())
+                .is_err()
+        );
+        assert!(
+            declarations
+                .add_attachment("minecraft:mana", &BTreeMap::new())
+                .is_err()
+        );
+        let mut other = NativeDeclarations::default();
+        other
+            .add_data_component("ruby:charge", &properties(&[("persistent", "false")]))
+            .unwrap();
+        let error = declarations.clone().merge(other).unwrap_err();
+        assert!(
+            error.contains("data component registration ruby:charge"),
+            "{error}"
+        );
+        // They never make content of their own, nor refuse it.
+        assert!(declarations.content_mods().unwrap().is_empty());
+        assert_eq!(declarations.data_components[0].id, "ruby:charge");
+        assert!(declarations.attachments[0].copy_on_death);
     }
 
     #[test]

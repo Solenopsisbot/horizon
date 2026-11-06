@@ -453,12 +453,34 @@ pub struct MenuType {
 /// container (`native_block_entity_container`) may.
 pub const MAX_MENU_SLOTS: u16 = 256;
 
+/// The blocks one declared block entity type names (`BlockEntityType.validBlocks`);
+/// vanilla's longest list, the signs', stays far below it.
+pub const MAX_BLOCK_ENTITY_BLOCKS: usize = 64;
+
+/// A block entity type a mod declares in code (a Java jar's
+/// `BlockEntityType`): its id, the vanilla type it behaves and saves as, and
+/// the mod's blocks that carry it. The content root numbers the id in
+/// `minecraft:block_entity_type`, after vanilla's and the per-block types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockEntityType {
+    /// `<namespace>:<path>`.
+    pub id: String,
+    /// The vanilla block entity type it copies, `minecraft:<path>`.
+    pub template: String,
+    /// Whether the game ticks it (`BlockEntityTicker`).
+    pub ticker: bool,
+    /// The mod's blocks that carry it, sorted.
+    pub blocks: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 enum Source {
     Dir(PathBuf),
     Zip(PathBuf),
-    /// No files: blocks and items a native mod declares in code.
-    Code,
+    /// Declared in code: blocks and items a native mod declares, and the data
+    /// files its declarations generate ([`Content::add_data_file`]: a Java
+    /// jar's recipes), held in memory by path.
+    Code(BTreeMap<String, Vec<u8>>),
 }
 
 /// A mod's content: its files and declarations.
@@ -474,6 +496,8 @@ pub struct Content {
     pub creative_tabs: Vec<CreativeTab>,
     pub entity_types: Vec<EntityType>,
     pub menu_types: Vec<MenuType>,
+    /// Block entity types declared in code ([`Content::declare_block_entity_types`]).
+    pub block_entity_types: Vec<BlockEntityType>,
     /// The namespaces it owns: the mod id, then the manifest's `namespaces`.
     pub namespaces: Vec<String>,
 }
@@ -482,12 +506,21 @@ pub struct Content {
 pub enum FileReader<'a> {
     Dir(&'a Path),
     Zip(Box<zip::ZipArchive<std::fs::File>>),
+    /// Data files generated from code declarations, by path.
+    Memory(&'a BTreeMap<String, Vec<u8>>),
 }
 impl FileReader<'_> {
     /// One content file's bytes.
     pub fn read(&mut self, name: &str) -> Result<Vec<u8>, String> {
         check_path(name)?;
+        if let Self::Memory(files) = self {
+            return files
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("{name}: not a generated file"));
+        }
         let reader: Box<dyn Read + '_> = match self {
+            Self::Memory(_) => unreachable!("answered above"),
             Self::Dir(root) => {
                 Box::new(std::fs::File::open(root.join(name)).map_err(|e| format!("{name}: {e}"))?)
             }
@@ -574,6 +607,7 @@ impl Content {
             creative_tabs: Vec::new(),
             entity_types: Vec::new(),
             menu_types: Vec::new(),
+            block_entity_types: Vec::new(),
             namespaces: manifest.owned_namespaces().map(str::to_owned).collect(),
         };
         content.check(manifest, declared)?;
@@ -584,7 +618,7 @@ impl Content {
     /// in code in `namespace` ([`Content::declare`]).
     pub fn declared(namespace: &str) -> Content {
         Content {
-            source: Source::Code,
+            source: Source::Code(BTreeMap::new()),
             files: Vec::new(),
             blocks: Vec::new(),
             items: Vec::new(),
@@ -592,6 +626,7 @@ impl Content {
             creative_tabs: Vec::new(),
             entity_types: Vec::new(),
             menu_types: Vec::new(),
+            block_entity_types: Vec::new(),
             namespaces: vec![namespace.to_owned()],
         }
     }
@@ -670,8 +705,134 @@ impl Content {
     pub fn source(&self) -> &Path {
         match &self.source {
             Source::Dir(path) | Source::Zip(path) => path,
-            Source::Code => Path::new(""),
+            Source::Code(_) => Path::new(""),
         }
+    }
+
+    /// Declared in code: its files, if any, were generated from declarations
+    /// and live in memory, so there is no folder or archive to stamp.
+    pub fn is_code(&self) -> bool {
+        matches!(self.source, Source::Code(_))
+    }
+
+    /// Adds one data file a code declaration generates (a Java jar's recipe
+    /// as `data/<ns>/recipe/<path>.json`), fenced as a content file is: a
+    /// plain path in this mod's own namespace, outside `data/<ns>/horizon/`
+    /// (declarations are typed, not files), capped like a file and the mod's
+    /// total, and added once. Only code-declared content holds generated
+    /// files; a `.hmod` or a mod folder keeps its own.
+    pub fn add_data_file(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), String> {
+        check_path(name)?;
+        let own = self.namespaces.first().cloned().unwrap_or_default();
+        let mut parts = name.splitn(3, '/');
+        let (top, namespace, rest) = (
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+        );
+        if top != "data" || namespace != own || rest.is_empty() {
+            return Err(format!("{name}: a generated file is under data/{own}/"));
+        }
+        if rest.starts_with("horizon/") {
+            return Err(format!(
+                "{name}: data/{own}/horizon/ holds declarations, not generated files"
+            ));
+        }
+        if bytes.len() as u64 > MAX_FILE {
+            return Err(format!("{name} is over {} MiB", MAX_FILE >> 20));
+        }
+        let Source::Code(files) = &mut self.source else {
+            return Err(format!(
+                "{name}: only code-declared content generates files"
+            ));
+        };
+        if files.contains_key(name) {
+            return Err(format!("{name} is generated twice"));
+        }
+        if files.len() >= MAX_FILES {
+            return Err(format!("more than {MAX_FILES} content files"));
+        }
+        let total: u64 = files.values().map(|f| f.len() as u64).sum();
+        if total + bytes.len() as u64 > MAX_TOTAL {
+            return Err(format!("content is over {} MiB", MAX_TOTAL >> 20));
+        }
+        files.insert(name.to_owned(), bytes);
+        let at = self.files.partition_point(|file| file.as_str() < name);
+        self.files.insert(at, name.to_owned());
+        Ok(())
+    }
+
+    /// Moves `other`'s generated files into this code-declared content, a
+    /// file this one already has left as it is. Both sides must be code
+    /// declared; the namespace fence of [`Self::add_data_file`] applies.
+    pub fn merge_generated(&mut self, other: &Content) -> Result<(), String> {
+        let Source::Code(files) = &other.source else {
+            return Ok(());
+        };
+        for (name, bytes) in files {
+            if !self.files.contains(name) {
+                self.add_data_file(name, bytes.clone())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds block entity types a mod declares in code, all or nothing: an id
+    /// in this mod's own namespace, declared once, a vanilla block entity type
+    /// as its template, and 1 to [`MAX_BLOCK_ENTITY_BLOCKS`] of this mod's own
+    /// blocks, each carried by one declared type at most (a block has one
+    /// block entity, `EntityBlock.newBlockEntity`). Blocks are declared first.
+    pub fn declare_block_entity_types(&mut self, types: &[BlockEntityType]) -> Result<(), String> {
+        let own = self
+            .namespaces
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default();
+        let blocks: BTreeSet<&str> = self.blocks.iter().map(|b| b.id.as_str()).collect();
+        let mut ids: BTreeSet<&str> = self
+            .block_entity_types
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        let mut carried: BTreeSet<&str> = self
+            .block_entity_types
+            .iter()
+            .flat_map(|t| t.blocks.iter().map(String::as_str))
+            .collect();
+        for kind in types {
+            let id = kind.id.as_str();
+            if !(namespaced_id(id) && id.split_once(':').is_some_and(|(ns, _)| ns == own)) {
+                return Err(format!("block entity type {id:?} is not an id in {own}:"));
+            }
+            if !ids.insert(id) {
+                return Err(format!("block entity type {id} is declared twice"));
+            }
+            if !vanilla_id(&kind.template) {
+                return Err(format!(
+                    "block entity type {id}: template {:?} is not a vanilla block entity type (minecraft:...)",
+                    kind.template
+                ));
+            }
+            if kind.blocks.is_empty() || kind.blocks.len() > MAX_BLOCK_ENTITY_BLOCKS {
+                return Err(format!(
+                    "block entity type {id}: 1 to {MAX_BLOCK_ENTITY_BLOCKS} blocks carry it"
+                ));
+            }
+            for block in &kind.blocks {
+                if !blocks.contains(block.as_str()) {
+                    return Err(format!(
+                        "block entity type {id}: block {block:?} is not one of this mod's blocks"
+                    ));
+                }
+                if !carried.insert(block.as_str()) {
+                    return Err(format!(
+                        "block entity type {id}: block {block} already carries another block entity type"
+                    ));
+                }
+            }
+        }
+        self.block_entity_types.extend_from_slice(types);
+        Ok(())
     }
 
     /// No files: a mod with code only.
@@ -1183,7 +1344,7 @@ fn reader_of(source: &Source) -> Result<FileReader<'_>, String> {
     Ok(match source {
         Source::Dir(root) => FileReader::Dir(root),
         Source::Zip(path) => FileReader::Zip(Box::new(open_zip(path)?)),
-        Source::Code => FileReader::Dir(Path::new("")),
+        Source::Code(files) => FileReader::Memory(files),
     })
 }
 
@@ -1367,6 +1528,81 @@ capabilities = ["registries"]
             ..block("ruby:cable")
         };
         content.declare(&[cable], &[]).unwrap();
+    }
+
+    #[test]
+    fn code_content_generates_fenced_data_files() {
+        let mut content = Content::declared("ruby");
+        content
+            .add_data_file("data/ruby/recipe/b.json", b"{}".to_vec())
+            .unwrap();
+        content
+            .add_data_file("data/ruby/recipe/a.json", b"{\"x\":1}".to_vec())
+            .unwrap();
+        assert_eq!(
+            content.files,
+            ["data/ruby/recipe/a.json", "data/ruby/recipe/b.json"]
+        );
+        assert_eq!(
+            content.file("data/ruby/recipe/a.json").unwrap(),
+            b"{\"x\":1}"
+        );
+        assert!(!content.is_empty() && content.is_code());
+        for bad in [
+            "data/jade/recipe/a.json",
+            "assets/ruby/lang/en_us.json",
+            "data/ruby/horizon/item/a.json",
+            "data/ruby/recipe/a.json",
+            "data/ruby/../x.json",
+        ] {
+            assert!(content.add_data_file(bad, Vec::new()).is_err(), "{bad}");
+        }
+        let mut other = Content::declared("ruby");
+        other
+            .add_data_file("data/ruby/recipe/c.json", b"{}".to_vec())
+            .unwrap();
+        content.merge_generated(&other).unwrap();
+        assert_eq!(content.files.len(), 3);
+        assert_eq!(content.file("data/ruby/recipe/c.json").unwrap(), b"{}");
+    }
+
+    #[test]
+    fn block_entity_types_name_their_own_blocks_once() {
+        let block = |id: &str| Block {
+            id: id.into(),
+            template: "minecraft:chest".into(),
+            ..Block::default()
+        };
+        let kind = |id: &str, blocks: &[&str]| BlockEntityType {
+            id: id.into(),
+            template: "minecraft:chest".into(),
+            ticker: false,
+            blocks: blocks.iter().map(|b| (*b).to_owned()).collect(),
+        };
+        let mut content = Content::declared("ruby");
+        content
+            .declare(&[block("ruby:safe"), block("ruby:vault")], &[])
+            .unwrap();
+        content
+            .declare_block_entity_types(&[kind("ruby:safe", &["ruby:safe"])])
+            .unwrap();
+        for (bad, why) in [
+            (kind("ruby:other", &["ruby:safe"]), "already carries"),
+            (kind("ruby:safe", &["ruby:vault"]), "declared twice"),
+            (
+                kind("ruby:x", &["ruby:missing"]),
+                "not one of this mod's blocks",
+            ),
+            (kind("jade:x", &["ruby:vault"]), "not an id in ruby:"),
+            (kind("ruby:x", &[]), "1 to 64 blocks"),
+        ] {
+            let error = content.declare_block_entity_types(&[bad]).unwrap_err();
+            assert!(error.contains(why), "{error}");
+        }
+        let mut modded = kind("ruby:x", &["ruby:vault"]);
+        modded.template = "ruby:chest".into();
+        assert!(content.declare_block_entity_types(&[modded]).is_err());
+        assert_eq!(content.block_entity_types.len(), 1);
     }
 
     #[test]
