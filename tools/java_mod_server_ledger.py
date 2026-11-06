@@ -90,7 +90,7 @@ def parse_log(text: str, filename: str, *, seconds: float = 0.0, timed_out: bool
 
     done = bool(re.search(r"Done \(", text))
     reason = ""
-    for pattern in (r"startup failed:\s*([^\n]+)", r"refused:\s*([^\n]+)",
+    for pattern in (r"skipping .*?\.jar:\s*([^\n]+)", r"startup failed:\s*([^\n]+)", r"refused:\s*([^\n]+)",
                     r"Metadata\([^\n]+", r"expected a [^\n]+"):
         failure = re.search(pattern, text, re.I)
         if failure:
@@ -102,7 +102,7 @@ def parse_log(text: str, filename: str, *, seconds: float = 0.0, timed_out: bool
         if entrypoint_line:
             reason = bounded(entrypoint_line.split("ERROR", 1)[-1].lstrip(" :"))
     if not reason:
-        errors = [line for line in text.splitlines() if "ERROR" in line]
+        errors = [line for line in text.splitlines() if "ERROR" in line and ("Horizon:" in line or filename in line)]
         if errors:
             reason = bounded(errors[-1].split("ERROR", 1)[-1].lstrip(" :"))
     subtype = ""
