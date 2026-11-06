@@ -119,6 +119,11 @@ pub(super) struct JavaMixinSummary {
     pub(super) woven: usize,
     pub(super) skipped: usize,
     pub(super) first_skip_reason: Option<String>,
+    /// The first skipped plans, loader-relevant ones first (`java_runtime_file::plan_rows`), so the
+    /// launcher can show which mixin wanted which game class; `skipped` stays the whole count.
+    pub(super) plans: Vec<super::java_runtime_file::RuntimePlan>,
+    /// Every skipped plan counted by its reason label.
+    pub(super) skipped_by_reason: std::collections::BTreeMap<String, usize>,
 }
 
 /// Why one jar never started: the path, and the runner's reason without the
@@ -162,12 +167,32 @@ impl JavaBatchOutcome {
 /// started. The dedicated role and the integrated server thread share this
 /// process, so a later batch replaces an earlier one.
 static JAVA_REPORTS: Mutex<Vec<JavaCompatibilityReport>> = Mutex::new(Vec::new());
+/// The same batch's refused jars, each with the runner's whole cause.
+static JAVA_FAILURES: Mutex<Vec<JavaJarFailure>> = Mutex::new(Vec::new());
 
-/// Records the batch a role's startup ran, replacing whatever was there.
+/// Records the batch a role's startup ran, replacing whatever was there. The
+/// refused jars of the earlier batch go with it: a role that records its
+/// refusals calls [`record_java_failures`] after this.
 pub(in crate::game) fn record_java_reports(reports: &[JavaCompatibilityReport]) {
     *JAVA_REPORTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = reports.to_vec();
+    record_java_failures(&[]);
+}
+
+/// Records the jars the same batch refused, for `server-status`'s refused rows.
+pub(in crate::game) fn record_java_failures(failures: &[JavaJarFailure]) {
+    *JAVA_FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = failures.to_vec();
+}
+
+/// The refused jars of the recorded batch.
+pub(in crate::game) fn java_failures() -> Vec<JavaJarFailure> {
+    JAVA_FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// The recorded batch, for `server-status`'s `java` section.
@@ -414,11 +439,7 @@ const MAX_SKIP_REASON_CHARS: usize = 240;
 fn first_game_skip_reason(skipped: &[horizon_native_java::SkippedMixinPlan]) -> Option<String> {
     skipped
         .iter()
-        .find(|plan| {
-            plan.reason == horizon_native_java::MixinSkipReason::UnsupportedFamily
-                || plan.reason == horizon_native_java::MixinSkipReason::TargetOutsideJar
-                || plan.target.owner.starts_with("net/minecraft/")
-        })
+        .find(|plan| super::java_runtime_file::needs_loader(plan))
         .map(|plan| {
             let mut reason = plan.to_string().replace(['\n', '\r'], " ");
             if reason.chars().count() > MAX_SKIP_REASON_CHARS {
@@ -505,6 +526,8 @@ pub(super) fn publish_java_game_hooks(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry(role)
+            plans: entry.skip_plans.clone(),
+            skipped_by_reason: entry.skipped_by_reason.clone(),
         .or_default()
         .push(JavaGameHookJar {
             jar,
@@ -549,6 +572,8 @@ pub(super) fn run_java_game_hook(
         outcome.ran += run.ran;
         if run.cancelled {
             outcome.cancelled = true;
+        skip_plans: report.mixin.plans.clone(),
+        skipped_by_reason: report.mixin.skipped_by_reason.clone(),
             break;
         }
     }
@@ -779,6 +804,7 @@ fn bootstrap_jar(
     game_hooks: bool,
 ) -> Result<JavaJarRun, String> {
     let kinds = if role.is_client() {
+    let (plans, skipped_by_reason) = super::java_runtime_file::plan_rows(&weave.skipped);
         ["client", "main", "neoforge"]
     } else {
         ["server", "main", "neoforge"]
@@ -802,6 +828,8 @@ fn bootstrap_jar(
         horizon_native_java::MixinSide::Client
     } else {
         horizon_native_java::MixinSide::Server
+            plans,
+            skipped_by_reason,
     };
     // The opt-in tier claims a game-class `@Inject` only when a host hook point
     // will fire it; the default weave keeps every such plan a skip.
@@ -1419,15 +1447,27 @@ where
         log::warn!("Horizon: Java registry snapshot not published: {e}");
     }
     if let Some(home) = std::env::var_os("HORIZON_HOME") {
-        let jars = batch
-            .reports
-            .iter()
-            .map(|r| super::java_runtime_file::RuntimeJar {
-                file: r
-                    .jar
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
+        let _ = super::java_runtime_file::write(&PathBuf::from(home), runtime_report(&batch));
+    }
+    Ok(batch)
+}
+
+/// The `java-runtime.json` rows of one batch: every jar it was given, in path
+/// order, the ones that started with their weave's plan list and the ones the
+/// runner refused with its whole cause, so the launcher and the ledger read the
+/// same answer `server-status` gives.
+fn runtime_report(batch: &JavaBatchOutcome) -> super::java_runtime_file::RuntimeReport {
+    use super::java_runtime_file::RuntimeJar;
+    fn file_name(path: &Path) -> String {
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+    let started = batch.reports.iter().map(|r| {
+        (
+            r.jar.as_path(),
+            RuntimeJar {
+                file: file_name(&r.jar),
                 loader: r.loader.map_or("unknown", JavaLoader::name).to_owned(),
                 engine: r.engine.name().to_owned(),
                 woven: r.mixin.woven,
@@ -1436,17 +1476,22 @@ where
                 registrations: r.registrations,
                 opaque: r.opaque,
                 isolation_failure: r.isolation_failure.clone(),
-            })
-            .collect();
-        let _ = super::java_runtime_file::write(
-            &PathBuf::from(home),
-            super::java_runtime_file::RuntimeReport {
-                schema_version: super::java_runtime_file::SCHEMA_VERSION,
-                jars,
+                refusal: None,
+                sha256: java_cache::known_sha256(&r.jar),
+                plans: r.mixin.plans.clone(),
+                skipped_by_reason: r.mixin.skipped_by_reason.clone(),
             },
-        );
-    }
-    Ok(batch)
+        )
+    });
+    let refused = batch.failures.iter().map(|failure| {
+        (
+            failure.jar.as_path(),
+            RuntimeJar::refused(file_name(&failure.jar), &failure.reason),
+        )
+    });
+    let mut rows: Vec<(&Path, RuntimeJar)> = started.chain(refused).collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    super::java_runtime_file::RuntimeReport::new(rows.into_iter().map(|(_, row)| row).collect())
 }
 
 /// The client role's batch: the content root's rows and one report per jar
@@ -1756,6 +1801,9 @@ mod tests {
         assert!(text.contains("demo/Mixin#hook"), "{text}");
         assert!(
             first_game_skip_reason(&[own]).is_none(),
+        // Through the entry's on-disk form, as a later start reads it.
+        let entry: java_cache::Entry =
+            serde_json::from_slice(&serde_json::to_vec(&entry).unwrap()).unwrap();
             "an in-jar skip needs no loader"
         );
         let unsupported = skipped_plan("demo/Target", MixinSkipReason::UnsupportedFamily, "INVOKE");
@@ -1766,6 +1814,62 @@ mod tests {
             Some("unsupported-family")
         );
         let long = skipped_plan(
+    /// `java-runtime.json` lists every jar the batch was given in path order:
+    /// a refused jar is a row of its own with the runner's whole cause, beside
+    /// the started jars and their plan lists.
+    #[test]
+    fn the_runtime_report_lists_refused_jars_with_their_whole_cause() {
+        let cause = format!(
+            "uncaught exception java/lang/IllegalArgumentException: Invalid version range '[0.7,)' \
+             (at {}#parse)",
+            "net/blay09/mods/balm/common/config/reflection/VersionRange".repeat(3)
+        );
+        assert!(cause.chars().count() > 240);
+        let mut started = report_for("/mods/b-started.jar");
+        started.mixin.skipped = 2;
+        (started.mixin.plans, started.mixin.skipped_by_reason) =
+            super::super::java_runtime_file::plan_rows(&[
+                skipped_plan(
+                    "demo/Own",
+                    horizon_native_java::MixinSkipReason::Cancellable,
+                    "TAIL",
+                ),
+                skipped_plan(
+                    "net/minecraft/server/MinecraftServer",
+                    horizon_native_java::MixinSkipReason::TargetOutsideJar,
+                    "HEAD",
+                ),
+            ]);
+        let batch = JavaBatchOutcome {
+            reports: vec![started],
+            failures: vec![
+                jar_failure(
+                    Path::new("/mods/c-refused.jar"),
+                    format!("/mods/c-refused.jar: {cause}"),
+                ),
+                jar_failure(
+                    Path::new("/mods/a-refused.jar"),
+                    "no native entrypoint".into(),
+                ),
+            ],
+            ..Default::default()
+        };
+        let report = runtime_report(&batch);
+        let files: Vec<&str> = report.jars.iter().map(|j| j.file.as_str()).collect();
+        assert_eq!(files, ["a-refused.jar", "b-started.jar", "c-refused.jar"]);
+        assert_eq!((report.jars_total, report.refused), (3, 2));
+        let refused = &report.jars[2];
+        assert_eq!(refused.engine, "refused");
+        assert_eq!(refused.refusal.as_deref(), Some(cause.as_str()));
+        let started = &report.jars[1];
+        assert_eq!(started.refusal, None);
+        assert_eq!(
+            started.plans[0].target,
+            "net/minecraft/server/MinecraftServer"
+        );
+        assert_eq!(started.skipped_by_reason["cancellable"], 1);
+    }
+
             "net/minecraft/A",
             MixinSkipReason::Weaver("x".repeat(1000)),
             "HEAD",
@@ -1789,6 +1893,8 @@ mod tests {
     }
 
     /// A jar stored on one start replays exactly the declarations it recorded,
+            skip_plans: Vec::new(),
+            skipped_by_reason: BTreeMap::new(),
     /// through the same converter the live path uses: the content root of a
     /// warm start is the one the cold start built.
     #[test]
@@ -1800,7 +1906,17 @@ mod tests {
             sha256: "a".repeat(64),
             size: 1024,
         };
-        let report = report_for("/mods/fixture.jar");
+        let mut report = report_for("/mods/fixture.jar");
+        // The skipped-plan list survives the cache too, so a replayed jar
+        // still explains its `needs-loader` label.
+        let skipped = [skipped_plan(
+            "net/minecraft/world/level/Level",
+            horizon_native_java::MixinSkipReason::TargetOutsideJar,
+            "HEAD",
+        )];
+        report.mixin.skipped = 1;
+        (report.mixin.plans, report.mixin.skipped_by_reason) =
+            super::super::java_runtime_file::plan_rows(&skipped);
         let entry = cache_entry(
             &identity,
             ExecutionRole::DedicatedServer,

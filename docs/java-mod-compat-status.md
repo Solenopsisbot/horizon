@@ -160,8 +160,14 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   A missing binary or server is a report line, not a failure; only `HORIZON_NEOFORGE_STRICT=1` stops startup.
 - `server-status` carries bounded `java` and `fml` sections: per-jar loader, engine, backend, weave label, executed
   entrypoints, registrations, opaque rows and isolation failures, `payload_channels`, and the preflight's
-  status/role/jars/mods/ids/error. The dedicated log prints one line per started jar. `java-runtime.json` (schema v1,
-  256 jars, 256 KiB cap) is written under `HORIZON_HOME` for launcher and support tooling.
+  status/role/jars/mods/ids/error. Refused jars are rows too (listed first, up to 8, `engine = "refused"`, the
+  runner's whole cause in `refusal`), and `jars`/`started`/`refused` and the engine counts include them. The dedicated
+  log prints one line per started jar and one bounded `skipping` line. `java-runtime.json` (schema v1, 256 jars,
+  256 KiB cap) is written under `HORIZON_HOME` for launcher and support tooling: one row per jar given, refused ones
+  with `refusal`, started ones with the first 64 skipped `plans` (mixin, target, method, injector, reason; the
+  loader-relevant ones first), `skipped_by_reason` counts and the jar's cache `sha256`. Plan lists shrink before rows
+  are dropped when the file would pass its cap. The launcher's runtime panel shows all of it per mod, with a "Clear
+  runtime cache" action that removes that jar's `java-content-cache/<sha256>-<role>.json` entries.
 
 ### `horizon-jvm` (the reference runner, not the native path)
 
@@ -706,10 +712,11 @@ than rows; the cache held 86 entries in 436 KiB.
    root once).
 6. **No JVM fallback in the game.** `horizon-jvm` is a standalone reference runner; a jar the native runtime refuses
    is skipped, so the `jvm`/`sidecar` counts in `server-status` are structurally zero.
-7. **Diagnostics are partial.** Refused jars are logged but absent from the `server-status` rows (it answers for the
-   jars that started); `java-runtime.json` carries each jar's woven/skipped counts and the first game-class or
-   unsupported skip reason, so the launcher's runtime panel can label a jar `needs-loader`, but it does not list the
-   plans behind that reason.
+7. **Diagnostics.** `server-status`, `java-runtime.json`, the launcher's runtime panel and the server ledger now carry
+   refused jars with the runner's whole cause (bounded only at 2,048 characters; the log line still stops at 160) and
+   each started jar's skipped plans and counts by reason. What is left: a refused row names no loader (the failure
+   carries only the path and cause), and the launcher matches report rows to installed mods by file name, so a jar
+   run outside the browser's `horizon-mods` folder has no panel row.
 8. **NeoForge.** Native metadata and `@Mod` bootstrap work. The real FML lifecycle is a bounded, opt-in child
    process (`horizon-jvm --real-loader`) used as a preflight on the integrated server, not the path a mod's code
    takes; the dedicated role does not preflight yet, there is no in-game loader selection, and no automatic
@@ -735,9 +742,9 @@ than rows; the cache held 86 entries in 436 KiB.
    runtime and drive them from the game; measure with rendering on and a curated pack, not offscreen.
 6. **NeoForge path.** Finish the FML path: give the dedicated role the integrated server's opt-in preflight, then
    in-process loader selection, with remap readiness checked against a real NeoForge 26.3 server.
-7. **Diagnostics.** Populate the runtime report's weave counts and first skip reason, include refused jars in
-   `server-status`, stop clipping the refusal cause, and surface a per-mod compatibility row (with cache clear) in the
-   launcher.
+7. **Diagnostics.** Done: weave counts, first skip reason, the per-plan list, refused rows with their whole cause in
+   `server-status` and `java-runtime.json`, and the launcher's per-mod row with a runtime-cache clear. Next: name a
+   refused jar's loader from its metadata, and show runtime rows for jars the launcher did not install.
 8. **Keep the corpus honest.** Refresh `tools/real_mod_fixtures/LAST_SERVER_LEDGER_{223,500}.txt` per release, fail
    a run when `ran` regresses or a refused row loses its cause, and extend the fixture workflow (it deliberately never
    downloads third-party jars).

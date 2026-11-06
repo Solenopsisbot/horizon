@@ -31,7 +31,8 @@ use std::{
 
 /// Layout of an entry, and the engine identity that produced it. Bump it when
 /// the entry format changes; a differing schema is a miss, never a guess.
-pub(super) const SCHEMA: u32 = 1;
+/// 2: the report's skipped-plan list and counts by reason.
+pub(super) const SCHEMA: u32 = 2;
 
 /// Total bytes the cache may keep before the next prune removes entries.
 const MAX_BYTES: u64 = 256 << 20;
@@ -43,6 +44,23 @@ const MAX_ENTRY_BYTES: u64 = 8 << 20;
 
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// The sha256 each jar path had when [`lookup`] last hashed it, so the batch's
+/// `java-runtime.json` row can name the jar's cache entry without hashing the
+/// jar a second time. The launcher's "clear compatibility cache" action
+/// removes `java-content-cache/<sha256>-*.json` by that name.
+static KNOWN: std::sync::Mutex<BTreeMap<PathBuf, String>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// The sha256 [`lookup`] took for `path` in this process, if it took one: a jar
+/// the cache never looked up (cache off, hook tier on, refused before lookup)
+/// has no entry to clear.
+pub(super) fn known_sha256(path: &Path) -> Option<String> {
+    KNOWN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .cloned()
+}
 
 /// A jar file's identity: what the cache is keyed by.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +86,12 @@ pub(super) struct Entry {
     pub(super) woven: usize,
     pub(super) skipped: usize,
     pub(super) first_skip_reason: Option<String>,
+    /// The report's bounded skipped-plan list, so a replayed jar explains its
+    /// skips in `java-runtime.json` as an interpreted one does.
+    #[serde(default)]
+    pub(super) skip_plans: Vec<crate::game::java_runtime_file::RuntimePlan>,
+    #[serde(default)]
+    pub(super) skipped_by_reason: BTreeMap<String, usize>,
     pub(super) isolation_failure: Option<String>,
     /// The typed rows the host recorded, in registration order.
     pub(super) rows: Vec<Row>,
@@ -313,6 +337,10 @@ pub(super) fn lookup(path: &Path, role: ExecutionRole) -> Option<(Identity, Opti
         return None;
     }
     let identity = identity(path)?;
+    KNOWN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf(), identity.sha256.clone());
     match load_in(&root(), &identity, role, &engine_key()) {
         Some(entry) => {
             HITS.fetch_add(1, Ordering::Relaxed);
@@ -478,6 +506,8 @@ mod tests {
             woven: 0,
             skipped: 0,
             first_skip_reason: None,
+            skip_plans: Vec::new(),
+            skipped_by_reason: BTreeMap::new(),
             isolation_failure: None,
             rows: vec![Row {
                 registry: "minecraft:block".into(),

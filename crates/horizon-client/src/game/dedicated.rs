@@ -453,6 +453,9 @@ where
         log("INFO", &java_report_line(report));
     }
     super::java_mods::record_java_reports(&batch.reports);
+    // `server-status` lists the refused jars too, each with the whole cause the
+    // log line below clips.
+    super::java_mods::record_java_failures(&batch.failures);
     // The runner names every jar that never started and why. A strict server
     // returns those lines, so the operator sees `<jar>: <reason>` instead of a
     // path with no diagnosis.

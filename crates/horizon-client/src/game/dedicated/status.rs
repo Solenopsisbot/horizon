@@ -8,7 +8,7 @@
 //! `player-release <uuid> ...`, `player-import <uuid> <json>` and `player-confirm <uuid> ...` are a proxy's,
 //! for a player it moves between two servers (transfer.rs).
 use super::super::java_mods::{
-    JavaCompatibilityReport, JavaEngine, JavaLoader,
+    JavaCompatibilityReport, JavaEngine, JavaJarFailure, JavaLoader,
     fml::{self, role_name},
 };
 use super::{ServerState, capture_log};
@@ -22,8 +22,11 @@ use std::{
 /// The window the tick rate is measured over.
 const TPS_WINDOW: Duration = Duration::from_secs(5);
 
-/// The most jars `server-status` lists one by one; the counts stay whole.
+/// The most started jars `server-status` lists one by one; the counts stay whole.
 const MAX_STATUS_JARS: usize = 8;
+/// The most refused jars it lists, ahead of the started ones: a refusal is what
+/// an operator reads the section for, so a long started list never hides one.
+const MAX_STATUS_REFUSED: usize = 8;
 /// The most payload channel ids the `java` section names; the count stays whole.
 const MAX_STATUS_ROWS: usize = 12;
 /// The most mod ids the `fml` section lists; FML's count stays whole.
@@ -75,6 +78,11 @@ fn java_rows() -> Vec<JavaCompatibilityReport> {
     super::super::java_mods::java_reports()
 }
 
+/// The same batch's refused jars.
+fn java_refused() -> Vec<JavaJarFailure> {
+    super::super::java_mods::java_failures()
+}
+
 /// The `java` key of `server-status`.
 ///
 /// The per-jar rows are the runner's reports; the payload channels are the
@@ -85,20 +93,33 @@ pub(super) fn java_status() -> Value {
         .declarations()
         .map(|declaration| declaration.id.clone())
         .collect();
-    java_section(&java_rows(), &channels)
+    java_section(&java_rows(), &java_refused(), &channels)
 }
 
-/// The `java` section of `server-status`: which explicitly selected jars the
-/// loader started, each one's loader, engine, backend, weave outcome and the
-/// work it cost (entrypoints executed, registrations recorded, how many of
-/// those stayed opaque), and whether any was isolated. The section totals
-/// those over every jar, so the bounded entry list never hides the whole.
-/// Sorted by jar path and bounded, so two servers that started the same jars
-/// answer the same. Every key is fixed, so a server with no jars answers zeros
-/// and an empty entry list.
-pub(super) fn java_section(reports: &[JavaCompatibilityReport], channels: &[String]) -> Value {
+/// The `java` section of `server-status`: every explicitly selected jar, the
+/// ones the loader started with their loader, engine, backend, weave outcome
+/// and the work they cost (entrypoints executed, registrations recorded, how
+/// many of those stayed opaque) and whether any was isolated, and the ones it
+/// refused with `engine = "refused"` and the runner's whole cause in
+/// `refusal`. `jars` counts both, `started` and `refused` each; the engine,
+/// backend and weave counts include the refused jars. The section totals over
+/// every jar, so the bounded entry list never hides the whole. Refused rows
+/// come first, then started ones, each sorted by jar path and bounded, so two
+/// servers given the same jars answer the same. Every key is fixed, so a
+/// server with no jars answers zeros and an empty entry list.
+pub(super) fn java_section(
+    reports: &[JavaCompatibilityReport],
+    refused: &[JavaJarFailure],
+    channels: &[String],
+) -> Value {
     let mut sorted: Vec<&JavaCompatibilityReport> = reports.iter().collect();
     sorted.sort_by(|a, b| a.jar.cmp(&b.jar));
+    let mut refused: Vec<&JavaJarFailure> = refused.iter().collect();
+    refused.sort_by(|a, b| a.jar.cmp(&b.jar));
+    // A refused jar ran on nothing and was never woven: it adds to the
+    // `refused` engine, the `none` backend and the `none` weave.
+    let refused_count = refused.len();
+    let plus_refused = |is_refused: bool| if is_refused { refused_count } else { 0 };
     let count = |of: fn(&JavaCompatibilityReport) -> usize| {
         sorted.iter().map(|report| of(report)).sum::<usize>()
     };
@@ -109,7 +130,8 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport], channels: &[Stri
         let count = sorted
             .iter()
             .filter(|report| report.engine == engine)
-            .count();
+            .count()
+            + plus_refused(engine == JavaEngine::Refused);
         engines.insert(engine.name().to_owned(), json!(count));
     }
     engines.insert("sidecar".to_owned(), json!(0));
@@ -119,7 +141,8 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport], channels: &[Stri
         let count = sorted
             .iter()
             .filter(|report| backend_name(report.engine) == backend)
-            .count();
+            .count()
+            + plus_refused(backend == backend_name(JavaEngine::Refused));
         backends.insert(backend.to_owned(), json!(count));
     }
     let mut weave = Map::new();
@@ -131,7 +154,8 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport], channels: &[Stri
         let count = sorted
             .iter()
             .filter(|report| report.engine == label)
-            .count();
+            .count()
+            + plus_refused(label == JavaEngine::Refused);
         weave.insert(name.to_owned(), json!(count));
     }
     // The content root's channels, in id order, named once: the runner's
@@ -141,25 +165,39 @@ pub(super) fn java_section(reports: &[JavaCompatibilityReport], channels: &[Stri
     channel_ids.dedup();
     let total_channels = channel_ids.len();
     channel_ids.truncate(MAX_STATUS_ROWS);
-    let entries: Vec<Value> = sorted
-        .iter()
-        .take(MAX_STATUS_JARS)
-        .map(|report| {
-            json!({
-                "jar": report.jar.display().to_string(),
-                "loader": report.loader.map_or("unknown", JavaLoader::name),
-                "engine": report.engine.name(),
-                "backend": backend_name(report.engine),
-                "weave": weave_name(report.engine),
-                "entrypoints": report.entrypoints,
-                "registrations": report.registrations,
-                "opaque": report.opaque,
-                "isolation_failure": report.isolation_failure.as_deref().map(bounded_error),
-            })
+    let refused_entries = refused.iter().take(MAX_STATUS_REFUSED).map(|failure| {
+        json!({
+            "jar": failure.jar.display().to_string(),
+            "loader": "unknown",
+            "engine": JavaEngine::Refused.name(),
+            "backend": backend_name(JavaEngine::Refused),
+            "weave": weave_name(JavaEngine::Refused),
+            "entrypoints": 0,
+            "registrations": 0,
+            "opaque": 0,
+            "isolation_failure": null,
+            "refusal": super::super::java_runtime_file::bounded_cause(&failure.reason),
         })
-        .collect();
+    });
+    let started_entries = sorted.iter().take(MAX_STATUS_JARS).map(|report| {
+        json!({
+            "jar": report.jar.display().to_string(),
+            "loader": report.loader.map_or("unknown", JavaLoader::name),
+            "engine": report.engine.name(),
+            "backend": backend_name(report.engine),
+            "weave": weave_name(report.engine),
+            "entrypoints": report.entrypoints,
+            "registrations": report.registrations,
+            "opaque": report.opaque,
+            "isolation_failure": report.isolation_failure.as_deref().map(bounded_error),
+            "refusal": null,
+        })
+    });
+    let entries: Vec<Value> = refused_entries.chain(started_entries).collect();
     json!({
-        "jars": sorted.len(),
+        "jars": sorted.len() + refused_count,
+        "started": sorted.len(),
+        "refused": refused_count,
         "listed": entries.len(),
         "isolated": sorted.iter().filter(|r| r.isolation_failure.is_some()).count(),
         "engines": engines,
@@ -397,13 +435,14 @@ fn player_status(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_FML_IDS, MAX_STATUS_ERROR_CHARS, MAX_STATUS_JARS, MAX_STATUS_ROWS, fml_section,
-        java_section, java_status, player_status,
+        MAX_FML_IDS, MAX_STATUS_ERROR_CHARS, MAX_STATUS_JARS, MAX_STATUS_REFUSED, MAX_STATUS_ROWS,
+        fml_section, java_section, java_status, player_status,
     };
     use crate::game::execution_role::ExecutionRole;
     use crate::game::java_mods::fml;
     use crate::game::java_mods::{
-        JavaCompatibilityReport, JavaEngine, JavaLoader, record_java_reports,
+        JavaCompatibilityReport, JavaEngine, JavaJarFailure, JavaLoader, record_java_failures,
+        record_java_reports,
     };
     use serde_json::{Value, json};
     use std::path::PathBuf;
@@ -469,7 +508,7 @@ mod tests {
             "demo:pong".to_owned(),
             "demo:ping".to_owned(),
         ];
-        let section = java_section(&[report], &channels);
+        let section = java_section(&[report], &[], &channels);
 
         assert_eq!(section["jars"], 1);
         assert_eq!(section["listed"], 1);
@@ -518,9 +557,11 @@ mod tests {
     #[test]
     fn no_jars_answer_a_stable_empty_shape() {
         assert_eq!(
-            java_section(&[], &[]),
+            java_section(&[], &[], &[]),
             json!({
                 "jars": 0,
+                "started": 0,
+                "refused": 0,
                 "listed": 0,
                 "isolated": 0,
                 "engines": {"native": 0, "native-qualified": 0, "refused": 0, "sidecar": 0},
@@ -554,7 +595,7 @@ mod tests {
                 )
             })
             .collect();
-        let section = java_section(&reports, &[]);
+        let section = java_section(&reports, &[], &[]);
         assert_eq!(section["jars"], json!(MAX_STATUS_JARS + 2));
         assert_eq!(section["listed"], json!(MAX_STATUS_JARS));
         assert_eq!(section["entrypoints"], json!(2 * (MAX_STATUS_JARS + 2)));
@@ -574,7 +615,7 @@ mod tests {
             .rev()
             .map(|i| format!("demo:c{i:02}"))
             .collect();
-        let section = java_section(&[], &channels);
+        let section = java_section(&[], &[], &channels);
         let listed = section["payload_channels"].as_array().unwrap();
         assert_eq!(listed.len(), MAX_STATUS_ROWS);
         assert_eq!(listed[0], "demo:c00");
@@ -585,7 +626,7 @@ mod tests {
     #[test]
     fn a_refused_jar_is_never_counted_as_native_work() {
         let report = java_report("/mods/refused.jar", JavaEngine::Refused, 0, 0, 0, None);
-        let section = java_section(&[report], &[]);
+        let section = java_section(&[report], &[], &[]);
         assert_eq!(
             section["backends"],
             json!({"native": 0, "jvm": 0, "none": 1})
@@ -597,6 +638,68 @@ mod tests {
         assert_eq!(section["entries"][0]["backend"], "none");
         assert_eq!(section["entries"][0]["weave"], "none");
         assert_eq!(section["entries"][0]["isolation_failure"], Value::Null);
+    }
+
+    fn refusal(jar: &str, reason: &str) -> JavaJarFailure {
+        JavaJarFailure {
+            jar: PathBuf::from(jar),
+            reason: reason.to_owned(),
+        }
+    }
+
+    /// A jar the runner refused is a row of its own, ahead of the started
+    /// ones, carrying the runner's cause whole: past the 160 characters the
+    /// log line keeps, and past the isolation-failure bound too. Every count
+    /// includes it.
+    #[test]
+    fn a_refused_jar_is_listed_first_with_its_whole_cause() {
+        let cause = format!(
+            "uncaught exception java/lang/NullPointerException: Tried to register a listener for a \
+             null phase (at {}#init)",
+            "com/example/collective/events/CollectiveEventListener".repeat(4)
+        );
+        assert!(cause.chars().count() > MAX_STATUS_ERROR_CHARS);
+        let started = java_report("/mods/a-started.jar", JavaEngine::Native, 1, 2, 0, None);
+        let section = java_section(
+            &[started],
+            &[refusal("/mods/z-collective.jar", &cause)],
+            &[],
+        );
+        assert_eq!(section["jars"], 2);
+        assert_eq!(section["started"], 1);
+        assert_eq!(section["refused"], 1);
+        assert_eq!(section["listed"], 2);
+        assert_eq!(section["engines"]["refused"], 1);
+        assert_eq!(section["backends"]["none"], 1);
+        assert_eq!(section["weave"]["none"], 1);
+        // The started jar's work is still its own.
+        assert_eq!(section["entrypoints"], 1);
+
+        let row = &section["entries"][0];
+        assert_eq!(row["jar"], "/mods/z-collective.jar");
+        assert_eq!(row["engine"], "refused");
+        assert_eq!(row["backend"], "none");
+        assert_eq!(row["refusal"], cause.as_str());
+        assert_eq!(section["entries"][1]["jar"], "/mods/a-started.jar");
+        assert_eq!(section["entries"][1]["refusal"], Value::Null);
+    }
+
+    /// Refused rows have their own bound, so more refusals than it never push
+    /// the started jars out of the list, and the counts stay whole.
+    #[test]
+    fn refused_rows_are_bounded_on_their_own() {
+        let refused: Vec<JavaJarFailure> = (0..MAX_STATUS_REFUSED + 3)
+            .rev()
+            .map(|i| refusal(&format!("/mods/r{i:02}.jar"), "no native entrypoint"))
+            .collect();
+        let started = java_report("/mods/s.jar", JavaEngine::Native, 1, 0, 0, None);
+        let section = java_section(&[started], &refused, &[]);
+        assert_eq!(section["refused"], json!(MAX_STATUS_REFUSED + 3));
+        assert_eq!(section["engines"]["refused"], json!(MAX_STATUS_REFUSED + 3));
+        let entries = section["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), MAX_STATUS_REFUSED + 1);
+        assert_eq!(entries[0]["jar"], "/mods/r00.jar");
+        assert_eq!(entries[MAX_STATUS_REFUSED]["jar"], "/mods/s.jar");
     }
 
     /// A failure reason from a report that was not built here is still cut to
@@ -612,7 +715,7 @@ mod tests {
             0,
             Some(&failure),
         );
-        let section = java_section(&[report], &[]);
+        let section = java_section(&[report], &[], &[]);
         let line = section["entries"][0]["isolation_failure"].as_str().unwrap();
         assert_eq!(line.chars().count(), MAX_STATUS_ERROR_CHARS + 3);
         assert!(line.starts_with(" xxx"), "{line}");
@@ -626,7 +729,7 @@ mod tests {
     #[test]
     fn old_java_keys_still_decode_after_a_round_trip() {
         let report = java_report("/mods/a.jar", JavaEngine::Native, 1, 2, 0, None);
-        let section = java_section(&[report], &["demo:ping".to_owned()]);
+        let section = java_section(&[report], &[], &["demo:ping".to_owned()]);
         let mut wire: Value = serde_json::from_str(&section.to_string()).unwrap();
 
         let object = wire.as_object_mut().unwrap();
@@ -636,12 +739,14 @@ mod tests {
             "registrations",
             "payload_channels",
             "payload_channels_total",
+            "started",
+            "refused",
         ] {
             object.remove(key);
         }
         for entry in object["entries"].as_array_mut().unwrap() {
             let entry = entry.as_object_mut().unwrap();
-            for key in ["weave", "entrypoints", "registrations"] {
+            for key in ["weave", "entrypoints", "registrations", "refusal"] {
                 entry.remove(key);
             }
         }
@@ -680,11 +785,15 @@ mod tests {
             0,
             None,
         )]);
+        record_java_failures(&[refusal("/mods/refused.jar", "no native entrypoint")]);
         let section = java_status();
-        assert_eq!(section["jars"], 1);
-        assert_eq!(section["entries"][0]["jar"], "/mods/recorded.jar");
+        assert_eq!(section["jars"], 2);
+        assert_eq!(section["entries"][0]["jar"], "/mods/refused.jar");
+        assert_eq!(section["entries"][0]["refusal"], "no native entrypoint");
+        assert_eq!(section["entries"][1]["jar"], "/mods/recorded.jar");
         assert_eq!(section["entrypoints"], 1);
 
+        // A later batch replaces both, refusals included.
         record_java_reports(&[]);
         assert_eq!(java_status()["jars"], 0);
         assert_eq!(java_status()["entries"], json!([]));

@@ -1293,6 +1293,7 @@ where
     super::java_mods::publish_server_declarations(batch.declarations);
     Ok(())
 }
+    super::java_mods::record_java_failures(&batch.failures);
 
 /// The server thread: a game of its own over the shared resources.
 #[allow(clippy::too_many_arguments)]
