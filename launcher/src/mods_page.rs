@@ -1364,6 +1364,18 @@ impl Launcher {
         self.mods.installed_list.reset();
     }
 
+    /// Clears the game's runtime cache for one installed Java mod's jar, so the next start runs
+    /// the jar again instead of replaying what it recorded.
+    fn mods_clear_runtime_cache(&mut self, title: &str, key: &str) {
+        let home = self.mods.home();
+        self.mods.message = Some(java::clear_runtime_cache(&home, key).map(|_| {
+            trf(
+                "Cleared the runtime cache for {name}. The game runs it again on its next start.",
+                &[("name", title)],
+            )
+        }));
+    }
+
     /// The ledger label an installed Java mod has, when the game's runtime report or its cached
     /// port check says: the report wins (it saw the jar run), the check fills in when it has
     /// none. None when neither says anything, so the page claims nothing.
@@ -1499,6 +1511,25 @@ impl Launcher {
                     .on_click(cx.listener(
                         move |this, _: &ClickEvent, _, cx| {
                             this.mods_clear_check(&entry);
+                            cx.notify();
+                        },
+                    )),
+                );
+            }
+            // The game's own cache of the jar's bootstrap, separate from the browser's check:
+            // only a jar the game looked up has an entry to clear.
+            if let Some(key) = runtime.cache_key.clone() {
+                let title = e.title.clone();
+                row = row.child(
+                    button(
+                        SharedString::from(format!("mods-clear-runtime-{}", e.project)),
+                        "Clear runtime cache",
+                        Kind::Ghost,
+                        &t,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            this.mods_clear_runtime_cache(&title, &key);
                             cx.notify();
                         },
                     )),
@@ -2350,6 +2381,7 @@ mod tests {
             failed,
             skipped,
             route: Some(java::Route::Native),
+            cache_key: None,
         }
     }
 

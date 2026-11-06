@@ -30,9 +30,14 @@ pub const LOADERS: [&str; 4] = ["neoforge", "fabric", "forge", "quilt"];
 /// A message or path on one line, cut to a player-sized length.
 fn bounded(text: &str) -> String {
     const MAX_DETAIL: usize = 240;
+    bounded_to(text, MAX_DETAIL)
+}
+
+/// `text` on one line, cut to `max` characters.
+fn bounded_to(text: &str, max: usize) -> String {
     let mut detail = text.replace(['\n', '\r'], " ");
-    if detail.chars().count() > MAX_DETAIL {
-        detail = detail.chars().take(MAX_DETAIL - 1).collect();
+    if detail.chars().count() > max {
+        detail = detail.chars().take(max - 1).collect();
         detail.push('…');
     }
     detail
@@ -71,7 +76,68 @@ struct RuntimeJar {
     payload_channels: Vec<String>,
     #[serde(default)]
     isolation_failure: Option<String>,
+    /// Why the game refused the jar, whole: on an `engine = "refused"` row only.
+    #[serde(default)]
+    refusal: Option<String>,
+    /// The jar's sha256: the name of its entries in the game's `java-content-cache/`.
+    #[serde(default)]
+    sha256: Option<String>,
+    /// The first skipped plans, the ones that need the loader first; `skipped` is the whole count.
+    #[serde(default)]
+    plans: Vec<RuntimePlan>,
+    /// Every skipped plan counted by its reason label.
+    #[serde(default)]
+    skipped_by_reason: std::collections::BTreeMap<String, usize>,
 }
+
+/// One skipped mixin plan in the runtime report: which mixin class wanted to change which
+/// target, with what injector, and why the game's weave left it out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimePlan {
+    #[serde(default)]
+    mixin: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    injector: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+impl RuntimePlan {
+    /// The plan as one technical line: `target-outside-jar HEAD net/minecraft/A#tick <- demo/M`.
+    /// Class and method names are code, not words, so only the line's label is translated.
+    fn line(&self) -> String {
+        let target = if self.method.is_empty() {
+            self.target.clone()
+        } else {
+            format!("{}#{}", self.target, self.method)
+        };
+        let mut line = format!(
+            "{} {} {target} <- {}",
+            self.reason, self.injector, self.mixin
+        );
+        if let Some(detail) = &self.detail {
+            line.push_str(&format!(" ({detail})"));
+        }
+        line
+    }
+}
+
+/// The longest refusal cause the panel shows. The game keeps the whole cause up to the same bound
+/// (`MAX_CAUSE_CHARS` in its `java_runtime_file.rs`), so the panel never clips what the game kept.
+const MAX_CAUSE: usize = 2048;
+/// Skipped plans one row lists; the rest are counted.
+const PLANS_SHOWN: usize = 8;
+
+/// The game's per-jar cache, under the game folder (`game/java_cache.rs`): one
+/// `<sha256>-<role>.json` per execution role that bootstrapped the jar.
+const RUNTIME_CACHE: &str = "java-content-cache";
+const RUNTIME_CACHE_ROLES: [&str; 3] = ["client", "integrated-server", "dedicated-server"];
 
 /// Where a jar's code runs in Horizon's hybrid path, in the vocabulary of the server ledger
 /// (`tools/java_mod_server_ledger.py`) and `tools/hybrid_pack.py`.
@@ -102,10 +168,14 @@ impl Route {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RuntimeLines {
     pub lines: Vec<String>,
+    /// The runtime refused the jar or failed to isolate it.
     pub failed: bool,
     pub skipped: usize,
     /// The ledger label the report alone supports (`None` for a defaulted row with no report).
     pub route: Option<Route>,
+    /// The jar's key in the game's runtime cache, when the game looked it up: what
+    /// [`clear_runtime_cache`] removes.
+    pub cache_key: Option<String>,
 }
 
 /// Reads the game's bounded runtime report, if one was written for this game folder. A file
@@ -157,11 +227,47 @@ pub fn runtime_lines_in(
             ("payloads", &payloads),
         ],
     )];
+    if let Some(cause) = jar.refusal.as_deref() {
+        // The whole cause: this is the line that says why the jar didn't run.
+        lines.push(say(
+            language,
+            "Refused: {cause}",
+            &[("cause", &bounded_to(cause, MAX_CAUSE))],
+        ));
+    }
     if let Some(reason) = jar.first_skip_reason.as_deref() {
         lines.push(say(
             language,
             "Runtime skipped: {reason}",
             &[("reason", &bounded(reason))],
+        ));
+    }
+    if !jar.skipped_by_reason.is_empty() {
+        let counts: Vec<String> = jar
+            .skipped_by_reason
+            .iter()
+            .map(|(reason, count)| format!("{} {count}", bounded(reason)))
+            .collect();
+        lines.push(say(
+            language,
+            "Skipped by reason: {counts}",
+            &[("counts", &bounded(&counts.join(", ")))],
+        ));
+    }
+    for plan in jar.plans.iter().take(PLANS_SHOWN) {
+        lines.push(say(
+            language,
+            "Skipped plan: {plan}",
+            &[("plan", &bounded(&plan.line()))],
+        ));
+    }
+    // The report lists the first plans and counts them all; say how many more there are.
+    let unlisted = jar.skipped.saturating_sub(jar.plans.len().min(PLANS_SHOWN));
+    if !jar.plans.is_empty() && unlisted > 0 {
+        lines.push(say(
+            language,
+            "(+{count} more)",
+            &[("count", &unlisted.to_string())],
         ));
     }
     if let Some(error) = jar.isolation_failure.as_deref() {
@@ -173,10 +279,35 @@ pub fn runtime_lines_in(
     }
     Some(RuntimeLines {
         lines,
-        failed: jar.isolation_failure.is_some(),
+        failed: jar.isolation_failure.is_some() || jar.engine.eq_ignore_ascii_case("refused"),
         skipped: jar.skipped,
         route: Some(route_of_jar(jar)),
+        cache_key: jar.sha256.clone().filter(|key| is_sha256(key)),
     })
+}
+
+fn is_sha256(key: &str) -> bool {
+    key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Removes the game's runtime cache entries for one jar, every role's, so its next start runs the
+/// jar again instead of replaying what an earlier start recorded. `Ok(false)` when there was
+/// nothing to remove. A key that isn't a sha256 never reaches the file system.
+pub fn clear_runtime_cache(home: &Path, key: &str) -> Result<bool, String> {
+    if !is_sha256(key) {
+        return Err(format!("{key} isn't a runtime cache key."));
+    }
+    let dir = home.join(RUNTIME_CACHE);
+    let mut removed = false;
+    for role in RUNTIME_CACHE_ROLES {
+        let path = dir.join(format!("{}-{role}.json", key.to_ascii_lowercase()));
+        match fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    Ok(removed)
 }
 
 /// Skip reasons that name a plan whose target is a game class (`net/minecraft`): the weaver
@@ -736,6 +867,94 @@ mod tests {
         )
         .unwrap();
         assert!(runtime_report(&home).is_none());
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// A refused row shows the game's whole cause, past the panel's usual line bound, and ranks
+    /// with the failures; a started row lists its skipped plans (the ones that need the loader
+    /// first, as the game wrote them), counts the rest, and names its runtime cache key.
+    #[test]
+    fn runtime_rows_show_the_whole_refusal_and_the_skipped_plans() {
+        let cause = format!(
+            "uncaught exception java/lang/IllegalStateException: Could not determine mod loader (at {}#detect)",
+            "io/github/jamalam360/jamlib/platform/".repeat(8)
+        );
+        assert!(cause.chars().count() > 240);
+        let key = "0123456789abcdef".repeat(4);
+        let report: RuntimeReport = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "jars": [{
+                "file": "jamlib.jar", "loader": "unknown", "engine": "refused",
+                "woven": 0, "skipped": 0, "registrations": 0, "opaque": 0,
+                "refusal": cause
+            }, {
+                "file": "gamefix.jar", "loader": "fabric", "engine": "native-qualified",
+                "woven": 1, "skipped": 12, "registrations": 0, "opaque": 0,
+                "first_skip_reason": "target-outside-jar HEAD net/minecraft/world/level/Level#tick",
+                "sha256": key,
+                "plans": [{
+                    "mixin": "demo/mixin/LevelMixin", "target": "net/minecraft/world/level/Level",
+                    "method": "tick", "injector": "HEAD", "reason": "target-outside-jar"
+                }, {
+                    "mixin": "demo/mixin/OwnMixin", "target": "demo/Own", "method": "run",
+                    "injector": "TAIL", "reason": "weaver-rejected", "detail": "stack shape"
+                }],
+                "skipped_by_reason": {"target-outside-jar": 11, "weaver-rejected": 1}
+            }]
+        }))
+        .unwrap();
+
+        let refused = runtime_lines_in(Language::English, &report, "jamlib.jar").unwrap();
+        assert!(refused.failed, "a refusal ranks with the failures");
+        assert_eq!(refused.route, Some(Route::Gap));
+        assert_eq!(refused.lines[1], format!("Refused: {cause}"));
+        assert_eq!(refused.cache_key, None);
+
+        let started = runtime_lines_in(Language::English, &report, "gamefix.jar").unwrap();
+        assert_eq!(started.route, Some(Route::Loader));
+        assert_eq!(started.cache_key.as_deref(), Some(key.as_str()));
+        let text = started.lines.join("\n");
+        assert!(
+            text.contains("Skipped by reason: target-outside-jar 11, weaver-rejected 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Skipped plan: target-outside-jar HEAD net/minecraft/world/level/Level#tick <- demo/mixin/LevelMixin"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("TAIL demo/Own#run <- demo/mixin/OwnMixin (stack shape)"),
+            "{text}"
+        );
+        // Two of twelve listed: the other ten are counted.
+        assert!(text.contains("(+10 more)"), "{text}");
+    }
+
+    /// Clearing a jar's runtime cache removes every role's entry for its key and nothing else,
+    /// and a value that isn't a sha256 never reaches the file system.
+    #[test]
+    fn clearing_the_runtime_cache_removes_only_that_jar() {
+        let home =
+            std::env::temp_dir().join(format!("horizon-runtime-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let dir = home.join(RUNTIME_CACHE);
+        fs::create_dir_all(&dir).unwrap();
+        let (a, b) = ("ab".repeat(32), "cd".repeat(32));
+        for name in [
+            format!("{a}-client.json"),
+            format!("{a}-dedicated-server.json"),
+            format!("{b}-client.json"),
+        ] {
+            fs::write(dir.join(name), b"{}").unwrap();
+        }
+        assert_eq!(clear_runtime_cache(&home, &a), Ok(true));
+        assert!(!dir.join(format!("{a}-client.json")).exists());
+        assert!(!dir.join(format!("{a}-dedicated-server.json")).exists());
+        assert!(dir.join(format!("{b}-client.json")).exists());
+        assert_eq!(clear_runtime_cache(&home, &a), Ok(false));
+        assert!(clear_runtime_cache(&home, "../../etc").is_err());
         fs::remove_dir_all(&home).unwrap();
     }
 
