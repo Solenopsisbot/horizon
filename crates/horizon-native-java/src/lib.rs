@@ -14,8 +14,14 @@ use std::{
 };
 
 pub mod weaver;
+mod game_hooks;
 mod java_regex;
 mod stack_walk;
+
+pub use game_hooks::{
+    GAME_OBJECT_PREFIX, GameHookContext, GameHookEffect, GameHookState, GameObject, GameObjectKind,
+    JarCallRedirect,
+};
 
 use weaver::{
     InvokeShift, Shift, SiteSelector, SliceBounds, weave_extended_classes_with_instance_callbacks,
@@ -2049,6 +2055,28 @@ pub trait Host {
         _initialized: std::collections::BTreeSet<String>,
     ) -> Result<(), NativeError> {
         Ok(())
+    }
+
+    /// Run a jar method somewhere else before its body runs.
+    ///
+    /// A game-hook callback calls members of a Mixin class on a game object
+    /// the jar never built: a `@Shadow` member stands for the game's own
+    /// method, and an interface the Mixin adds is implemented by the Mixin
+    /// class. The hook tier's host answers those (`game_hooks.rs`); every
+    /// other host keeps `None`, so the interpreter runs the body it found.
+    fn redirect_jar_call(
+        &self,
+        _class: &str,
+        _method: &Method,
+        _receiver: Option<&Value>,
+    ) -> Option<JarCallRedirect> {
+        None
+    }
+
+    /// Whether a host-owned object marker is an instance of `wanted`, for
+    /// `instanceof`/`checkcast` on an object the interpreter did not build.
+    fn host_instance_of(&self, _marker: &str, _wanted: &str) -> bool {
+        false
     }
 }
 
@@ -15105,106 +15133,18 @@ impl NativeJar {
         args: &[Value],
         host: &mut H,
     ) -> Result<GameHookRun, NativeError> {
-        let entries = registrations.entries(hook);
-        let Some(first) = entries.first() else {
-            return Err(NativeError::Metadata(format!(
-                "no native game hook callback is registered at {hook}"
-            )));
-        };
-        let expected = arg_count(&first.target.descriptor);
-        if args.len() != expected {
-            return Err(NativeError::Metadata(format!(
-                "game hook point {hook} passes {} argument(s) to {}#{}{}, got {}",
-                expected,
-                first.target.owner,
-                first.target.name,
-                first.target.descriptor,
-                args.len()
-            )));
-        }
-        let mut checked = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let site = GAME_HOOK_SITES
-                .iter()
-                .find(|site| site.hook == entry.hook && site.version == entry.version)
-                .ok_or_else(|| {
-                    NativeError::Metadata(format!(
-                        "game hook registration names {} version {}, which this runtime does not know",
-                        entry.hook, entry.version
-                    ))
-                })?;
-            game_hook_callback(&self.classes, &entry.callback, site)
-                .map_err(|reason| game_hook_error(&reason))?;
-            checked.push(self.game_hook_callback_values(entry, args)?);
-        }
-        let (persistent_static_fields, persistent_initialized_classes) =
-            host.persistent_class_state();
-        let mut callback_infos = CallbackInfos::new();
-        let mut results = Vec::with_capacity(entries.len());
-        let mut cancelled = false;
-        {
-            let mut runtime = Runtime {
-                classes: &self.classes,
-                linked: host.linked_class_table().cloned().unwrap_or_default(),
-                host,
-                calls: 0,
-                fields: BTreeMap::new(),
-                static_fields: persistent_static_fields,
-                initialized_classes: persistent_initialized_classes,
-                arrays: BTreeMap::new(),
-                next_array: 0,
-                next_object: 0,
-                streams: BTreeMap::new(),
-                next_stream: 0,
-                enum_constants: BTreeMap::new(),
-                string_builders: BTreeMap::new(),
-                string_readers: BTreeMap::new(),
-                io_writers: BTreeMap::new(),
-                io_paths: BTreeMap::new(),
-                io_files: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-                next_annotation: 0,
-                callback_infos: &mut callback_infos,
-                invoke_hooks: None,
-                anchor_hooks: None,
-                modify_hooks: None,
-                pending_skipped_new: Vec::new(),
-                depth: 0,
-                budget: &ExecutionBudget::UNBOUNDED,
-            };
-            for (entry, (is_static, values)) in entries.iter().zip(checked) {
-                let marker = callback_info_marker(&entry.target);
-                // Open the object even when this callback does not declare it:
-                // every callback at one hook point shares the object Mixin
-                // would hand the injection point, so a `cancel()` in one is
-                // what the next one observes.
-                runtime.open_callback_info(&marker)?;
-                let callback_receiver = (!is_static).then(|| {
-                    receiver
-                        .clone()
-                        .unwrap_or_else(|| Value::Ref(Some(entry.callback.owner.clone())))
-                });
-                let result = runtime.invoke(
-                    &entry.callback.owner,
-                    &entry.callback.name,
-                    &entry.callback.descriptor,
-                    callback_receiver,
-                    &values,
-                )?;
-                results.push(result);
-                if entry.cancellable && runtime.callback_info_cancelled(&marker)? {
-                    cancelled = true;
-                    break;
-                }
-            }
-            runtime.persist_class_state()?;
-        }
-        Ok(GameHookRun {
-            hook: hook.to_owned(),
-            ran: results.len(),
-            cancelled,
-            results,
-        })
+        // One firing with no game objects and no state kept: a host that
+        // fires from the game keeps both and calls `run_game_hook_in`.
+        self.run_game_hook_in(
+            registrations,
+            &mut GameHookState::default(),
+            &mut GameHookContext::default(),
+            hook,
+            receiver,
+            args,
+            host,
+            &ExecutionBudget::UNBOUNDED,
+        )
     }
 
     /// The receiver/static flag and full argument list for one registered hook
@@ -21759,6 +21699,23 @@ impl<H: Host> Runtime<'_, H> {
             .method(method, desc)
             .cloned()
             .ok_or_else(|| NativeError::MissingMethod(format!("{class}#{method}{desc}")))?;
+        // A game-hook callback's Mixin members on a game object resolve
+        // through the host first (`Host::redirect_jar_call`); every other host
+        // answers `None` and the body below runs as before.
+        if let Some(redirect) = self
+            .host
+            .redirect_jar_call(class, &target, receiver.as_ref())
+        {
+            return match redirect {
+                JarCallRedirect::Host(r) => match receiver.as_ref() {
+                    Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                    None => self.host.invoke(&r, args),
+                },
+                JarCallRedirect::Jar(r) => {
+                    self.invoke(&r.owner, &r.name, &r.descriptor, receiver, args)
+                }
+            };
+        }
         // A `static` accessor in a Mixin interface has a placeholder body that
         // only throws; Mixin generates the real one. Run the generated contract
         // instead of the placeholder.
@@ -22625,6 +22582,7 @@ impl<H: Host> Runtime<'_, H> {
                     // keeps the interpreter's previous neutral answer.
                     let matches = expect_ref(&value).is_some_and(|marker| {
                         self.object_is_instance_of(marker, &wanted)
+                            || self.host.host_instance_of(marker, &wanted)
                             || generic_type_instance_of(marker, &wanted)
                             || (wanted == "java/lang/Class"
                                 && class_marker_like(marker, self.classes, &self.linked))

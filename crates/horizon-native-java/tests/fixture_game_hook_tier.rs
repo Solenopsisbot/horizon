@@ -16,8 +16,8 @@
 //! the run stays inside the checkout.
 
 use horizon_native_java::{
-    Host, MixinSide, MixinSkipReason, NativeJar, StdHost, Value, game_hook_site_for,
-    game_hook_sites,
+    ExecutionBudget, GameHookContext, GameHookState, GameObject, Host, MixinSide, MixinSkipReason,
+    NativeJar, StdHost, Value, game_hook_site_for, game_hook_sites,
 };
 use std::{
     collections::BTreeMap,
@@ -230,25 +230,7 @@ struct Fixture {
 
 impl Fixture {
     fn build(name: &str) -> Self {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.local/native-java-game-hook")
-            .join(format!("{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let src = root.join("src");
-        let classes = root.join("classes");
-        fs::create_dir_all(&classes).unwrap();
         let sources: BTreeMap<&str, String> = BTreeMap::from([
-            ("org/spongepowered/asm/mixin/Mixin.java", MIXIN.into()),
-            ("org/spongepowered/asm/mixin/injection/At.java", AT.into()),
-            (
-                "org/spongepowered/asm/mixin/injection/Inject.java",
-                INJECT.into(),
-            ),
-            (
-                "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.java",
-                CALLBACK_INFO.into(),
-            ),
-            ("demo/HookSink.java", HOOK_SINK.into()),
             ("demo/Counter.java", COUNTER.into()),
             (
                 "net/minecraft/world/entity/player/Player.java",
@@ -263,7 +245,6 @@ impl Fixture {
                 ITEM_ENTITY.into(),
             ),
             ("net/minecraft/world/level/Level.java", LEVEL.into()),
-            ("demo/Main.java", MAIN.into()),
             (
                 "demo/TickMixin.java",
                 tick_mixin("afterTick", "TAIL", false, "TickMixin"),
@@ -280,6 +261,52 @@ impl Fixture {
             ),
             ("demo/WrongArgsMixin.java", WRONG_ARGS_MIXIN.into()),
         ]);
+        Self::build_with(
+            name,
+            sources,
+            &[
+                "TickMixin",
+                "PickupMixin",
+                "UnmappedMixin",
+                "HeadTickMixin",
+                "CancelTickMixin",
+                "WrongArgsMixin",
+            ],
+            COMPILE_ONLY,
+        )
+    }
+
+    /// Compile `extra` beside the Mixin stubs, `demo/HookSink` and
+    /// `demo/Main`, and pack every class but `compile_only` with a config
+    /// listing `mixins`.
+    fn build_with(
+        name: &str,
+        extra: BTreeMap<&str, String>,
+        mixins: &[&str],
+        compile_only: &[&str],
+    ) -> Self {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/native-java-game-hook")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let classes = root.join("classes");
+        fs::create_dir_all(&classes).unwrap();
+        let mut sources: BTreeMap<&str, String> = BTreeMap::from([
+            ("org/spongepowered/asm/mixin/Mixin.java", MIXIN.into()),
+            ("org/spongepowered/asm/mixin/injection/At.java", AT.into()),
+            (
+                "org/spongepowered/asm/mixin/injection/Inject.java",
+                INJECT.into(),
+            ),
+            (
+                "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.java",
+                CALLBACK_INFO.into(),
+            ),
+            ("demo/HookSink.java", HOOK_SINK.into()),
+            ("demo/Main.java", MAIN.into()),
+        ]);
+        sources.extend(extra);
         let mut paths = Vec::new();
         for (relative, body) in &sources {
             let path = src.join(relative);
@@ -298,11 +325,11 @@ impl Fixture {
         assert!(status.success(), "javac failed for {name}");
 
         let metadata = r#"{"id":"game-hook-tier","version":"1.0","entrypoints":{"main":["demo.Main"]},"mixins":["demo.mixins.json"]}"#;
-        let config = r#"{"package":"demo","mixins":["TickMixin","PickupMixin","UnmappedMixin","HeadTickMixin","CancelTickMixin","WrongArgsMixin"]}"#;
+        let config = serde_json::json!({ "package": "demo", "mixins": mixins }).to_string();
         let jar = root.join(format!("{name}.jar"));
         let options = SimpleFileOptions::default();
         let mut zip = zip::ZipWriter::new(fs::File::create(&jar).unwrap());
-        for (path, body) in [("fabric.mod.json", metadata), ("demo.mixins.json", config)] {
+        for (path, body) in [("fabric.mod.json", metadata), ("demo.mixins.json", &config)] {
             zip.start_file(path, options).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
         }
@@ -312,7 +339,7 @@ impl Fixture {
                 .unwrap()
                 .to_string_lossy()
                 .replace('\\', "/");
-            if COMPILE_ONLY.contains(&entry.as_str()) {
+            if compile_only.contains(&entry.as_str()) {
                 continue;
             }
             zip.start_file(entry, options).unwrap();
@@ -572,4 +599,324 @@ fn the_site_table_matches_the_hook_point_census() {
         ..tick.clone()
     };
     assert!(game_hook_site_for(&other_overload).is_none());
+}
+
+/// Mixin's `@Shadow`, with the real annotation's `CLASS` retention: the
+/// runtime reads it back from the class bytes, not from a reflective table.
+const SHADOW: &str = r#"package org.spongepowered.asm.mixin;
+import java.lang.annotation.*;
+@Retention(RetentionPolicy.CLASS)
+@Target({ElementType.METHOD, ElementType.FIELD})
+public @interface Shadow {}
+"#;
+
+/// Compile-only game classes with the members the receiver fixture calls.
+const RECEIVER_GAME: &[(&str, &str)] = &[
+    (
+        "net/minecraft/world/entity/Entity.java",
+        "package net.minecraft.world.entity;\npublic class Entity { public java.util.UUID getUUID() { return null; } public int getId() { return 0; } }\n",
+    ),
+    (
+        "net/minecraft/world/entity/LivingEntity.java",
+        "package net.minecraft.world.entity;\npublic class LivingEntity extends Entity { protected int noJumpDelay; public void jumpFromGround() {} }\n",
+    ),
+    (
+        "net/minecraft/world/entity/player/Player.java",
+        "package net.minecraft.world.entity.player;\npublic class Player extends net.minecraft.world.entity.LivingEntity { public void attack(net.minecraft.world.entity.Entity target) {} }\n",
+    ),
+    (
+        "net/minecraft/world/damagesource/DamageSource.java",
+        "package net.minecraft.world.damagesource;\npublic class DamageSource {}\n",
+    ),
+    (
+        "net/minecraft/server/level/ServerPlayer.java",
+        "package net.minecraft.server.level;\npublic class ServerPlayer extends net.minecraft.world.entity.player.Player { public void tick() {} public void die(net.minecraft.world.damagesource.DamageSource source) {} public Object getFoodData() { return null; } }\n",
+    ),
+];
+
+/// An interface the tick Mixin adds to every `ServerPlayer`, as real mods add
+/// `...Access` interfaces to reach their own fields on another player.
+const TICKS_ACCESS: &str = r#"package demo;
+public interface TicksAccess {
+    int demo$ticks();
+}
+"#;
+
+/// An instance callback that uses its receiver the way real ones do: a cast
+/// to the game class, a `@Shadow` member, a field the Mixin adds (with an
+/// initialiser), and an interface the Mixin implements on the target.
+const PLAYER_TICK_MIXIN: &str = r#"package demo;
+import net.minecraft.server.level.ServerPlayer;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(ServerPlayer.class)
+public abstract class PlayerTickMixin implements TicksAccess {
+    @Shadow public abstract int getId();
+    private int demo$ticks = 100;
+
+    public int demo$ticks() { return demo$ticks; }
+
+    @Inject(method = "tick", at = @At("TAIL"))
+    private void onTick(CallbackInfo ci) {
+        demo$ticks++;
+        ServerPlayer self = (ServerPlayer) (Object) this;
+        HookSink.mark(self.getUUID().toString() + "/" + getId() + "/" + demo$ticks);
+        Object other = self;
+        if (other instanceof TicksAccess access) {
+            HookSink.mark("access/" + access.demo$ticks());
+        }
+    }
+}
+"#;
+
+/// A cancellable HEAD callback that decides from its argument.
+const ATTACK_MIXIN: &str = r#"package demo;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(Player.class)
+public class AttackMixin {
+    @Inject(method = "attack", at = @At("HEAD"), cancellable = true)
+    private void onAttack(Entity target, CallbackInfo ci) {
+        HookSink.mark("attack/" + target.getId());
+        if (target.getId() == 42) {
+            ci.cancel();
+        }
+    }
+}
+"#;
+
+/// Two callbacks that reach what the model does not hold: a game method it
+/// does not answer, and a `@Shadow` field of the game object.
+const DEATH_MIXIN: &str = r#"package demo;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.damagesource.DamageSource;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(ServerPlayer.class)
+public class DeathMixin {
+    @Inject(method = "die", at = @At("HEAD"))
+    private void onDeath(DamageSource source, CallbackInfo ci) {
+        HookSink.mark("before-food");
+        Object food = ((ServerPlayer) (Object) this).getFoodData();
+        HookSink.mark("after-food");
+    }
+}
+"#;
+
+const JUMP_MIXIN: &str = r#"package demo;
+import net.minecraft.world.entity.LivingEntity;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(LivingEntity.class)
+public class JumpMixin {
+    @Shadow protected int noJumpDelay;
+
+    @Inject(method = "jumpFromGround", at = @At("TAIL"))
+    private void onJump(CallbackInfo ci) {
+        HookSink.mark("jump/" + noJumpDelay);
+    }
+}
+"#;
+
+fn marks(host: &StdHost) -> Vec<String> {
+    host.invocations()
+        .iter()
+        .filter(|call| call.method.owner == "demo/HookSink" && call.method.name == "mark")
+        .filter_map(|call| match call.args.first() {
+            Some(Value::Ref(Some(text))) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn game_hook_callbacks_see_a_modelled_receiver_and_refuse_the_rest() {
+    let mut sources: BTreeMap<&str, String> = RECEIVER_GAME
+        .iter()
+        .map(|(path, body)| (*path, (*body).to_owned()))
+        .collect();
+    sources.insert("org/spongepowered/asm/mixin/Shadow.java", SHADOW.into());
+    sources.insert("demo/TicksAccess.java", TICKS_ACCESS.into());
+    sources.insert("demo/PlayerTickMixin.java", PLAYER_TICK_MIXIN.into());
+    sources.insert("demo/AttackMixin.java", ATTACK_MIXIN.into());
+    sources.insert("demo/DeathMixin.java", DEATH_MIXIN.into());
+    sources.insert("demo/JumpMixin.java", JUMP_MIXIN.into());
+    let compile_only: Vec<&str> = COMPILE_ONLY
+        .iter()
+        .copied()
+        .chain([
+            "org/spongepowered/asm/mixin/Shadow.class",
+            "net/minecraft/world/entity/Entity.class",
+            "net/minecraft/world/entity/LivingEntity.class",
+            "net/minecraft/world/damagesource/DamageSource.class",
+        ])
+        .collect();
+    let fixture = Fixture::build_with(
+        "receiver",
+        sources,
+        &["PlayerTickMixin", "AttackMixin", "DeathMixin", "JumpMixin"],
+        &compile_only,
+    );
+    let jar = fixture.load();
+    let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+    let registrations = jar.register_game_hooks(&weave).unwrap();
+    assert_eq!(
+        registrations.hooks().collect::<Vec<_>>(),
+        ["attack_entity", "living_jump", "player_died", "player_tick"],
+        "{:#?}",
+        weave.skipped
+    );
+
+    // Lenient, so the compile-only `HookSink` calls are recorded: every
+    // refusal below is the hook tier's own, not the strict host's.
+    let mut host = StdHost::new();
+    let mut state = GameHookState::default();
+    let budget = ExecutionBudget::within(std::time::Duration::from_secs(5));
+    let alice = 0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128;
+    let bob = 0x00ff_u128;
+    let tick = |state: &mut GameHookState, host: &mut StdHost, player: GameObject| {
+        let mut context = GameHookContext::new();
+        let receiver = context.insert(player);
+        jar.run_game_hook_in(
+            &registrations,
+            state,
+            &mut context,
+            "player_tick",
+            Some(receiver),
+            &[],
+            host,
+            &budget,
+        )
+    };
+
+    // The receiver answers its UUID and id; the Mixin's initialiser ran once
+    // for the object, and its field survives to the next tick; the interface
+    // the Mixin adds is implemented on the player.
+    let alice_object = || GameObject::player(alice, "Alice").with_entity_id(7);
+    tick(&mut state, &mut host, alice_object()).unwrap();
+    tick(&mut state, &mut host, alice_object()).unwrap();
+    // A second player is a second object with its own field.
+    tick(
+        &mut state,
+        &mut host,
+        GameObject::player(bob, "Bob").with_entity_id(9),
+    )
+    .unwrap();
+    assert_eq!(
+        marks(&host),
+        [
+            "01234567-89ab-cdef-0011-223344556677/7/101",
+            "access/101",
+            "01234567-89ab-cdef-0011-223344556677/7/102",
+            "access/102",
+            "00000000-0000-0000-0000-0000000000ff/9/101",
+            "access/101",
+        ]
+    );
+
+    // A forgotten object (a player who left) starts fresh.
+    state.forget_object(&alice_object().marker());
+    tick(&mut state, &mut host, alice_object()).unwrap();
+    assert_eq!(marks(&host).last().map(String::as_str), Some("access/101"));
+
+    // The cancellable callback decides from its argument's id.
+    let attack = |state: &mut GameHookState, host: &mut StdHost, target: i32| {
+        let mut context = GameHookContext::new();
+        let receiver = context.insert(alice_object());
+        let target = context.insert(GameObject::entity(target, "minecraft:zombie", true));
+        jar.run_game_hook_in(
+            &registrations,
+            state,
+            &mut context,
+            "attack_entity",
+            Some(receiver),
+            &[target],
+            host,
+            &budget,
+        )
+        .unwrap()
+    };
+    assert!(attack(&mut state, &mut host, 42).cancelled);
+    assert!(!attack(&mut state, &mut host, 5).cancelled);
+
+    // A game method the model does not answer stops the callback where it
+    // was called, with an error naming it, instead of answering null.
+    let mut context = GameHookContext::new();
+    let receiver = context.insert(alice_object());
+    let source = context.insert(GameObject::opaque(
+        "net/minecraft/world/damagesource/DamageSource",
+        "lava",
+    ));
+    let error = jar
+        .run_game_hook_in(
+            &registrations,
+            &mut state,
+            &mut context,
+            "player_died",
+            Some(receiver),
+            &[source],
+            &mut host,
+            &budget,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("getFoodData"), "{error}");
+    let after = marks(&host);
+    assert_eq!(after.last().map(String::as_str), Some("before-food"));
+
+    // So does a `@Shadow` field read, which the model does not hold either.
+    let mut context = GameHookContext::new();
+    let receiver = context.insert(GameObject::entity(3, "minecraft:zombie", true));
+    let error = jar
+        .run_game_hook_in(
+            &registrations,
+            &mut state,
+            &mut context,
+            "living_jump",
+            Some(receiver),
+            &[],
+            &mut host,
+            &budget,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("noJumpDelay") && error.contains("@Shadow"),
+        "{error}"
+    );
+    assert!(!marks(&host).iter().any(|mark| mark.starts_with("jump/")));
+
+    // An object the firing does not describe (kept from an earlier one) is
+    // not live: its members refuse.
+    let mut context = GameHookContext::new();
+    let error = jar
+        .run_game_hook_in(
+            &registrations,
+            &mut state,
+            &mut context,
+            "player_tick",
+            Some(Value::Ref(Some(alice_object().marker()))),
+            &[],
+            &mut host,
+            &budget,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not live"), "{error}");
 }
