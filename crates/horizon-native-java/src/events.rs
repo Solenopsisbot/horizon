@@ -162,11 +162,14 @@ pub enum GameEvent {
     /// NeoForge's mod-bus `RegisterGuiLayersEvent`, fired once after the
     /// client entrypoints ran.
     ClientRegisterGuiLayers,
+    /// An item's tooltip is being built (Fabric `ItemTooltipCallback.EVENT`,
+    /// NeoForge `ItemTooltipEvent`): the listener edits its lines.
+    ClientItemTooltip,
 }
 
 impl GameEvent {
     /// Every event, in declaration order (the bit order of [`Self::bit`]).
-    pub const ALL: [GameEvent; 40] = [
+    pub const ALL: [GameEvent; 41] = [
         GameEvent::ServerStarting,
         GameEvent::ServerStarted,
         GameEvent::ServerStopping,
@@ -207,6 +210,7 @@ impl GameEvent {
         GameEvent::ClientDisconnect,
         GameEvent::ClientRegisterKeyMappings,
         GameEvent::ClientRegisterGuiLayers,
+        GameEvent::ClientItemTooltip,
     ];
 
     /// The stable name logs and reports use.
@@ -252,6 +256,7 @@ impl GameEvent {
             GameEvent::ClientDisconnect => "client_disconnect",
             GameEvent::ClientRegisterKeyMappings => "client_register_key_mappings",
             GameEvent::ClientRegisterGuiLayers => "client_register_gui_layers",
+            GameEvent::ClientItemTooltip => "client_item_tooltip",
         }
     }
 
@@ -293,6 +298,7 @@ impl GameEvent {
                 | GameEvent::ClientDisconnect
                 | GameEvent::ClientRegisterKeyMappings
                 | GameEvent::ClientRegisterGuiLayers
+                | GameEvent::ClientItemTooltip
         )
     }
 }
@@ -353,6 +359,8 @@ enum Shape {
     ClientJoin,
     /// `(ClientPacketListener, Minecraft)`
     ClientDisconnect,
+    /// `(ItemStack, Item.TooltipContext, TooltipFlag, List<Component>)`
+    ClientTooltip,
 }
 
 /// How a Fabric callback's return value combines across listeners.
@@ -718,6 +726,14 @@ const FABRIC_FIELDS: &[FabricField] = &[
         event: GameEvent::ClientDisconnect,
         shape: Shape::ClientDisconnect,
     },
+    FabricField {
+        owner: "net/fabricmc/fabric/api/client/item/v1/ItemTooltipCallback",
+        field: "EVENT",
+        method: "getTooltip",
+        descriptor: "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/Item$TooltipContext;Lnet/minecraft/world/item/TooltipFlag;Ljava/util/List;)V",
+        event: GameEvent::ClientItemTooltip,
+        shape: Shape::ClientTooltip,
+    },
 ];
 
 /// One table row, positionally.
@@ -810,6 +826,11 @@ const BUS_EVENTS: &[(&str, GameEvent)] = &[
         GameEvent::PlayerChangeLevel,
     ),
     ("RegisterCommandsEvent", GameEvent::RegisterCommands),
+    // Fired on the game bus, by the client only.
+    (
+        "entity/player/ItemTooltipEvent",
+        GameEvent::ClientItemTooltip,
+    ),
     ("TickEvent$ClientTickEvent$Pre", GameEvent::ClientTickStart),
     ("TickEvent$ClientTickEvent$Post", GameEvent::ClientTickEnd),
 ];
@@ -2025,6 +2046,7 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             marker(crate::client_surface::CONNECTION.into()),
             marker(crate::client_surface::MINECRAFT.into()),
         ],
+        Shape::ClientTooltip => crate::client_surface::tooltip_arguments(),
     })
 }
 

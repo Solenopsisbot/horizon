@@ -2573,6 +2573,8 @@ impl Game<'_> {
         // tooltip the stack hides stays hidden.
         if !nested && !lines.is_empty() {
             self.native_tooltip(stack, &mut lines);
+            // Java mods' tooltip listeners (`java_client.rs`).
+            self.java_client_tooltip(stack, &mut lines);
         }
         lines
     }

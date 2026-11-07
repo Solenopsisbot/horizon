@@ -10,6 +10,7 @@ use horizon_native_java::{
     client_surface::{
         ClientPlayer, ClientSnapshot, ClientStack, ClientText, DrawOp, StackSlot, TextMetrics,
     },
+    events::{EventContext, EventFacade, EventFiring, GameEvent},
 };
 use std::{
     collections::BTreeMap,
@@ -139,6 +140,113 @@ const STUBS: &[(&str, &str)] = &[
            static void addLast(net.minecraft.resources.Identifier id, HudElement e) {} }",
     ),
 ];
+
+const TOOLTIP_STUBS: &[(&str, &str)] = &[
+    (
+        "net/fabricmc/fabric/api/event/Event.java",
+        "package net.fabricmc.fabric.api.event;\n\
+         public abstract class Event<T> { public void register(T listener) {} }",
+    ),
+    (
+        "net/minecraft/world/item/Item.java",
+        "package net.minecraft.world.item;\npublic class Item { public interface TooltipContext {} }",
+    ),
+    (
+        "net/minecraft/world/item/TooltipFlag.java",
+        "package net.minecraft.world.item;\npublic interface TooltipFlag { boolean isAdvanced(); }",
+    ),
+    (
+        "net/fabricmc/fabric/api/client/item/v1/ItemTooltipCallback.java",
+        "package net.fabricmc.fabric.api.client.item.v1;\n\
+         public interface ItemTooltipCallback {\n\
+           net.fabricmc.fabric.api.event.Event<ItemTooltipCallback> EVENT = null;\n\
+           void getTooltip(net.minecraft.world.item.ItemStack s, net.minecraft.world.item.Item.TooltipContext c,\n\
+             net.minecraft.world.item.TooltipFlag f, java.util.List<net.minecraft.network.chat.Component> lines); }",
+    ),
+];
+
+const TOOLTIP_MOD: &str = r#"
+package demo;
+import net.fabricmc.fabric.api.client.item.v1.ItemTooltipCallback;
+import net.minecraft.ChatFormatting;
+import net.minecraft.network.chat.Component;
+public final class TooltipMod {
+  public void onInitializeClient() {
+    ItemTooltipCallback.EVENT.register((stack, context, flag, lines) -> {
+      if (stack.getMaxDamage() == 0) return;
+      lines.add(Component.literal("Durability: " + (stack.getMaxDamage() - stack.getDamageValue())).withStyle(ChatFormatting.GOLD));
+    });
+  }
+}
+"#;
+
+/// A Fabric `ItemTooltipCallback` appends a styled line after the game's own
+/// lines, which it gets in order with the name first.
+#[test]
+fn a_tooltip_callback_appends_its_line_to_the_games_lines() {
+    let root = std::env::temp_dir().join(format!(
+        "horizon-native-java-client-tooltip-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let mut sources = STUBS.to_vec();
+    sources.extend_from_slice(TOOLTIP_STUBS);
+    sources.push(("demo/TooltipMod.java", TOOLTIP_MOD));
+    let Some(jar_path) = build_jar(
+        &root,
+        &sources,
+        r#"{"id":"demo","version":"1","environment":"client","entrypoints":{"client":["demo.TooltipMod"]}}"#,
+    ) else {
+        eprintln!("skipped: no javac");
+        return;
+    };
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let entry = jar.discover_entrypoint("client").unwrap();
+    let mut host = StdHost::new();
+    jar.execute(&entry.class, entry.method.as_deref(), "client", &mut host)
+        .unwrap();
+    let listeners = host.game_listeners(&jar, false).listeners;
+    assert_eq!(listeners.len(), 1);
+    assert_eq!(listeners[0].event, GameEvent::ClientItemTooltip);
+    let frame = Arc::new(ClientSnapshot {
+        tooltip_stack: Some(ClientStack {
+            item: "minecraft:iron_pickaxe".into(),
+            count: 1,
+            damage: 50,
+            max_damage: 250,
+            max_stack: 1,
+            name: "Iron Pickaxe".into(),
+            ..ClientStack::empty()
+        }),
+        tooltip_lines: vec!["Iron Pickaxe".into(), "When in Main Hand:".into()],
+        ..ClientSnapshot::default()
+    });
+    host.begin_client_frame(frame, &[]);
+    let mut firing = EventFiring::new(
+        GameEvent::ClientItemTooltip,
+        Arc::new(EventFacade::default()),
+        EventContext::default(),
+    );
+    jar.run_game_listener(
+        &listeners[0],
+        &mut firing,
+        &mut host,
+        &ExecutionBudget::UNBOUNDED,
+    )
+    .unwrap();
+    let lines = host.end_client_frame().tooltip.expect("a tooltip frame");
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert_eq!(lines[0], ClientText::Literal("Iron Pickaxe".into()));
+    assert_eq!(lines[1], ClientText::Literal("When in Main Hand:".into()));
+    let ClientText::Json(json) = &lines[2] else {
+        panic!("a styled line: {:?}", lines[2]);
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(json).unwrap(),
+        serde_json::json!({"text": "Durability: 200", "color": "gold"})
+    );
+    let _ = fs::remove_dir_all(&root);
+}
 
 const CONFIG: &str = r#"
 package demo;

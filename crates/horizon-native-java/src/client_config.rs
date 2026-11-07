@@ -26,6 +26,11 @@
 //!   `handler.instance()` → the object, `defaults()` → a fresh default one,
 //!   `load()` → `true`, `save()` → nothing.
 //!
+//! - SuperMartijn642's config lib: `ConfigBuilders.newTomlConfig(...)` is a
+//!   builder whose `push`/`pop`/`comment`/`dontSync`/... steps answer
+//!   itself; `define(name, default[, min, max])` → a `Supplier` whose `get()`
+//!   is the boxed default.
+//!
 //! A saved config file is not read: a player's own settings are a later
 //! step, and the defaults are what a fresh install shows.
 
@@ -35,6 +40,13 @@ const AUTO_CONFIG: &str = "me/shedaniel/autoconfig/AutoConfig";
 const AUTO_HOLDER: &str = "me/shedaniel/autoconfig/ConfigHolder";
 const YACL_HANDLER: &str = "dev/isxander/yacl3/config/v2/api/ConfigClassHandler";
 const YACL_BUILDER: &str = "dev/isxander/yacl3/config/v2/api/ConfigClassHandler$Builder";
+const CONFIGLIB_BUILDERS: &str = "com/supermartijn642/configlib/api/ConfigBuilders";
+const CONFIGLIB_BUILDER: &str = "com/supermartijn642/configlib/api/IConfigBuilder";
+const CONFIGLIB: &str = "configlib-builder";
+/// `configlib-value/<n>`: the `n`th value defined, kept in the jar's statics.
+const CONFIGLIB_VALUE: &str = "configlib-value/";
+/// Values one jar's config lib builders may define.
+const MAX_CONFIGLIB_VALUES: usize = 1024;
 /// Marker prefixes: `config-holder/<class>`, `config-builder/<class>`.
 const HOLDER: &str = "config-holder/";
 const BUILDER: &str = "config-builder/";
@@ -58,6 +70,9 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Value>, NativeError> {
         let marker = |text: String| Some(Value::Ref(Some(text)));
         let held = receiver.and_then(expect_ref).cloned();
+        if let Some(value) = self.invoke_configlib(r, held.as_deref(), args) {
+            return Ok(Some(value));
+        }
         Ok(match (r.owner.as_str(), r.name.as_str()) {
             (AUTO_CONFIG, "register" | "getConfigHolder") => {
                 let Some(class) = class_arg(args) else {
@@ -114,6 +129,63 @@ impl<H: Host> Runtime<'_, H> {
             }
             _ => None,
         })
+    }
+
+    /// SuperMartijn642's config lib: builders and the defaults they define.
+    fn invoke_configlib(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&str>,
+        args: &[Value],
+    ) -> Option<Value> {
+        let builder = || Value::Ref(Some(CONFIGLIB.into()));
+        match (r.owner.as_str(), r.name.as_str(), receiver) {
+            (CONFIGLIB_BUILDERS, name, _) if name.starts_with("new") => Some(builder()),
+            (CONFIGLIB_BUILDER, "define", Some(CONFIGLIB)) => {
+                let params = r.descriptor.split(')').next()?.trim_start_matches('(');
+                let default = args.get(1)?;
+                // `define(String, boolean)`, `(String, int, int, int)`,
+                // `(String, double, double, double)`, `(String, String...)`,
+                // `(String, Enum)`: the default is the second argument.
+                let boxed = match &params["Ljava/lang/String;".len().min(params.len())..] {
+                    p if p.starts_with('Z') => {
+                        crate::boolean_value(matches!(default, Value::Int(v) if *v != 0))
+                    }
+                    p if p.starts_with('I') => match default {
+                        Value::Int(v) => Value::Ref(Some(format!("integer:{v}"))),
+                        _ => return None,
+                    },
+                    p if p.starts_with('D') => match default {
+                        Value::Float(v) => crate::double_value(*v),
+                        _ => return None,
+                    },
+                    _ => default.clone(),
+                };
+                let n = self
+                    .static_fields
+                    .keys()
+                    .filter(|k| k.starts_with("configlib#"))
+                    .count();
+                if n >= MAX_CONFIGLIB_VALUES {
+                    return None;
+                }
+                self.static_fields.insert(format!("configlib#{n}"), boxed);
+                Some(Value::Ref(Some(format!("{CONFIGLIB_VALUE}{n}"))))
+            }
+            (CONFIGLIB_BUILDER, "build", Some(CONFIGLIB)) => {
+                Some(Value::default_for(crate::return_desc(&r.descriptor)))
+            }
+            (CONFIGLIB_BUILDER, _, Some(CONFIGLIB))
+                if r.descriptor.ends_with(&format!("L{CONFIGLIB_BUILDER};")) =>
+            {
+                Some(builder())
+            }
+            ("java/util/function/Supplier", "get", Some(value)) => {
+                let n = value.strip_prefix(CONFIGLIB_VALUE)?;
+                self.static_fields.get(&format!("configlib#{n}")).cloned()
+            }
+            _ => None,
+        }
     }
 
     /// The config object of `class`, built from its defaults the first time.

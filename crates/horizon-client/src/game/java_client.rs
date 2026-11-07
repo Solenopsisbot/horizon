@@ -119,6 +119,9 @@ static HAS_KEYS: AtomicBool = AtomicBool::new(false);
 /// New mappings joined Controls: the window copies the player's keys for
 /// them out of `options.txt` at its next tick.
 static KEYS_PENDING: AtomicBool = AtomicBool::new(false);
+/// The player's max health (high half, `f32` bits) and armour value (low
+/// half) the last snapshot read, for a `&self` snapshot (a tooltip).
+static LAST_ATTRIBUTES: AtomicU64 = AtomicU64::new(0x41a0_0000_u64 << 32);
 /// `CLIENT_STARTED` fired.
 static STARTED: AtomicBool = AtomicBool::new(false);
 /// `JOIN` fired and `DISCONNECT` has not.
@@ -525,13 +528,6 @@ impl Game<'_> {
     /// The client state a firing shows. `gui` is the frame's GUI size, when
     /// drawing.
     fn java_client_snapshot(&mut self, gui: Option<[f32; 2]>) -> ClientSnapshot {
-        let window = self
-            .renderer
-            .as_ref()
-            .map_or([1280, 720], |r| [r.config.width, r.config.height]);
-        let batch = HudBatch::new(window);
-        let gui = gui.unwrap_or([batch.width, batch.height]);
-        let in_world = self.remote.as_ref().is_some_and(|r| r.has_level());
         let max_health = self.player.as_mut().map_or(20.0, |p| {
             p.attribute("minecraft:max_health").unwrap_or(20.0) as f32
         });
@@ -540,6 +536,48 @@ impl Game<'_> {
                 .or_else(|_| p.attribute("armor"))
                 .unwrap_or(0.0) as i32
         });
+        LAST_ATTRIBUTES.store(
+            u64::from(max_health.to_bits()) << 32 | armor_value as u32 as u64,
+            Ordering::Relaxed,
+        );
+        // Only the vanilla mappings `options.keyX` names are ever asked for.
+        let vanilla = [
+            "key.forward",
+            "key.left",
+            "key.back",
+            "key.right",
+            "key.jump",
+            "key.sneak",
+            "key.sprint",
+            "key.attack",
+            "key.use",
+        ];
+        let vanilla_keys_down: Vec<String> = vanilla
+            .into_iter()
+            .filter(|name| self.native_mapping(name).is_some_and(|(down, _)| down))
+            .map(str::to_owned)
+            .collect();
+        ClientSnapshot {
+            vanilla_keys_down,
+            ..self.java_client_snapshot_with(gui, max_health, armor_value)
+        }
+    }
+
+    /// [`Self::java_client_snapshot`] with the player's attributes given: a
+    /// `&self` caller (a tooltip) passes the last ones read.
+    fn java_client_snapshot_with(
+        &self,
+        gui: Option<[f32; 2]>,
+        max_health: f32,
+        armor_value: i32,
+    ) -> ClientSnapshot {
+        let window = self
+            .renderer
+            .as_ref()
+            .map_or([1280, 720], |r| [r.config.width, r.config.height]);
+        let batch = HudBatch::new(window);
+        let gui = gui.unwrap_or([batch.width, batch.height]);
+        let in_world = self.remote.as_ref().is_some_and(|r| r.has_level());
         let player = if in_world {
             self.player.as_ref().map(|p| ClientPlayer {
                 uuid: self.remote.as_ref().map_or(0, |r| r.profile()),
@@ -594,23 +632,6 @@ impl Game<'_> {
             min_y: self.world.shape.min_y,
             height: self.world.shape.height,
         });
-        // Only the vanilla mappings `options.keyX` names are ever asked for.
-        let vanilla = [
-            "key.forward",
-            "key.left",
-            "key.back",
-            "key.right",
-            "key.jump",
-            "key.sneak",
-            "key.sprint",
-            "key.attack",
-            "key.use",
-        ];
-        let vanilla_keys_down = vanilla
-            .into_iter()
-            .filter(|name| self.native_mapping(name).is_some_and(|(down, _)| down))
-            .map(str::to_owned)
-            .collect();
         ClientSnapshot {
             player,
             level,
@@ -637,10 +658,113 @@ impl Game<'_> {
             gui_scale: f64::from(batch.scale),
             partial_tick: self.clock.fraction() as f32,
             fps: self.frame_reading().0 as i32,
-            vanilla_keys_down,
+            // Read by the `&mut self` caller ([`Self::java_client_snapshot`]).
+            vanilla_keys_down: Vec::new(),
             metrics: Arc::default(),
             items: self.java_client_items(),
             tooltip_stack: None,
+            tooltip_lines: Vec::new(),
+            advanced_tooltips: self.settings.file.bool("advancedItemTooltips"),
+        }
+    }
+
+    /// `ItemTooltipCallback` / `ItemTooltipEvent`: every Java tooltip
+    /// listener edits `lines` (the name line first, as vanilla hands them),
+    /// jar after jar. A line a listener kept is the game's own line with its
+    /// style; a line it added is the mod's component. A listener that fails
+    /// is disabled and leaves the lines as they were.
+    pub(super) fn java_client_tooltip(&self, stack: &ItemStack, lines: &mut Vec<(Text, u32)>) {
+        if !listens(GameEvent::ClientItemTooltip) || !self.java_client_window() {
+            return;
+        }
+        let packed = LAST_ATTRIBUTES.load(Ordering::Relaxed);
+        let mut base = self.java_client_snapshot_with(
+            None,
+            f32::from_bits((packed >> 32) as u32),
+            packed as u32 as i32,
+        );
+        base.tooltip_stack = Some(self.java_client_stack(Some(stack)));
+        let mut store = store();
+        let mut disabled = false;
+        for entry in store.iter_mut() {
+            if !entry
+                .slots
+                .iter()
+                .any(|s| !s.disabled && s.listener.event == GameEvent::ClientItemTooltip)
+            {
+                continue;
+            }
+            let originals: Vec<String> = lines.iter().map(|(text, _)| text.plain()).collect();
+            let snapshot = Arc::new(ClientSnapshot {
+                tooltip_lines: originals.clone(),
+                ..base.clone()
+            });
+            let mut host = lock_resident(&entry.host);
+            let mut firing = EventFiring::new(
+                GameEvent::ClientItemTooltip,
+                Arc::new(EventFacade::default()),
+                EventContext::default(),
+            );
+            host.begin_client_frame(snapshot, &[]);
+            let mut failed = false;
+            for slot in entry
+                .slots
+                .iter_mut()
+                .filter(|s| !s.disabled && s.listener.event == GameEvent::ClientItemTooltip)
+            {
+                let limit = ExecutionBudget::within(budget(GameEvent::ClientItemTooltip));
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    entry
+                        .jar
+                        .run_game_listener(&slot.listener, &mut firing, &mut host, &limit)
+                }));
+                let reason = match run {
+                    Ok(Ok(_)) => {
+                        RAN.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_) => "panicked".to_owned(),
+                };
+                let target = slot.listener.target();
+                refuse(
+                    &entry.file,
+                    &format!("tooltip listener {}#{}", target.owner, target.name),
+                    &reason,
+                );
+                slot.disabled = true;
+                slot.refusal = Some(reason);
+                disabled = true;
+                failed = true;
+                break;
+            }
+            let out = host.end_client_frame();
+            if failed {
+                continue;
+            }
+            let Some(edited) = out.tooltip else {
+                continue;
+            };
+            // A line the mod kept (the same text) is the game's own line with
+            // its style, each matched once; a line it added is its component;
+            // a line it removed is gone, as in vanilla.
+            let mut kept: std::collections::VecDeque<((Text, u32), String)> =
+                lines.drain(..).zip(originals).collect();
+            let mut merged = Vec::with_capacity(edited.len());
+            for text in edited {
+                let found = match &text {
+                    ClientText::Literal(s) => kept.iter().position(|(_, o)| o == s),
+                    _ => None,
+                };
+                match found.and_then(|i| kept.remove(i)) {
+                    Some((line, _)) => merged.push(line),
+                    None => merged.push((java_text(&text), u32::MAX)),
+                }
+            }
+            *lines = merged;
+        }
+        if disabled {
+            recompute(&store);
         }
     }
 
@@ -1422,6 +1546,22 @@ mod tests {
         let mut running_jars = 0;
         // Draw ops each jar's HUD elements recorded over the three frames.
         let mut drew: BTreeMap<String, usize> = BTreeMap::new();
+        // Tooltip lines each jar's tooltip listeners added to a damaged
+        // diamond sword's one-line tooltip.
+        let mut tooltip_lines: BTreeMap<String, usize> = BTreeMap::new();
+        let tooltip = Arc::new(ClientSnapshot {
+            tooltip_stack: Some(horizon_native_java::client_surface::ClientStack {
+                item: "minecraft:diamond_sword".into(),
+                count: 1,
+                damage: 100,
+                max_damage: 1561,
+                max_stack: 1,
+                name: "Diamond Sword".into(),
+                ..horizon_native_java::client_surface::ClientStack::empty()
+            }),
+            tooltip_lines: vec!["Diamond Sword".into()],
+            ..(*snapshot).clone()
+        });
         let mut started = 0;
         for chunk in paths.chunks(32) {
             let Ok(batch) =
@@ -1476,6 +1616,39 @@ mod tests {
                         Arc::clone(&snapshot),
                         &mut entry.keys,
                     );
+                }
+                let tooltip_slots =
+                    |s: &&mut Slot| !s.disabled && s.listener.event == GameEvent::ClientItemTooltip;
+                if entry.slots.iter_mut().any(|s| tooltip_slots(&s)) {
+                    host.begin_client_frame(Arc::clone(&tooltip), &[]);
+                    let mut firing = EventFiring::new(
+                        GameEvent::ClientItemTooltip,
+                        Arc::new(EventFacade::default()),
+                        EventContext::default(),
+                    );
+                    for slot in entry.slots.iter_mut().filter(tooltip_slots) {
+                        let limit = ExecutionBudget::within(Duration::from_millis(250));
+                        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            entry.jar.run_game_listener(
+                                &slot.listener,
+                                &mut firing,
+                                &mut host,
+                                &limit,
+                            )
+                        }));
+                        let reason = match run {
+                            Ok(Ok(_)) => continue,
+                            Ok(Err(error)) => error.to_string(),
+                            Err(_) => "panicked".into(),
+                        };
+                        slot.disabled = true;
+                        slot.refusal = Some(reason);
+                    }
+                    if let Some(lines) = host.end_client_frame().tooltip
+                        && lines.len() > 1
+                    {
+                        tooltip_lines.insert(entry.file.clone(), lines.len() - 1);
+                    }
                 }
                 for _ in 0..3 {
                     for slot in entry.layers.iter_mut().filter(|l| !l.disabled) {
@@ -1575,6 +1748,10 @@ mod tests {
             println!("  ran {what}: {kept} kept, {ran} still running, {refused} refused");
         }
         println!("HUD elements that drew: {} jar(s) {drew:?}", drew.len());
+        println!(
+            "tooltip listeners that added lines: {} jar(s) {tooltip_lines:?}",
+            tooltip_lines.len()
+        );
         let mut causes: Vec<(String, usize)> = causes.into_iter().collect();
         causes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         for (cause, count) in causes.iter().take(25) {

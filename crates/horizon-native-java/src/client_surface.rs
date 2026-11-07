@@ -106,6 +106,25 @@ const USER: &str = "client/user";
 const OPTION: &str = "client/option/";
 /// A `Vec3` the façade handed out: `client/vec3/<x>,<y>,<z>`.
 const VEC3: &str = "client/vec3/";
+/// A tooltip listener's `List<Component>`: the host collection the game
+/// seeds with the tooltip's lines and reads back after the firing.
+const TOOLTIP_LIST: &str = "java/util/ArrayList#client-tooltip";
+const TOOLTIP_CONTEXT: &str = "client/tooltip-context";
+const TOOLTIP_FLAG: &str = "client/tooltip-flag";
+/// Lines a tooltip listener may leave; more are cut.
+const MAX_TOOLTIP_LINES: usize = 64;
+
+/// A Fabric `ItemTooltipCallback`'s arguments: the stack, its context, the
+/// flag and the lines.
+pub(crate) fn tooltip_arguments() -> Vec<Value> {
+    vec![
+        marker(format!("{}tooltip", items::STACK)),
+        marker(TOOLTIP_CONTEXT),
+        marker(TOOLTIP_FLAG),
+        marker(TOOLTIP_LIST),
+    ]
+}
+
 /// `Runnable`s one firing may queue with `Minecraft.execute`.
 const MAX_TASKS: usize = 64;
 /// A vanilla mapping read through `options.keyJump`...: `client/vanilla-key/key.jump`.
@@ -374,6 +393,11 @@ pub struct ClientSnapshot {
     pub items: Arc<ItemTable>,
     /// The stack a tooltip callback describes (`client/stack/tooltip`).
     pub tooltip_stack: Option<ClientStack>,
+    /// The tooltip's lines so far, as plain text, which a tooltip listener's
+    /// list starts with.
+    pub tooltip_lines: Vec<String>,
+    /// `TooltipFlag.isAdvanced` (F3+H).
+    pub advanced_tooltips: bool,
 }
 
 /// One registered mapping's input state, in [`StdHost::client_key_mappings`]
@@ -462,6 +486,9 @@ pub struct ClientFrameOutput {
     /// after the firing ([`NativeJar::run_client_task`]), as vanilla runs its
     /// queued tasks later in the same tick.
     pub tasks: Vec<Value>,
+    /// A tooltip firing's lines after its listeners, when the frame had a
+    /// tooltip; a line that is not text (null, another object) is dropped.
+    pub tooltip: Option<Vec<ClientText>>,
 }
 
 /// How a `KeyMapping` was constructed.
@@ -888,6 +915,23 @@ impl StdHost {
         state.made.clear();
         state.made_aliases.clear();
         state.tasks.clear();
+        let lines = state.frame.as_ref().and_then(|f| {
+            f.tooltip_stack.as_ref()?;
+            Some(
+                f.tooltip_lines
+                    .iter()
+                    .map(|line| component_value("literal", line))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        match lines {
+            Some(lines) => {
+                self.mutable_collections.insert(TOOLTIP_LIST.into(), lines);
+            }
+            None => {
+                self.mutable_collections.remove(TOOLTIP_LIST);
+            }
+        }
     }
 
     /// End the firing [`Self::begin_client_frame`] started: what the
@@ -903,6 +947,13 @@ impl StdHost {
             messages: std::mem::take(&mut state.messages),
             keys: std::mem::take(&mut state.presses),
             tasks: std::mem::take(&mut state.tasks),
+            tooltip: self.mutable_collections.remove(TOOLTIP_LIST).map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(text_arg)
+                    .take(MAX_TOOLTIP_LINES)
+                    .collect()
+            }),
         }
     }
 
@@ -1225,6 +1276,19 @@ impl StdHost {
                 _ => Some(Err(NativeError::UnknownHostCall(r.clone()))),
             };
         }
+        if event == GameEvent::ClientItemTooltip.name() {
+            let frame = state.frame.as_deref();
+            return Some(match r.name.as_str() {
+                "getToolTip" => Ok(marker(TOOLTIP_LIST)),
+                "getItemStack" => Ok(marker(format!("{}tooltip", items::STACK))),
+                "getFlags" => Ok(marker(TOOLTIP_FLAG)),
+                "getContext" => Ok(marker(TOOLTIP_CONTEXT)),
+                "getEntity" => Ok(frame
+                    .and_then(|f| f.player.as_ref())
+                    .map_or(Value::Ref(None), |_| marker(PLAYER))),
+                _ => Err(NativeError::UnknownHostCall(r.clone())),
+            });
+        }
         let client_event = matches!(
             event,
             "client_join" | "client_disconnect" | "client_tick_start" | "client_tick_end"
@@ -1491,6 +1555,11 @@ impl StdHost {
                     _ => None,
                 }
             }
+            TOOLTIP_FLAG => match (name, returns) {
+                ("isAdvanced", "Z") => Some(flag(frame.advanced_tooltips)),
+                ("isCreative", "Z") => Some(flag(false)),
+                _ => None,
+            },
             GAME_RENDERER => match (name, returns) {
                 ("getMainCamera" | "mainCamera", _) if frame.camera.is_some() => {
                     Some(marker(CAMERA))
