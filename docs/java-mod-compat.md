@@ -613,14 +613,36 @@ cancellable callback's `setReturnValue` comes back as `GameHookRun::returned` in
 when `cancelled` is, and the game skips its work for that value. A callback whose `@Inject` is not `cancellable`
 that calls `cancel()` or `setReturnValue()` fails the firing with Mixin's `CancellationException`, at every site.
 
-**Config plugins.** A Mixin config that names an `IMixinConfigPlugin` decides its Mixins in the plugin's own code,
-so the load weave refuses every plan it governs (`config-plugin`). The game-hook tier asks the plugin instead:
-`onLoad(package)` and `shouldApplyMixin(target, mixin)` run in the interpreter on a fresh strict host with a
-250 ms budget, and a plan binds only when the answer is `true`, the plugin is a jar class with no instance field,
-and its `preApply`/`postApply` are absent or empty (a plugin that edits bytecode there does work a hook point
-cannot). A throw, an unmodelled call or a `false` keeps `config-plugin`. The plugin is asked without the pack's
-mod list, so a compat Mixin that needs another mod stays off; a plugin that probes the loader with
-`Class.forName("net.fabricmc.api.EnvType")` (Collective) gets `ClassNotFoundException` and declines today.
+**Config plugins** (`crates/horizon-native-java/src/mixin_plugins.rs`). A Mixin config that names an
+`IMixinConfigPlugin` decides its Mixins in the plugin's own code, so the load weave refuses every plan it governs
+(`config-plugin`). The game-hook tier runs the plugin the way Mixin 0.8.7 does (the order is read from its
+`MixinConfig`/`MixinProcessor` bytecode): one instance per config, kept on a resident heap for the session, then
+`onLoad(package)`, `getRefMapperConfig()`, `shouldApplyMixin(target, mixin)` for every Mixin the config lists on
+this side and every target its `@Mixin` names, `acceptTargets(kept, others)` and `getMixins()`, whose companion
+Mixins bind without being listed, as Mixin applies them without asking. Then `preApply`/`postApply` run once per
+kept pair with a stand-in `ClassNode`/`IMixinInfo` that refuses any member: a plugin that only logs there passes,
+one that reads or edits the node refuses that Mixin. Each call has a strict host and a 250 ms budget. A failure
+in the constructor, `onLoad`, `getRefMapperConfig`, `acceptTargets` or `getMixins` refuses the config; a failing
+`shouldApplyMixin` refuses that Mixin; either way the plan keeps `config-plugin` and the member is in
+`LoadTimeMixinWeave::config_plugins`. The plugin sees a Fabric server with the jar alone: Fabric's classes load
+and NeoForge's/Forge's throw `ClassNotFoundException`, `isModLoaded` knows the jar and its declared dependencies,
+the environment and `MixinEnvironment#getSide` are the side, and `MixinExtrasBootstrap.init()` returns, as the
+loader has already run it. So a compat Mixin that needs another mod stays off.
+
+The same session runs on an entrypoint's own host before its first entrypoint, because a real loader has run every
+plugin by then on the mod's class loader: whiteout's `onInitialize` throws "The mixin plugin did not initialize the
+config!" unless its plugin's `onLoad` ran (it now runs). A session that fails at a config-level step is rolled back
+(static fields, initialised classes, resident heap), so a plugin can leave plans unbound but never refuse a jar.
+
+**MixinExtras** (`crates/horizon-native-java/src/mixin_extras.rs`). `@ModifyReturnValue`, `@WrapMethod`,
+`@ModifyExpressionValue`, `@ModifyReceiver`, `@WrapOperation` and `@WrapWithCondition` are discovered under any
+relocated package and each is a plan row. A `@ModifyReturnValue` at a `RETURN` value site with an override contract
+(`java_destroy_speed`) binds: its handler takes the value (then optionally the target's arguments) and its answer
+is the result, chained through the handlers in apply order, after the point's `@Inject` callbacks. `@WrapMethod`
+cannot bind, since its handler calls the original method through `Operation.call`, which a hook point inside
+Horizon's code cannot offer; the other four act on one instruction inside the body, which no hook point brackets.
+They are skipped with a sentence naming the injector. `@Local` and the other sugar parameters are not counted (the
+class reader keeps no parameter annotations).
 
 **The object model** (`crates/horizon-native-java/src/game_hooks.rs`). The game describes each object a firing
 passes as a `GameObject` (vanilla class, entity id, UUID, name, dimension, position, health, game mode, stack
@@ -718,7 +740,7 @@ What the tier does not fix, and does not pretend to:
   be mapped either. Those stay `target-outside-jar`.
 - Only the `JAVA_TIER_SITES` rows return a value; a public hook still carries no result, and no hook supplies an
   argument its payload does not carry. Adding a site is a host change (a game call site, then the table row), never
-  a parser change. `@ModifyReturnValue` and the other MixinExtras injectors are not discovered as plans at all.
+  a parser change. Of the MixinExtras injectors only `@ModifyReturnValue` binds (above).
 - The object model is what the bound callbacks reach first, not the game's API: a callback that goes further stops
   at a refusal. The tier does not build a bridge class, because there is no woven target to bridge into.
 

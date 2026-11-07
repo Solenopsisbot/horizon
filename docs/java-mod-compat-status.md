@@ -859,9 +859,17 @@ than rows; the cache held 86 entries in 436 KiB.
    "entrypoint executed, mixins skipped, vanilla server reached `Done`", not "the mod works". The opt-in hook tier
    (`HORIZON_JAVA_GAME_HOOKS=1`) fires its 19 public sites and 7 internal Java-tier ones (value-returning
    `getDestroySpeed` and `growCrop`, `PlayerList#remove`, `stopServer`'s tail, the player-tick heads and `Player#tick`)
-   from the game's own points, and asks a config's `IMixinConfigPlugin` natively, but across both corpora it binds
-   only 87 server-side plans (was 40; 51 of the loader tier's 1,285, was 18, statically counted), and a bound
-   callback stops at the first member the hook tier does not model. On a
+   from the game's own points (more since, from the sites work), runs a config's `IMixinConfigPlugin` the way Mixin
+   does and binds MixinExtras' `@ModifyReturnValue`. Statically counted on 7 November 2026 (`plugin_census` in
+   `mixin_plugins.rs`): of the loader tier's 1,285 server-side game plans, 224 name a site in a served shape and
+   190 bind (was 167 and 51; 155 of the 190 pass a plugin's session, and plans stopped at `config-plugin` fell
+   from 144 to 42); across both corpora (599 unique jars) 222 bind (was 87). The plugins left are led by ModernFix's
+   config (`org.objectweb.asm.Type#getDescriptor`, 116 questions in 2 jars), plugin classes that live in another
+   jar (`xaero.lib`'s, Collective's, MixinConstraints'; a lone jar cannot load them), and plugins extending a base
+   class outside the jar. MixinExtras is mostly mid-method: across both corpora 424 `@WrapOperation` and 366
+   `@ModifyExpressionValue` server-side game plans have no hook point that brackets their instruction, 72
+   `@WrapMethod` need the original callable, and 4 of 133 `@ModifyReturnValue` bind. A bound callback still stops
+   at the first member the hook tier does not model. On a
    dedicated server with two bot players and eight of those jars, 4 jars' callbacks ran (appleskin and syncmatica
    `player_logged_in` 2 each, shogi `player_tick` 1,457, servux `server_stopping` 1) and the rest refused and were
    disabled (`ServerPlayNetworking.canSend`, `Connection#getRemoteAddress`, a `@Shadow` field, Guava's `Ordering`).
@@ -989,8 +997,8 @@ than rows; the cache held 86 entries in 436 KiB.
    `MethodHandles` combinators and a runtime `LambdaMetafactory`. zoomify (×2) declares only client entrypoints in
    `fabric.mod.json`, so the server falls back to its NeoForge `@Mod` bootstrap, which touches the client-only
    `KeyMapping` (a real NeoForge server would fail the same way; a Fabric one runs nothing). cristellib's stage-1
-   init runs from a game-class mixin (`BootstrapMixin`), so its entrypoint finds its registry empty; whiteout needs
-   its Mixin config plugin.
+   init runs from a game-class mixin (`BootstrapMixin`), so its entrypoint finds its registry empty; whiteout's
+   entrypoint now runs: its Mixin config plugin runs before it, as on a loader.
 3. **Close runtime refusals.** The entrypoint-exception bucket is down to two missing-dependency rows (archers,
    wizards, and paladins in the same shape) that need the ledger to run a jar with its declared dependencies, and
    WorldEdit's Guava collector. Gate: refused share of in-scope server jars below 5% (committed ledgers 22%/26%;
