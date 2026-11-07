@@ -317,11 +317,20 @@ pub(crate) const COLLECTING_CONSUMER_PREFIX: &str = "@fn:collect:";
 /// functions (and the optional merge function) as escaped capture markers.
 const TO_MAP_COLLECTOR_PREFIX: &str = "collector/to-map/";
 
+/// The leading operand that marks a `to-map` collector as Guava's.
+const GUAVA_COLLECTOR_FLAG: &str = "@guava";
+
 /// The `Collectors.toMap` overloads the host answers with a collector marker.
 pub(crate) fn to_map_collector(r: &MethodRef, args: &[Value]) -> Option<Value> {
-    if r.owner != "java/util/stream/Collectors" || r.name != "toMap" {
-        return None;
-    }
+    // Guava's immutable-map collectors (`ImmutableMap.toImmutableMap`,
+    // `Maps.toImmutableEnumMap`, WorldEdit's platform table) collect the same
+    // way; only a repeated key raises Guava's `IllegalArgumentException`.
+    let guava = match (r.owner.as_str(), r.name.as_str()) {
+        ("java/util/stream/Collectors", "toMap") => false,
+        ("com/google/common/collect/ImmutableMap", "toImmutableMap")
+        | ("com/google/common/collect/Maps", "toImmutableEnumMap") => true,
+        _ => return None,
+    };
     let functions = match r.descriptor.as_str() {
         "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;" => {
             2
@@ -335,12 +344,15 @@ pub(crate) fn to_map_collector(r: &MethodRef, args: &[Value]) -> Option<Value> {
         }
         _ => return None,
     };
-    let parts = args
+    let mut parts = args
         .iter()
         .take(functions)
         .map(super::value_marker)
-        .collect::<Vec<_>>()
-        .join(",");
+        .collect::<Vec<_>>();
+    if guava {
+        parts.insert(0, GUAVA_COLLECTOR_FLAG.to_owned());
+    }
+    let parts = parts.join(",");
     Some(Value::Ref(Some(format!(
         "{TO_MAP_COLLECTOR_PREFIX}{parts}"
     ))))
@@ -1268,7 +1280,14 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         let Some(payload) = collector.strip_prefix(TO_MAP_COLLECTOR_PREFIX) else {
             return Ok(None);
         };
-        let functions = super::split_capture_markers(payload)?
+        let mut markers = super::split_capture_markers(payload)?;
+        let guava = markers
+            .first()
+            .is_some_and(|marker| marker == GUAVA_COLLECTOR_FLAG);
+        if guava {
+            markers.remove(0);
+        }
+        let functions = markers
             .into_iter()
             .map(|marker| super::parse_collection_value(&marker))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1297,6 +1316,18 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                     let earlier = entries[index].1.clone();
                     let merged = self.apply_callback(merge, &[earlier, value])?;
                     entries[index].1 = merged;
+                }
+                (Some(index), None) if guava => {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some(format!(
+                            "Multiple entries with same key: {key}={} and {key}={}",
+                            super::value_text(&entries[index].1),
+                            super::value_text(&value),
+                            key = super::value_text(&key),
+                        )),
+                        frame: None,
+                    });
                 }
                 (Some(index), None) => {
                     return Err(NativeError::UncaughtException {

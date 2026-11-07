@@ -58,6 +58,16 @@ public class Gson {
 }
 "#;
 
+const GUAVA_IMMUTABLE_MAP: &str = r#"package com.google.common.collect;
+public abstract class ImmutableMap<K, V> implements java.util.Map<K, V> {
+    public static <T, K, V> java.util.stream.Collector<T, ?, ImmutableMap<K, V>> toImmutableMap(
+            java.util.function.Function<? super T, ? extends K> key,
+            java.util.function.Function<? super T, ? extends V> value) {
+        return null;
+    }
+}
+"#;
+
 const PROBE: &str = r##"package demo;
 
 import java.io.IOException;
@@ -373,6 +383,20 @@ public final class Probe {
         return list.size() + "|" + list.get(1) + "|" + set.size() + "|" + nulls;
     }
 
+    public static String guavaMap() {
+        Map<String, Integer> lengths = List.of("a", "bb").stream()
+            .collect(com.google.common.collect.ImmutableMap.toImmutableMap(s -> s, String::length));
+        String duplicate;
+        try {
+            List.of("x", "x").stream()
+                .collect(com.google.common.collect.ImmutableMap.toImmutableMap(s -> s, s -> 1));
+            duplicate = "no-throw";
+        } catch (IllegalArgumentException error) {
+            duplicate = "duplicate";
+        }
+        return lengths.size() + "|" + lengths.get("bb") + "|" + duplicate;
+    }
+
     public static String classKinds() {
         return Marker.class.isInterface() + "|" + Probe.class.isInterface() + "|"
             + Ranked.class.isInterface();
@@ -433,6 +457,10 @@ impl Fixture {
             ("org/slf4j/LoggerFactory.java", SLF4J_FACTORY),
             ("org/slf4j/Logger.java", SLF4J_LOGGER),
             ("com/google/gson/Gson.java", GSON),
+            (
+                "com/google/common/collect/ImmutableMap.java",
+                GUAVA_IMMUTABLE_MAP,
+            ),
             ("demo/Probe.java", PROBE),
         ];
         let mut javac = Command::new(javac());
@@ -670,4 +698,12 @@ fn entry_set_value_writes_through_to_its_map() {
 fn collection_copy_of_copies_and_rejects_nulls() {
     let fixture = Fixture::build("copy-of");
     assert_eq!(fixture.text("copies"), "3|b|2|npe");
+}
+
+#[test]
+fn guava_immutable_map_collector_collects_and_rejects_duplicate_keys() {
+    // Guava raises `IllegalArgumentException` where `Collectors.toMap` raises
+    // `IllegalStateException`.
+    let fixture = Fixture::build("guava-map");
+    assert_eq!(fixture.text("guavaMap"), "2|2|duplicate");
 }

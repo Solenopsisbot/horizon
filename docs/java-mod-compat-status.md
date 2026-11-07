@@ -55,7 +55,9 @@ entrypoint, 94 and 197 reached `Done`; the refusals are the `native-gap` rows ab
 1. **Native refusals (27 wide, 68 mega).** 9 wide / 29 mega fail decoding class metadata; 18 / 34 fail with an
    uncaught exception in the entrypoint; mega adds one verifier refusal, two nested-jar-frame cases, one duplicate
    declaration and one unreadable metadata file. The gate is 0, so every row needs either a fix or a reclassification
-   backed by a loader proof.
+   backed by a loader proof. Re-measured 7 November on the 38 metadata rows of both ledgers (one fresh dedicated
+   server per jar): 15 → 22 run, 6 are client-only and now skipped, and 7 metadata refusals remain, each a jar
+   that needs something outside itself (below, under *Close metadata refusals*).
 2. **Five loader rows are listed but not proven.** 169 of the 174 `needs-loader` rows of the tier coverage reach
    `Done (` with no failure naming them. Four ship client code the server role loads (CreativeCore 2.14.16 twice,
    sway, combat-hitboxes; a plain Fabric server fails on sway and CreativeCore too), so they need a client-role
@@ -802,7 +804,10 @@ than rows; the cache held 86 entries in 436 KiB.
    `fabric.mod.json` says `"environment": "client"` are now client-only skips on a server, as on a real Fabric
    server, including a multi-loader jar's NeoForge `@Mod` class: 16 wide and 54 mega rows that used to "run" there
    moved to `skipped`. The raw log line is bounded at 160 characters, so a human sees a clipped cause; the ledger
-   recovers the skip class from the jar's own metadata.
+   recovers the skip class from the jar's own metadata. The JDK model is bounded, not a JDK: a `subList` is a copy,
+   a `Map.Entry` keeps its old value after `setValue` (the map is written), loggers drop everything,
+   `String.format` refuses argument indexes and the `+ , # (` flags, and streams are eager with at most 4,096
+   elements from a spliterator, range or file walk.
 3. **Nested and non-server entrypoints.** Nested JiJ/JarJar jars are probed but never bootstrapped in-game (`preLaunch`
    is not run either); the two mega jars that hit the 128-nested-jar-frame bound (ShulkerBoxTooltip) now run, the
    bound itself is unchanged. The Kotlin entrypoint
@@ -860,9 +865,19 @@ than rows; the cache held 86 entries in 436 KiB.
    objects' instance fields alive for later callbacks, and map the remaining game-class plans onto hook points (or
    provide the target classes through the loader path). Gate: `woven` or `run_game_hook` covered by a real-mod ledger, and every
    `native` label backed by zero skipped plans.
-2. **Close metadata refusals.** Bounded native collection/stream markers, `ServiceLoader`, exact `Integer.parseInt`,
-   `String.split`/`Map#keySet` receivers, `Gson` appendables and tighter `fabric.mod.json` bounds. Gate: metadata
-   refusals 38 → 0 across both corpora.
+2. **Close metadata refusals.** Gate: metadata refusals 38 → 0 across both corpora. The JDK surface config
+   bootstraps reach is modelled in `jdk_model.rs`/`jdk_stream.rs` (charsets, loggers, file walks, `Comparator`,
+   the missing stream stages, `toMap`, `String.format` widths, JDK `instanceof`, interface-default and
+   receiver dispatch; [java-mod-compat.md](java-mod-compat.md)). On the 38 rows, measured 7 November with a fresh
+   dedicated server per jar: `malformed Boolean marker` 7 → 2, `malformed Integer marker` 3 → 0, `expected a native
+   stream marker` 4 → 2, `ServiceLoader has no seeded providers` 2 → 0, `native collection marker, got null`
+   2 → 2, `list index out of bounds` 1 → 1, and icy-better-horses' uncaught exception is gone. What is left needs
+   more than the JDK: zoomify (×2) needs `yet_another_config_lib_v3`, whose config writer encodes through DFU's
+   `JsonOps`; emotecraft (×2) needs `player_animation_library` and the service providers it ships; servercore (×2)
+   builds its config through DazzleConf's reflection (`Method.getReturnType`, `getAnnotatedReturnType`, `Proxy`);
+   voxy walks its own jar through `ModContainer.getRootPaths()`. A ledger run is one jar per server, so the first
+   two cannot pass on their own, and the dedicated log reports the jar's alone-run refusal even when the pack class
+   path got further.
 3. **Close runtime refusals.** The entrypoint-exception bucket is down to two missing-dependency rows (archers,
    wizards, and paladins in the same shape) that need the ledger to run a jar with its declared dependencies, and
    WorldEdit's Guava collector. Gate: refused share of in-scope server jars below 5% (committed ledgers 22%/26%;
