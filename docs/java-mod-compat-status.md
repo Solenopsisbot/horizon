@@ -855,10 +855,23 @@ than rows; the cache held 86 entries in 436 KiB.
    kept 138 listeners and 33 were refused at their first unmodelled call, mostly `MinecraftServer#getWorldPath`
    (6), `registryAccess` (6 with the level's), `getResourceManager` (2), and interpreter collection/stream markers.
    Use-block/item, attack, block-break, entity-load and level load/unload listeners are identified but not fired;
-   command registration (`CommandRegistrationCallback`, 44 jars) and every client event (client tick 57 jars,
-   screens, rendering) have no dispatch. Priorities are registration order. There is also no compiled HUD,
-   key-binding, tooltip, screen, renderer or model façade in this branch. The former façade and census sources were
-   deleted; they are recoverable from commit `be8567b9a`, so client jars register content but do not draw.
+   command registration (`CommandRegistrationCallback`, 44 jars) has no dispatch. Priorities are registration order.
+   *Client surface (first slice).* The window fires client tick, level tick, started/stopping and join/disconnect
+   listeners (Fabric `ClientTickEvents`/`ClientLifecycleEvents`/`ClientPlayConnectionEvents`, NeoForge
+   `ClientTickEvent`/`ClientPlayerNetworkEvent`), lists key mappings (`KeyMappingHelper`, `RegisterKeyMappingsEvent`)
+   in Controls under the mod's own lang names and `key_<name>` in `options.txt`, answers `consumeClick`/`isDown`
+   from real input, and draws HUD elements (`HudElementRegistry`, `RegisterGuiLayersEvent`) through a bounded
+   `GuiGraphicsExtractor` (`text`, `centeredText`, `fill`, `fillGradient`, `outline`, pose translate/scale,
+   `Font.width`). On both corpora through the real client batch (723 jars, 480 started in the client role, 7 November
+   2026), 152 jars keep a client surface: 286 client listeners (139 `END_CLIENT_TICK` in 94 jars), 219 key mappings
+   in 68 jars, 30 HUD elements in 21 jars. Fired in a synthetic world frame (three ticks, three HUD frames), 78 of
+   the 316 callbacks refused (91 before the screen/server-data members), led by `getTextureManager` (5),
+   `getSingleplayerServer`, `Player#getItemBySlot` (4 each), `Minecraft#execute`, `gameRenderer`, `getActiveEffects`
+   (3 each) and interpreter Boolean/stream markers; **no corpus HUD element recorded a draw** there (they gate on
+   config objects, items or refuse first). In an offscreen client, light-overlay's three mappings appear in Controls,
+   a rebind persists, and its key shows its own "Light Overlay toggled on" in the action bar; DayCount's element
+   runs but its cloth-config `AutoConfig` gate reads disabled, so it draws nothing. Styles on components are dropped,
+   tooltips, screens, renderers and models have no façade, and the old façade sources stay in commit `be8567b9a`.
 5. **Content consumption.** Blocks, items, effects, entities, menus, block entity types and recipes reach the content
    model; data components and attachments are typed declaration rows that travel in the snapshot and the manifest.
    What is left:
@@ -933,8 +946,11 @@ than rows; the cache held 86 entries in 436 KiB.
    `player.connection` field read; then fire the identified use/attack/break/entity/level-load events
    from their game points, and dispatch `CommandRegistrationCallback`. Gate: no façade refusal among the ten most
    common listener causes on the corpus pack run.
-6. **Client surface.** Compile the façade client families (HUD, keys, tooltips, screens, renderers, models) into the
-   runtime and drive them from the game; measure with rendering on and a curated pack, not offscreen.
+6. **Client surface.** First slice done: client events, key mappings in Controls and HUD drawing
+   (`client_surface.rs`, `game/java_client.rs`). Next: the members the refusals name (`getTextureManager`,
+   `getSingleplayerServer`, item stacks, effects, `execute`), component styles, items and sprites in the HUD
+   façade, then tooltips, screens, renderers and models; measure with rendering on and a curated pack, not offscreen.
+   Gate: a corpus HUD element draws in the measurement's frame.
 7. **NeoForge path.** Finish the FML path: give the dedicated role the integrated server's opt-in preflight, then
    in-process loader selection, with remap readiness checked against a real NeoForge 26.3 server.
 8. **Diagnostics.** Done: weave counts, first skip reason, the per-plan list, refused rows with their whole cause in

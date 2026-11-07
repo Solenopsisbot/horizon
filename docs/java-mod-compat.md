@@ -319,6 +319,23 @@ captured lambda runs that lambda. The façade markers (`game/server`, `game/play
 the refusal. In the game, `game/java_events.rs` keeps the listening jars per role and the server's points fire
 them (see the status page's `horizon-client` list).
 
+The client surface (`client_surface.rs`) uses the same listeners for the window's events (`GameEvent::is_client`;
+a server counts them as events it never fires) and adds what a client entrypoint registers outside the event
+bus. A `KeyMapping` constructor records its name, `InputConstants` type and SDL-scancode key and its
+`KeyMapping.Category`, and `KeyMappingHelper.registerKeyMapping` (or NeoForge's `RegisterKeyMappingsEvent.register`,
+fired once at adoption) makes it a `ClientKeyMapping`; `HudElementRegistry.addLast`/`attachElement*` and
+`RegisterGuiLayersEvent.register*` record a `HudLayer` the game runs each frame (`NativeJar::run_hud_layer`). The
+`client/` markers stand in for `Minecraft` (`getInstance`, `player`, `level`, `options`, `gui`, `font`, `gameMode`),
+the local player, the client level, the window, the chat and action bar, the font, `GuiGraphicsExtractor` and its
+pose, answering from a `ClientSnapshot` the game hands each firing; draws come back as `DrawOp`s in GUI pixels and
+chat lines as `ClientMessage`s. A server host (`with_environment_type("SERVER")`) answers none of it, and outside a
+firing an unmodelled member keeps the host's old lenient answer. `tests/fixture_client_surface.rs` compiles a Fabric
+client jar (key mapping, tick listener consuming clicks, HUD element) and a NeoForge one (`Dist.CLIENT` subscriber
+with both registration events and `ClientTickEvent.Post`). In the game, `game/java_client.rs` keeps the jars on their
+resident host, registers the mappings with `horizon_client_input::mod_mappings` (Controls rows and `key_<name>` lines),
+and fires from the step loop, `tick_remote`, the disconnect, `save_for_exit`, the key events and `draw_extras`; its
+ignored `client_surface_corpus_measure` test is the corpus measurement.
+
 The legacy Forge event path has a source-built fixture in
 `crates/horizon-native-java/tests/fixture_legacy_forge_event.rs`. It compiles a tiny `@Mod` and
 `IEventBus`, executes `getModEventBus().addListener` with an `invokedynamic` callback, and validates
