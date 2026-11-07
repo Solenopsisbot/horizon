@@ -2,6 +2,7 @@
 //! registry, routes `BoneMealItem.useOn` through the behaviour library, and
 //! crops a growing plant's head with shears (`ShearsItem.useOn`).
 use super::Game;
+use super::java_game_hooks::{BoneMealStep, bone_meal_after_grow_crop};
 use horizon_client::{Result, items::ItemStack, vanillagen};
 use horizon_core::{geometry::Direction, position::BlockPos};
 use horizon_world::{level::classes::Class, worldgen::live::LiveFeatures};
@@ -33,42 +34,36 @@ impl Game<'_> {
         // A Java `@Inject` at `BoneMealItem.growCrop`'s HEAD may answer it
         // (`java_grow_crop`); `consumed` is whether `growCrop` or
         // `growWaterPlant` used the meal up, which a cancelled one does not.
-        let (used, consumed) = match self.java_hook_grow_crop(stack, pos) {
-            None => {
-                let used =
-                    self.with_level(|b, level, ticks| b.use_bone_meal(level, ticks, pos, face));
-                (used, used)
-            }
-            Some(true) => {
-                // useOn's success at the crop: growth particles, no meal used.
-                self.level_events
-                    .push(horizon_world::level::LevelEvent::LevelEvent {
-                        id: 1505,
-                        pos,
-                        data: 15,
-                    });
-                (true, false)
-            }
-            Some(false) => {
+        let java = self.java_hook_grow_crop(stack, pos);
+        let [dx, dy, dz] = face.normal();
+        let relative = pos.offset(dx, dy, dz);
+        let (used, consumed) = self.with_level(|b, level, ticks| {
+            bone_meal_after_grow_crop(java, |step| match step {
+                // growCrop, then growWaterPlant: the behaviour library's useOn.
+                BoneMealStep::Vanilla => b.use_bone_meal(level, ticks, pos, face),
                 // useOn goes on to growWaterPlant beside a sturdy clicked face.
-                let [dx, dy, dz] = face.normal();
-                let relative = pos.offset(dx, dy, dz);
-                let used = self.with_level(|b, level, ticks| {
+                BoneMealStep::WaterPlant => {
                     let clicked = horizon_world::level::LevelAccess::block_state(level, pos);
                     b.is_face_sturdy(clicked, face)
                         && b.grow_water_plant(level, ticks, relative, Some(face))
-                });
-                if used {
-                    self.level_events
-                        .push(horizon_world::level::LevelEvent::LevelEvent {
-                            id: 1505,
-                            pos: relative,
-                            data: 15,
-                        });
                 }
-                (used, used)
-            }
+            })
+        });
+        // The library posts its own growth particles; an answered growCrop's
+        // success shows them at the crop, a water plant's beside it.
+        let particles = match java {
+            Some(true) => Some(pos),
+            Some(false) if used => Some(relative),
+            _ => None,
         };
+        if let Some(pos) = particles {
+            self.level_events
+                .push(horizon_world::level::LevelEvent::LevelEvent {
+                    id: 1505,
+                    pos,
+                    data: 15,
+                });
+        }
         // ItemStack.causeUseVibration at the player, after the meal is used
         // up (shrunk even in creative): an emptied stack has no use effects.
         if used

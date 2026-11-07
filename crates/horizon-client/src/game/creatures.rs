@@ -1464,12 +1464,21 @@ impl Game<'_> {
         if let Some(player) = player.filter(|_| m.extra.leash.is_some()) {
             self.lead_killers.insert(m.id, (player, self.dim));
         }
+        // Java `@Inject`s at dropAllDeathLoot's HEAD and TAIL and die's TAIL.
+        let java = (
+            super::native_hooks::mob_kind(m),
+            m.last_damage
+                .map_or("minecraft:generic", |(d, _)| source_damage_type(d)),
+        );
+        self.java_hook_mob_death("java_drop_death_loot_head", m.id, &java.0, java.1);
         self.drop_death_loot(&mut dying, player, by_player, killer_entity, consumed, pos);
         self.create_wither_rose(m);
         if m.species() == Species::CopperGolem {
             // CopperGolem.dropEquipment: the preserved equipment too.
             self.golem_drop_equipment(&mut dying);
         }
+        self.java_hook_mob_death("java_drop_death_loot_tail", m.id, &java.0, java.1);
+        self.java_hook_mob_death("java_living_died", m.id, &java.0, java.1);
         if m.species() == Species::SulfurCube {
             self.split_sulfur_cube(m);
         }

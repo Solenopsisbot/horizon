@@ -1129,6 +1129,8 @@ impl Game<'_> {
         self.server_lists = Some(lists.clone());
         log("INFO", &format!("Preparing level \"{level_name}\""));
         let folder = world_dir.to_string_lossy().into_owned();
+        // A Java `@Inject` at the server's constructor tails.
+        self.java_hook_server_constructed();
         // The mods' common and server configs, read before the server starts.
         self.native_configs_server_start(&world_dir, true);
         // MinecraftServer.loadLevel's start: nothing is loaded yet.

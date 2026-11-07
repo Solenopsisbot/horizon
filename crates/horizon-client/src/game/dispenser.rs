@@ -1491,11 +1491,17 @@ impl Game<'_> {
         // (`java_grow_crop`): a cancelled growCrop uses no meal, and its
         // `false` goes on to growWaterPlant.
         let java = self.java_hook_grow_crop(&stack, target_pos);
-        let grown = self.with_level(|b, level, ticks| {
-            java.unwrap_or_else(|| b.grow_crop(level, ticks, target_pos))
-                || b.grow_water_plant(level, ticks, target_pos, None)
+        let (grown, consumed) = self.with_level(|b, level, ticks| {
+            super::java_game_hooks::bone_meal_after_grow_crop(java, |step| match step {
+                super::java_game_hooks::BoneMealStep::Vanilla => {
+                    b.grow_crop(level, ticks, target_pos)
+                        || b.grow_water_plant(level, ticks, target_pos, None)
+                }
+                super::java_game_hooks::BoneMealStep::WaterPlant => {
+                    b.grow_water_plant(level, ticks, target_pos, None)
+                }
+            })
         });
-        let consumed = grown && java != Some(true);
         if grown {
             self.level_events
                 .push(horizon_world::level::LevelEvent::LevelEvent {

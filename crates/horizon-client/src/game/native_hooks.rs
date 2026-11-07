@@ -2495,14 +2495,18 @@ impl Game<'_> {
         context: &NativeLifecycleContext,
         phase: ServerTickPhase,
     ) {
+        // A Java `@Inject` at `MinecraftServer.tickServer`'s HEAD or TAIL.
+        self.java_hook_server_tick(matches!(phase, ServerTickPhase::ServerTickStart { .. }));
         mod_api::dispatch_server_tick(self, mod_api::mods(), context, phase);
     }
     /// Before an authoritative server level's tick pass. `dimension` is its ID.
     pub(super) fn native_level_tick_pre(&mut self, dimension: &str) {
+        self.java_hook_level_tick(dimension, true);
         mod_api::dispatch_level_tick_pre(self, mod_api::mods(), dimension);
     }
     /// After a successful authoritative server level tick pass.
     pub(super) fn native_level_tick_post(&mut self, dimension: &str) {
+        self.java_hook_level_tick(dimension, false);
         mod_api::dispatch_level_tick_post(self, mod_api::mods(), dimension);
     }
     /// The HUD (not drawn under F1), after the minimap: place a box with
@@ -8340,6 +8344,10 @@ pub(super) fn hurt_server(hurting: Hurting<'_>, amount: &mut f32) -> bool {
     } = source;
     // Java listeners (Fabric ALLOW_DAMAGE, NeoForge LivingIncomingDamageEvent).
     if super::java_events::fire_allow_damage(entity, kind, damage_type, *amount) {
+        return true;
+    }
+    // A Java `@Inject` at `LivingEntity.hurtServer`'s HEAD.
+    if super::java_game_hooks::fire_living_hurt(entity, kind, damage_type, *amount) {
         return true;
     }
     let mut canceled = false;

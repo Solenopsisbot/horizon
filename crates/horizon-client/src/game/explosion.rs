@@ -880,6 +880,8 @@ impl Game<'_> {
             let distance = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
             self.pad_rumble(horizon_client::gamepad::Rumble::Explosion { distance, radius });
         }
+        // A Java `@Inject` at `ServerExplosion.explode`'s HEAD.
+        self.java_hook_explosion();
         // Explosion.explode: the blast is heard.
         let ctx = horizon_client::sculk::Context::default();
         self.post_game_event("minecraft:explode", center, ctx);

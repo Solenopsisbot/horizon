@@ -6449,12 +6449,30 @@ impl Game<'_> {
                     .items()
                     .correct_for_drops(held.as_ref(), &facts.name);
             if harvest {
+                // A Java `@Inject` at Block.playerDestroy's HEAD: a cancel
+                // skips its body (the statistic, exhaustion, drops, and
+                // spawnAfterBreak's silverfish and experience), not the
+                // subclasses' own part after their `super` call.
+                let had_entity = loot_entity.is_some();
+                let java_canceled = self.java_hook_block_player_destroy(
+                    true,
+                    pos,
+                    state,
+                    held.as_ref(),
+                    had_entity,
+                );
                 // Block.playerDestroy: the mined statistic, the exhaustion and the drops.
-                self.award_stat("mined", &facts.name, 1);
-                if let Some(p) = self.player.as_mut() {
+                if !java_canceled {
+                    self.award_stat("mined", &facts.name, 1);
+                }
+                if let Some(p) = self.player.as_mut().filter(|_| !java_canceled) {
                     p.cause_food_exhaustion(0.005);
                 }
-                let drops = self.block_loot_at(pos, state, held.as_ref(), loot_entity);
+                let drops = if java_canceled {
+                    Vec::new()
+                } else {
+                    self.block_loot_at(pos, state, held.as_ref(), loot_entity)
+                };
                 let silk = held
                     .as_ref()
                     .is_some_and(|h| h.enchantment_level("minecraft:silk_touch") > 0);
@@ -6476,6 +6494,7 @@ impl Game<'_> {
                 // tool has silk touch (#prevents_infested_spawns) or blocks don't drop.
                 if facts.name.starts_with("minecraft:infested_")
                     && !silk
+                    && !java_canceled
                     && self.ui.rules.bool("block_drops")
                 {
                     let at = [
@@ -6488,7 +6507,7 @@ impl Game<'_> {
                     }
                 }
                 // SpawnerBlock.spawnAfterBreak pops its experience whatever the tool.
-                let xp = if silk && &*facts.name != "minecraft:spawner" {
+                let xp = if java_canceled || (silk && &*facts.name != "minecraft:spawner") {
                     0
                 } else {
                     self.block_experience(&facts.name)
@@ -6501,6 +6520,16 @@ impl Game<'_> {
                             f64::from(pos[2]) + 0.5,
                         ],
                         xp,
+                    );
+                }
+                // Block.playerDestroy's TAIL, which a cancelled HEAD skips.
+                if !java_canceled {
+                    self.java_hook_block_player_destroy(
+                        false,
+                        pos,
+                        state,
+                        held.as_ref(),
+                        had_entity,
                     );
                 }
                 // TurtleEggBlock.playerDestroy: after the drops, one egg of a

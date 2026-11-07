@@ -780,6 +780,10 @@ fn bootstrap_jar(
         host = host.with_mod(dependency, "unknown");
     }
     let mut host = jar.seed_host(host);
+    // A Java `@Inject` at `Bootstrap.bootStrap`, which vanilla runs first.
+    if let Some(registrations) = &game_hook_registrations {
+        super::java_game_hooks::fire_java_bootstrap(role, path, &jar, registrations, &mut host);
+    }
     // One budget for the jar, not one per entrypoint: several Fabric entrypoints
     // of one jar share the time the batch allows the jar as a whole.
     let budget = horizon_native_java::ExecutionBudget::within(JAR_EXECUTION_BUDGET);

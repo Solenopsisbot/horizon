@@ -776,6 +776,8 @@ impl Game<'_> {
         ready: &Sender<Ready>,
         opening: Opening,
     ) -> Result<()> {
+        // A Java `@Inject` at `MinecraftServer.<init>`'s tail.
+        self.java_hook_server_constructed();
         // The mods' server configs, read before the server starts.
         if let Ok(dir) = std::env::current_dir() {
             self.native_configs_server_start(&dir.join("saves").join(&launch.folder), false);

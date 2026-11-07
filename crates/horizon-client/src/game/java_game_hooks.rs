@@ -71,6 +71,11 @@ struct JavaGameHookJar {
     disabled: BTreeSet<String>,
     /// Successful firings per hook.
     fired: BTreeMap<String, u64>,
+    /// Firings per hook in which one of this jar's callbacks cancelled.
+    cancelled: BTreeMap<String, u64>,
+    /// Firings per hook in which one of this jar's callbacks changed the
+    /// value the vanilla method returns.
+    overridden: BTreeMap<String, u64>,
 }
 
 /// The game-class callbacks one execution role's batch bound, in path order.
@@ -88,6 +93,13 @@ static BOUND: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64:
 /// Player generations, per role: a respawn or a logout makes the next player
 /// object a new one, as a new `ServerPlayer` is.
 static PLAYER_GENERATIONS: Mutex<BTreeMap<(HandlerRole, u128), u32>> = Mutex::new(BTreeMap::new());
+
+/// Firings that ran before their jar was published, per role, jar label and
+/// hook (`Bootstrap#bootStrap`, which runs before the jar's entrypoints):
+/// [`publish_java_game_hooks_resident`] moves them into the jar's counts.
+/// The flag says the hook failed there, so it is published disabled.
+static EARLY_FIRINGS: Mutex<BTreeMap<(HandlerRole, String, String), (u64, bool)>> =
+    Mutex::new(BTreeMap::new());
 
 /// Keys for objects the host has no stable id for (the dropped item a pickup
 /// names): each firing gets a fresh one.
@@ -200,21 +212,44 @@ pub(super) fn publish_java_game_hooks_resident(
         return;
     }
     let host = Arc::clone(host);
+    let label = jar_label(path);
+    let mut fired = BTreeMap::new();
+    let mut disabled = BTreeSet::new();
+    EARLY_FIRINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(r, l, hook), (count, failed)| {
+            if *r != role || *l != label {
+                return true;
+            }
+            fired.insert(hook.clone(), *count);
+            if *failed {
+                disabled.insert(hook.clone());
+            }
+            false
+        });
     let mut store = JAVA_GAME_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
     let jars = store.entry(role).or_default();
     jars.push(JavaGameHookJar {
-        label: path.file_name().map_or_else(
-            || path.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        ),
+        label,
         jar,
         registrations,
         host,
         state: GameHookState::default(),
-        disabled: BTreeSet::new(),
-        fired: BTreeMap::new(),
+        disabled,
+        fired,
+        cancelled: BTreeMap::new(),
+        overridden: BTreeMap::new(),
     });
     refresh_mask(role, jars);
+}
+
+/// A jar's file name, the label its log lines and counts carry.
+fn jar_label(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// Whether any jar of `role` still fires `hook`: one atomic load.
@@ -314,9 +349,11 @@ pub(super) fn run_java_game_hook_returning(
                 }
                 outcome.ran += run.ran;
                 if run.returned.is_some() {
+                    *entry.overridden.entry(hook.to_owned()).or_default() += 1;
                     outcome.returned = run.returned;
                 }
                 if run.cancelled {
+                    *entry.cancelled.entry(hook.to_owned()).or_default() += 1;
                     outcome.cancelled = true;
                     break;
                 }
@@ -340,7 +377,8 @@ pub(super) fn run_java_game_hook_returning(
     outcome
 }
 
-/// One line per jar and hook: how often it fired and whether it was
+/// One line per jar and hook: how often it fired, how often a callback
+/// cancelled or changed the returned value there, and whether it was
 /// disabled, for the log a server writes when it stops.
 pub(super) fn java_game_hook_summary(role: HandlerRole) -> Vec<String> {
     let store = JAVA_GAME_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
@@ -350,10 +388,18 @@ pub(super) fn java_game_hook_summary(role: HandlerRole) -> Vec<String> {
     let mut lines = Vec::new();
     for jar in jars {
         for hook in jar.registrations.hooks() {
+            let count = |map: &BTreeMap<String, u64>| map.get(hook).copied().unwrap_or(0);
+            let mut effects = String::new();
+            if count(&jar.cancelled) > 0 {
+                effects.push_str(&format!(", cancelled {}", count(&jar.cancelled)));
+            }
+            if count(&jar.overridden) > 0 {
+                effects.push_str(&format!(", overridden {}", count(&jar.overridden)));
+            }
             lines.push(format!(
-                "{} {hook}: fired {}{}",
+                "{} {hook}: fired {}{effects}{}",
                 jar.label,
-                jar.fired.get(hook).copied().unwrap_or(0),
+                count(&jar.fired),
                 if jar.disabled.contains(hook) {
                     ", disabled after a failure"
                 } else {
@@ -473,6 +519,112 @@ pub(super) fn fire_living_knockback(
         &args,
     )
     .cancelled
+}
+
+/// `LivingEntity.hurtServer`'s HEAD (`java_living_hurt`), from the damage
+/// code once hurtServer's guards passed, which runs without a `Game`.
+/// Answers whether a callback cancelled the hit. Horizon's callers only know
+/// a refused hit, so a cancel is one whatever value the callback set (vanilla
+/// would let a `setReturnValue(true)` count as landed); the level is an
+/// identity without its dimension.
+pub(super) fn fire_living_hurt(entity: i32, kind: &str, damage_type: &str, amount: f32) -> bool {
+    let Some(role) = thread_role() else {
+        return false;
+    };
+    if role == HandlerRole::Client || !java_game_hook_bound(role, "java_living_hurt") {
+        return false;
+    }
+    let mut context = GameHookContext::new();
+    let receiver = context.insert(entity_object(entity, kind));
+    let level = context.insert(GameObject::opaque(
+        "net/minecraft/server/level/ServerLevel",
+        &anonymous("level"),
+    ));
+    let source = context.insert(GameObject::opaque(
+        "net/minecraft/world/damagesource/DamageSource",
+        &anonymous(damage_type),
+    ));
+    let args = [level, source, Value::Float(f64::from(amount))];
+    run_java_game_hook(
+        role,
+        "java_living_hurt",
+        &mut context,
+        Some(receiver),
+        &args,
+    )
+    .cancelled
+}
+
+/// `Bootstrap.bootStrap`'s HEAD, then its TAIL (`java_bootstrap_head`,
+/// `java_bootstrap_tail`), for one jar as the server bootstraps it: on the
+/// jar's own host, after the host is seeded and before the jar's entrypoints
+/// run, which is where vanilla's `Main` bootstraps before Fabric starts the
+/// server entrypoints. Each jar hears its own firing. The jar is not
+/// published yet, so the counts wait in [`EARLY_FIRINGS`]; a failure is
+/// logged and leaves the jar's entrypoints to run as before.
+pub(super) fn fire_java_bootstrap(
+    role: ExecutionRole,
+    path: &Path,
+    jar: &NativeJar,
+    registrations: &GameHookRegistrations,
+    host: &mut horizon_native_java::StdHost,
+) {
+    let role = handler_role_of(role);
+    if role == HandlerRole::Client {
+        return;
+    }
+    let label = jar_label(path);
+    let mut state = GameHookState::default();
+    for hook in ["java_bootstrap_head", "java_bootstrap_tail"] {
+        if registrations.entries(hook).is_empty() {
+            continue;
+        }
+        let budget = ExecutionBudget::within(CALLBACK_BUDGET);
+        let mut context = GameHookContext::new();
+        host.set_strict_unknown_host_calls(true);
+        let mark = host.call_log_mark();
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            jar.run_game_hook_returning(
+                registrations,
+                &mut state,
+                &mut context,
+                hook,
+                None,
+                &[],
+                None,
+                &mut *host,
+                &budget,
+            )
+        }));
+        host.rewind_call_log(mark);
+        host.set_strict_unknown_host_calls(false);
+        let failure = match run {
+            Ok(Ok(run)) => {
+                log::info!(
+                    "Horizon: Java game hook {hook} fired {} callback(s) of {label} (first firing)",
+                    run.ran
+                );
+                None
+            }
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some("panicked".to_owned()),
+        };
+        if let Some(error) = &failure {
+            let error: String = error.replace(['\n', '\r'], " ").chars().take(300).collect();
+            log::warn!(
+                "Horizon: Java game hook {hook} of {label} failed and is disabled for this jar: {error}"
+            );
+        }
+        let mut early = EARLY_FIRINGS.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = early
+            .entry((role, label.clone(), hook.to_owned()))
+            .or_default();
+        if failure.is_some() {
+            entry.1 = true;
+        } else {
+            entry.0 += 1;
+        }
+    }
 }
 
 /// A key no other object of this run uses.
@@ -1032,6 +1184,43 @@ fn grown_from(outcome: &JavaGameHookOutcome) -> Option<bool> {
     }
 }
 
+/// What bone meal does next once `java_grow_crop` answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BoneMealStep {
+    /// Vanilla's own `growCrop`, then `growWaterPlant` when it grew nothing.
+    Vanilla,
+    /// `growWaterPlant` alone: a cancelled `growCrop` answered `false`.
+    WaterPlant,
+}
+
+/// A player's or a dispenser's bone meal after `BoneMealItem.growCrop`'s
+/// HEAD (`java_grow_crop`, [`Game::java_hook_grow_crop`]): whether the meal
+/// did something, and whether it was used up. `grow` runs one step and says
+/// whether it grew anything; both steps use the meal up when they grow.
+///
+/// - `None`: no callback cancelled, so vanilla runs ([`BoneMealStep::Vanilla`]).
+/// - `Some(true)`: the cancelled `growCrop` answered `true`, so both callers
+///   stop with a success and no meal is used (vanilla's body, which shrinks
+///   the stack, never ran); `grow` is not called.
+/// - `Some(false)`: `growCrop` answered `false`, so both callers go on to
+///   `growWaterPlant`, which uses the meal up only when it grows.
+pub(super) fn bone_meal_after_grow_crop(
+    java: Option<bool>,
+    mut grow: impl FnMut(BoneMealStep) -> bool,
+) -> (bool, bool) {
+    match java {
+        Some(true) => (true, false),
+        Some(false) => {
+            let grown = grow(BoneMealStep::WaterPlant);
+            (grown, grown)
+        }
+        None => {
+            let grown = grow(BoneMealStep::Vanilla);
+            (grown, grown)
+        }
+    }
+}
+
 /// The Java-tier-only points (`horizon_native_java::JAVA_TIER_SITES`): the
 /// positions the game reaches that the public native-mod API has no hook for,
 /// and the value-returning ones. Each says the vanilla method it stands for;
@@ -1160,6 +1349,252 @@ impl Game<'_> {
         ));
         let outcome = self.java_fire(role, "java_grow_crop", context, None, &[meal, level, pos]);
         grown_from(&outcome)
+    }
+}
+
+/// A key for an object of which there is one per name (a `Block` is one
+/// object per block type), so a Mixin field on it is kept.
+fn named_key(name: &str) -> String {
+    name.replace([':', '/', '|', '#'], "_")
+}
+
+/// The Java-tier server points added for the server's tick, its construction,
+/// a player's harvest, an explosion and a mob's death
+/// (`horizon_native_java::JAVA_TIER_SITES`, `hook_shapes.rs`).
+impl Game<'_> {
+    /// `MinecraftServer.tickServer`'s HEAD (`start`) or TAIL, from
+    /// `native_server_tick`'s `ServerTickStart`/`ServerTickEnd`. The host has
+    /// no `haveTime` supplier to hand: a callback reads null.
+    pub(super) fn java_hook_server_tick(&mut self, start: bool) {
+        let hook = if start {
+            "java_server_tick_head"
+        } else {
+            "java_server_tick_tail"
+        };
+        let Some(role) = self.java_server_hook(hook) else {
+            return;
+        };
+        let mut context = GameHookContext::new();
+        let receiver = context.insert(self.java_server_object());
+        self.java_fire(role, hook, context, Some(receiver), &[Value::Ref(None)]);
+    }
+
+    /// `ServerLevel.tick`'s HEAD (`start`) or TAIL for `dimension`, from
+    /// `native_level_tick_pre`/`_post`; `haveTime` is null, as above.
+    pub(super) fn java_hook_level_tick(&mut self, dimension: &str, start: bool) {
+        let hook = if start {
+            "java_level_tick_head"
+        } else {
+            "java_level_tick_tail"
+        };
+        let Some(role) = self.java_server_hook(hook) else {
+            return;
+        };
+        let mut context = GameHookContext::new();
+        let receiver = context.insert(GameObject::level(dimension));
+        self.java_fire(role, hook, context, Some(receiver), &[Value::Ref(None)]);
+    }
+
+    /// The server's constructor tails: `MinecraftServer.<init>`'s, then (on a
+    /// dedicated server) `DedicatedServer.<init>`'s, as the subclass's body
+    /// runs after its `super` call. Called once per server start, after the
+    /// Java batch ran and before the configs and `native_server_about_to_start`.
+    /// The arguments vanilla passes are game objects the host does not model
+    /// (identities only, one per server start) or JDK objects it has none of
+    /// (the thread, the `Optional` game rules, the proxy: null).
+    pub(super) fn java_hook_server_constructed(&mut self) {
+        let role = self.java_hook_role();
+        if role == HandlerRole::Client {
+            return;
+        }
+        let dedicated = role == HandlerRole::DedicatedServer;
+        for hook in [
+            "java_server_constructed",
+            "java_dedicated_server_constructed",
+        ] {
+            if hook == "java_dedicated_server_constructed" && !dedicated {
+                continue;
+            }
+            let Some(role) = self.java_server_hook(hook) else {
+                continue;
+            };
+            let mut context = GameHookContext::new();
+            let receiver = context.insert(self.java_server_object());
+            let mut object =
+                |class: &str, key: &str| context.insert(GameObject::opaque(class, key));
+            let storage = object(
+                "net/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess",
+                "server-storage",
+            );
+            let packs = object(
+                "net/minecraft/server/packs/repository/PackRepository",
+                "server-packs",
+            );
+            let stem = object("net/minecraft/server/WorldStem", "server-world-stem");
+            let fixer = object("com/mojang/datafixers/DataFixer", "server-data-fixer");
+            let services = object("net/minecraft/server/Services", "server-services");
+            let notifications = object(
+                "net/minecraft/server/notifications/NotificationManager",
+                "server-notifications",
+            );
+            let null = Value::Ref(None);
+            let args = if hook == "java_server_constructed" {
+                let listener = object(
+                    "net/minecraft/server/level/progress/LevelLoadListener",
+                    "server-level-load-listener",
+                );
+                // `propagatesCrashes`: true for a dedicated server.
+                vec![
+                    null.clone(),
+                    storage,
+                    packs,
+                    stem,
+                    null.clone(),
+                    null,
+                    fixer,
+                    services,
+                    listener,
+                    Value::Int(i32::from(dedicated)),
+                    notifications,
+                ]
+            } else {
+                let settings = object(
+                    "net/minecraft/server/dedicated/DedicatedServerSettings",
+                    "server-settings",
+                );
+                let management = object(
+                    "net/minecraft/server/jsonrpc/ManagementServer",
+                    "server-management",
+                );
+                vec![
+                    null.clone(),
+                    storage,
+                    packs,
+                    stem,
+                    null,
+                    settings,
+                    fixer,
+                    services,
+                    management,
+                    notifications,
+                ]
+            };
+            self.java_fire(role, hook, context, Some(receiver), &args);
+        }
+    }
+
+    /// `Block.playerDestroy`'s HEAD (`head`, true when a callback cancelled
+    /// it) or TAIL for the acting player's harvest of `state` at `pos` with
+    /// `held` (`destroyedWith`, a copy taken before the tool wore).
+    /// `block_entity` says whether the block had one: vanilla passes null
+    /// otherwise, and the host hands an identity when it had.
+    pub(super) fn java_hook_block_player_destroy(
+        &mut self,
+        head: bool,
+        pos: [i32; 3],
+        state: horizon_world::registry::BlockStateId,
+        held: Option<&horizon_client::items::ItemStack>,
+        block_entity: bool,
+    ) -> bool {
+        let hook = if head {
+            "java_block_player_destroy"
+        } else {
+            "java_block_player_destroyed"
+        };
+        let Some(role) = self.java_server_hook(hook) else {
+            return false;
+        };
+        let Some(player) = self.java_acting_player_object() else {
+            return false;
+        };
+        let name = self.res.facts().get(state).name.to_string();
+        let mut context = GameHookContext::new();
+        let receiver = context.insert(GameObject::opaque(
+            "net/minecraft/world/level/block/Block",
+            &named_key(&name),
+        ));
+        let level = context.insert(GameObject::level(self.dim.id()));
+        let player = context.insert(player);
+        let at = context.insert(GameObject::opaque(
+            "net/minecraft/core/BlockPos",
+            &format!("{}_{}_{}", pos[0], pos[1], pos[2]).replace('-', "m"),
+        ));
+        let block = context.insert(GameObject::opaque(
+            "net/minecraft/world/level/block/state/BlockState",
+            &anonymous(&name),
+        ));
+        let entity = if block_entity {
+            context.insert(GameObject::opaque(
+                "net/minecraft/world/level/block/entity/BlockEntity",
+                &anonymous("block_entity"),
+            ))
+        } else {
+            Value::Ref(None)
+        };
+        let (item, count) =
+            held.filter(|s| s.count > 0)
+                .map_or(("minecraft:air".to_owned(), 0), |s| {
+                    (
+                        s.item.to_string(),
+                        i32::try_from(s.count).unwrap_or(i32::MAX),
+                    )
+                });
+        let tool = context.insert(GameObject::item_stack(
+            &anonymous("destroyed_with"),
+            &item,
+            count,
+        ));
+        self.java_fire(
+            role,
+            hook,
+            context,
+            Some(receiver),
+            &[level, player, at, block, entity, tool],
+        )
+        .cancelled
+    }
+
+    /// `ServerExplosion.explode`'s HEAD, from `server_explode_as` before the
+    /// blast is heard. The explosion is an identity: the host does not model
+    /// its fields, so a callback reading them through `@Shadow` is refused.
+    pub(super) fn java_hook_explosion(&mut self) {
+        let Some(role) = self.java_server_hook("java_explosion_explode") else {
+            return;
+        };
+        let mut context = GameHookContext::new();
+        let receiver = context.insert(GameObject::opaque(
+            "net/minecraft/world/level/ServerExplosion",
+            &anonymous("explosion"),
+        ));
+        self.java_fire(role, "java_explosion_explode", context, Some(receiver), &[]);
+    }
+
+    /// A dying mob's `LivingEntity.dropAllDeathLoot` HEAD
+    /// (`java_drop_death_loot_head`) or TAIL (`_tail`), or `LivingEntity.die`'s
+    /// TAIL (`java_living_died`), from `mob_died`. `damage_type` names the
+    /// source it died to.
+    pub(super) fn java_hook_mob_death(
+        &mut self,
+        hook: &'static str,
+        entity: u32,
+        kind: &str,
+        damage_type: &str,
+    ) {
+        let Some(role) = self.java_server_hook(hook) else {
+            return;
+        };
+        let mut context = GameHookContext::new();
+        let receiver = context.insert(self.java_entity_object(entity as i32, kind));
+        let source = context.insert(GameObject::opaque(
+            "net/minecraft/world/damagesource/DamageSource",
+            &anonymous(damage_type),
+        ));
+        let args = if hook == "java_living_died" {
+            vec![source]
+        } else {
+            vec![context.insert(GameObject::level(self.dim.id())), source]
+        };
+        self.java_fire(role, hook, context, Some(receiver), &args);
     }
 }
 
@@ -1621,6 +2056,332 @@ public class GrowMixin {
         assert_eq!(speed(6.0), 6.0, "a fast block keeps the game's speed");
         assert_eq!(grow(), Some(true));
 
+        clear_java_game_hooks_as(role);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A bone meal use after `java_grow_crop`: an answered `true` stops with
+    /// a success and no meal used, an answered `false` goes on to the water
+    /// plant alone (which uses the meal only when it grows), and no answer
+    /// runs vanilla. `grow` records the steps it was asked to run.
+    #[test]
+    fn bone_meal_falls_back_the_way_growcrop_answered() {
+        let run = |java: Option<bool>, grows: bool| {
+            let mut steps = Vec::new();
+            let outcome = bone_meal_after_grow_crop(java, |step| {
+                steps.push(step);
+                grows
+            });
+            (outcome, steps)
+        };
+        // Answered true: a success, the meal kept, nothing grown here.
+        assert_eq!(run(Some(true), false), ((true, false), vec![]));
+        // Answered false: only growWaterPlant runs; the meal goes when it grew.
+        assert_eq!(
+            run(Some(false), true),
+            ((true, true), vec![BoneMealStep::WaterPlant])
+        );
+        assert_eq!(
+            run(Some(false), false),
+            ((false, false), vec![BoneMealStep::WaterPlant])
+        );
+        // No answer: vanilla's growCrop-then-growWaterPlant.
+        assert_eq!(run(None, true), ((true, true), vec![BoneMealStep::Vanilla]));
+        assert_eq!(
+            run(None, false),
+            ((false, false), vec![BoneMealStep::Vanilla])
+        );
+        // What the hook's outcome means for growCrop: a cancel without a
+        // value answers false, Mixin's default for a boolean.
+        let cancelled = |returned| JavaGameHookOutcome {
+            ran: 1,
+            cancelled: true,
+            returned,
+            failed: 0,
+        };
+        assert_eq!(grown_from(&cancelled(None)), Some(false));
+        assert_eq!(grown_from(&cancelled(Some(Value::Int(1)))), Some(true));
+        assert_eq!(grown_from(&JavaGameHookOutcome::default()), None);
+    }
+
+    /// The wave-3 server sites: callbacks at `Bootstrap.bootStrap`'s HEAD
+    /// (run before the jar is published, counted after), `ServerLevel.tick`'s
+    /// HEAD in Mixin's simple form (the callback info alone),
+    /// `LivingEntity.hurtServer`'s HEAD (cancelling only a heavy hit) and
+    /// `Block.playerDestroy`'s HEAD (cancelling), with the stop log's
+    /// per-site fire, cancel and override counts.
+    const SERVER_SITE_MIXINS: &str = r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+@Mixin(net.minecraft.world.entity.LivingEntity.class)
+public class HurtMixin {
+    @Inject(method = "hurtServer", at = @At("HEAD"), cancellable = true)
+    private void heavy(ServerLevel level, DamageSource source, float amount, CallbackInfoReturnable<Boolean> cir) {
+        if (amount > 5.0f) {
+            cir.setReturnValue(false);
+        }
+    }
+}
+"#;
+    const LEVEL_MIXIN: &str = r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+@Mixin(net.minecraft.server.level.ServerLevel.class)
+public class LevelMixin {
+    static int ticks;
+    @Inject(method = "tick", at = @At("HEAD"))
+    private void onTick(CallbackInfo ci) {
+        ticks++;
+    }
+}
+"#;
+    const BOOT_MIXIN: &str = r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+@Mixin(net.minecraft.server.Bootstrap.class)
+public class BootMixin {
+    static boolean booted;
+    @Inject(method = "bootStrap", at = @At("HEAD"))
+    private static void boot(CallbackInfo ci) {
+        booted = true;
+    }
+}
+"#;
+    const DESTROY_MIXIN: &str = r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+@Mixin(net.minecraft.world.level.block.Block.class)
+public class DestroyMixin {
+    @Inject(method = "playerDestroy", at = @At("HEAD"), cancellable = true)
+    private void keep(ServerLevel level, ServerPlayer player, BlockPos pos, BlockState state, BlockEntity entity, ItemStack tool, CallbackInfo ci) {
+        if (entity == null) {
+            ci.cancel();
+        }
+    }
+}
+"#;
+
+    /// The server-site fixture's jar under `.local/`; `None` without a JDK.
+    fn server_sites_jar() -> Option<(PathBuf, PathBuf)> {
+        let javac = std::env::var_os("JAVA_HOME")
+            .map(|home| PathBuf::from(home).join("bin/javac"))
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                std::env::split_paths(&std::env::var_os("PATH")?)
+                    .map(|dir| dir.join("javac"))
+                    .find(|path| path.is_file())
+            })?;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/java-game-hooks-test")
+            .join(format!("server-sites-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let classes = root.join("classes");
+        std::fs::create_dir_all(&classes).ok()?;
+        let stub = |class: &str| {
+            let (package, name) = class.rsplit_once('.').unwrap();
+            (
+                format!("{}.java", class.replace('.', "/")),
+                format!("package {package};\npublic class {name} {{}}\n"),
+            )
+        };
+        let mut sources: Vec<(String, String)> = [
+            "net.minecraft.core.BlockPos",
+            "net.minecraft.server.Bootstrap",
+            "net.minecraft.server.level.ServerLevel",
+            "net.minecraft.server.level.ServerPlayer",
+            "net.minecraft.world.damagesource.DamageSource",
+            "net.minecraft.world.entity.LivingEntity",
+            "net.minecraft.world.item.ItemStack",
+            "net.minecraft.world.level.block.Block",
+            "net.minecraft.world.level.block.entity.BlockEntity",
+            "net.minecraft.world.level.block.state.BlockState",
+        ]
+        .into_iter()
+        .map(stub)
+        .collect();
+        for (path, body) in [
+            ("org/spongepowered/asm/mixin/Mixin.java", MIXIN),
+            ("org/spongepowered/asm/mixin/injection/At.java", AT),
+            ("org/spongepowered/asm/mixin/injection/Inject.java", INJECT),
+            (
+                "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.java",
+                CALLBACK_INFO,
+            ),
+            (
+                "org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable.java",
+                CALLBACK_INFO_RETURNABLE,
+            ),
+            ("demo/HurtMixin.java", SERVER_SITE_MIXINS),
+            ("demo/LevelMixin.java", LEVEL_MIXIN),
+            ("demo/BootMixin.java", BOOT_MIXIN),
+            ("demo/DestroyMixin.java", DESTROY_MIXIN),
+        ] {
+            sources.push((path.to_owned(), body.to_owned()));
+        }
+        let mut files = Vec::new();
+        for (relative, body) in &sources {
+            let path = root.join("src").join(relative);
+            std::fs::create_dir_all(path.parent()?).ok()?;
+            std::fs::write(&path, body).ok()?;
+            files.push(path);
+        }
+        let status = std::process::Command::new(javac)
+            .args(["--release", "17", "-d"])
+            .arg(&classes)
+            .args(&files)
+            .status()
+            .ok()?;
+        assert!(status.success(), "javac failed");
+        let jar = root.join("server-sites.jar");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&jar).ok()?);
+        let options = zip::write::SimpleFileOptions::default();
+        let metadata =
+            r#"{"id":"server_sites","version":"1","entrypoints":{},"mixins":["demo.mixins.json"]}"#;
+        let config =
+            r#"{"package":"demo","mixins":["HurtMixin","LevelMixin","BootMixin","DestroyMixin"]}"#;
+        for (name, body) in [("fabric.mod.json", metadata), ("demo.mixins.json", config)] {
+            zip.start_file(name, options).ok()?;
+            zip.write_all(body.as_bytes()).ok()?;
+        }
+        for name in ["HurtMixin", "LevelMixin", "BootMixin", "DestroyMixin"] {
+            let name = format!("demo/{name}.class");
+            zip.start_file(&name, options).ok()?;
+            zip.write_all(&std::fs::read(classes.join(&name)).ok()?)
+                .ok()?;
+        }
+        zip.finish().ok()?;
+        Some((root, jar))
+    }
+
+    #[test]
+    fn the_server_sites_bind_fire_and_count_what_their_callbacks_did() {
+        let _lock = super::super::java_mods::test_lock();
+        let Some((root, jar_path)) = server_sites_jar() else {
+            eprintln!("skipping: no JDK");
+            return;
+        };
+        let role = HandlerRole::DedicatedServer;
+        clear_java_game_hooks_as(role);
+        let jar = NativeJar::from_path(&jar_path).expect("the fixture jar");
+        let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+        let registrations = jar.register_game_hooks(&weave).expect("registrations");
+        assert_eq!(
+            registrations.hooks().collect::<Vec<_>>(),
+            [
+                "java_block_player_destroy",
+                "java_bootstrap_head",
+                "java_level_tick_head",
+                "java_living_hurt",
+            ],
+            "{:#?}",
+            weave.skipped
+        );
+        // The bootstrap fires on the jar's own host before it is published.
+        let mut host = StdHost::new();
+        fire_java_bootstrap(
+            ExecutionRole::DedicatedServer,
+            &jar_path,
+            &jar,
+            &registrations,
+            &mut host,
+        );
+        publish_java_game_hooks(role, &jar_path, Arc::new(jar), registrations, &host);
+
+        // hurtServer, from the damage code: only the heavy hit is refused.
+        set_thread_role(role);
+        assert!(fire_living_hurt(
+            3,
+            "minecraft:zombie",
+            "minecraft:generic",
+            8.0
+        ));
+        assert!(!fire_living_hurt(
+            3,
+            "minecraft:zombie",
+            "minecraft:generic",
+            2.0
+        ));
+
+        // ServerLevel.tick in the simple form: the callback info alone.
+        let mut context = GameHookContext::new();
+        let level = context.insert(GameObject::level("minecraft:overworld"));
+        let tick = run_java_game_hook(
+            role,
+            "java_level_tick_head",
+            &mut context,
+            Some(level),
+            &[Value::Ref(None)],
+        );
+        assert_eq!((tick.ran, tick.cancelled, tick.failed), (1, false, 0));
+
+        // playerDestroy: a block without a block entity keeps its drops back.
+        let destroy = |block_entity: bool| {
+            let mut context = GameHookContext::new();
+            let block = context.insert(GameObject::opaque(
+                "net/minecraft/world/level/block/Block",
+                "minecraft_stone",
+            ));
+            let mut args = vec![
+                context.insert(GameObject::level("minecraft:overworld")),
+                context.insert(GameObject::player(7, "Steve")),
+                context.insert(GameObject::opaque("net/minecraft/core/BlockPos", "0_64_0")),
+                context.insert(GameObject::opaque(
+                    "net/minecraft/world/level/block/state/BlockState",
+                    "stone",
+                )),
+            ];
+            args.push(if block_entity {
+                context.insert(GameObject::opaque(
+                    "net/minecraft/world/level/block/entity/BlockEntity",
+                    "chest",
+                ))
+            } else {
+                Value::Ref(None)
+            });
+            args.push(context.insert(GameObject::item_stack("pick", "minecraft:iron_pickaxe", 1)));
+            run_java_game_hook(
+                role,
+                "java_block_player_destroy",
+                &mut context,
+                Some(block),
+                &args,
+            )
+            .cancelled
+        };
+        assert!(destroy(false));
+        assert!(!destroy(true));
+
+        let summary = java_game_hook_summary(role);
+        for line in [
+            "server-sites.jar java_bootstrap_head: fired 1",
+            "server-sites.jar java_level_tick_head: fired 1",
+            "server-sites.jar java_living_hurt: fired 2, cancelled 1, overridden 1",
+            "server-sites.jar java_block_player_destroy: fired 2, cancelled 1",
+        ] {
+            assert!(summary.iter().any(|l| l == line), "{line} in {summary:#?}");
+        }
         clear_java_game_hooks_as(role);
         let _ = std::fs::remove_dir_all(root);
     }
