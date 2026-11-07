@@ -252,8 +252,11 @@ impl Fixture {
             ("demo/PickupMixin.java", PICKUP_MIXIN.into()),
             ("demo/UnmappedMixin.java", UNMAPPED_MIXIN.into()),
             (
-                "demo/HeadTickMixin.java",
-                tick_mixin("atHead", "HEAD", false, "HeadTickMixin"),
+                // `RETURN` on `ServerPlayer#tick`: the public hook fires at
+                // its `TAIL`, the internal Java-tier one at its `HEAD`, and
+                // neither answers this position.
+                "demo/ReturnTickMixin.java",
+                tick_mixin("atReturn", "RETURN", false, "ReturnTickMixin"),
             ),
             (
                 "demo/CancelTickMixin.java",
@@ -268,7 +271,7 @@ impl Fixture {
                 "TickMixin",
                 "PickupMixin",
                 "UnmappedMixin",
-                "HeadTickMixin",
+                "ReturnTickMixin",
                 "CancelTickMixin",
                 "WrongArgsMixin",
             ],
@@ -441,7 +444,7 @@ fn game_hook_plans_register_and_run_at_the_host_point() {
         MixinSkipReason::TargetOutsideJar
     );
     for owner in [
-        "demo/HeadTickMixin",
+        "demo/ReturnTickMixin",
         "demo/CancelTickMixin",
         "demo/WrongArgsMixin",
     ] {

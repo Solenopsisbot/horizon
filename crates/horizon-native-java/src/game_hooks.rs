@@ -65,8 +65,14 @@ pub enum GameObjectKind {
     Level,
     /// The server (`MinecraftServer`).
     Server,
-    /// An argument the host passes for its identity only (a `DamageSource`,
-    /// a `Connection`): every member refuses.
+    /// A player's profile (`GameProfile`): their UUID and name.
+    Profile,
+    /// An item type (`Item`), keyed by its registry id.
+    Item,
+    /// An argument the host passes for its identity (a `DamageSource`, a
+    /// `Connection`, a login cookie): every member refuses except the few the
+    /// host gave a fact for (a connection's remote address, a cookie's
+    /// profile).
     Opaque,
 }
 
@@ -98,6 +104,13 @@ pub struct GameObject {
     pub count: Option<i32>,
     /// The server: whether it is a dedicated one.
     pub dedicated: Option<bool>,
+    /// A connection's remote address as `SocketAddress.toString` prints it
+    /// (`/127.0.0.1:52144`).
+    pub address: Option<String>,
+    /// A living entity's main-hand and off-hand stacks as (item id, count);
+    /// an empty hand is `("minecraft:air", 0)`, as vanilla's `ItemStack.EMPTY`.
+    pub main_hand: Option<(String, i32)>,
+    pub off_hand: Option<(String, i32)>,
 }
 
 impl GameObject {
@@ -117,6 +130,9 @@ impl GameObject {
             game_mode: None,
             count: None,
             dedicated: None,
+            address: None,
+            main_hand: None,
+            off_hand: None,
         }
     }
 
@@ -198,6 +214,29 @@ impl GameObject {
         object
     }
 
+    /// A player's `GameProfile`.
+    pub fn profile(uuid: u128, name: &str) -> Self {
+        let mut object = Self::new(
+            GameObjectKind::Profile,
+            "com/mojang/authlib/GameProfile",
+            uuid_text_of(uuid),
+        );
+        object.uuid = Some(uuid);
+        object.name = Some(name.to_owned());
+        object
+    }
+
+    /// An item type, by registry id (`minecraft:diamond_sword`).
+    pub fn item(id: &str) -> Self {
+        let mut object = Self::new(
+            GameObjectKind::Item,
+            "net/minecraft/world/item/Item",
+            id.replace([':', '/'], "_"),
+        );
+        object.type_id = Some(id.to_owned());
+        object
+    }
+
     /// An object passed for its identity only, of vanilla class `class`.
     pub fn opaque(class: &str, key: &str) -> Self {
         let simple = class.rsplit('/').next().unwrap_or(class);
@@ -240,6 +279,16 @@ impl GameObject {
         self.game_mode = Some(mode);
         self
     }
+    pub fn with_address(mut self, address: &str) -> Self {
+        self.address = Some(address.to_owned());
+        self
+    }
+    /// The stacks in the main and off hand, as (item id, count).
+    pub fn with_hands(mut self, main: (&str, i32), off: (&str, i32)) -> Self {
+        self.main_hand = Some((main.0.to_owned(), main.1));
+        self.off_hand = Some((off.0.to_owned(), off.1));
+        self
+    }
 
     /// The marker the interpreter sees for this object.
     pub fn marker(&self) -> String {
@@ -250,6 +299,8 @@ impl GameObject {
             GameObjectKind::ItemStack => "stack",
             GameObjectKind::Level => "level",
             GameObjectKind::Server => "server",
+            GameObjectKind::Profile => "profile",
+            GameObjectKind::Item => "itemtype",
             GameObjectKind::Opaque => "opaque",
         };
         format!("{GAME_OBJECT_PREFIX}{kind}/{}", self.key)
@@ -283,7 +334,8 @@ impl GameObject {
                 "net/minecraft/world/level/Level",
             ],
             GameObjectKind::Server => &["net/minecraft/server/MinecraftServer"],
-            GameObjectKind::Opaque => &[],
+            GameObjectKind::Item => &["net/minecraft/world/item/Item"],
+            GameObjectKind::Profile | GameObjectKind::Opaque => &[],
         };
         for class in rest {
             if !classes.contains(class) {
@@ -312,11 +364,20 @@ pub enum GameHookEffect {
 pub struct GameHookContext {
     objects: BTreeMap<String, GameObject>,
     effects: Vec<GameHookEffect>,
+    /// Server-wide facts (world folder, game rules, registries, the channels
+    /// each client takes): `facade_server.rs`. Empty unless the host set them,
+    /// and then every member that needs one refuses.
+    server: Arc<ServerFacts>,
 }
 
 impl GameHookContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The server-wide facts this firing's members answer from.
+    pub fn set_server_facts(&mut self, facts: Arc<ServerFacts>) {
+        self.server = facts;
     }
 
     /// Add `object` and answer the value a callback receives for it.
@@ -574,8 +635,18 @@ fn is_value_constructor(r: &MethodRef) -> bool {
         (
             "net/minecraft/network/chat/Component",
             "literal" | "translatable" | "empty" | "nullToEmpty"
-        )
+        ) | (
+            "net/minecraft/resources/Identifier",
+            "fromNamespaceAndPath" | "withDefaultNamespace" | "parse" | "tryParse" | "tryBuild"
+        ) | ("net/minecraft/resources/ResourceKey", "create")
     )
+}
+
+/// A game class whose instances are values the bootstrap host builds and
+/// answers itself: a payload type is its channel id
+/// (`new CustomPacketPayload.Type<>(id)` in a payload's static initialiser).
+fn is_host_value_class(owner: &str) -> bool {
+    owner == "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type"
 }
 
 /// A value marker the bootstrap host built and models the members of.
@@ -594,6 +665,9 @@ fn uuid_text_of(uuid: u128) -> String {
         &hex[20..32]
     )
 }
+
+/// A connection's remote address value: the rest is its `toString`.
+const SOCKET_ADDRESS: &str = "socket-address/";
 
 /// The refusal for a member the model does not answer.
 fn unmodelled(marker: &str, r: &MethodRef) -> NativeError {
@@ -746,8 +820,178 @@ impl<H: Host> GameHookHost<'_, H> {
             ("isEmpty", "()Z") if object.kind == GameObjectKind::ItemStack => {
                 fact(object.count.map(|c| Value::Int(i32::from(c <= 0))))
             }
+            ("getItem", "()Lnet/minecraft/world/item/Item;")
+                if object.kind == GameObjectKind::ItemStack =>
+            {
+                let item = object
+                    .type_id
+                    .as_deref()
+                    .ok_or_else(|| unmodelled(marker, r))?;
+                Ok(self.context.insert(GameObject::item(item)))
+            }
+            ("is", "(Lnet/minecraft/world/item/Item;)Z")
+                if object.kind == GameObjectKind::ItemStack =>
+            {
+                let other = args
+                    .first()
+                    .and_then(Self::is_game_object)
+                    .and_then(|other| self.context.object(other))
+                    .filter(|other| other.kind == GameObjectKind::Item)
+                    .and_then(|other| other.type_id.clone())
+                    .ok_or_else(|| unmodelled(marker, r))?;
+                Ok(Value::Int(i32::from(object.type_id.as_deref() == Some(&other))))
+            }
+            ("getMainHandItem" | "getOffhandItem", "()Lnet/minecraft/world/item/ItemStack;")
+                if living =>
+            {
+                let (hand, stack) = if r.name == "getMainHandItem" {
+                    ("mainhand", &object.main_hand)
+                } else {
+                    ("offhand", &object.off_hand)
+                };
+                let (item, count) = stack.clone().ok_or_else(|| unmodelled(marker, r))?;
+                Ok(self.context.insert(GameObject::item_stack(
+                    &format!("{}-{hand}", object.key),
+                    &item,
+                    count,
+                )))
+            }
+            ("getGameTime" | "getDayTime", "()J") if object.kind == GameObjectKind::Level => {
+                let time = if r.name == "getGameTime" {
+                    self.context.server.game_time
+                } else {
+                    self.context.server.day_time
+                };
+                fact(time.map(Value::Long))
+            }
+            // A player's profile, and a login cookie's (the host gives the
+            // cookie the joining player's UUID and name).
+            ("getGameProfile", "()Lcom/mojang/authlib/GameProfile;") if player => {
+                self.profile_of(marker, r, &object)
+            }
+            ("gameProfile", "()Lcom/mojang/authlib/GameProfile;")
+                if object.kind == GameObjectKind::Opaque
+                    && object.class == "net/minecraft/server/network/CommonListenerCookie" =>
+            {
+                self.profile_of(marker, r, &object)
+            }
+            ("id" | "getId", "()Ljava/util/UUID;") if object.kind == GameObjectKind::Profile => {
+                fact(
+                    object
+                        .uuid
+                        .map(|uuid| uuid_value(&uuid_text_of(uuid)))
+                        .transpose()?,
+                )
+            }
+            ("name" | "getName", "()Ljava/lang/String;")
+                if object.kind == GameObjectKind::Profile =>
+            {
+                fact(object.name.as_deref().map(string))
+            }
+            ("getRemoteAddress", "()Ljava/net/SocketAddress;")
+                if object.kind == GameObjectKind::Opaque
+                    && object.class == "net/minecraft/network/Connection" =>
+            {
+                fact(
+                    object
+                        .address
+                        .as_deref()
+                        .map(|address| string(&format!("{SOCKET_ADDRESS}{address}"))),
+                )
+            }
+            _ => {
+                // Server-wide members (world path, game rules, registry
+                // access) on the server, a level or an entity.
+                let server_wide = entity
+                    || matches!(object.kind, GameObjectKind::Server | GameObjectKind::Level);
+                match server_wide
+                    .then(|| facade_server::server_member(&self.context.server, r, args))
+                    .flatten()
+                {
+                    Some(answer) => answer.map_err(|_| unmodelled(marker, r)),
+                    None => Err(unmodelled(marker, r)),
+                }
+            }
+        }
+    }
+
+    /// The `GameProfile` of an object that knows a player's UUID and name.
+    fn profile_of(
+        &mut self,
+        marker: &str,
+        r: &MethodRef,
+        object: &GameObject,
+    ) -> Result<Value, NativeError> {
+        match (object.uuid, object.name.as_deref()) {
+            (Some(uuid), Some(name)) => Ok(self.context.insert(GameObject::profile(uuid, name))),
             _ => Err(unmodelled(marker, r)),
         }
+    }
+
+    /// A call on a value marker the hook tier hands out itself: a server-wide
+    /// marker (`facade_server.rs`) or a connection's remote address.
+    fn answer_value(
+        &mut self,
+        text: &str,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        if facade_server::owns(text) {
+            return Some(
+                facade_server::answer(&self.context.server, text, r, args).map_err(|_| {
+                    NativeError::Metadata(format!(
+                        "game hook value {text} does not model {}#{}{}",
+                        r.owner, r.name, r.descriptor
+                    ))
+                }),
+            );
+        }
+        // An `Identifier` value: its text and parts, as vanilla prints them.
+        if let Some(id) = text.strip_prefix("identifier/")
+            && let Some((namespace, path)) = id.split_once(':')
+        {
+            let answer = match (r.name.as_str(), r.descriptor.as_str()) {
+                ("toString", "()Ljava/lang/String;") => Value::Ref(Some(id.to_owned())),
+                ("getNamespace", "()Ljava/lang/String;") => Value::Ref(Some(namespace.to_owned())),
+                ("getPath", "()Ljava/lang/String;") => Value::Ref(Some(path.to_owned())),
+                // `Identifier.hashCode`: `31 * namespace.hashCode() + path.hashCode()`.
+                ("hashCode", "()I") => Value::Int(
+                    stable_hash(namespace)
+                        .wrapping_mul(31)
+                        .wrapping_add(stable_hash(path)),
+                ),
+                ("equals", "(Ljava/lang/Object;)Z") => Value::Int(i32::from(
+                    args.first().and_then(expect_ref).is_some_and(|o| o == text),
+                )),
+                _ => return None,
+            };
+            return Some(Ok(answer));
+        }
+        // `BuiltInRegistries.ITEM.getKey(item)` for an item the firing names.
+        if text == "registry/minecraft:item"
+            && r.name == "getKey"
+            && r.descriptor == "(Ljava/lang/Object;)Lnet/minecraft/resources/Identifier;"
+        {
+            let id = args
+                .first()
+                .and_then(Self::is_game_object)
+                .and_then(|item| self.context.object(item))
+                .filter(|item| item.kind == GameObjectKind::Item)
+                .and_then(|item| item.type_id.clone())?;
+            return Some(Ok(identifier_parse(&id)));
+        }
+        let address = text.strip_prefix(SOCKET_ADDRESS)?;
+        Some(match (r.name.as_str(), r.descriptor.as_str()) {
+            ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(address.to_owned()))),
+            ("hashCode", "()I") => Ok(Value::Int(stable_hash(address))),
+            ("equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(i32::from(
+                args.first().and_then(expect_ref).is_some_and(|o| o == text),
+            ))),
+            _ => Err(NativeError::Metadata(format!(
+                "game hook value {text} does not model {}#{}{}",
+                r.owner, r.name, r.descriptor
+            ))),
+        })
     }
 
     fn is_game_object(value: &Value) -> Option<&str> {
@@ -784,6 +1028,27 @@ impl<H: Host> Host for GameHookHost<'_, H> {
                 ))
             });
         }
+        // `ServerPlayNetworking.canSend(player, type)`: whether that player's
+        // client takes the channel, from the server facts.
+        let player = args
+            .first()
+            .and_then(Self::is_game_object)
+            .and_then(|marker| self.context.object(marker))
+            .filter(|object| object.kind == GameObjectKind::Player)
+            .and_then(|object| object.uuid);
+        let channel = args.get(1).and_then(|value| {
+            facade_server::channel_of(value, |marker| self.inner.payload_type_id(marker))
+        });
+        if let Some(answer) =
+            facade_server::can_send(&self.context.server, r, player, channel.as_deref())
+        {
+            return answer.map_err(|_| {
+                NativeError::Metadata(format!(
+                    "game hook callback calls {}#{}{} for a player or channel the firing does not name",
+                    r.owner, r.name, r.descriptor
+                ))
+            });
+        }
         if is_game_class(&r.owner) && !is_value_constructor(r) {
             return Err(NativeError::Metadata(format!(
                 "game hook callback calls {}#{}{}, which the hook tier does not model",
@@ -799,11 +1064,17 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        if let Some(text) = expect_ref(receiver).cloned()
+            && let Some(answer) = self.answer_value(&text, r, args)
+        {
+            return answer;
+        }
         if let Some(marker) = Self::is_game_object(receiver) {
             let marker = marker.to_owned();
             return self.answer(&marker, r, args);
         }
         if is_game_class(&r.owner)
+            && !is_host_value_class(&r.owner)
             && !expect_ref(receiver).is_some_and(|marker| is_host_value_marker(marker))
         {
             return Err(NativeError::Metadata(format!(
@@ -867,6 +1138,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
         self.inner.empty_mutable_collection(kind)
+    }
+
+    fn payload_type_id(&self, marker: &str) -> Option<String> {
+        self.inner.payload_type_id(marker)
     }
 
     fn redirect_jar_call(
@@ -975,12 +1250,60 @@ impl NativeJar {
         host: &mut H,
         budget: &ExecutionBudget,
     ) -> Result<GameHookRun, NativeError> {
+        self.run_game_hook_returning(
+            registrations,
+            state,
+            context,
+            hook,
+            receiver,
+            args,
+            None,
+            host,
+            budget,
+        )
+    }
+
+    /// [`Self::run_game_hook_in`] for a site whose vanilla method returns a
+    /// value (`hook_shapes.rs`).
+    ///
+    /// `actual` is the method's own result at a `RETURN`/`TAIL` site, which
+    /// the callbacks read with `CallbackInfoReturnable.getReturnValue`; every
+    /// other site passes `None`, and a mismatch is an error before any
+    /// callback runs. [`GameHookRun::returned`] is what the host must make the
+    /// method return: at a `HEAD` site, set exactly when a cancellable
+    /// callback cancelled (its `setReturnValue` value, else the type's
+    /// default), so the host skips its own work; at a `RETURN`/`TAIL` site,
+    /// a cancellable callback's override of `actual`.
+    ///
+    /// Mixin's rule for a callback that is not `cancellable` holds here too:
+    /// its `cancel()` or `setReturnValue()` throws `CancellationException`, so
+    /// the firing fails with that error rather than dropping the call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_game_hook_returning<H: Host>(
+        &self,
+        registrations: &GameHookRegistrations,
+        state: &mut GameHookState,
+        context: &mut GameHookContext,
+        hook: &str,
+        receiver: Option<Value>,
+        args: &[Value],
+        actual: Option<Value>,
+        host: &mut H,
+        budget: &ExecutionBudget,
+    ) -> Result<GameHookRun, NativeError> {
         let entries = registrations.entries(hook);
         let Some(first) = entries.first() else {
             return Err(NativeError::Metadata(format!(
                 "no native game hook callback is registered at {hook}"
             )));
         };
+        let first_site = game_hook_site_named(&first.hook, first.version).ok_or_else(|| {
+            NativeError::Metadata(format!(
+                "game hook registration names {} version {}, which this runtime does not know",
+                first.hook, first.version
+            ))
+        })?;
+        hook_shapes::check_actual_result(first_site, actual.as_ref())?;
         let expected = arg_count(&first.target.descriptor);
         if args.len() != expected {
             return Err(NativeError::Metadata(format!(
@@ -994,15 +1317,12 @@ impl NativeJar {
         }
         let mut checked = Vec::with_capacity(entries.len());
         for entry in entries {
-            let site = GAME_HOOK_SITES
-                .iter()
-                .find(|site| site.hook == entry.hook && site.version == entry.version)
-                .ok_or_else(|| {
-                    NativeError::Metadata(format!(
-                        "game hook registration names {} version {}, which this runtime does not know",
-                        entry.hook, entry.version
-                    ))
-                })?;
+            let site = game_hook_site_named(&entry.hook, entry.version).ok_or_else(|| {
+                NativeError::Metadata(format!(
+                    "game hook registration names {} version {}, which this runtime does not know",
+                    entry.hook, entry.version
+                ))
+            })?;
             game_hook_callback(&self.classes, &entry.callback, site)
                 .map_err(|reason| game_hook_error(&reason))?;
             checked.push(self.game_hook_callback_values(entry, args)?);
@@ -1065,6 +1385,10 @@ impl NativeJar {
                 // hand the injection point, so a `cancel()` in one is what the
                 // next one observes.
                 runtime.open_callback_info(&marker)?;
+                if let Some(actual) = &actual {
+                    runtime.callback_infos.set_actual(&marker, actual.clone())?;
+                }
+                let before = hook_shapes::callback_info_snapshot(runtime.callback_infos, &marker)?;
                 let callback_receiver = is_instance.then(|| {
                     receiver
                         .clone()
@@ -1103,7 +1427,25 @@ impl NativeJar {
                     &values,
                 )?;
                 results.push(result);
-                if entry.cancellable && runtime.callback_info_cancelled(&marker)? {
+                let after = hook_shapes::callback_info_snapshot(runtime.callback_infos, &marker)?;
+                if !entry.cancellable {
+                    // Mixin's `CallbackInfo.cancel()` (and the `cancel()` a
+                    // `setReturnValue` makes) throws on a callback that was not
+                    // declared cancellable.
+                    if after != before {
+                        return Err(NativeError::Metadata(format!(
+                            "uncaught exception java/util/concurrent/CancellationException: game hook callback {}#{}{} cancelled or set the result of {}#{}, which its @Inject does not declare cancellable",
+                            entry.callback.owner,
+                            entry.callback.name,
+                            entry.callback.descriptor,
+                            entry.target.owner,
+                            entry.target.name
+                        )));
+                    }
+                    continue;
+                }
+                // `CallbackInfoReturnable.setReturnValue` cancels as it sets.
+                if after.0 || after.1.is_some() {
                     cancelled = true;
                     break;
                 }
@@ -1130,6 +1472,14 @@ impl NativeJar {
             }
             Ok(())
         })();
+        let returned = outcome.as_ref().ok().map(|()| {
+            hook_shapes::game_hook_returned(
+                first_site,
+                runtime.callback_infos,
+                &callback_info_marker(&first.target),
+                cancelled,
+            )
+        });
         if !resident {
             // A host without a resident heap: `state` keeps every object, and
             // a failed firing keeps nothing, as before the heap.
@@ -1168,6 +1518,7 @@ impl NativeJar {
             hook: hook.to_owned(),
             ran: results.len(),
             cancelled,
+            returned: returned.transpose()?.flatten(),
             results,
         })
     }

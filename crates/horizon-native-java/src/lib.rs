@@ -15,25 +15,36 @@ use std::{
 
 mod annotation_values;
 mod block_item_id;
+pub mod brigadier;
+pub mod client_surface;
 mod color_collection;
 mod declarations_content;
 mod dfu_pair;
 pub mod events;
 mod fabric_registry;
+mod facade_server;
 mod game_hooks;
 mod heap;
+mod hook_shapes;
 mod java_regex;
 mod jdk_model;
+mod library_dispatch;
 mod jdk_stream;
 mod map_compute;
 mod reflect_constructors;
 mod reflect_enum;
+mod reflect_generic;
 mod reflect_names;
 mod stack_walk;
 mod type_switch;
 mod vanilla_registries;
 pub mod weaver;
 
+pub use facade_server::{GameRuleValue, ServerFacts};
+pub use hook_shapes::{
+    JAVA_TIER_HOOK_PREFIX, JAVA_TIER_SITES, every_game_hook_site, game_hook_site_at,
+    game_hook_site_named, java_tier_sites,
+};
 pub use game_hooks::{
     GAME_OBJECT_PREFIX, GameHookContext, GameHookEffect, GameHookState, GameObject, GameObjectKind,
     JarCallRedirect,
@@ -619,7 +630,9 @@ pub struct GameHookSite {
 /// `void` for a post hook (the hook carries no result to override); the plan
 /// carries no `shift`, `slice` or `ordinal`; and the callback's descriptor
 /// mirrors the target's arguments with at most one trailing `CallbackInfo` and
-/// returns `void`. Anything else is skipped with
+/// returns `void`. Every row here is a `void` method of the public API; the
+/// value-returning and Java-tier-only rows are the internal
+/// [`JAVA_TIER_SITES`], whose callbacks take a `CallbackInfoReturnable`. Anything else is skipped with
 /// [`MixinSkipReason::GameHookMismatch`], and a target with no site at all
 /// keeps [`MixinSkipReason::TargetOutsideJar`].
 ///
@@ -880,8 +893,12 @@ pub fn game_hook_sites() -> &'static [GameHookSite] {
 ///
 /// A plan descriptor that is empty (real Mixin's `method = "tick"`) matches the
 /// site's descriptor; a non-empty one must match it exactly.
+///
+/// This answers the first row of the public table, then of the internal
+/// [`JAVA_TIER_SITES`]; a plan uses [`game_hook_site_at`], which also picks
+/// the row by the plan's anchor.
 pub fn game_hook_site_for(target: &MethodRef) -> Option<&'static GameHookSite> {
-    GAME_HOOK_SITES.iter().find(|site| {
+    every_game_hook_site().find(|site| {
         site.target_owner == target.owner
             && site.target_name == target.name
             && (target.descriptor.is_empty() || target.descriptor == site.target_descriptor)
@@ -935,14 +952,11 @@ pub fn game_hook_site_fits(
             ),
         )));
     }
-    if return_desc(site.target_descriptor) != "V" {
-        return Err(MixinSkipReason::GameHookMismatch(bounded_weave_reason(
-            &format!(
-                "hook point {} names {}#{}{}, which returns a value; a host hook carries no result to override",
-                site.hook, site.target_owner, site.target_name, site.target_descriptor
-            ),
-        )));
-    }
+    // A value-returning target needs nothing more here: a non-cancellable
+    // callback only reads the result (`getReturnValue`), and a cancellable one
+    // passed the contract check above, so the host takes its override back
+    // (`hook_shapes.rs`). The callback's `CallbackInfoReturnable` is checked
+    // with its descriptor.
     Ok(())
 }
 
@@ -1022,6 +1036,14 @@ pub struct GameHookRun {
     pub ran: usize,
     /// Whether one of them cancelled the vanilla work.
     pub cancelled: bool,
+    /// The value the callbacks made a value-returning target return, in the
+    /// target's declared shape (`Value::Int` for `I`/`Z`, `Value::Float` for
+    /// `F`/`D`, a reference otherwise), or `None` when the target's own
+    /// result stands. At a `HEAD` site it is set exactly when `cancelled` is:
+    /// the `setReturnValue` value, else the type's default. At a
+    /// `RETURN`/`TAIL` site it is the last cancellable callback's override.
+    /// Always `None` at a `void` site.
+    pub returned: Option<Value>,
     /// Every callback result, in run order.
     pub results: Vec<Value>,
 }
@@ -2016,6 +2038,17 @@ pub trait Host {
         None
     }
 
+    /// Up to `limit` bytes (all that are left when `None`) of a bounded
+    /// input-stream marker the host holds, consumed from the stream.
+    ///
+    /// [`Self::resource_stream_text`] is lossy for binary data; a jar's
+    /// `readAllBytes` or `read(byte[], int, int)` on a resource stream needs
+    /// the exact bytes. An empty answer is end of stream. A host that keeps
+    /// no stream table keeps the default.
+    fn resource_stream_bytes(&mut self, _marker: &str, _limit: Option<usize>) -> Option<Vec<u8>> {
+        None
+    }
+
     /// A content builder step the interpreter answered itself: a data
     /// component or attachment builder flag, a built component type, or an
     /// attachment registration (`declarations_content`). A host that keeps
@@ -2041,6 +2074,15 @@ pub trait Host {
     /// linked resolution skips those names the same way it skips a class the
     /// running jar declares itself.
     fn models_class(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// Whether `Class.forName` finds a platform class (a loader or loader
+    /// API class) the running jar's loader provides. Multi-loader mods probe
+    /// `Class.forName("net.fabricmc.loader.api.FabricLoader")` to pick their
+    /// platform. The default answers none, so a probe keeps its
+    /// `ClassNotFoundException`.
+    fn platform_class_present(&self, _name: &str) -> bool {
         false
     }
 
@@ -2120,6 +2162,13 @@ pub trait Host {
     /// host models, for a library factory whose whole contract is "a new
     /// empty one" (Guava's `Maps.newHashMap()`); `None` when it models none.
     fn empty_mutable_collection(&mut self, _kind: &str) -> Option<Value> {
+        None
+    }
+
+    /// The channel id a `CustomPacketPayload.Type` marker this host built
+    /// names (`demo:sync`), for a networking call a wrapping host answers;
+    /// `None` when the host built no such type.
+    fn payload_type_id(&self, _marker: &str) -> Option<String> {
         None
     }
 }
@@ -2325,6 +2374,12 @@ pub struct StdHost {
     /// callback receives (server, level, player, NeoForge event object) can
     /// answer from it. `None` outside [`NativeJar::run_game_listener`].
     game_event: Option<Box<events::EventFiring>>,
+    /// The client surface's registrations and current firing
+    /// (`client_surface`): key mappings, HUD elements, the frame's snapshot.
+    client: client_surface::ClientState,
+    /// The command tree the jar's registration callbacks built and the
+    /// command running now (`brigadier.rs`).
+    brigadier: brigadier::BrigadierState,
 }
 
 impl Default for StdHost {
@@ -2395,6 +2450,8 @@ impl StdHost {
             next_iterator: 0,
             next_neutral_collection: 0,
             game_event: None,
+            client: client_surface::ClientState::default(),
+            brigadier: Default::default(),
         }
     }
 
@@ -3251,7 +3308,17 @@ impl StdHost {
         // An id the jar's metadata already describes stays opaque: the
         // metadata is the explicit adapter for that row, so inference must not
         // compete with it.
-        let declaration = if self.declared_registrations.contains(&key) {
+        //
+        // An id the host could not name (an `identifier/` marker with an empty
+        // namespace or path, e.g. an opaque key read back as `minecraft:`) also
+        // stays opaque. The registration is still recorded and answered, but a
+        // typed row under that id is one the content root must refuse, and it
+        // refused the whole jar (Farmer's Delight, before its id helpers were
+        // modelled) instead of just leaving the row out.
+        let named = id
+            .split_once(':')
+            .is_some_and(|(namespace, path)| !namespace.is_empty() && !path.is_empty());
+        let declaration = if !named || self.declared_registrations.contains(&key) {
             None
         } else {
             self.inferred_declaration(registry, &value)
@@ -3555,6 +3622,10 @@ impl Host for StdHost {
         Some(self.empty_collection(kind))
     }
 
+    fn payload_type_id(&self, marker: &str) -> Option<String> {
+        self.packet_types.get(marker).cloned()
+    }
+
     fn service_providers(&self, service: &str) -> Vec<String> {
         self.merged_service_providers(service)
     }
@@ -3566,6 +3637,14 @@ impl Host for StdHost {
         Some(text)
     }
 
+    fn resource_stream_bytes(&mut self, marker: &str, limit: Option<usize>) -> Option<Vec<u8>> {
+        let (bytes, index) = self.resource_streams.get_mut(marker)?;
+        let start = (*index).min(bytes.len());
+        let end = limit.map_or(bytes.len(), |limit| start.saturating_add(limit).min(bytes.len()));
+        *index = end;
+        Some(bytes[start..end].to_vec())
+    }
+
     fn linked_class_table(&self) -> Option<&Arc<LinkedClassTable>> {
         Some(&self.linked_classes)
     }
@@ -3575,6 +3654,18 @@ impl Host for StdHost {
     /// the host's place.
     fn models_class(&self, name: &str) -> bool {
         host_models_class(name)
+    }
+
+    /// A jar seeded with Fabric entrypoints runs on Fabric Loader, whose
+    /// classes (and the Fabric API this host models) are on its class path.
+    fn platform_class_present(&self, name: &str) -> bool {
+        name.starts_with("net/fabricmc/") && !self.fabric_entrypoint_containers.is_empty()
+    }
+
+    /// The command façade's markers (a source, a node, a builder) answer
+    /// `instanceof` for their Brigadier and vanilla types.
+    fn host_instance_of(&self, marker: &str, wanted: &str) -> bool {
+        self.brigadier_instance_of(marker, wanted)
     }
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
@@ -3591,8 +3682,17 @@ impl Host for StdHost {
         self.record(r, None, &[]);
         // Fabric `Event` fields, Forge per-event buses and the game-event
         // façade's statics: a listener's registration keeps its event's name.
+        // Brigadier's permission statics and `Commands.CommandSelection`.
+        if let Some(value) = self.brigadier_static(r) {
+            return Ok(value);
+        }
         if let Some(value) = self.game_event_static(r) {
             return Ok(value);
+        }
+        // The client stand-ins' fields (`Minecraft.player`, `options.keyJump`),
+        // key categories and input types.
+        if let Some(value) = self.client_static(r) {
+            return value;
         }
         if let Some(value) = jdk_model::static_field(&r.owner, &r.name) {
             return Ok(value);
@@ -3746,7 +3846,19 @@ impl Host for StdHost {
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
+        // `Minecraft.getInstance`, key-mapping and HUD registration.
+        if let Some(value) = self.client_invoke(r, args) {
+            return value;
+        }
+        // Command builders, argument types and a running command's getters.
+        if let Some(value) = self.brigadier_invoke(r, args) {
+            return value;
+        }
         if let Some(value) = jdk_model::static_call(r, args) {
+            return value;
+        }
+        // The game-event façade's statics (`ServerPlayNetworking.canSend`).
+        if let Some(value) = self.game_event_invoke(r, args) {
             return value;
         }
         if let Some(value) = self.collection_copy_of(r, args) {
@@ -4904,6 +5016,11 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        // The command dispatcher, builders, nodes and a running command's
+        // context and source (`brigadier.rs`).
+        if let Some(value) = self.brigadier_call(r, receiver, args) {
+            return value;
+        }
         if let Some(value) = jdk_model::instance_call(r, receiver, args) {
             return value;
         }
@@ -4925,6 +5042,11 @@ impl Host for StdHost {
             return Ok(
                 class_of_value(receiver).map_or(Value::Ref(None), |class| Value::Ref(Some(class)))
             );
+        }
+        // A client stand-in (`client/...`), a mod's `KeyMapping`, or a client
+        // registration event answers the client surface first.
+        if let Some(answer) = self.client_call(r, receiver, args) {
+            return answer;
         }
         // A game-event façade marker (server, level, player, event object)
         // answers its bounded surface; anything else refuses the listener.
@@ -6178,7 +6300,8 @@ impl Host for StdHost {
             match (r.name.as_str(), r.descriptor.as_str()) {
                 (
                     "<init>",
-                    "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/network/codec/StreamCodec;)V",
+                    "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/network/codec/StreamCodec;)V"
+                    | "(Lnet/minecraft/resources/Identifier;)V",
                 ) => {
                     let (namespace, path) = identifier_parts(Self::argument(r, args, 0)?);
                     self.packet_types
@@ -7893,7 +8016,8 @@ impl Host for StdHost {
             (
                 "net/fabricmc/loader/api/ModContainer",
                 "getRootPaths",
-                "()Ljava/util/Collection;",
+                // Fabric Loader declares `List<Path> getRootPaths()`.
+                "()Ljava/util/List;" | "()Ljava/util/Collection;",
             ) => {
                 let id = metadata_part(expect_ref(receiver), 1);
                 Ok(collection_value(
@@ -14349,10 +14473,17 @@ impl NativeJar {
         configs: &[MixinConfig],
         config_sides: &BTreeMap<String, MixinSide>,
     ) -> Result<Option<GameHookPlan>, MixinSkipReason> {
-        let Some(site) = game_hook_site_for(&plan.target) else {
+        let Some(site) = game_hook_site_at(&plan.target, &plan.at) else {
             return Ok(None);
         };
-        mixin_config_gate(configs, config_sides, &plan.callback.owner, side)?;
+        // A config plugin is asked natively here (`hook_shapes.rs`).
+        self.game_hook_config_gate(
+            configs,
+            config_sides,
+            &plan.callback.owner,
+            &plan.target.owner,
+            side,
+        )?;
         if plan.shift.is_some() || plan.slice.is_some() || plan.ordinal.is_some() {
             return Err(MixinSkipReason::SelectorModifier);
         }
@@ -15556,15 +15687,12 @@ impl NativeJar {
     ) -> Result<GameHookRegistrations, NativeError> {
         let mut registrations = GameHookRegistrations::default();
         for hook in &weave.game_hooks {
-            let site = GAME_HOOK_SITES
-                .iter()
-                .find(|site| site.hook == hook.hook && site.version == hook.version)
-                .ok_or_else(|| {
-                    NativeError::Metadata(format!(
-                        "game hook plan names {} version {}, which this runtime does not know",
-                        hook.hook, hook.version
-                    ))
-                })?;
+            let site = game_hook_site_named(hook.hook, hook.version).ok_or_else(|| {
+                NativeError::Metadata(format!(
+                    "game hook plan names {} version {}, which this runtime does not know",
+                    hook.hook, hook.version
+                ))
+            })?;
             if hook.plan.target.owner != site.target_owner
                 || hook.plan.target.name != site.target_name
                 || hook.plan.target.descriptor != site.target_descriptor
@@ -15654,17 +15782,22 @@ impl NativeJar {
             })?;
         let target_args = descriptor_arguments(&entry.target.descriptor);
         let callback_args = descriptor_arguments(&entry.callback.descriptor);
+        // A value-returning target hands a `CallbackInfoReturnable`, a `void`
+        // one a `CallbackInfo`: the same runtime-owned object either way.
+        let info = if return_desc(&entry.target.descriptor) == "V" {
+            CALLBACK_INFO_DESC
+        } else {
+            CALLBACK_INFO_RETURNABLE_DESC
+        };
         let mut values = args.to_vec();
         if callback_args.len() == target_args.len() + 1
-            && callback_args
-                .last()
-                .is_some_and(|arg| arg == CALLBACK_INFO_DESC)
+            && callback_args.last().is_some_and(|arg| arg == info)
             && callback_args[..target_args.len()] == target_args[..]
         {
             values.push(Value::Ref(Some(callback_info_marker(&entry.target))));
         } else if callback_args != target_args {
             return Err(NativeError::Metadata(format!(
-                "native game hook callback {}#{}{} must mirror {}'s arguments and may add one trailing CallbackInfo",
+                "native game hook callback {}#{}{} must mirror {}'s arguments and may add one trailing CallbackInfo or CallbackInfoReturnable",
                 entry.callback.owner,
                 entry.callback.name,
                 entry.callback.descriptor,
@@ -17989,11 +18122,6 @@ impl<H: Host> Runtime<'_, H> {
         self.callback_infos.open(marker)
     }
 
-    /// Whether a host hook callback cancelled its call.
-    fn callback_info_cancelled(&self, marker: &str) -> Result<bool, NativeError> {
-        self.callback_infos.flag(marker)
-    }
-
     /// Answer the bounded `CallbackInfo` surface for the object this execution
     /// owns.
     ///
@@ -19062,7 +19190,10 @@ impl<H: Host> Runtime<'_, H> {
                 .ok_or_else(|| NativeError::Metadata("Class.forName needs a class name".into()))?,
         );
         let internal = binary.replace('.', "/");
-        if self.has_class(&internal) {
+        if self.has_class(&internal)
+            || library_dispatch::jdk_class_exists(&internal)
+            || self.host.platform_class_present(&internal)
+        {
             return Ok(Value::Ref(Some(internal)));
         }
         // The JVM throws for an absent class, and a platform probe relies on
@@ -20459,6 +20590,9 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(path) = args.first().map(path_text).map(str::to_owned) else {
                     return Ok(None);
                 };
+                if let Some(value) = self.jar_root_files(r, &path, class, method)? {
+                    return Ok(Some(value));
+                }
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("exists", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
                         if !self.io_files.contains_key(&path) {
@@ -21715,7 +21849,13 @@ impl<H: Host> Runtime<'_, H> {
         let symbolic = self
             .class(&r.owner)
             .and_then(|file| file.method(&r.name, &r.descriptor));
-        let symbolic_is_abstract = symbolic.is_some_and(|method| method.code.is_none());
+        // `invokeinterface Sub.m()` names an interface that only inherits `m`
+        // from a superinterface (`IWriter.getExtension`, declared abstract by
+        // `ISerializer`). The JVM resolves the symbolic method through the
+        // superinterfaces, finds it abstract and selects the receiver's body.
+        let symbolic_is_abstract = symbolic.is_some_and(|method| method.code.is_none())
+            || (symbolic.is_none()
+                && self.inherits_abstract(&r.owner, &r.name, &r.descriptor));
         if symbolic_is_abstract
             && matches!(opcode, 0xb6 | 0xb9)
             && let Some(class) = receiver.and_then(|value| self.receiver_class(value))
@@ -23254,6 +23394,20 @@ impl<H: Host> Runtime<'_, H> {
                         AnchorOutcome::Normal => {
                             match self.static_fields.get(&Self::static_field_key(&field)) {
                                 Some(value) => value.clone(),
+                                // A field a jar class declares and nothing
+                                // assigned yet holds the JVM default; only a
+                                // static of a class the jar does not declare
+                                // is the host's to answer (a strict host would
+                                // refuse the read otherwise).
+                                None if self.class(&field.owner).is_some_and(|file| {
+                                    file.fields.iter().any(|declared| {
+                                        declared.name == field.name
+                                            && declared.descriptor == field.descriptor
+                                    })
+                                }) =>
+                                {
+                                    Value::default_for(&field.descriptor)
+                                }
                                 None => self.host.get_static(&field)?,
                             }
                         }
@@ -23465,6 +23619,11 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         self.invoke_string_builder(&r, receiver.as_ref(), &args)?
                     {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_library_model(&r, receiver.as_ref(), &args, class, method)
+                    ) {
                         value
                     } else if let Some(value) =
                         self.invoke_jdk_runtime(&r, receiver.as_ref(), &args)?
@@ -24894,9 +25053,11 @@ fn skipped_modify_variable_plan(
 /// Validate a `@Inject` callback against a game hook site's declared target.
 ///
 /// A host hook passes the target's arguments the same way the woven path does,
-/// so the callback must mirror them and may add one trailing `CallbackInfo`.
-/// The target is always `void` for a hook site (the census carries no result),
-/// so a `CallbackInfoReturnable` is a mismatch rather than an override.
+/// so the callback must mirror them and may add one trailing callback info:
+/// a `CallbackInfo` for a `void` target, a `CallbackInfoReturnable` for one
+/// that returns a value (a Java-tier site, `hook_shapes.rs`), exactly as Mixin
+/// requires. Anything else (captured locals, MixinExtras' `@Local`/`@Share`
+/// sugar) is a mismatch: the host has no local to hand.
 fn game_hook_callback(
     classes: &BTreeMap<String, ClassFile>,
     callback: &MethodRef,
@@ -24921,17 +25082,25 @@ fn game_hook_callback(
     }
     let target_args = descriptor_arguments(site.target_descriptor);
     let callback_args = descriptor_arguments(&callback.descriptor);
+    let info = site.callback_info_descriptor();
     let mirrors = callback_args == target_args
         || (callback_args.len() == target_args.len() + 1
-            && callback_args
-                .last()
-                .is_some_and(|arg| arg == CALLBACK_INFO_DESC)
+            && callback_args.last().is_some_and(|arg| arg == info)
             && callback_args[..target_args.len()] == target_args[..]);
     if !mirrors {
         return Err(MixinSkipReason::GameHookMismatch(bounded_weave_reason(
             &format!(
-                "hook point {} callback {}#{}{} must mirror {}'s arguments and may add one trailing CallbackInfo",
-                site.hook, callback.owner, callback.name, callback.descriptor, site.target_name
+                "hook point {} callback {}#{}{} must mirror {}'s arguments and may add one trailing {}",
+                site.hook,
+                callback.owner,
+                callback.name,
+                callback.descriptor,
+                site.target_name,
+                if site.returns_value() {
+                    "CallbackInfoReturnable"
+                } else {
+                    "CallbackInfo"
+                }
             ),
         )));
     }
@@ -40284,6 +40453,55 @@ mandatory = true
         assert!(host.registrations().is_empty());
     }
 
+    /// A block whose id the host could not name is recorded opaque, not as a
+    /// typed `minecraft:` row the content root would refuse the jar over.
+    #[test]
+    fn an_unnamed_block_registration_stays_opaque() {
+        let register = MethodRef {
+            owner: "net/minecraft/core/Registry".into(),
+            name: "register".into(),
+            descriptor: "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Ljava/lang/Object;".into(),
+        };
+        let mut host = StdHost::new();
+        let registry = Host::get_static(
+            &mut host,
+            &MethodRef {
+                owner: "net/minecraft/core/registries/BuiltInRegistries".into(),
+                name: "BLOCK".into(),
+                descriptor: "Lnet/minecraft/core/Registry;".into(),
+            },
+        )
+        .unwrap();
+        // Both values carry the builder chain inference types a block from.
+        for marker in ["@block-unnamed", "@block-named"] {
+            host.block_property_builders
+                .insert(marker.to_owned(), BTreeMap::new());
+        }
+        for (id, marker) in [
+            ("identifier/", "@block-unnamed"),
+            ("identifier/ruby:ore", "@block-named"),
+        ] {
+            let value = Value::Ref(Some(marker.into()));
+            let answer = Host::invoke(
+                &mut host,
+                &register,
+                &[registry.clone(), Value::Ref(Some(id.into())), value.clone()],
+            )
+            .unwrap();
+            // The caller's static field still gets its value either way.
+            assert_eq!(answer, value);
+        }
+        let rows = host.registrations();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "minecraft:");
+        assert_eq!(rows[0].declaration, None);
+        assert_eq!(rows[1].id, "ruby:ore");
+        assert!(matches!(
+            rows[1].declaration,
+            Some(RegistryDeclaration::Block { item: true, .. })
+        ));
+    }
+
     #[test]
     fn void_host_call_does_not_store_a_phantom_reference() {
         fn u2(bytes: &mut Vec<u8>, value: u16) {
@@ -40724,6 +40942,8 @@ mandatory = true
         let mut mapped = 0usize;
         let mut bound = 0usize;
         let mut by_hook: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut unbound: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut bound_by_hook: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut failures = Vec::new();
         for path in paths.lines().map(str::trim).filter(|line| !line.is_empty()) {
             let jar = match NativeJar::from_path(std::path::Path::new(path)) {
@@ -40752,7 +40972,7 @@ mandatory = true
                     continue;
                 }
                 server_plans += 1;
-                let Some(site) = game_hook_site_for(&plan.target) else {
+                let Some(site) = game_hook_site_at(&plan.target, &plan.at) else {
                     continue;
                 };
                 if plan.shift.is_some() || plan.slice.is_some() || plan.ordinal.is_some() {
@@ -40772,10 +40992,20 @@ mandatory = true
                 mapped += 1;
                 *by_hook.entry(site.hook).or_default() += 1;
             }
-            bound += jar
-                .plan_load_time_weave_with_game_hooks(MixinSide::Server)
-                .game_hooks
-                .len();
+            let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+            bound += weave.game_hooks.len();
+            for plan in &weave.game_hooks {
+                *bound_by_hook.entry(plan.hook).or_default() += 1;
+            }
+            // Why a plan on a site still does not bind: the gate it stops at.
+            for skipped in &weave.skipped {
+                if jar.classes.contains_key(&skipped.target.owner)
+                    || game_hook_site_at(&skipped.target, &skipped.at).is_none()
+                {
+                    continue;
+                }
+                *unbound.entry(skipped.reason.label()).or_default() += 1;
+            }
             jars += 1;
         }
         println!(
@@ -40783,7 +41013,20 @@ mandatory = true
             server_plans.saturating_sub(mapped)
         );
         for (hook, count) in &by_hook {
-            println!("  {count:4} {hook}");
+            println!(
+                "  {count:4} {hook} ({} bound)",
+                bound_by_hook.get(hook).copied().unwrap_or(0)
+            );
+        }
+        let java_tier: usize = bound_by_hook
+            .iter()
+            .filter(|(hook, _)| hook.starts_with(JAVA_TIER_HOOK_PREFIX))
+            .map(|(_, count)| count)
+            .sum();
+        println!("{java_tier} of the bound plans are at internal Java-tier sites");
+        println!("plans on a site that do not bind, by the gate they stop at:");
+        for (reason, count) in &unbound {
+            println!("  {count:4} {reason}");
         }
         for failure in &failures {
             eprintln!("{failure}");
