@@ -173,7 +173,17 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   object; world path, game rules, registry access, level clock and `ServerPlayNetworking.canSend` answer from the
   server's own state through `facade_server.rs`); a façade call outside that surface refuses the listener by name.
   Fabric `boolean`/`InteractionResult` callbacks stop at the first deciding answer, NeoForge `setCanceled` skips
-  later listeners without `receiveCanceled`. Priorities are not modelled (registration order). Over the 723-jar corpus, 83 of the 499 jars
+  later listeners without `receiveCanceled`. Listeners run in the loaders' order across every jar of an event
+  (`src/events/order.rs`): Fabric phases (`register(phase, listener)`, `addPhaseOrdering`, sorted as
+  `NodeSorting` does, ties by `Identifier.compareTo`), NeoForge/Forge `EventPriority` (from `addListener` or
+  `@SubscribeEvent(priority)`), then load and registration order; Forge EventBus 7's byte priorities are read as
+  `NORMAL`. The rest of the server's player and entity events are named too (`AttackBlockCallback`,
+  `UseEntityCallback`, `PlayerBlockBreakEvents.CANCELED`, `ENTITY_UNLOAD`, `ALLOW_DAMAGE`/`AFTER_DAMAGE`,
+  `AFTER_RESPAWN`/`COPY_FROM`, `AFTER_PLAYER_CHANGE_LEVEL`, and NeoForge's `LeftClickBlock`, `EntityInteract`,
+  `EntityLeaveLevelEvent`, `LivingIncomingDamageEvent`, `LivingDamageEvent.Post`, `PlayerRespawnEvent`, `Clone`,
+  `PlayerChangedDimensionEvent`); a firing hands the block as a `block-pos` value, the face as a `Direction`,
+  the hand, and a `BlockHitResult` that answers its block and face. Chat (`ServerMessageEvents`, `ServerChatEvent`)
+  is not named yet. Over the 723-jar corpus, 83 of the 499 jars
   that bootstrap natively register 257 listeners the game can fire (`server_started` 38 jars, `server_starting`
   35, `player_join` 34, `server_stopped` 22, `player_leave` 21, `server_stopping` 19, `server_tick_end` 17); the
   largest unfired family was client ticks. Command registration is a listener of its own
@@ -230,12 +240,30 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   cache). The integrated and dedicated servers fire server starting/started/stopping/stopped, server tick
   start/end, level tick start/end, player join/leave and a living entity's death (`ALLOW_DEATH`/`LivingDeathEvent`
   can cancel it, then `AFTER_DEATH`). With no listener, each point costs one atomic load. A listener that fails is
-  disabled and logged once with the cause; a server stop logs kept/disabled/run/refused counts. Use, attack, block
-  break, entity load and level load/unload are identified but not fired yet. Measured on `--dedicated` (fast
+  disabled and logged once with the cause; a server stop logs kept/disabled/run/refused counts. The servers also
+  fire the player and entity events (`game/java_events/player.rs`), each from the point the loader's own hook
+  uses, beside the native mods' hook: use on a block (`useItemOn`'s start), use of an item (`useItem`'s start),
+  use and attack of an entity, a dig's start, a break (before, cancelled, after), an incoming hit
+  (`hurtServer`), an entity joining and leaving a level, a respawn, the copy to the new player, a change of level
+  and a level's load and unload. A non-`PASS` result, a `false` answer or a NeoForge cancel stops the vanilla
+  action there (`SUCCESS_SERVER` swings the hand). Not fired yet: `AFTER_DAMAGE`, `AFTER_RESPAWN` for the End's
+  exit, a player's own `ENTITY_LOAD`. `java-runtime.json` has a `listeners` section, jar → event → kept,
+  dispatched, refused and disabled counts, rewritten at a server's stop. Measured on `--dedicated` with bots (8
+  November 2026, fast profile, flat world, two `flood-use` bots for 25 s, one bot attacking a summoned pig for
+  12 s): with a source-built jar whose use, dig and attack listeners answer `FAIL`, the bots placed 0 stone and
+  broke 0 grass blocks (248 and 53 without it) and the pig kept its 10 health after 30 attacks (killed without
+  it); the jar's listeners ran 510 use, 510 dig and 127 attack firings with no refusal. In a run with three
+  fight bots (normal difficulty) and 15 corpus jars that listen to these events (Carry On, Farmer's Delight, Connectible Chains, collective, Architectury...),
+  before this change 0 of these listeners were fired; now use-block (4 listeners), dig, attack, break-before
+  and one of two damage listeners are fired and refused at their first unmodelled call (`Player#isSpectator`,
+  `getItemInHand`, Fabric data attachments, `DamageSource#getEntity`), while Carry On's `ALLOW_DAMAGE` (172
+  runs), collective's and Icy's Better Horses' `ENTITY_LOAD` (765) and `ENTITY_UNLOAD` (116) and the level
+  loads run; no corpus listener reached a deciding answer, so the bots' blocks matched the run without jars.
+  Use of an item and of an entity were not exercised by the bots. Measured on `--dedicated` (fast
   profile, flat world, no players): Cupboard alone ran its `SERVER_STARTED` and `END_SERVER_TICK` listeners 557 times
   in 28 s with no refusal; the 48 corpus jars with server listeners kept 138 listeners from 42 jars, of which 105
   were still enabled at stop after 13,865 runs in 45 s. Join, leave and death were covered by tests only, not by a
-  run with a connected player. `java-runtime.json` does not carry listener counts yet (only the stop log line).
+  run with a connected player.
 - Java mods' commands join the server's command tree (`game/java_commands.rs`): the batch keeps every jar with a
   command registration on its resident host (the one its listeners and payload handlers share). The first
   command-tree build (`register_native_commands`, the native mods' extension point) runs the registrations, merges
@@ -956,8 +984,9 @@ than rows; the cache held 86 entries in 436 KiB.
    but the façade a listener sees is small: on a dedicated run of 48 corpus jars with server listeners, 42 jars
    kept 138 listeners and 33 were refused at their first unmodelled call, mostly `MinecraftServer#getWorldPath`
    (6), `registryAccess` (6 with the level's), `getResourceManager` (2), and interpreter collection/stream markers.
-   Use-block/item, attack, block-break, entity-load and level load/unload listeners are identified but not fired;
-   Priorities are registration order. Commands registered through Brigadier reach the server's tree and run
+   Use, attack, dig, break, damage, entity load/unload, respawn, copy, level change and level load/unload
+   listeners fire too, in Fabric phase and NeoForge priority order, and a deciding answer stops the vanilla
+   action (proven with bots); the corpus listeners for them mostly stop at an unmodelled façade call. Commands registered through Brigadier reach the server's tree and run
    (above), but through the same small façade: of 83 sampled console lines, 23 returned and 26 were refused.
    *Client surface (first slice).* The window fires client tick, level tick, started/stopping and join/disconnect
    listeners (Fabric `ClientTickEvents`/`ClientLifecycleEvents`/`ClientPlayConnectionEvents`, NeoForge
