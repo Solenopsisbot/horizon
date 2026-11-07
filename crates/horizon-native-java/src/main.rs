@@ -655,6 +655,7 @@ fn main() -> ExitCode {
     match error {
         None => {
             if json {
+                let commands = command_summary(&jar, &host, kind != "client");
                 println!(
                     "{}",
                     serde_json::json!({
@@ -680,6 +681,8 @@ fn main() -> ExitCode {
                         // The listeners the game can fire, by event name, and
                         // the registrations on events it never fires.
                         "game_listeners": game_listener_counts(&host, &jar, kind != "client"),
+                        // The command tree its registration callbacks build.
+                        "commands": commands,
                         "events": host.posted_events().len(),
                         "mixin_targets": mixin_target_labels(
                             jar.discovered_mixin_targets().iter()
@@ -709,6 +712,121 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// What the jar's command registration callbacks build, run on a copy of
+/// the host as a dedicated server's command-tree build would: the root
+/// commands, the argument nodes whose type the façade does not model, and the
+/// first refusal of a callback.
+fn command_summary(
+    jar: &horizon_native_java::NativeJar,
+    host: &horizon_native_java::StdHost,
+    server: bool,
+) -> serde_json::Value {
+    use horizon_native_java::{
+        brigadier::{ArgumentKind, NodeKind},
+        events::{EventContext, EventFacade, EventFiring, GameEvent},
+    };
+    let mut host = host.clone();
+    let listeners: Vec<_> = host
+        .game_listeners(jar, server)
+        .listeners
+        .into_iter()
+        .filter(|l| l.event == GameEvent::RegisterCommands)
+        .collect();
+    if listeners.is_empty() {
+        return serde_json::Value::Null;
+    }
+    let mut refused = None;
+    for listener in &listeners {
+        let mut firing = EventFiring::new(
+            GameEvent::RegisterCommands,
+            std::sync::Arc::new(EventFacade {
+                dedicated: true,
+                ..EventFacade::default()
+            }),
+            EventContext::default(),
+        );
+        let budget =
+            horizon_native_java::ExecutionBudget::within(std::time::Duration::from_secs(5));
+        if let Err(error) = jar.run_game_listener(listener, &mut firing, &mut host, &budget) {
+            refused.get_or_insert_with(|| error.to_string());
+        }
+    }
+    let tree = host.command_tree();
+    let roots: Vec<&str> = tree.roots().map(|(_, node)| node.kind.name()).collect();
+    let unmodelled: Vec<String> = tree
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            NodeKind::Argument {
+                name,
+                kind: ArgumentKind::Unmodelled(class),
+            } => Some(format!("{name}: {class}")),
+            _ => None,
+        })
+        .collect();
+    // Up to three runnable lines, shortest first, through literals and the
+    // argument kinds a console can type a value for.
+    let mut samples = Vec::new();
+    let mut queue = std::collections::VecDeque::new();
+    if !tree.nodes.is_empty() {
+        queue.push_back((0usize, String::new()));
+    }
+    while let Some((id, line)) = queue.pop_front() {
+        if samples.len() >= 3 || line.len() > 200 {
+            break;
+        }
+        for &child in &tree.nodes[id].children {
+            let word = match &tree.nodes[child].kind {
+                NodeKind::Literal(name) => name.clone(),
+                NodeKind::Argument { kind, .. } => match kind {
+                    ArgumentKind::Integer { min, max } => 1.clamp(*min, *max).to_string(),
+                    ArgumentKind::Long { min, max } => 1.clamp(*min, *max).to_string(),
+                    ArgumentKind::Bool => "true".into(),
+                    ArgumentKind::Word | ArgumentKind::Quoted | ArgumentKind::Greedy => {
+                        "test".into()
+                    }
+                    _ => continue,
+                },
+                NodeKind::Root => continue,
+            };
+            let next = if line.is_empty() {
+                word
+            } else {
+                format!("{line} {word}")
+            };
+            if tree.nodes[child].command.is_some() && samples.len() < 3 {
+                samples.push(next.clone());
+            }
+            queue.push_back((child, next));
+        }
+    }
+    // The tree level of each root's `requires` lambda, or why it refused.
+    let mut levels = serde_json::Map::new();
+    for (_, node) in tree.roots() {
+        if let Some(requirement @ horizon_native_java::brigadier::Requirement::Predicate(_)) =
+            &node.requirement
+        {
+            let budget =
+                horizon_native_java::ExecutionBudget::within(std::time::Duration::from_secs(1));
+            let level = match jar.requirement_level(requirement, true, &mut host, &budget) {
+                Ok(level) => serde_json::json!(level),
+                Err(error) => serde_json::json!(error.to_string()),
+            };
+            levels.insert(node.kind.name().to_owned(), level);
+        }
+    }
+    serde_json::json!({
+        "listeners": listeners.len(),
+        "roots": roots,
+        "requirement_levels": levels,
+        "samples": samples,
+        "nodes": tree.nodes.len(),
+        "executable": tree.nodes.iter().filter(|n| n.command.is_some()).count(),
+        "unmodelled_arguments": unmodelled,
+        "refused": refused,
+    })
 }
 
 /// The probe's view of [`StdHost::game_listeners`]: per event name, how many

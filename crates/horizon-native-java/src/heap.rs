@@ -235,6 +235,8 @@ impl StdHost {
         out.extend(self.item_property_builders.keys().map(String::as_str));
         out.extend(self.block_property_builders.keys().map(String::as_str));
         out.extend(self.resource_streams.keys().map(String::as_str));
+        // The command tree's callbacks and requirement lambdas (`brigadier.rs`).
+        self.brigadier_root_texts(out);
     }
 }
 
