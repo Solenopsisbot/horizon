@@ -15860,12 +15860,23 @@ impl NativeJar {
     ) -> Result<GameHookRegistrations, NativeError> {
         let mut registrations = GameHookRegistrations::default();
         for hook in &weave.game_hooks {
-            let site = game_hook_site_named(hook.hook, hook.version).ok_or_else(|| {
+            let named = game_hook_site_named(hook.hook, hook.version).ok_or_else(|| {
                 NativeError::Metadata(format!(
                     "game hook plan names {} version {}, which this runtime does not know",
                     hook.hook, hook.version
                 ))
             })?;
+            // One hook may stand for several vanilla methods (`living_jump`:
+            // `LivingEntity` and `MagmaCube`); the row is the one the plan targets.
+            let site = every_game_hook_site()
+                .find(|site| {
+                    site.hook == hook.hook
+                        && site.version == hook.version
+                        && site.target_owner == hook.plan.target.owner
+                        && site.target_name == hook.plan.target.name
+                        && site.target_descriptor == hook.plan.target.descriptor
+                })
+                .unwrap_or(named);
             if hook.plan.target.owner != site.target_owner
                 || hook.plan.target.name != site.target_name
                 || hook.plan.target.descriptor != site.target_descriptor

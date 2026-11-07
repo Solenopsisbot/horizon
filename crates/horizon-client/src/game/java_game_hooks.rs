@@ -2161,6 +2161,19 @@ public class BootMixin {
     }
 }
 "#;
+    /// The second row of one hook name (`living_jump` stands for
+    /// `LivingEntity` and `MagmaCube`): registering it must find its own row.
+    const JUMP_MIXIN: &str = r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+@Mixin(net.minecraft.world.entity.monster.cubemob.MagmaCube.class)
+public class JumpMixin {
+    @Inject(method = "jumpFromGround", at = @At("TAIL"))
+    private void jumped(CallbackInfo ci) {}
+}
+"#;
     const DESTROY_MIXIN: &str = r#"package demo;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
@@ -2213,6 +2226,7 @@ public class DestroyMixin {
             "net.minecraft.server.level.ServerPlayer",
             "net.minecraft.world.damagesource.DamageSource",
             "net.minecraft.world.entity.LivingEntity",
+            "net.minecraft.world.entity.monster.cubemob.MagmaCube",
             "net.minecraft.world.item.ItemStack",
             "net.minecraft.world.level.block.Block",
             "net.minecraft.world.level.block.entity.BlockEntity",
@@ -2237,6 +2251,7 @@ public class DestroyMixin {
             ("demo/LevelMixin.java", LEVEL_MIXIN),
             ("demo/BootMixin.java", BOOT_MIXIN),
             ("demo/DestroyMixin.java", DESTROY_MIXIN),
+            ("demo/JumpMixin.java", JUMP_MIXIN),
         ] {
             sources.push((path.to_owned(), body.to_owned()));
         }
@@ -2259,13 +2274,18 @@ public class DestroyMixin {
         let options = zip::write::SimpleFileOptions::default();
         let metadata =
             r#"{"id":"server_sites","version":"1","entrypoints":{},"mixins":["demo.mixins.json"]}"#;
-        let config =
-            r#"{"package":"demo","mixins":["HurtMixin","LevelMixin","BootMixin","DestroyMixin"]}"#;
+        let config = r#"{"package":"demo","mixins":["HurtMixin","LevelMixin","BootMixin","DestroyMixin","JumpMixin"]}"#;
         for (name, body) in [("fabric.mod.json", metadata), ("demo.mixins.json", config)] {
             zip.start_file(name, options).ok()?;
             zip.write_all(body.as_bytes()).ok()?;
         }
-        for name in ["HurtMixin", "LevelMixin", "BootMixin", "DestroyMixin"] {
+        for name in [
+            "HurtMixin",
+            "LevelMixin",
+            "BootMixin",
+            "DestroyMixin",
+            "JumpMixin",
+        ] {
             let name = format!("demo/{name}.class");
             zip.start_file(&name, options).ok()?;
             zip.write_all(&std::fs::read(classes.join(&name)).ok()?)
@@ -2294,6 +2314,7 @@ public class DestroyMixin {
                 "java_bootstrap_head",
                 "java_level_tick_head",
                 "java_living_hurt",
+                "living_jump",
             ],
             "{:#?}",
             weave.skipped
