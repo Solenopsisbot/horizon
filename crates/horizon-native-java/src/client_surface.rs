@@ -125,6 +125,25 @@ pub(crate) fn tooltip_arguments() -> Vec<Value> {
     ]
 }
 
+/// A `java.awt.Color` constant: `client/awt-color/<aarrggbb>`.
+const AWT_COLOR: &str = "client/awt-color/";
+/// `java.awt.Color`'s named constants (both spellings resolve).
+const AWT_COLORS: &[(&str, u32)] = &[
+    ("WHITE", 0xffff_ffff),
+    ("LIGHT_GRAY", 0xffc0_c0c0),
+    ("GRAY", 0xff80_8080),
+    ("DARK_GRAY", 0xff40_4040),
+    ("BLACK", 0xff00_0000),
+    ("RED", 0xffff_0000),
+    ("PINK", 0xffff_afaf),
+    ("ORANGE", 0xffff_c800),
+    ("YELLOW", 0xffff_ff00),
+    ("GREEN", 0xff00_ff00),
+    ("MAGENTA", 0xffff_00ff),
+    ("CYAN", 0xff00_ffff),
+    ("BLUE", 0xff00_00ff),
+];
+
 /// `Runnable`s one firing may queue with `Minecraft.execute`.
 const MAX_TASKS: usize = 64;
 /// A vanilla mapping read through `options.keyJump`...: `client/vanilla-key/key.jump`.
@@ -1013,6 +1032,12 @@ impl StdHost {
                 }
             }
             (FONT_CLASS, "lineHeight") => Some(Ok(Value::Int(9))),
+            // `java.awt.Color`'s constants, which HUD mods turn into ARGB
+            // ints with `getRGB()` (durabilityviewer's indicator colours).
+            ("java/awt/Color", name) => AWT_COLORS
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, argb)| Ok(marker(format!("{AWT_COLOR}{argb:08x}")))),
             // Item, block and effect constants answer only in a firing: an
             // entrypoint reading `Items.DIAMOND` keeps the answer it always got.
             ("net/minecraft/world/item/Items", name) if frame.is_some() => Some(Ok(marker(
@@ -1229,6 +1254,18 @@ impl StdHost {
             }
             ("toString", "()Ljava/lang/String;") => return Some(Ok(marker(text))),
             _ => {}
+        }
+        if let Some(hex) = text.strip_prefix(AWT_COLOR) {
+            let argb = u32::from_str_radix(hex, 16).ok()?;
+            let channel = |shift: u32| Value::Int(((argb >> shift) & 0xff) as i32);
+            return Some(match r.name.as_str() {
+                "getRGB" => Ok(Value::Int(argb as i32)),
+                "getAlpha" => Ok(channel(24)),
+                "getRed" => Ok(channel(16)),
+                "getGreen" => Ok(channel(8)),
+                "getBlue" => Ok(channel(0)),
+                _ => refuse(),
+            });
         }
         let Some(frame) = self.client.frame.clone() else {
             // Outside a firing: what the host answered before this surface.
@@ -2384,6 +2421,26 @@ mod tests {
             ),
             Some(Err(NativeError::UnknownHostCall(_)))
         ));
+    }
+
+    /// `java.awt.Color.GREEN.getRGB()` is opaque green, as on the JVM, through
+    /// the host's own static and instance paths.
+    #[test]
+    fn awt_colour_constants_answer_their_argb() {
+        let mut host = StdHost::new();
+        let green = crate::Host::get_static(
+            &mut host,
+            &method("java/awt/Color", "GREEN", "Ljava/awt/Color;"),
+        )
+        .unwrap();
+        let rgb = crate::Host::invoke_instance(
+            &mut host,
+            &method("java/awt/Color", "getRGB", "()I"),
+            &green,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(rgb, Value::Int(0xff00_ff00_u32 as i32));
     }
 
     #[test]

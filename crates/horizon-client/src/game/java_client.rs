@@ -80,6 +80,10 @@ struct LayerSlot {
     layer: HudLayer,
     disabled: bool,
     refusal: Option<String>,
+    /// Frames it has drawn, for its warm-up budget.
+    frames: u32,
+    /// Frames in a row it ran out of time in.
+    overruns: u32,
 }
 
 /// One registered mapping: its Controls name and input state.
@@ -146,6 +150,12 @@ fn budget(event: GameEvent) -> Duration {
 /// The time one HUD element may take in one frame. A frame at 60 fps has
 /// 16 ms for everything; an element over this is disabled, not drawn late.
 const HUD_BUDGET: Duration = Duration::from_millis(4);
+/// Frames in a row an element may run out of time in before it is disabled.
+const HUD_OVERRUNS: u32 = 8;
+/// An element's first frames, which run its one-time class initialisation.
+const HUD_WARMUP_FRAMES: u32 = 3;
+/// The time one of those frames may take.
+const HUD_WARMUP_BUDGET: Duration = Duration::from_millis(100);
 
 fn store() -> std::sync::MutexGuard<'static, Vec<ClientJar>> {
     STORE.lock().unwrap_or_else(|e| e.into_inner())
@@ -324,6 +334,8 @@ pub(super) fn adopt(
                 layer,
                 disabled: false,
                 refusal: None,
+                frames: 0,
+                overruns: 0,
             })
             .collect(),
         translations,
@@ -1056,7 +1068,15 @@ impl Game<'_> {
             for slot in entry.layers.iter_mut().filter(|l| !l.disabled) {
                 let presses: Vec<KeyPress> = entry.keys.iter().map(|k| k.press).collect();
                 host.begin_client_frame(Arc::clone(&snapshot), &presses);
-                let limit = ExecutionBudget::within(HUD_BUDGET);
+                // The first frames initialise the element's classes and
+                // config (`<clinit>`, the JVM's one-time work); they get the
+                // warm-up budget, every later frame the per-frame one.
+                let limit = ExecutionBudget::within(if slot.frames < HUD_WARMUP_FRAMES {
+                    HUD_WARMUP_BUDGET
+                } else {
+                    HUD_BUDGET
+                });
+                slot.frames = slot.frames.saturating_add(1);
                 let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     entry.jar.run_hud_layer(&slot.layer, &mut host, &limit)
                 }));
@@ -1064,6 +1084,7 @@ impl Game<'_> {
                 let reason = match run {
                     Ok(Ok(())) => {
                         RAN.fetch_add(1, Ordering::Relaxed);
+                        slot.overruns = 0;
                         draws.extend(out.draws);
                         for (key, press) in entry.keys.iter_mut().zip(out.keys) {
                             key.press = press;
@@ -1076,6 +1097,15 @@ impl Game<'_> {
                             out.tasks,
                             &snapshot,
                         ));
+                        continue;
+                    }
+                    // Over its time in one frame: that frame draws nothing.
+                    // A loaded machine can push any element over once, so
+                    // only a run of overruns disables it.
+                    Ok(Err(horizon_native_java::NativeError::ExecutionBudgetExceeded {
+                        ..
+                    })) if slot.overruns + 1 < HUD_OVERRUNS => {
+                        slot.overruns += 1;
                         continue;
                     }
                     Ok(Err(error)) => error.to_string(),
@@ -1478,7 +1508,10 @@ mod tests {
     /// the client role through the real batch, 32 at a time; each kept jar's
     /// client listeners then fire (started, join, three ticks, level ticks)
     /// and its HUD elements draw three frames, in a synthetic world frame: a
-    /// player at (0.5, 64, 0.5), a 427x240 GUI. The counts print at the end.
+    /// player at (0.5, 64, 0.5) holding a damaged pickaxe, a 427x240 GUI.
+    /// Tooltip listeners describe a damaged diamond sword. The counts, each
+    /// HUD element's slowest frame and the tooltip lines added print at the
+    /// end; `HORIZON_CLIENT_DUMP_DRAWS=1` also prints every frame's draw ops.
     ///
     ///   HORIZON_JAVA_CACHE=0 HORIZON_CLIENT_CORPUS=~/horizon-corpus/corpus-xl:~/horizon-corpus/mega \
     ///   cargo test -p horizon-client --bin horizon-client -- --ignored client_surface_corpus --nocapture
@@ -1505,7 +1538,21 @@ mod tests {
                 max_health: 20.0,
                 on_ground: true,
                 game_mode: "SURVIVAL".into(),
-                inventory: vec![horizon_native_java::client_surface::ClientStack::empty(); 36],
+                // A damaged pickaxe in the selected slot, so item HUDs draw.
+                inventory: std::iter::once(horizon_native_java::client_surface::ClientStack {
+                    item: "minecraft:diamond_pickaxe".into(),
+                    count: 1,
+                    damage: 700,
+                    max_damage: 1561,
+                    max_stack: 1,
+                    name: "Diamond Pickaxe".into(),
+                    ..horizon_native_java::client_surface::ClientStack::empty()
+                })
+                .chain(std::iter::repeat_n(
+                    horizon_native_java::client_surface::ClientStack::empty(),
+                    35,
+                ))
+                .collect(),
                 food: 20,
                 saturation: 5.0,
                 air: 300,
@@ -1549,6 +1596,9 @@ mod tests {
         // Tooltip lines each jar's tooltip listeners added to a damaged
         // diamond sword's one-line tooltip.
         let mut tooltip_lines: BTreeMap<String, usize> = BTreeMap::new();
+        // The slowest of each HUD element's three frames (the first runs
+        // its class initialisation).
+        let mut hud_time: BTreeMap<String, Duration> = BTreeMap::new();
         let tooltip = Arc::new(ClientSnapshot {
             tooltip_stack: Some(horizon_native_java::client_surface::ClientStack {
                 item: "minecraft:diamond_sword".into(),
@@ -1654,10 +1704,18 @@ mod tests {
                     for slot in entry.layers.iter_mut().filter(|l| !l.disabled) {
                         host.begin_client_frame(Arc::clone(&snapshot), &[]);
                         let limit = ExecutionBudget::within(Duration::from_millis(250));
+                        let started = std::time::Instant::now();
                         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             entry.jar.run_hud_layer(&slot.layer, &mut host, &limit)
                         }));
-                        let drawn = host.end_client_frame().draws.len();
+                        let took = started.elapsed();
+                        let slowest = hud_time.entry(slot.layer.id.clone()).or_default();
+                        *slowest = (*slowest).max(took);
+                        let frame_out = host.end_client_frame();
+                        if std::env::var_os("HORIZON_CLIENT_DUMP_DRAWS").is_some() {
+                            eprintln!("DRAWS {}: {:?}", slot.layer.id, frame_out.draws);
+                        }
+                        let drawn = frame_out.draws.len();
                         if drawn > 0 {
                             *drew.entry(entry.file.clone()).or_default() += drawn;
                         }
@@ -1748,6 +1806,7 @@ mod tests {
             println!("  ran {what}: {kept} kept, {ran} still running, {refused} refused");
         }
         println!("HUD elements that drew: {} jar(s) {drew:?}", drew.len());
+        println!("HUD element slowest frame: {hud_time:?}");
         println!(
             "tooltip listeners that added lines: {} jar(s) {tooltip_lines:?}",
             tooltip_lines.len()
