@@ -185,7 +185,8 @@ def read_jar_entrypoints(path: Path | None) -> JarEntrypoints | None:
     """Read a jar's loader metadata; None when the jar cannot be read.
 
     This mirrors the native reader's rule: Fabric entrypoint keys, NeoForge
-    `@Mod` classes, and `clientSideOnly` from the NeoForge/Forge TOML.
+    `@Mod` classes, and client-only from the NeoForge/Forge TOML's
+    `clientSideOnly` or Fabric's `"environment": "client"`.
     """
     if path is None:
         return None
@@ -199,11 +200,16 @@ def read_jar_entrypoints(path: Path | None) -> JarEntrypoints | None:
                 if not isinstance(obj, dict):
                     return None
                 kinds = fabric_entrypoint_kinds(obj)
-            client_side_only = False
+                # `"environment": "client"` keeps a Fabric mod off a server
+                # (a multi-loader jar's NeoForge `@Mod` class included).
+                fabric_client_only = obj.get("environment") == "client"
+            else:
+                fabric_client_only = False
+            client_side_only = fabric_client_only
             for name in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml"):
                 if name in names:
                     text = jar.read(name).decode("utf-8", errors="replace")
-                    client_side_only = bool(
+                    client_side_only = fabric_client_only or bool(
                         re.search(r"(?im)^\s*clientSideOnly\s*=\s*[\"']?true[\"']?\s*$", text)
                     )
                     break

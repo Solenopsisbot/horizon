@@ -249,6 +249,25 @@ class JavaModServerLedgerTests(unittest.TestCase):
         self.assertEqual((client_row.verdict, client_row.subtype), ("skipped", "client-only"))
         self.assertEqual(server_row.verdict, "refused")
 
+    def test_fabric_client_environment_skips_a_multi_loader_jar(self):
+        # A Fabric `"environment": "client"` jar that also carries a NeoForge
+        # `@Mod` class is client-only on a server: the native reader refuses it
+        # with the clientSideOnly line, and the row is a client-only skip.
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = self._jar(
+                tmp, "multi.jar",
+                fabric={"schemaVersion": 1, "id": "multi", "environment": "client",
+                        "entrypoints": {"client": ["demo.Client"]}},
+                neoforge='modLoader = "javafml"\n[[mods]]\nmodId = "multi"\n',
+                mod_class=True,
+            )
+            row = LEDGER.parse_log(
+                "[Server thread/WARN]: Horizon: dedicated Java compatibility: skipping "
+                "/mods/multi.jar: /mods/multi.jar: clientSideOnly mod cannot run for server "
+                "execution\nDone (1.0s)!",
+                "multi.jar", jar=jar)
+        self.assertEqual((row.verdict, row.subtype), ("skipped", "client-only"))
+
     def test_unreadable_jar_keeps_log_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             corrupt = self._jar(tmp, "corrupt.jar", corrupt=True)
