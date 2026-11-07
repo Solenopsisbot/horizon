@@ -70,9 +70,10 @@ entrypoint, 94 and 197 reached `Done`; the refusals are the `native-gap` rows ab
 
 **Phase 2:**
 
-1. **Game-class mixins do not apply.** The load-time weaver only rewrites same-jar targets, and the two opt-in hook
-   points (`player_tick`, `item_picked_up`) are not fired by game code. Closing this is the whole distance for the
-   45 / 86 `needs-loader` jars.
+1. **Game-class mixins mostly do not apply.** The load-time weaver only rewrites same-jar targets. The opt-in hook
+   tier (`HORIZON_JAVA_GAME_HOOKS=1`) now fires its 19 sites from the game, but they cover a small share of the
+   game-class plans a `needs-loader` jar carries, and a callback runs only as far as the hook tier's object model
+   reaches. Closing this is most of the distance for the 45 / 86 `needs-loader` jars.
 2. **Callbacks and the client surface.** Only entrypoints and received-payload handlers execute; event listeners are
    recorded but never dispatched, and there is no compiled HUD, key-binding, tooltip, screen, renderer or model
    façade, so client jars register content but do not draw.
@@ -135,9 +136,9 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   `unsupported-family`, `cancellable`, `selector-modifier`, `not-in-config`, `other-side`, `config-plugin`,
   `constructor-target`, `unresolved`, `target-missing`, `ambiguous-target`, `listed-without-plan`, `weaver-rejected`).
   The game uses the load-time weave only: a game-class target still has no class to rewrite, so a real jar reads
-  `native-qualified`. The opt-in `plan_load_time_weave_with_game_hooks` tier can bind an `@Inject` for a game class
-  to one of two named host hook points (`player_tick`, `item_picked_up`) and run its callback there; the game's
-  loader does not call it yet, because no game code fires those registrations.
+  `native-qualified`. With `HORIZON_JAVA_GAME_HOOKS=1` the loader plans with `plan_load_time_weave_with_game_hooks`
+  instead, binds an `@Inject` for a game class to one of the 19 `GAME_HOOK_SITES` rows, and the game fires the
+  callback at that host hook point ([the hook tier](java-mod-compat.md#game-class-hook-tier-experiment)).
 
   The fixture family matrix is **11 applied / 0 missing**: every family above weaves and runs with its own argument
   at its own position (`crates/horizon-native-java/tests/fixture_mixin_family_matrix.rs`). This is the exact
@@ -770,7 +771,13 @@ than rows; the cache held 86 entries in 436 KiB.
 1. **Game-class mixins do not apply.** The load weave only rewrites classes inside the jar; a plan whose target is a
    Minecraft class is skipped. That is every plan that matters (0 woven; 2,944 and 7,742 skipped), so `ran` means
    "entrypoint executed, mixins skipped, vanilla server reached `Done`", not "the mod works". The opt-in hook tier
-   binds two game-class sites (`player_tick`, `item_picked_up`) but the game does not fire it yet.
+   (`HORIZON_JAVA_GAME_HOOKS=1`) fires its 19 sites from the game's own hook points, but across both corpora it binds
+   only 40 server-side plans in 23 jars, and a bound callback stops at the first member the hook tier does not model. On a
+   dedicated server with two bot players and eight of those jars, 4 jars' callbacks ran (appleskin and syncmatica
+   `player_logged_in` 2 each, shogi `player_tick` 1,457, servux `server_stopping` 1) and the rest refused and were
+   disabled (`ServerPlayNetworking.canSend`, `Connection#getRemoteAddress`, a `@Shadow` field, Guava's `Ordering`).
+   Objects an entrypoint built keep only their static fields after it returns, so a callback that reads a
+   listener list the entrypoint filled (servux's) sees it empty.
 2. **Refusals.** 27 of 121 wide and 68 of 265 mega jars that declare a server entrypoint still fail (22%/26%). The
    causes are named above and in the ledgers. The raw log line is bounded at 160 characters, so a human sees a clipped
    cause; the ledger recovers the skip class from the jar's own metadata.
@@ -808,9 +815,10 @@ than rows; the cache held 86 entries in 436 KiB.
 
 ## Planned work
 
-1. **Make mixins count.** Fire the opt-in game-hook registrations from the game's own hook points, widen the
-   hand-checked site table from its two rows, and map the remaining game-class plans onto hook points (or provide the
-   target classes through the loader path). Gate: `woven` or `run_game_hook` covered by a real-mod ledger, and every
+1. **Make mixins count.** Widen the game-hook tier's object model from what the bound callbacks reach first
+   (players, entities, levels, the server; Fabric networking, `Connection`, `@Shadow` fields next), keep entrypoint
+   objects' instance fields alive for later callbacks, and map the remaining game-class plans onto hook points (or
+   provide the target classes through the loader path). Gate: `woven` or `run_game_hook` covered by a real-mod ledger, and every
    `native` label backed by zero skipped plans.
 2. **Close metadata refusals.** Bounded native collection/stream markers, `ServiceLoader`, exact `Integer.parseInt`,
    `String.split`/`Map#keySet` receivers, `Gson` appendables and tighter `fabric.mod.json` bounds. Gate: metadata

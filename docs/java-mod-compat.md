@@ -517,19 +517,67 @@ path for `@Inject` plans whose target is a game class:
 2. **Register.** `NativeJar::register_game_hooks(&weave)` re-checks each plan against the site table and the
    jar's own callback bytes, then answers a `GameHookRegistrations`: hook name → callbacks, in Mixin apply order
    (priority, then config order, then method order).
-3. **Run.** Where the hook point fires, the host calls
-   `NativeJar::run_game_hook(&registrations, hook, receiver, args, &mut host)`. The callbacks run with a
-   runtime-owned `CallbackInfo`; a cancellable one that calls `cancel()` stops the ones after it and sets
-   `GameHookRun::cancelled`. The target object's marker is the callback receiver, and a callback's static fields
-   are the jar's: they persist to the next firing, exactly as a woven callback's would.
+3. **Run.** Where the hook point fires, the host calls `NativeJar::run_game_hook_in(&registrations, &mut state,
+   &mut context, hook, receiver, args, &mut host, &budget)` (`run_game_hook` is the same with no objects and no
+   kept state). The callbacks run with a runtime-owned `CallbackInfo`; a cancellable one that calls `cancel()`
+   stops the ones after it and sets `GameHookRun::cancelled`. An instance callback receives the target object as
+   `this` (see the object model below), and a callback's static fields are the jar's: they persist to the next
+   firing, exactly as a woven callback's would.
 
-The site table (`GAME_HOOK_SITES`) is deliberately tiny and hand-checked, because running a mod's callback at the
-wrong moment is worse than refusing it. It holds two sites:
+The site table (`GAME_HOOK_SITES`) is small and hand-checked, because running a mod's callback at the wrong moment
+is worse than refusing it. Its 19 rows name 18 hook points, and the game fires every one of them
+(`crates/horizon-client/src/game/java_game_hooks.rs`, called from `native_hooks.rs`):
 
-| Hook point | Target | Position | Contract |
-|---|---|---|---|
-| `player_tick` | `ServerPlayer#tick()V` | `TAIL` (at the end of the tick) | listen, server side |
-| `item_picked_up` | `ItemEntity#playerTouch(Player)V` | `HEAD` (before the stack is taken) | cancel, server side |
+| Hook point | Vanilla target | Position | Contract | What the game hands the callback |
+|---|---|---|---|---|
+| `player_tick` | `ServerPlayer#tick` | `TAIL` | listen | the player |
+| `item_picked_up` | `ItemEntity#playerTouch` | `HEAD` | cancel | a dropped item (no entity id: a new object each firing), the player |
+| `living_death` | `LivingEntity#die` | `HEAD` | cancel | the entity (the player for a player), an opaque `DamageSource` |
+| `player_died` | `ServerPlayer#die` | `HEAD` | listen | the player, an opaque `DamageSource` |
+| `player_clone` | `ServerPlayer#restoreFrom` | `TAIL` | listen | the new player, the old one, `restoreAll` |
+| `player_logged_in` | `PlayerList#placeNewPlayer` | `TAIL` | listen | the joined player as `this` and as the argument, an opaque `Connection` and cookie |
+| `living_jump` | `LivingEntity#jumpFromGround`, `MagmaCube#jumpFromGround` | `TAIL` | listen, both sides | the entity |
+| `level_unload` | `ServerLevel#close` | `TAIL` | listen | the level |
+| `server_stopping` | `MinecraftServer#stopServer` | `HEAD` | listen | the server |
+| `entity_mount` | `Entity#removeVehicle` | `HEAD` | cancel | the rider, for a dismount only |
+| `living_knockback` | `LivingEntity#knockback(DDD DamageSource F Z)` | `HEAD` | cancel, both sides | the entity, the push; the hit's damage and the invert flag read 0 and false |
+| `living_entity_use_item_stop` | `LivingEntity#releaseUsingItem` | `HEAD` | cancel, both sides | the user |
+| `living_entity_use_item_tick` | `LivingEntity#updatingUsingItem` | `HEAD` | cancel, both sides | the user; a cancel is the hook's, which finishes the use |
+| `left_click_block` | `ServerPlayerGameMode#handleBlockBreakAction` | `HEAD` | cancel | the acting player as `this`, opaque position, action and face; `maxBuildHeight` and `sequence` read 0 |
+| `player_container_open` | `ServerPlayer#openHorseInventory` | `TAIL` | listen | the player, an opaque mount and container (a mount's inventory only) |
+| `item_damaged` | `ItemStack#hurtAndBreak(int, LivingEntity, EquipmentSlot)` | `HEAD` | cancel | the stack, the wear after Unbreaking, the player, an opaque slot |
+| `attack_entity` | `Player#attack` | `HEAD` | cancel | the acting player, the target |
+| `player_start_tracking` | `ServerEntity#addPairing` | `TAIL` | listen | the tracked entity as `this`, the watching player |
+
+At a cancellable site a callback's cancel sets the hook's own cancel flag and the native mods' dispatch for that
+point is skipped, as Mixin's cancel at `HEAD` returns before the method body that posts their event. A role whose
+jars bound nothing at a point pays one atomic load there and builds no value. Each firing has a 250 ms budget.
+
+**The object model** (`crates/horizon-native-java/src/game_hooks.rs`). The game describes each object a firing
+passes as a `GameObject` (vanilla class, entity id, UUID, name, dimension, position, health, game mode, stack
+count), and the interpreter sees a stable marker: `game/player/<uuid>.<generation>`, `game/entity/<id>`,
+`game/level/<dimension>`, `game/server/main`. A player is one object from login or respawn to logout: the
+generation moves on at `restoreFrom` and at logout, as a new `ServerPlayer` would be.
+
+- A member on a marker answers from that description when it is modelled: `getId`, `getUUID`, `getStringUUID`,
+  `getX`/`getY`/`getZ`, `isAlive`, `isRemoved`, `getHealth`, `isSpectator`, `isCreative`, `getScoreboardName`,
+  `getName`/`getDisplayName`, `level`/`serverLevel`, `getServer`, `isClientSide`, `isDedicatedServer`, an item
+  entity's `getItem`, a stack's `getCount`/`isEmpty`, `Object`'s `equals`/`hashCode`/`toString`, and
+  `sendSystemMessage`, which the game applies as a chat line after the firing.
+- A Mixin's `@Shadow`, abstract, `@Accessor` and `@Invoker` members (read back from the class bytes, because Mixin
+  keeps those annotations `CLASS`-retained) stand for the game method of that name: they reach the same table. An
+  interface the Mixin adds to its target is implemented on the object by the Mixin's body, and `instanceof` sees
+  the vanilla hierarchy and those interfaces.
+- Fields a Mixin adds live in the jar's `GameHookState`, keyed by the object's marker, and the Mixin's no-argument
+  constructor (where `javac` puts its field initialisers) runs once per object. Guava's no-argument collection
+  factories answer a new empty collection there.
+- Everything else refuses with an error that names it: an unmodelled member, any other `net/minecraft` or
+  `com/mojang` call, a `@Shadow` field read or write, a call the bootstrap host does not model (the kept host
+  copy is strict), and any member of an object the firing does not describe (one kept from an earlier firing).
+
+**Failure.** A callback that throws, runs past its budget, panics or refuses is logged once with the jar and the
+cause, and that jar's callbacks stop firing at that hook; the jar's other hooks, every other jar and the game keep
+running. A stopping server logs one line per jar and hook with how often it fired and whether it was disabled.
 
 **Coverage rule.** A plan maps only when every one of these holds; the first failure is reported with its own
 reason:
@@ -548,24 +596,31 @@ keeps `MixinSkipReason::TargetOutsideJar`, unchanged. The census test
 (`crates/horizon-native-java/tests/fixture_game_hook_tier.rs`) fails if a site's name, version, contract, side or
 cancellation drifts from `native-hooks.json`, so the table cannot quietly disagree with the hook it claims.
 
-The tier is opt-in: the game's loader still calls `plan_load_time_weave`, which refuses every game-class plan as
-before, because Horizon's game has no code yet that fires these registrations. Claiming the plans without a host
-that fires them would label a jar `native` while its callbacks never ran. A host with hook points available uses
-`plan_load_time_weave_with_game_hooks`, registers once per jar at load, and calls `run_game_hook` at each point;
-a compatibility report reads `weave.game_hooks` for what mapped and `weave.skipped` for what did not.
+The tier is opt-in (`HORIZON_JAVA_GAME_HOOKS=1`): by default the game's loader calls `plan_load_time_weave`, which
+refuses every game-class plan as before. With the flag the loader uses `plan_load_time_weave_with_game_hooks`,
+registers once per jar at load (a jar that binds a callback is not cached), and the game fires the points above; a
+compatibility report reads `weave.game_hooks` for what mapped and `weave.skipped` for what did not.
+
+Measured 7 November 2026: across corpus-xl and mega the tier binds 40 server-side plans in 23 jars (15 of them
+`player_logged_in`). A dedicated server with eight of those jars and two `horizon-bots` players (36 s) ran
+appleskin's and syncmatica's `player_logged_in` (2 firings each), shogi's `player_tick` (1,457 firings, its
+`ShogiCooldowns` map kept per player) and servux's `server_stopping` (1). servux's `player_logged_in` refused at
+`Connection#getRemoteAddress` and was disabled; in other runs weaponmaster refused at
+`ServerPlayNetworking.canSend`, CustomPlayerModels at a `@Shadow` field, jamlib at Guava's `Ordering`. The bots
+attacked nothing and nobody died, so the cancellable sites have no real-jar firing yet. A ran callback is not a
+working mod: objects an entrypoint built keep only their static fields after it returns, so servux's
+`server_stopping` iterated its listener list empty.
 
 What the tier does not fix, and does not pretend to:
 
-- Real jars' `@Inject` annotations are `CLASS`-retention, so discovery still sees no plans until the port
-  pipeline surfaces them; the tier classifies plans, it does not make them appear.
 - A hook is only usable when its **population and position** equal the target's. `entity_tick_pre`/`_post` are
   batched per entity family and skip players, projectiles, orbs and TNT, so `Entity#tick` does not map onto them
   even though the names look close; `level_tick_pre` carries no `BooleanSupplier`, so `ServerLevel#tick` cannot
   be mapped either. Those stay `target-outside-jar`.
 - Post hooks cannot override a result, and pre hooks cannot supply arguments the hook payload does not carry.
   Adding a site is a host change (add or extend the hook, then add the table row), never a parser change.
-- Instance callbacks receive the target marker the host names; the host must be able to reconstruct the target
-  object from it. The tier does not build a bridge class, because there is no woven target to bridge into.
+- The object model is what the bound callbacks reach first, not the game's API: a callback that goes further stops
+  at a refusal. The tier does not build a bridge class, because there is no woven target to bridge into.
 
 The fixture `crates/horizon-native-java/tests/fixture_game_hook_tier.rs` compiles a jar with six `@Mixin`
 classes targeting game classes: `player_tick` (TAIL, maps), `item_picked_up` (HEAD, cancellable, maps),
@@ -573,7 +628,12 @@ classes targeting game classes: `player_tick` (TAIL, maps), `item_picked_up` (HE
 `game-hook-mismatch`), a cancellable `player_tick` (listen-only, `game-hook-mismatch`) and a `playerTouch`
 callback that drops the player argument (`game-hook-mismatch`). It then registers the two mapped callbacks,
 fires both points, checks the host saw the callback bodies, checks the cancellation surfaced, and checks a
-callback's static counter survived to the second firing.
+callback's static counter survived to the second firing. A second jar in the same test checks the object model:
+an instance callback casts `this`, reads its UUID and a `@Shadow` id, keeps a Mixin field (with its initialiser)
+per player, reaches an interface the Mixin adds, cancels from its argument's id, and refuses an unmodelled game
+method, a `@Shadow` field and an object that is no longer live. The game-side tests
+(`java_game_hooks.rs`) fire the real knockback hook point: a bound callback cancels the push only for the entity
+and strength it tests, and a failing callback is disabled for its own hook only.
 
 Reproduce:
 
