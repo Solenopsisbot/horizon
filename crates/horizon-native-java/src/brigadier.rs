@@ -325,11 +325,17 @@ pub struct CommandInvocation {
     pub arguments: Vec<(String, CommandArgument)>,
 }
 
-/// Text a command produced: a literal, or a translation key.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Text a command produced: a literal, or a translation key, or a whole
+/// component with style and translation arguments.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommandText {
+    /// The literal, the key, or for a [`Self::component`] its plain text.
     pub text: String,
     pub translate: bool,
+    /// Vanilla's component JSON when the command built more than a bare text
+    /// or key (`facade_text.rs`): colours, decorations, `with` arguments,
+    /// siblings. The game shows this one when it is set.
+    pub component: Option<String>,
 }
 
 impl CommandText {
@@ -337,6 +343,7 @@ impl CommandText {
         Self {
             text: key.to_owned(),
             translate: true,
+            component: None,
         }
     }
 
@@ -346,12 +353,22 @@ impl CommandText {
         if let Some(key) = raw.strip_prefix("component/translatable/") {
             return Self::key(key);
         }
+        if raw.starts_with(crate::facade_text::JSON_PREFIX)
+            && let Some(json) = crate::facade_text::to_json(value)
+        {
+            return Self {
+                text: crate::facade_text::plain(&json),
+                translate: false,
+                component: Some(json.to_string()),
+            };
+        }
         Self {
             text: raw
                 .strip_prefix("component/literal/")
                 .unwrap_or(raw)
                 .to_owned(),
             translate: false,
+            component: None,
         }
     }
 }
@@ -944,29 +961,6 @@ impl StdHost {
             (PERMISSION_LEVEL, "byId") => {
                 let id = int_arg(args, 0)?;
                 return Some(Ok(permission_level_marker(id.clamp(0, 4) as u8)));
-            }
-            // Kotlin's null checks, which a Kotlin mod's command bodies run on
-            // every parameter: a pure check, `NullPointerException` on null.
-            // The lenient entrypoint path answered them neutrally; a strict
-            // command run would refuse them as unmodelled.
-            (
-                "kotlin/jvm/internal/Intrinsics",
-                "checkNotNull"
-                | "checkNotNullParameter"
-                | "checkNotNullExpressionValue"
-                | "checkParameterIsNotNull"
-                | "checkExpressionValueIsNotNull",
-            ) if return_desc(&r.descriptor) == "V" => {
-                return Some(match args.first() {
-                    Some(Value::Ref(None)) | None => Err(NativeError::UncaughtException {
-                        class: "java/lang/NullPointerException".into(),
-                        message: args
-                            .get(1)
-                            .map(|name| format!("{} must not be null", expect_string(name))),
-                        frame: None,
-                    }),
-                    Some(_) => Ok(Value::Void),
-                });
             }
             ("me/lucko/fabric/api/permissions/v0/Permissions", _) => {
                 return self.lucko_permissions(r, args);
@@ -1702,37 +1696,6 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             && (return_desc(&r.descriptor) == "V")
                 == (return_desc(&callback.target.descriptor) == "V")
     }
-
-    /// `String.join(separator, CharSequence...)` and `String.join(separator,
-    /// Iterable)`: command feedback builds its lines with them. The varargs
-    /// array lives in the interpreter, so this runs here rather than in the
-    /// host; a `StringBuilder` element reads its text, `null` reads `null`.
-    pub(crate) fn invoke_string_join(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
-        if r.owner != "java/lang/String" || r.name != "join" {
-            return None;
-        }
-        let text = |runtime: &Self, value: &Value| match value {
-            Value::Ref(Some(marker)) => runtime
-                .string_builders
-                .get(marker)
-                .cloned()
-                .unwrap_or_else(|| crate::value_text(value)),
-            other => crate::value_text(other),
-        };
-        let separator = text(self, args.first()?);
-        let parts: Vec<String> = match r.descriptor.as_str() {
-            "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;" => {
-                let array = expect_ref(args.get(1)?)?;
-                let values = self.arrays.get(array)?.clone();
-                values.iter().map(|value| text(self, value)).collect()
-            }
-            "(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;" => {
-                self.host.mutable_collection_values(args.get(1)?)?
-            }
-            _ => return None,
-        };
-        Some(marker(parts.join(&separator)))
-    }
 }
 
 /// The level-probe source a requirement is classified with: a player, so a
@@ -2029,6 +1992,7 @@ impl NativeJar {
                             .unwrap_or(CommandText {
                                 text: m.to_owned(),
                                 translate: false,
+                                component: None,
                             })
                     },
                 );

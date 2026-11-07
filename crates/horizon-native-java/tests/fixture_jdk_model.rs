@@ -68,6 +68,19 @@ public abstract class ImmutableMap<K, V> implements java.util.Map<K, V> {
 }
 "#;
 
+/// Compiled for `javac` only: a Kotlin mod's bytecode reaches the platform's
+/// `Intrinsics`, which the host models.
+const KOTLIN_INTRINSICS: &str = r#"package kotlin.jvm.internal;
+public class Intrinsics {
+    public static void checkNotNull(Object value) {}
+    public static void checkNotNull(Object value, String message) {}
+    public static void checkNotNullParameter(Object value, String name) {}
+    public static void checkParameterIsNotNull(Object value, String name) {}
+    public static void checkNotNullExpressionValue(Object value, String expression) {}
+    public static void checkExpressionValueIsNotNull(Object value, String expression) {}
+}
+"#;
+
 const PROBE: &str = r##"package demo;
 
 import java.io.IOException;
@@ -397,6 +410,48 @@ public final class Probe {
         return lengths.size() + "|" + lengths.get("bb") + "|" + duplicate;
     }
 
+    static String thrown(Runnable check) {
+        try {
+            check.run();
+            return "ok";
+        } catch (NullPointerException e) {
+            return "NPE:" + e.getMessage();
+        } catch (IllegalArgumentException e) {
+            return "IAE:" + e.getMessage();
+        } catch (IllegalStateException e) {
+            return "ISE:" + e.getMessage();
+        }
+    }
+
+    public static String kotlinNullChecks() {
+        return thrown(() -> kotlin.jvm.internal.Intrinsics.checkNotNull(null)) + "|"
+            + thrown(() -> kotlin.jvm.internal.Intrinsics.checkNotNull(null, "custom")) + "|"
+            + thrown(() -> kotlin.jvm.internal.Intrinsics.checkNotNullParameter(null, "name")) + "|"
+            + thrown(() -> kotlin.jvm.internal.Intrinsics.checkParameterIsNotNull(null, "name")) + "|"
+            + thrown(() -> kotlin.jvm.internal.Intrinsics.checkNotNullExpressionValue(null, "getFoo(...)")) + "|"
+            + thrown(() -> kotlin.jvm.internal.Intrinsics.checkExpressionValueIsNotNull(null, "getFoo(...)")) + "|"
+            + thrown(() -> kotlin.jvm.internal.Intrinsics.checkNotNullParameter("x", "name"));
+    }
+
+    public static String optionalSupplierThrow() {
+        String wanted = "Probe";
+        try {
+            java.util.Optional.empty().orElseThrow(() -> new IllegalArgumentException("none for " + wanted));
+            return "present";
+        } catch (IllegalArgumentException missing) {
+            return "IAE:" + missing.getMessage();
+        }
+    }
+
+    public static String joinIterable() {
+        java.util.List<CharSequence> parts = new ArrayList<>();
+        parts.add("a");
+        parts.add(new StringBuilder("sb"));
+        parts.add(null);
+        parts.add("1,2");
+        return String.join("-", parts);
+    }
+
     public static String classKinds() {
         return Marker.class.isInterface() + "|" + Probe.class.isInterface() + "|"
             + Ranked.class.isInterface();
@@ -461,6 +516,7 @@ impl Fixture {
                 "com/google/common/collect/ImmutableMap.java",
                 GUAVA_IMMUTABLE_MAP,
             ),
+            ("kotlin/jvm/internal/Intrinsics.java", KOTLIN_INTRINSICS),
             ("demo/Probe.java", PROBE),
         ];
         let mut javac = Command::new(javac());
@@ -706,4 +762,34 @@ fn guava_immutable_map_collector_collects_and_rejects_duplicate_keys() {
     // `IllegalStateException`.
     let fixture = Fixture::build("guava-map");
     assert_eq!(fixture.text("guavaMap"), "2|2|duplicate");
+}
+
+#[test]
+fn kotlin_null_checks_throw_what_the_intrinsics_throw() {
+    // `java` with kotlin-stdlib 2.4.21 prints the same, except that a
+    // parameter check also names the calling method ("method
+    // demo.Probe.lambda$..., parameter name"), which a host call cannot see.
+    let fixture = Fixture::build("kotlin-checks");
+    assert_eq!(
+        fixture.text("kotlinNullChecks"),
+        "NPE:null|NPE:custom|NPE:Parameter specified as non-null is null: parameter name|\
+         IAE:Parameter specified as non-null is null: parameter name|\
+         NPE:getFoo(...) must not be null|ISE:getFoo(...) must not be null|ok"
+    );
+}
+
+#[test]
+fn string_join_over_an_iterable_joins_the_element_texts() {
+    // The elements, not the collection's stored item markers; a builder
+    // joins as its text and a null as "null".
+    let fixture = Fixture::build("join-iterable");
+    assert_eq!(fixture.text("joinIterable"), "a-sb-null-1,2");
+}
+
+#[test]
+fn optional_or_else_throw_throws_what_a_jar_supplier_builds() {
+    // WorldEdit's `ArgumentConverters.get` ends in this shape; the supplier
+    // is a capturing jar lambda, not a host callback.
+    let fixture = Fixture::build("or-else-throw");
+    assert_eq!(fixture.text("optionalSupplierThrow"), "IAE:none for Probe");
 }

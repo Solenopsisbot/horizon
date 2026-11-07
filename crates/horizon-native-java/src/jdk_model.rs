@@ -219,8 +219,49 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
                 ""
             })))
         }
+        ("kotlin/jvm/internal/Intrinsics", name, descriptor)
+            if crate::return_desc(descriptor) == "V" =>
+        {
+            kotlin_null_check(name, args)
+        }
         _ => None,
     }
+}
+
+/// Kotlin's null-check intrinsics, which compiled Kotlin runs on every
+/// non-null parameter and platform-typed expression: a pure check that throws
+/// on null, with the exception class and message `kotlin.jvm.internal.Intrinsics`
+/// uses. The two pre-1.4 forms throw `IllegalArgumentException` and
+/// `IllegalStateException`; the current ones throw `NullPointerException`. A
+/// parameter check's JDK message also names the calling method, which a host
+/// call cannot see, so that part is left out.
+fn kotlin_null_check(name: &str, args: &[Value]) -> Option<Result<Value, NativeError>> {
+    let detail = || args.get(1).map(|value| expect_string(value).to_owned());
+    let parameter = || {
+        detail().map(|name| format!("Parameter specified as non-null is null: parameter {name}"))
+    };
+    let (class, message) = match name {
+        "checkNotNull" => ("java/lang/NullPointerException", detail()),
+        "checkNotNullParameter" => ("java/lang/NullPointerException", parameter()),
+        "checkParameterIsNotNull" => ("java/lang/IllegalArgumentException", parameter()),
+        "checkNotNullExpressionValue" => (
+            "java/lang/NullPointerException",
+            detail().map(|expression| format!("{expression} must not be null")),
+        ),
+        "checkExpressionValueIsNotNull" => (
+            "java/lang/IllegalStateException",
+            detail().map(|expression| format!("{expression} must not be null")),
+        ),
+        _ => return None,
+    };
+    Some(match args.first() {
+        Some(Value::Ref(None)) | None => Err(NativeError::UncaughtException {
+            class: class.into(),
+            message,
+            frame: None,
+        }),
+        Some(_) => Ok(Value::Void),
+    })
 }
 
 /// An instance call on a modelled value, or `None` to leave it to the host.
@@ -968,6 +1009,47 @@ fn is_object_marker(marker: &str) -> bool {
 }
 
 impl<H: crate::Host> crate::Runtime<'_, H> {
+    /// `String.join(separator, CharSequence...)` and `String.join(separator,
+    /// Iterable)`: command feedback builds its lines with them. The varargs
+    /// array lives in the interpreter, so this runs here rather than in the
+    /// host; a `StringBuilder` element reads its text, `null` reads `null`.
+    /// An `Iterable`'s elements come back from the host as stored item
+    /// markers, so each is parsed back to its value before it is joined.
+    pub(crate) fn invoke_string_join(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+        if r.owner != "java/lang/String" || r.name != "join" {
+            return None;
+        }
+        let text = |runtime: &Self, value: &Value| match value {
+            Value::Ref(Some(marker)) => runtime
+                .string_builders
+                .get(marker)
+                .cloned()
+                .unwrap_or_else(|| crate::value_text(value)),
+            other => crate::value_text(other),
+        };
+        let separator = text(self, args.first()?);
+        let parts: Vec<String> = match r.descriptor.as_str() {
+            "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;" => {
+                let array = expect_ref(args.get(1)?)?;
+                let values = self.arrays.get(array)?.clone();
+                values.iter().map(|value| text(self, value)).collect()
+            }
+            "(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;" => {
+                let items = self.host.mutable_collection_values(args.get(1)?)?;
+                items
+                    .iter()
+                    .map(|item| {
+                        crate::parse_collection_value(item)
+                            .map(|value| text(self, &value))
+                            .unwrap_or_else(|_| item.clone())
+                    })
+                    .collect()
+            }
+            _ => return None,
+        };
+        Some(Value::Ref(Some(parts.join(&separator))))
+    }
+
     /// The JDK calls the interpreter answers itself, in one dispatch slot:
     /// `CharSequence` on text, `Class` kind queries on jar classes, and list
     /// sorts that need a comparator to run.
