@@ -138,6 +138,20 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   opt-in hook tier.
 - **Payloads.** Declared payload channels, codecs (`minecraft:raw`/`byte_array`, `minecraft:string`,
   `minecraft:empty`, opaque fallback), sender/receiver hosts and dispatch of a received frame to the jar's handler.
+- **Game events** (`src/events.rs`). Each listener a jar registers gets a stable identity: the Fabric `Event` field
+  (22 server-side fields: `ServerLifecycleEvents` start/started/stopping/stopped, `ServerTickEvents` server and
+  level start/end, `ServerLevelEvents` load/unload, `ServerPlayConnectionEvents` and `ServerPlayerEvents`
+  join/leave, `ServerEntityEvents.ENTITY_LOAD`, `ServerLivingEntityEvents` allow/after death, `UseBlock`/`UseItem`/
+  `AttackEntityCallback`, `PlayerBlockBreakEvents` before/after) or the NeoForge/Forge event class (`addListener`
+  lambdas and method references, `register(Object|Class)` and `@EventBusSubscriber` `@SubscribeEvent` methods,
+  Forge EventBus 7's per-event `BUS`). `NativeJar::run_game_listener` runs one with the jar's own statics, under a
+  time budget, against bounded façade markers (server, player list, level, player, join handler, NeoForge event
+  object); a façade call outside that surface refuses the listener by name. Fabric `boolean`/`InteractionResult`
+  callbacks stop at the first deciding answer, NeoForge `setCanceled` skips later listeners without
+  `receiveCanceled`. Priorities are not modelled (registration order). Over the 723-jar corpus, 83 of the 499 jars
+  that bootstrap natively register 257 listeners the game can fire (`server_started` 38 jars, `server_starting`
+  35, `player_join` 34, `server_stopped` 22, `player_leave` 21, `server_stopping` 19, `server_tick_end` 17); the
+  largest unfired families are client ticks and `CommandRegistrationCallback` (44 jars).
 - **Probe.** `horizon-native-java [--json] [--mixin-plans] [--weave <out.jar>] <jar> [kind] [class]` reports
   entrypoints, host calls, registrations, plans and skips, and can write a woven jar.
 
@@ -154,6 +168,17 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   frames above the custom-payload envelope are chunked, direction and codec are validated, and `horizon-ctl`'s
   `payload send` injects a declared frame into a hosted world. Each role (client, integrated server, dedicated)
   has its own handler host and queues.
+- Java event listeners run on servers (`game/java_events.rs`): the batch keeps every jar that registered a listener
+  the game fires, with the host its entrypoints ran on, per role (such a jar is no longer replayed from the content
+  cache). The integrated and dedicated servers fire server starting/started/stopping/stopped, server tick
+  start/end, level tick start/end, player join/leave and a living entity's death (`ALLOW_DEATH`/`LivingDeathEvent`
+  can cancel it, then `AFTER_DEATH`). With no listener, each point costs one atomic load. A listener that fails is
+  disabled and logged once with the cause; a server stop logs kept/disabled/run/refused counts. Use, attack, block
+  break, entity load and level load/unload are identified but not fired yet. Measured on `--dedicated` (fast
+  profile, flat world, no players): Cupboard alone ran its `SERVER_STARTED` and `END_SERVER_TICK` listeners 557 times
+  in 28 s with no refusal; the 48 corpus jars with server listeners kept 138 listeners from 42 jars, of which 105
+  were still enabled at stop after 13,865 runs in 45 s. Join, leave and death were covered by tests only, not by a
+  run with a connected player. `java-runtime.json` does not carry listener counts yet (only the stop log line).
 - An opt-in NeoForge loader preflight: when `HORIZON_NEOFORGE_SERVER` (an installed server) and `HORIZON_JVM_BIN` are
   set, the integrated server runs `horizon-jvm --real-loader --entry-kind neoforge` once before its native batch in a
   bounded child process and reports what FancyModLoader saw (completion, mod count, sorted ids, first error).
@@ -700,11 +725,16 @@ than rows; the cache held 86 entries in 436 KiB.
 3. **Nested and non-server entrypoints.** Nested JiJ/JarJar jars are probed but never bootstrapped in-game (`preLaunch`
    is not run either); two mega jars now fail the interpreter's 128-nested-jar-frame bound. The Kotlin entrypoint
    adapter runs, but an adapter the runtime still does not model is refused.
-4. **Callbacks.** Only entrypoints and received-payload handlers execute. Event listeners (`ServerTickEvent`,
-   Fabric lifecycle/tick events, client tick/render events) are recorded by the host but the game never dispatches
-   them; there is also no compiled HUD, key-binding, tooltip, screen, renderer or model façade in this branch. The
-   former façade and census sources were deleted; they are recoverable from commit `be8567b9a`, so client jars
-   register content but do not draw.
+4. **Callbacks.** Entrypoints, received-payload handlers and server-side event listeners execute. Servers fire
+   lifecycle, server/level tick, player join/leave and living-death listeners (Fabric, NeoForge, Forge EventBus 7),
+   but the façade a listener sees is small: on a dedicated run of 48 corpus jars with server listeners, 42 jars
+   kept 138 listeners and 33 were refused at their first unmodelled call, mostly `MinecraftServer#getWorldPath`
+   (6), `registryAccess` (6 with the level's), `getResourceManager` (2), and interpreter collection/stream markers.
+   Use-block/item, attack, block-break, entity-load and level load/unload listeners are identified but not fired;
+   command registration (`CommandRegistrationCallback`, 44 jars) and every client event (client tick 57 jars,
+   screens, rendering) have no dispatch. Priorities are registration order. There is also no compiled HUD,
+   key-binding, tooltip, screen, renderer or model façade in this branch. The former façade and census sources were
+   deleted; they are recoverable from commit `be8567b9a`, so client jars register content but do not draw.
 5. **Content consumption.** Blocks, items, effects, entities and menus reach the content model. Block entities,
    recipes and ingredients are recorded and warned as not expressible; data components and attachments have a
    manifest section but no declaration table; a guest stores the login manifest, but local command and content
@@ -738,17 +768,21 @@ than rows; the cache held 86 entries in 436 KiB.
    of in-scope server jars below 5% (currently 22%/26%).
 4. **Finish content.** Block entities, recipes and ingredients in the content model; data-component and attachment
    declaration tables; guests consume the applied manifest in command/content lookups; then mod hot reload.
-5. **Client surface.** Compile the façade client families (HUD, keys, tooltips, screens, renderers, models) into the
+5. **Event surface.** Grow the listener façade by the refusals the dedicated pack run logs (world path, registry
+   access, resource manager, game rules, `execute`), fire the identified use/attack/break/entity/level-load events
+   from their game points, and dispatch `CommandRegistrationCallback`. Gate: no façade refusal among the ten most
+   common listener causes on the corpus pack run.
+6. **Client surface.** Compile the façade client families (HUD, keys, tooltips, screens, renderers, models) into the
    runtime and drive them from the game; measure with rendering on and a curated pack, not offscreen.
-6. **NeoForge path.** Finish the FML path: give the dedicated role the integrated server's opt-in preflight, then
+7. **NeoForge path.** Finish the FML path: give the dedicated role the integrated server's opt-in preflight, then
    in-process loader selection, with remap readiness checked against a real NeoForge 26.3 server.
-7. **Diagnostics.** Done: weave counts, first skip reason, the per-plan list, refused rows with their whole cause in
+8. **Diagnostics.** Done: weave counts, first skip reason, the per-plan list, refused rows with their whole cause in
    `server-status` and `java-runtime.json`, and the launcher's per-mod row with a runtime-cache clear. Next: name a
    refused jar's loader from its metadata, and show runtime rows for jars the launcher did not install.
-8. **Keep the corpus honest.** Refresh `tools/real_mod_fixtures/LAST_SERVER_LEDGER_{223,500}.txt` per release, fail
+9. **Keep the corpus honest.** Refresh `tools/real_mod_fixtures/LAST_SERVER_LEDGER_{223,500}.txt` per release, fail
    a run when `ran` regresses or a refused row loses its cause, and extend the fixture workflow (it deliberately never
    downloads third-party jars).
-9. **Performance.** Rerun the efficiency suite with a curated pack and steady-state heap, and a playable client
+10. **Performance.** Rerun the efficiency suite with a curated pack and steady-state heap, and a playable client
    session with mods that actually draw.
 
 ## How to reproduce

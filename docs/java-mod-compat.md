@@ -296,6 +296,28 @@ The native event path has a source-built Fabric fixture in
 API, executes a real `invokedynamic` listener registration, and dispatches the recorded listener through
 `StdHost::dispatch_event`; this keeps event registration and callback routing covered with real classfiles.
 
+Game events have their own identity and runner (`crates/horizon-native-java/src/events.rs`). The host answers
+a Fabric API `Event` field read with `fabric-event/<owner>.<FIELD>` and a Forge event's `BUS` with
+`forge-bus/<event class>`, so `StdHost::game_listeners(&jar, server)` can name the event of every registration:
+a Fabric `register` (lambda, method reference, or an object of a jar class implementing the callback interface,
+whose method comes from the field table), a NeoForge/Forge `addListener` (the event class is the `Class` argument
+or the target's last parameter), `register(Object|Class)` and `@EventBusSubscriber` `@SubscribeEvent` methods
+(`Dist.CLIENT` subscribers are dropped on a server). Registrations on events the game does not fire are counted
+by source in `unsupported`; the probe prints both under `game_listeners`. `NativeJar::run_game_listener` runs one
+listener for an `EventFiring` (the event, an `EventFacade` snapshot of tick count, players and levels, and an
+`EventContext` naming the level, player, entity and damage): against the host's persistent class state, under
+an `ExecutionBudget`, with the host's call log rolled back afterwards. A `handler::accept` method reference on a
+captured lambda runs that lambda. The façade markers (`game/server`, `game/player-list`, `game/level/<id>`,
+`game/player/<uuid>`, `game/connection/<uuid>`, `game-event/<event>`) answer the calls listeners make first
+(`getTickCount`, `getPlayerList().getPlayers()`, `level.dimension() == Level.OVERWORLD`, `player.getUUID()`,
+`handler.player`, `event.getServer()`, `setCanceled`); any other instance call on one is
+`NativeError::UnknownHostCall`, which the game turns into "disable this listener, log once". The fixture
+`tests/fixture_game_events.rs` compiles a Fabric jar (lambda, object and `handler::accept` listeners,
+`ALLOW_DEATH`, an unmodelled call) and a NeoForge jar (`this::onTick`, two `LivingDeathEvent` listeners, an
+`@EventBusSubscriber`) and checks each listener runs once per firing with the right argument, cancellation, and
+the refusal. In the game, `game/java_events.rs` keeps the listening jars per role and the server's points fire
+them (see the status page's `horizon-client` list).
+
 The legacy Forge event path has a source-built fixture in
 `crates/horizon-native-java/tests/fixture_legacy_forge_event.rs`. It compiles a tiny `@Mod` and
 `IEventBus`, executes `getModEventBus().addListener` with an `invokedynamic` callback, and validates
