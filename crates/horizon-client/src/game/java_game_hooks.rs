@@ -2174,6 +2174,34 @@ public class JumpMixin {
     private void jumped(CallbackInfo ci) {}
 }
 "#;
+    /// Asks a Fabric event the jar made: the host has no array-backed invoker
+    /// to run, so the firing must fail rather than read a made-up `false`.
+    const EVENT_MIXIN: &str = r#"package demo;
+import net.fabricmc.fabric.api.event.Event;
+import net.fabricmc.fabric.api.event.EventFactory;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+@Mixin(net.minecraft.world.level.ServerExplosion.class)
+public class EventMixin {
+    public interface Check { boolean ok(int value); }
+    static final Event<Check> CHECK = EventFactory.createArrayBacked(Check.class, checks -> value -> {
+        for (Check check : checks) {
+            if (!check.ok(value)) {
+                return false;
+            }
+        }
+        return true;
+    });
+    @Inject(method = "explode", at = @At("HEAD"))
+    private void ask(CallbackInfoReturnable<Integer> cir) {
+        if (!CHECK.invoker().ok(1)) {
+            throw new IllegalStateException("vetoed");
+        }
+    }
+}
+"#;
     const DESTROY_MIXIN: &str = r#"package demo;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
@@ -2227,6 +2255,7 @@ public class DestroyMixin {
             "net.minecraft.world.damagesource.DamageSource",
             "net.minecraft.world.entity.LivingEntity",
             "net.minecraft.world.entity.monster.cubemob.MagmaCube",
+            "net.minecraft.world.level.ServerExplosion",
             "net.minecraft.world.item.ItemStack",
             "net.minecraft.world.level.block.Block",
             "net.minecraft.world.level.block.entity.BlockEntity",
@@ -2252,6 +2281,15 @@ public class DestroyMixin {
             ("demo/BootMixin.java", BOOT_MIXIN),
             ("demo/DestroyMixin.java", DESTROY_MIXIN),
             ("demo/JumpMixin.java", JUMP_MIXIN),
+            ("demo/EventMixin.java", EVENT_MIXIN),
+            (
+                "net/fabricmc/fabric/api/event/Event.java",
+                "package net.fabricmc.fabric.api.event;\npublic abstract class Event<T> { public T invoker() { return null; } }\n",
+            ),
+            (
+                "net/fabricmc/fabric/api/event/EventFactory.java",
+                "package net.fabricmc.fabric.api.event;\npublic final class EventFactory { public static <T> Event<T> createArrayBacked(Class<? super T> type, java.util.function.Function<T[], T> invoker) { return null; } }\n",
+            ),
         ] {
             sources.push((path.to_owned(), body.to_owned()));
         }
@@ -2274,7 +2312,7 @@ public class DestroyMixin {
         let options = zip::write::SimpleFileOptions::default();
         let metadata =
             r#"{"id":"server_sites","version":"1","entrypoints":{},"mixins":["demo.mixins.json"]}"#;
-        let config = r#"{"package":"demo","mixins":["HurtMixin","LevelMixin","BootMixin","DestroyMixin","JumpMixin"]}"#;
+        let config = r#"{"package":"demo","mixins":["HurtMixin","LevelMixin","BootMixin","DestroyMixin","JumpMixin","EventMixin"]}"#;
         for (name, body) in [("fabric.mod.json", metadata), ("demo.mixins.json", config)] {
             zip.start_file(name, options).ok()?;
             zip.write_all(body.as_bytes()).ok()?;
@@ -2285,6 +2323,8 @@ public class DestroyMixin {
             "BootMixin",
             "DestroyMixin",
             "JumpMixin",
+            "EventMixin",
+            "EventMixin$Check",
         ] {
             let name = format!("demo/{name}.class");
             zip.start_file(&name, options).ok()?;
@@ -2312,6 +2352,7 @@ public class DestroyMixin {
             [
                 "java_block_player_destroy",
                 "java_bootstrap_head",
+                "java_explosion_explode",
                 "java_level_tick_head",
                 "java_living_hurt",
                 "living_jump",
@@ -2393,6 +2434,22 @@ public class DestroyMixin {
         };
         assert!(destroy(false));
         assert!(!destroy(true));
+
+        // A Fabric event's invoker is not run, so the callback fails instead
+        // of reading a made-up `false` (its jar's invoker answers true).
+        let mut context = GameHookContext::new();
+        let explosion = context.insert(GameObject::opaque(
+            "net/minecraft/world/level/ServerExplosion",
+            "blast",
+        ));
+        let blast = run_java_game_hook(
+            role,
+            "java_explosion_explode",
+            &mut context,
+            Some(explosion),
+            &[],
+        );
+        assert_eq!((blast.ran, blast.failed), (0, 1));
 
         let summary = java_game_hook_summary(role);
         for line in [

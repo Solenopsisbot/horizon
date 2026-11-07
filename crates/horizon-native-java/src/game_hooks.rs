@@ -1020,6 +1020,12 @@ impl<H: Host> GameHookHost<'_, H> {
     }
 }
 
+/// Whether `marker` is what `Event.invoker()` answers for a Fabric event the
+/// host made (`fabric-event/<n>/invoker`, `lib.rs`).
+fn is_fabric_event_invoker(marker: &str) -> bool {
+    marker.starts_with("fabric-event/") && marker.ends_with("/invoker")
+}
+
 impl<H: Host> Host for GameHookHost<'_, H> {
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         // An instance-field read the callbacks never wrote reaches the host
@@ -1087,6 +1093,16 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         // flag) lives on the jar's bootstrap host, across firings.
         if facade_saved_data::owns_call(r, expect_ref(receiver).map(String::as_str)) {
             return self.inner.invoke_instance(r, receiver, args);
+        }
+        // A Fabric `Event`'s invoker is a host marker, not the jar's own
+        // array-backed invoker over its listeners, so any answer here would be
+        // made up (an `Allow` invoker answering `false` cancels what vanilla
+        // keeps). The firing fails instead.
+        if expect_ref(receiver).is_some_and(|marker| is_fabric_event_invoker(marker)) {
+            return Err(NativeError::Metadata(format!(
+                "game hook callback calls {}#{}{} on a Fabric event's invoker, which the hook tier does not run",
+                r.owner, r.name, r.descriptor
+            )));
         }
         if let Some(text) = expect_ref(receiver).cloned()
             && let Some(answer) = self.answer_value(&text, r, args)

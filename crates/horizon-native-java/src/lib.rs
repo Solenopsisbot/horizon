@@ -22759,6 +22759,22 @@ impl<H: Host> Runtime<'_, H> {
             {
                 return Ok(value);
             }
+            // A Fabric event's invoker is a host marker standing for the
+            // jar's array-backed invoker, which the host does not run: the
+            // host answers the call (a lenient host as before, a strict one,
+            // a game-hook firing, by refusing it), never a made-up default
+            // that an `Allow` callback would read as "cancel".
+            if let Some(receiver @ Value::Ref(Some(marker))) = receiver.as_ref()
+                && marker.starts_with("fabric-event/")
+                && marker.ends_with("/invoker")
+            {
+                let r = MethodRef {
+                    owner: class.to_owned(),
+                    name: method.to_owned(),
+                    descriptor: desc.to_owned(),
+                };
+                return self.host.invoke_instance(&r, receiver, args);
+            }
             return Ok(Value::default_for(return_desc(desc)));
         };
         let mut locals = vec![Value::Ref(None); target.max_locals.max(1) as usize];
