@@ -9,7 +9,7 @@ pub use crate::settings::Opt;
 use crate::{
     gamepad::{self, GlyphStyle},
     hud::{HudAtlas, HudBatch, rgba},
-    keybinds::{self, CATEGORIES, KeyBinds, MAPPINGS},
+    keybinds::{self, CATEGORIES, KeyBinds},
     lang::{self, LanguageInfo},
     settings::{SOUND_SOURCES, Settings},
     text::{self, Style, Text},
@@ -3338,16 +3338,25 @@ impl OptionsUi {
                     list: false,
                     row: 0,
                 });
-                let mut mappings: Vec<(&str, &str)> =
-                    MAPPINGS.iter().map(|(n, _, c)| (*n, *c)).collect();
+                // Vanilla's mappings, then the Java mods' (`mod_mappings`).
+                let mut mappings: Vec<(&str, &str)> = crate::mod_mappings::all()
+                    .iter()
+                    .map(|(n, _, c)| (*n, *c))
+                    .collect();
                 let query = self.settings_search.value.to_lowercase();
                 mappings.retain(|(name, _)| {
-                    query.is_empty() || lang::get(name).to_lowercase().contains(&query)
+                    query.is_empty()
+                        || crate::mod_mappings::label(name)
+                            .plain()
+                            .to_lowercase()
+                            .contains(&query)
                 });
                 mappings.sort_by(|a, b| {
                     let ca = CATEGORIES.iter().position(|c| *c == a.1).unwrap_or(99);
                     let cb = CATEGORIES.iter().position(|c| *c == b.1).unwrap_or(99);
+                    // Mod categories (all past vanilla's) stay together.
                     ca.cmp(&cb)
+                        .then_with(|| a.1.cmp(b.1))
                         .then_with(|| lang::get(a.0).cmp(&lang::get(b.0)))
                 });
                 let row_left = cx - 170.0;
@@ -3376,12 +3385,11 @@ impl OptionsUi {
                         last_category = category;
                         rows.begin(&out, y);
                         let label =
-                            Text::translate(&format!("key.category.minecraft.{category}"), &[])
-                                .with_style(&Style {
-                                    bold: Some(true),
-                                    underlined: Some(true),
-                                    ..Style::default()
-                                });
+                            crate::mod_mappings::category_label(category).with_style(&Style {
+                                bold: Some(true),
+                                underlined: Some(true),
+                                ..Style::default()
+                            });
                         out.push(Widget {
                             x: 0.0,
                             y: y + 7.0,
@@ -3405,7 +3413,7 @@ impl OptionsUi {
                         w: 200.0,
                         h: 9.0,
                         kind: WKind::Text {
-                            text: tr(name),
+                            text: crate::mod_mappings::label(name),
                             color: u32::MAX,
                             centered: false,
                         },
@@ -3433,7 +3441,10 @@ impl OptionsUi {
                     }
                     let reset_x = scrollbar_x - 50.0 - 10.0;
                     let change_x = reset_x - 5.0 - 75.0;
-                    let name_static = MAPPINGS.iter().find(|m| m.0 == name).map_or("", |m| m.0);
+                    let name_static = crate::mod_mappings::all()
+                        .iter()
+                        .find(|m| m.0 == name)
+                        .map_or("", |m| m.0);
                     out.push(button(change_x, y, 75.0, message, Act::Key(name_static)));
                     if !conflicts.is_empty() {
                         out.push(Widget {

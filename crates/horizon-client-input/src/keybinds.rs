@@ -335,16 +335,20 @@ fn distinct<T: PartialEq>(keys: Vec<T>) -> Vec<T> {
 }
 
 impl KeyBinds {
+    /// The key of mapping `name`; a mod mapping the player never rebound has
+    /// its default (`crate::mod_mappings`).
     pub fn get(&self, name: &str) -> &str {
         self.keys
             .get(name)
-            .map_or("key.keyboard.unknown", String::as_str)
+            .map_or_else(|| Self::default_of(name), String::as_str)
     }
     pub fn default_of(name: &str) -> &'static str {
         MAPPINGS
             .iter()
             .find(|m| m.0 == name)
-            .map_or("key.keyboard.unknown", |m| m.1)
+            .map(|m| m.1)
+            .or_else(|| crate::mod_mappings::find(name).map(|m| m.1))
+            .unwrap_or("key.keyboard.unknown")
     }
     pub fn is_default(&self, name: &str) -> bool {
         self.get(name) == Self::default_of(name)
@@ -352,16 +356,32 @@ impl KeyBinds {
     pub fn set(&mut self, name: &str, key: &str) {
         if let Some((n, _, _)) = MAPPINGS.iter().find(|m| m.0 == name) {
             self.keys.insert(n, key.to_owned());
+        } else if let Some((n, _, _)) = crate::mod_mappings::find(name) {
+            self.keys.insert(n, key.to_owned());
         }
     }
+    /// The keys `options.txt` gets: every vanilla mapping's, and each mod
+    /// mapping's the player's settings hold. A mod mapping registered after
+    /// the file was read keeps the file's line until the game copies it in,
+    /// so a save in between cannot replace the player's key with the default.
     pub fn saved(&self) -> Vec<(&'static str, String)> {
-        MAPPINGS
+        let mut saved: Vec<(&'static str, String)> = MAPPINGS
             .iter()
             .map(|(n, _, _)| (*n, self.get(n).to_owned()))
-            .collect()
+            .collect();
+        for (n, _, _) in crate::mod_mappings::registered() {
+            if let Some(key) = self.keys.get(n) {
+                saved.push((n, key.clone()));
+            }
+        }
+        saved
     }
     pub fn reset_all(&mut self) {
         *self = Self::default();
+        // Reset is a choice: the mods' mappings are saved at their defaults.
+        for (n, default, _) in crate::mod_mappings::registered() {
+            self.keys.insert(n, default.to_owned());
+        }
     }
     /// Mappings sharing `name`'s key (KeyMapping.same), for conflict marks.
     pub fn conflicts(&self, name: &str) -> Vec<&'static str> {
@@ -369,7 +389,7 @@ impl KeyBinds {
         if key == "key.keyboard.unknown" {
             return Vec::new();
         }
-        MAPPINGS
+        crate::mod_mappings::all()
             .iter()
             .filter(|(n, _, _)| {
                 *n != name && self.get(n) == key && (!self.is_default(n) || !self.is_default(name))

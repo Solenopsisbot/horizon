@@ -417,8 +417,12 @@ impl Settings {
     /// Typed view of an options file.
     pub fn from_file(f: OptionsFile) -> Self {
         let mut keys = KeyBinds::default();
-        for (name, _, _) in crate::keybinds::MAPPINGS {
-            keys.set(name, &f.key_binding(name));
+        // A Java mod's mappings too, once registered (`mod_mappings`).
+        for (name, _, _) in crate::mod_mappings::all() {
+            let key = f.key_binding(name);
+            if !key.is_empty() {
+                keys.set(name, &key);
+            }
         }
         let mut volumes = [1.0; 11];
         for (i, source) in SOUND_SOURCES.iter().enumerate() {

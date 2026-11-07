@@ -1237,6 +1237,7 @@ impl Game<'_> {
         }
         if self.remote.is_some() {
             self.native_client_disconnecting();
+            self.java_client_disconnected();
         }
         if let Some(mut r) = self.remote.take() {
             r.session.disconnect();
@@ -6053,7 +6054,10 @@ impl Game<'_> {
 
     /// One client tick while connected (Minecraft.tick with a ClientLevel).
     pub(super) fn tick_remote(&mut self) -> Result<()> {
+        // Java client mods' `START_LEVEL_TICK` / `END_LEVEL_TICK` (`java_client`).
+        self.java_client_level_tick(true);
         self.tick_remote_level()?;
+        self.java_client_level_tick(false);
         // The rockets boosting this player tick after it, also while it waits
         // for chunks.
         self.tick_own_rockets();

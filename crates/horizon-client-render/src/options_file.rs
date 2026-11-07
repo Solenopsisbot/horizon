@@ -489,6 +489,11 @@ pub struct OptionsFile {
     values: Vec<V>,
     /// `fullscreenResolution`, kept verbatim.
     pub fullscreen_resolution: Option<String>,
+    /// `key_<name>` lines of mappings vanilla does not have (a Java mod's),
+    /// by mapping name. They are read before the mod registers its mapping,
+    /// so every one is kept and written back, beside the registered
+    /// mappings' (`Self::serialize`).
+    mod_keys: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for OptionsFile {
@@ -496,6 +501,7 @@ impl Default for OptionsFile {
         Self {
             values: TABLE.iter().map(|d| d.default.clone()).collect(),
             fullscreen_resolution: None,
+            mod_keys: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -525,6 +531,11 @@ impl OptionsFile {
     pub fn string(&self, key: &str) -> String {
         match self.get(key) {
             Some(V::Str(s)) => s.clone(),
+            None => key
+                .strip_prefix("key_")
+                .and_then(|name| self.mod_keys.get(name))
+                .cloned()
+                .unwrap_or_default(),
             _ => String::new(),
         }
     }
@@ -552,7 +563,15 @@ impl OptionsFile {
     /// `OptionInstance.set` with a candidate value (invalid values revert to
     /// the initial value).
     pub fn set(&mut self, key: &str, value: V) {
-        let Some(i) = Self::index(key) else { return };
+        let Some(i) = Self::index(key) else {
+            // A mod mapping's key (`key_key.examplemod.zoom`).
+            if let (Some(name), V::Str(text)) = (key.strip_prefix("key_"), value)
+                && crate::mod_mappings::find(name).is_some()
+            {
+                self.mod_keys.insert(name.to_owned(), text);
+            }
+            return;
+        };
         let Kind::Option(spec) = TABLE[i].kind else {
             self.values[i] = value;
             return;
@@ -603,6 +622,14 @@ impl OptionsFile {
         // A fixer failure abandons the whole file, leaving the defaults.
         if crate::options_fixes::update(&mut raw, version).is_ok() {
             file.apply(&raw);
+            // At most `mod_mappings::MAX` of them, as the registry holds.
+            let mod_keys = raw.iter().filter_map(|(k, v)| {
+                let name = k.strip_prefix("key_")?;
+                Self::index(k)
+                    .is_none()
+                    .then(|| (name.to_owned(), v.clone()))
+            });
+            file.mod_keys = mod_keys.take(crate::mod_mappings::MAX).collect();
         }
         file
     }
@@ -686,6 +713,20 @@ impl OptionsFile {
             out.push(':');
             out.push_str(&rendered);
             out.push('\n');
+        }
+        // Options.save writes every mapping it has: a registered mod mapping's
+        // line is its kept key, else its default. A line of a mapping not
+        // registered (yet) is kept as read: the Java batch registers after the
+        // game may first save, and dropping it there would lose the player's key.
+        let registered = crate::mod_mappings::registered();
+        for (name, default, _) in &registered {
+            let key = self.mod_keys.get(*name).map_or(*default, String::as_str);
+            out.push_str(&format!("key_{name}:{key}\n"));
+        }
+        for (name, key) in &self.mod_keys {
+            if !registered.iter().any(|row| row.0 == name) {
+                out.push_str(&format!("key_{name}:{key}\n"));
+            }
         }
         if let Some(r) = &self.fullscreen_resolution {
             out.push_str("fullscreenResolution:");

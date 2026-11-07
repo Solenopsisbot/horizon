@@ -143,6 +143,7 @@ pub use horizon_client_input::input;
 pub use horizon_client_input::interaction_input;
 pub use horizon_client_input::key_names;
 pub use horizon_client_input::keybinds;
+pub use horizon_client_input::mod_mappings;
 pub use horizon_client_input::keymapping;
 pub use horizon_client_input::mouse;
 pub use horizon_client_input::window;

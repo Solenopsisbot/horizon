@@ -653,6 +653,8 @@ fn run_one_on(
         && cacheable(&run)
         // Event listeners live in the bootstrapped host too.
         && !super::java_events::has_listeners(run.jar.as_ref(), run.host.as_ref(), role)
+        // So do a client's listeners, key mappings and HUD elements.
+        && !super::java_client::has_surface(run.jar.as_ref(), run.host.as_ref(), role)
     {
         let typed: Vec<horizon_native_java::RegistryEntry> =
             run.host.as_ref().map_or_else(Vec::new, |host| {
@@ -681,8 +683,8 @@ fn run_one_on(
 /// names a sibling library start; it must not change how a jar that already
 /// runs resolves its own symbols. Keeping the alone run preserves every
 /// pre-linking success while a jar that needs a sibling library still gets
-/// one. When both attempts fail, the alone diagnostic is reported: it names
-/// the jar's own refusal instead of a linked shadow of it.
+/// one. When both attempts fail, see [`pack_refusal`] for which cause is
+/// reported.
 fn bootstrap_jar_with_pack(
     path: &Path,
     role: ExecutionRole,
@@ -694,8 +696,31 @@ fn bootstrap_jar_with_pack(
     let alone = Arc::new(LinkedClassTable::default());
     match bootstrap_jar(path, role, &alone, game_hooks) {
         Ok(run) => Ok(run),
-        Err(alone) => bootstrap_jar(path, role, table, game_hooks).or(Err(alone)),
+        Err(alone) => bootstrap_jar(path, role, table, game_hooks)
+            .map_err(|linked| pack_refusal(path, &alone, &linked)),
     }
+}
+
+/// The one cause a jar refused both alone and with the pack's class path
+/// reports, in the log and in `java-runtime.json`.
+///
+/// The linked attempt resolves the jar's own classes exactly as the alone one
+/// does (host first, then the jar), and only adds the siblings' classes the
+/// jar could not find alone, so it runs the same code until the first symbol
+/// alone lacked. When the two causes differ, the linked one is therefore the
+/// blocker the pack actually hits: reporting the alone cause (as the batch did
+/// before) named a missing sibling library while the jar, given it, had got
+/// further and failed on something else. Both are kept, the linked cause
+/// first and each labelled, so a bounded log line still shows the real
+/// blocker. Identical causes are reported once, unlabelled.
+fn pack_refusal(path: &Path, alone: &str, linked: &str) -> String {
+    if alone == linked {
+        return alone.to_owned();
+    }
+    let prefix = format!("{}: ", path.display());
+    let alone = alone.strip_prefix(&prefix).unwrap_or(alone);
+    let linked = linked.strip_prefix(&prefix).unwrap_or(linked);
+    format!("{prefix}with the pack class path: {linked}; alone: {alone}")
 }
 
 /// Reads, weaves and runs one jar against the pack's class path.
@@ -1339,6 +1364,12 @@ fn adopt_run(
         // The event store keeps the jars whose listeners the game fires.
         let jar = Arc::new(jar);
         super::java_events::adopt_resident(role, &report.jar, &jar, &host);
+        // The command store keeps the jars that register commands, on the
+        // same resident host.
+        super::java_commands::adopt(role, &report.jar, &jar, &host);
+        // The window keeps the client listeners, key mappings and HUD
+        // elements it drives (`java_client`), on the same resident host.
+        super::java_client::adopt(role, &report.jar, &jar, &host);
         if let Some(registrations) = game_hooks {
             publish_java_game_hooks_resident(id, &report.jar, jar, registrations, &host);
         }
@@ -1363,6 +1394,10 @@ where
     super::java_payloads::clear_handler_jars_as(handler_role(role));
     clear_java_game_hooks_as(handler_role(role));
     super::java_events::clear_as(handler_role(role));
+    if role.is_client() {
+        super::java_client::clear();
+    }
+    super::java_commands::clear_as(handler_role(role));
     let cache_before = java_cache::stats();
     let mut batch = JavaBatchOutcome::default();
     // The shared adoption step is serial, in path order: `adopt_host` mutates
@@ -2262,6 +2297,76 @@ mod tests {
         assert_eq!(run.report.entrypoints, 1);
         assert_eq!(run.report.engine, JavaEngine::Native);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The library's method fails on its own: given the library, the mod gets
+    /// past the missing-symbol check and stops one call deeper.
+    const DEEPER_LIBRARY: &[(&str, &str)] = &[(
+        "lib/Config.java",
+        "package lib;\n\
+         public final class Config {\n\
+             public static String name = \"linked\";\n\
+             public static int number() { throw new UnsupportedOperationException(\"deeper\"); }\n\
+         }\n",
+    )];
+
+    const DEEPER_MOD: &[(&str, &str)] = &[(
+        "demo/Entry.java",
+        "package demo;\n\
+         import lib.Config;\n\
+         public class Entry {\n\
+             public static void onInitialize() {\n\
+                 if (Config.name == null) { throw new IllegalStateException(\"no library\"); }\n\
+                 Config.number();\n\
+             }\n\
+         }\n",
+    )];
+
+    /// A jar refused both alone and linked reports the linked cause first: the
+    /// pack got further, and the alone cause (the missing library) would hide
+    /// the blocker the pack really hits. The alone cause stays, labelled.
+    #[test]
+    fn a_jar_refused_both_ways_reports_the_linked_cause_first() {
+        let root = scratch_root("pack-deeper");
+        let Some(library) = compile_java_classes(&root, "lib", DEEPER_LIBRARY, &[]) else {
+            return;
+        };
+        let Some(app) = compile_java_classes(&root, "app", DEEPER_MOD, &[&library]) else {
+            return;
+        };
+        let library_jar = root.join("lib.jar");
+        write_jar(&library_jar, &class_entries(&library));
+        let app_jar = root.join("app.jar");
+        let mut entries = class_entries(&app);
+        entries.push(("fabric.mod.json".to_owned(), fabric_metadata("deeper_app")));
+        write_jar(&app_jar, &entries);
+
+        let table = pack_class_table(&[library_jar, app_jar.clone()]);
+        let error = match bootstrap_jar_with_pack(
+            &app_jar,
+            ExecutionRole::DedicatedServer,
+            &table,
+            false,
+        ) {
+            Ok(_) => panic!("the library's method throws, so the jar must be refused"),
+            Err(error) => error,
+        };
+        let reason = jar_failure(&app_jar, error).reason;
+        let (linked, alone) = reason
+            .strip_prefix("with the pack class path: ")
+            .and_then(|rest| rest.split_once("; alone: "))
+            .unwrap_or_else(|| panic!("both causes, labelled, linked first: {reason}"));
+        assert!(linked.contains("UnsupportedOperationException"), "{reason}");
+        assert!(alone.contains("IllegalStateException"), "{reason}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Two identical causes are one cause: nothing is labelled or repeated.
+    #[test]
+    fn identical_refusals_are_reported_once() {
+        let path = Path::new("/mods/same.jar");
+        let cause = "/mods/same.jar: no native entrypoint";
+        assert_eq!(pack_refusal(path, cause, cause), cause);
     }
 
     /// The measured question this wiring asks: of a real corpus, how many jars
