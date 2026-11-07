@@ -113,6 +113,9 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
     if let Some(collector) = to_map_collector(r, args) {
         return Some(Ok(collector));
     }
+    if let Some(comparator) = crate::jdk_stream::comparator_static(r, args) {
+        return Some(Ok(comparator));
+    }
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         // The wrappers' static reducers, which streams reach as method
         // references (`Integer::sum` as a `toMap` merge or `reduce` operator).
@@ -198,6 +201,9 @@ pub(crate) fn instance_call(
     receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
+    if let Some(comparator) = crate::jdk_stream::comparator_instance(r, receiver, args) {
+        return Some(Ok(comparator));
+    }
     if r.owner == "java/nio/file/Path" && r.name == "resolveSibling" {
         return resolve_sibling(r, receiver, args).map(Ok);
     }
@@ -577,6 +583,61 @@ pub(crate) fn unbox_for_descriptor(descriptor: &str, args: &mut [Value]) {
     }
 }
 
+/// A parsed class's `access_flags`, read back from its bytes (the parser
+/// keeps the raw class file and skips the field for every other use).
+fn class_access_flags(file: &crate::ClassFile) -> Option<u16> {
+    let mut reader = crate::Reader::new(&file.raw);
+    if reader.u4().ok()? != 0xCAFE_BABE {
+        return None;
+    }
+    reader.skip(4).ok()?;
+    crate::read_pool(&mut reader).ok()?;
+    reader.u2().ok()
+}
+
+/// The text `String.valueOf` gives a boxed value, for a concatenation
+/// operand typed `desc`.
+///
+/// `"" + Boolean.TRUE` is `"true"`; the runtime's box marker is
+/// `boolean:true`, and pasting the marker made Xaero's config codec reject a
+/// 12-character boolean against its 5-character bound. Only an operand typed
+/// as a box, `Number`, `Comparable`, `Serializable` or `Object` is read as a
+/// box: a `String` operand is text, whatever it spells.
+pub(crate) fn boxed_text(marker: &str, desc: &str) -> Option<String> {
+    if !matches!(
+        desc,
+        "Ljava/lang/Object;"
+            | "Ljava/lang/Number;"
+            | "Ljava/lang/Comparable;"
+            | "Ljava/io/Serializable;"
+            | "Ljava/lang/Boolean;"
+            | "Ljava/lang/Integer;"
+            | "Ljava/lang/Long;"
+            | "Ljava/lang/Short;"
+            | "Ljava/lang/Byte;"
+            | "Ljava/lang/Character;"
+            | "Ljava/lang/Float;"
+            | "Ljava/lang/Double;"
+    ) {
+        return None;
+    }
+    let (prefix, rest) = marker.split_once(':')?;
+    match prefix {
+        "boolean" => matches!(rest, "true" | "false").then(|| rest.to_owned()),
+        "integer" | "long" | "short" | "byte" => {
+            rest.parse::<i64>().ok().map(|value| value.to_string())
+        }
+        "character" => rest
+            .parse::<u32>()
+            .ok()
+            .and_then(char::from_u32)
+            .map(String::from),
+        "double" => rest.parse::<f64>().ok().map(super::format_java_float),
+        "float" => rest.parse::<f64>().ok().map(super::format_java_float32),
+        _ => None,
+    }
+}
+
 /// Whether `marker` names an object this runtime or the host built
 /// (`owner/Class#n`), as opposed to string text.
 fn is_object_marker(marker: &str) -> bool {
@@ -586,6 +647,44 @@ fn is_object_marker(marker: &str) -> bool {
 }
 
 impl<H: crate::Host> crate::Runtime<'_, H> {
+    /// The JDK calls the interpreter answers itself, in one dispatch slot:
+    /// `CharSequence` on text and `Class` kind queries on jar classes.
+    pub(crate) fn invoke_jdk_runtime(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_class_kind(r, receiver) {
+            return Ok(Some(value));
+        }
+        self.invoke_char_sequence(r, receiver, args)
+    }
+
+    /// `Class.isInterface`/`isEnum`/`isAnnotation`/`isRecord` for a class a
+    /// jar declares, from its class-file access flags and superclass.
+    ///
+    /// The host only knows class names, so it answered `false` for every
+    /// `isInterface()`, and a config library that proxies an interface
+    /// (servercore's DazzleConf: "OptimizationConfig is not an interface")
+    /// refused its own config type. A platform class keeps the host's answer.
+    fn invoke_class_kind(&self, r: &MethodRef, receiver: Option<&Value>) -> Option<Value> {
+        if r.owner != "java/lang/Class" || r.descriptor != "()Z" {
+            return None;
+        }
+        let name = expect_ref(receiver?)?;
+        let file = self.class(name)?;
+        let flags = class_access_flags(file)?;
+        let answer = match r.name.as_str() {
+            "isInterface" => flags & 0x0200 != 0,
+            "isAnnotation" => flags & 0x2000 != 0,
+            "isEnum" => flags & 0x4000 != 0 && file.super_name == "java/lang/Enum",
+            "isRecord" => file.super_name == "java/lang/Record" && flags & 0x0010 != 0,
+            _ => return None,
+        };
+        Some(Value::Int(i32::from(answer)))
+    }
+
     /// A `java.lang.CharSequence` call on a `String` or a modelled
     /// `StringBuilder`/`StringBuffer`.
     ///
@@ -594,7 +693,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
     /// surface is keyed by `java/lang/String`, so the call is answered as the
     /// `String` method on the receiver's text. A jar class implementing
     /// `CharSequence`, or any other object, keeps the normal dispatch.
-    pub(crate) fn invoke_char_sequence(
+    fn invoke_char_sequence(
         &mut self,
         r: &MethodRef,
         receiver: Option<&Value>,
@@ -632,6 +731,33 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         self.host
             .invoke_instance(&as_string, &Value::Ref(Some(text)), args)
             .map(Some)
+    }
+
+    /// The class whose body an instance method reference runs for
+    /// `receiver`: the receiver class's own override or inherited body when
+    /// the receiver is a jar object, else `None` to keep the symbolic owner.
+    ///
+    /// The JVM invokes a `REF_invokeVirtual`/`REF_invokeInterface` handle
+    /// virtually. The marker does not record the handle kind, so a concrete
+    /// symbolic body is only replaced by a jar override found on the
+    /// receiver's chain; an abstract one is always resolved there.
+    pub(crate) fn callback_dispatch_owner(
+        &self,
+        target: &MethodRef,
+        receiver: Option<&Value>,
+    ) -> Option<String> {
+        let class = self.receiver_class(receiver?)?.to_owned();
+        if class == target.owner {
+            return None;
+        }
+        let (owner, true) = self.member_owner(&class, &target.name, &target.descriptor)? else {
+            return None;
+        };
+        let method = self
+            .class(&owner)?
+            .method(&target.name, &target.descriptor)?;
+        (method.code.is_some() && !method.is_static() && method.access & 0x0002 == 0)
+            .then_some(owner)
     }
 
     /// The jar class whose override a platform-typed virtual call selects.
@@ -831,7 +957,11 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
     /// Run a functional-interface value the way a stream stage does: a jar
     /// lambda or method reference through the callback path, anything else
     /// through the host's `Function.apply`.
-    fn apply_callback(&mut self, function: &Value, args: &[Value]) -> Result<Value, NativeError> {
+    pub(crate) fn apply_callback(
+        &mut self,
+        function: &Value,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
         if let Some(value) = self.invoke_callback(function, args)? {
             return Ok(value);
         }

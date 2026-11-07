@@ -13,7 +13,7 @@
 //! The logging stubs are compiled for `javac` but left out of the jar: the jar
 //! must reach the host's logger model, as a real mod reaches the platform's.
 
-use horizon_native_java::{NativeJar, StdHost, Value};
+use horizon_native_java::{LinkedClassTable, NativeJar, StdHost, Value};
 use std::{
     fs,
     io::Write,
@@ -51,7 +51,7 @@ public interface Logger {
 }
 "#;
 
-const PROBE: &str = r#"package demo;
+const PROBE: &str = r##"package demo;
 
 import java.io.IOException;
 import java.io.Reader;
@@ -59,6 +59,7 @@ import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -68,7 +69,9 @@ import java.util.ServiceLoader;
 import java.util.Spliterators;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
+import java.util.Optional;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import java.util.stream.StreamSupport;
 
 interface Parser {
@@ -111,6 +114,29 @@ final class Counting extends Spliterators.AbstractSpliterator<Integer> {
 }
 
 interface Integration {}
+
+/** rrls's service shape: an interface method the provider class implements. */
+interface Ranked {
+    boolean active();
+    default int priority() { return 0; }
+}
+
+final class Low implements Ranked {
+    public boolean active() { return true; }
+    public int priority() { return -5; }
+}
+
+final class High implements Ranked {
+    public boolean active() { return true; }
+    public int priority() { return 7; }
+}
+
+final class Off implements Ranked {
+    public boolean active() { return false; }
+    public int priority() { return 100; }
+}
+
+interface Marker {}
 
 public final class Probe {
     public static String defaults() {
@@ -225,8 +251,61 @@ public final class Probe {
         map.put("b", 2);
         return (map != null) + "|" + map.size() + "|" + map.get("b");
     }
+
+    public static String intStreams() {
+        List<String> labels = IntStream.rangeClosed(1, 3).mapToObj(i -> "#" + i)
+            .collect(Collectors.toList());
+        int sum = IntStream.range(0, 5).sum();
+        long count = IntStream.range(2, 2).count();
+        return labels.toString() + "|" + sum + "|" + count;
+    }
+
+    public static String ordering() {
+        List<String> words = List.of("pear", "fig", "apple", "kiwi");
+        List<String> natural = words.stream().sorted().collect(Collectors.toList());
+        List<String> byLength = words.stream()
+            .sorted(Comparator.comparingInt(String::length).thenComparing(Comparator.reverseOrder()))
+            .collect(Collectors.toList());
+        String longest = words.stream().max(Comparator.comparingInt(String::length)).orElse("none");
+        String shortest = words.stream().min(Comparator.comparing(String::length)).orElse("none");
+        Optional<String> first = words.stream().findFirst();
+        String none = List.<String>of().stream().max(Comparator.naturalOrder()).orElse("none");
+        int total = List.of(1, 2, 3).stream().reduce(0, Integer::sum);
+        String joined = words.stream().reduce((a, b) -> a + "+" + b).orElse("");
+        Comparator<String> reversed = Comparator.<String>naturalOrder().reversed();
+        return natural.toString() + "|" + byLength.toString() + "|" + longest + "|" + shortest + "|" + first.get()
+            + "|" + none + "|" + total + "|" + joined + "|" + reversed.compare("a", "b");
+    }
+
+    public static String serviceRanking() {
+        List<Ranked> services = List.of(new Low(), new Off(), new High());
+        Ranked best = services.stream().filter(Ranked::active)
+            .max(Comparator.comparingInt(Ranked::priority)).orElseThrow();
+        return best.getClass().getSimpleName() + "|" + best.priority();
+    }
+
+    public static String streamIterator() {
+        Iterator<String> values = List.of("x", "y").stream().map(s -> s + s).iterator();
+        StringBuilder out = new StringBuilder();
+        while (values.hasNext()) {
+            out.append(values.next());
+        }
+        return out.toString();
+    }
+
+    public static String boxedConcat() {
+        Boolean flag = Boolean.TRUE;
+        Integer number = 42;
+        Object anything = Long.valueOf(9);
+        return "" + flag + "|" + number + "|" + anything + "|" + ("" + flag).length();
+    }
+
+    public static String classKinds() {
+        return Marker.class.isInterface() + "|" + Probe.class.isInterface() + "|"
+            + Ranked.class.isInterface();
+    }
 }
-"#;
+"##;
 
 fn javac() -> PathBuf {
     std::env::var_os("JAVA_HOME")
@@ -419,4 +498,63 @@ fn sub_list_copies_the_range_and_checks_bounds() {
 fn a_jdk_constructor_reference_builds_a_usable_collection() {
     let fixture = Fixture::build("ctor-ref");
     assert_eq!(fixture.text("constructorReference"), "true|2|2");
+}
+
+#[test]
+fn int_streams_range_map_and_sum() {
+    let fixture = Fixture::build("intstream");
+    assert_eq!(fixture.text("intStreams"), "[#1, #2, #3]|10|0");
+}
+
+#[test]
+fn sorted_max_min_reduce_and_comparator_combinators() {
+    let fixture = Fixture::build("ordering");
+    assert_eq!(
+        fixture.text("ordering"),
+        "[apple, fig, kiwi, pear]|[fig, pear, kiwi, apple]|apple|fig|pear|none|6|pear+fig+apple+kiwi|1"
+    );
+}
+
+#[test]
+fn interface_method_references_dispatch_on_the_provider() {
+    // `Ranked::active` and `Ranked::priority` name the interface; each
+    // provider class answers its own.
+    let fixture = Fixture::build("ranking");
+    assert_eq!(fixture.text("serviceRanking"), "High|7");
+}
+
+#[test]
+fn a_stream_iterator_walks_its_elements() {
+    let fixture = Fixture::build("stream-iterator");
+    assert_eq!(fixture.text("streamIterator"), "xxyy");
+}
+
+#[test]
+fn concatenating_a_box_prints_its_value() {
+    let fixture = Fixture::build("boxed-concat");
+    assert_eq!(fixture.text("boxedConcat"), "true|42|9|4");
+}
+
+#[test]
+fn class_is_interface_reads_the_jar_class_flags() {
+    let fixture = Fixture::build("class-kinds");
+    assert_eq!(fixture.text("classKinds"), "true|false|true");
+}
+
+#[test]
+fn a_nested_jar_service_file_seeds_its_providers() {
+    // A JiJ library's own `META-INF/services` rows, as the pack class path
+    // links them for Xaero's bundled `xaerolib`.
+    let mut table = LinkedClassTable::default();
+    table.link_service_file(
+        "META-INF/services/demo.api.Platform",
+        b"# the fabric helper\ndemo.fabric.FabricPlatform  \n\ndemo.Fallback # last\n",
+    );
+    table.link_service_file("META-INF/MANIFEST.MF", b"demo.Ignored\n");
+    table.link_service_file("META-INF/services/nested/dir", b"demo.Ignored\n");
+    assert_eq!(
+        table.service_providers("demo/api/Platform"),
+        ["demo/fabric/FabricPlatform", "demo/Fallback"]
+    );
+    assert_eq!(table.provider_count(), 2);
 }

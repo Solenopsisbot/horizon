@@ -19,6 +19,7 @@ pub mod events;
 mod game_hooks;
 mod java_regex;
 mod jdk_model;
+mod jdk_stream;
 mod map_compute;
 mod reflect_enum;
 mod stack_walk;
@@ -8643,7 +8644,9 @@ fn java_value_text(value: &Value, desc: &str) -> String {
         Value::Long(value) => value.to_string(),
         Value::Float(value) if desc == "F" => format_java_float32(*value),
         Value::Float(value) => format_java_float(*value),
-        Value::Ref(Some(value)) => value.clone(),
+        Value::Ref(Some(value)) => {
+            jdk_model::boxed_text(value, desc).unwrap_or_else(|| value.clone())
+        }
         Value::Ref(None) => "null".to_owned(),
         Value::Void => String::new(),
     }
@@ -18695,8 +18698,17 @@ impl<H: Host> Runtime<'_, H> {
                 target_args.len()
             )));
         }
+        // A method reference to an instance method dispatches on its receiver
+        // (`AdvancedService::isServiceActive` names an interface method; the
+        // provider's class has the body), exactly as the call it stands for.
+        let owner = if target_is_static || callback.target.name == "<init>" {
+            callback.target.owner.clone()
+        } else {
+            self.callback_dispatch_owner(&callback.target, receiver.as_ref())
+                .unwrap_or_else(|| callback.target.owner.clone())
+        };
         let result = self.invoke(
-            &callback.target.owner,
+            &owner,
             &callback.target.name,
             &callback.target.descriptor,
             receiver,
@@ -21349,6 +21361,11 @@ impl<H: Host> Runtime<'_, H> {
             return None;
         }
         let marker = expect_array_marker(receiver?).ok()?;
+        // The shared empty array has no table row; its clone is an empty
+        // array too (the host would otherwise answer a null clone).
+        if marker == "array/empty" {
+            return Some(Value::Ref(Some(marker.to_owned())));
+        }
         let values = self.arrays.get(marker)?.clone();
         let clone = self.new_array("java/lang/Object", "clone");
         self.arrays.insert(clone.clone(), values);
@@ -21640,6 +21657,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.stream_support_stream(r, args, class, method)? {
             return Ok(Some(value));
         }
+        if let Some(value) = self.primitive_stream_source(r, args, class, method)? {
+            return Ok(Some(value));
+        }
         if r.owner == "java/util/Optional"
             && r.name == "stream"
             && r.descriptor == "()Ljava/util/stream/Stream;"
@@ -21901,10 +21921,11 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Value::Int(matched as i32)
             }
-            // Ordering and execution mode do not change the bounded value
-            // sequence; returning the same stream keeps a `sorted` or
-            // `parallel` in the chain from falling out to a null host answer.
-            ("sorted", _) | ("parallel", _) | ("sequential", _) | ("unordered", _) => {
+            // Execution mode does not change the bounded value sequence;
+            // returning the same stream keeps a `parallel` in the chain from
+            // falling out to a null host answer. `sorted` reorders, so it is a
+            // real stage (`jdk_stream::more_stream_stages`).
+            ("parallel", _) | ("sequential", _) | ("unordered", _) => {
                 self.new_stream(class, method, values)
             }
             ("peek", "(Ljava/util/function/Consumer;)Ljava/util/stream/Stream;") => {
@@ -21977,7 +21998,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Value::Void
             }
-            _ => return Ok(None),
+            _ => return self.more_stream_stages(r, &values, args, class, method),
         };
         Ok(Some(result))
     }
@@ -23180,8 +23201,13 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         value
                     } else if let Some(value) =
-                        self.invoke_char_sequence(&r, receiver.as_ref(), &args)?
+                        self.invoke_jdk_runtime(&r, receiver.as_ref(), &args)?
                     {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_modelled_comparator(&r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = self.invoke_game_enum_values(&r, class, method) {
                         value
