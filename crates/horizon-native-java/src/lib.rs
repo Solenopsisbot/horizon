@@ -24,6 +24,7 @@ pub mod events;
 mod fabric_registry;
 mod facade_server;
 mod game_hooks;
+mod guava_model;
 mod heap;
 mod hook_shapes;
 mod java_regex;
@@ -18972,6 +18973,18 @@ impl<H: Host> Runtime<'_, H> {
             let expected = arg_count(&callback.target.descriptor);
             if values.len() == expected && callback.target.name != "<init>" {
                 jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut values);
+                // A library the interpreter models (Guava, proxies, the JDK
+                // shapes in `library_dispatch`) answers a method reference
+                // to it the way it answers the direct call.
+                if let Some(value) = self.invoke_library_model(
+                    &callback.target,
+                    None,
+                    &values,
+                    "callback",
+                    "callback",
+                )? {
+                    return Ok(Some(value));
+                }
                 return self.host.invoke(&callback.target, &values).map(Some);
             }
             // A constructor reference (`GameClass::new`, `HashMap::new`) is a
@@ -19011,6 +19024,15 @@ impl<H: Host> Runtime<'_, H> {
             if let Some(value) =
                 self.invoke_reflect_method(&callback.target, Some(&receiver), &rest)?
             {
+                return Ok(Some(value));
+            }
+            if let Some(value) = self.invoke_library_model(
+                &callback.target,
+                Some(&receiver),
+                &rest,
+                "callback",
+                "callback",
+            )? {
                 return Ok(Some(value));
             }
             return self
@@ -20464,11 +20486,19 @@ impl<H: Host> Runtime<'_, H> {
         let Some(text) = self.io_files.get(path).cloned() else {
             if !required {
                 // `Files.newBufferedReader` over a path the invocation never
-                // wrote answers an empty stream: a jar resource the host
-                // resolves elsewhere still reaches its own reader, and a
-                // bootstrap that checks `exists` first writes defaults.
-                self.string_readers.insert(marker.to_owned(), String::new());
-                return Ok(());
+                // wrote reads the jar resource `Files.exists` already answers
+                // for that name; any other path is the JDK's
+                // `NoSuchFileException`, which a config bootstrap catches to
+                // write its defaults (moderner_beta's `loadConfig`).
+                if let Some(text) = library_dispatch::resource_text(&mut *self.host, path) {
+                    self.string_readers.insert(marker.to_owned(), text);
+                    return Ok(());
+                }
+                return Err(NativeError::UncaughtException {
+                    class: "java/nio/file/NoSuchFileException".into(),
+                    message: Some(path.to_string()),
+                    frame: None,
+                });
             }
             let class = if r.owner == "java/nio/file/Files" {
                 "java/nio/file/NoSuchFileException"
@@ -23799,6 +23829,14 @@ impl<H: Host> Runtime<'_, H> {
                                 }
                             })
                             .collect::<Vec<_>>();
+                        // An object a library model answers `toString` for (a
+                        // Guava `TypeToken`, a proxy) concatenates as that text.
+                        let mut captured = captured;
+                        for value in &mut captured {
+                            if let Some(text) = self.library_to_string(value, class, method)? {
+                                *value = Value::Ref(Some(text));
+                            }
+                        }
                         let mut joined = String::new();
                         let (mut next_arg, mut next_constant) = (0, 0);
                         let expand = |placeholder: u8,

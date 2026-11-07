@@ -31,6 +31,27 @@ const PROXY_CLASS: &str = "jdk/proxy/$Proxy";
 const MAX_PROXY_INTERFACES: usize = 64;
 /// The `Lookup` marker `MethodHandles.lookup()` and `privateLookupIn` answer.
 const LOOKUP_MARKER: &str = "method-handles-lookup";
+/// Prefix of a `MethodType` marker; the rest is its method descriptor.
+const METHOD_TYPE_PREFIX: &str = "method-type/";
+
+/// The field descriptor of a class marker: a primitive's letter, an array
+/// descriptor as is, `L...;` for anything else.
+fn class_type_descriptor(name: &str) -> String {
+    match name {
+        "boolean" => "Z".into(),
+        "byte" => "B".into(),
+        "char" => "C".into(),
+        "short" => "S".into(),
+        "int" => "I".into(),
+        "long" => "J".into(),
+        "float" => "F".into(),
+        "double" => "D".into(),
+        "void" => "V".into(),
+        array if array.starts_with('[') => array.to_owned(),
+        other => format!("L{};", other.replace('.', "/")),
+    }
+}
+
 /// Prefix of a method handle marker:
 /// `method-handle/<special|virtual>/<bound receiver or ->/<method marker>`.
 const HANDLE_PREFIX: &str = "method-handle/";
@@ -355,6 +376,122 @@ impl<H: Host> Runtime<'_, H> {
                     "{HANDLE_PREFIX}{kind}/-/{method}"
                 )))))
             }
+            // A lookup by name over the class model. A static or virtual
+            // method the model holds becomes a handle; anything else is the
+            // JDK's `NoSuchMethodException` (a caller probing `valueOf` on a
+            // JDK type takes its fallback), since the bounded runtime cannot
+            // bind a JDK method to a handle.
+            (
+                "java/lang/invoke/MethodHandles$Lookup",
+                "findStatic" | "findVirtual",
+                "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
+            ) => {
+                let class = args.first().and_then(expect_ref).cloned();
+                let name = args.get(1).and_then(expect_ref).cloned();
+                let (Some(class), Some(name)) = (class, name) else {
+                    return Err(npe(None));
+                };
+                let class = class.replace('.', "/");
+                let wanted_static = r.name == "findStatic";
+                let descriptor = args
+                    .get(2)
+                    .and_then(expect_ref)
+                    .and_then(|marker| marker.strip_prefix(METHOD_TYPE_PREFIX).map(str::to_owned));
+                let found = self.class(&class).and_then(|file| {
+                    file.methods
+                        .iter()
+                        .find(|method| {
+                            method.name == name
+                                && method.is_static() == wanted_static
+                                && descriptor
+                                    .as_deref()
+                                    .is_none_or(|descriptor| method.descriptor == descriptor)
+                        })
+                        .map(|method| method.descriptor.clone())
+                });
+                match found {
+                    Some(descriptor) => Ok(Some(Value::Ref(Some(format!(
+                        "{HANDLE_PREFIX}virtual/-/reflect-method/{class}#{name}{descriptor}"
+                    ))))),
+                    None => Err(NativeError::UncaughtException {
+                        class: "java/lang/NoSuchMethodException".into(),
+                        message: Some(format!(
+                            "no such method: {}.{name}",
+                            class.replace('/', ".")
+                        )),
+                        frame: None,
+                    }),
+                }
+            }
+            (
+                "java/lang/invoke/MethodHandles$Lookup",
+                "findConstructor",
+                "(Ljava/lang/Class;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
+            ) => {
+                let Some(class) = args
+                    .first()
+                    .and_then(expect_ref)
+                    .map(|c| c.replace('.', "/"))
+                else {
+                    return Err(npe(None));
+                };
+                // A constructor's type returns `void`; the descriptor matches
+                // `<init>` exactly.
+                let descriptor = args
+                    .get(1)
+                    .and_then(expect_ref)
+                    .and_then(|marker| marker.strip_prefix(METHOD_TYPE_PREFIX).map(str::to_owned));
+                let found = descriptor.as_deref().is_some_and(|descriptor| {
+                    self.class(&class)
+                        .is_some_and(|file| file.method("<init>", descriptor).is_some())
+                });
+                match (found, descriptor) {
+                    (true, Some(descriptor)) => Ok(Some(Value::Ref(Some(format!(
+                        "{HANDLE_PREFIX}new/-/reflect-method/{class}#<init>{descriptor}"
+                    ))))),
+                    _ => Err(NativeError::UncaughtException {
+                        class: "java/lang/NoSuchMethodException".into(),
+                        message: Some(format!("no such constructor: {}", class.replace('/', "."))),
+                        frame: None,
+                    }),
+                }
+            }
+            // `MethodType.methodType(rtype, ptypes...)` as its descriptor, so a
+            // lookup can match a method exactly.
+            ("java/lang/invoke/MethodType", "methodType", descriptor)
+                if descriptor.ends_with(")Ljava/lang/invoke/MethodType;") =>
+            {
+                let mut types = Vec::new();
+                for value in args {
+                    match value {
+                        Value::Ref(Some(marker)) if self.arrays.contains_key(marker) => {
+                            types.extend(self.array(value)?.clone());
+                        }
+                        Value::Ref(Some(marker)) if marker.starts_with(METHOD_TYPE_PREFIX) => {
+                            return Ok(None);
+                        }
+                        other => types.push(other.clone()),
+                    }
+                }
+                let Some((result, parameters)) = types.split_first() else {
+                    return Ok(None);
+                };
+                let mut descriptor = String::from("(");
+                for parameter in parameters {
+                    let Some(name) = expect_ref(parameter) else {
+                        return Err(npe(None));
+                    };
+                    descriptor.push_str(&class_type_descriptor(name));
+                }
+                descriptor.push(')');
+                let Some(result) = expect_ref(result) else {
+                    return Err(npe(None));
+                };
+                descriptor.push_str(&class_type_descriptor(result));
+                Ok(Some(Value::Ref(Some(format!(
+                    "{METHOD_TYPE_PREFIX}{descriptor}"
+                )))))
+            }
             ("java/lang/Module", "addReads", "(Ljava/lang/Module;)Ljava/lang/Module;") => {
                 Ok(receiver.cloned())
             }
@@ -418,6 +555,13 @@ impl<H: Host> Runtime<'_, H> {
             ));
         };
         let (name, descriptor) = (&member[..at], &member[at..]);
+        if kind == "new" {
+            // A constructor handle builds the object, then runs `<init>`.
+            let values = coerce_arguments(descriptor, &values);
+            let instance = self.new_object(class);
+            self.invoke(class, "<init>", descriptor, Some(instance.clone()), &values)?;
+            return Ok(instance);
+        }
         let is_static = self
             .class(class)
             .and_then(|file| file.method(name, descriptor))

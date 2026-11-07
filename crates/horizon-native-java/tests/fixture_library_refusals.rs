@@ -228,6 +228,16 @@ public class Probe {
             + "|" + (Proxy.getInvocationHandler(config) == handler) + "|" + joined(seen);
     }
 
+    public static String missingConfig() {
+        try (java.io.BufferedReader reader = java.nio.file.Files.newBufferedReader(java.nio.file.Path.of("config", "absent.json"))) {
+            return "opened";
+        } catch (java.nio.file.NoSuchFileException e) {
+            return "missing:" + e.getMessage();
+        } catch (java.io.IOException e) {
+            return "io";
+        }
+    }
+
     public static void main(String[] args) throws Throwable {
         System.out.println(reflection());
         System.out.println(collectionCopies());
@@ -240,6 +250,7 @@ public class Probe {
         System.out.println(entries());
         System.out.println(streams());
         System.out.println(proxies());
+        System.out.println(missingConfig());
     }
 }
 "##;
@@ -276,6 +287,17 @@ public class Platform {
             + "|" + listed + "|" + Files.walk(own).count();
     }
 
+    public static String ownRegistry() {
+        net.minecraft.resources.ResourceKey<net.minecraft.core.Registry<String>> key =
+            net.minecraft.resources.ResourceKey.createRegistryKey(
+                net.minecraft.resources.Identifier.fromNamespaceAndPath("demo", "things"));
+        net.minecraft.core.Registry<String> built = net.fabricmc.fabric.api.event.registry.FabricRegistryBuilder
+            .from(new net.minecraft.core.MappedRegistry<>(key, com.mojang.serialization.Lifecycle.stable(), false))
+            .buildAndRegister();
+        net.minecraft.resources.Identifier id = built.key().identifier();
+        return id.getNamespace() + ":" + id.getPath();
+    }
+
     public static String fastutil() {
         Object2IntOpenHashMap<String> counts = new Object2IntOpenHashMap<>();
         counts.put("a", 3);
@@ -301,6 +323,39 @@ public interface ModContainer {
 }
 "#;
 
+/// Just enough of the game's registry types and Fabric's builder for
+/// `javac`; the host answers all of them.
+const REGISTRY_STUBS: &[(&str, &str)] = &[
+    (
+        "net/minecraft/resources/Identifier.java",
+        "package net.minecraft.resources;\npublic final class Identifier {\n    public static Identifier fromNamespaceAndPath(String namespace, String path) { return null; }\n    public String getNamespace() { return null; }\n    public String getPath() { return null; }\n}\n",
+    ),
+    (
+        "net/minecraft/resources/ResourceKey.java",
+        "package net.minecraft.resources;\npublic final class ResourceKey<T> {\n    public static <T> ResourceKey<net.minecraft.core.Registry<T>> createRegistryKey(Identifier id) { return null; }\n    public Identifier identifier() { return null; }\n}\n",
+    ),
+    (
+        "net/minecraft/core/Registry.java",
+        "package net.minecraft.core;\npublic interface Registry<T> { net.minecraft.resources.ResourceKey<? extends Registry<T>> key(); }\n",
+    ),
+    (
+        "net/minecraft/core/WritableRegistry.java",
+        "package net.minecraft.core;\npublic interface WritableRegistry<T> extends Registry<T> {}\n",
+    ),
+    (
+        "net/minecraft/core/MappedRegistry.java",
+        "package net.minecraft.core;\npublic class MappedRegistry<T> implements WritableRegistry<T> {\n    public MappedRegistry(net.minecraft.resources.ResourceKey<? extends Registry<T>> key, com.mojang.serialization.Lifecycle lifecycle, boolean intrusive) {}\n    public net.minecraft.resources.ResourceKey<? extends Registry<T>> key() { return null; }\n}\n",
+    ),
+    (
+        "com/mojang/serialization/Lifecycle.java",
+        "package com.mojang.serialization;\npublic class Lifecycle { public static Lifecycle stable() { return null; } }\n",
+    ),
+    (
+        "net/fabricmc/fabric/api/event/registry/FabricRegistryBuilder.java",
+        "package net.fabricmc.fabric.api.event.registry;\npublic final class FabricRegistryBuilder<T, R extends net.minecraft.core.WritableRegistry<T>> {\n    public static <T, R extends net.minecraft.core.WritableRegistry<T>> FabricRegistryBuilder<T, R> from(R registry) { return null; }\n    public R buildAndRegister() { return null; }\n}\n",
+    ),
+];
+
 const OBJECT2INT: &str = r#"package it.unimi.dsi.fastutil.objects;
 public class Object2IntOpenHashMap<K> extends java.util.HashMap<K, Integer> {
     public int put(K key, int value) { return 0; }
@@ -308,6 +363,104 @@ public class Object2IntOpenHashMap<K> extends java.util.HashMap<K, Integer> {
     public int addTo(K key, int increment) { return 0; }
 }
 "#;
+
+/// The Guava surface the game ships: `Preconditions`, `TypeToken`, a
+/// `LoadingCache`, a `HashMultimap` and `Suppliers.memoize` (WorldEdit's
+/// piston injector, spell_power's memoized defaults). The expected string is
+/// what `java` prints with Guava 33.3.1 on the class path; the jar itself
+/// carries no Guava, so the stubs below exist for `javac` only.
+const GUAVA_PROBE: &str = r##"package demo;
+
+import com.google.common.base.Preconditions;
+import com.google.common.base.Suppliers;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import com.google.common.collect.HashMultimap;
+import com.google.common.reflect.TypeToken;
+import java.util.List;
+import java.util.function.Supplier;
+
+public class Libs {
+    static int loads;
+    static int supplied;
+
+    public static String guava() throws Exception {
+        String checked = Preconditions.checkNotNull("kept");
+        String npe;
+        try { Preconditions.checkNotNull(null, "missing"); npe = "no"; } catch (NullPointerException e) { npe = e.getMessage(); }
+        String iae;
+        try { Preconditions.checkArgument(false, "bad"); iae = "no"; } catch (IllegalArgumentException e) { iae = e.getMessage(); }
+
+        TypeToken<String> plain = TypeToken.of(String.class);
+        TypeToken<List<String>> list = new TypeToken<List<String>>() {};
+        TypeToken<Integer> boxed = TypeToken.of(int.class).wrap();
+
+        LoadingCache<String, Integer> cache = CacheBuilder.newBuilder().weakKeys().maximumSize(10)
+            .build(CacheLoader.from(key -> { loads++; return key.length(); }));
+        int first = cache.getUnchecked("abc");
+        int again = cache.getUnchecked("abc");
+        int other = cache.getUnchecked("hello");
+
+        HashMultimap<String, Integer> multi = HashMultimap.create();
+        multi.put("a", 1);
+        multi.put("a", 2);
+        multi.put("a", 1);
+        multi.get("b").add(5);
+
+        Supplier<Integer> memo = Suppliers.memoize(() -> ++supplied)::get;
+        int m1 = memo.get();
+        int m2 = memo.get();
+
+        return checked + "|" + npe + "|" + iae
+            + "|" + plain.getRawType().getName() + "|" + list.getRawType().getName() + "|" + list
+            + "|" + plain.equals(TypeToken.of(String.class)) + list.equals(plain) + "|" + boxed.getRawType().getName()
+            + "|" + first + again + other + "|" + loads
+            + "|" + multi.get("a").size() + "|" + multi.size() + "|" + multi.containsKey("b") + multi.containsKey("c")
+            + "|" + m1 + m2 + "|" + supplied;
+    }
+
+}
+"##;
+
+const GUAVA_STUBS: &[(&str, &str)] = &[
+    (
+        "com/google/common/base/Preconditions.java",
+        "package com.google.common.base;\npublic final class Preconditions {\n    public static <T> T checkNotNull(T value) { return value; }\n    public static <T> T checkNotNull(T value, Object message) { return value; }\n    public static void checkArgument(boolean ok, Object message) {}\n}\n",
+    ),
+    (
+        "com/google/common/base/Supplier.java",
+        "package com.google.common.base;\npublic interface Supplier<T> extends java.util.function.Supplier<T> { T get(); }\n",
+    ),
+    (
+        "com/google/common/base/Function.java",
+        "package com.google.common.base;\npublic interface Function<F, T> extends java.util.function.Function<F, T> { T apply(F input); }\n",
+    ),
+    (
+        "com/google/common/base/Suppliers.java",
+        "package com.google.common.base;\npublic final class Suppliers {\n    public static <T> Supplier<T> memoize(Supplier<T> delegate) { return delegate; }\n}\n",
+    ),
+    (
+        "com/google/common/cache/CacheLoader.java",
+        "package com.google.common.cache;\npublic abstract class CacheLoader<K, V> {\n    public abstract V load(K key) throws Exception;\n    public static <K, V> CacheLoader<K, V> from(com.google.common.base.Function<K, V> function) { return null; }\n}\n",
+    ),
+    (
+        "com/google/common/cache/LoadingCache.java",
+        "package com.google.common.cache;\npublic interface LoadingCache<K, V> { V getUnchecked(K key); }\n",
+    ),
+    (
+        "com/google/common/cache/CacheBuilder.java",
+        "package com.google.common.cache;\npublic final class CacheBuilder<K, V> {\n    public static CacheBuilder<Object, Object> newBuilder() { return null; }\n    public CacheBuilder<K, V> weakKeys() { return this; }\n    public CacheBuilder<K, V> maximumSize(long size) { return this; }\n    public <K1 extends K, V1 extends V> LoadingCache<K1, V1> build(CacheLoader<? super K1, V1> loader) { return null; }\n}\n",
+    ),
+    (
+        "com/google/common/collect/HashMultimap.java",
+        "package com.google.common.collect;\npublic final class HashMultimap<K, V> {\n    public static <K, V> HashMultimap<K, V> create() { return null; }\n    public boolean put(K key, V value) { return true; }\n    public java.util.Set<V> get(K key) { return null; }\n    public int size() { return 0; }\n    public boolean containsKey(Object key) { return false; }\n}\n",
+    ),
+    (
+        "com/google/common/reflect/TypeToken.java",
+        "package com.google.common.reflect;\npublic abstract class TypeToken<T> {\n    protected TypeToken() {}\n    public static <T> TypeToken<T> of(Class<T> type) { return null; }\n    public final Class<? super T> getRawType() { return null; }\n    public final TypeToken<T> wrap() { return this; }\n}\n",
+    ),
+];
 
 fn javac() -> PathBuf {
     std::env::var_os("JAVA_HOME")
@@ -479,20 +632,24 @@ fn proxies_route_calls_to_their_handler_and_run_default_methods() {
 }
 
 fn platform(test: &str, method: &str) -> String {
-    let fixture = Fixture::build(
-        test,
-        &[
-            ("demo/Probe.java", REFLECTION),
-            ("demo/Platform.java", PLATFORM),
-            ("net/fabricmc/loader/api/FabricLoader.java", FABRIC_LOADER),
-            ("net/fabricmc/loader/api/ModContainer.java", MOD_CONTAINER),
-            (
-                "it/unimi/dsi/fastutil/objects/Object2IntOpenHashMap.java",
-                OBJECT2INT,
-            ),
-        ],
-    );
-    fixture.text_of("demo/Platform", method)
+    let mut sources = vec![
+        ("demo/Probe.java", REFLECTION),
+        ("demo/Platform.java", PLATFORM),
+        ("net/fabricmc/loader/api/FabricLoader.java", FABRIC_LOADER),
+        ("net/fabricmc/loader/api/ModContainer.java", MOD_CONTAINER),
+        (
+            "it/unimi/dsi/fastutil/objects/Object2IntOpenHashMap.java",
+            OBJECT2INT,
+        ),
+    ];
+    sources.extend_from_slice(REGISTRY_STUBS);
+    Fixture::build(test, &sources).text_of("demo/Platform", method)
+}
+
+#[test]
+fn a_registry_the_mod_constructs_keeps_its_key_through_the_fabric_builder() {
+    // moderner_beta: `FabricRegistryBuilder.from(new MappedRegistry<>(key, ...))`.
+    assert_eq!(platform("registry", "ownRegistry"), "demo:things");
 }
 
 #[test]
@@ -520,6 +677,27 @@ fn a_mod_root_lists_the_jars_own_classes() {
 #[test]
 fn fastutil_primitive_maps_are_maps_with_a_zero_default() {
     assert_eq!(platform("fastutil", "fastutil"), "5|0|1|2|true|true");
+}
+
+#[test]
+fn guava_preconditions_tokens_caches_multimaps_and_memoized_suppliers() {
+    let mut sources = vec![("demo/Libs.java", GUAVA_PROBE)];
+    sources.extend_from_slice(GUAVA_STUBS);
+    let fixture = Fixture::build("guava", &sources);
+    assert_eq!(
+        fixture.text_of("demo/Libs", "guava"),
+        "kept|missing|bad|java.lang.String|java.util.List|java.util.List<java.lang.String>\
+         |truefalse|java.lang.Integer|335|2|2|3|truefalse|11|1"
+    );
+}
+
+#[test]
+fn reading_a_config_file_that_was_never_written_is_no_such_file() {
+    // moderner_beta catches the `NoSuchFileException` and writes defaults.
+    assert_eq!(
+        probe("missing", "missingConfig"),
+        "missing:config/absent.json"
+    );
 }
 
 #[test]

@@ -21,6 +21,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.invoke_reflect_proxy(r, receiver, args)? {
             return Ok(Some(value));
         }
+        if let Some(value) = self.invoke_guava(r, receiver, args)? {
+            return Ok(Some(value));
+        }
         if let Some(value) = self.invoke_filter_stream(r, receiver, args, class, method)? {
             return Ok(Some(value));
         }
@@ -54,7 +57,51 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.invoke_simple_entry(r, receiver, args)? {
             return Ok(Some(value));
         }
+        if let Some(value) = self.invoke_mapped_registry(r, receiver, args) {
+            return Ok(Some(value));
+        }
         Ok(None)
+    }
+
+    /// A registry a mod constructs itself (`new MappedRegistry<>(key, ...)`,
+    /// `new DefaultedMappedRegistry<>(default, key, ...)`) keeps its key, so
+    /// `FabricRegistryBuilder.from(registry)` names the same `registry/<id>`
+    /// marker `createSimple(key)` would (moderner_beta's registry helper).
+    fn invoke_mapped_registry(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Option<Value> {
+        const KEY_FIELD: &str = "|net/minecraft/core/MappedRegistry#key";
+        match (r.owner.as_str(), r.name.as_str()) {
+            (
+                "net/minecraft/core/MappedRegistry" | "net/minecraft/core/DefaultedMappedRegistry",
+                "<init>",
+            ) => {
+                let marker = expect_ref(receiver?)?.clone();
+                // The default id comes first in `DefaultedMappedRegistry`.
+                let key = args
+                    .iter()
+                    .find(|value| {
+                        expect_ref(value).is_some_and(|key| key.starts_with("registry/"))
+                    })?
+                    .clone();
+                self.fields.insert(format!("{marker}{KEY_FIELD}"), key);
+                Some(Value::Void)
+            }
+            ("net/fabricmc/fabric/api/event/registry/FabricRegistryBuilder", "from") => {
+                let registry = expect_ref(args.first()?)?;
+                let Some(Value::Ref(Some(key))) =
+                    self.fields.get(&format!("{registry}{KEY_FIELD}"))
+                else {
+                    return None;
+                };
+                let id = key.strip_prefix("registry/")?;
+                Some(Value::Ref(Some(format!("fabric-registry-builder/{id}"))))
+            }
+            _ => None,
+        }
     }
 
     /// `AbstractMap.SimpleEntry` and `SimpleImmutableEntry`, the entries
@@ -334,6 +381,34 @@ impl<H: Host> Runtime<'_, H> {
                 descriptor: call.into(),
             },
             std::slice::from_ref(value),
+        )
+    }
+
+    /// The text `String.valueOf(value)` gives for an object one of the
+    /// library models answers `toString` for; `None` for anything else
+    /// (strings, boxes and plain markers keep the concatenation's own text).
+    pub(super) fn library_to_string(
+        &mut self,
+        value: &Value,
+        class: &str,
+        method: &str,
+    ) -> Result<Option<String>, NativeError> {
+        let Some(marker) = expect_ref(value) else {
+            return Ok(None);
+        };
+        if !marker.contains('#') && !marker.starts_with("typetoken/") {
+            return Ok(None);
+        }
+        let to_string = MethodRef {
+            owner: "java/lang/Object".into(),
+            name: "toString".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        Ok(
+            match self.invoke_library_model(&to_string, Some(value), &[], class, method)? {
+                Some(Value::Ref(Some(text))) => Some(text),
+                _ => None,
+            },
         )
     }
 
@@ -1139,6 +1214,25 @@ impl<H: Host> Runtime<'_, H> {
             _ => return Ok(None),
         }))
     }
+}
+
+/// The text of the jar resource the host's virtual filesystem answers for
+/// `path` (`Files.exists` checks the same table), opened the way
+/// `ClassLoader.getResourceAsStream` opens it; `None` when there is none.
+pub(super) fn resource_text<H: Host + ?Sized>(host: &mut H, path: &str) -> Option<String> {
+    let name = path.trim_start_matches('/');
+    let stream = host
+        .invoke_instance(
+            &MethodRef {
+                owner: "java/lang/ClassLoader".into(),
+                name: "getResourceAsStream".into(),
+                descriptor: "(Ljava/lang/String;)Ljava/io/InputStream;".into(),
+            },
+            &Value::Ref(Some("classloader/bootstrap".into())),
+            &[Value::Ref(Some(name.to_owned()))],
+        )
+        .ok()?;
+    host.resource_stream_text(expect_ref(&stream)?)
 }
 
 /// Whether `Class.forName` finds `internal` in the JDK the game runs on.
