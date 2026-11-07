@@ -236,21 +236,31 @@ def _native_content(raw: bytes) -> tuple[tuple[str, str, str], ...]:
     return tuple(sorted(set(content)))
 
 
-def _toml_declarations(text: str) -> tuple[str, str, tuple[str, ...], bool]:
-    """Bounded NeoForge/Forge metadata: first mod id, required deps, client-only."""
+def _toml_declarations(text: str, *, neoforge: bool = False) -> tuple[str, str, tuple[str, ...], bool]:
+    """Bounded NeoForge/Forge metadata: first mod id, required deps, client-only.
+
+    The two formats disagree on what a dependency with no flag means. NeoForge's
+    FML (12.x, `ModInfo$ModVersion`) reads only `type`, defaulting to
+    `required`, and ignores the legacy `mandatory`; so does a `required = true`
+    some jars write. Legacy Forge `mods.toml` uses `mandatory`, default false.
+    A dependency whose `side` is `CLIENT` is not enforced on a dedicated
+    server, which is the role the ledgers measure.
+    """
     ident = version = ""
     required: list[str] = []
     client_only = False
     section = "none"
     dependency_id = ""
-    dependency_required = False
+    dependency_required = neoforge
+    dependency_client = False
 
     def flush() -> None:
-        nonlocal dependency_id, dependency_required
-        if dependency_id and dependency_required:
+        nonlocal dependency_id, dependency_required, dependency_client
+        if dependency_id and dependency_required and not dependency_client:
             required.append(dependency_id)
         dependency_id = ""
-        dependency_required = False
+        dependency_required = neoforge
+        dependency_client = False
 
     for raw in text.splitlines():
         line = raw.strip()
@@ -283,8 +293,10 @@ def _toml_declarations(text: str) -> tuple[str, str, tuple[str, ...], bool]:
                 dependency_id = value
             elif key == "type":
                 dependency_required = value.lower() == "required"
-            elif key == "mandatory":
+            elif key == "mandatory" and not neoforge:
                 dependency_required = value.lower() == "true"
+            elif key == "side":
+                dependency_client = value.upper() == "CLIENT"
     flush()
     return ident, version, tuple(sorted(set(required))), client_only
 
@@ -341,7 +353,8 @@ def read_declaration(path: Path) -> Declaration:
             for name in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml"):
                 if name in names:
                     ident, version, depends, client_only = _toml_declarations(
-                        jar.read(name).decode("utf-8", errors="replace"))
+                        jar.read(name).decode("utf-8", errors="replace"),
+                        neoforge=name == "META-INF/neoforge.mods.toml")
                     if not ident:
                         raise ValueError(f"{name} has no modId")
                     return Declaration(

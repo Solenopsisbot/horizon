@@ -336,8 +336,20 @@ class HybridPackTests(unittest.TestCase):
                     '[[dependencies.neo]]\nmodId = "minecraft"\ntype = "required"\n'
                     '[[dependencies.neo]]\nmodId = "optional-lib"\ntype = "optional"\n'
                     '[[dependencies.neo]]\nmodId = "mandatory-lib"\nmandatory = true\n'
+                    # FML reads only `type`, default required: BiomesOPlenty's
+                    # `required=true` and a legacy `mandatory=false` both load as required.
+                    '[[dependencies.neo]]\nmodId = "glitchcore"\nrequired=true\n'
+                    '[[dependencies.neo]]\nmodId = "legacy-flag"\nmandatory = false\n'
+                    '[[dependencies.neo]]\nmodId = "client-lib"\nside = "CLIENT"\n'
                 ),
             )
+            forge = Path(tmp) / "forge.jar"
+            with zipfile.ZipFile(forge, "w") as jar:
+                jar.writestr("META-INF/mods.toml", (
+                    'modLoader = "javafml"\n[[mods]]\nmodId = "old"\n'
+                    '[[dependencies.old]]\nmodId = "kept"\nmandatory = true\n'
+                    '[[dependencies.old]]\nmodId = "unflagged"\n'))
+            old = HYBRID.read_declaration(forge)
             outer = HYBRID.read_declaration(fabric)
             neo = HYBRID.read_declaration(toml)
         self.assertEqual((outer.mod_id, outer.version), ("outer", "3"))
@@ -349,7 +361,9 @@ class HybridPackTests(unittest.TestCase):
         self.assertEqual((neo.mod_id, neo.version), ("neo", "2"))
         # The optional dependency is dropped, the two required forms are kept
         # (platform ids are filtered by the compatibility check, not the reader).
-        self.assertEqual(neo.depends, ("mandatory-lib", "minecraft"))
+        self.assertEqual(neo.depends, ("glitchcore", "legacy-flag", "mandatory-lib", "minecraft"))
+        # Legacy Forge keeps `mandatory`, default false.
+        self.assertEqual(old.depends, ("kept",))
 
     def test_commands_cover_each_half_and_keep_loader_environment(self):
         with tempfile.TemporaryDirectory() as tmp:
