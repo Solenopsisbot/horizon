@@ -172,7 +172,9 @@ const FABRIC_STUBS: &[(&str, &str)] = &[
          public final class ServerLifecycleEvents {\n\
            public static final Event<ServerStarted> SERVER_STARTED = null;\n\
            public static final Event<ServerStarting> SERVER_STARTING = null;\n\
+           public static final Event<ServerStopping> SERVER_STOPPING = null;\n\
            public interface ServerStarted { void onServerStarted(MinecraftServer server); }\n\
+           public interface ServerStopping { void onServerStopping(MinecraftServer server); }\n\
            public interface ServerStarting { void onServerStarting(MinecraftServer server); } }",
     ),
     (
@@ -209,6 +211,7 @@ public final class TickMod {
   public static int started;
   public static String firstPlayer;
   public static int refused;
+  public static int stopping;
   static final class Started implements ServerLifecycleEvents.ServerStarted {
     public void onServerStarted(MinecraftServer server) {
       started++;
@@ -226,6 +229,9 @@ public final class TickMod {
     ServerLifecycleEvents.SERVER_STARTING.register(TickMod::starting);
     ServerLivingEntityEvents.ALLOW_DEATH.register((entity, source, amount) -> amount < 10.0f);
     CommandRegistrationCallback.EVENT.register((dispatcher, context, selection) -> { });
+    // An event wrapper's shape: a `Consumer` handed on as `handler::accept`.
+    java.util.function.Consumer<MinecraftServer> handler = server -> stopping++;
+    ServerLifecycleEvents.SERVER_STOPPING.register(handler::accept);
   }
   static void starting(MinecraftServer server) {
     refused++;
@@ -275,6 +281,10 @@ fn fabric_listeners_keep_their_event_and_run_once_per_firing() {
             (
                 GameEvent::LivingAllowDeath,
                 "ServerLivingEntityEvents.ALLOW_DEATH"
+            ),
+            (
+                GameEvent::ServerStopping,
+                "ServerLifecycleEvents.SERVER_STOPPING"
             ),
         ]
     );
@@ -365,6 +375,21 @@ fn fabric_listeners_keep_their_event_and_run_once_per_firing() {
     }
     assert_eq!(
         static_value(&host, "demo/TickMod", "refusedI"),
+        Some(Value::Int(1))
+    );
+
+    // `handler::accept` runs the lambda the handler is.
+    let mut firing = EventFiring::new(
+        GameEvent::ServerStopping,
+        facade(0),
+        EventContext::default(),
+    );
+    assert_eq!(
+        fire(&jar, &mut host, &found.listeners, &mut firing).unwrap(),
+        1
+    );
+    assert_eq!(
+        static_value(&host, "demo/TickMod", "stoppingI"),
         Some(Value::Int(1))
     );
     let _ = fs::remove_dir_all(root);

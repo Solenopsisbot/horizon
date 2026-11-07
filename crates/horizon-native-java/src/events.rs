@@ -1373,6 +1373,32 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
 }
 
 impl NativeJar {
+    /// Follow a method reference to a functional interface's own method on a
+    /// captured lambda (`handler::accept`, the shape Architectury-style event
+    /// wrappers register) to the jar method that lambda names. Bounded: eight
+    /// links, and only while the target is not a class of this jar.
+    fn unwrap_indy(
+        &self,
+        mut target: MethodRef,
+        mut captures: Vec<Value>,
+    ) -> (MethodRef, Vec<Value>) {
+        for _ in 0..8 {
+            if self.classes.contains_key(&target.owner) {
+                break;
+            }
+            let Some(Value::Ref(Some(inner))) = captures.first() else {
+                break;
+            };
+            let Ok(inner) = parse_callback_marker(inner) else {
+                break;
+            };
+            let mut next = inner.captures;
+            next.extend(captures.drain(1..));
+            (target, captures) = (inner.target, next);
+        }
+        (target, captures)
+    }
+
     /// Run one listener this jar registered for `firing`, through `host` (the
     /// host its entrypoints ran on, so its statics are the jar's).
     ///
@@ -1401,6 +1427,7 @@ impl NativeJar {
         };
         let (target, receiver, args) = match &listener.callback {
             ListenerCallback::Indy { target, captures } => {
+                let (target, captures) = self.unwrap_indy(target.clone(), captures.clone());
                 let is_static = self
                     .classes
                     .get(&target.owner)
@@ -1412,7 +1439,7 @@ impl NativeJar {
                             target.owner, target.name, target.descriptor
                         ))
                     })?;
-                let mut captures = captures.clone();
+                let mut captures = captures;
                 let receiver = if is_static {
                     None
                 } else if captures.is_empty() {
@@ -1426,10 +1453,11 @@ impl NativeJar {
                 (target, receiver, captures)
             }
             ListenerCallback::Object { receiver, method } => {
-                (method, Some(receiver.clone()), event_args)
+                (method.clone(), Some(receiver.clone()), event_args)
             }
-            ListenerCallback::Static { method } => (method, None, event_args),
+            ListenerCallback::Static { method } => (method.clone(), None, event_args),
         };
+        let target = &target;
         let expected = arg_count(&target.descriptor);
         if args.len() != expected {
             return Err(NativeError::Metadata(format!(
