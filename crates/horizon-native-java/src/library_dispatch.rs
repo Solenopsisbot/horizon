@@ -18,6 +18,10 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // A config library's defaults (`client_config.rs`).
+        if let Some(value) = self.invoke_config_library(r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // Runtime-built method handles (`method_handles.rs`) before the
         // proxy module's lookups, which refuse every JDK member.
         if let Some(value) = self.invoke_method_handle_model(r, receiver, args)? {

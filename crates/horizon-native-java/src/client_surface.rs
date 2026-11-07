@@ -57,9 +57,13 @@ use crate::{
 #[path = "client_items.rs"]
 mod items;
 pub use items::{ClientEffect, ClientItem, ClientStack, ItemTable, StackSlot};
-// Styles on chat components, as legacy codes inside their text.
+// Style objects (`Style`, `TextColor`, `ChatFormatting`).
 #[path = "client_text.rs"]
 mod text;
+// Config libraries' defaults (`AutoConfig`, YACL), for the interpreter's
+// library dispatch.
+#[path = "client_config.rs"]
+mod config;
 
 /// `Minecraft.getInstance()`, and every client listener's `Minecraft`.
 pub const MINECRAFT: &str = "client/minecraft";
@@ -343,6 +347,8 @@ pub struct ClientSnapshot {
     pub render_distance: i32,
     /// `options.mainHand()`: the player's main arm is the left one.
     pub left_handed: bool,
+    /// The single-player world is open to LAN (`IntegratedServer.isPublished`).
+    pub lan_open: bool,
     /// The camera: eye position, rotation (degrees) and whether it is
     /// detached (third person).
     pub camera: Option<ClientCamera>,
@@ -938,6 +944,7 @@ impl StdHost {
                     .and_then(|f| f.player.as_ref())
                     .map_or(Value::Ref(None), |_| marker(GAME_MODE)),
                 "gameRenderer" => marker(GAME_RENDERER),
+                "debugEntries" => marker(DEBUG),
                 _ if frame.is_some() => return refuse(),
                 _ => return None,
             })),
@@ -969,6 +976,20 @@ impl StdHost {
                     items::EFFECT_HOLDER,
                     items::effect_constant_id(name)
                 ))))
+            }
+            // `EquipmentSlot.VALUES`: every slot in declaration order.
+            ("net/minecraft/world/entity/EquipmentSlot", "VALUES") => {
+                let slots: Vec<Value> = [
+                    "MAINHAND", "OFFHAND", "FEET", "LEGS", "CHEST", "HEAD", "BODY", "SADDLE",
+                ]
+                .iter()
+                .map(|name| {
+                    marker(format!(
+                        "enum/net/minecraft/world/entity/EquipmentSlot/{name}"
+                    ))
+                })
+                .collect();
+                Some(Ok(crate::collection_value("list", &slots)))
             }
             ("net/minecraft/world/item/ItemStack", "EMPTY") if frame.is_some() => {
                 Some(Ok(marker(format!("{}empty", items::STACK))))
@@ -1040,6 +1061,14 @@ impl StdHost {
         }
         let text = expect_ref(receiver)?.clone();
         let refuse = || Err(NativeError::UnknownHostCall(r.clone()));
+        // `NonNullList` is a `List`: the inventory's lists answer as one.
+        if r.owner == "net/minecraft/core/NonNullList" && text.starts_with("list") {
+            let as_list = MethodRef {
+                owner: "java/util/List".into(),
+                ..r.clone()
+            };
+            return Some(crate::Host::invoke_instance(self, &as_list, receiver, args));
+        }
         // Constructors record their arguments against the new object.
         if r.name == "<init>" {
             if r.owner == KEY_MAPPING {
@@ -1374,6 +1403,7 @@ impl StdHost {
             GUI | HUD => match (name, returns) {
                 ("getChat", _) => Some(marker(CHAT)),
                 ("getGuiTicks", "I") => int(frame.gui_ticks),
+                ("isHidden", "Z") => Some(flag(frame.hide_gui)),
                 // 26.3 reads the open screen through the GUI.
                 ("screen", _) if !frame.screen_open => Some(Value::Ref(None)),
                 ("setOverlayMessage", "V") => {
@@ -1462,7 +1492,9 @@ impl StdHost {
                 }
             }
             GAME_RENDERER => match (name, returns) {
-                ("getMainCamera", _) if frame.camera.is_some() => Some(marker(CAMERA)),
+                ("getMainCamera" | "mainCamera", _) if frame.camera.is_some() => {
+                    Some(marker(CAMERA))
+                }
                 _ => None,
             },
             CAMERA => {
@@ -1494,6 +1526,7 @@ impl StdHost {
             INTEGRATED_SERVER => match (name, returns) {
                 ("isDedicatedServer", "Z") => Some(flag(false)),
                 ("isSingleplayer", "Z") => Some(flag(true)),
+                ("isPublished", "Z") => Some(flag(frame.lan_open)),
                 _ => None,
             },
             USER => {
@@ -1512,7 +1545,9 @@ impl StdHost {
                 _ => None,
             },
             DEBUG => match (name, returns) {
-                ("showDebugScreen", "Z") => Some(flag(frame.debug_screen)),
+                // `getDebugOverlay().showDebugScreen()` and 26.3's
+                // `debugEntries.isOverlayVisible()`.
+                ("showDebugScreen" | "isOverlayVisible", "Z") => Some(flag(frame.debug_screen)),
                 _ => None,
             },
             FONT => match (name, returns) {

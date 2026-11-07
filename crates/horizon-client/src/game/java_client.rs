@@ -620,6 +620,7 @@ impl Game<'_> {
             gui_ticks: self.visual_ticks() as i32,
             render_distance: self.settings.render_distance,
             left_handed: self.settings.main_hand_left,
+            lan_open: self.lan.is_some(),
             camera: in_world
                 .then(|| self.eye_position())
                 .flatten()
@@ -1379,6 +1380,12 @@ mod tests {
                 health: 20.0,
                 max_health: 20.0,
                 on_ground: true,
+                game_mode: "SURVIVAL".into(),
+                inventory: vec![horizon_native_java::client_surface::ClientStack::empty(); 36],
+                food: 20,
+                saturation: 5.0,
+                air: 300,
+                max_air: 300,
                 ..ClientPlayer::default()
             }),
             level: Some(ClientLevel {
@@ -1390,6 +1397,11 @@ mod tests {
             }),
             gui_size: [427, 240],
             window_size: [854, 480],
+            render_distance: 12,
+            camera: Some(ClientCamera {
+                pos: [0.5, 65.62, 0.5],
+                ..ClientCamera::default()
+            }),
             gui_scale: 2.0,
             fps: 60,
             // Single player, the common case: no server data to ask for.
