@@ -136,3 +136,42 @@ fn fml_loader_runs_a_real_mod_when_installed() {
     assert!(text.contains("real loader: FML probe completed"), "{text}");
     let _ = fs::remove_dir_all(root);
 }
+
+/// The game's opt-in preflight runs FML with no `--java-mod` (the installed
+/// server's own mods are the load), so a jar-less `--real-loader --entry-kind
+/// neoforge` must reach the FML path instead of stopping at the usage line.
+/// Without an install the path's own error is the answer; with one
+/// (`NEOFORGE_SERVER_DIR`), the run completes and lists `neoforge`.
+#[test]
+fn a_jarless_fml_run_reaches_the_loader() {
+    let empty = std::env::temp_dir().join(format!("horizon-fml-empty-{}", std::process::id()));
+    fs::create_dir_all(&empty).unwrap();
+    let installed = std::env::var_os("NEOFORGE_SERVER_DIR");
+    let libs = installed
+        .as_ref()
+        .map(|server| PathBuf::from(server).join("libraries"))
+        .unwrap_or_else(|| empty.clone());
+    let output = Command::new(env!("CARGO_BIN_EXE_horizon-jvm"))
+        .args(["--real-loader", "--entry-kind", "neoforge", "--libs"])
+        .arg(&libs)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(&empty);
+    assert!(!text.contains("usage: horizon-jvm"), "{text}");
+    if installed.is_none() {
+        assert!(!output.status.success(), "{text}");
+        assert!(
+            text.contains("no NeoForge unix_args.txt classpath found"),
+            "{text}"
+        );
+    } else {
+        assert!(output.status.success(), "FML probe failed:\n{text}");
+        assert!(text.contains("mod=neoforge"), "{text}");
+        assert!(text.contains("real loader: FML probe completed"), "{text}");
+    }
+}

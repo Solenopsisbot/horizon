@@ -1393,7 +1393,11 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    if args.is_empty() && !fml_flags.list && !fml_flags.report {
+    // A real FML run needs no jar either: the installed server's own mods
+    // (`minecraft`, `neoforge`) are the load, which is what the game's opt-in
+    // preflight asks for when it was given no `--java-mod`.
+    let fml_run = real_loader && entry_kind == "neoforge";
+    if args.is_empty() && !fml_flags.list && !fml_flags.report && !fml_run {
         // `--remap-report` alone is a complete request: the line above is the
         // whole answer, and an empty jar list is not an error for it.
         if remap_report {
