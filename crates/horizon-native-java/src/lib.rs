@@ -3729,6 +3729,9 @@ impl Host for StdHost {
         if let Some(value) = jdk_model::static_call(r, args) {
             return value;
         }
+        if let Some(value) = self.collection_copy_of(r, args) {
+            return value;
+        }
         if let Some(value) = dfu_pair::static_call(r, args) {
             return value;
         }
@@ -6345,6 +6348,10 @@ impl Host for StdHost {
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 ("getKey", "()Ljava/lang/Object;") => Ok(key),
                 ("getValue", "()Ljava/lang/Object;") => Ok(value),
+                ("setValue", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
+                    let replacement = Self::argument(r, args, 0)?.clone();
+                    self.entry_set_value(&key, &value, replacement)
+                }
                 ("equals", "(Ljava/lang/Object;)Z") => {
                     let equal = map_entry_parts(Self::argument(r, args, 0)?).is_ok_and(
                         |(other_key, other_value)| key == other_key && value == other_value,

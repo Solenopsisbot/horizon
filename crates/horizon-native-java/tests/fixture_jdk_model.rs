@@ -336,6 +336,43 @@ public final class Probe {
             "hello", -1) + String.format("%.2f|%.2f|%.0f", 2.675, 9.995, 2.5);
     }
 
+    public static String entrySetValue() {
+        Map<String, List<Integer>> coats = new HashMap<>();
+        coats.put("bay", new ArrayList<>(List.of(1, 2)));
+        coats.put("grey", new ArrayList<>(List.of(3)));
+        int replaced = 0;
+        for (Map.Entry<String, List<Integer>> entry : coats.entrySet()) {
+            List<Integer> before = entry.setValue(List.of(0, 0, 0, 0));
+            replaced += before.size();
+        }
+        String immutable;
+        try {
+            Map.entry("k", 1).setValue(2);
+            immutable = "set";
+        } catch (UnsupportedOperationException error) {
+            immutable = "unsupported";
+        }
+        return replaced + "|" + coats.get("bay").size() + "|" + coats.get("grey").size() + "|"
+            + immutable;
+    }
+
+    public static String copies() {
+        List<String> source = new ArrayList<>(List.of("a", "b", "a"));
+        List<String> list = List.copyOf(source);
+        java.util.Set<String> set = java.util.Set.copyOf(source);
+        source.add("c");
+        String nulls;
+        try {
+            List<String> withNull = new ArrayList<>();
+            withNull.add(null);
+            List.copyOf(withNull);
+            nulls = "copied";
+        } catch (NullPointerException error) {
+            nulls = "npe";
+        }
+        return list.size() + "|" + list.get(1) + "|" + set.size() + "|" + nulls;
+    }
+
     public static String classKinds() {
         return Marker.class.isInterface() + "|" + Probe.class.isInterface() + "|"
             + Ranked.class.isInterface();
@@ -621,4 +658,16 @@ fn string_format_widths_flags_hex_and_half_up_precision() {
         fixture.text("formats"),
         "[00ff|ab   |   ab|-0042|7   |FF|he|ffffffff]2.68|10.00|3"
     );
+}
+
+#[test]
+fn entry_set_value_writes_through_to_its_map() {
+    let fixture = Fixture::build("entry-set-value");
+    assert_eq!(fixture.text("entrySetValue"), "3|4|4|unsupported");
+}
+
+#[test]
+fn collection_copy_of_copies_and_rejects_nulls() {
+    let fixture = Fixture::build("copy-of");
+    assert_eq!(fixture.text("copies"), "3|b|2|npe");
 }

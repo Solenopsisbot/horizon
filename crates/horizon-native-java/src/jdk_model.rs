@@ -347,6 +347,108 @@ pub(crate) fn to_map_collector(r: &MethodRef, args: &[Value]) -> Option<Value> {
 }
 
 impl crate::StdHost {
+    /// `List.copyOf`, `Set.copyOf` and `Map.copyOf`: an immutable copy of a
+    /// collection the host can read, with the JDK's rules (a `null` element
+    /// throws `NullPointerException`, a set keeps the first of equal
+    /// elements). Without this the call answered an empty neutral list, and
+    /// icy-better-horses found every breed's coat list empty.
+    pub(crate) fn collection_copy_of(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        let kind = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            ("java/util/List", "copyOf", "(Ljava/util/Collection;)Ljava/util/List;") => "list",
+            ("java/util/Set", "copyOf", "(Ljava/util/Collection;)Ljava/util/Set;") => "set",
+            ("java/util/Map", "copyOf", "(Ljava/util/Map;)Ljava/util/Map;") => "map",
+            _ => return None,
+        };
+        let source = args.first()?;
+        let null_pointer = || NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: None,
+            frame: None,
+        };
+        if matches!(source, Value::Ref(None)) {
+            return Some(Err(null_pointer()));
+        }
+        let values = match super::host_collection_values(self, source).and_then(|items| {
+            items
+                .iter()
+                .map(|item| super::parse_collection_value(item))
+                .collect::<Result<Vec<_>, _>>()
+        }) {
+            Ok(values) => values,
+            Err(error) => return Some(Err(error)),
+        };
+        if values.iter().any(|value| matches!(value, Value::Ref(None))) {
+            return Some(Err(null_pointer()));
+        }
+        let values = if kind == "set" {
+            let mut seen = std::collections::BTreeSet::new();
+            values
+                .into_iter()
+                .filter(|value| seen.insert(super::value_marker(value)))
+                .collect()
+        } else {
+            values
+        };
+        Some(Ok(super::collection_value(kind, &values)))
+    }
+
+    /// `Map.Entry.setValue` on an entry `entrySet()` handed out.
+    ///
+    /// An entry marker is a value (`map-entry/k,v`), not a view, so the write
+    /// goes to the one host map that holds exactly this key and value: the
+    /// map the entry came from (`for (e : map.entrySet()) e.setValue(...)`,
+    /// icy-better-horses freezing its coat lists). The earlier value is the
+    /// answer, as on the JVM. An entry no mutable map holds is an immutable
+    /// `Map.entry`, which raises `UnsupportedOperationException`; one that
+    /// several maps hold is refused rather than written to a guess. The
+    /// entry marker itself keeps its old value: a later `getValue()` on the
+    /// same entry reads the value it was created with.
+    pub(crate) fn entry_set_value(
+        &mut self,
+        key: &Value,
+        old: &Value,
+        replacement: Value,
+    ) -> Result<Value, NativeError> {
+        let holders = self
+            .mutable_collections
+            .iter()
+            .filter(|(marker, _)| {
+                super::is_map_owner(
+                    marker
+                        .split_once('#')
+                        .map_or(marker.as_str(), |(class, _)| class),
+                )
+            })
+            .filter_map(|(marker, values)| {
+                values
+                    .chunks_exact(2)
+                    .position(|pair| &pair[0] == key && &pair[1] == old)
+                    .map(|pair| (marker.clone(), pair * 2 + 1))
+            })
+            .collect::<Vec<_>>();
+        match holders.as_slice() {
+            [] => Err(NativeError::UncaughtException {
+                class: "java/lang/UnsupportedOperationException".into(),
+                message: None,
+                frame: None,
+            }),
+            [(marker, index)] => {
+                let values = self
+                    .mutable_collections
+                    .get_mut(marker)
+                    .expect("the holder was just found");
+                Ok(std::mem::replace(&mut values[*index], replacement))
+            }
+            _ => Err(NativeError::Metadata(
+                "Map.Entry.setValue: several maps hold this entry".into(),
+            )),
+        }
+    }
+
     /// `List.subList(from, to)` on a list the host holds.
     ///
     /// The JDK answers a view; the bounded host answers a copy of the range
