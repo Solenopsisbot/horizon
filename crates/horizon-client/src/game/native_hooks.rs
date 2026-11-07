@@ -7127,7 +7127,9 @@ impl Game<'_> {
     /// Server-side. API 57.
     pub(super) fn native_player_logged_out(&mut self, player: u128, name: &str) {
         mod_api::dispatch_player_logged_out(self, mod_api::mods(), player, name);
-        // The Java hook tier's next player with this UUID is a new object.
+        // A Java `@Inject` at `PlayerList.remove`'s HEAD, then the Java hook
+        // tier's next player with this UUID is a new object.
+        self.java_hook_player_list_remove(player, name);
         self.java_hook_player_logged_out(player);
     }
     /// `player` (`name`) respawned (NeoForge's `PlayerRespawnEvent`): at the
@@ -10341,6 +10343,8 @@ impl Game<'_> {
             if pressed {
                 self.native_panel_key(name);
             }
+            // Java mods' key mappings click on it (`java_client`).
+            self.java_client_key(name, pressed);
             self.native_key(name, pressed);
         }
     }
@@ -10364,6 +10368,7 @@ impl Game<'_> {
     /// A mouse button while playing, for `native_key`.
     pub(super) fn native_mouse_event(&mut self, button: MouseButton, pressed: bool) {
         let name = keybinds::mouse_name(button);
+        self.java_client_key(&name, pressed);
         self.native_key(&name, pressed);
     }
     /// Wheel steps while playing: whether a native mod took them.

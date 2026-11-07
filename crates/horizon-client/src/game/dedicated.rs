@@ -1133,7 +1133,7 @@ impl Game<'_> {
         self.native_configs_server_start(&world_dir, true);
         // MinecraftServer.loadLevel's start: nothing is loaded yet.
         self.native_server_about_to_start(true);
-        self.java_server_starting();
+        self.java_server_starting(&world_dir);
         self.native_lifecycle_open_started();
         // The registries the server sends are read while the world prepares.
         let sync = super::lan::preload_sync_data(&self.options.resources);
@@ -2453,6 +2453,8 @@ impl Game<'_> {
         self.log_saved_levels();
         // Only a successful final save closes the epoch; storage is still held.
         self.native_lifecycle_world_closed();
+        // A Java `@Inject` at `MinecraftServer.stopServer`'s TAIL.
+        self.java_hook_server_stopped();
         self.java_server_stopped();
         self.lan_close(false);
         Ok(())

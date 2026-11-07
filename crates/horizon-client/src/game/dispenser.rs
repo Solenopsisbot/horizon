@@ -1487,10 +1487,15 @@ impl Game<'_> {
     ) -> Result<Dispensed> {
         let target = offset(pos, facing);
         let target_pos = Self::pos_of(target);
+        // A Java `@Inject` at `BoneMealItem.growCrop`'s HEAD may answer it
+        // (`java_grow_crop`): a cancelled growCrop uses no meal, and its
+        // `false` goes on to growWaterPlant.
+        let java = self.java_hook_grow_crop(&stack, target_pos);
         let grown = self.with_level(|b, level, ticks| {
-            b.grow_crop(level, ticks, target_pos)
+            java.unwrap_or_else(|| b.grow_crop(level, ticks, target_pos))
                 || b.grow_water_plant(level, ticks, target_pos, None)
         });
+        let consumed = grown && java != Some(true);
         if grown {
             self.level_events
                 .push(horizon_world::level::LevelEvent::LevelEvent {
@@ -1501,7 +1506,7 @@ impl Game<'_> {
         }
         self.process_level_events()?;
         if grown {
-            Ok((shrink(stack), CLICK))
+            Ok((if consumed { shrink(stack) } else { Some(stack) }, CLICK))
         } else {
             Ok((Some(stack), FAIL))
         }

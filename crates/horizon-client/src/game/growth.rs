@@ -30,11 +30,49 @@ impl Game<'_> {
             _ => Direction::East,
         };
         let pos = BlockPos::new(hit.pos[0], hit.pos[1], hit.pos[2]);
-        let used = self.with_level(|b, level, ticks| b.use_bone_meal(level, ticks, pos, face));
+        // A Java `@Inject` at `BoneMealItem.growCrop`'s HEAD may answer it
+        // (`java_grow_crop`); `consumed` is whether `growCrop` or
+        // `growWaterPlant` used the meal up, which a cancelled one does not.
+        let (used, consumed) = match self.java_hook_grow_crop(stack, pos) {
+            None => {
+                let used =
+                    self.with_level(|b, level, ticks| b.use_bone_meal(level, ticks, pos, face));
+                (used, used)
+            }
+            Some(true) => {
+                // useOn's success at the crop: growth particles, no meal used.
+                self.level_events
+                    .push(horizon_world::level::LevelEvent::LevelEvent {
+                        id: 1505,
+                        pos,
+                        data: 15,
+                    });
+                (true, false)
+            }
+            Some(false) => {
+                // useOn goes on to growWaterPlant beside a sturdy clicked face.
+                let [dx, dy, dz] = face.normal();
+                let relative = pos.offset(dx, dy, dz);
+                let used = self.with_level(|b, level, ticks| {
+                    let clicked = horizon_world::level::LevelAccess::block_state(level, pos);
+                    b.is_face_sturdy(clicked, face)
+                        && b.grow_water_plant(level, ticks, relative, Some(face))
+                });
+                if used {
+                    self.level_events
+                        .push(horizon_world::level::LevelEvent::LevelEvent {
+                            id: 1505,
+                            pos: relative,
+                            data: 15,
+                        });
+                }
+                (used, used)
+            }
+        };
         // ItemStack.causeUseVibration at the player, after the meal is used
         // up (shrunk even in creative): an emptied stack has no use effects.
         if used
-            && stack.count > 1
+            && (stack.count > 1 || !consumed)
             && let Some(p) = self.player.as_ref().map(|p| p.position)
         {
             let ctx = self.player_context(None);
@@ -45,7 +83,9 @@ impl Game<'_> {
             self.swing_arm();
             // ItemStack.useOn: an item interaction counts as a use.
             self.award_stat("used", &stack.item, 1);
-            self.consume_held();
+            if consumed {
+                self.consume_held();
+            }
         }
         Ok(used)
     }

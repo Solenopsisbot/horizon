@@ -3924,6 +3924,8 @@ impl Game<'_> {
                 self.guest_die(host, gi, conn);
                 continue;
             }
+            // A Java `@Inject` at `ServerPlayer.tick`'s (and `Player.tick`'s) HEAD.
+            self.java_guest_tick_head(host, conn);
             let play = host.play.entry(conn).or_default();
             // ServerGamePacketListenerImpl.tick's dropSpamThrottler.
             play.creative_drops = play.creative_drops.saturating_sub(1);

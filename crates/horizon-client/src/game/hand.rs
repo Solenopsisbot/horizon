@@ -414,6 +414,8 @@ impl Game<'_> {
         if self.player.as_ref().is_some_and(|p| !p.ground.on_ground) {
             speed /= 5.0;
         }
+        // A Java `@Inject` at `Player.getDestroySpeed`'s RETURN may replace it.
+        let speed = self.java_hook_destroy_speed(state, speed);
         speed / hardness / if harvest { 30.0 } else { 100.0 }
     }
     /// A key for the main-hand stack (`destroyingItem`): its item and components.

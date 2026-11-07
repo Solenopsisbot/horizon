@@ -161,6 +161,8 @@ mod item_areas;
 mod item_draw;
 mod item_particles;
 mod item_use;
+mod java_client;
+mod java_commands;
 mod java_content;
 mod java_events;
 mod java_game_hooks;
@@ -7620,6 +7622,8 @@ impl Game<'_> {
         {
             speed *= self.submerged_mining_speed();
         }
+        // A Java `@Inject` at `Player.getDestroySpeed`'s RETURN may replace it.
+        speed = self.java_hook_destroy_speed(state, speed);
         let progress = if hardness == 0.0 {
             1.0
         } else {
@@ -13067,6 +13071,7 @@ impl Game<'_> {
         if self.native_window() && !self.native_client_stopped {
             self.native_client_stopped = true;
             self.native_client_stopping();
+            self.java_client_stopping();
         }
         // Native application termination can bypass CloseRequested. Finish any
         // save screen synchronously here, before the process can go away.
@@ -19229,6 +19234,9 @@ impl Game<'_> {
                     let steps = self.clock.advance(elapsed);
                     for _ in 0..steps {
                         let started = Instant::now();
+                        // Java client mods' `START_CLIENT_TICK` / `ClientTickEvent.Pre`
+                        // (`java_client`), every tick in a world or not.
+                        self.java_client_tick(true);
                         if self.title.is_none() && !self.pause {
                             if self.tick_script.armed() {
                                 self.tick_script_step(event_loop);
@@ -19251,6 +19259,7 @@ impl Game<'_> {
                         self.tick_chat_queue();
                         self.tick_music();
                         self.tick_sound_engine();
+                        self.java_client_tick(false);
                         self.clock.record(started.elapsed());
                         if let Some(report) = self.clock.take_sprint_report() {
                             self.sprint_report(&report);

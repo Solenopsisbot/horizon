@@ -34,8 +34,8 @@ use super::native_server::NativeServerPlayer;
 #[cfg(test)]
 use horizon_native_java::StdHost;
 use horizon_native_java::{
-    ExecutionBudget, GAME_HOOK_SITES, GameHookContext, GameHookEffect, GameHookRegistrations,
-    GameHookState, GameObject, NativeJar, Value,
+    ExecutionBudget, GameHookContext, GameHookEffect, GameHookRegistrations, GameHookState,
+    GameObject, NativeJar, Value, every_game_hook_site,
 };
 use std::{
     cell::Cell,
@@ -43,7 +43,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -79,10 +79,11 @@ struct JavaGameHookJar {
 static JAVA_GAME_HOOKS: Mutex<BTreeMap<HandlerRole, Vec<JavaGameHookJar>>> =
     Mutex::new(BTreeMap::new());
 
-/// Per role, one bit per hook name (its first row in `GAME_HOOK_SITES`) that
-/// any of the role's jars still fires. Read before anything else at every hook
-/// point, so a game with no bound jar pays one relaxed load.
-static BOUND: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+/// Per role, one bit per hook name (its first row in `GAME_HOOK_SITES`, then
+/// the internal `JAVA_TIER_SITES`) that any of the role's jars still fires.
+/// Read before anything else at every hook point, so a game with no bound jar
+/// pays one relaxed load.
+static BOUND: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Player generations, per role: a respawn or a logout makes the next player
 /// object a new one, as a new `ServerPlayer` is.
@@ -100,12 +101,17 @@ thread_local! {
 }
 
 /// What one firing of a host hook point did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct JavaGameHookOutcome {
     /// How many callbacks ran; a cancellation stops the ones after it.
     pub(super) ran: usize,
     /// Whether a callback cancelled the vanilla work at this point.
     pub(super) cancelled: bool,
+    /// What a value-returning site's callbacks made the vanilla method return
+    /// (`GameHookRun::returned`): at a `HEAD` site the cancelled call's
+    /// result, at a `RETURN`/`TAIL` site the override of the result the game
+    /// handed in. `None` leaves the game's own value.
+    pub(super) returned: Option<Value>,
     /// Jars whose callbacks failed at this firing (and are now disabled here).
     pub(super) failed: usize,
 }
@@ -118,10 +124,10 @@ fn role_index(role: HandlerRole) -> usize {
     }
 }
 
-/// The hook's bit: the index of its first row in the site table.
-fn hook_bit(hook: &str) -> Option<u32> {
-    GAME_HOOK_SITES
-        .iter()
+/// The hook's bit: the index of its first row over both site tables. The
+/// tables hold far fewer than 64 rows (a unit test keeps it so).
+fn hook_bit(hook: &str) -> Option<u64> {
+    every_game_hook_site()
         .position(|site| site.hook == hook)
         .map(|index| 1 << index)
 }
@@ -231,6 +237,25 @@ pub(super) fn run_java_game_hook(
     receiver: Option<Value>,
     args: &[Value],
 ) -> JavaGameHookOutcome {
+    run_java_game_hook_returning(role, hook, context, receiver, args, None)
+}
+
+/// [`run_java_game_hook`] for a site whose vanilla method returns a value:
+/// `actual` is the game's own result at a `RETURN`/`TAIL` site (`None` at a
+/// `HEAD` one), and [`JavaGameHookOutcome::returned`] is what the game must
+/// use instead, if anything.
+///
+/// Every jar sees the game's own `actual`: an override is made by a
+/// cancellable callback, and its cancel stops the callbacks after it, so no
+/// later jar ever reads an earlier jar's override, as in Mixin.
+pub(super) fn run_java_game_hook_returning(
+    role: HandlerRole,
+    hook: &str,
+    context: &mut GameHookContext,
+    receiver: Option<Value>,
+    args: &[Value],
+    actual: Option<Value>,
+) -> JavaGameHookOutcome {
     let mut outcome = JavaGameHookOutcome::default();
     if !java_game_hook_bound(role, hook) {
         return outcome;
@@ -261,13 +286,14 @@ pub(super) fn run_java_game_hook(
             let mut host = lock_resident(host);
             host.set_strict_unknown_host_calls(true);
             let mark = host.call_log_mark();
-            let run = jar.run_game_hook_in(
+            let run = jar.run_game_hook_returning(
                 registrations,
                 state,
                 context,
                 hook,
                 receiver.clone(),
                 args,
+                actual.clone(),
                 &mut *host,
                 &budget,
             );
@@ -287,6 +313,9 @@ pub(super) fn run_java_game_hook(
                     );
                 }
                 outcome.ran += run.ran;
+                if run.returned.is_some() {
+                    outcome.returned = run.returned;
+                }
                 if run.cancelled {
                     outcome.cancelled = true;
                     break;
@@ -492,6 +521,28 @@ impl Game<'_> {
             Some(p) => player_object(p),
             None => GameObject::player(uuid, name),
         };
+        // The hands are known only for the player swapped in for this hook
+        // point: their inventory is the `Game`'s now.
+        if self
+            .native_acting_player()
+            .is_some_and(|acting| acting.uuid == uuid)
+        {
+            let stack = |s: Option<&horizon_client::items::ItemStack>| {
+                s.filter(|s| s.count > 0).map_or_else(
+                    || ("minecraft:air".to_owned(), 0),
+                    |s| {
+                        let item = if s.item.contains(':') {
+                            s.item.to_string()
+                        } else {
+                            format!("minecraft:{}", s.item)
+                        };
+                        (item, i32::try_from(s.count).unwrap_or(i32::MAX))
+                    },
+                )
+            };
+            let (main, off) = (stack(self.held()), stack(self.offhand.as_ref()));
+            object = object.with_hands((&main.0, main.1), (&off.0, off.1));
+        }
         object.key = format!("{}.{}", object.key, player_generation(role, uuid));
         if object.name.as_deref().is_none_or(str::is_empty) {
             object.name = Some(name.to_owned());
@@ -524,6 +575,25 @@ impl Game<'_> {
         Some(self.java_player_object(player.uuid, &player.name))
     }
 
+    /// A guest's remote address as Java's `InetSocketAddress.toString` prints
+    /// an accepted socket's (`/127.0.0.1:52144`). IPv6 is left out: Java
+    /// spells it uncompressed, which `SocketAddr` does not.
+    fn java_guest_address(&self, player: u128) -> Option<String> {
+        let guest = self
+            .lan
+            .as_ref()?
+            .hub
+            .guests
+            .iter()
+            .find(|g| g.uuid == player)?;
+        match guest.address {
+            // Port 0 is the window's own memory connection, which vanilla
+            // names a `LocalAddress`, not a socket.
+            std::net::SocketAddr::V4(address) if address.port() != 0 => Some(format!("/{address}")),
+            _ => None,
+        }
+    }
+
     fn java_server_object(&self) -> GameObject {
         GameObject::server(self.java_hook_role() == HandlerRole::DedicatedServer)
     }
@@ -533,15 +603,33 @@ impl Game<'_> {
         &mut self,
         role: HandlerRole,
         hook: &str,
-        mut context: GameHookContext,
+        context: GameHookContext,
         receiver: Option<Value>,
         args: &[Value],
     ) -> JavaGameHookOutcome {
-        // A server object is always reachable through `getServer`.
+        self.java_fire_returning(role, hook, context, receiver, args, None)
+    }
+
+    /// [`Self::java_fire`] at a value-returning site, with the game's own
+    /// result at a `RETURN`/`TAIL` one (`run_java_game_hook_returning`).
+    fn java_fire_returning(
+        &mut self,
+        role: HandlerRole,
+        hook: &str,
+        mut context: GameHookContext,
+        receiver: Option<Value>,
+        args: &[Value],
+        actual: Option<Value>,
+    ) -> JavaGameHookOutcome {
+        // A server object is always reachable through `getServer`, and the
+        // server-wide members (world path, game rules, registries, which
+        // channels a client takes) answer from the server's own state.
         if self.java_hook_role() != HandlerRole::Client {
             context.insert(self.java_server_object());
+            context.set_server_facts(self.java_server_facts());
         }
-        let outcome = run_java_game_hook(role, hook, &mut context, receiver, args);
+        let outcome =
+            run_java_game_hook_returning(role, hook, &mut context, receiver, args, actual);
         for effect in context.take_effects() {
             match effect {
                 GameHookEffect::SystemMessage { player, text } => {
@@ -552,8 +640,11 @@ impl Game<'_> {
         outcome
     }
 
-    /// `ServerPlayer.tick`'s TAIL for the swapped-in player.
+    /// `ServerPlayer.tick`'s TAIL for the swapped-in player, after the end of
+    /// its `Player.tick` (`java_base_player_tick_tail`, `hook_shapes.rs`):
+    /// Horizon runs the two as one step.
     pub(super) fn java_hook_player_tick(&mut self) {
+        self.java_hook_acting_player("java_base_player_tick_tail");
         let Some(role) = self.java_server_hook("player_tick") else {
             return;
         };
@@ -660,15 +751,24 @@ impl Game<'_> {
         let mut context = GameHookContext::new();
         let joined = self.java_player_object(player, name);
         let receiver = context.insert(joined.clone());
-        let connection = context.insert(GameObject::opaque(
-            "net/minecraft/network/Connection",
-            &anonymous("connection"),
-        ));
+        // The connection knows its remote address (a guest's TCP peer; the
+        // window's own memory connection has none), the cookie the joining
+        // player's profile.
+        let mut connection =
+            GameObject::opaque("net/minecraft/network/Connection", &anonymous("connection"));
+        if let Some(address) = self.java_guest_address(player) {
+            connection = connection.with_address(&address);
+        }
+        let connection = context.insert(connection);
         let joined = context.insert(joined);
-        let cookie = context.insert(GameObject::opaque(
-            "net/minecraft/server/network/CommonListenerCookie",
-            &anonymous("cookie"),
-        ));
+        let cookie = context.insert(
+            GameObject::opaque(
+                "net/minecraft/server/network/CommonListenerCookie",
+                &anonymous("cookie"),
+            )
+            .with_uuid(player)
+            .with_name(name),
+        );
         self.java_fire(
             role,
             "player_logged_in",
@@ -908,6 +1008,158 @@ impl Game<'_> {
             Some(receiver),
             &[watcher],
         );
+    }
+}
+
+/// The mining speed after a `Player.getDestroySpeed` RETURN firing
+/// (`java_destroy_speed`): a cancellable callback's override, else the
+/// game's own `speed`. The override comes back already rounded to `float`.
+fn destroy_speed_from(outcome: &JavaGameHookOutcome, speed: f32) -> f32 {
+    match outcome.returned {
+        Some(Value::Float(overridden)) => overridden as f32,
+        _ => speed,
+    }
+}
+
+/// What a `BoneMealItem.growCrop` HEAD firing (`java_grow_crop`) makes the
+/// method return: `Some` when a callback cancelled (its `setReturnValue`, or
+/// `false`, the type's default, for a bare `cancel()`), `None` to let it run.
+fn grown_from(outcome: &JavaGameHookOutcome) -> Option<bool> {
+    match (outcome.cancelled, &outcome.returned) {
+        (true, Some(Value::Int(grown))) => Some(*grown != 0),
+        (true, _) => Some(false),
+        (false, _) => None,
+    }
+}
+
+/// The Java-tier-only points (`horizon_native_java::JAVA_TIER_SITES`): the
+/// positions the game reaches that the public native-mod API has no hook for,
+/// and the value-returning ones. Each says the vanilla method it stands for;
+/// `hook_shapes.rs` in horizon-native-java holds the table and its notes.
+impl Game<'_> {
+    /// A listen-only point whose receiver is the swapped-in player and whose
+    /// target takes no argument.
+    fn java_hook_acting_player(&mut self, hook: &'static str) {
+        let Some(role) = self.java_server_hook(hook) else {
+            return;
+        };
+        let Some(player) = self.java_acting_player_object() else {
+            return;
+        };
+        let mut context = GameHookContext::new();
+        let receiver = context.insert(player);
+        self.java_fire(role, hook, context, Some(receiver), &[]);
+    }
+
+    /// `ServerPlayer.tick`'s HEAD, then `Player.tick`'s, for the swapped-in
+    /// player: Horizon runs the two methods as one step of a living guest's
+    /// tick, so both heads fire before its digging and item use.
+    fn java_hook_player_tick_head(&mut self) {
+        self.java_hook_acting_player("java_player_tick_head");
+        self.java_hook_acting_player("java_base_player_tick_head");
+    }
+
+    /// Where `tick_guests` starts a living guest's tick: swaps the guest in
+    /// only when a jar bound one of the two heads.
+    pub(super) fn java_guest_tick_head(&mut self, host: &mut super::lan::LanHost, conn: u32) {
+        let role = self.java_hook_role();
+        if role == HandlerRole::Client
+            || !(java_game_hook_bound(role, "java_player_tick_head")
+                || java_game_hook_bound(role, "java_base_player_tick_head"))
+        {
+            return;
+        }
+        self.as_guest(host, conn, |g| g.java_hook_player_tick_head());
+    }
+
+    /// `PlayerList.remove`'s HEAD, from `native_player_logged_out`: the
+    /// leaving player as the receiver (as at `player_logged_in`) and as the
+    /// argument. Horizon has unlisted it already, so the object carries the
+    /// UUID and name only. Called before the next player object starts.
+    pub(super) fn java_hook_player_list_remove(&mut self, player: u128, name: &str) {
+        let Some(role) = self.java_server_hook("java_player_list_remove") else {
+            return;
+        };
+        let mut context = GameHookContext::new();
+        let leaving = self.java_player_object(player, name);
+        let receiver = context.insert(leaving.clone());
+        let leaving = context.insert(leaving);
+        self.java_fire(
+            role,
+            "java_player_list_remove",
+            context,
+            Some(receiver),
+            &[leaving],
+        );
+    }
+
+    /// `MinecraftServer.stopServer`'s TAIL: after the final save and the
+    /// levels' close, before the server's stopped event.
+    pub(super) fn java_hook_server_stopped(&mut self) {
+        let Some(role) = self.java_server_hook("java_server_stopped") else {
+            return;
+        };
+        let mut context = GameHookContext::new();
+        let receiver = context.insert(self.java_server_object());
+        self.java_fire(role, "java_server_stopped", context, Some(receiver), &[]);
+    }
+
+    /// `Player.getDestroySpeed`'s RETURN for the swapped-in player mining
+    /// `state`: `speed` is the vanilla result Horizon computed, and the
+    /// answer is what the progress must divide by the hardness. A firing that
+    /// fails leaves `speed`.
+    pub(super) fn java_hook_destroy_speed(
+        &mut self,
+        state: horizon_world::registry::BlockStateId,
+        speed: f32,
+    ) -> f32 {
+        let Some(role) = self.java_server_hook("java_destroy_speed") else {
+            return speed;
+        };
+        let Some(player) = self.java_acting_player_object() else {
+            return speed;
+        };
+        let name = self.res.facts().get(state).name.to_string();
+        let mut context = GameHookContext::new();
+        let receiver = context.insert(player);
+        let block = context.insert(GameObject::opaque(
+            "net/minecraft/world/level/block/state/BlockState",
+            &anonymous(&name),
+        ));
+        let outcome = self.java_fire_returning(
+            role,
+            "java_destroy_speed",
+            context,
+            Some(receiver),
+            &[block],
+            Some(Value::Float(f64::from(speed))),
+        );
+        destroy_speed_from(&outcome, speed)
+    }
+
+    /// `BoneMealItem.growCrop`'s HEAD for `stack` on `pos` of this level:
+    /// `Some(grown)` when a callback cancelled, which the caller returns in
+    /// place of `grow_crop` without growing or using up the meal; `None` to
+    /// run it.
+    pub(super) fn java_hook_grow_crop(
+        &mut self,
+        stack: &horizon_client::items::ItemStack,
+        pos: horizon_core::position::BlockPos,
+    ) -> Option<bool> {
+        let role = self.java_server_hook("java_grow_crop")?;
+        let mut context = GameHookContext::new();
+        let meal = context.insert(GameObject::item_stack(
+            &anonymous("meal"),
+            &stack.item,
+            stack.count as i32,
+        ));
+        let level = context.insert(GameObject::level(self.dim.id()));
+        let pos = context.insert(GameObject::opaque(
+            "net/minecraft/core/BlockPos",
+            &format!("{}_{}_{}", pos.x, pos.y, pos.z).replace('-', "m"),
+        ));
+        let outcome = self.java_fire(role, "java_grow_crop", context, None, &[meal, level, pos]);
+        grown_from(&outcome)
     }
 }
 
@@ -1153,6 +1405,223 @@ public class DeathMixin {
 
         clear_java_game_hooks_as(role);
         assert!(!java_game_hook_bound(role, "living_knockback"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+    const CALLBACK_INFO_RETURNABLE: &str = "package org.spongepowered.asm.mixin.injection.callback;\npublic class CallbackInfoReturnable<R> extends CallbackInfo { public R getReturnValue() { return null; } public void setReturnValue(R value) {} }\n";
+    /// The value-returning Java-tier sites: a `getDestroySpeed` override that
+    /// triples the speed of a slow block only, and a `growCrop` HEAD that
+    /// answers `true` without growing.
+    const VALUE_MIXINS: &str = r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.state.BlockState;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+@Mixin(net.minecraft.world.entity.player.Player.class)
+public class SpeedMixin {
+    @Inject(method = "getDestroySpeed", at = @At("RETURN"), cancellable = true)
+    private static void faster(BlockState state, CallbackInfoReturnable<Float> cir) {
+        if (cir.getReturnValue() < 2.0f) {
+            cir.setReturnValue(cir.getReturnValue() * 3.0f);
+        }
+    }
+}
+"#;
+    const GROW_MIXIN: &str = r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+@Mixin(net.minecraft.world.item.BoneMealItem.class)
+public class GrowMixin {
+    @Inject(method = "growCrop", at = @At("HEAD"), cancellable = true)
+    private static void claim(ItemStack stack, Level level, BlockPos pos, CallbackInfoReturnable<Boolean> cir) {
+        cir.setReturnValue(true);
+    }
+}
+"#;
+
+    /// The value fixture's jar under `.local/`; `None` without a JDK.
+    fn value_fixture_jar() -> Option<(PathBuf, PathBuf)> {
+        let javac = std::env::var_os("JAVA_HOME")
+            .map(|home| PathBuf::from(home).join("bin/javac"))
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                std::env::split_paths(&std::env::var_os("PATH")?)
+                    .map(|dir| dir.join("javac"))
+                    .find(|path| path.is_file())
+            })?;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/java-game-hooks-test")
+            .join(format!("values-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let classes = root.join("classes");
+        std::fs::create_dir_all(&classes).ok()?;
+        let stub =
+            |package: &str, name: &str| format!("package {package};\npublic class {name} {{}}\n");
+        let sources = [
+            ("org/spongepowered/asm/mixin/Mixin.java", MIXIN.to_owned()),
+            (
+                "org/spongepowered/asm/mixin/injection/At.java",
+                AT.to_owned(),
+            ),
+            (
+                "org/spongepowered/asm/mixin/injection/Inject.java",
+                INJECT.to_owned(),
+            ),
+            (
+                "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.java",
+                CALLBACK_INFO.to_owned(),
+            ),
+            (
+                "org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable.java",
+                CALLBACK_INFO_RETURNABLE.to_owned(),
+            ),
+            (
+                "net/minecraft/core/BlockPos.java",
+                stub("net.minecraft.core", "BlockPos"),
+            ),
+            (
+                "net/minecraft/world/item/ItemStack.java",
+                stub("net.minecraft.world.item", "ItemStack"),
+            ),
+            (
+                "net/minecraft/world/item/BoneMealItem.java",
+                stub("net.minecraft.world.item", "BoneMealItem"),
+            ),
+            (
+                "net/minecraft/world/level/Level.java",
+                stub("net.minecraft.world.level", "Level"),
+            ),
+            (
+                "net/minecraft/world/level/block/state/BlockState.java",
+                stub("net.minecraft.world.level.block.state", "BlockState"),
+            ),
+            (
+                "net/minecraft/world/entity/player/Player.java",
+                stub("net.minecraft.world.entity.player", "Player"),
+            ),
+            ("demo/SpeedMixin.java", VALUE_MIXINS.to_owned()),
+            ("demo/GrowMixin.java", GROW_MIXIN.to_owned()),
+        ];
+        let mut files = Vec::new();
+        for (relative, body) in &sources {
+            let path = root.join("src").join(relative);
+            std::fs::create_dir_all(path.parent()?).ok()?;
+            std::fs::write(&path, body).ok()?;
+            files.push(path);
+        }
+        let status = std::process::Command::new(javac)
+            .args(["--release", "17", "-d"])
+            .arg(&classes)
+            .args(&files)
+            .status()
+            .ok()?;
+        assert!(status.success(), "javac failed");
+        let jar = root.join("values.jar");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&jar).ok()?);
+        let options = zip::write::SimpleFileOptions::default();
+        let metadata =
+            r#"{"id":"values","version":"1","entrypoints":{},"mixins":["demo.mixins.json"]}"#;
+        let config = r#"{"package":"demo","mixins":["SpeedMixin","GrowMixin"]}"#;
+        for (name, body) in [("fabric.mod.json", metadata), ("demo.mixins.json", config)] {
+            zip.start_file(name, options).ok()?;
+            zip.write_all(body.as_bytes()).ok()?;
+        }
+        for name in ["demo/SpeedMixin.class", "demo/GrowMixin.class"] {
+            zip.start_file(name, options).ok()?;
+            zip.write_all(&std::fs::read(classes.join(name)).ok()?)
+                .ok()?;
+        }
+        zip.finish().ok()?;
+        Some((root, jar))
+    }
+
+    /// Every site has its own bit in the role masks.
+    #[test]
+    fn every_site_fits_the_bound_mask() {
+        assert!(every_game_hook_site().count() <= 64);
+        assert!(hook_bit("java_destroy_speed").is_some());
+        assert_ne!(hook_bit("java_destroy_speed"), hook_bit("player_tick"));
+    }
+
+    /// The game reads back what a bound callback made a value-returning
+    /// vanilla method return: the mining speed it overrode (only for the
+    /// slow block it picks), and a `growCrop` it answered `true` without
+    /// growing. Nothing bound leaves the game's own values.
+    #[test]
+    fn a_bound_value_callback_overrides_what_the_game_uses() {
+        let _lock = super::super::java_mods::test_lock();
+        let Some((root, jar_path)) = value_fixture_jar() else {
+            eprintln!("skipping: no JDK");
+            return;
+        };
+        let role = HandlerRole::DedicatedServer;
+        clear_java_game_hooks_as(role);
+        let speed = |speed: f32| {
+            let mut context = GameHookContext::new();
+            let player = context.insert(GameObject::player(7, "Steve"));
+            let block = context.insert(GameObject::opaque(
+                "net/minecraft/world/level/block/state/BlockState",
+                "stone",
+            ));
+            let outcome = run_java_game_hook_returning(
+                role,
+                "java_destroy_speed",
+                &mut context,
+                Some(player),
+                &[block],
+                Some(Value::Float(f64::from(speed))),
+            );
+            destroy_speed_from(&outcome, speed)
+        };
+        let grow = || {
+            let mut context = GameHookContext::new();
+            let args = [
+                context.insert(GameObject::item_stack("meal", "minecraft:bone_meal", 3)),
+                context.insert(GameObject::level("minecraft:overworld")),
+                context.insert(GameObject::opaque("net/minecraft/core/BlockPos", "1_64_2")),
+            ];
+            grown_from(&run_java_game_hook_returning(
+                role,
+                "java_grow_crop",
+                &mut context,
+                None,
+                &args,
+                None,
+            ))
+        };
+        // Nothing bound: the game's own values stand.
+        assert_eq!(speed(1.5), 1.5);
+        assert_eq!(grow(), None);
+
+        let jar = NativeJar::from_path(&jar_path).expect("the fixture jar");
+        let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+        let registrations = jar.register_game_hooks(&weave).expect("registrations");
+        assert_eq!(
+            registrations.hooks().collect::<Vec<_>>(),
+            ["java_destroy_speed", "java_grow_crop"],
+            "{:#?}",
+            weave.skipped
+        );
+        publish_java_game_hooks(
+            role,
+            &jar_path,
+            Arc::new(jar),
+            registrations,
+            &StdHost::new(),
+        );
+        assert_eq!(speed(1.5), 4.5, "the slow block's speed is tripled");
+        assert_eq!(speed(6.0), 6.0, "a fast block keeps the game's speed");
+        assert_eq!(grow(), Some(true));
+
+        clear_java_game_hooks_as(role);
         let _ = std::fs::remove_dir_all(root);
     }
 }

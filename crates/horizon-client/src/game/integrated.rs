@@ -782,7 +782,7 @@ impl Game<'_> {
         }
         // MinecraftServer.loadLevel's start: nothing is loaded yet.
         self.native_server_about_to_start(false);
-        self.java_server_starting();
+        self.java_server_starting(&std::path::Path::new("saves").join(&launch.folder));
         self.native_lifecycle_open_started();
         // `load_world`, with the world `serve` started preparing.
         startup::time("server.wait_rest", || self.join_world_rest())?;
@@ -927,6 +927,8 @@ impl Game<'_> {
         self.save.flush()?;
         // `WorldCloseFinal` follows a successful final save.
         self.native_lifecycle_world_closed();
+        // A Java `@Inject` at `MinecraftServer.stopServer`'s TAIL.
+        self.java_hook_server_stopped();
         self.java_server_stopped();
         self.session_lock = None;
         Ok(())
