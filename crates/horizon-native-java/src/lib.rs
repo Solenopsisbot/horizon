@@ -33,6 +33,8 @@ mod jdk_reflect_proxy;
 mod jdk_stream;
 mod library_dispatch;
 mod map_compute;
+mod mixin_extras;
+mod mixin_plugins;
 mod reflect_constructors;
 mod reflect_enum;
 mod reflect_generic;
