@@ -268,6 +268,20 @@ class JavaModServerLedgerTests(unittest.TestCase):
                 "multi.jar", jar=jar)
         self.assertEqual((row.verdict, row.subtype), ("skipped", "client-only"))
 
+    def test_fabric_metadata_with_a_byte_order_mark_is_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = self._jar(
+                tmp, "bom.jar",
+                fabric_raw="\ufeff" + json.dumps(
+                    {"schemaVersion": 1, "id": "bom", "environment": "client",
+                     "entrypoints": {"main": [], "client": []}}),
+            )
+            row = LEDGER.parse_log(
+                "skipping /mods/bom.jar: /mods/bom.jar: clientSideOnly mod cannot run for server "
+                "execution\nDone (1.0s)!",
+                "bom.jar", jar=jar)
+        self.assertEqual((row.verdict, row.subtype), ("skipped", "client-only"))
+
     def test_unreadable_jar_keeps_log_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             corrupt = self._jar(tmp, "corrupt.jar", corrupt=True)

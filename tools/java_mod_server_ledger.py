@@ -138,7 +138,12 @@ def metadata(path: Path) -> tuple[str, str]:
 
 
 def lenient_json_text(text: str) -> str:
-    """Escape raw control characters inside JSON strings, as the native reader does."""
+    """Escape raw control characters inside JSON strings, as the native reader does.
+
+    A leading byte-order mark is dropped: the loader (and the native reader)
+    accept a fabric.mod.json that starts with one.
+    """
+    text = text.removeprefix("\ufeff")
     out: list[str] = []
     in_string = escaped = False
     escapes = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f"}
