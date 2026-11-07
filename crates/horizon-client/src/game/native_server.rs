@@ -930,7 +930,7 @@ impl Game<'_> {
             self.server_lists.is_some(),
         );
         commands.extend(extras.iter().cloned());
-        let (tree, mut levels, problems) =
+        let (mut tree, mut levels, problems) =
             command_tree(&commands, |name| host.hub.vanilla_command(name));
         for p in problems {
             log::warn!("Horizon: a native mod's command was left out: {p}");
@@ -940,6 +940,9 @@ impl Game<'_> {
                 .iter()
                 .any(|c| c.usage.split(' ').next() == Some(name.as_str()))
         });
+        // The commands Java mods registered through Brigadier join the same
+        // root (java_commands.rs); a name taken above keeps its owner.
+        self.merge_java_command_tree(&mut tree);
         host.hub.set_mod_commands(0, tree);
         host.native_commands = Some(levels);
     }

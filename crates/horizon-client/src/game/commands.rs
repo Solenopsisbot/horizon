@@ -205,6 +205,10 @@ impl Game<'_> {
         if self.client_mod_command(command) {
             return true;
         }
+        // A command a Java mod registered through Brigadier (java_commands.rs).
+        if let Some(ok) = self.run_java_command(command) {
+            return ok;
+        }
         let d = vanilla::game_dispatcher_with_features(&self.level.enabled_features);
         let parse = d.parse(command, &self.ui.registries);
         let result = match parse.executable() {
