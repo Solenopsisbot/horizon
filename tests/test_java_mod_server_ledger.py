@@ -496,5 +496,62 @@ class DependencyClosureTests(unittest.TestCase):
         self.assertNotIn("deps=", LEDGER.format_row(LEDGER.Row("solo.jar")))
 
 
+    @staticmethod
+    def _ledger_row(file, verdict, recommend, reason=""):
+        return LEDGER.Row(file, "id", "1", verdict, engine="native" if verdict == "ran" else "refused",
+                          reason=reason, recommend=recommend)
+
+    def test_a_started_jar_turned_native_gap_is_a_regression(self):
+        before = [self._ledger_row("ok.jar", "ran", "native-ok"),
+                  self._ledger_row("loader.jar", "ran", "needs-loader"),
+                  self._ledger_row("moved.jar", "ran", "native-ok"),
+                  self._ledger_row("fixed.jar", "refused", "native-gap"),
+                  self._ledger_row("absent.jar", "refused", "missing-dependency")]
+        after = [self._ledger_row("ok.jar", "refused", "native-gap", "uncaught exception NPE"),
+                 self._ledger_row("loader.jar", "refused", "native-gap", "Metadata(x)"),
+                 # Between the two started labels only the plan count moved.
+                 self._ledger_row("moved.jar", "ran", "needs-loader"),
+                 self._ledger_row("fixed.jar", "ran", "native-ok"),
+                 self._ledger_row("absent.jar", "refused", "native-gap"),
+                 self._ledger_row("new.jar", "refused", "native-gap")]
+        regressions = LEDGER.label_regressions(before, after)
+        self.assertEqual([(r.file, r.before, r.after) for r in regressions],
+                         [("loader.jar", "ran/needs-loader", "refused/native-gap"),
+                          ("ok.jar", "ran/native-ok", "refused/native-gap")])
+        self.assertIn("uncaught exception NPE", regressions[1].line())
+
+    def test_a_jar_that_ran_and_is_refused_regresses_whatever_its_label(self):
+        # A row of an older ledger with a legacy label still counts by verdict.
+        before = [self._ledger_row("legacy.jar", "ran", "native")]
+        after = [self._ledger_row("legacy.jar", "refused", "missing-dependency")]
+        self.assertEqual([r.file for r in LEDGER.label_regressions(before, after)], ["legacy.jar"])
+        # Losing only a dependency is not a native regression when the jar never ran.
+        self.assertEqual(LEDGER.label_regressions(
+            [self._ledger_row("lib.jar", "skipped", "native-ok")],
+            [self._ledger_row("lib.jar", "unresolved", "missing-dependency")]), [])
+
+    def test_compare_to_fails_the_run_and_lists_the_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old.txt"
+            new = Path(tmp) / "new.txt"
+            old.write_text("\n".join(LEDGER.format_row(row) for row in [
+                self._ledger_row("a.jar", "ran", "native-ok"),
+                self._ledger_row("b.jar", "ran", "needs-loader")]) + "\n", encoding="utf-8")
+            new.write_text("\n".join(LEDGER.format_row(row) for row in [
+                self._ledger_row("a.jar", "refused", "native-gap", "uncaught exception boom"),
+                self._ledger_row("b.jar", "ran", "needs-loader")]) + "\n", encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                worse = LEDGER.main(["--from", str(new), "--compare-to", str(old)])
+            self.assertEqual(worse, 1)
+            self.assertIn("compared 2 jar(s)", err.getvalue())
+            self.assertIn("a.jar: ran/native-ok -> refused/native-gap: uncaught exception boom",
+                          err.getvalue())
+            self.assertNotIn("b.jar:", err.getvalue())
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                same = LEDGER.main(["--from", str(old), "--compare-to", str(old)])
+            self.assertEqual(same, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

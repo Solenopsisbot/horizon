@@ -26,6 +26,12 @@ id no corpus jar provides is not started and gets a fourth label,
 `missing-dependency`, instead of a `native-gap` that would blame native execution
 for what any loader refuses too. `--rerun LEDGER` picks the jars an earlier ledger
 labelled `--rerun-label` (default `native-gap`).
+
+`--compare-to LEDGER` guards against silent regressions: after the ledger is built
+(or read with `--from`), every jar that LEDGER also holds is compared, and the tool
+exits 1 listing each one whose outcome got worse: a jar that started (`native-ok`
+or `needs-loader`) now `native-gap`, or a jar that ran now refused. Jars only one
+side holds, and a move to `missing-dependency` (no native cause), are not compared.
 """
 
 from __future__ import annotations
@@ -895,6 +901,45 @@ def read_ledger(path: Path) -> list[Row]:
     return rows
 
 
+@dataclass(frozen=True)
+class Regression:
+    """One jar whose outcome got worse between a baseline and a fresh ledger."""
+    file: str
+    before: str
+    after: str
+    reason: str
+
+    def line(self) -> str:
+        return f"{self.file}: {self.before} -> {self.after}: {bounded(self.reason)}"
+
+
+# Labels of a jar the server started; losing one of them is a regression.
+STARTED_LABELS = (NATIVE_OK, NEEDS_LOADER)
+
+
+def label_regressions(baseline: list[Row], fresh: list[Row]) -> list[Regression]:
+    """The rows of `fresh` worse than the same file's row in `baseline`, by file.
+
+    Worse is `native-ok`/`needs-loader` becoming `native-gap`, or `ran` becoming
+    `refused`. A label moving between the two started labels is not a regression
+    (the plan count moved, not native execution), and neither is a move to
+    `missing-dependency`, which says a requirement is absent, not that native
+    execution failed.
+    """
+    before = {row.file: row for row in baseline}
+    found = []
+    for row in sorted(fresh, key=lambda row: row.file):
+        old = before.get(row.file)
+        if old is None:
+            continue
+        lost_start = label(old) in STARTED_LABELS and label(row) == NATIVE_GAP
+        lost_run = old.verdict == "ran" and row.verdict == "refused"
+        if lost_start or lost_run:
+            found.append(Regression(row.file, f"{old.verdict}/{label(old)}",
+                                    f"{row.verdict}/{label(row)}", row.reason))
+    return found
+
+
 def id_list(value: str) -> tuple[str, ...]:
     """A `deps=`/`dep_refused=` field: comma-separated mod ids, empty for none."""
     return tuple(item for item in value.split(",") if item)
@@ -1093,7 +1138,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rerun", type=Path,
                         help="only the jars this earlier text ledger labelled --rerun-label")
     parser.add_argument("--rerun-label", default=NATIVE_GAP, choices=LABELS)
+    parser.add_argument("--compare-to", type=Path, dest="baseline",
+                        help="exit 1 listing the jars whose outcome is worse than in this "
+                             "earlier text ledger")
     args = parser.parse_args(argv)
+
+    baseline: list[Row] = []
+    if args.baseline is not None:
+        # Read before any server starts, so a bad path fails at once.
+        if not args.baseline.is_file():
+            parser.error(f"ledger does not exist: {args.baseline}")
+        try:
+            baseline = read_ledger(args.baseline)
+        except ValueError as error:
+            parser.error(str(error))
 
     if args.reuse is not None:
         if not args.reuse.is_file():
@@ -1196,6 +1254,15 @@ def main(argv: list[str] | None = None) -> int:
                          sort_keys=True))
     elif not (args.table or args.docs):
         print(text, end="")
+    if args.baseline is not None:
+        regressions = label_regressions(baseline, rows)
+        compared = len({row.file for row in rows} & {row.file for row in baseline})
+        print(f"compared {compared} jar(s) with {args.baseline}: "
+              f"{len(regressions)} got worse", file=sys.stderr)
+        for regression in regressions:
+            print(f"  {regression.line()}", file=sys.stderr)
+        if regressions:
+            return 1
     return 0
 
 
