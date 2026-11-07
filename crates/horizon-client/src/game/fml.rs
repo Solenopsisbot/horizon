@@ -279,7 +279,19 @@ pub(in crate::game) fn strict_requested() -> bool {
 /// server. `None` means it was skipped, which is the normal startup; a failure
 /// is a report here, and only [`FmlOutcome::strict_error`] makes it fatal.
 pub(crate) fn preflight(role: ExecutionRole, jars: &[PathBuf]) -> Option<FmlOutcome> {
-    Some(preflight_with(FmlConfig::from_env(role, jars)?))
+    let outcome = preflight_with(FmlConfig::from_env(role, jars)?);
+    // With no jar, no native batch runs to write `java-runtime.json`, so the
+    // preflight writes it: no rows, its `fml` section only. With jars, the
+    // batch's own write carries the same section.
+    if jars.is_empty()
+        && let Some(home) = std::env::var_os("HORIZON_HOME")
+    {
+        let _ = super::super::java_runtime_file::write(
+            std::path::Path::new(&home),
+            super::super::java_runtime_file::RuntimeReport::new(Vec::new()),
+        );
+    }
+    Some(outcome)
 }
 
 /// One configured preflight, kept for `server-status` whatever it found: a

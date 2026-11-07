@@ -7,6 +7,9 @@
 //! Every addition since schema 1 is optional on read, so the schema stays 1 and an older launcher still
 //! reads what it knows.
 //!
+//! When the opt-in FML preflight ran (`game/fml.rs`), the file also carries its `fml` section, the same
+//! answer `server-status` gives: a role started with no jar still writes the file for it, with no rows.
+//!
 //! The file never grows past [`MAX_BYTES`]: when the rows do not fit, the per-jar plan lists shrink first
 //! (the counts stay whole), and only then are trailing rows dropped (`jars_total` keeps the whole count).
 use horizon_native_java::{MixinSkipReason, SkippedMixinPlan};
@@ -176,6 +179,9 @@ pub(crate) struct RuntimeReport {
     /// Refused rows the batch had, before the bounds.
     #[serde(default)]
     pub(crate) refused: usize,
+    /// The last opt-in FML preflight of this process; absent when none ran. [`write`] fills it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fml: Option<RuntimeFml>,
     /// What each jar's game-event listeners did on this process's servers: jar file → event name
     /// (`use_block`, `server_tick_end`...) → counts. [`write`] fills it, and a server's stop rewrites it
     /// ([`refresh_listeners`]) with the session's counts.
@@ -193,6 +199,48 @@ pub(crate) struct RuntimeListeners {
     pub(crate) disabled: usize,
 }
 
+/// Mod ids the `fml` section lists, sorted and deduplicated.
+const MAX_FML_IDS: usize = 64;
+
+/// The real FancyModLoader preflight as the file reports it: `ok` or `failed`, the role and jar count it ran
+/// for, FML's own mod count and ids, why it failed and whether `HORIZON_NEOFORGE_STRICT` made that fatal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RuntimeFml {
+    pub(crate) status: String,
+    pub(crate) role: String,
+    pub(crate) jars: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mods: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+    #[serde(default)]
+    pub(crate) strict: bool,
+}
+
+impl RuntimeFml {
+    pub(crate) fn from_report(report: &super::java_mods::fml::FmlReport, strict: bool) -> Self {
+        let mut ids: Vec<String> = report
+            .mod_ids
+            .iter()
+            .map(|id| bounded(id, MAX_NAME_CHARS))
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids.truncate(MAX_FML_IDS);
+        Self {
+            status: if report.succeeded() { "ok" } else { "failed" }.to_owned(),
+            role: super::java_mods::fml::role_name(report.role).to_owned(),
+            jars: report.jars,
+            mods: report.mods,
+            ids,
+            error: report.failure.as_deref().map(bounded_cause),
+            strict,
+        }
+    }
+}
+
 impl RuntimeReport {
     /// A report of `jars`, with its whole counts taken before any bound applies.
     pub(crate) fn new(jars: Vec<RuntimeJar>) -> Self {
@@ -201,6 +249,7 @@ impl RuntimeReport {
             jars_total: jars.len(),
             refused: jars.iter().filter(|jar| jar.engine == "refused").count(),
             jars,
+            fml: None,
             listeners: BTreeMap::new(),
         }
     }
@@ -234,9 +283,14 @@ pub(crate) fn encode(report: RuntimeReport) -> Vec<u8> {
     }
 }
 
-/// Writes the report under `home`, with the listener counts now when the caller set none.
+/// Writes the report under `home`, with the process's last FML preflight attached when one ran and the
+/// caller did not set it.
 pub(crate) fn write(home: &Path, report: RuntimeReport) -> std::io::Result<()> {
     let mut report = report;
+    if report.fml.is_none() {
+        report.fml = super::java_mods::fml::last_report()
+            .map(|last| RuntimeFml::from_report(&last, super::java_mods::fml::strict_requested()));
+    }
     if report.listeners.is_empty() {
         report.listeners = super::java_events::listener_counts();
     }
@@ -394,6 +448,40 @@ mod tests {
         assert_eq!((report.jars_total, report.refused), (2, 1));
         let back: RuntimeReport = serde_json::from_slice(&encode(report.clone())).unwrap();
         assert_eq!(back, report);
+    }
+
+    /// The `fml` section says what the preflight found, bounded like `server-status`'s, and a file without it
+    /// (no preflight, or an older game) reads with none.
+    #[test]
+    fn the_fml_section_reports_the_preflight_and_is_optional() {
+        use super::super::execution_role::ExecutionRole;
+        let failed = super::super::java_mods::fml::FmlReport {
+            role: ExecutionRole::DedicatedServer,
+            jars: 2,
+            mods: None,
+            mod_ids: vec!["neoforge".into(), "minecraft".into(), "neoforge".into()],
+            failure: Some(format!(
+                "FML probe failed: {}\nnext",
+                "x".repeat(MAX_CAUSE_CHARS)
+            )),
+        };
+        let fml = RuntimeFml::from_report(&failed, true);
+        assert_eq!(
+            (fml.status.as_str(), fml.role.as_str(), fml.jars, fml.strict),
+            ("failed", "dedicated-server", 2, true)
+        );
+        assert_eq!(fml.ids, ["minecraft", "neoforge"]);
+        let error = fml.error.clone().unwrap();
+        assert_eq!(error.chars().count(), MAX_CAUSE_CHARS);
+        assert!(!error.contains('\n'));
+
+        let mut report = RuntimeReport::new(Vec::new());
+        report.fml = Some(fml);
+        let back: RuntimeReport = serde_json::from_slice(&encode(report.clone())).unwrap();
+        assert_eq!(back, report);
+        let none: RuntimeReport =
+            serde_json::from_slice(&encode(RuntimeReport::new(Vec::new()))).unwrap();
+        assert_eq!(none.fml, None);
     }
 
     /// A schema-1 file written before the plan list and refusal rows still reads, with the new fields empty.
