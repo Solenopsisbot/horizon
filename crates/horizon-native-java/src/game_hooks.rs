@@ -542,6 +542,32 @@ fn is_game_class(owner: &str) -> bool {
 /// Static game-class calls that only build a value a callback then hands to a
 /// modelled member (`Component.literal("hi")` for `sendSystemMessage`). The
 /// bootstrap host answers them with the same markers the model reads.
+/// Guava's no-argument collection factories, whose whole contract is a new,
+/// empty, mutable collection: the kind the host builds for each. Callbacks
+/// build their per-object state with them (`Maps.newHashMap()` in a Mixin's
+/// field initialiser). A factory that takes elements or an expected size is
+/// not listed and stays an unknown call.
+fn empty_collection_factory(r: &MethodRef) -> Option<&'static str> {
+    if !r.descriptor.starts_with("()") {
+        return None;
+    }
+    match (r.owner.as_str(), r.name.as_str()) {
+        (
+            "com/google/common/collect/Maps",
+            "newHashMap" | "newLinkedHashMap" | "newConcurrentMap",
+        ) => Some("map"),
+        (
+            "com/google/common/collect/Lists",
+            "newArrayList" | "newLinkedList" | "newCopyOnWriteArrayList",
+        ) => Some("list"),
+        (
+            "com/google/common/collect/Sets",
+            "newHashSet" | "newLinkedHashSet" | "newConcurrentHashSet",
+        ) => Some("set"),
+        _ => None,
+    }
+}
+
 fn is_value_constructor(r: &MethodRef) -> bool {
     matches!(
         (r.owner.as_str(), r.name.as_str()),
@@ -750,6 +776,14 @@ impl<H: Host> Host for GameHookHost<'_, H> {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if let Some(kind) = empty_collection_factory(r) {
+            return self.inner.empty_mutable_collection(kind).ok_or_else(|| {
+                NativeError::Metadata(format!(
+                    "game hook callback calls {}#{}{}, and the host models no {kind}",
+                    r.owner, r.name, r.descriptor
+                ))
+            });
+        }
         if is_game_class(&r.owner) && !is_value_constructor(r) {
             return Err(NativeError::Metadata(format!(
                 "game hook callback calls {}#{}{}, which the hook tier does not model",
@@ -821,6 +855,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         initialized: BTreeSet<String>,
     ) -> Result<(), NativeError> {
         self.inner.store_persistent_class_state(fields, initialized)
+    }
+
+    fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
+        self.inner.empty_mutable_collection(kind)
     }
 
     fn redirect_jar_call(

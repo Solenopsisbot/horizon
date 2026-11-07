@@ -2092,6 +2092,13 @@ pub trait Host {
     fn host_instance_of(&self, _marker: &str, _wanted: &str) -> bool {
         false
     }
+
+    /// A new, empty, mutable collection of `kind` (`list`, `set`, `map`) the
+    /// host models, for a library factory whose whole contract is "a new
+    /// empty one" (Guava's `Maps.newHashMap()`); `None` when it models none.
+    fn empty_mutable_collection(&mut self, _kind: &str) -> Option<Value> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3521,6 +3528,10 @@ impl Host for StdHost {
 
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<String>> {
         self.mutable_values(value)
+    }
+
+    fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
+        Some(self.empty_collection(kind))
     }
 
     fn service_providers(&self, service: &str) -> Vec<String> {
