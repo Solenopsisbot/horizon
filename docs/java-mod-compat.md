@@ -894,7 +894,34 @@ Bundled non-class files also retain bounded bytes (4 MiB per file and 32 MiB per
 `read()`, `available()`, `skip(long)`, `skipNBytes(long)`, `mark/reset`, and `close()` cursors; marker-only resources remain empty streams.
 The native host also exposes `StdHost::with_service_provider` for deterministic `ServiceLoader`
 fixtures. `ServiceLoader.load`/`loadInstalled` return a seeded service marker, `iterator()` yields the
-seeded provider class markers, and `reload()` is a bounded no-op; missing services remain explicit errors.
+seeded provider class markers, and `reload()` is a bounded no-op. The seeded set is every `META-INF/services` row
+of the running jar, of the pack's linked jars and of the jars nested in them (JiJ/JarJar, which a loader puts on
+the class path too), so for a service type no host root models (a mod's own API interface) an empty set is the
+JVM's answer: an empty loader, and `findFirst()` is empty. A JDK or game service type with no seeded row is still
+refused, because its providers could live where the native path never looks.
+
+The JDK and logging values a config bootstrap reaches before the game live in `src/jdk_model.rs` and
+`src/jdk_stream.rs` (fixture: `tests/fixture_jdk_model.rs`, whose expected strings are what `java` prints for the
+same probe). `StandardCharsets` and `Charset.forName` answer `charset/<name>` markers (six standard charsets;
+any other name raises `UnsupportedCharsetException`); log4j, slf4j, `java.util.logging` and Mojang `LogUtils`
+factories answer a named logger whose levels are all disabled. `Path.resolveSibling`, `List.subList` (a copy, not a
+view), `Collectors.toMap` (duplicate keys throw, merge functions apply), `StreamSupport.stream` over a jar
+spliterator (drained eagerly through `tryAdvance`, at most 4,096 elements), `IntStream`/`LongStream` ranges,
+`sorted`/`max`/`min`/`findFirst`/`reduce`/`iterator`, and `Comparator`'s factories and combinators are modelled;
+natural order follows `compareTo` and sorting is stable. `instanceof` sees the JDK supertypes of boxed values and of
+the JDK collections (`new ArrayList<>() instanceof List`), `CharSequence` calls on text answer as `String`, string
+concatenation prints a box's value (`"" + Boolean.TRUE` is `true`), and `Class.isInterface`/`isEnum`/`isRecord`
+read a jar class's flags. Dispatch follows the JVM where it used to stop at the host: a class-typed call reaches an
+inherited interface default, a call typed by a platform class (`Reader.read()`) or by a jar class that only
+inherits the method abstractly runs the receiver's override, and an instance method reference dispatches on its
+receiver. `String.format` reads the `-`/`0` flags, widths, `%x`/`%X` and `%.Nf` (rounded half-up on the shortest
+digits, as the JDK's `Formatter` does); argument indexes and the other flags are still refused. `Modifier.isPublic`
+and its siblings read the flags reflection answers, `List.sort`/`Collections.sort` run the jar's comparator over a
+host list, and a mutable collection hands out its elements in the same form as an immutable one, so
+`new ArrayList<>(map.entrySet())` keeps whole entries. `Files.walk`/`Files.list` enumerate the invocation's virtual
+file table (a folder nothing created raises `NoSuchFileException`), and `Files.createDirectories` records the
+folder there. Every file a jar writes stays in that table; nothing in these modules reads or writes the host
+filesystem.
 For native client paths that mirror bootstrap-visible `NumberFormat.getIntegerInstance(Locale.US)`,
 `horizon_client::java_text::format_integer_us` provides deterministic ASCII digit grouping (including negative
 values) without emulating arbitrary locale or formatter patterns.

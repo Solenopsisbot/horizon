@@ -51,6 +51,13 @@ public interface Logger {
 }
 "#;
 
+const GSON: &str = r#"package com.google.gson;
+public class Gson {
+    public Gson() {}
+    public void toJson(Object src, java.lang.reflect.Type typeOfSrc, Appendable writer) {}
+}
+"#;
+
 const PROBE: &str = r##"package demo;
 
 import java.io.IOException;
@@ -300,6 +307,35 @@ public final class Probe {
         return "" + flag + "|" + number + "|" + anything + "|" + ("" + flag).length();
     }
 
+    public static String gsonTypedWriter() {
+        java.io.StringWriter writer = new java.io.StringWriter();
+        new com.google.gson.Gson().toJson(List.of(1, 2), List.class, writer);
+        return writer.toString();
+    }
+
+    public static String entryList() {
+        Map<String, Integer> map = new HashMap<>();
+        map.put("b,2", 2);
+        map.put("a", 1);
+        map.put("c", 3);
+        List<Map.Entry<String, Integer>> entries = new ArrayList<>(map.entrySet());
+        entries.sort(Map.Entry.comparingByKey());
+        StringBuilder out = new StringBuilder();
+        for (Map.Entry<String, Integer> entry : entries) {
+            out.append(entry.getKey()).append('=').append(entry.getValue()).append(';');
+        }
+        List<Integer> numbers = new ArrayList<>(List.of(3, 1, 2));
+        java.util.Collections.sort(numbers);
+        numbers.sort(Comparator.reverseOrder());
+        return out + "|" + numbers.get(0) + numbers.get(1) + numbers.get(2) + "|"
+            + map.containsKey("b,2") + "|" + map.get("b,2");
+    }
+
+    public static String formats() {
+        return String.format("[%04x|%-5s|%5s|%05d|%-4d|%X|%.2s|%x]", 255, "ab", "ab", -42, 7, 255,
+            "hello", -1) + String.format("%.2f|%.2f|%.0f", 2.675, 9.995, 2.5);
+    }
+
     public static String classKinds() {
         return Marker.class.isInterface() + "|" + Probe.class.isInterface() + "|"
             + Ranked.class.isInterface();
@@ -359,6 +395,7 @@ impl Fixture {
             ("org/apache/logging/log4j/Logger.java", LOG4J_LOGGER),
             ("org/slf4j/LoggerFactory.java", SLF4J_FACTORY),
             ("org/slf4j/Logger.java", SLF4J_LOGGER),
+            ("com/google/gson/Gson.java", GSON),
             ("demo/Probe.java", PROBE),
         ];
         let mut javac = Command::new(javac());
@@ -380,7 +417,8 @@ impl Fixture {
             br#"{"id":"jdk-fixture","version":"1.0","entrypoints":{"main":"demo.Probe"}}"#,
         )
         .unwrap();
-        // Only the mod's own classes ship: the logging stubs exist for javac.
+        // Only the mod's own classes ship: the logging and Gson stubs exist for
+        // javac.
         for class in files_under(&classes.join("demo")) {
             let entry = class
                 .strip_prefix(&classes)
@@ -557,4 +595,30 @@ fn a_nested_jar_service_file_seeds_its_providers() {
         ["demo/fabric/FabricPlatform", "demo/Fallback"]
     );
     assert_eq!(table.provider_count(), 2);
+}
+
+#[test]
+fn gson_to_json_with_a_type_writes_to_the_last_argument() {
+    // `toJson(src, typeOfSrc, writer)`: emotecraft saves its config this way.
+    let fixture = Fixture::build("gson-typed");
+    assert_eq!(fixture.text("gsonTypedWriter"), "[1,2]");
+}
+
+#[test]
+fn entry_lists_round_trip_and_sort_like_the_jdk() {
+    // `new ArrayList<>(map.entrySet())` then `sort(comparingByKey())`, the
+    // idiom config writers (peek, sound-physics) use to order their keys; a
+    // key holding the collection separator survives the copy and the lookup.
+    let fixture = Fixture::build("entry-list");
+    assert_eq!(fixture.text("entryList"), "a=1;b,2=2;c=3;|321|true|2");
+}
+
+#[test]
+fn string_format_widths_flags_hex_and_half_up_precision() {
+    // The JDK's `Formatter`: `%.2f` rounds the shortest digits half-up.
+    let fixture = Fixture::build("formats");
+    assert_eq!(
+        fixture.text("formats"),
+        "[00ff|ab   |   ab|-0042|7   |FF|he|ffffffff]2.68|10.00|3"
+    );
 }

@@ -329,6 +329,58 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         Ok(Some(Value::Int(self.compare_with(receiver, a, b)?)))
     }
 
+    /// `List.sort(comparator)`, `Collections.sort(list)` and
+    /// `Collections.sort(list, comparator)` on a list the host holds.
+    ///
+    /// The host keeps the elements but cannot run a jar comparator, so the
+    /// runtime sorts them here and writes them back through the host's own
+    /// `clear`/`add`. A list the host does not hold mutably (an immutable
+    /// `List.of`) is left to the host.
+    pub(crate) fn invoke_list_sort(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let (list, comparator) = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            ("java/util/Collections", "sort", "(Ljava/util/List;)V") => {
+                (args.first().cloned(), Value::Ref(None))
+            }
+            ("java/util/Collections", "sort", "(Ljava/util/List;Ljava/util/Comparator;)V") => (
+                args.first().cloned(),
+                args.get(1).cloned().unwrap_or(Value::Ref(None)),
+            ),
+            (owner, "sort", "(Ljava/util/Comparator;)V") if super::is_list_owner(owner) => (
+                receiver.cloned(),
+                args.first().cloned().unwrap_or(Value::Ref(None)),
+            ),
+            _ => return Ok(None),
+        };
+        let Some(list) = list else {
+            return Ok(None);
+        };
+        let Some(items) = self.host.mutable_collection_values(&list) else {
+            return Ok(None);
+        };
+        let values = items
+            .iter()
+            .map(|item| super::parse_collection_value(item))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sorted = self.sort_values(values, &comparator)?;
+        let method = |name: &str, descriptor: &str| MethodRef {
+            owner: "java/util/List".into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        self.host
+            .invoke_instance(&method("clear", "()V"), &list, &[])?;
+        let add = method("add", "(Ljava/lang/Object;)Z");
+        for value in sorted {
+            self.host.invoke_instance(&add, &list, &[value])?;
+        }
+        Ok(Some(Value::Void))
+    }
+
     /// A stable merge sort under `comparator`, as `List.sort` and
     /// `Stream.sorted` are (TimSort keeps equal elements in order).
     pub(crate) fn sort_values(

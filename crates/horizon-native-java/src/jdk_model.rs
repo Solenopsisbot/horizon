@@ -117,6 +117,34 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         return Some(Ok(comparator));
     }
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        // `Arrays.asList(new T[0])`: the shared empty array has no elements,
+        // so the list is empty rather than a one-element list holding it.
+        ("java/util/Arrays", "asList", "([Ljava/lang/Object;)Ljava/util/List;") if matches!(args.first(), Some(Value::Ref(Some(marker))) if marker == "array/empty") => {
+            Some(Ok(Value::Ref(Some("list".into()))))
+        }
+        // `Modifier`'s predicates over the access flags reflection answers
+        // (`Field.getModifiers`): config frameworks check `isPublic`/`isStatic`
+        // before they read a field, and the neutral `false` made every field
+        // look private.
+        ("java/lang/reflect/Modifier", name, "(I)Z") => {
+            let bit = match name {
+                "isPublic" => 0x0001,
+                "isPrivate" => 0x0002,
+                "isProtected" => 0x0004,
+                "isStatic" => 0x0008,
+                "isFinal" => 0x0010,
+                "isSynchronized" => 0x0020,
+                "isVolatile" => 0x0040,
+                "isTransient" => 0x0080,
+                "isNative" => 0x0100,
+                "isInterface" => 0x0200,
+                "isAbstract" => 0x0400,
+                "isStrict" => 0x0800,
+                _ => return None,
+            };
+            let flags = int_arg(args, 0)?;
+            Some(Ok(Value::Int(i32::from(flags & bit != 0))))
+        }
         // The wrappers' static reducers, which streams reach as method
         // references (`Integer::sum` as a `toMap` merge or `reduce` operator).
         ("java/lang/Integer", "sum" | "max" | "min", "(II)I") => {
@@ -638,6 +666,179 @@ pub(crate) fn boxed_text(marker: &str, desc: &str) -> Option<String> {
     }
 }
 
+/// The `[flags][width][.precision]` part of one `String.format` specifier.
+///
+/// Only the `-` (left-justify) and `0` (zero-pad) flags are read; any other
+/// flag, an argument index (`%1$s`) or a combination the JDK rejects
+/// (`%-d` with no width, `%05s`) is refused with a named reason rather than
+/// formatted differently from the JVM.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FormatSpec {
+    left: bool,
+    zero: bool,
+    width: Option<usize>,
+    pub(crate) precision: Option<usize>,
+}
+
+impl FormatSpec {
+    /// Read the specifier starting at `at` (just past `%`), leaving `at` on
+    /// the conversion character.
+    pub(crate) fn parse(bytes: &[u8], at: &mut usize) -> Result<Self, NativeError> {
+        let mut spec = Self::default();
+        while let Some(flag) = bytes.get(*at) {
+            match flag {
+                b'-' => spec.left = true,
+                b'0' => spec.zero = true,
+                b'+' | b' ' | b',' | b'#' | b'(' => {
+                    return Err(NativeError::Metadata(format!(
+                        "unsupported String.format flag {}",
+                        *flag as char
+                    )));
+                }
+                _ => break,
+            }
+            *at += 1;
+        }
+        let digits = |at: &mut usize| {
+            let start = *at;
+            while bytes.get(*at).is_some_and(u8::is_ascii_digit) {
+                *at += 1;
+            }
+            std::str::from_utf8(&bytes[start..*at])
+                .ok()
+                .filter(|text| !text.is_empty())
+                .and_then(|text| text.parse::<usize>().ok())
+        };
+        spec.width = digits(at);
+        if bytes.get(*at) == Some(&b'$') {
+            return Err(NativeError::Metadata(
+                "String.format argument indexes are not modelled".into(),
+            ));
+        }
+        if bytes.get(*at) == Some(&b'.') {
+            *at += 1;
+            spec.precision = Some(digits(at).ok_or_else(|| {
+                NativeError::Metadata("String.format precision has no digits".into())
+            })?);
+        }
+        Ok(spec)
+    }
+
+    /// Apply the width, flags and (for `%s`) precision to one converted
+    /// piece.
+    pub(crate) fn pad(&self, piece: String, conversion: char) -> Result<String, NativeError> {
+        if matches!(conversion, '%' | 'n') {
+            return Ok(piece);
+        }
+        let numeric = matches!(conversion, 'd' | 'x' | 'X' | 'f');
+        if (self.left || self.zero) && self.width.is_none() {
+            return Err(NativeError::Metadata(format!(
+                "String.format %{conversion} flag needs a width"
+            )));
+        }
+        if self.zero && (!numeric || self.left) {
+            return Err(NativeError::Metadata(format!(
+                "String.format %{conversion} does not take the 0 flag here"
+            )));
+        }
+        let piece = match (self.precision, conversion) {
+            (Some(precision), 's') => piece.chars().take(precision).collect(),
+            (Some(_), 'f') | (None, _) => piece,
+            (Some(_), other) => {
+                return Err(NativeError::Metadata(format!(
+                    "String.format %{other} does not take a precision"
+                )));
+            }
+        };
+        let Some(width) = self.width else {
+            return Ok(piece);
+        };
+        let length = piece.chars().count();
+        if length >= width {
+            return Ok(piece);
+        }
+        let fill = width - length;
+        Ok(if self.left {
+            format!("{piece}{}", " ".repeat(fill))
+        } else if self.zero {
+            match piece.strip_prefix('-') {
+                Some(digits) => format!("-{}{digits}", "0".repeat(fill)),
+                None => format!("{}{piece}", "0".repeat(fill)),
+            }
+        } else {
+            format!("{}{piece}", " ".repeat(fill))
+        })
+    }
+}
+
+/// `%.<precision>f` as the JDK's `Formatter` prints it.
+///
+/// The JDK rounds `RoundingMode.HALF_UP` on the double's shortest decimal
+/// digits (what `Double.toString` shows), not on its exact binary value:
+/// `String.format("%.2f", 2.675)` is `2.68` and `9.995` is `10.00`, where a
+/// correctly rounded binary value would give `2.67` and `9.99`.
+pub(crate) fn format_half_up(value: f64, precision: usize) -> String {
+    let scientific = format!("{:e}", value.abs());
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return format!("{value:.precision$}");
+    };
+    let Ok(exponent) = exponent.parse::<i64>() else {
+        return format!("{value:.precision$}");
+    };
+    let significant = mantissa.replace('.', "").into_bytes();
+    // The digits as `int.frac`: `point` digits sit before the decimal point.
+    let point = exponent + 1;
+    let mut integer = Vec::new();
+    let mut fraction = Vec::new();
+    if point <= 0 {
+        integer.push(b'0');
+        fraction.extend(std::iter::repeat_n(b'0', (-point) as usize));
+        fraction.extend_from_slice(&significant);
+    } else {
+        let point = point as usize;
+        for index in 0..point.max(significant.len()) {
+            let digit = significant.get(index).copied().unwrap_or(b'0');
+            if index < point {
+                integer.push(digit);
+            } else {
+                fraction.push(digit);
+            }
+        }
+    }
+    let round_up = fraction.get(precision).is_some_and(|digit| *digit >= b'5');
+    fraction.resize(precision, b'0');
+    let mut digits = integer;
+    let split = digits.len();
+    digits.extend_from_slice(&fraction);
+    if round_up {
+        let mut index = digits.len();
+        loop {
+            if index == 0 {
+                digits.insert(0, b'1');
+                break;
+            }
+            index -= 1;
+            if digits[index] == b'9' {
+                digits[index] = b'0';
+            } else {
+                digits[index] += 1;
+                break;
+            }
+        }
+    }
+    let split = split + (digits.len() - split - precision);
+    let mut text = String::from_utf8_lossy(&digits[..split]).into_owned();
+    if precision > 0 {
+        text.push('.');
+        text.push_str(&String::from_utf8_lossy(&digits[split..]));
+    }
+    if value.is_sign_negative() {
+        format!("-{text}")
+    } else {
+        text
+    }
+}
+
 /// Whether `marker` names an object this runtime or the host built
 /// (`owner/Class#n`), as opposed to string text.
 fn is_object_marker(marker: &str) -> bool {
@@ -648,7 +849,8 @@ fn is_object_marker(marker: &str) -> bool {
 
 impl<H: crate::Host> crate::Runtime<'_, H> {
     /// The JDK calls the interpreter answers itself, in one dispatch slot:
-    /// `CharSequence` on text and `Class` kind queries on jar classes.
+    /// `CharSequence` on text, `Class` kind queries on jar classes, and list
+    /// sorts that need a comparator to run.
     pub(crate) fn invoke_jdk_runtime(
         &mut self,
         r: &MethodRef,
@@ -656,6 +858,9 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
         if let Some(value) = self.invoke_class_kind(r, receiver) {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_list_sort(r, receiver, args)? {
             return Ok(Some(value));
         }
         self.invoke_char_sequence(r, receiver, args)
@@ -797,6 +1002,68 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         let method = self.class(&owner)?.method(&r.name, &r.descriptor)?;
         (method.code.is_some() && !method.is_static() && method.access & 0x0002 == 0)
             .then_some(owner)
+    }
+
+    /// `Files.walk(path)` / `Files.list(path)` over the invocation's virtual
+    /// file table.
+    ///
+    /// A path exists when the jar wrote it, created it as a directory, or
+    /// wrote something beneath it; anything else raises the JVM's
+    /// `NoSuchFileException`, which is what a fresh game directory answers for
+    /// a folder the mod never made (emotecraft walks `emotes/`). `walk` yields
+    /// the start path, then every descendant (intermediate directories
+    /// included) in sorted order; `list` yields the direct children. Both are
+    /// bounded by [`MAX_SPLITERATOR_ELEMENTS`]. The host filesystem is never
+    /// read.
+    pub(crate) fn files_tree(
+        &mut self,
+        r: &MethodRef,
+        path: &str,
+        class: &str,
+        method: &str,
+    ) -> Result<Value, NativeError> {
+        let root = path.trim_end_matches('/');
+        let prefix = format!("{root}/");
+        let mut found = std::collections::BTreeSet::new();
+        for key in self.io_files.keys() {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let parts = rest
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>();
+            let depth = if r.name == "list" { 1 } else { parts.len() };
+            for end in 1..=depth.min(parts.len()) {
+                found.insert(format!("{prefix}{}", parts[..end].join("/")));
+            }
+        }
+        if found.is_empty()
+            && !self.io_files.contains_key(root)
+            && !self.io_files.contains_key(path)
+        {
+            return Err(NativeError::UncaughtException {
+                class: "java/nio/file/NoSuchFileException".into(),
+                message: Some(path.to_owned()),
+                frame: None,
+            });
+        }
+        if found.len() >= MAX_SPLITERATOR_ELEMENTS {
+            return Err(NativeError::Metadata(format!(
+                "Files.{} under {path} holds more than {MAX_SPLITERATOR_ELEMENTS} entries",
+                r.name
+            )));
+        }
+        let mut values = Vec::with_capacity(found.len() + 1);
+        if r.name == "walk" {
+            values.push(Value::Ref(Some(format!("path:{path}"))));
+        }
+        values.extend(
+            found
+                .into_iter()
+                .map(|entry| Value::Ref(Some(format!("path:{entry}")))),
+        );
+        Ok(self.new_stream(class, method, values))
     }
 
     /// `accept(value)` on the consumer [`Self::stream_support_stream`] passes
@@ -1111,6 +1378,69 @@ mod tests {
                 .unwrap(),
             Value::Void
         );
+    }
+
+    #[test]
+    fn arrays_as_list_of_the_empty_array_is_an_empty_list() {
+        let as_list = method(
+            "java/util/Arrays",
+            "asList",
+            "([Ljava/lang/Object;)Ljava/util/List;",
+        );
+        assert_eq!(
+            static_call(&as_list, &[text("array/empty")])
+                .unwrap()
+                .unwrap(),
+            text("list")
+        );
+        // A runtime-owned array is the interpreter's to expand.
+        assert!(static_call(&as_list, &[text("array/demo/Probe/run/0")]).is_none());
+    }
+
+    #[test]
+    fn modifier_predicates_read_their_flag_bits() {
+        // `public static final` is 0x19 on the JVM.
+        let flags = Value::Int(0x19);
+        for (name, expected) in [
+            ("isPublic", 1),
+            ("isStatic", 1),
+            ("isFinal", 1),
+            ("isPrivate", 0),
+            ("isAbstract", 0),
+        ] {
+            let predicate = method("java/lang/reflect/Modifier", name, "(I)Z");
+            assert_eq!(
+                static_call(&predicate, std::slice::from_ref(&flags))
+                    .unwrap()
+                    .unwrap(),
+                Value::Int(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_half_up_rounds_the_shortest_digits_like_the_jdk() {
+        // `String.format("%.<p>f", x)` on a JVM (java 21).
+        for (value, precision, expected) in [
+            (0.125, 2, "0.13"),
+            (-0.125, 2, "-0.13"),
+            (2.675, 2, "2.68"),
+            (9.995, 2, "10.00"),
+            (0.5, 0, "1"),
+            (1.0 / 3.0, 3, "0.333"),
+            (1.005, 2, "1.01"),
+            (0.045, 2, "0.05"),
+            (123456.785, 2, "123456.79"),
+            (1e-7, 3, "0.000"),
+            (2.5, 0, "3"),
+        ] {
+            assert_eq!(
+                format_half_up(value, precision),
+                expected,
+                "{value} {precision}"
+            );
+        }
     }
 
     #[test]

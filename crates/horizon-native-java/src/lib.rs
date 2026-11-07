@@ -2704,9 +2704,12 @@ impl StdHost {
 
     fn mutable_values(&self, receiver: &Value) -> Option<Vec<String>> {
         let marker = expect_ref(receiver)?;
-        self.mutable_collections
-            .get(marker)
-            .map(|values| values.iter().map(value_marker).collect::<Vec<_>>())
+        self.mutable_collections.get(marker).map(|values| {
+            values
+                .iter()
+                .map(collection_item_marker)
+                .collect::<Vec<_>>()
+        })
     }
 
     /// Answer `java.util.Properties` members from the map a collection keeps.
@@ -2838,18 +2841,6 @@ impl StdHost {
                 Value::Ref(Some(format!("custom-number/{number}")))
             }
             other => Value::Ref(Some(format!("custom-value/{other}"))),
-        }
-    }
-
-    fn ensure_mutable_collection(&mut self, receiver: &Value) {
-        if let Some(marker) = expect_ref(receiver)
-            && is_collection_owner(
-                marker
-                    .split_once('#')
-                    .map_or(marker.as_str(), |(class, _)| class),
-            )
-        {
-            self.mutable_collections.entry(marker.clone()).or_default();
         }
     }
 
@@ -5524,8 +5515,13 @@ impl Host for StdHost {
                     self.mutable_collections.insert(marker.to_owned(), source);
                     return Ok(Value::Void);
                 }
+                // The JDK collection's constructor: on a jar subclass
+                // (emotecraft's `UUIDMap extends ConcurrentHashMap`) it is the
+                // `super()` call, and the object is that collection from here on.
                 (_, "<init>", _) => {
-                    self.ensure_mutable_collection(receiver);
+                    self.mutable_collections
+                        .entry(marker.to_owned())
+                        .or_default();
                     return Ok(Value::Void);
                 }
                 (owner, "offer" | "offerLast" | "addLast", "(Ljava/lang/Object;)Z")
@@ -6442,7 +6438,7 @@ impl Host for StdHost {
                 host_collection_values(self, receiver)?.is_empty() as i32,
             )),
             (owner, "contains", "(Ljava/lang/Object;)Z") if is_collection_owner(owner) => {
-                let needle = value_marker(Self::argument(r, args, 0)?);
+                let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
@@ -6468,7 +6464,7 @@ impl Host for StdHost {
                 ))
             }
             (owner, "indexOf", "(Ljava/lang/Object;)I") if is_list_like_owner(owner) => {
-                let needle = value_marker(Self::argument(r, args, 0)?);
+                let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
@@ -6477,7 +6473,7 @@ impl Host for StdHost {
                 ))
             }
             (owner, "lastIndexOf", "(Ljava/lang/Object;)I") if is_list_like_owner(owner) => {
-                let needle = value_marker(Self::argument(r, args, 0)?);
+                let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
@@ -6498,7 +6494,7 @@ impl Host for StdHost {
                 )?)
             }
             (owner, "get", "(Ljava/lang/Object;)Ljava/lang/Object;") if is_map_owner(owner) => {
-                let needle = value_marker(Self::argument(r, args, 0)?);
+                let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 let values = host_collection_values(self, receiver)?;
                 let mut pairs = values.chunks_exact(2);
                 Ok(pairs
@@ -6510,7 +6506,7 @@ impl Host for StdHost {
             (owner, "getOrDefault", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;")
                 if is_map_owner(owner) =>
             {
-                let needle = value_marker(Self::argument(r, args, 0)?);
+                let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 let fallback = Self::argument(r, args, 1)?.clone();
                 let values = host_collection_values(self, receiver)?;
                 let mut pairs = values.chunks_exact(2);
@@ -6521,7 +6517,7 @@ impl Host for StdHost {
                 }
             }
             (owner, "containsKey", "(Ljava/lang/Object;)Z") if is_map_owner(owner) => {
-                let needle = value_marker(Self::argument(r, args, 0)?);
+                let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .chunks_exact(2)
@@ -6529,7 +6525,7 @@ impl Host for StdHost {
                 ))
             }
             (owner, "containsValue", "(Ljava/lang/Object;)Z") if is_map_owner(owner) => {
-                let needle = value_marker(Self::argument(r, args, 0)?);
+                let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .chunks_exact(2)
@@ -6548,7 +6544,13 @@ impl Host for StdHost {
                     .collect::<Result<Vec<_>, NativeError>>()?;
                 Ok(collection_value("set", &entries))
             }
-            (owner, "keySet", "()Ljava/util/Set;") if is_map_owner(owner) => {
+            // `ConcurrentHashMap.keySet()` declares its `KeySetView`; the
+            // snapshot is the same key set.
+            (
+                owner,
+                "keySet",
+                "()Ljava/util/Set;" | "()Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+            ) if is_map_owner(owner) => {
                 let values = host_collection_values(self, receiver)?;
                 let keys = values
                     .chunks_exact(2)
@@ -8516,7 +8518,10 @@ fn builder_append_text(r: &MethodRef, args: &[Value]) -> Result<String, NativeEr
         },
         "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
         | "(Ljava/lang/Object;)Ljava/lang/StringBuffer;" => match value {
-            Value::Ref(Some(value)) => value.clone(),
+            // `append(Object)` is `String.valueOf`: a box prints its value.
+            Value::Ref(Some(value)) => {
+                jdk_model::boxed_text(value, "Ljava/lang/Object;").unwrap_or_else(|| value.clone())
+            }
             Value::Ref(None) => "null".into(),
             Value::Int(value) => value.to_string(),
             Value::Long(value) => value.to_string(),
@@ -9056,6 +9061,19 @@ fn bounded_captured_markers(values: &[Value]) -> String {
     text
 }
 
+/// One element of a collection as the collection readers hand it out: the
+/// [`value_marker`] form with its separator escapes already removed, which is
+/// what splitting an immutable `list/...` marker yields. A mutable collection
+/// answers the same form, so an element that itself holds a comma (a
+/// `map-entry/k,v` from `new ArrayList<>(map.entrySet())`) parses back whole,
+/// and a lookup compares like with like.
+fn collection_item_marker(value: &Value) -> String {
+    match value {
+        Value::Ref(Some(value)) => format!("r{value}"),
+        other => value_marker(other),
+    }
+}
+
 fn value_marker(value: &Value) -> String {
     match value {
         Value::Int(value) => format!("i{value}"),
@@ -9590,15 +9608,20 @@ fn format_java_string_call<H: Host>(
             continue;
         }
         i += 1;
+        // `%[flags][width][.precision]conversion`: the `-` and `0` flags, a
+        // width and a precision are read here (`jdk_model::FormatSpec`);
+        // argument indexes and the other flags stay refused below.
+        let spec = jdk_model::FormatSpec::parse(bytes, &mut i)?;
         let conversion = *bytes
             .get(i)
             .ok_or_else(|| NativeError::Metadata("unterminated String.format conversion".into()))?
             as char;
         i += 1;
+        let mut piece = String::new();
         match conversion {
-            '%' => output.push('%'),
-            'n' => output.push('\n'),
-            's' => output.push_str(&value_text(values.get(next).ok_or_else(|| {
+            '%' => piece.push('%'),
+            'n' => piece.push('\n'),
+            's' => piece.push_str(&value_text(values.get(next).ok_or_else(|| {
                 NativeError::Metadata("String.format missing %s argument".into())
             })?)),
             'd' => {
@@ -9613,7 +9636,7 @@ fn format_java_string_call<H: Host>(
                     .ok_or_else(|| {
                         NativeError::Metadata("String.format %d requires an integer".into())
                     })?;
-                output.push_str(&text);
+                piece.push_str(&text);
             }
             'f' => {
                 let value = values.get(next).ok_or_else(|| {
@@ -9622,13 +9645,18 @@ fn format_java_string_call<H: Host>(
                 let value = boxed_float(value).ok_or_else(|| {
                     NativeError::Metadata("String.format %f requires a floating-point value".into())
                 })?;
-                output.push_str(&format_java_decimal(value));
+                piece.push_str(&match spec.precision {
+                    Some(precision) if value.is_finite() => {
+                        jdk_model::format_half_up(value, precision)
+                    }
+                    _ => format_java_decimal(value),
+                });
             }
             'b' => {
                 let value = values.get(next).ok_or_else(|| {
                     NativeError::Metadata("String.format missing %b argument".into())
                 })?;
-                output.push_str(if matches!(value, Value::Ref(None)) {
+                piece.push_str(if matches!(value, Value::Ref(None)) {
                     "false"
                 } else {
                     "true"
@@ -9643,7 +9671,25 @@ fn format_java_string_call<H: Host>(
                     .ok_or_else(|| {
                         NativeError::Metadata("String.format %c requires a character".into())
                     })?;
-                output.push(value);
+                piece.push(value);
+            }
+            'x' | 'X' => {
+                let value = values.get(next).ok_or_else(|| {
+                    NativeError::Metadata("String.format missing %x argument".into())
+                })?;
+                // Two's complement of the argument's own width, as the JDK
+                // prints a negative `int` or `long` in hex.
+                let text = boxed_integer(value)
+                    .map(|value| format!("{:x}", value as u32))
+                    .or_else(|| boxed_long(value).map(|value| format!("{:x}", value as u64)))
+                    .ok_or_else(|| {
+                        NativeError::Metadata("String.format %x requires an integer".into())
+                    })?;
+                piece.push_str(&if conversion == 'X' {
+                    text.to_ascii_uppercase()
+                } else {
+                    text
+                });
             }
             other => {
                 return Err(NativeError::Metadata(format!(
@@ -9651,6 +9697,7 @@ fn format_java_string_call<H: Host>(
                 )));
             }
         }
+        output.push_str(&spec.pad(piece, conversion)?);
         if !matches!(conversion, '%' | 'n') {
             next += 1;
         }
@@ -17589,7 +17636,16 @@ fn gson_json_text<H: Host>(host: &H, value: &Value) -> Result<String, NativeErro
                 let values = runtime_collection_values(host, value)?;
                 gson_json_array(host, &values)?
             }
-            None => format!("\"{}\"", gson_json_escape(marker)),
+            // A boxed number or boolean is a JSON number or literal, as
+            // Gson writes an `Integer`/`Boolean` field; a `Character` is a
+            // one-character string.
+            None => match jdk_model::boxed_text(marker, "Ljava/lang/Object;") {
+                Some(text) if marker.starts_with("character:") => {
+                    format!("\"{}\"", gson_json_escape(&text))
+                }
+                Some(text) => text,
+                None => format!("\"{}\"", gson_json_escape(marker)),
+            },
         },
     })
 }
@@ -20369,6 +20425,20 @@ impl<H: Host> Runtime<'_, H> {
                         self.io_files.entry(path).or_default();
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
+                    // Directories share the file table (as `File.mkdirs`
+                    // records them), so a later `walk`/`list` sees them.
+                    ("createDirectories" | "createDirectory", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        self.io_files.entry(path).or_default();
+                        args.first().cloned().unwrap_or(Value::Ref(None))
+                    }
+                    ("walk" | "list", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;")
+                            && descriptor.ends_with(")Ljava/util/stream/Stream;") =>
+                    {
+                        return self.files_tree(r, &path, class, method).map(Some);
+                    }
                     ("delete" | "deleteIfExists", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
@@ -21159,7 +21229,9 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     let text =
                         gson_json_text(self.host, args.first().unwrap_or(&Value::Ref(None)))?;
-                    let target = args.get(1).and_then(expect_ref).ok_or_else(|| {
+                    // The writer is the last argument in every overload:
+                    // `toJson(src, writer)` and `toJson(src, typeOfSrc, writer)`.
+                    let target = args.last().and_then(expect_ref).ok_or_else(|| {
                         NativeError::Metadata("Gson.toJson needs an Appendable receiver".into())
                     })?;
                     if let Some(key) = self.io_sink_key(target) {
@@ -23415,6 +23487,20 @@ impl<H: Host> Runtime<'_, H> {
                     // sites, and a marker there is not the string Java returns.
                     if let Some((recipe, constants)) = file.string_concat_recipe(index) {
                         let arguments = descriptor_arguments(&descriptor);
+                        // A `StringBuilder` operand concatenates as its text
+                        // (`String.valueOf` calls its `toString`), not as the
+                        // builder's object marker.
+                        let captured = captured
+                            .into_iter()
+                            .map(|value| {
+                                match expect_ref(&value)
+                                    .and_then(|marker| self.string_builders.get(marker))
+                                {
+                                    Some(text) => Value::Ref(Some(text.clone())),
+                                    None => value,
+                                }
+                            })
+                            .collect::<Vec<_>>();
                         let mut joined = String::new();
                         let (mut next_arg, mut next_constant) = (0, 0);
                         let expand = |placeholder: u8,
@@ -27544,7 +27630,7 @@ mod tests {
     }
 
     #[test]
-    fn string_format_rejects_widths_explicitly() {
+    fn string_format_pads_widths_and_refuses_argument_indexes() {
         let mut host = NullHost;
         let runtime = Runtime {
             classes: &BTreeMap::new(),
@@ -27580,18 +27666,31 @@ mod tests {
             name: "format".into(),
             descriptor: "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;".into(),
         };
-        let error = format_java_string_call(
-            &runtime,
-            &method,
-            &[
-                Value::Ref(Some("%03d".into())),
-                Value::Ref(Some("array/test/args/0".into())),
-            ],
-        )
-        .unwrap_err();
-        assert!(
-            matches!(error, NativeError::Metadata(message) if message.contains("unsupported String.format conversion %0"))
-        );
+        let format = |pattern: &str| {
+            format_java_string_call(
+                &runtime,
+                &method,
+                &[
+                    Value::Ref(Some(pattern.into())),
+                    Value::Ref(Some("array/test/args/0".into())),
+                ],
+            )
+        };
+        // `String.format(pattern, 7)` on a JVM.
+        for (pattern, expected) in [("%03d", "007"), ("[%-3d]", "[7  ]"), ("%04x", "0007")] {
+            assert_eq!(
+                format(pattern).unwrap(),
+                Value::Ref(Some(expected.into())),
+                "{pattern}"
+            );
+        }
+        // Argument indexes and the other flags are refused, not approximated.
+        for pattern in ["%1$d", "%+d"] {
+            assert!(
+                matches!(format(pattern), Err(NativeError::Metadata(_))),
+                "{pattern}"
+            );
+        }
     }
 
     #[test]
