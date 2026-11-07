@@ -115,7 +115,10 @@ pub enum GameHookShape {
 
 impl NativeJar {
     /// Every MixinExtras injector the jar's `@Mixin` classes declare, one per
-    /// (target class, method selector, `@At`), sorted by callback then target.
+    /// (target class, method selector, `@At`), in the order Mixin applies
+    /// them (`@Mixin` priority, then config and list position, then method
+    /// order, as [`NativeJar::mixin_plans_in_apply_order`]): the order bound
+    /// `@ModifyReturnValue` handlers chain in.
     pub fn mixin_extras_plans(&self) -> Vec<MixinExtrasPlan> {
         let mut plans = Vec::new();
         for class in self.classes.values() {
@@ -184,19 +187,22 @@ impl NativeJar {
                 }
             }
         }
-        plans.sort_by(|a, b| {
-            (&a.callback.owner, &a.callback.name, &a.callback.descriptor)
-                .cmp(&(&b.callback.owner, &b.callback.name, &b.callback.descriptor))
-                .then_with(|| {
-                    (&a.target.owner, &a.target.name, &a.at).cmp(&(
-                        &b.target.owner,
-                        &b.target.name,
-                        &b.at,
-                    ))
-                })
-        });
         plans.dedup();
-        plans
+        // Reuse the injection plans' apply-order key: a stand-in plan per
+        // injector, carrying its index, sorts the same way.
+        let mut keys: Vec<MixinInjectionPlan> = plans
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| MixinInjectionPlan {
+                ordinal: Some(index as i32),
+                ..MixinInjectionPlan::inject_at_head(plan.target.clone(), plan.callback.clone())
+            })
+            .collect();
+        self.sort_mixin_plans_in_apply_order(&mut keys, &self.mixin_configs());
+        let mut slots: Vec<Option<MixinExtrasPlan>> = plans.into_iter().map(Some).collect();
+        keys.iter()
+            .filter_map(|key| key.ordinal.and_then(|index| slots[index as usize].take()))
+            .collect()
     }
 
     /// One MixinExtras plan in the game-hook tier: a hook plan when it binds,
