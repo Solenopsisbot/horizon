@@ -1006,8 +1006,32 @@ than rows; the cache held 86 entries in 436 KiB.
    (3 each) and interpreter Boolean/stream markers; **no corpus HUD element recorded a draw** there (they gate on
    config objects, items or refuse first). In an offscreen client, light-overlay's three mappings appear in Controls,
    a rebind persists, and its key shows its own "Light Overlay toggled on" in the action bar; DayCount's element
-   runs but its cloth-config `AutoConfig` gate reads disabled, so it draws nothing. Styles on components are dropped,
-   tooltips, screens, renderers and models have no façade, and the old façade sources stay in commit `be8567b9a`.
+   runs but its cloth-config `AutoConfig` gate reads disabled, so it draws nothing.
+   *Client surface (second slice).* The frame also carries the player's inventory, armour, off hand, effects, food,
+   air, experience, camera, GUI ticks, render distance and level height: `ItemStack`/`Item`/`Inventory`/
+   `MobEffectInstance` are slot markers (`client_items.rs`), `Items`/`Blocks`/`MobEffects` constants answer inside a
+   firing so `stack.getItem() == Items.ELYTRA` holds, `Minecraft.execute` queues tasks the window runs after the
+   firing, `getSingleplayerServer` is null on a server connection and a bounded stand-in in single player, and
+   `getTextureManager` names textures but refuses `register`. `GuiGraphicsExtractor` adds `item`, `fakeItem`,
+   `itemDecorations` (drawn by Horizon's item renderer from the real slot stack), `blitSprite` of GUI-atlas sprites
+   and the line fills. Styled components are the interpreter's component JSON (`facade_text.rs`), decoded by the
+   game's own component decoder; `Style`/`TextColor` objects and `java.awt.Color` constants answer on the client
+   (`client_text.rs`). Config libraries answer their defaults (`client_config.rs`): cloth-config `AutoConfig`, YACL
+   `ConfigClassHandler` and SuperMartijn642's config lib construct or keep the default values; a saved config file
+   is not read yet. Fabric `ItemTooltipCallback` and NeoForge `ItemTooltipEvent` edit Horizon's item tooltips (the
+   game's lines keep their style; added lines are the mod's components). A HUD element's first three frames get
+   100 ms (class initialisation) and only eight overruns of 4 ms in a row disable it.
+   Measured the same way (8 November 2026; the synthetic player holds a damaged pickaxe, tooltip listeners describe
+   a damaged diamond sword), 175 jars keep a surface and 82 of 382 callbacks refuse (93 of 366 before this slice);
+   **three jars' HUD elements draw** (DayCount, both durabilityviewer copies; slowest frame 1.2 ms), 11 jars keep a
+   tooltip listener and Durability Tooltip adds its line. In an offscreen client, DayCount draws "Day: 3" and
+   durabilityviewer draws the held pickaxe, armour and free-slot chest; its durability numbers are missing because
+   the interpreter resolves an inherited static field through superclasses but not superinterfaces
+   (`ItemIndicator.color_green` reads 0, so the text has no alpha); Durability Tooltip's line shows in the
+   inventory tooltip. Remaining refusals lead with `getResourceManager`, `MultiPlayerGameMode#canHurtPlayer`,
+   `ItemStack#get(DataComponentType)` (4 each), `ClientPacketListener#registryAccess`,
+   `IntegratedServer#getWorldPath` (3 each) and interpreter Boolean/stream markers. Screens, renderers and models
+   have no façade, and the old façade sources stay in commit `be8567b9a`.
 5. **Content consumption.** Blocks, items, effects, entities, menus, block entity types and recipes reach the content
    model; data components and attachments are typed declaration rows that travel in the snapshot and the manifest.
    What is left:
@@ -1114,11 +1138,11 @@ than rows; the cache held 86 entries in 436 KiB.
    their game points. Commands next: the source's position and rotation, the jar's own `SuggestionProvider`s
    answering `ask_server`, a player-run sample. Gate: no façade refusal among the ten most
    common listener causes on the corpus pack run.
-6. **Client surface.** First slice done: client events, key mappings in Controls and HUD drawing
-   (`client_surface.rs`, `game/java_client.rs`). Next: the members the refusals name (`getTextureManager`,
-   `getSingleplayerServer`, item stacks, effects, `execute`), component styles, items and sprites in the HUD
-   façade, then tooltips, screens, renderers and models; measure with rendering on and a curated pack, not offscreen.
-   Gate: a corpus HUD element draws in the measurement's frame.
+6. **Client surface.** Two slices done: client events, key mappings in Controls, HUD drawing with items, sprites
+   and styled text, the player's items and effects, config defaults and item tooltips (`client_surface.rs`,
+   `client_items.rs`, `client_text.rs`, `client_config.rs`, `game/java_client.rs`); the gate (a corpus HUD element
+   draws in the measurement's frame) is met by DayCount and durabilityviewer. Next: data components on stacks
+   (`ItemStack#get`), the resource manager, saved config files, then screens, renderers and models.
 7. **NeoForge path.** Done: the dedicated role's preflight, its `java-runtime.json` section, and a reproducible
    NeoForge corpus (`tools/neoforge_corpus.py`, `LAST_SERVER_LEDGER_NEOFORGE.txt`); remapping checked and moot for
    26.3. Next: model FML's environment (`FMLEnvironment`, `ModList`, `ModContainer`) for the 14 refusals, give a
