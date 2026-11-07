@@ -977,7 +977,20 @@ than rows; the cache held 86 entries in 436 KiB.
    builds its config through DazzleConf's reflection (`Method.getReturnType`, `getAnnotatedReturnType`, `Proxy`);
    voxy walks its own jar through `ModContainer.getRootPaths()`. A ledger run is one jar per server, so the first
    two cannot pass on their own, and the dedicated log reports the jar's alone-run refusal even when the pack class
-   path got further.
+   path got further. Library models (`reflect_generic.rs`, `jdk_reflect_proxy.rs`, `guava_model.rs`,
+   `library_dispatch.rs`; [java-mod-compat.md](java-mod-compat.md)) then closed most of them; measured 7 November on
+   the 15 `native-gap` rows of that day's fresh ledgers, one dedicated server per jar, 60 s: voxy and moderner_beta
+   now run alone (15 → 13), and with their declared dependencies beside them emotecraft (×2, with
+   `player_animation_library`), archers, wizards and paladins (with `spell_engine`, `spell_power` and the rest of
+   their closure) reach `Done (` with their entrypoint run, so 8 rows are left. servercore (×2) now builds its
+   DazzleConf config through generic reflection and proxies and stops at the game façade
+   (`TextColor.fromLegacyFormat` answers null for a `@DefaultObject`). WorldEdit (×2) gets past Guava's
+   `TypeToken`, caches and multimaps and stops in piston's `ArgumentConverters`, which spins converters with
+   `MethodHandles` combinators and a runtime `LambdaMetafactory`. zoomify (×2) declares only client entrypoints in
+   `fabric.mod.json`, so the server falls back to its NeoForge `@Mod` bootstrap, which touches the client-only
+   `KeyMapping` (a real NeoForge server would fail the same way; a Fabric one runs nothing). cristellib's stage-1
+   init runs from a game-class mixin (`BootstrapMixin`), so its entrypoint finds its registry empty; whiteout needs
+   its Mixin config plugin.
 3. **Close runtime refusals.** The entrypoint-exception bucket is down to two missing-dependency rows (archers,
    wizards, and paladins in the same shape) that need the ledger to run a jar with its declared dependencies, and
    WorldEdit's Guava collector. Gate: refused share of in-scope server jars below 5% (committed ledgers 22%/26%;

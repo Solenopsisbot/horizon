@@ -1056,6 +1056,33 @@ host list, and a mutable collection hands out its elements in the same form as a
 file table (a folder nothing created raises `NoSuchFileException`), and `Files.createDirectories` records the
 folder there. Every file a jar writes stays in that table; nothing in these modules reads or writes the host
 filesystem.
+
+Libraries a mod bundles or the game ships get their own models (fixture: `tests/fixture_library_refusals.rs`,
+expected strings from `java`, with Guava 33.3.1 on the class path for the Guava probe). `src/reflect_generic.rs`
+reads class and method `Signature` attributes: `getGenericSuperclass`/`getGenericInterfaces`,
+`Method.getReturnType`/`getGenericReturnType`/`getParameterTypes`/`getAnnotatedReturnType` (type-use annotations
+are not read, so every `AnnotatedType` has none), `Class.getModifiers`, and `getMethods` (public members, inherited
+from jar supertypes) versus `getDeclaredMethods`. `src/jdk_reflect_proxy.rs` builds `Proxy.newProxyInstance` over
+interfaces the class model holds: a call on the proxy runs the handler's `invoke` with a `Method` and the boxed
+`Object[]` (null for no arguments), `Object`'s methods included; `MethodHandles.lookup`/`privateLookupIn`,
+`unreflect`/`unreflectSpecial`, `findStatic`/`findVirtual`/`findConstructor` over jar classes, `bindTo` and
+`invokeWithArguments` are modelled, a lookup of a JDK method is `NoSuchMethodException`, and handle combinators
+(`dropArguments`, `filterReturnValue`, `invoker`) and a runtime `LambdaMetafactory` are not. `src/guava_model.rs`
+answers `Preconditions`, `TypeToken` (`of`, the `new TypeToken<T>() {}` idiom, equality by type), `CacheBuilder`
+and `LoadingCache` (a host map; a miss runs the loader once), `HashMultimap`/`LinkedHashMultimap`/
+`ArrayListMultimap` (value collections write through), `Sets.immutableEnumSet` and `Suppliers.memoize`.
+`src/library_dispatch.rs` holds the rest: an abstract method a jar interface inherits from a superinterface
+dispatches on the receiver, `Paths.get(first, more...)`, `Throwable`/`Thread.getStackTrace` from the jar frames
+(no line numbers), `Class.forName` finding `java.*`/`javax.*` and (for a Fabric jar) `net.fabricmc.*`,
+`Class.isInstance`/`cast`, `Class.getModule` (jar classes in the unnamed module, `java.*` in `java.base`), a
+mod root from `ModContainer.getRootPaths()` listing the jar's own class entries, `FilterInputStream` subclasses
+and `BufferedInputStream`/`DataInputStream` reading through the stream they wrap, `ByteArrayInputStream` over a
+runtime `byte[]`, byte-exact `readAllBytes`/`read(byte[]...)` of a jar resource, `Collection.toArray` and
+`Arrays.asList` (a copy, not a write-through view), `AbstractMap.SimpleEntry`/`SimpleImmutableEntry`, fastutil
+collections as `java.util` maps, lists and sets with their primitive overloads (`put(K, int)`, `getInt`,
+`addTo`; a missing key answers `0`), and `instanceof`/`toString` on a box the runtime keeps unboxed.
+`Files.newBufferedReader`/`newInputStream` on a path nothing wrote reads the jar resource `Files.exists` answers
+for that name, or raises `NoSuchFileException`.
 For native client paths that mirror bootstrap-visible `NumberFormat.getIntegerInstance(Locale.US)`,
 `horizon_client::java_text::format_integer_us` provides deterministic ASCII digit grouping (including negative
 values) without emulating arbitrary locale or formatter patterns.
