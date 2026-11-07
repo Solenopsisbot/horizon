@@ -145,6 +145,12 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Ok(Some(collection_value("set", &unique)))
             }
+            "com/google/common/collect/ImmutableSet" | "com/google/common/collect/ImmutableMap"
+            | "com/google/common/collect/ImmutableBiMap"
+                if r.name == "of" =>
+            {
+                self.invoke_immutable_of(r, args)
+            }
             TYPE_TOKEN => self.invoke_type_token(r, receiver, args),
             "com/google/common/cache/CacheBuilder" => self.invoke_cache_builder(r, receiver, args),
             "com/google/common/cache/CacheLoader" => match (r.name.as_str(), r.descriptor.as_str())
@@ -174,6 +180,71 @@ impl<H: Host> Runtime<'_, H> {
             | "com/google/common/collect/ListMultimap" => self.invoke_multimap(r, receiver, args),
             _ => Ok(None),
         }
+    }
+
+    /// `ImmutableSet.of(...)` and `ImmutableMap.of(...)`/`ImmutableBiMap.of`,
+    /// Guava's documented answers over the host's own collections.
+    ///
+    /// A set keeps the first of equal elements, in argument order, and its
+    /// `of(e1, ..., e6, E... others)` overload spreads the array. A map keeps
+    /// its pairs in order and refuses a repeated key with Guava's
+    /// `IllegalArgumentException` (a bi-map also a repeated value). A `null`
+    /// element, key or value is Guava's `NullPointerException`.
+    fn invoke_immutable_of(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let mut values = args.to_vec();
+        if r.descriptor.contains("[Ljava/lang/Object;)")
+            && let Some(rest) = values.pop()
+        {
+            if matches!(rest, Value::Ref(None)) {
+                return Err(thrown("java/lang/NullPointerException", None));
+            }
+            values.extend(self.array(&rest)?.clone());
+        }
+        if values.iter().any(|value| matches!(value, Value::Ref(None))) {
+            return Err(thrown("java/lang/NullPointerException", None));
+        }
+        if r.owner == "com/google/common/collect/ImmutableSet" {
+            let mut unique: Vec<Value> = Vec::with_capacity(values.len());
+            for value in values {
+                if !unique.contains(&value) {
+                    unique.push(value);
+                }
+            }
+            return Ok(Some(collection_value("set", &unique)));
+        }
+        if values.len() % 2 != 0 {
+            return Ok(None);
+        }
+        let bimap = r.owner == "com/google/common/collect/ImmutableBiMap";
+        for (index, pair) in values.chunks(2).enumerate() {
+            for earlier in values.chunks(2).take(index) {
+                let (kind, clash) = if earlier[0] == pair[0] {
+                    ("key", true)
+                } else if bimap && earlier[1] == pair[1] {
+                    ("value", true)
+                } else {
+                    ("", false)
+                };
+                if clash {
+                    let text = |value: &Value| expect_string(value).to_owned();
+                    return Err(thrown(
+                        "java/lang/IllegalArgumentException",
+                        Some(format!(
+                            "Multiple entries with same {kind}: {}={} and {}={}",
+                            text(&pair[0]),
+                            text(&pair[1]),
+                            text(&earlier[0]),
+                            text(&earlier[1])
+                        )),
+                    ));
+                }
+            }
+        }
+        Ok(Some(collection_value("map", &values)))
     }
 
     /// `Suppliers.memoize(s)` (and `memoizeWithExpiration`, whose expiry a

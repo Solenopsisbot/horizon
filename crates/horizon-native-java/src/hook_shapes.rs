@@ -266,9 +266,6 @@ pub(crate) fn check_actual_result(
     }
 }
 
-/// The wall-clock bound of one config-plugin question.
-const CONFIG_PLUGIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
-
 /// The config whose lists decide one Mixin class on `side`: the first that
 /// names it there and is not limited to the other side, as
 /// [`mixin_config_gate`] picks it.
@@ -291,118 +288,44 @@ fn governing_config<'a>(
     })
 }
 
-/// Whether a method body is a bare `return`: a plugin hook that does nothing.
-fn does_nothing(method: &Method) -> bool {
-    method.code.as_deref() == Some(&[0xb1])
-}
-
 impl NativeJar {
     /// The config gate for one game-hook plan.
     ///
     /// A config that names an `IMixinConfigPlugin` decides each of its Mixins
     /// in the plugin's own code, so the plain gate refuses every plan it
-    /// governs (`config-plugin`). The game-hook tier asks the plugin instead,
-    /// as Mixin would: `onLoad(mixinPackage)`, then
-    /// `shouldApplyMixin(targetClassName, mixinClassName)`, interpreted with a
-    /// fresh, strict host under a 250 ms budget. The plan passes only when the
-    /// plugin answered `true` and the plugin is one the tier can stand behind:
+    /// governs (`config-plugin`). The game-hook tier asks the plugin instead:
+    /// `plugins` holds one session per config, run once per weave the way
+    /// Mixin runs a plugin (`mixin_plugins.rs`: a persistent instance,
+    /// `onLoad`, `getRefMapperConfig`, `shouldApplyMixin` for every listed
+    /// Mixin and target, `acceptTargets`, `getMixins`, then `preApply` and
+    /// `postApply` with stand-in nodes). The plan passes only when that
+    /// session ran and the plugin answered `true` for this Mixin at this
+    /// target; a refused session, a failed question or a `false` keeps
+    /// `config-plugin`. A companion Mixin a plugin's `getMixins()` added is
+    /// listed by no config, and passes as Mixin applies it: without asking.
     ///
-    /// - it is a class of this jar extending `Object`, with no instance field
-    ///   (the interpreter has no plugin object to keep between the calls);
-    /// - its `preApply` and `postApply` are absent or a bare `return`, because
-    ///   a plugin that edits the target's bytecode there does work a hook
-    ///   point cannot do.
-    ///
-    /// Anything else (a refusal, a throw, a call the strict host does not
-    /// model, a `false`) keeps `config-plugin`. The plugin is asked without
-    /// the pack's mod list: a plugin that applies a compat Mixin only when
-    /// another mod is loaded answers for this jar alone, so a pack can lose a
-    /// compat callback, never gain one the plugin only allows alone (unless
-    /// its answer is "apply when X is absent", which this documents).
+    /// The plugin is asked without the pack's mod list: a plugin that applies
+    /// a compat Mixin only when another mod is loaded answers for this jar
+    /// alone, so a pack can lose a compat callback, never gain one the plugin
+    /// only allows alone (unless its answer is "apply when X is absent",
+    /// which this documents).
     pub(crate) fn game_hook_config_gate(
         &self,
         configs: &[MixinConfig],
         config_sides: &BTreeMap<String, MixinSide>,
+        plugins: &ConfigPlugins,
         mixin: &str,
         target: &str,
         side: MixinSide,
     ) -> Result<(), MixinSkipReason> {
         match mixin_config_gate(configs, config_sides, mixin, side) {
             Err(MixinSkipReason::ConfigPlugin) => {}
+            Err(MixinSkipReason::NotInConfig) if plugins.is_companion(mixin) => return Ok(()),
             other => return other,
         }
         let config = governing_config(configs, config_sides, mixin, side)
             .ok_or(MixinSkipReason::ConfigPlugin)?;
-        let plugin = config
-            .plugin
-            .as_deref()
-            .ok_or(MixinSkipReason::ConfigPlugin)?;
-        match self.ask_config_plugin(plugin, config.package.as_deref(), target, mixin) {
-            Some(true) => Ok(()),
-            _ => Err(MixinSkipReason::ConfigPlugin),
-        }
-    }
-
-    /// `plugin`'s answer for `mixin` on `target` (internal names), or `None`
-    /// when the tier cannot ask it (see [`Self::game_hook_config_gate`]).
-    fn ask_config_plugin(
-        &self,
-        plugin: &str,
-        package: Option<&str>,
-        target: &str,
-        mixin: &str,
-    ) -> Option<bool> {
-        let owner = plugin.replace('.', "/");
-        let class = self.classes.get(&owner)?;
-        if class.super_name != "java/lang/Object"
-            || class.fields.iter().any(|field| field.access & 0x0008 == 0)
-            || class
-                .methods
-                .iter()
-                .any(|m| matches!(m.name.as_str(), "preApply" | "postApply") && !does_nothing(m))
-        {
-            return None;
-        }
-        let should = "(Ljava/lang/String;Ljava/lang/String;)Z";
-        class.method("shouldApplyMixin", should)?;
-        let mut host = StdHost::new();
-        host.set_strict_unknown_host_calls(true);
-        let budget = ExecutionBudget::within(CONFIG_PLUGIN_BUDGET);
-        // The plugin keeps no instance state (checked above), so its own
-        // class marker stands for the object Mixin would construct.
-        let receiver = Some(Value::Ref(Some(owner.clone())));
-        let text = |value: Option<&str>| Value::Ref(value.map(str::to_owned));
-        if class.method("onLoad", "(Ljava/lang/String;)V").is_some() {
-            let on_load = MethodRef {
-                owner: owner.clone(),
-                name: "onLoad".into(),
-                descriptor: "(Ljava/lang/String;)V".into(),
-            };
-            self.invoke_persistent(
-                &on_load,
-                receiver.clone(),
-                &[text(package)],
-                &mut host,
-                &budget,
-            )
-            .ok()?;
-        }
-        let ask = MethodRef {
-            owner,
-            name: "shouldApplyMixin".into(),
-            descriptor: should.into(),
-        };
-        let binary = |name: &str| name.replace('/', ".");
-        match self.invoke_persistent(
-            &ask,
-            receiver,
-            &[text(Some(&binary(target))), text(Some(&binary(mixin)))],
-            &mut host,
-            &budget,
-        ) {
-            Ok(Value::Int(answer)) => Some(answer != 0),
-            _ => None,
-        }
+        plugins.decide(&config.path, mixin, target)
     }
 }
 

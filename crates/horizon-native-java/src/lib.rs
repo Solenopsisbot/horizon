@@ -5075,7 +5075,7 @@ impl Host for StdHost {
         self.record(r, Some(receiver), args);
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_instance(r, receiver) {
-            return Ok(value);
+            return value;
         }
         // The command dispatcher, builders, nodes and a running command's
         // context and source (`brigadier.rs`).
