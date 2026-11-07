@@ -325,6 +325,61 @@ mod tests {
         assert_eq!(order, ["x:z", "x:a", "x:b"]);
     }
 
+    fn listener(source: &str, order: ListenerOrder) -> GameListener {
+        GameListener {
+            event: super::super::GameEvent::UseBlock,
+            loader: if matches!(order, ListenerOrder::Phase(_)) {
+                super::super::EventLoader::Fabric
+            } else {
+                super::super::EventLoader::NeoForge
+            },
+            source: source.into(),
+            callback: super::super::ListenerCallback::Static {
+                method: crate::MethodRef {
+                    owner: "demo/Mod".into(),
+                    name: "on".into(),
+                    descriptor: "()V".into(),
+                },
+            },
+            receives_cancelled: false,
+            order,
+            shape: None,
+            combine: super::super::Combine::Void,
+        }
+    }
+
+    #[test]
+    fn one_jars_phase_ordering_orders_every_jars_listeners() {
+        let phase = |id: &str| ListenerOrder::Phase(id.into());
+        // Jar 0 registers in the default phase; jar 1 registers on its own
+        // phase and orders it first. One event, one order: jar 1's listener
+        // runs before jar 0's.
+        let a = listener("UseBlockCallback.EVENT", phase(DEFAULT_PHASE));
+        let b = listener("UseBlockCallback.EVENT", phase("zz:first"));
+        let c = listener("UseBlockCallback.EVENT", phase(DEFAULT_PHASE));
+        let ordering = PhaseOrdering {
+            source: "UseBlockCallback.EVENT".into(),
+            first: "zz:first".into(),
+            second: DEFAULT_PHASE.into(),
+        };
+        assert_eq!(
+            dispatch_order(&[(0, 0, &a), (1, 0, &b), (1, 1, &c)], &[&ordering]),
+            [(1, 0), (0, 0), (1, 1)]
+        );
+        // Without it, `zz:first` sorts after `fabric:default` by its path.
+        assert_eq!(
+            dispatch_order(&[(0, 0, &a), (1, 0, &b), (1, 1, &c)], &[]),
+            [(0, 0), (1, 1), (1, 0)]
+        );
+        // NeoForge priorities run across jars too, highest first.
+        let low = listener("x", ListenerOrder::Priority(3));
+        let high = listener("x", ListenerOrder::Priority(1));
+        assert_eq!(
+            dispatch_order(&[(0, 0, &low), (1, 0, &high)], &[]),
+            [(1, 0), (0, 0)]
+        );
+    }
+
     #[test]
     fn priorities_read_markers_and_annotation_values() {
         assert_eq!(
