@@ -30,8 +30,8 @@ mod hook_shapes;
 mod java_regex;
 mod jdk_model;
 mod jdk_reflect_proxy;
-mod library_dispatch;
 mod jdk_stream;
+mod library_dispatch;
 mod map_compute;
 mod reflect_constructors;
 mod reflect_enum;
@@ -43,13 +43,13 @@ mod vanilla_registries;
 pub mod weaver;
 
 pub use facade_server::{GameRuleValue, ServerFacts};
-pub use hook_shapes::{
-    JAVA_TIER_HOOK_PREFIX, JAVA_TIER_SITES, every_game_hook_site, game_hook_site_at,
-    game_hook_site_named, java_tier_sites,
-};
 pub use game_hooks::{
     GAME_OBJECT_PREFIX, GameHookContext, GameHookEffect, GameHookState, GameObject, GameObjectKind,
     JarCallRedirect,
+};
+pub use hook_shapes::{
+    JAVA_TIER_HOOK_PREFIX, JAVA_TIER_SITES, every_game_hook_site, game_hook_site_at,
+    game_hook_site_named, java_tier_sites,
 };
 
 use weaver::{
@@ -3656,7 +3656,9 @@ impl Host for StdHost {
     fn resource_stream_bytes(&mut self, marker: &str, limit: Option<usize>) -> Option<Vec<u8>> {
         let (bytes, index) = self.resource_streams.get_mut(marker)?;
         let start = (*index).min(bytes.len());
-        let end = limit.map_or(bytes.len(), |limit| start.saturating_add(limit).min(bytes.len()));
+        let end = limit.map_or(bytes.len(), |limit| {
+            start.saturating_add(limit).min(bytes.len())
+        });
         *index = end;
         Some(bytes[start..end].to_vec())
     }
@@ -21892,8 +21894,7 @@ impl<H: Host> Runtime<'_, H> {
         // `ISerializer`). The JVM resolves the symbolic method through the
         // superinterfaces, finds it abstract and selects the receiver's body.
         let symbolic_is_abstract = symbolic.is_some_and(|method| method.code.is_none())
-            || (symbolic.is_none()
-                && self.inherits_abstract(&r.owner, &r.name, &r.descriptor));
+            || (symbolic.is_none() && self.inherits_abstract(&r.owner, &r.name, &r.descriptor));
         if symbolic_is_abstract
             && matches!(opcode, 0xb6 | 0xb9)
             && let Some(class) = receiver.and_then(|value| self.receiver_class(value))
@@ -23398,14 +23399,15 @@ impl<H: Host> Runtime<'_, H> {
                     // A box the runtime keeps unboxed (`Double.valueOf`
                     // answers a `Float` value) is still a reference here.
                     let unboxed = self.library_instance_of(&value, &wanted);
-                    let matches = unboxed || expect_ref(&value).is_some_and(|marker| {
-                        self.object_is_instance_of(marker, &wanted)
-                            || self.host.host_instance_of(marker, &wanted)
-                            || jdk_model::platform_instance_of(marker, &wanted)
-                            || generic_type_instance_of(marker, &wanted)
-                            || (wanted == "java/lang/Class"
-                                && class_marker_like(marker, self.classes, &self.linked))
-                    });
+                    let matches = unboxed
+                        || expect_ref(&value).is_some_and(|marker| {
+                            self.object_is_instance_of(marker, &wanted)
+                                || self.host.host_instance_of(marker, &wanted)
+                                || jdk_model::platform_instance_of(marker, &wanted)
+                                || generic_type_instance_of(marker, &wanted)
+                                || (wanted == "java/lang/Class"
+                                    && class_marker_like(marker, self.classes, &self.linked))
+                        });
                     stack.push(Value::Int(i32::from(matches)));
                 }
                 0xc2 | 0xc3 => {
