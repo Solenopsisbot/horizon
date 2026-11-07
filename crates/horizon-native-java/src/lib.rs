@@ -13,6 +13,7 @@ use std::{
     sync::Arc,
 };
 
+pub mod events;
 pub mod weaver;
 mod declarations_content;
 mod game_hooks;
@@ -2266,6 +2267,10 @@ pub struct StdHost {
     /// declare a collection return, so a caller that mutates one never shares
     /// its contents with another call site.
     next_neutral_collection: usize,
+    /// The game event one listener is running for, so the façade markers a
+    /// callback receives (server, level, player, NeoForge event object) can
+    /// answer from it. `None` outside [`NativeJar::run_game_listener`].
+    game_event: Option<Box<events::EventFiring>>,
 }
 
 impl Default for StdHost {
@@ -2334,6 +2339,7 @@ impl StdHost {
             next_fabric_event: 0,
             next_iterator: 0,
             next_neutral_collection: 0,
+            game_event: None,
         }
     }
 
@@ -3531,6 +3537,11 @@ impl Host for StdHost {
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.record(r, None, &[]);
+        // Fabric `Event` fields, Forge per-event buses and the game-event
+        // façade's statics: a listener's registration keeps its event's name.
+        if let Some(value) = self.game_event_static(r) {
+            return Ok(value);
+        }
         // Registry statics get a stable marker instead of a null constant so
         // registration calls downstream can name their target registry.
         if let Some(id) = registry_static_id(&r.owner, &r.name) {
@@ -4749,6 +4760,11 @@ impl Host for StdHost {
             return Ok(
                 class_of_value(receiver).map_or(Value::Ref(None), |class| Value::Ref(Some(class)))
             );
+        }
+        // A game-event façade marker (server, level, player, event object)
+        // answers its bounded surface; anything else refuses the listener.
+        if let Some(answer) = self.game_event_call(r, receiver, args) {
+            return answer;
         }
         if let Some(value) = self.networking_register(r, args) {
             return Ok(value);
@@ -14774,6 +14790,62 @@ impl NativeJar {
             host,
             &mut CallbackInfos::new(),
         )
+    }
+
+    /// Invoke one jar method the way a later firing of a registered callback
+    /// runs: against the host's persistent class state (so a listener sees the
+    /// statics its entrypoint wrote, and the next firing sees what this one
+    /// wrote) and under `budget`, so a looping listener cannot stall the
+    /// server tick that fired it. Used by [`Self::run_game_listener`].
+    pub(crate) fn invoke_persistent<H: Host>(
+        &self,
+        target: &MethodRef,
+        receiver: Option<Value>,
+        args: &[Value],
+        host: &mut H,
+        budget: &ExecutionBudget,
+    ) -> Result<Value, NativeError> {
+        let (static_fields, initialized_classes) = host.persistent_class_state();
+        let mut callback_infos = CallbackInfos::new();
+        let mut runtime = Runtime {
+            classes: &self.classes,
+            linked: host.linked_class_table().cloned().unwrap_or_default(),
+            host,
+            calls: 0,
+            fields: BTreeMap::new(),
+            static_fields,
+            initialized_classes,
+            arrays: BTreeMap::new(),
+            next_array: 0,
+            next_object: 0,
+            streams: BTreeMap::new(),
+            next_stream: 0,
+            enum_constants: BTreeMap::new(),
+            string_builders: BTreeMap::new(),
+            string_readers: BTreeMap::new(),
+            io_writers: BTreeMap::new(),
+            io_paths: BTreeMap::new(),
+            io_files: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            next_annotation: 0,
+            callback_infos: &mut callback_infos,
+            invoke_hooks: None,
+            anchor_hooks: None,
+            modify_hooks: None,
+            pending_skipped_new: Vec::new(),
+            depth: 0,
+            budget,
+        };
+        let result = runtime.invoke(
+            &target.owner,
+            &target.name,
+            &target.descriptor,
+            receiver,
+            args,
+        );
+        // A failed run keeps what it wrote before failing, as a JVM would.
+        runtime.persist_class_state()?;
+        result
     }
 
     /// Invoke one jar method with the `CallbackInfo` objects of the execution

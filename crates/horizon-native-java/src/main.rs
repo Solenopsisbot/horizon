@@ -677,6 +677,9 @@ fn main() -> ExitCode {
                             }))
                             .collect::<Vec<_>>(),
                         "listeners": host.listener_registrations().count(),
+                        // The listeners the game can fire, by event name, and
+                        // the registrations on events it never fires.
+                        "game_listeners": game_listener_counts(&host, &jar, kind != "client"),
                         "events": host.posted_events().len(),
                         "mixin_targets": mixin_target_labels(
                             jar.discovered_mixin_targets().iter()
@@ -706,6 +709,24 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The probe's view of [`StdHost::game_listeners`]: per event name, how many
+/// listeners the game would dispatch, plus `unsupported` registrations by source.
+fn game_listener_counts(
+    host: &horizon_native_java::StdHost,
+    jar: &horizon_native_java::NativeJar,
+    server: bool,
+) -> serde_json::Value {
+    let found = host.game_listeners(jar, server);
+    let mut events = std::collections::BTreeMap::<&str, usize>::new();
+    for listener in &found.listeners {
+        *events.entry(listener.event.name()).or_default() += 1;
+    }
+    serde_json::json!({
+        "events": events,
+        "unsupported": found.unsupported,
+    })
 }
 
 #[cfg(test)]

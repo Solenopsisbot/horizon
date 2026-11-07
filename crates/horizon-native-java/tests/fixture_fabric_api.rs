@@ -286,11 +286,26 @@ fn fabric_api_bootstrap_registers_both_listeners_in_declaration_order() {
     assert_eq!(lifecycle[0].method.descriptor, format!("L{FABRIC_EVENT};"));
 
     // Generic `Event<T>.register(T)` erases to `(Ljava/lang/Object;)V` at the
-    // call site, which is the shape the listener record carries.
-    for register in calls_to(&host, FABRIC_EVENT, "register") {
-        assert_eq!(register.method.descriptor, "(Ljava/lang/Object;)V");
-        assert_eq!(register.receiver, Some(Value::Ref(None)));
-    }
+    // call site, which is the shape the listener record carries. Its receiver
+    // is the field it was read from, so the listener keeps its event.
+    let receivers: Vec<Option<Value>> = calls_to(&host, FABRIC_EVENT, "register")
+        .into_iter()
+        .map(|register| {
+            assert_eq!(register.method.descriptor, "(Ljava/lang/Object;)V");
+            register.receiver.clone()
+        })
+        .collect();
+    assert_eq!(
+        receivers,
+        [
+            Some(Value::Ref(Some(format!(
+                "fabric-event/{SERVER_LIFECYCLE}.SERVER_STARTING"
+            )))),
+            Some(Value::Ref(Some(format!(
+                "fabric-event/{COMMAND_CALLBACK}.EVENT"
+            )))),
+        ]
+    );
 
     // Both listeners are recorded, in declaration order, with the resolved
     // callback target.  They are bound instance method references, so the
