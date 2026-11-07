@@ -267,6 +267,64 @@ class CorpusTest(unittest.TestCase):
         )
         self.assertEqual(row["nested"][0]["verdict"], "fallback")
 
+    def test_outer_entrypoint_failure_is_not_masked_by_nested_ok(self):
+        inner = nested_jar_bytes({
+            "schemaVersion": 1, "id": "inner", "version": "1.0",
+            "entrypoints": {"main": ["com.example.Inner"]},
+        })
+        self.jar(self.fabric, "outer.jar", {
+            "fabric.mod.json": json.dumps({
+                "schemaVersion": 1, "id": "outer", "version": "1.0",
+                "entrypoints": {"main": ["com.example.Outer"]},
+                "jars": [{"file": "META-INF/jars/inner.jar"}],
+            }),
+            "META-INF/jars/inner.jar": inner,
+        })
+
+        class FailingOuterToolchain(MetadataToolchain):
+            def probe(self, tool, mode, args):
+                path = Path(next(arg for arg in args if arg.endswith(".jar")))
+                if path.name == "outer.jar" and mode == "main":
+                    return response(
+                        {"status": "error", "stage": "execute", "error": "stream marker mismatch"},
+                        code=1,
+                    )
+                return super().probe(tool, mode, args)
+
+        row = self.report(FailingOuterToolchain())["jars"][0]
+        self.assertEqual(row["verdict"], "fallback")
+        self.assertIn("stream marker mismatch", row["reason"])
+        self.assertIn("nested: 1 nested jar(s): 1 ok; 0 skipped", row["reason"])
+
+    def test_outer_entrypoint_failure_reason_preserved_when_no_nested_ok(self):
+        inner = nested_jar_bytes({
+            "schemaVersion": 1, "id": "inner-client", "version": "1.0",
+            "entrypoints": {"client": ["com.example.Client"]},
+        })
+        self.jar(self.fabric, "outer.jar", {
+            "fabric.mod.json": json.dumps({
+                "schemaVersion": 1, "id": "outer", "version": "1.0",
+                "entrypoints": {"main": ["com.example.Outer"]},
+                "jars": [{"file": "META-INF/jars/inner-client.jar"}],
+            }),
+            "META-INF/jars/inner-client.jar": inner,
+        })
+
+        class FailingOuterToolchain(MetadataToolchain):
+            def probe(self, tool, mode, args):
+                path = Path(next(arg for arg in args if arg.endswith(".jar")))
+                if path.name == "outer.jar" and mode == "main":
+                    return response(
+                        {"status": "error", "stage": "execute", "error": "unseeded service provider"},
+                        code=1,
+                    )
+                return super().probe(tool, mode, args)
+
+        row = self.report(FailingOuterToolchain())["jars"][0]
+        self.assertEqual(row["verdict"], "fallback")
+        self.assertIn("unseeded service provider", row["reason"])
+        self.assertIn("nested: 1 nested jar(s): 1 fallback; 0 skipped", row["reason"])
+
     def test_nested_duplicate_is_probed_once(self):
         inner = nested_jar_bytes({
             "schemaVersion": 1, "id": "inner", "version": "1.0",

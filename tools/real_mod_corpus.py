@@ -854,7 +854,7 @@ def nested_summary(rows: list[dict[str, Any]], skipped: list[dict[str, Any]]) ->
 
 def fold_nested(row: dict[str, Any], rows: list[dict[str, Any]],
                 skipped: list[dict[str, Any]]) -> None:
-    """An outer jar with any successful nested jar is ok; readable nested jars otherwise fallback."""
+    """A bundle jar with any successful nested jar is ok; keep outer failure reasons when present."""
     if not rows:
         if skipped and row["verdict"] == "fallback":
             row["reason"] = f"{row['reason']}; {len(skipped)} nested jar(s) skipped"
@@ -863,15 +863,21 @@ def fold_nested(row: dict[str, Any], rows: list[dict[str, Any]],
     for nested in rows:
         counts[nested["verdict"]] += 1
     summary = nested_summary(rows, skipped)
+    has_outer_entrypoints = bool(row.get("entrypoints"))
     if counts["ok"]:
         if row["verdict"] == "ok":
             row["reason"] = f"{row['reason']}; nested: {summary}"
-        else:
+        elif not has_outer_entrypoints:
+            row["verdict"] = "ok"
             row["reason"] = f"nested jar(s) ran: {summary}"
-        row["verdict"] = "ok"
+        else:
+            row["reason"] = f"{row['reason']}; nested: {summary}"
     elif any(nested["loader"] != "unknown" for nested in rows):
         row["verdict"] = "fallback"
-        row["reason"] = f"nested jars probed, none ok ({summary})"
+        if has_outer_entrypoints:
+            row["reason"] = f"{row['reason']}; nested: {summary}"
+        else:
+            row["reason"] = f"nested jars probed, none ok ({summary})"
 
 
 def probe_nested(parent: Path, meta: dict[str, Any], depth: int,
