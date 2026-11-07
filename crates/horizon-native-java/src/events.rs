@@ -37,9 +37,17 @@
 //!   `Predicate` listener returning `true`); a later listener that did not ask
 //!   for cancelled events (`receiveCanceled`) is skipped.
 //!
-//! Priorities are not modelled: listeners run in registration order, jar by jar.
+//! # Order
+//!
+//! Listeners run in the loaders' own order ([`order`]): Fabric phases
+//! (`register(phase, listener)`, `addPhaseOrdering`), NeoForge/Forge
+//! `EventPriority`, then registration order, across every jar as one event.
+
+pub mod order;
 
 use std::{collections::BTreeMap, sync::Arc};
+
+pub use order::{ListenerOrder, PhaseOrdering, dispatch_order};
 
 use crate::{
     ExecutionBudget, HostInvocation, MethodRef, NativeError, NativeJar, StdHost, Value, arg_count,
@@ -324,8 +332,17 @@ enum Shape {
     UseBlock,
     /// `(Player, Level, InteractionHand)`
     UseItem,
-    /// `(Player, Level, InteractionHand, Entity, EntityHitResult)`
+    /// `(Player, Level, InteractionHand, Entity, EntityHitResult)`: attacking
+    /// or using an entity.
     AttackEntity,
+    /// `(Player, Level, InteractionHand, BlockPos, Direction)`
+    AttackBlock,
+    /// `(LivingEntity, DamageSource, float baseTaken, float taken, boolean blocked)`
+    AfterDamage,
+    /// `(ServerPlayer oldPlayer, ServerPlayer newPlayer, boolean alive)`
+    PlayerPair,
+    /// `(ServerPlayer, ServerLevel origin, ServerLevel destination)`
+    ChangeLevel,
     /// `(CommandDispatcher, CommandBuildContext, Commands.CommandSelection)`
     Commands,
     /// `(Minecraft)`
@@ -552,6 +569,81 @@ const FABRIC_FIELDS: &[FabricField] = &[
         event: GameEvent::BlockBreakAfter,
         shape: Shape::BlockBreak,
     },
+    // The rest of the server's player and entity events (Fabric API 26.3's
+    // `fabric-events-interaction-v0`, `fabric-entity-events-v1`,
+    // `fabric-lifecycle-events-v1`), read with `javap`.
+    FabricField {
+        owner: "net/fabricmc/fabric/api/event/player/AttackBlockCallback",
+        field: "EVENT",
+        method: "interact",
+        descriptor: "(Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/level/Level;Lnet/minecraft/world/InteractionHand;Lnet/minecraft/core/BlockPos;Lnet/minecraft/core/Direction;)Lnet/minecraft/world/InteractionResult;",
+        event: GameEvent::AttackBlock,
+        shape: Shape::AttackBlock,
+    },
+    FabricField {
+        owner: "net/fabricmc/fabric/api/event/player/UseEntityCallback",
+        field: "EVENT",
+        method: "interact",
+        descriptor: "(Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/level/Level;Lnet/minecraft/world/InteractionHand;Lnet/minecraft/world/entity/Entity;Lnet/minecraft/world/phys/EntityHitResult;)Lnet/minecraft/world/InteractionResult;",
+        event: GameEvent::UseEntity,
+        shape: Shape::AttackEntity,
+    },
+    FabricField {
+        owner: "net/fabricmc/fabric/api/event/player/PlayerBlockBreakEvents",
+        field: "CANCELED",
+        method: "onBlockBreakCanceled",
+        descriptor: "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/block/entity/BlockEntity;)V",
+        event: GameEvent::BlockBreakCanceled,
+        shape: Shape::BlockBreak,
+    },
+    fabric(
+        lifecycle!("ServerEntityEvents"),
+        "ENTITY_UNLOAD",
+        "onUnload",
+        "(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/server/level/ServerLevel;)V",
+        GameEvent::EntityUnload,
+        Shape::EntityLevel,
+    ),
+    FabricField {
+        owner: "net/fabricmc/fabric/api/entity/event/v1/ServerLivingEntityEvents",
+        field: "ALLOW_DAMAGE",
+        method: "allowDamage",
+        descriptor: "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/damagesource/DamageSource;F)Z",
+        event: GameEvent::LivingAllowDamage,
+        shape: Shape::EntityDamageAmount,
+    },
+    FabricField {
+        owner: "net/fabricmc/fabric/api/entity/event/v1/ServerLivingEntityEvents",
+        field: "AFTER_DAMAGE",
+        method: "afterDamage",
+        descriptor: "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/damagesource/DamageSource;FFZ)V",
+        event: GameEvent::LivingAfterDamage,
+        shape: Shape::AfterDamage,
+    },
+    FabricField {
+        owner: "net/fabricmc/fabric/api/entity/event/v1/ServerPlayerEvents",
+        field: "AFTER_RESPAWN",
+        method: "afterRespawn",
+        descriptor: "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/server/level/ServerPlayer;Z)V",
+        event: GameEvent::PlayerRespawn,
+        shape: Shape::PlayerPair,
+    },
+    FabricField {
+        owner: "net/fabricmc/fabric/api/entity/event/v1/ServerPlayerEvents",
+        field: "COPY_FROM",
+        method: "copyFromPlayer",
+        descriptor: "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/server/level/ServerPlayer;Z)V",
+        event: GameEvent::PlayerCopy,
+        shape: Shape::PlayerPair,
+    },
+    FabricField {
+        owner: "net/fabricmc/fabric/api/entity/event/v1/ServerEntityLevelChangeEvents",
+        field: "AFTER_PLAYER_CHANGE_LEVEL",
+        method: "afterChangeLevel",
+        descriptor: "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/server/level/ServerLevel;)V",
+        event: GameEvent::PlayerChangeLevel,
+        shape: Shape::ChangeLevel,
+    },
     FabricField {
         owner: "net/fabricmc/fabric/api/command/v2/CommandRegistrationCallback",
         field: "EVENT",
@@ -691,6 +783,32 @@ const BUS_EVENTS: &[(&str, GameEvent)] = &[
     ("entity/player/AttackEntityEvent", GameEvent::AttackEntity),
     ("level/BlockEvent$BreakEvent", GameEvent::BlockBreakBefore),
     ("level/block/BreakBlockEvent", GameEvent::BlockBreakBefore),
+    (
+        "entity/player/PlayerInteractEvent$LeftClickBlock",
+        GameEvent::AttackBlock,
+    ),
+    (
+        "entity/player/PlayerInteractEvent$EntityInteract",
+        GameEvent::UseEntity,
+    ),
+    ("entity/EntityLeaveLevelEvent", GameEvent::EntityUnload),
+    (
+        "entity/living/LivingIncomingDamageEvent",
+        GameEvent::LivingAllowDamage,
+    ),
+    (
+        "entity/living/LivingDamageEvent$Post",
+        GameEvent::LivingAfterDamage,
+    ),
+    (
+        "entity/player/PlayerEvent$PlayerRespawnEvent",
+        GameEvent::PlayerRespawn,
+    ),
+    ("entity/player/PlayerEvent$Clone", GameEvent::PlayerCopy),
+    (
+        "entity/player/PlayerEvent$PlayerChangedDimensionEvent",
+        GameEvent::PlayerChangeLevel,
+    ),
     ("RegisterCommandsEvent", GameEvent::RegisterCommands),
     ("TickEvent$ClientTickEvent$Pre", GameEvent::ClientTickStart),
     ("TickEvent$ClientTickEvent$Post", GameEvent::ClientTickEnd),
@@ -795,6 +913,8 @@ pub struct GameListener {
     pub callback: ListenerCallback,
     /// NeoForge/Forge `receiveCanceled`: it still runs after a cancellation.
     pub receives_cancelled: bool,
+    /// Its Fabric phase or NeoForge/Forge priority ([`dispatch_order`]).
+    pub order: ListenerOrder,
     shape: Option<Shape>,
     combine: Combine,
 }
@@ -817,6 +937,8 @@ pub struct GameListeners {
     /// Source → listener count, for registrations the game never fires
     /// (`CommandRegistrationCallback.EVENT`, a client tick...).
     pub unsupported: BTreeMap<String, usize>,
+    /// The `addPhaseOrdering` calls made on the Fabric fields the game fires.
+    pub phase_orderings: Vec<PhaseOrdering>,
 }
 
 impl GameListeners {
@@ -882,8 +1004,20 @@ pub struct EventContext {
     pub entity: Option<FacadeEntity>,
     /// The damage type id of a death (`minecraft:player_attack`).
     pub damage: Option<String>,
-    /// The damage amount of an `ALLOW_DEATH`.
+    /// The damage amount of an `ALLOW_DEATH`, `ALLOW_DAMAGE` or `AFTER_DAMAGE`.
     pub amount: f32,
+    /// The block a use, attack or break is about.
+    pub pos: Option<[i32; 3]>,
+    /// The face clicked (`[0, 1, 0]` is the top).
+    pub face: Option<[i32; 3]>,
+    /// The off hand acts (the main hand otherwise).
+    pub off_hand: bool,
+    /// `AFTER_RESPAWN`/`COPY_FROM`'s `alive` (back from the End, not a
+    /// death); `AFTER_DAMAGE`'s `blocked`.
+    pub flag: bool,
+    /// The level a player left (`AFTER_PLAYER_CHANGE_LEVEL`'s origin);
+    /// `level` is the destination.
+    pub origin: Option<String>,
 }
 
 /// One firing of one event, carried across every listener of every jar.
@@ -1008,6 +1142,16 @@ impl StdHost {
             && r.owner.starts_with("net/fabricmc/fabric/api/")
         {
             return Some(marker(format!("fabric-event/{}.{}", r.owner, r.name)));
+        }
+        // `Event.DEFAULT_PHASE` and the `EventPriority` constants: what a
+        // listener's order is registered with (`order.rs`).
+        if r.owner == FABRIC_EVENT && r.name == "DEFAULT_PHASE" {
+            return Some(marker(format!("identifier/{}", order::DEFAULT_PHASE)));
+        }
+        if order::PRIORITY_CLASSES.contains(&r.owner.as_str())
+            && order::PRIORITIES.contains(&r.name.as_str())
+        {
+            return Some(marker(format!("enum/{}/{}", r.owner, r.name)));
         }
         if r.name == "BUS"
             && r.owner.starts_with(FORGE_EVENT_ROOT)
@@ -1379,6 +1523,32 @@ fn event_parameter(descriptor: &str, skip: usize) -> Option<String> {
     }
 }
 
+/// A Fabric field as listeners name it (`UseBlockCallback.EVENT`).
+fn fabric_source(row: &FabricField) -> String {
+    format!(
+        "{}.{}",
+        row.owner.rsplit('/').next().unwrap_or(row.owner),
+        row.field
+    )
+}
+
+/// The phase id an `Identifier` argument names (`identifier/mymod:late` →
+/// `mymod:late`). Anything else keeps its text, so two registrations with
+/// the same unmodelled value still share a phase.
+fn phase_id(value: &Value) -> String {
+    match expect_ref(value) {
+        Some(text) => text.strip_prefix("identifier/").unwrap_or(text).to_owned(),
+        None => order::DEFAULT_PHASE.to_owned(),
+    }
+}
+
+/// The `EventPriority` a bus registration passes, `NORMAL` without one.
+fn bus_priority(args: &[Value]) -> u8 {
+    args.iter()
+        .find_map(|value| expect_ref(value).and_then(|text| order::priority_of(text)))
+        .unwrap_or(2)
+}
+
 fn count_unsupported(out: &mut GameListeners, source: String) {
     // Bounded: a jar naming thousands of distinct events keeps the first 64.
     if out.unsupported.len() < 64 || out.unsupported.contains_key(&source) {
@@ -1391,6 +1561,19 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
     let owner = invocation.method.owner.as_str();
     let name = invocation.method.name.as_str();
     let receiver = invocation.receiver.as_ref().and_then(expect_ref);
+    // Fabric: `<Field>.addPhaseOrdering(first, second)`, kept for the order.
+    if owner == FABRIC_EVENT && name == "addPhaseOrdering" {
+        if let Some(row) = receiver.and_then(|r| fabric_field(r))
+            && let [first, second] = invocation.args.as_slice()
+        {
+            out.phase_orderings.push(PhaseOrdering {
+                source: fabric_source(row),
+                first: phase_id(first),
+                second: phase_id(second),
+            });
+        }
+        return;
+    }
     // Fabric: `<Field>.register([phase,] listener)` on a named Event field.
     if owner == FABRIC_EVENT && name == "register" {
         let Some(receiver) = receiver else {
@@ -1403,11 +1586,19 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
             count_unsupported(out, source.to_owned());
             return;
         };
-        let source = format!(
-            "{}.{}",
-            row.owner.rsplit('/').next().unwrap_or(row.owner),
-            row.field
-        );
+        let source = fabric_source(row);
+        // `register(Identifier phase, listener)`: the phase is the first
+        // argument; plain `register(listener)` is the default phase.
+        let order = if invocation
+            .method
+            .descriptor
+            .starts_with("(Lnet/minecraft/resources/Identifier;")
+            && let Some(phase) = invocation.args.first()
+        {
+            ListenerOrder::Phase(phase_id(phase))
+        } else {
+            ListenerOrder::default_phase()
+        };
         let callback = if let Some(indy) = indy_argument(&invocation.args) {
             match parse_callback_marker(indy) {
                 Ok(marker) => ListenerCallback::Indy {
@@ -1439,6 +1630,7 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
             source,
             callback,
             receives_cancelled: false,
+            order,
             shape: Some(row.shape),
             combine,
         });
@@ -1449,7 +1641,7 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
         let Some(class) = receiver.and_then(|r| r.strip_prefix("forge-bus/")) else {
             return;
         };
-        push_bus_listener(class, invocation, jar, out, false);
+        push_bus_listener(class, invocation, jar, out, false, bus_priority(&invocation.args));
         return;
     }
     if !crate::is_event_bus_owner(owner) {
@@ -1479,7 +1671,14 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
                 Some(last.strip_prefix('L')?.strip_suffix(';')?.to_owned())
             });
             match class {
-                Some(class) => push_bus_listener(&class, invocation, jar, out, receives),
+                Some(class) => push_bus_listener(
+                    &class,
+                    invocation,
+                    jar,
+                    out,
+                    receives,
+                    bus_priority(&invocation.args),
+                ),
                 None => count_unsupported(out, "IEventBus.addListener".into()),
             }
         }
@@ -1507,6 +1706,7 @@ fn push_bus_listener(
     jar: &NativeJar,
     out: &mut GameListeners,
     receives_cancelled: bool,
+    priority: u8,
 ) {
     let Some((event, loader)) = bus_event(class) else {
         count_unsupported(out, class.to_owned());
@@ -1537,6 +1737,7 @@ fn push_bus_listener(
         source: class.to_owned(),
         callback,
         receives_cancelled,
+        order: ListenerOrder::Priority(priority),
         shape: None,
         combine: Combine::Void,
     });
@@ -1577,6 +1778,11 @@ fn subscribe_methods(
             annotation.values.get("receiveCanceled"),
             Some(crate::AnnotationValue::Bool(true))
         );
+        // `@SubscribeEvent(priority = EventPriority.HIGH)`.
+        let priority = match annotation.values.get("priority") {
+            Some(crate::AnnotationValue::String(text)) => order::priority_of(text).unwrap_or(2),
+            _ => 2,
+        };
         let target = MethodRef {
             owner: class.to_owned(),
             name: method.name.clone(),
@@ -1594,6 +1800,7 @@ fn subscribe_methods(
                 None => ListenerCallback::Static { method: target },
             },
             receives_cancelled,
+            order: ListenerOrder::Priority(priority),
             shape: None,
             combine: Combine::Void,
         });
@@ -1658,8 +1865,33 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             context.damage.as_deref().unwrap_or("minecraft:generic")
         ))
     };
-    let hand = || marker("enum/net/minecraft/world/InteractionHand/MAIN_HAND".into());
+    let hand = || {
+        let hand = if context.off_hand {
+            "OFF_HAND"
+        } else {
+            "MAIN_HAND"
+        };
+        marker(format!("enum/net/minecraft/world/InteractionHand/{hand}"))
+    };
     let opaque = |what: &str| marker(format!("game/{what}/0"));
+    // `block-pos/x,y,z`, the host's block position value (`getX`...).
+    let pos = || {
+        context
+            .pos
+            .map(|[x, y, z]| marker(format!("block-pos/{x},{y},{z}")))
+            .ok_or_else(|| missing("block position"))
+    };
+    let direction = || {
+        let name = match context.face {
+            Some([0, -1, 0]) => "DOWN",
+            Some([0, 0, -1]) => "NORTH",
+            Some([0, 0, 1]) => "SOUTH",
+            Some([-1, 0, 0]) => "WEST",
+            Some([1, 0, 0]) => "EAST",
+            _ => "UP",
+        };
+        marker(format!("enum/net/minecraft/core/Direction/{name}"))
+    };
     Ok(match shape {
         Shape::Server => vec![server()],
         Shape::Level => vec![level()?],
@@ -1687,15 +1919,48 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
         Shape::BlockBreak => vec![
             level()?,
             player_marker(player()?),
-            opaque("block-pos"),
+            pos()?,
             opaque("block-state"),
             Value::Ref(None),
         ],
-        Shape::UseBlock => vec![
+        Shape::UseBlock => {
+            // The hit result names its block: `game/block-hit/x,y,z`.
+            let [x, y, z] = context.pos.ok_or_else(|| missing("block position"))?;
+            vec![
+                player_marker(player()?),
+                level()?,
+                hand(),
+                marker(format!("game/block-hit/{x},{y},{z}")),
+            ]
+        }
+        Shape::AttackBlock => vec![
             player_marker(player()?),
             level()?,
             hand(),
-            opaque("block-hit"),
+            pos()?,
+            direction(),
+        ],
+        Shape::AfterDamage => vec![
+            subject()?,
+            damage(),
+            Value::Float(f64::from(context.amount)),
+            Value::Float(f64::from(context.amount)),
+            Value::Int(i32::from(context.flag)),
+        ],
+        // Horizon keeps one player across a respawn: the old and the new
+        // player are the same marker.
+        Shape::PlayerPair => {
+            let player = player_marker(player()?);
+            vec![player.clone(), player, Value::Int(i32::from(context.flag))]
+        }
+        Shape::ChangeLevel => vec![
+            player_marker(player()?),
+            context
+                .origin
+                .as_deref()
+                .map(level_marker)
+                .ok_or_else(|| missing("origin level"))?,
+            level()?,
         ],
         Shape::UseItem => vec![player_marker(player()?), level()?, hand()],
         Shape::AttackEntity => vec![
