@@ -18,6 +18,11 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // Runtime-built method handles (`method_handles.rs`) before the
+        // proxy module's lookups, which refuse every JDK member.
+        if let Some(value) = self.invoke_method_handle_model(r, receiver, args)? {
+            return Ok(Some(value));
+        }
         if let Some(value) = self.invoke_reflect_proxy(r, receiver, args)? {
             return Ok(Some(value));
         }
@@ -399,7 +404,10 @@ impl<H: Host> Runtime<'_, H> {
         let Some(marker) = expect_ref(value) else {
             return Ok(None);
         };
-        if !marker.contains('#') && !marker.starts_with("typetoken/") {
+        if !marker.contains('#')
+            && !marker.starts_with("typetoken/")
+            && !marker.starts_with("method-type/")
+        {
             return Ok(None);
         }
         let to_string = MethodRef {

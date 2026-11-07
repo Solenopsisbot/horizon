@@ -24,6 +24,8 @@ mod dfu_pair;
 mod entrypoint_role;
 pub mod events;
 mod fabric_registry;
+mod facade_saved_data;
+mod facade_text;
 mod facade_server;
 mod game_hooks;
 mod guava_model;
@@ -35,6 +37,7 @@ mod jdk_reflect_proxy;
 mod jdk_stream;
 mod library_dispatch;
 mod map_compute;
+mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
 mod reflect_constructors;
@@ -2018,6 +2021,13 @@ pub trait Host {
     fn get_static(&mut self, _: &MethodRef) -> Result<Value, NativeError> {
         Ok(Value::Ref(None))
     }
+    /// An instance field the interpreter does not hold, read with its
+    /// receiver: a field of a host object (`player.connection` on a façade
+    /// player). The default answers as hosts always did, without it.
+    fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
+        let _ = receiver;
+        self.get_static(r)
+    }
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
         Ok(Value::default_for(return_desc(&r.descriptor)))
     }
@@ -2364,6 +2374,8 @@ pub struct StdHost {
     /// The id each `new LevelResource(id)` a jar built carries
     /// (`facade_server.rs`), by the object's marker.
     level_resources: BTreeMap<String, String>,
+    /// A server's saved data the jar's callbacks stored (`facade_saved_data.rs`).
+    saved_data: facade_saved_data::SavedDataState,
     holders: BTreeMap<String, Value>,
     mutable_collections: BTreeMap<String, Vec<Value>>,
     iterators: BTreeMap<String, (Vec<Value>, usize)>,
@@ -2468,6 +2480,7 @@ impl StdHost {
             fabric_entrypoint_containers: Vec::new(),
             packet_types: BTreeMap::new(),
             level_resources: BTreeMap::new(),
+            saved_data: facade_saved_data::SavedDataState::default(),
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             iterators: BTreeMap::new(),
@@ -3633,6 +3646,14 @@ impl StdHost {
 }
 
 impl Host for StdHost {
+    fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
+        // A façade object's own field (`facade_server.rs`).
+        if let Some(value) = self.facade_field(receiver, r) {
+            return Ok(value);
+        }
+        self.get_static(r)
+    }
+
     fn note_content_builder(&mut self, event: ContentBuilderEvent) {
         if let Some(entry) = self.content_builders.note(event) {
             // An attachment registers itself; a metadata row for the same key
@@ -5132,6 +5153,12 @@ impl Host for StdHost {
         }
         // A game-event façade marker (server, level, player, event object)
         // answers its bounded surface; anything else refuses the listener.
+        // A server's saved data (the storage, its types, a `SavedData`'s
+        // dirty flag) and a façade player's server-wide members
+        // (`facade_server.rs`, `facade_saved_data.rs`).
+        if let Some(answer) = self.server_facade_call(r, receiver, args) {
+            return answer;
+        }
         if let Some(answer) = self.game_event_call(r, receiver, args) {
             return answer;
         }
@@ -8832,6 +8859,10 @@ fn component_value(kind: &str, text: &str) -> Value {
 
 fn component_text(value: &Value) -> String {
     let raw = expect_ref(value).map_or("", |value| value.as_str());
+    // A styled component or one with arguments (`facade_text.rs`).
+    if raw.starts_with(facade_text::JSON_PREFIX) {
+        return facade_text::to_json(value).map_or_else(String::new, |json| facade_text::plain(&json));
+    }
     raw.strip_prefix("component/literal/")
         .or_else(|| raw.strip_prefix("component/translatable/"))
         .unwrap_or(raw)
@@ -19244,7 +19275,9 @@ impl<H: Host> Runtime<'_, H> {
             "filter" if r.descriptor == "(Ljava/util/function/Predicate;)Ljava/util/Optional;" => {
                 args.first()
             }
-            "orElseGet" if r.descriptor == "(Ljava/util/function/Supplier;)Ljava/lang/Object;" => {
+            "orElseGet" | "orElseThrow"
+                if r.descriptor == "(Ljava/util/function/Supplier;)Ljava/lang/Object;" =>
+            {
                 args.first()
             }
             _ => return Ok(None),
@@ -19252,6 +19285,26 @@ impl<H: Host> Runtime<'_, H> {
         let Some(callback) = callback else {
             return Ok(None);
         };
+        // `orElseThrow(supplier)` on an empty optional throws what the
+        // supplier answers. The supplier is usually a jar lambda the host
+        // cannot run (it answered null, so every such throw became an NPE), so
+        // it runs here; a present value is the host's `get`.
+        if r.name == "orElseThrow" {
+            if present.is_some() {
+                return Ok(None);
+            }
+            let Some(supplied) = self.invoke_callback(callback, &[])? else {
+                return Ok(None);
+            };
+            return Err(match supplied {
+                Value::Ref(Some(_)) => NativeError::UncaughtException {
+                    class: thrown_class(&supplied),
+                    message: thrown_message(&supplied, self.host),
+                    frame: None,
+                },
+                other => thrown_from_supplied(other),
+            });
+        }
         let Some(value) = present else {
             return match r.name.as_str() {
                 "map" => Ok(Some(Value::Ref(None))),
@@ -23639,7 +23692,7 @@ impl<H: Host> Runtime<'_, H> {
                                 .and_then(|key| self.fields.get(&key).cloned())
                             {
                                 Some(value) => value,
-                                None => self.host.get_static(&r)?,
+                                None => self.host.get_field(&receiver, &r)?,
                             }
                         }
                         AnchorOutcome::Suppress => Value::default_for(&r.descriptor),
@@ -23777,6 +23830,10 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_map_compute(&r, receiver.as_ref(), &args))
+                    {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_server_facade(&r, receiver.as_ref(), &args))
                     {
                         value
                     } else if let Some(value) = invoke_or_catch!(
