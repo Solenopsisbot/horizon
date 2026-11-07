@@ -1073,3 +1073,49 @@ public final class Main {
         ])
     );
 }
+
+/// A config manager checks each annotated field with
+/// `Modifier.isPublic(field.getModifiers())` and names its declaring class in
+/// the error (naturally_trimmed); a logging shim's `$SwitchMap` over SLF4J's
+/// `Level` sizes itself from `values()` (moderner-beta).
+#[test]
+fn modifier_predicates_and_library_enum_switch_maps_answer() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "org/slf4j/event/Level.java",
+        "package org.slf4j.event;\npublic enum Level { ERROR, WARN, INFO, DEBUG, TRACE }\n",
+    );
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import org.slf4j.event.Level;
+public final class Main {
+    public static int open = 1;
+    private static final int closed = 2;
+    static int weight(Level level) {
+        switch (level) {
+            case TRACE: return 5;
+            case ERROR: return 1;
+            default: return 3;
+        }
+    }
+    public static void main() throws Exception {
+        Field open = Main.class.getDeclaredField("open");
+        Field closed = Main.class.getDeclaredField("closed");
+        Probe.check("public", Modifier.isPublic(open.getModifiers()) && Modifier.isStatic(open.getModifiers()));
+        Probe.check("private", !Modifier.isPublic(closed.getModifiers())
+            && Modifier.isPrivate(closed.getModifiers()) && Modifier.isFinal(closed.getModifiers()));
+        Probe.check("declaring", open.getDeclaringClass() == Main.class);
+        Probe.check("switch", weight(Level.TRACE) == 5);
+        Probe.check("ordinal", Level.TRACE.ordinal() == 4 && "WARN".equals(Level.WARN.name()));
+    }
+}
+"#,
+    );
+    assert_eq!(
+        run("modifiers", sources, &["org/slf4j/event/Level.class"]),
+        all_true(&["declaring", "ordinal", "private", "public", "switch"])
+    );
+}

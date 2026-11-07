@@ -3582,6 +3582,14 @@ impl Host for StdHost {
         if let Some(id) = registry_static_id(&r.owner, &r.name) {
             return Ok(Value::Ref(Some(format!("registry/{id}"))));
         }
+        // A modelled game enum's constant is its `enum/<class>/<NAME>` marker,
+        // the same value `values()` lists.
+        if r.descriptor == format!("L{};", r.owner)
+            && game_enum_constants(&r.owner)
+                .is_some_and(|constants| constants.contains(&r.name.as_str()))
+        {
+            return Ok(Value::Ref(Some(format!("enum/{}/{}", r.owner, r.name))));
+        }
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("java/time/Duration", "ZERO", "Ljava/time/Duration;") => Ok(duration_value(0)),
             // TimeUnit constants carry their name; the conversion accessors
@@ -4282,6 +4290,13 @@ impl Host for StdHost {
             | ("java/util/Collections", "unmodifiableSet", "(Ljava/util/Set;)Ljava/util/Set;")
             | ("java/util/Collections", "unmodifiableMap", "(Ljava/util/Map;)Ljava/util/Map;") => {
                 Ok(Self::argument(r, args, 0)?.clone())
+            }
+            // `java.lang.reflect.Modifier` predicates over the access flags a
+            // reflected member's `getModifiers()` answers (the JVM's bits).
+            ("java/lang/reflect/Modifier", name, "(I)Z") if modifier_bit(name).is_some() => {
+                let flags = expect_int(r, Self::argument(r, args, 0)?)?;
+                let bit = modifier_bit(name).unwrap_or_default();
+                Ok(Value::Int(i32::from(flags & bit != 0)))
             }
             // commons-io ships with the game too; `IOUtils.toString(stream,
             // charset)` drains a bundled resource stream the host opened (the
@@ -5179,7 +5194,7 @@ impl Host for StdHost {
         if r.owner == "java/lang/reflect/Field"
             && matches!(
                 r.name.as_str(),
-                "getName" | "getType" | "getModifiers" | "toString"
+                "getName" | "getType" | "getModifiers" | "getDeclaringClass" | "toString"
             )
         {
             let marker = receiver_marker.as_deref().ok_or_else(|| {
@@ -5188,7 +5203,7 @@ impl Host for StdHost {
             let method = marker.strip_prefix("reflect-field/").ok_or_else(|| {
                 NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
             })?;
-            let (_, member) = method.split_once('#').ok_or_else(|| {
+            let (declaring, member) = method.split_once('#').ok_or_else(|| {
                 NativeError::Metadata("reflective field marker has no name separator".into())
             })?;
             let (name, descriptor_and_access) = member.split_once(':').unwrap_or((member, ""));
@@ -5203,6 +5218,10 @@ impl Host for StdHost {
                     Ok(Value::Ref(Some(erased_field_type(descriptor))))
                 }
                 ("getModifiers", "()I") => Ok(Value::Int(i32::from(access))),
+                // The class the marker was read from declares the field.
+                ("getDeclaringClass", "()Ljava/lang/Class;") => {
+                    Ok(Value::Ref(Some(declaring.to_owned())))
+                }
                 ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(marker.to_owned()))),
                 _ => Err(NativeError::MissingMethod(format!(
                     "java/lang/reflect/Field#{}{}",
@@ -9317,6 +9336,9 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "net/minecraft/world/level/block/Mirror" => &["NONE", "LEFT_RIGHT", "FRONT_BACK"],
         // Mods iterate `PackType.values()` to register a pack for each side.
         "net/minecraft/server/packs/PackType" => &["CLIENT_RESOURCES", "SERVER_DATA"],
+        // SLF4J ships with the game; logging shims switch over its levels
+        // (javac's `$SwitchMap` sizes its table from `values()`).
+        "org/slf4j/event/Level" => &["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
         _ => return None,
     })
 }
@@ -10061,6 +10083,25 @@ fn java_float_text(scientific: String) -> String {
 
 /// The collection kind a reference return descriptor declares, when it is one
 /// of the `java.util` collections the host models.
+/// The access-flag bit one `java.lang.reflect.Modifier.isX(int)` tests.
+fn modifier_bit(name: &str) -> Option<i32> {
+    Some(match name {
+        "isPublic" => 0x0001,
+        "isPrivate" => 0x0002,
+        "isProtected" => 0x0004,
+        "isStatic" => 0x0008,
+        "isFinal" => 0x0010,
+        "isSynchronized" => 0x0020,
+        "isVolatile" => 0x0040,
+        "isTransient" => 0x0080,
+        "isNative" => 0x0100,
+        "isInterface" => 0x0200,
+        "isAbstract" => 0x0400,
+        "isStrict" => 0x0800,
+        _ => return None,
+    })
+}
+
 /// The opaque value an unmodelled step of a game builder chain (or a game
 /// type's own `create*` factory) answers.
 ///
@@ -21343,8 +21384,21 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        if r.owner != "java/lang/Enum" {
+        // A modelled game enum's constant answers `Enum`'s members through its
+        // own class too (`invokevirtual Level.ordinal()`).
+        let game_constant = game_enum_constants(&r.owner).is_some()
+            && receiver
+                .and_then(expect_ref)
+                .is_some_and(|marker| marker.starts_with(&format!("enum/{}/", r.owner)));
+        if r.owner != "java/lang/Enum" && !game_constant {
             return Ok(None);
+        }
+        if game_constant && matches!(r.name.as_str(), "name" | "toString") {
+            let name = receiver
+                .and_then(expect_ref)
+                .and_then(|marker| marker.rsplit('/').next())
+                .map(str::to_owned);
+            return Ok(name.map(|name| Value::Ref(Some(name))));
         }
         if r.name == "<init>" && r.descriptor == "(Ljava/lang/String;I)V" {
             let marker = expect_ref(receiver.unwrap_or(&Value::Ref(None))).ok_or_else(|| {
@@ -21387,6 +21441,16 @@ impl<H: Host> Runtime<'_, H> {
         else {
             return Ok(None);
         };
+        // A modelled game enum has no jar `$VALUES`: its constants' order is
+        // the declaration order the table keeps.
+        if !self.has_class(class)
+            && let Some(constants) = game_enum_constants(class)
+        {
+            return Ok(constants
+                .iter()
+                .position(|constant| *constant == name)
+                .map(|ordinal| Value::Int(ordinal as i32)));
+        }
         self.ensure_initialized(class)?;
         let key = format!("{class}#$VALUES[L{class};");
         let Some(values) = self.static_fields.get(&key).cloned() else {
