@@ -457,7 +457,7 @@ fn first_game_skip_reason(skipped: &[horizon_native_java::SkippedMixinPlan]) -> 
 }
 
 // The bound jars live with the code that fires them: `java_game_hooks.rs`.
-use super::java_game_hooks::{clear_java_game_hooks_as, publish_java_game_hooks};
+use super::java_game_hooks::{clear_java_game_hooks_as, publish_java_game_hooks_resident};
 
 /// The environment variable that turns the game-class hook tier on. It is off
 /// by default: the default weave keeps every game-class plan a skip, because a
@@ -1315,9 +1315,14 @@ fn adopt_run(
     let id = handler_role(role);
     // A cached result has neither: a jar that declared payload channels was
     // never stored, so nothing is left to publish.
-    if let (Some(jar), Some(mut host)) = (jar, host) {
+    if let (Some(jar), Some(host)) = (jar, host) {
+        // One resident host per jar and role: the host its entrypoints ran
+        // on, holding its statics and the objects they reach. Every store
+        // below keeps this one, so a payload handler, a listener and a game
+        // hook of the jar see each other's changes.
+        let host: super::java_payloads::ResidentHost = Arc::new(std::sync::Mutex::new(host));
         let adopted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::java_payloads::adopt_host(id, &jar, &mut host, payload_declarations);
+            super::java_payloads::adopt_resident_host(id, &jar, &host, payload_declarations);
         }));
         if adopted.is_err() {
             batch.failures.push(JavaJarFailure {
@@ -1327,15 +1332,15 @@ fn adopt_run(
             return;
         }
         // Dispatch keeps the hosts that declared payload channels
-        // (`java_payloads::store_handler_host_as`); the hook tier keeps the
+        // (`java_payloads::store_handler_resident_as`); the hook tier keeps the
         // jars that bound game-class callbacks. No other consumer needs the
         // parsed jar or its resources after its entrypoints ran, so do not hold
         // them for the process lifetime.
         // The event store keeps the jars whose listeners the game fires.
         let jar = Arc::new(jar);
-        super::java_events::adopt(role, &report.jar, &jar, &host);
+        super::java_events::adopt_resident(role, &report.jar, &jar, &host);
         if let Some(registrations) = game_hooks {
-            publish_java_game_hooks(id, &report.jar, jar, registrations, &host);
+            publish_java_game_hooks_resident(id, &report.jar, jar, registrations, &host);
         }
         drop(host);
     }

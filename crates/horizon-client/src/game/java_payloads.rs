@@ -21,7 +21,7 @@ use horizon_native_java::{
 };
 use horizon_protocol::packets::{configuration::CustomPayload, play::Clientbound as C};
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 // ---------------------------------------------------------------------------
 // The payload model (ported from `horizon-mods`: `payloads.rs`).
@@ -851,6 +851,22 @@ impl Reader<'_> {
 // Java handlers.
 // ---------------------------------------------------------------------------
 
+/// The host one jar bootstrapped on, kept for its role's whole run and shared
+/// by every store that calls the jar back: its payload handlers, its event
+/// listeners (`java_events`) and its game-hook callbacks (`java_game_hooks`).
+/// It holds the jar's statics and the objects its entrypoint built
+/// (`horizon_native_java::JavaHeap`), so a payload handler that subscribes a
+/// player to a list is what the stop listener walks.
+///
+/// Lock order: a store's own mutex, then this one. No callback reaches
+/// another store while it runs, so nothing takes them the other way round.
+pub(super) type ResidentHost = Arc<Mutex<StdHost>>;
+
+/// A jar's resident host, whatever an earlier panic left in it.
+pub(super) fn lock_resident(host: &ResidentHost) -> MutexGuard<'_, StdHost> {
+    host.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The jars and registrations of running Java mods, so a received frame can
 /// reach its registered handler.
 struct HandlerJar {
@@ -859,7 +875,7 @@ struct HandlerJar {
     /// The host the jar bootstrapped on. Its payload-type markers are what let
     /// a registration's marker resolve to a channel id, so a jar is only ever
     /// stored with one.
-    host: StdHost,
+    host: ResidentHost,
 }
 
 /// The execution role whose Java payload handlers own a connection.
@@ -874,16 +890,22 @@ static HANDLER_JARS: Mutex<BTreeMap<HandlerRole, Vec<HandlerJar>>> = Mutex::new(
 
 /// Remember the jars and registrations of one execution role's bootstrap, and
 /// the host each ran on so a received frame's channel id resolves to the
-/// registration's payload-type marker. Sends the host had queued are dropped
-/// from the kept copy (the caller already published them).
-pub(super) fn store_handler_host_as(role: HandlerRole, jar: NativeJar, host: &StdHost) {
-    let registrations = host.payload_registrations().to_vec();
-    if registrations.is_empty() {
-        return;
-    }
-    let mut template = host.clone();
-    let _ = template.take_outgoing_payloads();
-    let _ = template.take_incoming_payloads();
+/// registration's payload-type marker. Sends the host still has queued are
+/// dropped (the caller already published them).
+///
+/// The store keeps the jar's resident host itself, not a copy, so the
+/// handlers run on the state its other callbacks share.
+pub(super) fn store_handler_resident_as(role: HandlerRole, jar: NativeJar, host: &ResidentHost) {
+    let registrations = {
+        let mut template = lock_resident(host);
+        let registrations = template.payload_registrations().to_vec();
+        if registrations.is_empty() {
+            return;
+        }
+        let _ = template.take_outgoing_payloads();
+        let _ = template.take_incoming_payloads();
+        registrations
+    };
     HANDLER_JARS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -892,7 +914,7 @@ pub(super) fn store_handler_host_as(role: HandlerRole, jar: NativeJar, host: &St
         .push(HandlerJar {
             jar,
             registrations,
-            host: template,
+            host: Arc::clone(host),
         });
 }
 
@@ -975,7 +997,11 @@ fn dispatch_matching(
             })
             .cloned()
             .collect();
-        let mut host = handler.host.clone();
+        // The handler runs on the jar's resident host, so what it changes is
+        // what the next frame, listener or hook sees; what it logged is
+        // rolled back, so frames do not grow the call log.
+        let mut host = lock_resident(&handler.host);
+        let mark = host.call_log_mark();
         let matched = dispatch_payload_frame_with(
             &handler.jar,
             &mut host,
@@ -984,8 +1010,9 @@ fn dispatch_matching(
             payload.clone(),
             context.clone(),
         )
-        .map_err(|error| error.to_string())?;
-        if matched {
+        .map_err(|error| error.to_string());
+        host.rewind_call_log(mark);
+        if matched? {
             publish_from_host(&mut host)?;
             return Ok(true);
         }
@@ -1302,12 +1329,29 @@ pub(super) fn forget_guest(conn: u32) {
 /// many channels the content root declares so far; a channel the model cannot
 /// parse, a duplicate id and a bad queued frame are warnings, never a startup
 /// failure.
+#[cfg(test)]
 pub(super) fn adopt_host(
     role: HandlerRole,
     jar: &NativeJar,
     host: &mut StdHost,
     declarations: &mut Vec<PayloadDeclaration>,
 ) -> usize {
+    let resident: ResidentHost = Arc::new(Mutex::new(std::mem::take(host)));
+    let count = adopt_resident_host(role, jar, &resident, declarations);
+    *host = lock_resident(&resident).clone();
+    count
+}
+
+/// [`adopt_host`] for the jar's resident host, which the payload store keeps
+/// (shared with the jar's other callback stores) instead of a copy.
+pub(super) fn adopt_resident_host(
+    role: HandlerRole,
+    jar: &NativeJar,
+    resident: &ResidentHost,
+    declarations: &mut Vec<PayloadDeclaration>,
+) -> usize {
+    let mut guard = lock_resident(resident);
+    let host = &mut *guard;
     let (own, skipped) = declarations_from_host(host);
     for skipped in &skipped {
         log::warn!("Horizon: a Java payload channel was skipped: {skipped}");
@@ -1323,10 +1367,11 @@ pub(super) fn adopt_host(
     if let Err(error) = publish_from_host(host) {
         log::warn!("Horizon: a Java payload send at bootstrap was skipped: {error}");
     }
+    drop(guard);
     // Keep the bootstrapped host, not just its registrations: dispatch
     // resolves a registration's payload-type marker through the host's
     // channel map, and a jar stored without one never matches a frame.
-    store_handler_host_as(role, jar.clone(), host);
+    store_handler_resident_as(role, jar.clone(), resident);
     count
 }
 

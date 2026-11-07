@@ -857,6 +857,14 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.store_persistent_class_state(fields, initialized)
     }
 
+    fn take_persistent_heap(&mut self) -> Option<JavaHeap> {
+        self.inner.take_persistent_heap()
+    }
+
+    fn store_persistent_heap(&mut self, heap: JavaHeap) -> Result<(), NativeError> {
+        self.inner.store_persistent_heap(heap)
+    }
+
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
         self.inner.empty_mutable_collection(kind)
     }
@@ -945,9 +953,16 @@ impl NativeJar {
     /// name (see [`GameHookContext::insert`]), `state` is the jar's own and
     /// persists between firings, and `budget` bounds the firing's wall-clock
     /// time. A call the model does not answer fails the firing with an error
-    /// naming it; the callbacks that ran before it keep their effects, the
-    /// state they wrote is dropped, and the host decides whether to fire the
-    /// jar again.
+    /// naming it; the callbacks that ran before it keep their effects, and the
+    /// host decides whether to fire the jar again.
+    ///
+    /// On a resident host (`StdHost`) the callbacks run on the jar's own
+    /// objects (`heap.rs`): what its entrypoint built and earlier firings
+    /// changed, through statics or lambda captures. Their writes to those
+    /// objects and to statics stay even when the firing fails, as a JVM's
+    /// would; only the fields a failed firing wrote on game objects are
+    /// dropped. Fields on game objects always stay in `state`, so
+    /// [`GameHookState::forget_object`] still forgets them per object.
     #[allow(clippy::too_many_arguments)]
     pub fn run_game_hook_in<H: Host>(
         &self,
@@ -1040,77 +1055,112 @@ impl NativeJar {
         };
         // `game_hook_callback_values` answers whether the callback is an
         // instance method: only those receive the game object as `this`.
-        for (entry, (is_instance, values)) in entries.iter().zip(checked) {
-            let marker = callback_info_marker(&entry.target);
-            // Every callback at one hook point shares the object Mixin would
-            // hand the injection point, so a `cancel()` in one is what the
-            // next one observes.
-            runtime.open_callback_info(&marker)?;
-            let callback_receiver = is_instance.then(|| {
-                receiver
-                    .clone()
-                    .unwrap_or_else(|| Value::Ref(Some(entry.callback.owner.clone())))
-            });
-            // The first callback of a Mixin class on a game object runs the
-            // class's constructor on it: `javac` put the Mixin's field
-            // initialisers there, which real Mixin merges into the target's
-            // constructors. A Mixin that extends a game class has no
-            // no-argument constructor to run, and its fields start at Java's
-            // defaults.
-            if let Some(Value::Ref(Some(object))) = &callback_receiver
-                && object.starts_with(GAME_OBJECT_PREFIX)
-                && initialized.insert(format!("{}|{object}", entry.callback.owner))
-                && self
-                    .classes
-                    .get(&entry.callback.owner)
-                    .is_some_and(|class| {
-                        class.super_name == "java/lang/Object"
-                            && class.method("<init>", "()V").is_some()
-                    })
-            {
-                runtime.invoke(
+        // The jar's own objects: what its entrypoint built and earlier
+        // firings changed. Fields on game objects come from `state`.
+        let resident = runtime.adopt_resident_heap();
+        let outcome = (|| -> Result<(), NativeError> {
+            for (entry, (is_instance, values)) in entries.iter().zip(checked) {
+                let marker = callback_info_marker(&entry.target);
+                // Every callback at one hook point shares the object Mixin would
+                // hand the injection point, so a `cancel()` in one is what the
+                // next one observes.
+                runtime.open_callback_info(&marker)?;
+                let callback_receiver = is_instance.then(|| {
+                    receiver
+                        .clone()
+                        .unwrap_or_else(|| Value::Ref(Some(entry.callback.owner.clone())))
+                });
+                // The first callback of a Mixin class on a game object runs the
+                // class's constructor on it: `javac` put the Mixin's field
+                // initialisers there, which real Mixin merges into the target's
+                // constructors. A Mixin that extends a game class has no
+                // no-argument constructor to run, and its fields start at Java's
+                // defaults.
+                if let Some(Value::Ref(Some(object))) = &callback_receiver
+                    && object.starts_with(GAME_OBJECT_PREFIX)
+                    && initialized.insert(format!("{}|{object}", entry.callback.owner))
+                    && self
+                        .classes
+                        .get(&entry.callback.owner)
+                        .is_some_and(|class| {
+                            class.super_name == "java/lang/Object"
+                                && class.method("<init>", "()V").is_some()
+                        })
+                {
+                    runtime.invoke(
+                        &entry.callback.owner,
+                        "<init>",
+                        "()V",
+                        callback_receiver.clone(),
+                        &[],
+                    )?;
+                }
+                let result = runtime.invoke(
                     &entry.callback.owner,
-                    "<init>",
-                    "()V",
-                    callback_receiver.clone(),
-                    &[],
+                    &entry.callback.name,
+                    &entry.callback.descriptor,
+                    callback_receiver,
+                    &values,
                 )?;
+                results.push(result);
+                if entry.cancellable && runtime.callback_info_cancelled(&marker)? {
+                    cancelled = true;
+                    break;
+                }
             }
-            let result = runtime.invoke(
-                &entry.callback.owner,
-                &entry.callback.name,
-                &entry.callback.descriptor,
-                callback_receiver,
-                &values,
-            )?;
-            results.push(result);
-            if entry.cancellable && runtime.callback_info_cancelled(&marker)? {
-                cancelled = true;
-                break;
+            // A write to a `@Shadow` field is a write to the game object's own
+            // field, which the host never sees: that callback did not do what
+            // it meant to, so the firing fails instead of keeping the write.
+            if let Some(key) = runtime.fields.keys().find(|key| {
+                key.split_once('|').is_some_and(|(object, field)| {
+                    object.starts_with(GAME_OBJECT_PREFIX) && model.shadow_fields.contains(field)
+                })
+            }) {
+                return Err(NativeError::Metadata(format!(
+                    "game hook callback writes the game's field {key} through @Shadow, which the host does not apply"
+                )));
             }
+            if !resident
+                && (runtime.fields.len() > MAX_GAME_HOOK_FIELDS
+                    || runtime.arrays.len() > MAX_GAME_HOOK_ARRAYS)
+            {
+                return Err(NativeError::Metadata(format!(
+                    "game hook callbacks keep more than {MAX_GAME_HOOK_FIELDS} fields or {MAX_GAME_HOOK_ARRAYS} arrays"
+                )));
+            }
+            Ok(())
+        })();
+        if !resident {
+            // A host without a resident heap: `state` keeps every object, and
+            // a failed firing keeps nothing, as before the heap.
+            outcome?;
+            runtime.persist_class_state()?;
+            state.fields = std::mem::take(&mut runtime.fields);
+            state.arrays = std::mem::take(&mut runtime.arrays);
+        } else {
+            // Game objects' fields stay with `state`, kept per object; the
+            // jar's objects go back to the host, which keeps what the statics,
+            // its registrations or those game-object fields still reach. A
+            // failed firing's game-object writes are dropped.
+            let (game, jar): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut runtime.fields)
+                .into_iter()
+                .partition(|(key, _)| key.starts_with(GAME_OBJECT_PREFIX));
+            runtime.fields = jar;
+            if outcome.is_ok() {
+                state.fields = game;
+            }
+            state.arrays.clear();
+            let roots = state
+                .fields
+                .values()
+                .filter_map(|value| expect_ref(value).cloned())
+                .collect();
+            let persistence = runtime.persist_class_state();
+            let heap = runtime.persist_resident_heap_with(roots);
+            outcome?;
+            persistence?;
+            heap?;
         }
-        // A write to a `@Shadow` field is a write to the game object's own
-        // field, which the host never sees: that callback did not do what it
-        // meant to, so the firing fails instead of keeping the write.
-        if let Some(key) = runtime.fields.keys().find(|key| {
-            key.split_once('|').is_some_and(|(object, field)| {
-                object.starts_with(GAME_OBJECT_PREFIX) && model.shadow_fields.contains(field)
-            })
-        }) {
-            return Err(NativeError::Metadata(format!(
-                "game hook callback writes the game's field {key} through @Shadow, which the host does not apply"
-            )));
-        }
-        if runtime.fields.len() > MAX_GAME_HOOK_FIELDS
-            || runtime.arrays.len() > MAX_GAME_HOOK_ARRAYS
-        {
-            return Err(NativeError::Metadata(format!(
-                "game hook callbacks keep more than {MAX_GAME_HOOK_FIELDS} fields or {MAX_GAME_HOOK_ARRAYS} arrays"
-            )));
-        }
-        runtime.persist_class_state()?;
-        state.fields = std::mem::take(&mut runtime.fields);
-        state.arrays = std::mem::take(&mut runtime.arrays);
         state.next_object = runtime.next_object;
         state.next_array = runtime.next_array;
         state.initialized = initialized;

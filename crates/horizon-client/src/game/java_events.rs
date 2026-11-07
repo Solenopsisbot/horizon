@@ -36,7 +36,11 @@ use horizon_native_java::{
     },
 };
 
-use super::{Dim, Game, execution_role::ExecutionRole, java_payloads::HandlerRole};
+use super::{
+    Dim, Game,
+    execution_role::ExecutionRole,
+    java_payloads::{HandlerRole, ResidentHost, lock_resident},
+};
 
 /// One listener as the store keeps it.
 struct Slot {
@@ -45,12 +49,13 @@ struct Slot {
     disabled: bool,
 }
 
-/// One jar with listeners: the jar, the host its entrypoints ran on, and its
-/// listeners in registration order.
+/// One jar with listeners: the jar, the host its entrypoints ran on (shared
+/// with the jar's payload handlers and game hooks), and its listeners in
+/// registration order.
 struct EventJar {
     file: String,
     jar: Arc<NativeJar>,
-    host: StdHost,
+    host: ResidentHost,
     slots: Vec<Slot>,
 }
 
@@ -138,18 +143,31 @@ pub(super) fn has_listeners(
 /// Keeps one bootstrapped jar's listeners for its role. Returns how many it
 /// kept; a jar with none keeps nothing.
 ///
-/// The host is cloned after the entrypoints ran, so the mod's statics and the
-/// seeded mod list travel with the jar.
+/// A copy of `host` becomes the jar's resident host; the batch shares one
+/// with its other stores through [`adopt_resident`].
+#[cfg(test)]
 pub(super) fn adopt(
     role: ExecutionRole,
     path: &Path,
     jar: &Arc<NativeJar>,
     host: &StdHost,
 ) -> usize {
+    adopt_resident(role, path, jar, &Arc::new(Mutex::new(host.clone())))
+}
+
+/// [`adopt`] keeping the jar's resident host itself: the host its entrypoints
+/// ran on, so the listeners see the mod's statics, the objects its entrypoint
+/// built and the seeded mod list, and share them with its other callbacks.
+pub(super) fn adopt_resident(
+    role: ExecutionRole,
+    path: &Path,
+    jar: &Arc<NativeJar>,
+    host: &ResidentHost,
+) -> usize {
     if role.is_client() {
         return 0;
     }
-    let found = host.game_listeners(jar, true);
+    let found = lock_resident(host).game_listeners(jar, true);
     let file = path.file_name().map_or_else(
         || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -178,7 +196,7 @@ pub(super) fn adopt(
     store.entry(handler_role(role)).or_default().push(EventJar {
         file,
         jar: Arc::clone(jar),
-        host: host.clone(),
+        host: Arc::clone(host),
         slots: found
             .listeners
             .into_iter()
@@ -227,7 +245,8 @@ pub(super) fn fire(role: HandlerRole, mut firing: EventFiring) -> Fired {
             let limit = ExecutionBudget::within(budget(event));
             // A panic in the interpreter must not take the server tick with it.
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                jar.run_game_listener(&slot.listener, &mut firing, host, &limit)
+                let mut host = lock_resident(host);
+                jar.run_game_listener(&slot.listener, &mut firing, &mut host, &limit)
             }));
             match run {
                 Ok(Ok(run)) => {
@@ -665,10 +684,7 @@ mod tests {
 
     /// A static of the first kept jar of `role` (`key` is name + descriptor).
     fn kept_static(role: HandlerRole, key: &str) -> Option<Value> {
-        store()
-            .get(&role)?
-            .first()?
-            .host
+        lock_resident(&store().get(&role)?.first()?.host)
             .persistent_class_state()
             .0
             .remove(&format!("demo/EventMod#{key}"))

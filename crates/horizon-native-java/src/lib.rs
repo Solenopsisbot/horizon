@@ -21,6 +21,7 @@ mod dfu_pair;
 pub mod events;
 mod fabric_registry;
 mod game_hooks;
+mod heap;
 mod java_regex;
 mod jdk_model;
 mod jdk_stream;
@@ -43,6 +44,7 @@ use weaver::{
 };
 
 pub use declarations_content::{ATTACHMENT_REGISTRY, ContentBuilderEvent, ContentBuilderKind};
+pub use heap::{CallLogMark, JavaHeap};
 pub use weaver::{
     ReturnMode, ShiftBy, WovenClasses, callback_info_class, callback_info_returnable_class,
     weave_class, weave_class_with_extras, weave_classes, weave_classes_with_extras, weave_head,
@@ -2079,6 +2081,19 @@ pub trait Host {
         Ok(())
     }
 
+    /// Take the objects earlier invocations of this jar left (`heap.rs`), so a
+    /// callback reaches the instance state its entrypoint built. `None`: the
+    /// host keeps no resident jar instance and every invocation starts empty.
+    fn take_persistent_heap(&mut self) -> Option<JavaHeap> {
+        None
+    }
+
+    /// Keep an invocation's objects for the next one. The resident host
+    /// collects what nothing reaches and refuses a heap over its bound.
+    fn store_persistent_heap(&mut self, _heap: JavaHeap) -> Result<(), NativeError> {
+        Ok(())
+    }
+
     /// Run a jar method somewhere else before its body runs.
     ///
     /// A game-hook callback calls members of a Mixin class on a game object
@@ -2292,6 +2307,10 @@ pub struct StdHost {
     /// The runtime still owns the map; the host only provides the lifetime.
     persistent_static_fields: BTreeMap<String, Value>,
     persistent_initialized_classes: std::collections::BTreeSet<String>,
+    /// The jar's objects retained across invocations (`heap.rs`): instance
+    /// fields, arrays, builders and enum identity of what its statics and
+    /// registered callbacks still reach.
+    heap: heap::JavaHeap,
     /// Bounded diagnostics for calls outside the modeled host surface.
     unknown_host_calls: BTreeMap<String, usize>,
     strict_unknown_host_calls: bool,
@@ -2368,6 +2387,7 @@ impl StdHost {
             throwable_causes: BTreeMap::new(),
             persistent_static_fields: BTreeMap::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
+            heap: heap::JavaHeap::default(),
             unknown_host_calls: BTreeMap::new(),
             strict_unknown_host_calls: false,
             next_lazy_optional: 0,
@@ -8330,6 +8350,14 @@ impl Host for StdHost {
         self.persistent_static_fields = fields;
         self.persistent_initialized_classes = initialized;
         Ok(())
+    }
+
+    fn take_persistent_heap(&mut self) -> Option<JavaHeap> {
+        Some(self.take_resident_heap())
+    }
+
+    fn store_persistent_heap(&mut self, heap: JavaHeap) -> Result<(), NativeError> {
+        self.store_resident_heap(heap)
     }
 }
 
@@ -15027,6 +15055,10 @@ impl NativeJar {
         if !runtime.classes.contains_key(&class_name) {
             return Err(NativeError::MissingMethod(format!("class {class}")));
         }
+        // The objects an earlier entrypoint of this jar built are this one's
+        // too, and what this one builds outlives it for the callbacks it
+        // registers (`heap.rs`).
+        let resident = runtime.adopt_resident_heap();
         let result = (|| -> Result<(), NativeError> {
             runtime.ensure_initialized(&class_name)?;
             // An inherited entrypoint method belongs to the class that
@@ -15078,8 +15110,14 @@ impl NativeJar {
             Ok(())
         })();
         let persistence = runtime.persist_class_state();
+        let heap = if resident {
+            runtime.persist_resident_heap()
+        } else {
+            Ok(())
+        };
         result?;
         persistence?;
+        heap?;
         Ok(ExecutionReport {
             class: class.to_owned(),
             method: method.to_owned(),
@@ -15121,10 +15159,11 @@ impl NativeJar {
     }
 
     /// Invoke one jar method the way a later firing of a registered callback
-    /// runs: against the host's persistent class state (so a listener sees the
-    /// statics its entrypoint wrote, and the next firing sees what this one
-    /// wrote) and under `budget`, so a looping listener cannot stall the
-    /// server tick that fired it. Used by [`Self::run_game_listener`].
+    /// runs: against the host's persistent class state and resident heap (so a
+    /// listener sees the statics and objects its entrypoint built, and the next
+    /// firing sees what this one changed) and under `budget`, so a looping
+    /// listener cannot stall the server tick that fired it. Used by
+    /// [`Self::run_game_listener`] and [`dispatch_payload_frame_with`].
     pub(crate) fn invoke_persistent<H: Host>(
         &self,
         target: &MethodRef,
@@ -15164,6 +15203,9 @@ impl NativeJar {
             depth: 0,
             budget,
         };
+        // The callback sees the objects its entrypoint built, and the next
+        // callback sees what this one changed (`heap.rs`).
+        let resident = runtime.adopt_resident_heap();
         let result = runtime.invoke(
             &target.owner,
             &target.name,
@@ -15172,7 +15214,11 @@ impl NativeJar {
             args,
         );
         // A failed run keeps what it wrote before failing, as a JVM would.
-        runtime.persist_class_state()?;
+        let persistence = runtime.persist_class_state();
+        if resident {
+            runtime.persist_resident_heap()?;
+        }
+        persistence?;
         result
     }
 
@@ -27208,14 +27254,9 @@ pub fn dispatch_payload_frame_with(
     };
     args.push(payload);
     args.push(context);
-    jar.invoke_method_with_args(
-        &target.owner,
-        &target.name,
-        &target.descriptor,
-        receiver,
-        &args,
-        host,
-    )?;
+    // A handler runs on the jar's resident state: the statics and objects its
+    // entrypoint built (a handler map, a config) and what earlier frames left.
+    jar.invoke_persistent(&target, receiver, &args, host, &ExecutionBudget::UNBOUNDED)?;
     Ok(true)
 }
 

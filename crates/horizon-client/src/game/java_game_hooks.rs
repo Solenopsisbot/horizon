@@ -29,11 +29,13 @@
 
 use super::Game;
 use super::execution_role::ExecutionRole;
-use super::java_payloads::HandlerRole;
+use super::java_payloads::{HandlerRole, ResidentHost, lock_resident};
 use super::native_server::NativeServerPlayer;
+#[cfg(test)]
+use horizon_native_java::StdHost;
 use horizon_native_java::{
     ExecutionBudget, GAME_HOOK_SITES, GameHookContext, GameHookEffect, GameHookRegistrations,
-    GameHookState, GameObject, NativeJar, StdHost, Value,
+    GameHookState, GameObject, NativeJar, Value,
 };
 use std::{
     cell::Cell,
@@ -62,7 +64,8 @@ struct JavaGameHookJar {
     label: String,
     jar: Arc<NativeJar>,
     registrations: GameHookRegistrations,
-    host: StdHost,
+    /// Shared with the jar's payload handlers and event listeners.
+    host: ResidentHost,
     state: GameHookState,
     /// Hooks whose callbacks failed once and no longer fire for this jar.
     disabled: BTreeSet<String>,
@@ -154,12 +157,10 @@ pub(super) fn clear_java_game_hooks_as(role: HandlerRole) {
         .retain(|(r, _), _| *r != role);
 }
 
-/// Keeps one jar's bound callbacks for its role's host hook points.
-///
-/// The host is cloned after the entrypoints ran, so persistent class state and
-/// the seeded mod class path travel with the jar. The copy is strict: a call
-/// the bootstrap host would answer with a neutral value fails the callback
-/// instead, so a callback never "succeeds" on a value the game never produced.
+/// Keeps one jar's bound callbacks for its role's host hook points, on a copy
+/// of `host`; the batch shares the jar's one resident host with its other
+/// stores through [`publish_java_game_hooks_resident`].
+#[cfg(test)]
 pub(super) fn publish_java_game_hooks(
     role: HandlerRole,
     path: &Path,
@@ -167,11 +168,32 @@ pub(super) fn publish_java_game_hooks(
     registrations: GameHookRegistrations,
     host: &StdHost,
 ) {
+    publish_java_game_hooks_resident(
+        role,
+        path,
+        jar,
+        registrations,
+        &Arc::new(Mutex::new(host.clone())),
+    );
+}
+
+/// [`publish_java_game_hooks`] keeping the jar's resident host itself: the
+/// host its entrypoints ran on, so its statics, the objects its entrypoint
+/// built and the seeded mod class path are the callbacks', shared with its
+/// payload handlers and listeners. A firing runs it strict: a call the
+/// bootstrap host would answer with a neutral value fails the callback
+/// instead, so a callback never "succeeds" on a value the game never produced.
+pub(super) fn publish_java_game_hooks_resident(
+    role: HandlerRole,
+    path: &Path,
+    jar: Arc<NativeJar>,
+    registrations: GameHookRegistrations,
+    host: &ResidentHost,
+) {
     if registrations.is_empty() {
         return;
     }
-    let mut host = host.clone();
-    host.set_strict_unknown_host_calls(true);
+    let host = Arc::clone(host);
     let mut store = JAVA_GAME_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
     let jars = store.entry(role).or_default();
     jars.push(JavaGameHookJar {
@@ -232,16 +254,26 @@ pub(super) fn run_java_game_hook(
         // The interpreter returns its errors; the unwind guard only keeps a
         // bug in it from taking the server thread down with the jar.
         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            jar.run_game_hook_in(
+            // Strict for this firing only: the same host runs the jar's
+            // lenient listeners and payload handlers. What the callbacks
+            // logged is rolled back, so a hook fired every tick does not
+            // grow the call log.
+            let mut host = lock_resident(host);
+            host.set_strict_unknown_host_calls(true);
+            let mark = host.call_log_mark();
+            let run = jar.run_game_hook_in(
                 registrations,
                 state,
                 context,
                 hook,
                 receiver.clone(),
                 args,
-                host,
+                &mut *host,
                 &budget,
-            )
+            );
+            host.rewind_call_log(mark);
+            host.set_strict_unknown_host_calls(false);
+            run
         }));
         let error = match run {
             Ok(Ok(run)) => {
