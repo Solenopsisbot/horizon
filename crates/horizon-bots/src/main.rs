@@ -1185,7 +1185,7 @@ fn run_bot(
                             // The client sends the attack, then swings the arm.
                             let sent = send(
                                 play::Serverbound::Attack(play::Attack { id: victim }).encode(),
-                            ) && send(raw(sb::PUNCH, |w| w.varint(0)));
+                            ) && send(raw(sb::PUNCH, |_| {}));
                             if sent {
                                 bot.attacks.fetch_add(1, Ordering::Relaxed);
                             }
