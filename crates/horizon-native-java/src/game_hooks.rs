@@ -639,6 +639,8 @@ fn is_value_constructor(r: &MethodRef) -> bool {
             "net/minecraft/resources/Identifier",
             "fromNamespaceAndPath" | "withDefaultNamespace" | "parse" | "tryParse" | "tryBuild"
         ) | ("net/minecraft/resources/ResourceKey", "create")
+            // A logger: the bootstrap host's slf4j model answers it.
+            | ("com/mojang/logging/LogUtils", "getLogger")
     )
 }
 
@@ -646,7 +648,11 @@ fn is_value_constructor(r: &MethodRef) -> bool {
 /// answers itself: a payload type is its channel id
 /// (`new CustomPacketPayload.Type<>(id)` in a payload's static initialiser).
 fn is_host_value_class(owner: &str) -> bool {
-    owner == "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type"
+    matches!(
+        owner,
+        "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type"
+            | "net/minecraft/world/level/storage/LevelResource"
+    )
 }
 
 /// A value marker the bootstrap host built and models the members of.
@@ -839,7 +845,9 @@ impl<H: Host> GameHookHost<'_, H> {
                     .filter(|other| other.kind == GameObjectKind::Item)
                     .and_then(|other| other.type_id.clone())
                     .ok_or_else(|| unmodelled(marker, r))?;
-                Ok(Value::Int(i32::from(object.type_id.as_deref() == Some(&other))))
+                Ok(Value::Int(i32::from(
+                    object.type_id.as_deref() == Some(&other),
+                )))
             }
             ("getMainHandItem" | "getOffhandItem", "()Lnet/minecraft/world/item/ItemStack;")
                 if living =>
@@ -902,10 +910,12 @@ impl<H: Host> GameHookHost<'_, H> {
             _ => {
                 // Server-wide members (world path, game rules, registry
                 // access) on the server, a level or an entity.
-                let server_wide = entity
-                    || matches!(object.kind, GameObjectKind::Server | GameObjectKind::Level);
+                let server_wide =
+                    entity || matches!(object.kind, GameObjectKind::Server | GameObjectKind::Level);
+                let args =
+                    facade_server::with_level_resources(args, |m| self.inner.level_resource_id(m));
                 match server_wide
-                    .then(|| facade_server::server_member(&self.context.server, r, args))
+                    .then(|| facade_server::server_member(&self.context.server, r, &args))
                     .flatten()
                 {
                     Some(answer) => answer.map_err(|_| unmodelled(marker, r)),
@@ -1142,6 +1152,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn payload_type_id(&self, marker: &str) -> Option<String> {
         self.inner.payload_type_id(marker)
+    }
+
+    fn level_resource_id(&self, marker: &str) -> Option<String> {
+        self.inner.level_resource_id(marker)
     }
 
     fn redirect_jar_call(

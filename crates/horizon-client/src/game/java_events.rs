@@ -29,7 +29,7 @@ use std::{
 };
 
 use horizon_native_java::{
-    ExecutionBudget, NativeJar, StdHost,
+    ExecutionBudget, GameRuleValue, NativeJar, ServerFacts, StdHost,
     events::{
         EventContext, EventFacade, EventFiring, FacadeEntity, FacadeLevel, FacadePlayer, GameEvent,
         GameListener,
@@ -70,6 +70,32 @@ static LISTENED: AtomicU32 = AtomicU32::new(0);
 /// `MinecraftServer.getTickCount()` for the façade: ticks since the server
 /// started, counted at the tick-start point.
 static SERVER_TICKS: AtomicI32 = AtomicI32::new(0);
+
+/// The registries a role's server facts list, built once per server start:
+/// thousands of ids that do not change while the server runs.
+static REGISTRIES: Mutex<BTreeMap<HandlerRole, RegistryTable>> = Mutex::new(BTreeMap::new());
+
+type RegistryTable = BTreeMap<String, Arc<std::collections::BTreeSet<String>>>;
+
+/// The world folder each role's server opened, set when it starts (before
+/// the level loads, as vanilla's storage access is).
+static WORLD_DIRS: Mutex<BTreeMap<HandlerRole, std::path::PathBuf>> = Mutex::new(BTreeMap::new());
+
+/// The vanilla registries the command registries hold besides blocks
+/// (`Registries::ids`), which the server facts list for `registryAccess()`.
+const FACT_REGISTRIES: &[&str] = &[
+    "minecraft:item",
+    "minecraft:entity_type",
+    "minecraft:mob_effect",
+    "minecraft:enchantment",
+    "minecraft:worldgen/structure",
+    "minecraft:worldgen/biome",
+    "minecraft:attribute",
+    "minecraft:damage_type",
+    "minecraft:sound_event",
+    "minecraft:recipe",
+    "minecraft:advancement",
+];
 
 /// Listener runs and refusals since the process started, for the stop summary.
 static RAN: AtomicU64 = AtomicU64::new(0);
@@ -325,7 +351,7 @@ impl Game<'_> {
     /// its levels. Built only when a listener is about to run. `subject` is a
     /// player the event is about who is not (or no longer) in the hub's list:
     /// one leaving, or one whose turn has the hub taken out.
-    fn java_event_facade(&self, subject: Option<FacadePlayer>) -> Arc<EventFacade> {
+    pub(super) fn java_event_facade(&self, subject: Option<FacadePlayer>) -> Arc<EventFacade> {
         let (mut players, max_players): (Vec<FacadePlayer>, i32) =
             self.lan.as_ref().map_or((Vec::new(), 20), |host| {
                 let players = host
@@ -358,7 +384,140 @@ impl Game<'_> {
             max_players,
             players,
             levels,
+            server: self.java_server_facts(),
         })
+    }
+
+    /// What a Java callback may ask about the server as a whole
+    /// (`horizon_native_java::ServerFacts`): the world folder in the
+    /// interpreter's virtual game folder, the game rules now, the registries
+    /// the server's commands see, and the payload channels each player's
+    /// client takes. Built only when a callback is about to run; the
+    /// registries are built once per server start.
+    pub(super) fn java_server_facts(&self) -> Arc<ServerFacts> {
+        let rules = &self.ui.rules;
+        let game_rules = rules
+            .available_rules()
+            .filter_map(|rule| {
+                let value = match rules.get(rule.name)? {
+                    horizon_client::gamerules::Value::Bool(b) => GameRuleValue::Bool(b),
+                    horizon_client::gamerules::Value::Int(i) => GameRuleValue::Int(i),
+                };
+                Some((rule.name.to_owned(), value))
+            })
+            .collect();
+        Arc::new(ServerFacts {
+            world_dir: WORLD_DIRS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&handler_role(self.options.execution_role))
+                .and_then(|dir| virtual_world_dir(dir))
+                .or_else(|| virtual_world_dir(&self.world_root)),
+            game_rules,
+            registries: self.java_fact_registries(),
+            client_channels: self.java_client_channels(),
+            game_time: Some(self.world.game_time),
+            day_time: Some(self.world.day_time),
+        })
+    }
+
+    /// The registries for [`Self::java_server_facts`], from the command
+    /// registries the world opened with, cached per role.
+    fn java_fact_registries(&self) -> RegistryTable {
+        let role = handler_role(self.options.execution_role);
+        let mut cache = REGISTRIES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(table) = cache.get(&role) {
+            return table.clone();
+        }
+        let reg = &self.ui.registries;
+        let mut table = RegistryTable::new();
+        let add = |table: &mut RegistryTable,
+                   name: &str,
+                   ids: &mut dyn Iterator<Item = &String>| {
+            let ids: std::collections::BTreeSet<String> = ids.map(|id| namespaced(id)).collect();
+            if !ids.is_empty() {
+                table
+                    .entry(name.to_owned())
+                    .or_insert_with(|| Arc::new(ids));
+            }
+        };
+        add(&mut table, "minecraft:block", &mut reg.blocks.keys());
+        for name in FACT_REGISTRIES
+            .iter()
+            .copied()
+            .chain(reg.by_registry.keys().map(String::as_str))
+        {
+            add(&mut table, name, &mut reg.ids(name).iter());
+        }
+        if !table.is_empty() {
+            cache.insert(role, table.clone());
+            return table;
+        }
+        // Before the world opens (`SERVER_STARTING`) the command registries
+        // are not built yet, but vanilla's registries already are: list the
+        // static ones from the resources, uncached, so the full table is
+        // built once the world has opened.
+        let items: std::collections::BTreeSet<String> = self
+            .res
+            .items()
+            .order
+            .iter()
+            .map(|id| namespaced(id))
+            .collect();
+        let blocks: std::collections::BTreeSet<String> = (0..self.pack.assets.registry.len())
+            .filter_map(|id| {
+                let id = u32::try_from(id).ok()?;
+                let state = self
+                    .pack
+                    .assets
+                    .registry
+                    .state(horizon_world::registry::BlockStateId(id))?;
+                Some(namespaced(&state.name))
+            })
+            .collect();
+        let entities: std::collections::BTreeSet<String> = self
+            .res
+            .mob_types()
+            .keys()
+            .map(|id| namespaced(id))
+            .chain(["minecraft:player".to_owned()])
+            .collect();
+        for (name, ids) in [
+            ("minecraft:item", items),
+            ("minecraft:block", blocks),
+            ("minecraft:entity_type", entities),
+        ] {
+            if !ids.is_empty() {
+                table.insert(name.to_owned(), Arc::new(ids));
+            }
+        }
+        table
+    }
+
+    /// Per placed guest, the payload channels its client takes: every
+    /// declared client-bound channel for a Horizon client (the transport
+    /// carries them on `horizon:payload`), none for any other client, which
+    /// declared no channel to this server.
+    fn java_client_channels(&self) -> BTreeMap<u128, std::collections::BTreeSet<String>> {
+        let Some(host) = self.lan.as_ref() else {
+            return BTreeMap::new();
+        };
+        let horizon: Vec<u128> = host
+            .hub
+            .guests
+            .iter()
+            .filter(|g| g.placed && g.brand == "horizon")
+            .map(|g| g.uuid)
+            .collect();
+        if horizon.is_empty() {
+            return BTreeMap::new();
+        }
+        let channels: std::collections::BTreeSet<String> =
+            super::java_payloads::client_bound_channels();
+        horizon
+            .into_iter()
+            .map(|uuid| (uuid, channels.clone()))
+            .collect()
     }
 
     /// Fires `event` with `context` when a jar listens to it.
@@ -385,8 +544,21 @@ impl Game<'_> {
 
     /// `MinecraftServer.runServer`'s start, before the levels load (Fabric
     /// `SERVER_STARTING`, NeoForge `ServerAboutToStartEvent`).
-    pub(super) fn java_server_starting(&mut self) {
+    ///
+    /// `world_dir` is the world folder the server is about to open: vanilla's
+    /// storage access exists before the server starts, so `getWorldPath`
+    /// answers from here on, before the level loads.
+    pub(super) fn java_server_starting(&mut self, world_dir: &Path) {
         SERVER_TICKS.store(0, Ordering::Relaxed);
+        let role = handler_role(self.options.execution_role);
+        REGISTRIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&role);
+        WORLD_DIRS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(role, world_dir.to_path_buf());
         self.java_event(GameEvent::ServerStarting, EventContext::default());
     }
 
@@ -563,6 +735,40 @@ impl Game<'_> {
 }
 
 /// A guest as the façade shows them.
+/// A registry id with its namespace (`stone` → `minecraft:stone`).
+fn namespaced(id: &str) -> String {
+    if id.contains(':') {
+        id.to_owned()
+    } else {
+        format!("minecraft:{id}")
+    }
+}
+
+/// The world folder as the interpreter's virtual file system spells it: the
+/// game folder (the working directory) is `/horizon/game`, the root
+/// `FabricLoader.getGameDir` answers. A world outside the game folder has no
+/// such path and the façade refuses `getWorldPath`.
+fn virtual_world_dir(world_root: &Path) -> Option<String> {
+    let relative = if world_root.is_absolute() {
+        let cwd = std::env::current_dir().ok()?;
+        world_root.strip_prefix(cwd).ok()?.to_path_buf()
+    } else {
+        world_root.to_path_buf()
+    };
+    let mut parts = Vec::new();
+    for part in relative.components() {
+        match part {
+            std::path::Component::Normal(name) => parts.push(name.to_str()?.to_owned()),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("/horizon/game/{}", parts.join("/")))
+}
+
 fn facade_player(guest: &horizon_client::lan::guest::Guest) -> FacadePlayer {
     FacadePlayer {
         uuid: guest.uuid,
@@ -699,6 +905,25 @@ mod tests {
             }),
             EventContext::default(),
         )
+    }
+
+    #[test]
+    fn the_world_folder_is_spelled_inside_the_virtual_game_folder() {
+        let cwd = std::env::current_dir().unwrap();
+        // The dedicated server's absolute `<game>/world`, and single
+        // player's relative `saves/<folder>`.
+        assert_eq!(
+            virtual_world_dir(&cwd.join("world")).as_deref(),
+            Some("/horizon/game/world")
+        );
+        assert_eq!(
+            virtual_world_dir(Path::new("./saves/New World")).as_deref(),
+            Some("/horizon/game/saves/New World")
+        );
+        // Outside the game folder, or no folder at all: no path to answer.
+        assert_eq!(virtual_world_dir(Path::new("/elsewhere/world")), None);
+        assert_eq!(virtual_world_dir(Path::new("")), None);
+        assert_eq!(virtual_world_dir(Path::new("../world")), None);
     }
 
     #[test]

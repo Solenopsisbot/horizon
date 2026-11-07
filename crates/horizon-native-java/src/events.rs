@@ -43,8 +43,11 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     ExecutionBudget, HostInvocation, MethodRef, NativeError, NativeJar, StdHost, Value, arg_count,
-    component_value, expect_ref, parse_callback_marker, return_desc, stable_hash, uuid_value,
+    component_value, expect_ref, facade_server, parse_callback_marker, return_desc, stable_hash,
+    uuid_value,
 };
+
+pub use crate::facade_server::{GameRuleValue, ServerFacts};
 
 /// One game event the game can fire, whatever loader named it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -91,11 +94,44 @@ pub enum GameEvent {
     BlockBreakBefore,
     /// A player broke a block.
     BlockBreakAfter,
+    /// The server builds its command tree (Fabric `CommandRegistrationCallback`,
+    /// NeoForge/Forge `RegisterCommandsEvent`): the listener registers on the
+    /// Brigadier façade (`brigadier.rs`).
+    RegisterCommands,
+    // Client events: the window's own points fire them, never a server
+    // (`client_surface` holds the façade they see).
+    /// The client finished starting, before its first tick (Fabric
+    /// `CLIENT_STARTED`).
+    ClientStarted,
+    /// The client is about to stop (Fabric `CLIENT_STOPPING`).
+    ClientStopping,
+    /// Each client tick's start (Fabric `START_CLIENT_TICK`, NeoForge
+    /// `ClientTickEvent.Pre`), in a world or not.
+    ClientTickStart,
+    /// Each client tick's end (Fabric `END_CLIENT_TICK`, NeoForge
+    /// `ClientTickEvent.Post`).
+    ClientTickEnd,
+    /// The client level's tick starts (Fabric `ClientTickEvents.START_LEVEL_TICK`).
+    ClientLevelTickStart,
+    /// The client level's tick ends.
+    ClientLevelTickEnd,
+    /// The client joined a world and play is ready (Fabric
+    /// `ClientPlayConnectionEvents.JOIN`, NeoForge `ClientPlayerNetworkEvent.LoggingIn`).
+    ClientJoin,
+    /// The client left its world (Fabric `ClientPlayConnectionEvents.DISCONNECT`,
+    /// NeoForge `ClientPlayerNetworkEvent.LoggingOut`).
+    ClientDisconnect,
+    /// NeoForge's mod-bus `RegisterKeyMappingsEvent`, fired once after the
+    /// client entrypoints ran.
+    ClientRegisterKeyMappings,
+    /// NeoForge's mod-bus `RegisterGuiLayersEvent`, fired once after the
+    /// client entrypoints ran.
+    ClientRegisterGuiLayers,
 }
 
 impl GameEvent {
     /// Every event, in declaration order (the bit order of [`Self::bit`]).
-    pub const ALL: [GameEvent; 20] = [
+    pub const ALL: [GameEvent; 31] = [
         GameEvent::ServerStarting,
         GameEvent::ServerStarted,
         GameEvent::ServerStopping,
@@ -116,6 +152,17 @@ impl GameEvent {
         GameEvent::AttackEntity,
         GameEvent::BlockBreakBefore,
         GameEvent::BlockBreakAfter,
+        GameEvent::RegisterCommands,
+        GameEvent::ClientStarted,
+        GameEvent::ClientStopping,
+        GameEvent::ClientTickStart,
+        GameEvent::ClientTickEnd,
+        GameEvent::ClientLevelTickStart,
+        GameEvent::ClientLevelTickEnd,
+        GameEvent::ClientJoin,
+        GameEvent::ClientDisconnect,
+        GameEvent::ClientRegisterKeyMappings,
+        GameEvent::ClientRegisterGuiLayers,
     ];
 
     /// The stable name logs and reports use.
@@ -141,6 +188,17 @@ impl GameEvent {
             GameEvent::AttackEntity => "attack_entity",
             GameEvent::BlockBreakBefore => "block_break_before",
             GameEvent::BlockBreakAfter => "block_break_after",
+            GameEvent::RegisterCommands => "register_commands",
+            GameEvent::ClientStarted => "client_started",
+            GameEvent::ClientStopping => "client_stopping",
+            GameEvent::ClientTickStart => "client_tick_start",
+            GameEvent::ClientTickEnd => "client_tick_end",
+            GameEvent::ClientLevelTickStart => "client_level_tick_start",
+            GameEvent::ClientLevelTickEnd => "client_level_tick_end",
+            GameEvent::ClientJoin => "client_join",
+            GameEvent::ClientDisconnect => "client_disconnect",
+            GameEvent::ClientRegisterKeyMappings => "client_register_key_mappings",
+            GameEvent::ClientRegisterGuiLayers => "client_register_gui_layers",
         }
     }
 
@@ -158,6 +216,24 @@ impl GameEvent {
                 | GameEvent::UseItem
                 | GameEvent::AttackEntity
                 | GameEvent::BlockBreakBefore
+        )
+    }
+
+    /// Whether only a client (the window) fires it; a server keeps none of
+    /// these listeners.
+    pub fn is_client(self) -> bool {
+        matches!(
+            self,
+            GameEvent::ClientStarted
+                | GameEvent::ClientStopping
+                | GameEvent::ClientTickStart
+                | GameEvent::ClientTickEnd
+                | GameEvent::ClientLevelTickStart
+                | GameEvent::ClientLevelTickEnd
+                | GameEvent::ClientJoin
+                | GameEvent::ClientDisconnect
+                | GameEvent::ClientRegisterKeyMappings
+                | GameEvent::ClientRegisterGuiLayers
         )
     }
 }
@@ -199,6 +275,16 @@ enum Shape {
     UseItem,
     /// `(Player, Level, InteractionHand, Entity, EntityHitResult)`
     AttackEntity,
+    /// `(CommandDispatcher, CommandBuildContext, Commands.CommandSelection)`
+    Commands,
+    /// `(Minecraft)`
+    Minecraft,
+    /// `(ClientLevel)`
+    ClientLevel,
+    /// `(ClientPacketListener, PacketSender, Minecraft)`
+    ClientJoin,
+    /// `(ClientPacketListener, Minecraft)`
+    ClientDisconnect,
 }
 
 /// How a Fabric callback's return value combines across listeners.
@@ -226,6 +312,13 @@ struct FabricField {
 macro_rules! lifecycle {
     ($class:literal) => {
         concat!("net/fabricmc/fabric/api/event/lifecycle/v1/", $class)
+    };
+}
+
+/// A class of Fabric API's client lifecycle-events package.
+macro_rules! client_lifecycle {
+    ($class:literal) => {
+        concat!("net/fabricmc/fabric/api/client/event/lifecycle/v1/", $class)
     };
 }
 
@@ -408,6 +501,80 @@ const FABRIC_FIELDS: &[FabricField] = &[
         event: GameEvent::BlockBreakAfter,
         shape: Shape::BlockBreak,
     },
+    FabricField {
+        owner: "net/fabricmc/fabric/api/command/v2/CommandRegistrationCallback",
+        field: "EVENT",
+        method: "register",
+        descriptor: "(Lcom/mojang/brigadier/CommandDispatcher;Lnet/minecraft/commands/CommandBuildContext;Lnet/minecraft/commands/Commands$CommandSelection;)V",
+        event: GameEvent::RegisterCommands,
+        shape: Shape::Commands,
+    },
+    // Client events (`fabric-lifecycle-events-v1`, `fabric-networking-api-v1`
+    // of the same Fabric API), fired by the window only.
+    fabric(
+        client_lifecycle!("ClientTickEvents"),
+        "END_CLIENT_TICK",
+        "onEndTick",
+        "(Lnet/minecraft/client/Minecraft;)V",
+        GameEvent::ClientTickEnd,
+        Shape::Minecraft,
+    ),
+    fabric(
+        client_lifecycle!("ClientTickEvents"),
+        "START_CLIENT_TICK",
+        "onStartTick",
+        "(Lnet/minecraft/client/Minecraft;)V",
+        GameEvent::ClientTickStart,
+        Shape::Minecraft,
+    ),
+    fabric(
+        client_lifecycle!("ClientTickEvents"),
+        "END_LEVEL_TICK",
+        "onEndTick",
+        "(Lnet/minecraft/client/multiplayer/ClientLevel;)V",
+        GameEvent::ClientLevelTickEnd,
+        Shape::ClientLevel,
+    ),
+    fabric(
+        client_lifecycle!("ClientTickEvents"),
+        "START_LEVEL_TICK",
+        "onStartTick",
+        "(Lnet/minecraft/client/multiplayer/ClientLevel;)V",
+        GameEvent::ClientLevelTickStart,
+        Shape::ClientLevel,
+    ),
+    fabric(
+        client_lifecycle!("ClientLifecycleEvents"),
+        "CLIENT_STARTED",
+        "onClientStarted",
+        "(Lnet/minecraft/client/Minecraft;)V",
+        GameEvent::ClientStarted,
+        Shape::Minecraft,
+    ),
+    fabric(
+        client_lifecycle!("ClientLifecycleEvents"),
+        "CLIENT_STOPPING",
+        "onClientStopping",
+        "(Lnet/minecraft/client/Minecraft;)V",
+        GameEvent::ClientStopping,
+        Shape::Minecraft,
+    ),
+    FabricField {
+        owner: "net/fabricmc/fabric/api/client/networking/v1/ClientPlayConnectionEvents",
+        field: "JOIN",
+        method: "onPlayReady",
+        descriptor: "(Lnet/minecraft/client/multiplayer/ClientPacketListener;Lnet/fabricmc/fabric/api/networking/v1/PacketSender;Lnet/minecraft/client/Minecraft;)V",
+        event: GameEvent::ClientJoin,
+        shape: Shape::ClientJoin,
+    },
+    FabricField {
+        owner: "net/fabricmc/fabric/api/client/networking/v1/ClientPlayConnectionEvents",
+        field: "DISCONNECT",
+        method: "onPlayDisconnect",
+        descriptor: "(Lnet/minecraft/client/multiplayer/ClientPacketListener;Lnet/minecraft/client/Minecraft;)V",
+        event: GameEvent::ClientDisconnect,
+        shape: Shape::ClientDisconnect,
+    },
 ];
 
 /// One table row, positionally.
@@ -473,7 +640,31 @@ const BUS_EVENTS: &[(&str, GameEvent)] = &[
     ("entity/player/AttackEntityEvent", GameEvent::AttackEntity),
     ("level/BlockEvent$BreakEvent", GameEvent::BlockBreakBefore),
     ("level/block/BreakBlockEvent", GameEvent::BlockBreakBefore),
+    ("RegisterCommandsEvent", GameEvent::RegisterCommands),
+    ("TickEvent$ClientTickEvent$Pre", GameEvent::ClientTickStart),
+    ("TickEvent$ClientTickEvent$Post", GameEvent::ClientTickEnd),
 ];
+
+/// NeoForge (`net/neoforged/neoforge/client/event/`) and Forge
+/// (`net/minecraftforge/client/event/`) client event classes, by the path
+/// under that root (NeoForge 26.3.0.101's names). Forge's client tick lives in
+/// `TickEvent` under the common root, in [`BUS_EVENTS`].
+const CLIENT_BUS_EVENTS: &[(&str, GameEvent)] = &[
+    ("ClientTickEvent$Pre", GameEvent::ClientTickStart),
+    ("ClientTickEvent$Post", GameEvent::ClientTickEnd),
+    ("ClientPlayerNetworkEvent$LoggingIn", GameEvent::ClientJoin),
+    (
+        "ClientPlayerNetworkEvent$LoggingOut",
+        GameEvent::ClientDisconnect,
+    ),
+    (
+        "RegisterKeyMappingsEvent",
+        GameEvent::ClientRegisterKeyMappings,
+    ),
+    ("RegisterGuiLayersEvent", GameEvent::ClientRegisterGuiLayers),
+];
+const NEOFORGE_CLIENT_EVENT_ROOT: &str = "net/neoforged/neoforge/client/event/";
+const FORGE_CLIENT_EVENT_ROOT: &str = "net/minecraftforge/client/event/";
 
 const NEOFORGE_EVENT_ROOT: &str = "net/neoforged/neoforge/event/";
 const FORGE_EVENT_ROOT: &str = "net/minecraftforge/event/";
@@ -494,6 +685,20 @@ const EVENT_BUS_SUBSCRIBER: &[&str] = &[
 
 /// The game event and loader an event class names, if the game fires it.
 fn bus_event(class: &str) -> Option<(GameEvent, EventLoader)> {
+    let client = class
+        .strip_prefix(NEOFORGE_CLIENT_EVENT_ROOT)
+        .map(|rest| (rest, EventLoader::NeoForge))
+        .or_else(|| {
+            class
+                .strip_prefix(FORGE_CLIENT_EVENT_ROOT)
+                .map(|rest| (rest, EventLoader::Forge))
+        });
+    if let Some((rest, loader)) = client {
+        return CLIENT_BUS_EVENTS
+            .iter()
+            .find(|(path, _)| *path == rest)
+            .map(|(_, event)| (*event, loader));
+    }
     let (rest, loader) = match class.strip_prefix(NEOFORGE_EVENT_ROOT) {
         Some(rest) => (rest, EventLoader::NeoForge),
         None => (class.strip_prefix(FORGE_EVENT_ROOT)?, EventLoader::Forge),
@@ -609,6 +814,10 @@ pub struct EventFacade {
     pub max_players: i32,
     pub players: Vec<FacadePlayer>,
     pub levels: Vec<FacadeLevel>,
+    /// Server-wide facts (world folder, game rules, registries, the channels
+    /// each client takes), shared between firings: the game rebuilds it only
+    /// when one of them changes.
+    pub server: Arc<ServerFacts>,
 }
 
 /// What this one firing is about.
@@ -739,6 +948,11 @@ impl StdHost {
     /// `InteractionResult` and dimension constants plus the field read of a
     /// join handler's `player`.
     pub(crate) fn game_event_static(&self, r: &MethodRef) -> Option<Value> {
+        // `LevelResource` and `GameRules` constants: values, the same with or
+        // without a firing.
+        if let Some(value) = facade_server::static_field(r) {
+            return Some(value);
+        }
         if r.descriptor == "Lnet/fabricmc/fabric/api/event/Event;"
             && r.owner.starts_with("net/fabricmc/fabric/api/")
         {
@@ -777,6 +991,29 @@ impl StdHost {
         }
     }
 
+    /// Answer a static call the façade models during a firing, or `None`:
+    /// `ServerPlayNetworking.canSend(player, type)`, from the channels the
+    /// game says that player's client takes. Outside a firing, or for a
+    /// player argument that is not a façade player, it is not answered here.
+    pub(crate) fn game_event_invoke(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        let firing = self.game_event.as_deref()?;
+        let player = args
+            .first()
+            .and_then(expect_ref)
+            .and_then(|text| match facade(text) {
+                Some(Facade::Player(uuid) | Facade::Connection(uuid)) => Some(uuid),
+                _ => None,
+            });
+        let channel = args.get(1).and_then(|value| {
+            facade_server::channel_of(value, |marker| self.packet_types.get(marker).cloned())
+        });
+        facade_server::can_send(&firing.facade.server, r, player, channel.as_deref())
+    }
+
     /// Answer one instance call whose receiver is a façade marker, or `None`
     /// when the receiver is not one (the host's usual surface answers it).
     /// A façade call the surface does not model is an error, so the caller
@@ -788,6 +1025,12 @@ impl StdHost {
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
         let text = expect_ref(receiver)?;
+        // `new LevelResource("data/x.json")`: keep its id for a later
+        // `getWorldPath`.
+        if let Some(id) = facade_server::level_resource_init(r, args) {
+            self.level_resources.insert(text.clone(), id);
+            return Some(Ok(Value::Void));
+        }
         if let Some(name) = text.strip_prefix("interaction-result/") {
             // `consumesAction` is the one query mods make of a result.
             return match (r.name.as_str(), r.descriptor.as_str()) {
@@ -798,7 +1041,30 @@ impl StdHost {
                 _ => None,
             };
         }
+        // The server-wide markers (rules, registries, a rule, a level
+        // resource) answer from the firing's server facts; outside a firing
+        // there are none, and the call refuses.
+        if facade_server::owns(text) {
+            return Some(match self.game_event.as_deref() {
+                Some(firing) => facade_server::answer(&firing.facade.server, text, r, args),
+                None => Err(NativeError::UnknownHostCall(r.clone())),
+            });
+        }
         let kind = facade(text)?;
+        if matches!(
+            kind,
+            Facade::Server | Facade::Level(_) | Facade::Player(_) | Facade::Entity(_)
+        ) && let Some(firing) = self.game_event.as_deref()
+            && let Some(answer) = facade_server::server_member(
+                &firing.facade.server,
+                r,
+                &facade_server::with_level_resources(args, |m| {
+                    self.level_resources.get(m).cloned()
+                }),
+            )
+        {
+            return Some(answer);
+        }
         if r.owner == "java/lang/Object" || r.owner == "java/lang/Record" {
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 ("toString", "()Ljava/lang/String;") => Some(Ok(marker(text.clone()))),
@@ -965,13 +1231,24 @@ impl StdHost {
             listeners_from(invocation, jar, &mut out);
         }
         subscriber_classes(jar, server, &mut out);
+        if server {
+            // A server never fires a client event: a common entrypoint's
+            // client registrations count as events it does not fire.
+            let (client, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut out.listeners)
+                .into_iter()
+                .partition(|listener| listener.event.is_client());
+            out.listeners = kept;
+            for listener in client {
+                count_unsupported(&mut out, listener.source);
+            }
+        }
         out
     }
 
     /// How many host calls the log holds, to roll a listener's calls back
     /// once it ran: a listener fired every tick must not grow the log for the
     /// life of the server.
-    fn call_log_marks(&self) -> (usize, usize, usize) {
+    pub(crate) fn call_log_marks(&self) -> (usize, usize, usize) {
         (
             self.calls.len(),
             self.invocations.len(),
@@ -979,7 +1256,10 @@ impl StdHost {
         )
     }
 
-    fn truncate_call_log(&mut self, (calls, invocations, posted): (usize, usize, usize)) {
+    pub(crate) fn truncate_call_log(
+        &mut self,
+        (calls, invocations, posted): (usize, usize, usize),
+    ) {
         self.calls.truncate(calls);
         self.invocations.truncate(invocations);
         self.posted_events.truncate(posted);
@@ -998,7 +1278,7 @@ fn context_subject(context: &EventContext) -> Option<Value> {
 }
 
 /// The last `@indy:` argument of a registration call: its listener.
-fn indy_argument(args: &[Value]) -> Option<&str> {
+pub(crate) fn indy_argument(args: &[Value]) -> Option<&str> {
     args.iter().rev().find_map(|value| match value {
         Value::Ref(Some(text)) if text.starts_with("@indy:") => Some(text.as_str()),
         _ => None,
@@ -1006,14 +1286,19 @@ fn indy_argument(args: &[Value]) -> Option<&str> {
 }
 
 /// An object argument whose class the jar declares: `cls#N`.
-fn jar_object<'a>(jar: &NativeJar, value: &'a Value) -> Option<(&'a str, &'a Value)> {
+pub(crate) fn jar_object<'a>(jar: &NativeJar, value: &'a Value) -> Option<(&'a str, &'a Value)> {
     let text = expect_ref(value)?;
     let (class, _) = text.split_once('#')?;
     jar.classes.contains_key(class).then_some((class, value))
 }
 
 /// A method `name`+`descriptor` declared by `class` or a jar superclass.
-fn resolve_method(jar: &NativeJar, class: &str, name: &str, descriptor: &str) -> Option<MethodRef> {
+pub(crate) fn resolve_method(
+    jar: &NativeJar,
+    class: &str,
+    name: &str,
+    descriptor: &str,
+) -> Option<MethodRef> {
     let mut current = class.to_owned();
     for _ in 0..32 {
         let file = jar.classes.get(&current)?;
@@ -1369,6 +1654,31 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             subject()?,
             opaque("entity-hit"),
         ],
+        Shape::Commands => {
+            let selection = if firing.facade.dedicated {
+                "DEDICATED"
+            } else {
+                "INTEGRATED"
+            };
+            vec![
+                marker(crate::brigadier::DISPATCHER.into()),
+                marker(crate::brigadier::BUILD_CONTEXT.into()),
+                marker(format!(
+                    "enum/net/minecraft/commands/Commands$CommandSelection/{selection}"
+                )),
+            ]
+        }
+        Shape::Minecraft => vec![marker(crate::client_surface::MINECRAFT.into())],
+        Shape::ClientLevel => vec![marker(crate::client_surface::LEVEL.into())],
+        Shape::ClientJoin => vec![
+            marker(crate::client_surface::CONNECTION.into()),
+            marker(crate::client_surface::PACKET_SENDER.into()),
+            marker(crate::client_surface::MINECRAFT.into()),
+        ],
+        Shape::ClientDisconnect => vec![
+            marker(crate::client_surface::CONNECTION.into()),
+            marker(crate::client_surface::MINECRAFT.into()),
+        ],
     })
 }
 
@@ -1425,7 +1735,60 @@ impl NativeJar {
             Some(shape) => fabric_arguments(shape, firing)?,
             None => vec![event_marker(firing.event)],
         };
-        let (target, receiver, args) = match &listener.callback {
+        let marks = host.call_log_marks();
+        host.game_event = Some(Box::new(firing.clone()));
+        let result = self.invoke_listener_callback(&listener.callback, event_args, host, budget);
+        if let Some(after) = host.game_event.take() {
+            firing.cancelled = after.cancelled;
+        }
+        host.truncate_call_log(marks);
+        let (target, result) = result?;
+        let mut run = ListenerRun {
+            ran: true,
+            stop: false,
+        };
+        match (listener.loader, listener.combine) {
+            (EventLoader::Fabric, Combine::Allow) => {
+                if result == Value::Int(0) {
+                    firing.cancelled = true;
+                    run.stop = true;
+                }
+            }
+            (EventLoader::Fabric, Combine::Interaction) => {
+                let name = expect_ref(&result)
+                    .and_then(|text| text.strip_prefix("interaction-result/"))
+                    .unwrap_or("PASS");
+                if name != "PASS" {
+                    firing.interaction = Some(name.to_owned());
+                    firing.cancelled = true;
+                    run.stop = true;
+                }
+            }
+            // A Forge `Predicate` listener answers whether it cancels.
+            (EventLoader::Forge, _)
+                if firing.event.cancellable()
+                    && return_desc(&target.descriptor) == "Z"
+                    && result == Value::Int(1) =>
+            {
+                firing.cancelled = true;
+            }
+            _ => {}
+        }
+        Ok(run)
+    }
+
+    /// Run one listener callback with the event's arguments: a lambda's
+    /// captures (its bound receiver first) go before them, an object's
+    /// method gets its receiver. Returns the jar method that ran and its
+    /// value. The caller owns the host's firing state and call-log rollback.
+    pub(crate) fn invoke_listener_callback(
+        &self,
+        callback: &ListenerCallback,
+        event_args: Vec<Value>,
+        host: &mut StdHost,
+        budget: &ExecutionBudget,
+    ) -> Result<(MethodRef, Value), NativeError> {
+        let (target, receiver, args) = match callback {
             ListenerCallback::Indy { target, captures } => {
                 let (target, captures) = self.unwrap_indy(target.clone(), captures.clone());
                 let is_static = self
@@ -1468,52 +1831,132 @@ impl NativeJar {
                 args.len()
             )));
         }
-        let marks = host.call_log_marks();
-        host.game_event = Some(Box::new(firing.clone()));
-        let result = self.invoke_persistent(target, receiver, &args, host, budget);
-        if let Some(after) = host.game_event.take() {
-            firing.cancelled = after.cancelled;
-        }
-        host.truncate_call_log(marks);
-        let result = result?;
-        let mut run = ListenerRun {
-            ran: true,
-            stop: false,
-        };
-        match (listener.loader, listener.combine) {
-            (EventLoader::Fabric, Combine::Allow) => {
-                if result == Value::Int(0) {
-                    firing.cancelled = true;
-                    run.stop = true;
-                }
-            }
-            (EventLoader::Fabric, Combine::Interaction) => {
-                let name = expect_ref(&result)
-                    .and_then(|text| text.strip_prefix("interaction-result/"))
-                    .unwrap_or("PASS");
-                if name != "PASS" {
-                    firing.interaction = Some(name.to_owned());
-                    firing.cancelled = true;
-                    run.stop = true;
-                }
-            }
-            // A Forge `Predicate` listener answers whether it cancels.
-            (EventLoader::Forge, _)
-                if firing.event.cancellable()
-                    && return_desc(&target.descriptor) == "Z"
-                    && result == Value::Int(1) =>
-            {
-                firing.cancelled = true;
-            }
-            _ => {}
-        }
-        Ok(run)
+        let value = self.invoke_persistent(target, receiver, &args, host, budget)?;
+        Ok((target.clone(), value))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listener's server, level and player markers answer the server-wide
+    /// members from the firing's facts, and refuse them outside a firing.
+    #[test]
+    fn listener_markers_answer_server_wide_members_from_the_facts() {
+        let call = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let alex = 0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128;
+        let facade = EventFacade {
+            players: vec![FacadePlayer {
+                uuid: alex,
+                name: "Alex".into(),
+                level: "minecraft:overworld".into(),
+                entity_id: 7,
+            }],
+            server: Arc::new(ServerFacts {
+                world_dir: Some("/horizon/game/world".into()),
+                game_rules: [("keep_inventory".to_owned(), GameRuleValue::Bool(false))].into(),
+                client_channels: [(alex, ["demo:sync".to_owned()].into())].into(),
+                ..ServerFacts::default()
+            }),
+            ..EventFacade::default()
+        };
+        let mut host = StdHost::new();
+        let root = host
+            .game_event_static(&call(
+                "net/minecraft/world/level/storage/LevelResource",
+                "ROOT",
+                "Lnet/minecraft/world/level/storage/LevelResource;",
+            ))
+            .unwrap();
+        let world_path = call(
+            "net/minecraft/server/MinecraftServer",
+            "getWorldPath",
+            "(Lnet/minecraft/world/level/storage/LevelResource;)Ljava/nio/file/Path;",
+        );
+        let server = marker(SERVER.into());
+        // No firing: no facts to answer from.
+        assert!(matches!(
+            host.game_event_call(&world_path, &server, std::slice::from_ref(&root)),
+            Some(Err(NativeError::UnknownHostCall(_)))
+        ));
+        host.game_event = Some(Box::new(EventFiring::new(
+            GameEvent::ServerStarted,
+            Arc::new(facade),
+            EventContext::default(),
+        )));
+        assert_eq!(
+            host.game_event_call(&world_path, &server, std::slice::from_ref(&root))
+                .unwrap()
+                .unwrap(),
+            Value::Ref(Some("path:/horizon/game/world/.".into()))
+        );
+        let rules = host
+            .game_event_call(
+                &call(
+                    "net/minecraft/server/level/ServerLevel",
+                    "getGameRules",
+                    "()Lnet/minecraft/world/level/gamerules/GameRules;",
+                ),
+                &level_marker("minecraft:overworld"),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let keep = host
+            .game_event_static(&call(
+                "net/minecraft/world/level/gamerules/GameRules",
+                "KEEP_INVENTORY",
+                "Lnet/minecraft/world/level/gamerules/GameRule;",
+            ))
+            .unwrap();
+        let get = call(
+            "net/minecraft/world/level/gamerules/GameRules",
+            "get",
+            "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/Object;",
+        );
+        assert_eq!(
+            host.game_event_call(&get, &rules, &[keep])
+                .unwrap()
+                .unwrap(),
+            Value::Ref(Some("boolean:false".into()))
+        );
+        // `registryAccess` with no registries listed refuses by name.
+        assert!(matches!(
+            host.game_event_call(
+                &call(
+                    "net/minecraft/server/level/ServerPlayer",
+                    "registryAccess",
+                    "()Lnet/minecraft/core/RegistryAccess;",
+                ),
+                &player_marker(alex),
+                &[],
+            ),
+            Some(Err(NativeError::UnknownHostCall(_)))
+        ));
+        let can_send = call(
+            "net/fabricmc/fabric/api/networking/v1/ServerPlayNetworking",
+            "canSend",
+            "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/resources/Identifier;)Z",
+        );
+        let ask = |host: &mut StdHost, channel: &str| {
+            host.game_event_invoke(
+                &can_send,
+                &[
+                    player_marker(alex),
+                    Value::Ref(Some(format!("identifier/{channel}"))),
+                ],
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(ask(&mut host, "demo:sync"), Value::Int(1));
+        assert_eq!(ask(&mut host, "demo:other"), Value::Int(0));
+    }
 
     #[test]
     fn uuid_text_is_the_canonical_java_form() {
@@ -1534,10 +1977,57 @@ mod tests {
             bus_event("net/minecraftforge/event/TickEvent$ServerTickEvent$Pre"),
             Some((GameEvent::ServerTickStart, EventLoader::Forge))
         );
+        // Both loaders' command registration is the command-tree build.
         assert_eq!(
             bus_event("net/neoforged/neoforge/event/RegisterCommandsEvent"),
+            Some((GameEvent::RegisterCommands, EventLoader::NeoForge))
+        );
+        assert_eq!(
+            bus_event("net/minecraftforge/event/RegisterCommandsEvent"),
+            Some((GameEvent::RegisterCommands, EventLoader::Forge))
+        );
+    }
+
+    #[test]
+    fn client_events_name_their_fabric_fields_and_bus_classes() {
+        let row = fabric_field(
+            "fabric-event/net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents.END_CLIENT_TICK",
+        )
+        .unwrap();
+        assert_eq!(
+            (row.event, row.method, row.shape),
+            (GameEvent::ClientTickEnd, "onEndTick", Shape::Minecraft)
+        );
+        let join = fabric_field(
+            "fabric-event/net/fabricmc/fabric/api/client/networking/v1/ClientPlayConnectionEvents.JOIN",
+        )
+        .unwrap();
+        assert_eq!(join.event, GameEvent::ClientJoin);
+        // The server's own `JOIN` stays the server's.
+        let server_join = fabric_field(
+            "fabric-event/net/fabricmc/fabric/api/networking/v1/ServerPlayConnectionEvents.JOIN",
+        )
+        .unwrap();
+        assert_eq!(server_join.event, GameEvent::PlayerJoin);
+        assert_eq!(
+            bus_event("net/neoforged/neoforge/client/event/ClientTickEvent$Post"),
+            Some((GameEvent::ClientTickEnd, EventLoader::NeoForge))
+        );
+        assert_eq!(
+            bus_event("net/neoforged/neoforge/client/event/RegisterKeyMappingsEvent"),
+            Some((GameEvent::ClientRegisterKeyMappings, EventLoader::NeoForge))
+        );
+        assert_eq!(
+            bus_event("net/minecraftforge/event/TickEvent$ClientTickEvent$Pre"),
+            Some((GameEvent::ClientTickStart, EventLoader::Forge))
+        );
+        // A client class the game does not fire stays unnamed.
+        assert_eq!(
+            bus_event("net/neoforged/neoforge/client/event/ScreenEvent$Init$Post"),
             None
         );
+        assert!(GameEvent::ClientTickEnd.is_client());
+        assert!(!GameEvent::ServerTickEnd.is_client());
     }
 
     #[test]

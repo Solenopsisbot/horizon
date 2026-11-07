@@ -1221,6 +1221,23 @@ pub(super) fn declared() -> PayloadRegistry {
         .unwrap_or_default()
 }
 
+/// The declared channels a server may send to a client (`playToClient` and
+/// the bidirectional play form), by id.
+pub(super) fn client_bound_channels() -> std::collections::BTreeSet<String> {
+    let registry = DECLARED.lock().unwrap_or_else(|e| e.into_inner());
+    registry
+        .iter()
+        .flat_map(PayloadRegistry::declarations)
+        .filter(|d| {
+            matches!(
+                d.direction,
+                PayloadDirection::PlayToClient | PayloadDirection::PlayBidirectional
+            )
+        })
+        .map(|d| d.id.clone())
+        .collect()
+}
+
 /// The declared channels keyed by id, for diagnostics.
 #[cfg(test)]
 pub(super) fn declared_by_id() -> BTreeMap<String, PayloadDeclaration> {

@@ -102,6 +102,7 @@ fn facade(tick_count: i32) -> Arc<EventFacade> {
             entity_id: 7,
         }],
         levels: vec![],
+        server: Default::default(),
     })
 }
 
@@ -283,6 +284,10 @@ fn fabric_listeners_keep_their_event_and_run_once_per_firing() {
                 "ServerLivingEntityEvents.ALLOW_DEATH"
             ),
             (
+                GameEvent::RegisterCommands,
+                "CommandRegistrationCallback.EVENT"
+            ),
+            (
                 GameEvent::ServerStopping,
                 "ServerLifecycleEvents.SERVER_STOPPING"
             ),
@@ -294,12 +299,13 @@ fn fabric_listeners_keep_their_event_and_run_once_per_firing() {
             .iter()
             .all(|l| l.loader == EventLoader::Fabric)
     );
-    // The command callback is registered on an event the game never fires.
+    // The command callback is a listener the server fires when it builds its
+    // command tree (`brigadier.rs`), not an unsupported registration.
     assert_eq!(
         found
             .unsupported
             .get("net/fabricmc/fabric/api/command/v2/CommandRegistrationCallback.EVENT"),
-        Some(&1)
+        None
     );
 
     // Five ticks, numbered 100..=104: the listener runs five times and its

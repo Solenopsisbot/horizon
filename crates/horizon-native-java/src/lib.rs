@@ -2171,6 +2171,12 @@ pub trait Host {
     fn payload_type_id(&self, _marker: &str) -> Option<String> {
         None
     }
+
+    /// The id a `new LevelResource(id)` this host saw carries, by the
+    /// object's marker; `None` for any other object.
+    fn level_resource_id(&self, _marker: &str) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2336,6 +2342,9 @@ pub struct StdHost {
     /// Identifiers retained by `CustomPacketPayload.Type` values created by
     /// the bounded networking façade.
     packet_types: BTreeMap<String, String>,
+    /// The id each `new LevelResource(id)` a jar built carries
+    /// (`facade_server.rs`), by the object's marker.
+    level_resources: BTreeMap<String, String>,
     holders: BTreeMap<String, Value>,
     mutable_collections: BTreeMap<String, Vec<Value>>,
     iterators: BTreeMap<String, (Vec<Value>, usize)>,
@@ -2431,6 +2440,7 @@ impl StdHost {
             payload_bytes: BTreeMap::new(),
             fabric_entrypoint_containers: Vec::new(),
             packet_types: BTreeMap::new(),
+            level_resources: BTreeMap::new(),
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             iterators: BTreeMap::new(),
@@ -3624,6 +3634,10 @@ impl Host for StdHost {
 
     fn payload_type_id(&self, marker: &str) -> Option<String> {
         self.packet_types.get(marker).cloned()
+    }
+
+    fn level_resource_id(&self, marker: &str) -> Option<String> {
+        self.level_resources.get(marker).cloned()
     }
 
     fn service_providers(&self, service: &str) -> Vec<String> {
@@ -10433,18 +10447,19 @@ fn is_collection_owner(owner: &str) -> bool {
 /// `new` opcode instantiated is tracked by its own marker, so it must be
 /// recognized here to reach the mutable list table.
 fn is_list_owner(owner: &str) -> bool {
-    matches!(
-        owner,
-        "java/util/List"
-            | "java/util/AbstractList"
-            | "java/util/AbstractSequentialList"
-            | "java/util/ArrayList"
-            | "java/util/LinkedList"
-            | "java/util/Vector"
-            | "java/util/Stack"
-            | "java/util/concurrent/CopyOnWriteArrayList"
-            | "com/google/common/collect/ImmutableList"
-    )
+    library_dispatch::fastutil_kind(owner) == Some("list")
+        || matches!(
+            owner,
+            "java/util/List"
+                | "java/util/AbstractList"
+                | "java/util/AbstractSequentialList"
+                | "java/util/ArrayList"
+                | "java/util/LinkedList"
+                | "java/util/Vector"
+                | "java/util/Stack"
+                | "java/util/concurrent/CopyOnWriteArrayList"
+                | "com/google/common/collect/ImmutableList"
+        )
 }
 
 /// A type that behaves like a list for the mutating `Collection` members.
@@ -10498,44 +10513,46 @@ fn is_queue_owner(owner: &str) -> bool {
 
 /// Every concrete set a jar constructs directly.
 fn is_set_owner(owner: &str) -> bool {
-    matches!(
-        owner,
-        "java/util/Set"
-            | "java/util/AbstractSet"
-            | "java/util/HashSet"
-            | "java/util/LinkedHashSet"
-            | "java/util/TreeSet"
-            | "java/util/SortedSet"
-            | "java/util/NavigableSet"
-            | "java/util/concurrent/CopyOnWriteArraySet"
-            | "java/util/concurrent/ConcurrentSkipListSet"
-            | "java/util/EnumSet"
-            | "com/google/common/collect/ImmutableSet"
-    )
+    library_dispatch::fastutil_kind(owner) == Some("set")
+        || matches!(
+            owner,
+            "java/util/Set"
+                | "java/util/AbstractSet"
+                | "java/util/HashSet"
+                | "java/util/LinkedHashSet"
+                | "java/util/TreeSet"
+                | "java/util/SortedSet"
+                | "java/util/NavigableSet"
+                | "java/util/concurrent/CopyOnWriteArraySet"
+                | "java/util/concurrent/ConcurrentSkipListSet"
+                | "java/util/EnumSet"
+                | "com/google/common/collect/ImmutableSet"
+        )
 }
 
 /// Every concrete map a jar constructs directly.
 fn is_map_owner(owner: &str) -> bool {
-    matches!(
-        owner,
-        "java/util/Map"
-            | "java/util/AbstractMap"
-            | "java/util/SortedMap"
-            | "java/util/NavigableMap"
-            | "java/util/HashMap"
-            | "java/util/LinkedHashMap"
-            | "java/util/TreeMap"
-            | "java/util/IdentityHashMap"
-            | "java/util/WeakHashMap"
-            | "java/util/EnumMap"
-            | "java/util/Hashtable"
-            | "java/util/Properties"
-            | "java/util/concurrent/ConcurrentMap"
-            | "java/util/concurrent/ConcurrentHashMap"
-            | "java/util/concurrent/ConcurrentSkipListMap"
-            | "com/google/common/collect/ImmutableMap"
-            | "com/google/common/collect/ImmutableBiMap"
-    )
+    library_dispatch::fastutil_kind(owner) == Some("map")
+        || matches!(
+            owner,
+            "java/util/Map"
+                | "java/util/AbstractMap"
+                | "java/util/SortedMap"
+                | "java/util/NavigableMap"
+                | "java/util/HashMap"
+                | "java/util/LinkedHashMap"
+                | "java/util/TreeMap"
+                | "java/util/IdentityHashMap"
+                | "java/util/WeakHashMap"
+                | "java/util/EnumMap"
+                | "java/util/Hashtable"
+                | "java/util/Properties"
+                | "java/util/concurrent/ConcurrentMap"
+                | "java/util/concurrent/ConcurrentHashMap"
+                | "java/util/concurrent/ConcurrentSkipListMap"
+                | "com/google/common/collect/ImmutableMap"
+                | "com/google/common/collect/ImmutableBiMap"
+        )
 }
 
 /// The `key=value` assignments one `.properties` document declares.
@@ -19792,21 +19809,7 @@ impl<H: Host> Runtime<'_, H> {
             && r.descriptor == "()[Ljava/lang/reflect/Method;"
         {
             let class = reflection_class_name(receiver, r)?.to_owned();
-            let methods = self
-                .class(&class)
-                .map(|file| {
-                    file.methods
-                        .iter()
-                        .filter(|method| method.name != "<init>")
-                        .map(|method| {
-                            Value::Ref(Some(format!(
-                                "reflect-method/{class}#{}{}",
-                                method.name, method.descriptor
-                            )))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let methods = self.reflected_methods(&class, r.name == "getDeclaredMethods");
             let marker = self.new_array("java/lang/reflect/Method", "getMethods");
             self.arrays.insert(marker.clone(), methods);
             return Ok(Some(Value::Ref(Some(marker))));
@@ -23357,7 +23360,10 @@ impl<H: Host> Runtime<'_, H> {
                     // reflection surface builds answer their own runtime type,
                     // and a class marker answers `Class`. Every other marker
                     // keeps the interpreter's previous neutral answer.
-                    let matches = expect_ref(&value).is_some_and(|marker| {
+                    // A box the runtime keeps unboxed (`Double.valueOf`
+                    // answers a `Float` value) is still a reference here.
+                    let unboxed = library_dispatch::unboxed_instance_of(&value, &wanted);
+                    let matches = unboxed || expect_ref(&value).is_some_and(|marker| {
                         self.object_is_instance_of(marker, &wanted)
                             || self.host.host_instance_of(marker, &wanted)
                             || jdk_model::platform_instance_of(marker, &wanted)
@@ -23563,6 +23569,8 @@ impl<H: Host> Runtime<'_, H> {
                                 == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
                     {
                         format_java_string_call(self, &r, &args)?
+                    } else if let Some(value) = self.invoke_string_join(&r, &args) {
+                        value
                     } else if let Some(value) =
                         self.invoke_string_split(&r, receiver.as_ref(), &args, class, method)?
                     {
@@ -23713,10 +23721,19 @@ impl<H: Host> Runtime<'_, H> {
                                     invoke_or_catch!(at, self.host.invoke(&resolved, &args))
                                 }
                             } else if let Some(receiver) = receiver.as_ref() {
-                                invoke_or_catch!(
-                                    at,
-                                    self.host.invoke_instance(&resolved, receiver, &args)
-                                )
+                                // A library's own functional interface (log4j's
+                                // `TriConsumer`, a mod API's callback type)
+                                // called on a lambda of this jar: its one
+                                // abstract method is the lambda's body.
+                                if self.foreign_functional_call(&resolved, receiver, &args) {
+                                    invoke_or_catch!(at, self.invoke_callback(receiver, &args))
+                                        .unwrap_or_else(|| Value::default_for(&resolved.descriptor))
+                                } else {
+                                    invoke_or_catch!(
+                                        at,
+                                        self.host.invoke_instance(&resolved, receiver, &args)
+                                    )
+                                }
                             } else {
                                 invoke_or_catch!(at, self.host.invoke(&resolved, &args))
                             }
