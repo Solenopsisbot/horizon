@@ -77,9 +77,11 @@ entrypoint, 94 and 197 reached `Done`; the refusals are the `native-gap` rows ab
 2. **Callbacks and the client surface.** Only entrypoints and received-payload handlers execute; event listeners are
    recorded but never dispatched, and there is no compiled HUD, key-binding, tooltip, screen, renderer or model
    façade, so client jars register content but do not draw.
-3. **Content consumption.** Block entities, recipes and ingredients are recorded but not expressible; data components
-   and attachments have no declaration table; a guest stores the login manifest but local lookups do not consume it;
-   there is no mod hot reload.
+3. **Content consumption.** Recipes and block entity types reach the content root only when everything they name is
+   declared (824 of 3,192 mod-namespace recipe files in the 25 mega jars that ship them); 12 of 40 data-component
+   registrations are still opaque and every `BlockEntityType` builder is; ingredients have no consumer; a guest
+   without the jars is refused by the content identity check before the manifest helps it; there is no mod hot
+   reload.
 4. **No fallback by definition.** Phase 2 keeps phase 1's zero-refusal baseline and moves the 45 / 86
    `needs-loader` jars onto the native engine; the opt-in FML preflight and `horizon-jvm` remain development tools,
    never a quiet fallback, and the NeoForge lifecycle needs native coverage if the corpus widens.
@@ -126,8 +128,10 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   returns a neutral value by default and is counted; the probe fixtures can make it a hard error
   (`with_strict_unknown_host_calls`). The whole run is isolated per jar (`catch_unwind`).
 - **Declarations.** Typed `Registry.register`/`DeferredRegister` rows become blocks, items, mob effects, entities,
-  menus, block entities, recipes and ingredients, with item/block property inference from ordinary Java builders.
-  `META-INF/horizon-native.json` remains the explicit override.
+  menus, block entities, recipes, ingredients, data components and attachments, with item/block property inference
+  from ordinary Java builders, data-component flags from `DataComponentType.builder()` chains, and Fabric
+  `AttachmentRegistry` rows (`declarations_content.rs`). A jar's `data/<ns>/recipe/*.json` files are recipe rows
+  beside its metadata. `META-INF/horizon-native.json` remains the explicit override.
 - **Mixin.** Annotation-based plan discovery (config lists, side, priority, selectors) and a classfile writer/weaver
   that rewrites classes whose target is in the same jar. All eleven fixture families weave: `HEAD`, cancellable
   `HEAD`, `RETURN`, `TAIL`, `INVOKE`, `FIELD`, `NEW`, `JUMP`, `@Overwrite`, `@ModifyArg` and `@ModifyVariable`,
@@ -168,7 +172,10 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
 - Java rows are converted into the current content model and layered into the content root: the window's client role
   before the root is built, the integrated server's rows published from the server thread and merged on the next
   rebuild, and the dedicated role before resources. A sorted typed registry snapshot is published beside the root
-  and coalesces equal rows; two rows that disagree are refused, not first-wins.
+  and coalesces equal rows; two rows that disagree are refused, not first-wins. Resolvable recipes become generated
+  `data/<ns>/recipe/` files the crafting loader and the recipe book read, block entity types are numbered after the
+  per-block ones, and one namespace declared by two jars joins rather than clashes. Each jar logs what it adds and
+  the first reason for what it leaves out.
 - Declared Java content travels to LAN guests: a bounded, versioned `horizon:java_content` manifest (v3 header with
   epoch and content hash, eight registry id sections, block-entity/menu/entity template rows) is sent at login and
   again when the declaration set changes. A mismatched v3 hash is refused rather than replacing local content.
@@ -794,11 +801,28 @@ than rows; the cache held 86 entries in 436 KiB.
    screens, rendering) have no dispatch. Priorities are registration order. There is also no compiled HUD,
    key-binding, tooltip, screen, renderer or model façade in this branch. The former façade and census sources were
    deleted; they are recoverable from commit `be8567b9a`, so client jars register content but do not draw.
-5. **Content consumption.** Blocks, items, effects, entities and menus reach the content model. Block entities,
-   recipes and ingredients are recorded and warned as not expressible; data components and attachments have a
-   manifest section but no declaration table; a guest stores the login manifest, but local command and content
-   lookups do not consume the stored rows yet. There is no mod hot reload (content rows arriving late rebuild the
-   root once).
+5. **Content consumption.** Blocks, items, effects, entities, menus, block entity types and recipes reach the content
+   model; data components and attachments are typed declaration rows that travel in the snapshot and the manifest.
+   What is left:
+   - *Recipes* load from a jar's `data/<ns>/recipe/*.json` and from typed declarations, but only when the type is a
+     vanilla one and every item they name is vanilla or declared by the same jar. On the 25 mega jars that ship mod
+     recipes, one dedicated server applies **824** and logs **1,212** left out with a reason (most name an item the
+     jar registers opaquely, or use the mod's own serializer); before this change 0 applied. A recipe naming another
+     jar's item is left out, since each jar is checked alone.
+   - *Block entity types* come only from `META-INF/horizon-native.json`: the 15 corpus `block_entity_type`
+     registrations go through `FabricBlockEntityTypeBuilder`/`BlockEntityType` builders with a mod class and no vanilla
+     template, so they stay opaque. A declared type keeps its template id; the game gives the block its own
+     template's behaviour, not the declared type's.
+   - *Data components*: 28 of 40 corpus registrations are typed (17/29 mega, 11/11 wide; 0 before), with
+     `persistent`/`network`/`cache_encoding` and a codec label that is only the codec's declared type. *Attachments*:
+     21 Fabric `AttachmentRegistry` rows (16 mega, 5 wide; none recorded before). NeoForge's
+     `DeferredRegister.DataComponents` and `AttachmentType` register through suppliers the deferred register never
+     runs, so they stay opaque; no component value is encoded from a row.
+   - *Ingredients* are kept as declarations: no vanilla data folder reads them.
+   - *Guests*: an applied manifest's item, block, effect, entity, data-component, menu and block-entity ids join the
+     guest's command registries (parsing and suggestions). A guest without the jars is still refused by the content
+     identity check, and its creative tab and item tables stay its own root's.
+   - There is no mod hot reload (content rows arriving late rebuild the root once).
 6. **No JVM fallback in the game.** `horizon-jvm` is a standalone reference runner; a jar the native runtime refuses
    is skipped, so the `jvm`/`sidecar` counts in `server-status` are structurally zero.
 7. **Diagnostics.** `server-status`, `java-runtime.json`, the launcher's runtime panel and the server ledger now carry
@@ -826,8 +850,9 @@ than rows; the cache held 86 entries in 436 KiB.
 3. **Close runtime refusals.** Entrypoint static-init failures (null config/listener phase, reflection on a null
    class), the `StackUnderflow` verifier gap, the nested-jar-frame bound and duplicate declarations. Gate: refused share
    of in-scope server jars below 5% (currently 22%/26%).
-4. **Finish content.** Block entities, recipes and ingredients in the content model; data-component and attachment
-   declaration tables; guests consume the applied manifest in command/content lookups; then mod hot reload.
+4. **Finish content.** Type `BlockEntityType` builders and the jar's opaque items so more recipes resolve (check
+   recipes across the pack, not per jar); NeoForge data components and attachments through their deferred suppliers;
+   let a guest without the jars build a root from the manifest; then mod hot reload.
 5. **Event surface.** Grow the listener façade by the refusals the dedicated pack run logs (world path, registry
    access, resource manager, game rules, `execute`), fire the identified use/attack/break/entity/level-load events
    from their game points, and dispatch `CommandRegistrationCallback`. Gate: no façade refusal among the ten most

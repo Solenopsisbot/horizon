@@ -739,9 +739,14 @@ wrong side of a split Fabric jar is immediately actionable.
 
 An explicitly supported jar may include `META-INF/horizon-native.json` to supply that typed adapter data:
 `{"id":"mod_id","registrations":[{"registry":"minecraft:block","id":"mod_id:block","kind":"block","template":"minecraft:stone","properties":{},"item":true},{"registry":"minecraft:recipe","id":"mod_id:block","kind":"recipe","recipe":{"type":"minecraft:crafting_shaped","pattern":["#"]}}]}`.
-The loader validates block, item, mob-effect, recipe, and ingredient declarations, turns them into declaration-only
-`Content`, writes recipe and ingredient declarations as `data/<namespace>/{recipe,ingredient}/<path>.json`, and layers them through
-the same `content_root` planner as `.hmod` content. Unsupported custom kinds fail before content planning
+The loader validates block, item, mob-effect, block-entity, recipe, ingredient, data-component and attachment
+declarations, turns them into declaration-only `Content`, writes each recipe whose type is vanilla and whose items
+are all vanilla or declared by the same jar as the generated file `data/<namespace>/recipe/<path>.json`, and layers
+them through the same `content_root` planner as `.hmod` content. A jar's own `data/<ns>/recipe/*.json` files
+(outside `minecraft`) are recipe declarations too, so they load like a datapack's. Block entity types join their
+namespace when the blocks they name are declared there. Ingredients, data components and attachments stay declaration
+rows (the registry snapshot and the `horizon:java_content` manifest carry the last two); a recipe or block entity
+type left out is logged with its reason. Unsupported custom kinds fail before content planning
 with the registry, id, and kind named, rather than silently entering the native registries.
 
 The embedded JVM runner treats a discovered `neoforge` entrypoint as constructor-only, invoking the
