@@ -918,7 +918,6 @@ fn extend_registries_with(
 }
 
 /// The declared-content epoch of the last v3 manifest this client applied, 0
-/// until one is./// The declared-content epoch of the last v3 manifest this client applied, 0
 /// until one is. A later post-login re-send uses it to tell "the host's
 /// declarations changed" from "the same content again".
 static APPLIED_EPOCH: AtomicU64 = AtomicU64::new(0);
