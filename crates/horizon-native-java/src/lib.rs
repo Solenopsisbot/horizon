@@ -43,6 +43,7 @@ mod reflect_generic;
 mod reflect_names;
 mod stack_walk;
 mod type_switch;
+mod value_class;
 mod vanilla_registries;
 pub mod weaver;
 
@@ -19591,6 +19592,10 @@ impl<H: Host> Runtime<'_, H> {
                 let marker = self.new_array(class, method);
                 self.arrays
                     .insert(marker.clone(), vec![Value::Ref(None); length]);
+                if let Value::Ref(Some(component)) = StdHost::argument(r, args, 0)? {
+                    let component = component.replace('.', "/");
+                    self.record_array_component(&marker, &component);
+                }
                 Value::Ref(Some(marker))
             }
             ("getLength", "(Ljava/lang/Object;)I") => {
@@ -23412,15 +23417,20 @@ impl<H: Host> Runtime<'_, H> {
                         _ => Value::Int(0),
                     };
                     self.arrays.insert(marker.clone(), vec![empty; length]);
+                    if let Some(component) = value_class::primitive_array_component(atype) {
+                        self.record_array_component(&marker, component);
+                    }
                     stack.push(Value::Ref(Some(marker)));
                 }
                 0xbd => {
                     let i = read_u16(code, &mut pc)?;
                     let length = array_length(pop_int(&mut stack, class, method, at)?)?;
-                    let _component = class_name(&file.pool, i)?;
+                    let component = class_name(&file.pool, i)?.to_owned();
                     let marker = self.new_array(class, method);
                     self.arrays
                         .insert(marker.clone(), vec![Value::Ref(None); length]);
+                    // `getClass()` of the array names this component.
+                    self.record_array_component(&marker, &component);
                     stack.push(Value::Ref(Some(marker)));
                 }
                 0xbe => {
@@ -23501,6 +23511,9 @@ impl<H: Host> Runtime<'_, H> {
                     // pop_int read them innermost first.
                     counts.reverse();
                     let marker = self.new_multidim_array(&descriptor, class, method, &counts);
+                    if let Some(component) = value_class::component_of_array_class(&descriptor) {
+                        self.record_array_component(&marker, &component);
+                    }
                     stack.push(Value::Ref(Some(marker)));
                 }
                 0xc0 => {

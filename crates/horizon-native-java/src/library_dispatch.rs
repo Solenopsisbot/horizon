@@ -21,6 +21,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.invoke_reflect_proxy(r, receiver, args)? {
             return Ok(Some(value));
         }
+        if let Some(value) = self.invoke_array_class(r, receiver) {
+            return Ok(Some(value));
+        }
         if let Some(value) = self.invoke_guava(r, receiver, args)? {
             return Ok(Some(value));
         }
@@ -416,7 +419,10 @@ impl<H: Host> Runtime<'_, H> {
     /// opcode's own: unboxed boxes and proxies.
     pub(super) fn library_instance_of(&self, value: &Value, wanted: &str) -> bool {
         unboxed_instance_of(value, wanted)
-            || expect_ref(value).is_some_and(|marker| self.proxy_instance_of(marker, wanted))
+            || expect_ref(value).is_some_and(|marker| {
+                self.proxy_instance_of(marker, wanted)
+                    || crate::value_class::string_instance_of(marker, wanted)
+            })
     }
 
     /// `value instanceof wanted`, by the same rules the `instanceof` opcode
