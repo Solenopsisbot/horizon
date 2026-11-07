@@ -67,8 +67,11 @@ entrypoint, 94 and 197 reached `Done`; the refusals are the `native-gap` rows ab
    halves inside the 180 s bound with 0 static conflicts (71 native jars, 43 loader jars, the loader half at
    `Done (` in 15 s; [Hybrid sessions](#hybrid-sessions-a-native-half-and-a-loader-half)). Sway stays out of
    it (client code), seven Helix jars have no ledger row, and no client-role hybrid has been measured.
-4. **NeoForge is outside the measured corpus.** Both corpora are Fabric 26.3. If a NeoForge corpus joins phase 1,
-   the dedicated role still lacks the FML preflight and there is no automatic intermediary-to-official remapping.
+4. **NeoForge is measured, not gated.** An 85-jar NeoForge 26.3 corpus now has a server ledger (51 `native-ok`, 20
+   `needs-loader`, 14 `native-gap`; [NeoForge corpus](#neoforge-corpus-8-november-2026)) and both server roles have
+   the opt-in FML preflight, but phase 1's gate still counts only the two Fabric corpora: the NeoForge loader tier
+   has no `Done (` proof (the FML probe loads and constructs mods without opening a world) and no hybrid session.
+   Remapping is not a blocker: 26.3 ships unobfuscated and NeoForge jars name official classes.
 
 **Phase 2:**
 
@@ -256,9 +259,14 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   a field a refused `SERVER_STARTED` listener never set, `Locale.ROOT`, `RegistryAccess#lookupOrThrow`). A
   command run by a connected player was covered by tests only.
 - An opt-in NeoForge loader preflight: when `HORIZON_NEOFORGE_SERVER` (an installed server) and `HORIZON_JVM_BIN` are
-  set, the integrated server runs `horizon-jvm --real-loader --entry-kind neoforge` once before its native batch in a
-  bounded child process and reports what FancyModLoader saw (completion, mod count, sorted ids, first error).
-  A missing binary or server is a report line, not a failure; only `HORIZON_NEOFORGE_STRICT=1` stops startup.
+  set, the integrated and the dedicated server run `horizon-jvm --real-loader --entry-kind neoforge` once before
+  their native batch in a bounded child process and report what FancyModLoader saw (completion, mod count, sorted
+  ids, first error with FML's `- Mod x requires y` items). With no `--java-mod` the run loads the install's own
+  `minecraft` and `neoforge` (the runner used to stop that at its usage line, so a jar-less preflight always
+  failed). The result is in `server-status` and in `java-runtime.json`'s `fml` section; a role with no jar writes
+  that file with the section alone. A missing binary or server is a report line, not a failure; only
+  `HORIZON_NEOFORGE_STRICT=1` stops startup. Checked on a real NeoForge 26.3.0.101 server: a jar-less dedicated
+  start lists 2 mods, and Waystones with Balm and Shogi lists 7 (`kuma_api` and `shogi_api` are JarJar modules).
 - `server-status` carries bounded `java` and `fml` sections: per-jar loader, engine, backend, weave label, executed
   entrypoints, registrations, opaque rows and isolation failures, `payload_channels`, and the preflight's
   status/role/jars/mods/ids/error. Refused jars are rows too (listed first, up to 8, `engine = "refused"`, the
@@ -329,6 +337,38 @@ libraries, or already running).
 The role-agnostic probe over the same 500 jars (`real_mod_corpus.py`) reports **167 ok (33.4%), 303 fallback (60.6%),
 30 unsupported (6.0%)**, with the top non-ok groups being "no main entrypoint but needs the loader/embedded JVM",
 client-only entrypoints, and malformed metadata.
+
+### NeoForge corpus (8 November 2026)
+
+`tools/neoforge_corpus.py lock --limit 80` took the 80 most-downloaded Modrinth mods tagged NeoForge and 26.3; 79
+publish a NeoForge 26.3 jar, and their required Modrinth dependencies add 6 (85 jars, 211 MB, every file checked
+against Modrinth's SHA-512; the lock is `tools/real_mod_fixtures/neoforge_corpus.lock.json`, the jars stay in
+`~/horizon-corpus/neoforge/`). 70 carry only `neoforge.mods.toml`, 4 also a legacy `mods.toml`, 8 also a
+`fabric.mod.json`, and 3 have no root metadata (Essential, Kotlin for Forge, mezz_config's JarJar carrier).
+
+Native, each jar with its declared closure through the real dedicated server
+(`LAST_SERVER_LEDGER_NEOFORGE.txt`, fast build of 40db5fe5b plus the wave's uncommitted runtime work, 60 s bound):
+
+| Label | Jars | What |
+|---|---:|---|
+| `native-ok` | 51 | 40 ran, 6 client-only, 5 libraries with nothing to run |
+| `needs-loader` | 20 | ran, with server mixin plans on game classes the weave skips |
+| `native-gap` | 14 | 9 uncaught exceptions, 3 missing members, 1 metadata, 1 no entrypoint |
+| `missing-dependency` | 0 | (6 before the reader fixes below) |
+
+The real FancyModLoader of an installed NeoForge 26.3.0.101 server (`horizon-jvm --real-loader --entry-kind
+neoforge`, `Dist.DEDICATED_SERVER`, one run per jar with the same closure; it bootstraps the game and constructs
+every mod, but opens no world) loads and initializes 76 of 85: 48 of the 51 `native-ok` (Essential misses
+commons-codec, ImmediatelyFast reaches LWJGL, Cubes Without Borders fails its own init), 18 of the 20 `needs-loader`
+(sodium-extra needs client Sodium; Carry On asks for `javafml` 26.3.0.37-beta) and 10 of the 14 `native-gap`. The
+other 4 gaps fail under FML too: fzzy_config's init, and veinminer, veinminer-client and zoomify need the `klf`
+language provider, which the probe does not pick up from Kotlin for Forge's jar. So 28 rows have a real-loader
+listing (not a `Done (` proof) and 6 have no tier.
+
+Three reader bugs the corpus found, fixed in `tools/hybrid_pack.py` (the ledger's declaration reader): FML 12
+reads only a dependency's `type` and defaults it to required (BiomesOPlenty writes `required=true`), NeoForge's
+template comments (`modId = "almanac" #mandatory`) were kept in the value, and JarJar modules
+(`META-INF/jarjar/`, JEI's mezz_config, Xaero's xaerolib) were not counted as provided ids.
 
 ## What runs native, what needs the loader, why
 
@@ -964,10 +1004,17 @@ than rows; the cache held 86 entries in 436 KiB.
    each started jar's skipped plans and counts by reason. What is left: a refused row names no loader (the failure
    carries only the path and cause), and the launcher matches report rows to installed mods by file name, so a jar
    run outside the browser's `horizon-mods` folder has no panel row.
-8. **NeoForge.** Native metadata and `@Mod` bootstrap work. The real FML lifecycle is a bounded, opt-in child
-   process (`horizon-jvm --real-loader`) used as a preflight on the integrated server, not the path a mod's code
-   takes; the dedicated role does not preflight yet, there is no in-game loader selection, and no automatic
-   intermediary-to-official remapping.
+8. **NeoForge.** Native metadata and `@Mod` bootstrap work, and the 85-jar NeoForge corpus runs 51 jars natively
+   (14 refused, 20 need the loader). The real FML lifecycle is a bounded, opt-in child process (`horizon-jvm
+   --real-loader`) used as a preflight on both server roles, not the path a mod's code takes; there is no in-game
+   loader selection and no NeoForge hybrid session. The refusals are mostly NeoForge's loader environment, which the
+   runtime does not model: `FMLEnvironment#getDist`, `ModList`/`ModContainer` lookups that return null ("mod list is
+   null", "Mod 'architectury' is not available!"), the platform version query REI makes, config bootstraps
+   (TerraBlender, GlitchCore, YACL, fzzy_config), and Kotlin for Forge's language provider. A multi-loader jar with
+   a `fabric.mod.json` runs its Fabric entrypoints, as Fabric Loader would; on a NeoForge server that is the wrong
+   half (zoomify reads "no native entrypoint"). No remapping is needed: the 26.3 server jar holds official names
+   (7,744 `net/minecraft/` classes), and the 4 corpus jars with intermediary-looking names carry them as strings in
+   Fabric-compat code.
 9. **The numbers are narrow.** Both corpora are filename-sorted slices of 26.3 Fabric jars, the client run is
    offscreen with no mod drawing, and the efficiency suite has no steady-state or playable-session figure.
 
@@ -1039,8 +1086,11 @@ than rows; the cache held 86 entries in 436 KiB.
    `getSingleplayerServer`, item stacks, effects, `execute`), component styles, items and sprites in the HUD
    façade, then tooltips, screens, renderers and models; measure with rendering on and a curated pack, not offscreen.
    Gate: a corpus HUD element draws in the measurement's frame.
-7. **NeoForge path.** Finish the FML path: give the dedicated role the integrated server's opt-in preflight, then
-   in-process loader selection, with remap readiness checked against a real NeoForge 26.3 server.
+7. **NeoForge path.** Done: the dedicated role's preflight, its `java-runtime.json` section, and a reproducible
+   NeoForge corpus (`tools/neoforge_corpus.py`, `LAST_SERVER_LEDGER_NEOFORGE.txt`); remapping checked and moot for
+   26.3. Next: model FML's environment (`FMLEnvironment`, `ModList`, `ModContainer`) for the 14 refusals, give a
+   multi-loader jar its NeoForge half on a NeoForge pack, add a `Done (` loader proof (a launched FML server) so the
+   NeoForge loader tier can join the gate, then in-process loader selection.
 8. **Diagnostics.** Done: weave counts, first skip reason, the per-plan list, refused rows with their whole cause in
    `server-status` and `java-runtime.json`, and the launcher's per-mod row with a runtime-cache clear. Next: name a
    refused jar's loader from its metadata, and show runtime rows for jars the launcher did not install.
@@ -1063,6 +1113,14 @@ scratch=$(mktemp -d)
 TMPDIR=$scratch HORIZON_NO_AUDIO=1 python3 tools/java_mod_server_ledger.py ~/horizon-corpus/corpus-xl \
   --binary target/fast/horizon-client --native-binary target/fast/horizon-native-java \
   --resources .local/horizon-client/26.3 --timeout 60 --json --output ledger.txt > ledger.json
+
+# the NeoForge corpus: fetch the locked jars, then the same ledger with each jar's dependency closure
+python3 tools/neoforge_corpus.py fetch
+TMPDIR=$scratch HORIZON_NO_AUDIO=1 python3 tools/java_mod_server_ledger.py ~/horizon-corpus/neoforge --with-deps \
+  --deps-dir ~/horizon-corpus/neoforge --binary target/fast/horizon-client \
+  --resources .local/horizon-client/26.3 --timeout 60 --output ledger-neoforge.txt
+# one jar (and its closure) through the real FML of an installed NeoForge 26.3 server
+target/fast/horizon-jvm --real-loader --entry-kind neoforge --libs <server>/libraries <jar> <deps>...
 
 # the same jars through the real Fabric loader (needs the game jar, loader and libraries)
 python3 tools/java_mod_loader_ledger.py --mods-dir ~/horizon-corpus/corpus-xl \
