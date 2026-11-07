@@ -62,6 +62,7 @@ use weaver::{
 
 pub use declarations_content::{ATTACHMENT_REGISTRY, ContentBuilderEvent, ContentBuilderKind};
 pub use heap::{CallLogMark, JavaHeap};
+pub use mixin_extras::{GameHookShape, MixinExtrasKind, MixinExtrasPlan};
 pub use mixin_plugins::ConfigPluginReport;
 use mixin_plugins::ConfigPlugins;
 pub use weaver::{
@@ -979,6 +980,9 @@ pub struct GameHookPlan {
     pub anchor: String,
     /// The plan with its concrete target descriptor.
     pub plan: MixinInjectionPlan,
+    /// How the callback is called: an `@Inject` or a MixinExtras
+    /// `@ModifyReturnValue` handler (`mixin_extras.rs`).
+    pub shape: GameHookShape,
 }
 
 /// One callback bound to one host hook point.
@@ -996,6 +1000,8 @@ pub struct RegisteredGameHook {
     pub anchor: String,
     /// Whether `CallbackInfo.cancel()` is honoured at this point.
     pub cancellable: bool,
+    /// How the callback is called and what its answer does.
+    pub shape: GameHookShape,
 }
 
 /// The callbacks one jar registered at host hook points, grouped by hook and
@@ -4454,6 +4460,12 @@ impl Host for StdHost {
             ("java/util/Collections", "emptySet", "()Ljava/util/Set;") => {
                 Ok(collection_empty("set"))
             }
+            // `ConcurrentHashMap.newKeySet()`: a new, empty, mutable set.
+            (
+                "java/util/concurrent/ConcurrentHashMap",
+                "newKeySet",
+                "()Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+            ) => Ok(self.empty_collection("set")),
             ("java/util/Collections", "emptyMap", "()Ljava/util/Map;") => {
                 Ok(collection_empty("map"))
             }
@@ -10578,6 +10590,7 @@ fn is_set_owner(owner: &str) -> bool {
                 | "java/util/NavigableSet"
                 | "java/util/concurrent/CopyOnWriteArraySet"
                 | "java/util/concurrent/ConcurrentSkipListSet"
+                | "java/util/concurrent/ConcurrentHashMap$KeySetView"
                 | "java/util/EnumSet"
                 | "com/google/common/collect/ImmutableSet"
         )
@@ -14344,14 +14357,43 @@ impl NativeJar {
         all_owners.extend(anchor_by_owner.keys().cloned());
         all_owners.extend(modify_arg_by_owner.keys().cloned());
         all_owners.extend(modify_variable_by_owner.keys().cloned());
+        // MixinExtras injectors (`mixin_extras.rs`): the hook tier binds a
+        // `@ModifyReturnValue` at a value site, after the point's `@Inject`
+        // callbacks; every other one is a row with its reason.
+        let mut extras_bound = BTreeSet::new();
+        for plan in self.mixin_extras_plans() {
+            let outcome = if game_hooks {
+                self.mixin_extras_game_hook_plan(&plan, side, &configs, &config_sides, &plugins)
+            } else if self.classes.contains_key(&plan.target.owner) {
+                Err(MixinSkipReason::UnsupportedFamily)
+            } else {
+                Err(MixinSkipReason::TargetOutsideJar)
+            };
+            match outcome {
+                Ok(hook) => {
+                    extras_bound.insert(plan.callback.owner.clone());
+                    weave.game_hooks.push(hook);
+                }
+                Err(reason) => weave.skipped.push(SkippedMixinPlan {
+                    target: plan.target,
+                    callback: plan.callback,
+                    at: plan.kind.label().to_owned(),
+                    reason,
+                }),
+            }
+        }
         let all_plans = plans
             .iter()
             .chain(overwrites.iter())
             .cloned()
             .collect::<Vec<_>>();
-        let extra_owners = anchor_by_owner
-            .values()
-            .flat_map(|plans| plans.iter().map(|plan| plan.callback.owner.clone()))
+        let extra_owners = extras_bound
+            .into_iter()
+            .chain(
+                anchor_by_owner
+                    .values()
+                    .flat_map(|plans| plans.iter().map(|plan| plan.callback.owner.clone())),
+            )
             .chain(
                 modify_arg_by_owner
                     .values()
@@ -14581,6 +14623,7 @@ impl NativeJar {
             version: site.version,
             anchor: anchor.to_owned(),
             plan: concrete,
+            shape: GameHookShape::Inject,
         }))
     }
 
@@ -14945,10 +14988,13 @@ impl NativeJar {
                     !method.is_static()
                         && method.name != "<init>"
                         && method.access & SYNTHETIC == 0
-                        && !method
-                            .annotations
-                            .iter()
-                            .any(|annotation| PLANNED.contains(&annotation.descriptor.as_str()))
+                        && !method.annotations.iter().any(|annotation| {
+                            PLANNED.contains(&annotation.descriptor.as_str())
+                                // A MixinExtras injector has its own row
+                                // (`mixin_extras.rs`).
+                                || MixinExtrasKind::from_descriptor(&annotation.descriptor)
+                                    .is_some()
+                        })
                         // A resolvable `@Accessor`/`@Invoker` is applied by
                         // the interpreter, not a generic merged member. One
                         // whose contract cannot be named stays in the report
@@ -15000,10 +15046,13 @@ impl NativeJar {
                     !method.is_static()
                         && method.name != "<init>"
                         && method.access & SYNTHETIC == 0
-                        && !method
-                            .annotations
-                            .iter()
-                            .any(|annotation| PLANNED.contains(&annotation.descriptor.as_str()))
+                        && !method.annotations.iter().any(|annotation| {
+                            PLANNED.contains(&annotation.descriptor.as_str())
+                                // A MixinExtras injector has its own row
+                                // (`mixin_extras.rs`).
+                                || MixinExtrasKind::from_descriptor(&annotation.descriptor)
+                                    .is_some()
+                        })
                         // A resolvable `@Accessor`/`@Invoker` is applied by
                         // the interpreter, not a generic merged member. One
                         // whose contract cannot be named stays in the report
@@ -15792,8 +15841,16 @@ impl NativeJar {
                     site.target_descriptor
                 )));
             }
-            game_hook_callback(&self.classes, &hook.plan.callback, site)
-                .map_err(|reason| game_hook_error(&reason))?;
+            match hook.shape {
+                GameHookShape::Inject => {
+                    game_hook_callback(&self.classes, &hook.plan.callback, site)
+                        .map_err(|reason| game_hook_error(&reason))?;
+                }
+                GameHookShape::ModifyReturnValue => {
+                    mixin_extras::modify_return_callback(&self.classes, &hook.plan.callback, site)
+                        .map_err(|reason| game_hook_error(&reason))?;
+                }
+            }
             registrations.insert(RegisteredGameHook {
                 hook: site.hook.to_owned(),
                 version: site.version,
@@ -15801,6 +15858,7 @@ impl NativeJar {
                 callback: hook.plan.callback.clone(),
                 anchor: hook.anchor.clone(),
                 cancellable: hook.plan.cancellable,
+                shape: hook.shape,
             });
         }
         Ok(registrations)
@@ -15866,6 +15924,16 @@ impl NativeJar {
             })?;
         let target_args = descriptor_arguments(&entry.target.descriptor);
         let callback_args = descriptor_arguments(&entry.callback.descriptor);
+        // A `@ModifyReturnValue` handler takes the value about to be returned,
+        // which the firing loop puts first, then optionally the arguments.
+        if entry.shape == GameHookShape::ModifyReturnValue {
+            let values = if callback_args.len() > 1 {
+                args.to_vec()
+            } else {
+                Vec::new()
+            };
+            return Ok((!method.is_static(), values));
+        }
         // A value-returning target hands a `CallbackInfoReturnable`, a `void`
         // one a `CallbackInfo`: the same runtime-owned object either way.
         let info = if return_desc(&entry.target.descriptor) == "V" {

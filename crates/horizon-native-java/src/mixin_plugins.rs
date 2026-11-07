@@ -609,6 +609,8 @@ mod tests {
         let mut refusals: BTreeMap<String, (usize, usize)> = BTreeMap::new();
         let mut failures: BTreeMap<String, usize> = BTreeMap::new();
         let (mut sessions, mut ran, mut companions) = (0, 0, 0);
+        let mut bound_through_plugin = 0;
+        let mut extras: BTreeMap<&'static str, (usize, usize, usize)> = BTreeMap::new();
         for path in paths.lines().map(str::trim).filter(|line| !line.is_empty()) {
             let Ok(jar) = NativeJar::from_path(std::path::Path::new(path)) else {
                 continue;
@@ -648,6 +650,50 @@ mod tests {
             }
             let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
             bound += weave.game_hooks.len();
+            let sides = jar.mixin_config_sides();
+            bound_through_plugin += weave
+                .game_hooks
+                .iter()
+                .filter(|hook| {
+                    let owner = &hook.plan.callback.owner;
+                    let governing = configs.iter().find(|config| {
+                        let binary = owner.replace('/', ".");
+                        (config.mixins.contains(&binary) || config.server.contains(&binary))
+                            && sides
+                                .get(&config.path)
+                                .is_none_or(|only| *only == MixinSide::Server)
+                    });
+                    governing.is_some_and(|config| config.plugin.is_some())
+                        || weave
+                            .config_plugins
+                            .iter()
+                            .any(|report| report.companions.contains(owner))
+                })
+                .count();
+            // MixinExtras: (server-side game plans, on a site, bound) by kind.
+            for plan in jar.mixin_extras_plans() {
+                let callback = plan.callback.owner.replace('/', ".");
+                let (mut server, mut client) = (false, false);
+                for config in &configs {
+                    let common = config.mixins.contains(&callback);
+                    server |= common || config.server.contains(&callback);
+                    client |= common || config.client.contains(&callback);
+                }
+                if (client && !server) || jar.classes.contains_key(&plan.target.owner) {
+                    continue;
+                }
+                let anchor = if plan.at.is_empty() {
+                    "HEAD"
+                } else {
+                    plan.at.as_str()
+                };
+                let row = extras.entry(plan.kind.label()).or_default();
+                row.0 += 1;
+                row.1 += usize::from(game_hook_site_at(&plan.target, anchor).is_some());
+                row.2 += usize::from(weave.game_hooks.iter().any(|hook| {
+                    hook.plan.callback == plan.callback && hook.shape != GameHookShape::Inject
+                }));
+            }
             for skipped in &weave.skipped {
                 if !jar.classes.contains_key(&skipped.target.owner)
                     && game_hook_site_at(&skipped.target, &skipped.at).is_some()
@@ -685,7 +731,7 @@ mod tests {
                     None => ran += 1,
                 }
                 for (mixin, reason) in &report.failed {
-                    let key: String = reason.chars().take(150).collect();
+                    let key: String = reason.chars().take(320).collect();
                     *failures.entry(key).or_default() += 1;
                     if named_here.contains(mixin) {
                         eprintln!("failed {name} {mixin}: {reason}");
@@ -696,9 +742,14 @@ mod tests {
         println!(
             "{jars} jar(s), {game_plans} server-side game plan(s): {named} name a site in a served shape, {bound} bind"
         );
+        println!("{bound_through_plugin} of the bound plans passed a config plugin's session");
         println!("plans on a site that do not bind, by gate:");
         for (reason, count) in &unbound {
             println!("  {count:5} {reason}");
+        }
+        println!("MixinExtras server-side game plans (on a site, bound):");
+        for (kind, (count, on_site, bound)) in &extras {
+            println!("  {count:5} {kind} ({on_site} on a site, {bound} bound)");
         }
         println!("{sessions} plugin session(s): {ran} ran, {companions} companion Mixin(s)");
         let mut rows = refusals.into_iter().collect::<Vec<_>>();

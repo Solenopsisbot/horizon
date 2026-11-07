@@ -1337,8 +1337,14 @@ impl NativeJar {
                     entry.hook, entry.version
                 ))
             })?;
-            game_hook_callback(&self.classes, &entry.callback, site)
-                .map_err(|reason| game_hook_error(&reason))?;
+            match entry.shape {
+                GameHookShape::Inject => game_hook_callback(&self.classes, &entry.callback, site),
+                GameHookShape::ModifyReturnValue => {
+                    mixin_extras::modify_return_callback(&self.classes, &entry.callback, site)
+                        .map(|_| ())
+                }
+            }
+            .map_err(|reason| game_hook_error(&reason))?;
             checked.push(self.game_hook_callback_values(entry, args)?);
         }
         let model = Arc::clone(
@@ -1433,7 +1439,12 @@ impl NativeJar {
                         &[],
                     )?;
                 }
-                let result = runtime.invoke(
+                if entry.shape == GameHookShape::ModifyReturnValue {
+                    // MixinExtras chains handlers: each gets the value as the
+                    // ones before it left it, and its answer is the new one.
+                    let mut handler_args = vec![runtime.callback_infos.current(&marker)?];
+                    handler_args.extend(values);
+                    let result = runtime.invoke(
                     &entry.callback.owner,
                     &entry.callback.name,
                     &entry.callback.descriptor,
