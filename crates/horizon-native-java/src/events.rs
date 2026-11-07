@@ -1245,6 +1245,11 @@ impl StdHost {
                 None => Err(NativeError::UnknownHostCall(r.clone())),
             });
         }
+        if let Some(hit) = text.strip_prefix("game/block-hit/") {
+            return Some(
+                block_hit_answer(hit, r).ok_or_else(|| NativeError::UnknownHostCall(r.clone())),
+            );
+        }
         let kind = facade(text)?;
         if matches!(
             kind,
@@ -1461,6 +1466,26 @@ impl StdHost {
     }
 }
 
+/// A `UseBlockCallback`'s `BlockHitResult` (`game/block-hit/x,y,z/FACE`, as
+/// [`fabric_arguments`] builds it): the clicked block and face, the click on
+/// that face's centre, and its type. Anything else refuses the listener.
+fn block_hit_answer(hit: &str, r: &MethodRef) -> Option<Value> {
+    let (pos, face) = hit.split_once('/')?;
+    let [x, y, z] = {
+        let mut parts = pos.split(',').map(|v| v.parse::<i32>().ok());
+        [parts.next()??, parts.next()??, parts.next()??]
+    };
+    match (r.name.as_str(), return_desc(&r.descriptor)) {
+        ("getBlockPos", _) => Some(marker(format!("block-pos/{x},{y},{z}"))),
+        ("getDirection", _) => Some(marker(format!("enum/net/minecraft/core/Direction/{face}"))),
+        ("getType", _) => Some(marker(
+            "enum/net/minecraft/world/phys/HitResult$Type/BLOCK".into(),
+        )),
+        ("isInside" | "isWorldBorderHit", "Z") => Some(Value::Int(0)),
+        _ => None,
+    }
+}
+
 /// The player or entity marker a firing is about.
 fn context_subject(context: &EventContext) -> Option<Value> {
     if let Some(uuid) = context.player {
@@ -1641,7 +1666,14 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
         let Some(class) = receiver.and_then(|r| r.strip_prefix("forge-bus/")) else {
             return;
         };
-        push_bus_listener(class, invocation, jar, out, false, bus_priority(&invocation.args));
+        push_bus_listener(
+            class,
+            invocation,
+            jar,
+            out,
+            false,
+            bus_priority(&invocation.args),
+        );
         return;
     }
     if !crate::is_event_bus_owner(owner) {
@@ -1881,17 +1913,15 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             .map(|[x, y, z]| marker(format!("block-pos/{x},{y},{z}")))
             .ok_or_else(|| missing("block position"))
     };
-    let direction = || {
-        let name = match context.face {
-            Some([0, -1, 0]) => "DOWN",
-            Some([0, 0, -1]) => "NORTH",
-            Some([0, 0, 1]) => "SOUTH",
-            Some([-1, 0, 0]) => "WEST",
-            Some([1, 0, 0]) => "EAST",
-            _ => "UP",
-        };
-        marker(format!("enum/net/minecraft/core/Direction/{name}"))
+    let face = match context.face {
+        Some([0, -1, 0]) => "DOWN",
+        Some([0, 0, -1]) => "NORTH",
+        Some([0, 0, 1]) => "SOUTH",
+        Some([-1, 0, 0]) => "WEST",
+        Some([1, 0, 0]) => "EAST",
+        _ => "UP",
     };
+    let direction = || marker(format!("enum/net/minecraft/core/Direction/{face}"));
     Ok(match shape {
         Shape::Server => vec![server()],
         Shape::Level => vec![level()?],
@@ -1924,13 +1954,13 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             Value::Ref(None),
         ],
         Shape::UseBlock => {
-            // The hit result names its block: `game/block-hit/x,y,z`.
+            // The hit result names its block and face: `game/block-hit/x,y,z/UP`.
             let [x, y, z] = context.pos.ok_or_else(|| missing("block position"))?;
             vec![
                 player_marker(player()?),
                 level()?,
                 hand(),
-                marker(format!("game/block-hit/{x},{y},{z}")),
+                marker(format!("game/block-hit/{x},{y},{z}/{face}")),
             ]
         }
         Shape::AttackBlock => vec![

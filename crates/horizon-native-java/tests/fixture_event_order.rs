@@ -157,7 +157,9 @@ const FABRIC_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/world/phys/BlockHitResult.java",
-        "package net.minecraft.world.phys;\npublic class BlockHitResult {}",
+        "package net.minecraft.world.phys;\n\
+         public class BlockHitResult { public net.minecraft.core.BlockPos getBlockPos() { return null; }\n\
+           public net.minecraft.core.Direction getDirection() { return null; } }",
     ),
     (
         "net/minecraft/core/BlockPos.java",
@@ -202,6 +204,8 @@ public final class PhaseMod {
   public static int lastY;
   public static int offHand;
   public static int up;
+  public static int hitY;
+  public static int hitUp;
   public void onInitialize() {
     Identifier early = Identifier.fromNamespaceAndPath("demo", "zz_early");
     // Registered first, in the default phase: runs after `early`.
@@ -212,6 +216,8 @@ public final class PhaseMod {
     UseBlockCallback.EVENT.register((p, l, h, hit) -> {
       order = order * 10 + 3;
       if (h == InteractionHand.OFF_HAND) offHand++;
+      hitY = hit.getBlockPos().getY();
+      if (hit.getDirection() == Direction.UP) hitUp++;
       return InteractionResult.FAIL;
     });
     // Never reached: the FAIL before it decides the use.
@@ -292,6 +298,15 @@ fn fabric_phases_order_listeners_and_a_deciding_result_stops_the_rest() {
     );
     assert_eq!(
         static_value(&host, "demo/PhaseMod", "offHandI"),
+        Some(Value::Int(1))
+    );
+    // The hit result names the block and face the use was fired with.
+    assert_eq!(
+        static_value(&host, "demo/PhaseMod", "hitYI"),
+        Some(Value::Int(70))
+    );
+    assert_eq!(
+        static_value(&host, "demo/PhaseMod", "hitUpI"),
         Some(Value::Int(1))
     );
     assert!(firing.cancelled);
