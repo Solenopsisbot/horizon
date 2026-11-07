@@ -162,6 +162,7 @@ mod item_draw;
 mod item_particles;
 mod item_use;
 mod java_content;
+mod java_events;
 mod java_mods;
 mod java_payloads;
 mod java_registry;

@@ -1133,6 +1133,7 @@ impl Game<'_> {
         self.native_configs_server_start(&world_dir, true);
         // MinecraftServer.loadLevel's start: nothing is loaded yet.
         self.native_server_about_to_start(true);
+        self.java_server_starting();
         self.native_lifecycle_open_started();
         // The registries the server sends are read while the world prepares.
         let sync = super::lan::preload_sync_data(&self.options.resources);
@@ -1362,6 +1363,7 @@ impl Game<'_> {
         }
         // The dedicated server's open is complete before its first tick.
         self.native_lifecycle_world_ready();
+        self.java_server_started();
         let mut state = ServerState {
             lists,
             console,
@@ -2411,6 +2413,7 @@ impl Game<'_> {
         self.save_game()?;
         self.log_saved_levels();
         self.native_lifecycle_world_closed();
+        self.java_server_stopped();
         self.lan_close(false);
         Err(format!("the server thread panicked: {message}").into())
     }
@@ -2420,8 +2423,10 @@ impl Game<'_> {
         self.native_lifecycle.begin_close();
         // MinecraftServer.stopServer's start: everyone is still here.
         self.native_server_stopping(true);
+        self.java_server_stopping();
         self.native_configs_server_stop();
         log("INFO", "Stopping server");
+        self.java_players_leaving();
         self.native_players_leaving();
         log("INFO", "Saving players");
         if let Some(mut host) = self.lan.take() {
@@ -2448,6 +2453,7 @@ impl Game<'_> {
         self.log_saved_levels();
         // Only a successful final save closes the epoch; storage is still held.
         self.native_lifecycle_world_closed();
+        self.java_server_stopped();
         self.lan_close(false);
         Ok(())
     }

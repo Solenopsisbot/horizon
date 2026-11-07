@@ -1366,6 +1366,7 @@ impl Game<'_> {
         let kind = super::native_hooks::mob_kind(m);
         let mut cancel = false;
         self.native_living_death(m.id, &kind, damage_type, attacker, &mut cancel);
+        cancel = cancel || self.java_living_death(None, Some((m.id as i32, &kind)), damage_type);
         if cancel {
             self.died.remove(&m.id);
             if let Some(alive) = self.mobs.iter_mut().find(|o| o.id == m.id) {

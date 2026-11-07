@@ -2110,6 +2110,7 @@ impl Game<'_> {
                     {
                         self.lan = Some(host);
                         self.native_player_logged_in(uuid, &name);
+                        self.java_player_joined(uuid);
                         // A hook's command can close the hub.
                         host = self.lan.take()?;
                     }
@@ -2184,6 +2185,7 @@ impl Game<'_> {
                     if guest.placed && !host.players_told_left {
                         self.lan = Some(host);
                         self.native_player_logged_out(guest.uuid, &guest.name);
+                        self.java_player_left(&guest);
                         host = self.lan.take()?;
                     }
                 }

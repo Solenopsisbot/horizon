@@ -473,6 +473,7 @@ impl Game<'_> {
             && server
         {
             self.native_lifecycle_server_tick_start(running);
+            self.java_server_tick(true);
         }
         let observe_level =
             running.is_some() && (self.serving.is_some() || self.options.dedicated.is_some());
@@ -500,6 +501,7 @@ impl Game<'_> {
             };
             if observe_level {
                 self.native_level_tick_pre(dim.id());
+                self.java_level_tick(dim.id(), true);
             }
             self.update_dedicated_streaming();
             self.update_world();
@@ -524,6 +526,7 @@ impl Game<'_> {
             }
             if observe_level {
                 self.native_level_tick_post(dim.id());
+                self.java_level_tick(dim.id(), false);
             }
             self.publish_server_debug(dim);
             // An entity that crossed into a level that already ticked this
@@ -555,6 +558,9 @@ impl Game<'_> {
         // `ServerTickEnd`: an errored tick or an idle-close failure (at
         // the `?` above) never reaches this site.
         self.native_lifecycle_server_tick_end(paused);
+        if running.is_some() && server {
+            self.java_server_tick(false);
+        }
         Ok(())
     }
 

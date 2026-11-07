@@ -4062,6 +4062,14 @@ impl Game<'_> {
                 return;
             }
         }
+        // The Java mods' `ALLOW_DEATH` / `LivingDeathEvent` (java_events.rs).
+        if host.hub.guests[gi].health <= 0.0
+            && !host.hub.guests[gi].dead
+            && self.java_living_death(Some(&host.hub.guests[gi]), None, "minecraft:generic")
+        {
+            host.hub.guests[gi].health = 1.0;
+            return;
+        }
         if host.hub.guests[gi].health <= 0.0 && !host.hub.guests[gi].dead {
             self.guest_forget_digging(host, conn);
             // FishingHook.shouldStopFishing: its owner is dead.

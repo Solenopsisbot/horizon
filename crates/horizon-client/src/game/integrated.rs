@@ -691,6 +691,7 @@ impl Game<'_> {
         }
         // The server thread's `WorldOpenReady` site, before the tick loop.
         self.native_lifecycle_world_ready();
+        self.java_server_started();
         if let (Some(script), Some(output)) = (
             std::env::var_os("HORIZON_COMMAND_SCRIPT"),
             std::env::var_os("HORIZON_COMMAND_OUTPUT"),
@@ -781,6 +782,7 @@ impl Game<'_> {
         }
         // MinecraftServer.loadLevel's start: nothing is loaded yet.
         self.native_server_about_to_start(false);
+        self.java_server_starting();
         self.native_lifecycle_open_started();
         // `load_world`, with the world `serve` started preparing.
         startup::time("server.wait_rest", || self.join_world_rest())?;
@@ -892,7 +894,9 @@ impl Game<'_> {
         self.native_lifecycle.begin_close();
         // MinecraftServer.stopServer's start: everyone is still here.
         self.native_server_stopping(false);
+        self.java_server_stopping();
         self.native_configs_server_stop();
+        self.java_players_leaving();
         self.native_players_leaving();
         // IntegratedServer.stopServer: teardownPublishedState.
         if let Some(s) = self.serving.take() {
@@ -923,6 +927,7 @@ impl Game<'_> {
         self.save.flush()?;
         // `WorldCloseFinal` follows a successful final save.
         self.native_lifecycle_world_closed();
+        self.java_server_stopped();
         self.session_lock = None;
         Ok(())
     }

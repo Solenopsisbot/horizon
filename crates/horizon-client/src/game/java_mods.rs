@@ -754,6 +754,8 @@ fn run_one_on(
     // host, which a later start cannot rebuild from rows.
     if let Some((identity, _)) = &cached
         && cacheable(&run)
+        // Event listeners live in the bootstrapped host too.
+        && !super::java_events::has_listeners(run.jar.as_ref(), run.host.as_ref(), role)
     {
         let typed: Vec<horizon_native_java::RegistryEntry> =
             run.host.as_ref().map_or_else(Vec::new, |host| {
@@ -1432,8 +1434,11 @@ fn adopt_run(
         // jars that bound game-class callbacks. No other consumer needs the
         // parsed jar or its resources after its entrypoints ran, so do not hold
         // them for the process lifetime.
+        // The event store keeps the jars whose listeners the game fires.
+        let jar = Arc::new(jar);
+        super::java_events::adopt(role, &report.jar, &jar, &host);
         if let Some(registrations) = game_hooks {
-            publish_java_game_hooks(id, Arc::new(jar), registrations, &host);
+            publish_java_game_hooks(id, jar, registrations, &host);
         }
         drop(host);
     }
@@ -1455,6 +1460,7 @@ where
 {
     super::java_payloads::clear_handler_jars_as(handler_role(role));
     clear_java_game_hooks_as(handler_role(role));
+    super::java_events::clear_as(handler_role(role));
     let cache_before = java_cache::stats();
     let mut batch = JavaBatchOutcome::default();
     // The shared adoption step is serial, in path order: `adopt_host` mutates
