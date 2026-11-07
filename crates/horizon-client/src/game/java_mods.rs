@@ -607,23 +607,14 @@ fn run_one_on(
             path.display()
         ));
     }
-    let kinds = if role.is_client() {
-        ["client", "main", "neoforge"]
-    } else {
-        ["server", "main", "neoforge"]
-    };
-    let fabric_entrypoint = kinds
-        .iter()
-        .any(|kind| !metadata.discover_entrypoints(kind).is_empty());
+    // A jar with Fabric metadata runs only its Fabric entrypoints, as on Fabric
+    // Loader, even when it also ships a NeoForge `@Mod` class
+    // (`horizon_native_java::NativeJar::role_entrypoint_kinds`).
+    let fabric_entrypoint = metadata.role_entrypoints(role.is_client()).is_some();
     // Fabric names its entrypoints in metadata; Forge/NeoForge only marks the
-    // class with `@Mod`, which the metadata read does not scan. A jar without
-    // Fabric metadata (or with Forge/NeoForge metadata too) keeps the full
-    // read so that discovery is exactly what it was.
-    let needs_class_discovery = metadata.fabric_id.is_none()
-        || metadata.neoforge_id.is_some()
-        || metadata
-            .resource_names()
-            .any(|name| name == "META-INF/mods.toml" || name == "META-INF/neoforge.mods.toml");
+    // class with `@Mod`, which the metadata read does not scan, so a jar
+    // without Fabric metadata keeps the full read.
+    let needs_class_discovery = !metadata.has_fabric_metadata();
     if !fabric_entrypoint && !needs_class_discovery {
         return Err(format!("{}: no native entrypoint", path.display()));
     }
@@ -733,19 +724,10 @@ fn bootstrap_jar(
     table: &Arc<LinkedClassTable>,
     game_hooks: bool,
 ) -> Result<JavaJarRun, String> {
-    let kinds = if role.is_client() {
-        ["client", "main", "neoforge"]
-    } else {
-        ["server", "main", "neoforge"]
-    };
     let jar = horizon_native_java::NativeJar::from_path(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    let (kind, entries) = kinds
-        .iter()
-        .find_map(|kind| {
-            let e = jar.discover_entrypoints(kind);
-            (!e.is_empty()).then_some((*kind, e))
-        })
+    let (kind, entries) = jar
+        .role_entrypoints(role.is_client())
         .ok_or_else(|| format!("{}: no native entrypoint", path.display()))?;
     if entries.iter().any(|e| e.adapter.is_some()) {
         return Err(format!(
@@ -2393,13 +2375,6 @@ mod tests {
         } else {
             horizon_native_java::MixinSide::Server
         };
-        // The same entrypoint kinds `bootstrap_jar` tries for the role: a
-        // Fabric jar commonly declares only `main`, which both roles run.
-        let kinds = if client {
-            ["client", "main", "neoforge"]
-        } else {
-            ["server", "main", "neoforge"]
-        };
         let mut jars = std::fs::read_dir(&root)
             .expect("list the corpus")
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -2425,10 +2400,9 @@ mod tests {
             let Ok(jar) = NativeJar::from_path(path) else {
                 continue;
             };
-            if !kinds
-                .iter()
-                .any(|kind| !jar.discover_entrypoints(kind).is_empty())
-            {
+            // The same entrypoints `bootstrap_jar` runs for the role: a
+            // Fabric jar commonly declares only `main`, which both roles run.
+            if jar.role_entrypoints(client).is_none() {
                 continue;
             }
             considered += 1;

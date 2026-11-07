@@ -20,6 +20,7 @@ pub mod client_surface;
 mod color_collection;
 mod declarations_content;
 mod dfu_pair;
+mod entrypoint_role;
 pub mod events;
 mod fabric_registry;
 mod facade_server;
@@ -60,6 +61,8 @@ use weaver::{
 
 pub use declarations_content::{ATTACHMENT_REGISTRY, ContentBuilderEvent, ContentBuilderKind};
 pub use heap::{CallLogMark, JavaHeap};
+pub use mixin_plugins::ConfigPluginReport;
+use mixin_plugins::ConfigPlugins;
 pub use weaver::{
     ReturnMode, ShiftBy, WovenClasses, callback_info_class, callback_info_returnable_class,
     weave_class, weave_class_with_extras, weave_classes, weave_classes_with_extras, weave_head,
@@ -1104,6 +1107,10 @@ pub struct LoadTimeMixinWeave {
     pub accessors: Vec<MixinAccessorPlan>,
     /// Everything else the jar's Mixin classes declare.
     pub skipped: Vec<SkippedMixinPlan>,
+    /// What each config plugin's session did (`mixin_plugins.rs`): why a
+    /// refused one stopped, and which questions failed. Only
+    /// [`NativeJar::plan_load_time_weave_with_game_hooks`] runs plugins.
+    pub config_plugins: Vec<ConfigPluginReport>,
 }
 
 /// One synthetic instance-callback bridge a woven jar added.
@@ -3700,6 +3707,10 @@ impl Host for StdHost {
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.record(r, None, &[]);
+        // `MixinEnvironment.Side` constants (`mixin_plugins.rs`).
+        if let Some(value) = self.mixin_platform_static(r) {
+            return Ok(value);
+        }
         // Fabric `Event` fields, Forge per-event buses and the game-event
         // façade's statics: a listener's registration keeps its event's name.
         // Brigadier's permission statics and `Commands.CommandSelection`.
@@ -3818,6 +3829,14 @@ impl Host for StdHost {
             ("java/util/Locale", "US", "Ljava/util/Locale;") => {
                 Ok(Value::Ref(Some("locale/US".into())))
             }
+            // `toLowerCase(Locale.ROOT)` is the locale-neutral case mapping a
+            // plugin or config reader uses on mod and class names.
+            ("java/util/Locale", "ROOT", "Ljava/util/Locale;") => {
+                Ok(Value::Ref(Some("locale/ROOT".into())))
+            }
+            ("java/util/Locale", "ENGLISH", "Ljava/util/Locale;") => {
+                Ok(Value::Ref(Some("locale/ENGLISH".into())))
+            }
 
             (
                 "net/fabricmc/loader/api/FabricLoader",
@@ -3866,6 +3885,10 @@ impl Host for StdHost {
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
+        // Mixin's environment and MixinExtras' bootstrap (`mixin_plugins.rs`).
+        if let Some(value) = self.mixin_platform_invoke(r) {
+            return Ok(value);
+        }
         // `Minecraft.getInstance`, key-mapping and HUD registration.
         if let Some(value) = self.client_invoke(r, args) {
             return value;
@@ -4881,6 +4904,19 @@ impl Host for StdHost {
                 };
                 Ok(Value::Ref(self.properties.get(key).cloned()))
             }
+            // `Boolean.getBoolean(name)`: whether the system property `name`
+            // is `true`, ignoring case; an unset property or null name is
+            // `false` (a plugin's `-Dmod.disable...` switch).
+            ("java/lang/Boolean", "getBoolean", "(Ljava/lang/String;)Z") => {
+                let set = match Self::argument(r, args, 0)? {
+                    Value::Ref(Some(key)) => self
+                        .properties
+                        .get(key)
+                        .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+                    _ => false,
+                };
+                Ok(Value::Int(set as i32))
+            }
             (
                 "java/lang/System",
                 "getProperty",
@@ -5036,6 +5072,10 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
+        if let Some(value) = self.mixin_platform_instance(r, receiver) {
+            return Ok(value);
+        }
         // The command dispatcher, builders, nodes and a running command's
         // context and source (`brigadier.rs`).
         if let Some(value) = self.brigadier_call(r, receiver, args) {
@@ -5336,16 +5376,22 @@ impl Host for StdHost {
         if r.owner == "java/util/Locale" {
             let marker = expect_ref(receiver)
                 .ok_or_else(|| NativeError::Metadata("malformed Locale marker".into()))?;
-            if marker != "locale/US" {
-                return Err(NativeError::Metadata("unsupported Locale marker".into()));
-            }
+            // (language, country, language tag, toString), as the JDK answers
+            // `Locale.US`, `Locale.ROOT` and `Locale.ENGLISH`.
+            let (language, country, tag, text) = match marker.as_str() {
+                "locale/US" => ("en", "US", "en-US", "en_US"),
+                "locale/ROOT" => ("", "", "und", ""),
+                "locale/ENGLISH" => ("en", "", "en", "en"),
+                _ => return Err(NativeError::Metadata("unsupported Locale marker".into())),
+            };
+            let text_value = |text: &str| Ok(Value::Ref(Some(text.to_owned())));
             return match (r.name.as_str(), r.descriptor.as_str()) {
-                ("getLanguage", "()Ljava/lang/String;") => Ok(Value::Ref(Some("en".into()))),
-                ("getCountry", "()Ljava/lang/String;") => Ok(Value::Ref(Some("US".into()))),
-                ("toLanguageTag", "()Ljava/lang/String;") => Ok(Value::Ref(Some("en-US".into()))),
-                ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some("en_US".into()))),
+                ("getLanguage", "()Ljava/lang/String;") => text_value(language),
+                ("getCountry", "()Ljava/lang/String;") => text_value(country),
+                ("toLanguageTag", "()Ljava/lang/String;") => text_value(tag),
+                ("toString", "()Ljava/lang/String;") => text_value(text),
                 _ => Err(NativeError::Metadata(format!(
-                    "unsupported Locale.US query {}#{}{}",
+                    "unsupported Locale query {}#{}{}",
                     r.owner, r.name, r.descriptor
                 ))),
             };
@@ -14216,9 +14262,17 @@ impl NativeJar {
         let mut modify_arg_by_owner: BTreeMap<String, Vec<MixinModifyArgPlan>> = BTreeMap::new();
         let mut modify_variable_by_owner: BTreeMap<String, Vec<MixinModifyVariablePlan>> =
             BTreeMap::new();
+        // Config plugins run once per weave, as Mixin runs each once per
+        // config (`mixin_plugins.rs`); only the hook tier asks them.
+        let plugins = if game_hooks {
+            self.run_config_plugins(&configs, &config_sides, side)
+        } else {
+            ConfigPlugins::default()
+        };
+        weave.config_plugins = plugins.reports();
         for plan in &plans {
             if game_hooks {
-                match self.game_hook_plan(plan, side, &configs, &config_sides) {
+                match self.game_hook_plan(plan, side, &configs, &config_sides, &plugins) {
                     Ok(Some(hook)) => {
                         weave.game_hooks.push(hook);
                         continue;
@@ -14495,14 +14549,16 @@ impl NativeJar {
         side: MixinSide,
         configs: &[MixinConfig],
         config_sides: &BTreeMap<String, MixinSide>,
+        plugins: &ConfigPlugins,
     ) -> Result<Option<GameHookPlan>, MixinSkipReason> {
         let Some(site) = game_hook_site_at(&plan.target, &plan.at) else {
             return Ok(None);
         };
-        // A config plugin is asked natively here (`hook_shapes.rs`).
+        // A config plugin's session decides here (`hook_shapes.rs`).
         self.game_hook_config_gate(
             configs,
             config_sides,
+            plugins,
             &plan.callback.owner,
             &plan.target.owner,
             side,
