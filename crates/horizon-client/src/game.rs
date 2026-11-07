@@ -6362,6 +6362,10 @@ impl Game<'_> {
         }
         // Native mods, once the game allowed the break: a canceled one keeps
         // the block, and a guest's acknowledgement puts it back in its world.
+        // Java listeners first (Fabric PlayerBlockBreakEvents.BEFORE, NeoForge BreakEvent).
+        if self.java_break_block(pos) {
+            return Ok(());
+        }
         let mut canceled = false;
         self.native_destroy_block(pos, state, &mut canceled);
         if canceled {
@@ -6432,6 +6436,10 @@ impl Game<'_> {
                 correct_tool,
             )
         });
+        // Fabric PlayerBlockBreakEvents.AFTER, where Block.destroy follows a removal.
+        if removed {
+            self.java_broke_block(pos);
+        }
         if removed && !creative {
             let held = self.held().cloned();
             self.mine_block_with_held(&facts.name, facts.hardness);
@@ -6614,6 +6622,10 @@ impl Game<'_> {
             && let Some(entity) = self.level_entity(id)
         {
             let kind = self.target_type(entity);
+            // Java listeners first (Fabric UseEntityCallback, NeoForge EntityInteract).
+            if self.java_use_entity(id, &kind) {
+                return Ok(true);
+            }
             let stack = self.held().cloned();
             let mut claimed = false;
             self.native_interact_entity(id, &kind, stack.as_ref(), &mut claimed);
@@ -6682,6 +6694,12 @@ impl Game<'_> {
         // canceled click does nothing (a guest's block is sent back).
         // A slow tick's line names the phase of a use that took it (#8669): the mods' hook,
         // the block's own use, then the item's.
+        // Java listeners at the same point (Fabric UseBlockCallback, NeoForge RightClickBlock).
+        if let Some(hit) = block_hit
+            && self.java_use_block(hit.pos, hit.face)
+        {
+            return Ok(true);
+        }
         if let Some(hit) = block_hit {
             let mut canceled = false;
             horizon_client::spans::time("use_mods", || {
@@ -6879,6 +6897,10 @@ impl Game<'_> {
         }
         drop(block_phase);
         let _item_phase = horizon_client::spans::guard("use_item");
+        // Java listeners where ServerPlayerGameMode.useItem starts (Fabric UseItemCallback).
+        if self.java_use_item() {
+            return Ok(true);
+        }
         let Some(stack) = self.held().cloned() else {
             return Ok(false);
         };

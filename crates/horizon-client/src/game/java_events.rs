@@ -32,7 +32,7 @@ use horizon_native_java::{
     ExecutionBudget, GameRuleValue, NativeJar, ServerFacts, StdHost,
     events::{
         EventContext, EventFacade, EventFiring, FacadeEntity, FacadeLevel, FacadePlayer, GameEvent,
-        GameListener,
+        GameListener, PhaseOrdering, dispatch_order,
     },
 };
 
@@ -42,6 +42,9 @@ use super::{
     java_payloads::{HandlerRole, ResidentHost, lock_resident},
 };
 
+mod player;
+pub(super) use player::fire_allow_damage;
+
 /// One listener as the store keeps it.
 struct Slot {
     listener: GameListener,
@@ -50,19 +53,63 @@ struct Slot {
 }
 
 /// One jar with listeners: the jar, the host its entrypoints ran on (shared
-/// with the jar's payload handlers and game hooks), and its listeners in
-/// registration order.
+/// with the jar's payload handlers and game hooks), its listeners in
+/// registration order, the phase orderings it declared and what its
+/// listeners did, by event.
 struct EventJar {
     file: String,
     jar: Arc<NativeJar>,
     host: ResidentHost,
     slots: Vec<Slot>,
+    orderings: Vec<PhaseOrdering>,
+    counts: BTreeMap<GameEvent, Counts>,
 }
 
-/// The listening jars of each execution role, in the batch's path order. Keyed
-/// by role because the window and its server thread run different jars in one
-/// process.
-static STORE: Mutex<BTreeMap<HandlerRole, Vec<EventJar>>> = Mutex::new(BTreeMap::new());
+/// One jar's runs and refusals of one event's listeners.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Counts {
+    dispatched: u64,
+    refused: u64,
+}
+
+/// One role's listening jars, in the batch's path order, and each event's
+/// dispatch order over them (`(jar, slot)`, [`dispatch_order`]): the
+/// loaders' phases and priorities across every jar, kept until the jars
+/// change.
+#[derive(Default)]
+struct RoleStore {
+    jars: Vec<EventJar>,
+    order: BTreeMap<GameEvent, Vec<(usize, usize)>>,
+}
+
+impl RoleStore {
+    fn reorder(&mut self) {
+        let orderings: Vec<&PhaseOrdering> =
+            self.jars.iter().flat_map(|jar| &jar.orderings).collect();
+        self.order = GameEvent::ALL
+            .iter()
+            .filter_map(|&event| {
+                let listeners: Vec<(usize, usize, &GameListener)> = self
+                    .jars
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(j, jar)| {
+                        jar.slots
+                            .iter()
+                            .enumerate()
+                            .filter(move |(_, slot)| slot.listener.event == event)
+                            .map(move |(s, slot)| (j, s, &slot.listener))
+                    })
+                    .collect();
+                (!listeners.is_empty()).then(|| (event, dispatch_order(&listeners, &orderings)))
+            })
+            .collect();
+    }
+}
+
+/// The listening jars of each execution role. Keyed by role because the
+/// window and its server thread run different jars in one process.
+static STORE: Mutex<BTreeMap<HandlerRole, RoleStore>> = Mutex::new(BTreeMap::new());
 
 /// The events any role has a listener for ([`GameEvent::bit`]): the fast path.
 static LISTENED: AtomicU64 = AtomicU64::new(0);
@@ -124,14 +171,14 @@ pub(super) fn handler_role(role: ExecutionRole) -> HandlerRole {
     }
 }
 
-fn store() -> std::sync::MutexGuard<'static, BTreeMap<HandlerRole, Vec<EventJar>>> {
+fn store() -> std::sync::MutexGuard<'static, BTreeMap<HandlerRole, RoleStore>> {
     STORE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn recompute_mask(store: &BTreeMap<HandlerRole, Vec<EventJar>>) {
+fn recompute_mask(store: &BTreeMap<HandlerRole, RoleStore>) {
     let mask = store
         .values()
-        .flatten()
+        .flat_map(|role| &role.jars)
         .flat_map(|jar| &jar.slots)
         .filter(|slot| !slot.disabled)
         .fold(0, |mask, slot| mask | slot.listener.event.bit());
@@ -141,6 +188,26 @@ fn recompute_mask(store: &BTreeMap<HandlerRole, Vec<EventJar>>) {
 /// Whether any jar of any role listens to `event`.
 pub(super) fn listens(event: GameEvent) -> bool {
     LISTENED.load(Ordering::Relaxed) & event.bit() != 0
+}
+
+/// Whether a jar listens to an entity joining or leaving a level: the
+/// entity walk that tells the native mods runs for it too.
+pub(super) fn listens_entities() -> bool {
+    LISTENED.load(Ordering::Relaxed) & (GameEvent::EntityLoad.bit() | GameEvent::EntityUnload.bit())
+        != 0
+}
+
+/// The first server role (integrated before dedicated) with an enabled
+/// listener of `event`, for a point that runs without a `Game`.
+fn listening_role(event: GameEvent) -> Option<HandlerRole> {
+    store().iter().find_map(|(role, store)| {
+        store
+            .jars
+            .iter()
+            .flat_map(|jar| &jar.slots)
+            .any(|slot| !slot.disabled && slot.listener.event == event)
+            .then_some(*role)
+    })
 }
 
 /// Forgets a previous bootstrap's listeners for one role.
@@ -219,7 +286,8 @@ pub(super) fn adopt_resident(
         summary.join(", ")
     );
     let mut store = store();
-    store.entry(handler_role(role)).or_default().push(EventJar {
+    let entry = store.entry(handler_role(role)).or_default();
+    entry.jars.push(EventJar {
         file,
         jar: Arc::clone(jar),
         host: Arc::clone(host),
@@ -231,7 +299,10 @@ pub(super) fn adopt_resident(
                 disabled: false,
             })
             .collect(),
+        orderings: found.phase_orderings,
+        counts: BTreeMap::new(),
     });
+    entry.reorder();
     recompute_mask(&store);
     kept
 }
@@ -243,55 +314,68 @@ pub(super) struct Fired {
     pub(super) ran: usize,
     /// A listener cancelled the vanilla work.
     pub(super) cancelled: bool,
+    /// The `InteractionResult` a Fabric listener decided with (`SUCCESS`,
+    /// `FAIL`...); `None` when every listener passed.
+    pub(super) interaction: Option<String>,
 }
 
-/// Runs every enabled listener of `firing.event` for `role`, jar by jar in
-/// path order, each in registration order. A Fabric `boolean`/result callback
-/// that decides stops the rest; a NeoForge cancellation is carried to the next
-/// jar's listeners. A listener that fails is disabled and logged once.
+/// Runs every enabled listener of `firing.event` for `role` in the loaders'
+/// order across the role's jars (Fabric phases, NeoForge priorities, then
+/// path and registration order). A Fabric `boolean`/result callback that
+/// decides stops the rest; a NeoForge cancellation is carried to every later
+/// listener, which runs only if it receives cancelled events. A listener that
+/// fails is disabled and logged once.
 pub(super) fn fire(role: HandlerRole, mut firing: EventFiring) -> Fired {
     let event = firing.event;
     let mut store = store();
-    let Some(jars) = store.get_mut(&role) else {
+    let Some(RoleStore { jars, order }) = store.get_mut(&role) else {
+        return Fired::default();
+    };
+    let Some(order) = order.get(&event) else {
         return Fired::default();
     };
     let mut fired = Fired::default();
     let mut disabled_any = false;
-    'jars: for entry in jars.iter_mut() {
+    for &(j, s) in order {
         let EventJar {
             file,
             jar,
             host,
             slots,
-        } = entry;
-        for slot in slots
-            .iter_mut()
-            .filter(|slot| !slot.disabled && slot.listener.event == event)
-        {
-            let limit = ExecutionBudget::within(budget(event));
-            // A panic in the interpreter must not take the server tick with it.
-            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut host = lock_resident(host);
-                jar.run_game_listener(&slot.listener, &mut firing, &mut host, &limit)
-            }));
-            match run {
-                Ok(Ok(run)) => {
-                    if run.ran {
-                        fired.ran += 1;
-                        RAN.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if run.stop {
-                        break 'jars;
-                    }
+            counts,
+            ..
+        } = &mut jars[j];
+        let slot = &mut slots[s];
+        if slot.disabled {
+            continue;
+        }
+        let limit = ExecutionBudget::within(budget(event));
+        // A panic in the interpreter must not take the server tick with it.
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut host = lock_resident(host);
+            jar.run_game_listener(&slot.listener, &mut firing, &mut host, &limit)
+        }));
+        let count = counts.entry(event).or_default();
+        match run {
+            Ok(Ok(run)) => {
+                if run.ran {
+                    fired.ran += 1;
+                    count.dispatched += 1;
+                    RAN.fetch_add(1, Ordering::Relaxed);
                 }
-                Ok(Err(error)) => {
-                    refuse(file, &mut slot.disabled, &slot.listener, &error.to_string());
-                    disabled_any = true;
+                if run.stop {
+                    break;
                 }
-                Err(_) => {
-                    refuse(file, &mut slot.disabled, &slot.listener, "panicked");
-                    disabled_any = true;
-                }
+            }
+            Ok(Err(error)) => {
+                count.refused += 1;
+                refuse(file, &mut slot.disabled, &slot.listener, &error.to_string());
+                disabled_any = true;
+            }
+            Err(_) => {
+                count.refused += 1;
+                refuse(file, &mut slot.disabled, &slot.listener, "panicked");
+                disabled_any = true;
             }
         }
     }
@@ -299,6 +383,7 @@ pub(super) fn fire(role: HandlerRole, mut firing: EventFiring) -> Fired {
         recompute_mask(&store);
     }
     fired.cancelled = firing.cancelled;
+    fired.interaction = firing.interaction;
     fired
 }
 
@@ -321,11 +406,42 @@ fn refuse(file: &str, disabled: &mut bool, listener: &GameListener, reason: &str
     );
 }
 
+/// What each jar's listeners of each event did, every server role together,
+/// for `java-runtime.json`: file → event name → counts. Only jars that kept
+/// a listener the game fires are listed.
+pub(super) fn listener_counts()
+-> BTreeMap<String, BTreeMap<String, super::java_runtime_file::RuntimeListeners>> {
+    let store = store();
+    let mut out: BTreeMap<String, BTreeMap<String, super::java_runtime_file::RuntimeListeners>> =
+        BTreeMap::new();
+    for jar in store.values().flat_map(|role| &role.jars) {
+        let events = out.entry(jar.file.clone()).or_default();
+        for slot in &jar.slots {
+            let row = events
+                .entry(slot.listener.event.name().to_owned())
+                .or_default();
+            row.kept += 1;
+            row.disabled += usize::from(slot.disabled);
+        }
+        for (event, counts) in &jar.counts {
+            let row = events.entry(event.name().to_owned()).or_default();
+            row.dispatched += counts.dispatched;
+            row.refused += counts.refused;
+        }
+    }
+    out
+}
+
 /// Listeners kept, enabled and disabled across every role, plus process-wide
 /// runs and refusals: `(kept, disabled, ran, refused)`.
 pub(super) fn stats() -> (usize, usize, u64, u64) {
     let store = store();
-    let slots = || store.values().flatten().flat_map(|jar| &jar.slots);
+    let slots = || {
+        store
+            .values()
+            .flat_map(|role| &role.jars)
+            .flat_map(|jar| &jar.slots)
+    };
     (
         slots().count(),
         slots().filter(|slot| slot.disabled).count(),
@@ -418,6 +534,19 @@ impl Game<'_> {
             client_channels: self.java_client_channels(),
             game_time: Some(self.world.game_time),
             day_time: Some(self.world.day_time),
+            // Each placed player's op level, as `PlayerList` sends it.
+            permission_levels: self
+                .lan
+                .as_ref()
+                .map(|host| {
+                    host.hub
+                        .guests
+                        .iter()
+                        .filter(|g| g.placed)
+                        .map(|g| (g.uuid, g.permission.min(4)))
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -482,10 +611,20 @@ impl Game<'_> {
             .map(|id| namespaced(id))
             .chain(["minecraft:player".to_owned()])
             .collect();
+        // The biomes the resources (and the data packs) define: vanilla's
+        // worldgen registries are loaded before `SERVER_STARTING` too.
+        let biomes: std::collections::BTreeSet<String> = self
+            .res
+            .biomes()
+            .index
+            .keys()
+            .map(|id| namespaced(id))
+            .collect();
         for (name, ids) in [
             ("minecraft:item", items),
             ("minecraft:block", blocks),
             ("minecraft:entity_type", entities),
+            ("minecraft:worldgen/biome", biomes),
         ] {
             if !ids.is_empty() {
                 table.insert(name.to_owned(), Arc::new(ids));
@@ -580,6 +719,10 @@ impl Game<'_> {
             log::info!(
                 "Horizon: Java event listeners: {kept} kept ({disabled} disabled), {ran} run(s), {refused} refusal(s)"
             );
+            // `java-runtime.json` says what each jar's listeners did this session.
+            if let Some(home) = std::env::var_os("HORIZON_HOME") {
+                let _ = super::java_runtime_file::refresh_listeners(Path::new(&home));
+            }
         }
     }
 
@@ -714,7 +857,7 @@ impl Game<'_> {
                 level,
             }),
             damage: Some(damage_type.to_owned()),
-            amount: 0.0,
+            ..EventContext::default()
         };
         if allow
             && self
@@ -806,7 +949,17 @@ mod tests {
             (
                 "net/fabricmc/fabric/api/event/Event.java",
                 "package net.fabricmc.fabric.api.event;\n\
-                 public abstract class Event<T> { public void register(T listener) {} }",
+                 import net.minecraft.resources.Identifier;\n\
+                 public abstract class Event<T> { public static final Identifier DEFAULT_PHASE = null;\n\
+                 public void register(T listener) {}\n\
+                 public void register(Identifier phase, T listener) {}\n\
+                 public void addPhaseOrdering(Identifier first, Identifier second) {} }",
+            ),
+            (
+                "net/minecraft/resources/Identifier.java",
+                "package net.minecraft.resources;\n\
+                 public final class Identifier {\n\
+                 public static Identifier fromNamespaceAndPath(String n, String p) { return null; } }",
             ),
             (
                 "net/minecraft/server/MinecraftServer.java",
@@ -839,6 +992,7 @@ mod tests {
                  public final class EventMod {{\n\
                    public static int ticks;\n\
                    public static int lastTick;\n\
+                   public static int order;\n\
                    public void onInitialize() {{ {body} }} }}"
             ),
         )
@@ -890,7 +1044,7 @@ mod tests {
 
     /// A static of the first kept jar of `role` (`key` is name + descriptor).
     fn kept_static(role: HandlerRole, key: &str) -> Option<Value> {
-        lock_resident(&store().get(&role)?.first()?.host)
+        lock_resident(&store().get(&role)?.jars.first()?.host)
             .persistent_class_state()
             .0
             .remove(&format!("demo/EventMod#{key}"))
@@ -974,6 +1128,44 @@ mod tests {
         assert_eq!(fire(HandlerRole::IntegratedServer, tick_end(43)).ran, 0);
         clear_as(HandlerRole::DedicatedServer);
         assert!(!listens(GameEvent::ServerTickEnd));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap_or(&path));
+    }
+
+    /// The store runs an event's listeners in Fabric's phase order (an early
+    /// phase ordered before the default one runs first though registered
+    /// last), and `java-runtime.json`'s counts say, per jar and event, how
+    /// many listeners were kept, ran, failed and are disabled.
+    #[test]
+    fn listeners_run_in_phase_order_and_are_counted_per_event() {
+        let _guard = super::super::java_mods::test_lock();
+        clear_all();
+        let Some(path) = fabric_jar(
+            "phases",
+            "net.minecraft.resources.Identifier early =\n\
+               net.minecraft.resources.Identifier.fromNamespaceAndPath(\"demo\", \"zz_early\");\n\
+             ServerTickEvents.END_SERVER_TICK.register(s -> { order = order * 10 + 2; });\n\
+             ServerTickEvents.END_SERVER_TICK.register(s -> s.getCommands());\n\
+             ServerTickEvents.END_SERVER_TICK.register(early, s -> { order = order * 10 + 1; });\n\
+             ServerTickEvents.END_SERVER_TICK.addPhaseOrdering(early,\n\
+               net.fabricmc.fabric.api.event.Event.DEFAULT_PHASE);",
+        ) else {
+            eprintln!("skipped: no javac");
+            return;
+        };
+        assert_eq!(bootstrap(&path, ExecutionRole::DedicatedServer), 3);
+        assert_eq!(fire(HandlerRole::DedicatedServer, tick_end(1)).ran, 2);
+        assert_eq!(
+            kept_static(HandlerRole::DedicatedServer, "orderI"),
+            Some(Value::Int(12))
+        );
+        fire(HandlerRole::DedicatedServer, tick_end(2));
+        let counts = listener_counts();
+        let row = counts["phases.jar"]["server_tick_end"];
+        assert_eq!(
+            (row.kept, row.dispatched, row.refused, row.disabled),
+            (3, 4, 1, 1)
+        );
+        clear_as(HandlerRole::DedicatedServer);
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap_or(&path));
     }
 

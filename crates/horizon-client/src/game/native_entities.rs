@@ -303,7 +303,9 @@ impl Game<'_> {
     /// entity it announces; nothing runs when no mod is loaded, on a client
     /// of a server (which tells nothing), or when nothing is new.
     pub(super) fn native_joins_flush(&mut self, loaded_from_disk: bool, watch: u32) -> bool {
-        if self.remote.is_some() || crate::mod_api::mods().is_empty() || !self.joins_pending() {
+        // Java listeners of an entity's load or unload need the same walk.
+        let heard = !crate::mod_api::mods().is_empty() || super::java_events::listens_entities();
+        if self.remote.is_some() || !heard || !self.joins_pending() {
             return true;
         }
         for t in &mut self.tnts {
@@ -437,7 +439,8 @@ impl Game<'_> {
     /// silent): everything now in the level counts as announced, and will
     /// be told when it leaves.
     pub(super) fn native_joins_skip(&mut self) {
-        if self.remote.is_none() && !crate::mod_api::mods().is_empty() {
+        let heard = !crate::mod_api::mods().is_empty() || super::java_events::listens_entities();
+        if self.remote.is_none() && heard {
             while let Some((slot, id)) = self.next_unannounced() {
                 self.persist.joined_mark = id;
                 let kind = self.slot_kind_and_position(slot).0.into_owned();

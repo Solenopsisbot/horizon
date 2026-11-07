@@ -2589,6 +2589,11 @@ impl Game<'_> {
         state: BlockStateId,
         canceled: &mut bool,
     ) {
+        // Java listeners (Fabric AttackBlockCallback, NeoForge LeftClickBlock).
+        if self.java_attack_block(pos, face) {
+            *canceled = true;
+            return;
+        }
         // A Java `@Inject` at `handleBlockBreakAction`'s HEAD runs first; its
         // cancel returns before the body that tells the native mods.
         if self.java_hook_left_click_block(pos, face) {
@@ -4209,6 +4214,7 @@ impl Game<'_> {
         to: &str,
     ) {
         mod_api::dispatch_player_changed_dimension(self, mod_api::mods(), player, name, from, to);
+        self.java_player_changed_level(player, from, to);
     }
     /// A player's client started (`flying`) or stopped flying (vanilla's
     /// `handlePlayerAbilities`, which honours it only for a player who may
@@ -7019,6 +7025,12 @@ impl Game<'_> {
         pos: [f64; 3],
         canceled: &mut bool,
     ) {
+        // Java listeners where `handleInteract` takes the attack, before
+        // `Player.attack` (Fabric AttackEntityCallback, NeoForge AttackEntityEvent).
+        if self.java_attack_entity(entity, kind) {
+            *canceled = true;
+            return;
+        }
         // A Java `@Inject` at `Player.attack`'s HEAD runs first; its cancel
         // returns before the body that tells the native mods.
         if self.java_hook_attack_entity(entity, kind, pos) {
@@ -7062,6 +7074,7 @@ impl Game<'_> {
     /// `native_level_unload` follows. Server-side. API 134.
     pub(super) fn native_level_load(&mut self, dimension: &str) {
         mod_api::dispatch_level_load(self, mod_api::mods(), dimension);
+        self.java_level_loaded(dimension, true);
     }
     /// `dimension`'s level closed (NeoForge's `LevelEvent.Unload`, posted after
     /// `level.close()` in `MinecraftServer.stopServer`), after its last save:
@@ -7076,6 +7089,7 @@ impl Game<'_> {
         mod_api::dispatch_level_unload(self, mod_api::mods(), dimension);
         // A Java `@Inject` at `ServerLevel.close`'s TAIL.
         self.java_hook_level_unload(dimension);
+        self.java_level_loaded(dimension, false);
     }
     /// The server's difficulty changed, from `from` to `to` (`peaceful`,
     /// `easy`, `normal`, `hard`; NeoForge's `DifficultyChangeEvent`). It is
@@ -7139,6 +7153,7 @@ impl Game<'_> {
     /// 115.
     pub(super) fn native_player_respawned(&mut self, player: u128, name: &str) {
         mod_api::dispatch_player_respawned(self, mod_api::mods(), player, name);
+        self.java_player_respawned(player, false);
     }
     /// A player was saved to the world's store (NeoForge's
     /// `PlayerEvent.SaveToFile`, `PlayerList.save`): when they leave or the
@@ -7187,6 +7202,7 @@ impl Game<'_> {
         mod_api::dispatch_player_clone(self, mod_api::mods(), player, name, was_death);
         // A Java `@Inject` at `ServerPlayer.restoreFrom`'s TAIL.
         self.java_hook_player_clone(player, name, was_death);
+        self.java_player_copied(player, !was_death);
     }
     /// The number of players with the mod container at `pos` of `dimension`
     /// open went from `previous` to `viewers` (vanilla's
@@ -7425,6 +7441,7 @@ impl Game<'_> {
     /// it). Check `kind`. Server-side.
     pub(super) fn native_entity_leave_level(&mut self, dimension: &str, entity: u32, kind: &str) {
         mod_api::dispatch_entity_leave_level(self, mod_api::mods(), dimension, entity, kind);
+        self.java_entity_unloaded(dimension, entity, kind);
     }
     /// An entity joins the server level `dimension` (NeoForge's
     /// `EntityJoinLevelEvent`): vanilla's `PersistentEntitySectionManager.addEntity`.
@@ -7463,6 +7480,10 @@ impl Game<'_> {
             loaded_from_disk,
             canceled,
         );
+        // Java listeners (Fabric ENTITY_LOAD, NeoForge EntityJoinLevelEvent, which may cancel).
+        if !*canceled && self.java_entity_loaded(dimension, entity, kind) {
+            *canceled = true;
+        }
     }
     /// An entity mounts or dismounts a vehicle (NeoForge's `EntityMountEvent`, posted from
     /// `Entity.startRiding` and `removeVehicle`): `entity` of type `kind` (`minecraft:player`,
@@ -8317,6 +8338,10 @@ pub(super) fn hurt_server(hurting: Hurting<'_>, amount: &mut f32) -> bool {
         causing,
         direct,
     } = source;
+    // Java listeners (Fabric ALLOW_DAMAGE, NeoForge LivingIncomingDamageEvent).
+    if super::java_events::fire_allow_damage(entity, kind, damage_type, *amount) {
+        return true;
+    }
     let mut canceled = false;
     Game::native_living_incoming_damage(
         entity,

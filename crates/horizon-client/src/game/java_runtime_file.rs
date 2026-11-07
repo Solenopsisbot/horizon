@@ -176,6 +176,21 @@ pub(crate) struct RuntimeReport {
     /// Refused rows the batch had, before the bounds.
     #[serde(default)]
     pub(crate) refused: usize,
+    /// What each jar's game-event listeners did on this process's servers: jar file → event name
+    /// (`use_block`, `server_tick_end`...) → counts. [`write`] fills it, and a server's stop rewrites it
+    /// ([`refresh_listeners`]) with the session's counts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) listeners: BTreeMap<String, BTreeMap<String, RuntimeListeners>>,
+}
+
+/// One jar's listeners of one game event: how many it kept, how many times they ran (`dispatched`), how
+/// many failed and were disabled at that failure (`refused`), and how many are disabled now.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RuntimeListeners {
+    pub(crate) kept: usize,
+    pub(crate) dispatched: u64,
+    pub(crate) refused: u64,
+    pub(crate) disabled: usize,
 }
 
 impl RuntimeReport {
@@ -186,6 +201,7 @@ impl RuntimeReport {
             jars_total: jars.len(),
             refused: jars.iter().filter(|jar| jar.engine == "refused").count(),
             jars,
+            listeners: BTreeMap::new(),
         }
     }
 }
@@ -218,12 +234,30 @@ pub(crate) fn encode(report: RuntimeReport) -> Vec<u8> {
     }
 }
 
+/// Writes the report under `home`, with the listener counts now when the caller set none.
 pub(crate) fn write(home: &Path, report: RuntimeReport) -> std::io::Result<()> {
+    let mut report = report;
+    if report.listeners.is_empty() {
+        report.listeners = super::java_events::listener_counts();
+    }
     let bytes = encode(report);
     fs::create_dir_all(home)?;
     let part = home.join(".java-runtime.json.part");
     fs::write(&part, bytes)?;
     fs::rename(part, home.join("java-runtime.json"))
+}
+
+/// Rewrites `home`'s file with the listener counts now, keeping its rows: a server's stop calls it, so the
+/// file says what the session's listeners did. Nothing happens without a file to update.
+pub(crate) fn refresh_listeners(home: &Path) -> std::io::Result<()> {
+    let Ok(bytes) = fs::read(home.join("java-runtime.json")) else {
+        return Ok(());
+    };
+    let Ok(mut report) = serde_json::from_slice::<RuntimeReport>(&bytes) else {
+        return Ok(());
+    };
+    report.listeners = super::java_events::listener_counts();
+    write(home, report)
 }
 
 #[cfg(test)]
