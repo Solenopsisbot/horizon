@@ -305,8 +305,9 @@ or the target's last parameter), `register(Object|Class)` and `@EventBusSubscrib
 (`Dist.CLIENT` subscribers are dropped on a server). Registrations on events the game does not fire are counted
 by source in `unsupported`; the probe prints both under `game_listeners`. `NativeJar::run_game_listener` runs one
 listener for an `EventFiring` (the event, an `EventFacade` snapshot of tick count, players and levels, and an
-`EventContext` naming the level, player, entity and damage): against the host's persistent class state, under
-an `ExecutionBudget`, with the host's call log rolled back afterwards. A `handler::accept` method reference on a
+`EventContext` naming the level, player, entity and damage): against the host's persistent class state and
+resident heap, under an `ExecutionBudget`, with the host's call log rolled back afterwards.
+A `handler::accept` method reference on a
 captured lambda runs that lambda. The façade markers (`game/server`, `game/player-list`, `game/level/<id>`,
 `game/player/<uuid>`, `game/connection/<uuid>`, `game-event/<event>`) answer the calls listeners make first
 (`getTickCount`, `getPlayerList().getPlayers()`, `level.dimension() == Level.OVERWORLD`, `player.getUUID()`,
@@ -521,8 +522,8 @@ path for `@Inject` plans whose target is a game class:
    &mut context, hook, receiver, args, &mut host, &budget)` (`run_game_hook` is the same with no objects and no
    kept state). The callbacks run with a runtime-owned `CallbackInfo`; a cancellable one that calls `cancel()`
    stops the ones after it and sets `GameHookRun::cancelled`. An instance callback receives the target object as
-   `this` (see the object model below), and a callback's static fields are the jar's: they persist to the next
-   firing, exactly as a woven callback's would.
+   `this` (see the object model below), and a callback's static fields and the objects they reach are the jar's:
+   they persist to the next firing, exactly as a woven callback's would.
 
 The site table (`GAME_HOOK_SITES`) is small and hand-checked, because running a mod's callback at the wrong moment
 is worse than refusing it. Its 19 rows name 18 hook points, and the game fires every one of them
@@ -645,8 +646,9 @@ appleskin's and syncmatica's `player_logged_in` (2 firings each), shogi's `playe
 `Connection#getRemoteAddress` and was disabled; in other runs weaponmaster refused at
 `ServerPlayNetworking.canSend`, CustomPlayerModels at a `@Shadow` field, jamlib at Guava's `Ordering`. The bots
 attacked nothing and nobody died, so the cancellable sites have no real-jar firing yet. A ran callback is not a
-working mod: objects an entrypoint built keep only their static fields after it returns, so servux's
-`server_stopping` iterated its listener list empty.
+working mod: servux's `server_stopping` iterates an empty `ServerHandler` list, because the plan that fills it
+(`DedicatedServer.<init>` `TAIL`) has no hook site. Its entrypoint's own objects now survive (the resident heap
+below): its `ServerInitHandler` keeps the `ServuxInitHandler` it registered.
 
 Re-measured 7 November 2026 after the Java-tier rows, the value shapes and the plugin gate, with the static count
 of `game_hook_tier_measures_the_phase_two_loader_set` (a server-side plan is one whose callback's config is not
@@ -881,7 +883,16 @@ Logfare (120), and the workspace's NeoForge 1.21.11 ABI probe constructor (165) 
 Instance calls preserve their receiver through `Host::invoke_instance`, so a game-owned host can implement
 stateful object contracts without changing the interpreter's classfile boundary. Jar-owned `new` allocations
 also receive distinct bounded identity markers, so instance fields from separate Java objects do not alias
-inside one native invocation.
+inside one native invocation. They also outlive it: a `StdHost` keeps a resident heap per jar (`heap.rs`; one host
+per jar and role in the game, shared by its payload handlers, event listeners and game hooks). The instance fields,
+arrays, `StringBuilder`s, enum identity and object counters an entrypoint or callback leaves move into the host when
+it returns and back out before the next, so a listener walks the objects its entrypoint stored in a static or
+captured in its lambda, and the next callback sees what it changed. When a store finds the heap doubled since the
+last collection, it drops what nothing reaches from the jar's statics, the host's own tables (call log,
+registrations, payload handlers, holders) or a game object's Mixin fields; a collectable marker is found wherever
+another value's text embeds it. Past 65,536 fields, 8,192 arrays or 32 MiB after collection the store is refused
+and the callback that grew it fails. Fields a Mixin adds to a game object stay per object in `GameHookState`.
+A failed callback keeps what it wrote, as a JVM would, including a class whose `<clinit>` it broke off.
 This is a real native execution boundary, not a claim of full JVM compatibility: general reflection,
 Kotlin runtime behavior, and loader APIs remain on the embedded-JVM path until their native host contracts are
 implemented. Class literals support bounded metadata queries (`getName`, `getSimpleName`, `getTypeName`,

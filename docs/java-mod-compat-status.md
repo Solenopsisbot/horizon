@@ -815,8 +815,14 @@ than rows; the cache held 86 entries in 436 KiB.
    dedicated server with two bot players and eight of those jars, 4 jars' callbacks ran (appleskin and syncmatica
    `player_logged_in` 2 each, shogi `player_tick` 1,457, servux `server_stopping` 1) and the rest refused and were
    disabled (`ServerPlayNetworking.canSend`, `Connection#getRemoteAddress`, a `@Shadow` field, Guava's `Ordering`).
-   Objects an entrypoint built keep only their static fields after it returns, so a callback that reads a
-   listener list the entrypoint filled (servux's) sees it empty.
+   The objects an entrypoint builds now outlive it (`heap.rs`, a resident heap per jar and role shared by its payload
+   handlers, listeners and hooks): measured 7 November 2026 on 172 corpus jars with server listeners or bound hooks
+   (four dedicated batches, four `horizon-bots` players each, the same binary with the heap switched off and on),
+   refused listeners fell from 62 to 57 of 325, failed game hooks from 28 to 23, and refusals on a lost collection
+   (`got null`) from 11 to 3. servux keeps its `ServerInitHandler` list (one `ServuxInitHandler`), but its
+   `server_stopping` callback still walks an empty `ServerHandler` list: the plan that fills it injects at
+   `DedicatedServer.<init>` `TAIL`, which has no hook site. A `<clinit>` that a strict hook firing refused leaves its
+   class half-initialised (jamlib's `Event#listeners`).
 2. **Refusals.** The committed ledgers (an older binary) count 27 of 121 wide and 68 of 265 mega jars that declare a
    server entrypoint as failing (22%/26%). A fresh dedicated-server re-measure on 7 November 2026 (all workstreams'
    fixes, one server per jar, 60 s) counts **5 wide and 15 mega `native-gap` rows**. The entrypoint-exception bucket
@@ -891,9 +897,9 @@ than rows; the cache held 86 entries in 436 KiB.
 ## Planned work
 
 1. **Make mixins count.** Widen the game-hook tier's object model from what the bound callbacks reach first
-   (players, entities, levels, the server; Fabric networking, `Connection`, `@Shadow` fields next), keep entrypoint
-   objects' instance fields alive for later callbacks, and map the remaining game-class plans onto hook points (or
-   provide the target classes through the loader path). Gate: `woven` or `run_game_hook` covered by a real-mod ledger, and every
+   (players, entities, levels, the server; Fabric networking, `Connection`, `@Shadow` fields next) and map the
+   remaining game-class plans onto hook points, constructor tails such as servux's `DedicatedServer.<init>` first
+   (or provide the target classes through the loader path). Entrypoint objects already outlive the entrypoint. Gate: `woven` or `run_game_hook` covered by a real-mod ledger, and every
    `native` label backed by zero skipped plans.
 2. **Close metadata refusals.** Gate: metadata refusals 38 → 0 across both corpora. The JDK surface config
    bootstraps reach is modelled in `jdk_model.rs`/`jdk_stream.rs` (charsets, loggers, file walks, `Comparator`,
