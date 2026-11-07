@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -314,6 +316,184 @@ class JavaModServerLedgerTests(unittest.TestCase):
         if os.environ.get("HORIZON_LEDGER_INTEGRATION") != "1" or not resources.is_dir():
             self.skipTest("real-server integration is opt-in and needs prepared resources")
         self.assertTrue(resources.is_dir())
+
+
+class DependencyClosureTests(unittest.TestCase):
+    """`--with-deps`: which jars run beside a jar, and whose outcome the row is."""
+
+    @staticmethod
+    def _fabric(directory, name, ident, *, depends=(), provides=(), nested=(),
+                version="1.0.0"):
+        """A Fabric jar; `nested` are (id, provides) pairs carried as jar-in-jar."""
+        path = Path(directory) / name
+        meta = {"schemaVersion": 1, "id": ident, "version": version,
+                "depends": {dep: "*" for dep in depends}}
+        if provides:
+            meta["provides"] = list(provides)
+        with zipfile.ZipFile(path, "w") as jar:
+            jar.writestr("fabric.mod.json", json.dumps(meta))
+            for index, (inner, inner_provides) in enumerate(nested):
+                buffer = io.BytesIO()
+                with zipfile.ZipFile(buffer, "w") as nested_jar:
+                    nested_jar.writestr("fabric.mod.json", json.dumps(
+                        {"schemaVersion": 1, "id": inner, "version": "1",
+                         "provides": list(inner_provides)}))
+                jar.writestr(f"META-INF/jars/inner{index}.jar", buffer.getvalue())
+        return path
+
+    def _closure(self, directory, jar):
+        index = LEDGER.provider_index(LEDGER.corpus_jars([Path(directory)]))
+        return LEDGER.dependency_closure(jar, index)
+
+    def test_closure_resolves_aliases_and_nested_modules_transitively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # spells needs a config library under its alias, and an API module
+            # only the API jar carries nested; the config library needs the API.
+            jar = self._fabric(tmp, "spells.jar", "spells",
+                               depends=("minecraft", "fabricloader", "cloth-config2",
+                                        "fabric-networking-api-v1"))
+            self._fabric(tmp, "cloth.jar", "cloth-config", provides=("cloth-config2",),
+                         depends=("fabric-api",))
+            self._fabric(tmp, "fabric-api.jar", "fabric-api",
+                         nested=(("fabric-networking-api-v1", ()),))
+            self._fabric(tmp, "unrelated.jar", "unrelated")
+            closure = self._closure(tmp, jar)
+        self.assertEqual(sorted(closure.ids), ["cloth-config", "fabric-api"])
+        self.assertEqual(sorted(path.name for path in closure.jars),
+                         ["cloth.jar", "fabric-api.jar"])
+        self.assertEqual(closure.missing, ())
+
+    def test_a_jars_own_nested_module_satisfies_its_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = self._fabric(tmp, "bundler.jar", "bundler", depends=("tinylib",),
+                               nested=(("tinylib", ()),))
+            self._fabric(tmp, "tinylib.jar", "tinylib")
+            closure = self._closure(tmp, jar)
+        self.assertEqual((closure.jars, closure.missing), ((), ()))
+
+    def test_the_library_beats_a_mod_that_bundles_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = self._fabric(tmp, "app.jar", "app", depends=("fabric-api-base",))
+            # The bundler nests the whole API (and so more ids than the API jar).
+            self._fabric(tmp, "bundler.jar", "lod", nested=(
+                ("fabric-api", ()), ("fabric-api-base", ()), ("fabric-extra", ())))
+            self._fabric(tmp, "fabric-api.jar", "fabric-api",
+                         nested=(("fabric-api-base", ()),))
+            closure = self._closure(tmp, jar)
+        self.assertEqual(closure.ids, ("fabric-api",))
+
+    def test_missing_ids_name_who_needed_them_and_do_not_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = self._fabric(tmp, "archers.jar", "archers",
+                               depends=("spell_engine", "absent_lib"))
+            self._fabric(tmp, "spell_engine.jar", "spell_engine", depends=("structure_pool_api",))
+            closure = self._closure(tmp, jar)
+            row = LEDGER.missing_dependency_row(jar, closure)
+            # No server starts: a fake binary and an empty resources folder are enough.
+            binary = Path(tmp) / "not-a-game"
+            binary.write_text("")
+            resources = Path(tmp) / "resources"
+            resources.mkdir()
+            output = Path(tmp) / "ledger.txt"
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                LEDGER.main([tmp, "--only", "archers", "--with-deps", "--deps-dir", tmp,
+                             "--binary", str(binary), "--resources", str(resources),
+                             "--native-binary", str(binary), "--output", str(output)])
+            stored = LEDGER.read_ledger(output)
+        self.assertEqual(closure.ids, ("spell_engine",))
+        self.assertEqual(closure.missing, (("absent_lib", "archers"),
+                                           ("structure_pool_api", "spell_engine")))
+        self.assertEqual(LEDGER.label(row), LEDGER.MISSING_DEPENDENCY)
+        self.assertEqual(LEDGER.reason_category(row), "missing-dependency")
+        self.assertEqual(
+            row.reason,
+            "missing-dependency: absent_lib, structure_pool_api (needed by spell_engine)")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual((stored[0].file, LEDGER.label(stored[0]), stored[0].reason),
+                         ("archers.jar", LEDGER.MISSING_DEPENDENCY, row.reason))
+        self.assertEqual(stored[0].deps, ("spell_engine",))
+
+    def test_neoforge_mandatory_dependencies_join_the_closure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "neo.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("META-INF/neoforge.mods.toml", (
+                    '[[mods]]\nmodId="neo"\nversion="1"\n'
+                    '[[dependencies.neo]]\nmodId="neoforge"\ntype="required"\n'
+                    '[[dependencies.neo]]\nmodId="geckolib"\ntype="required"\n'
+                    '[[dependencies.neo]]\nmodId="jei"\ntype="optional"\n'))
+            self._fabric(tmp, "gecko.jar", "geckolib")
+            self._fabric(tmp, "jei.jar", "jei")
+            closure = self._closure(tmp, jar)
+        self.assertEqual((closure.ids, closure.missing), (("geckolib",), ()))
+
+    def test_the_row_is_the_jar_under_test_not_its_dependency(self):
+        deps = (Path("/mods/lib-2.jar"),)
+        log = (
+            "Horizon: dedicated Java compatibility: /mods/app-2.jar: engine=native "
+            "loader=fabric id=app version=1\n"
+            "Horizon: ERROR /mods/lib-2.jar: no native Fabric or NeoForge entrypoint "
+            "for server execution (available: client)\n"
+            "[Server thread/WARN]: Horizon: dedicated Java compatibility: skipping "
+            "/mods/lib-2.jar: clientSideOnly mod cannot run for server execution\n"
+            "Done (1.0s)!\n"
+        )
+        text = LEDGER.closure_text(log, Path("/mods/app-2.jar"), deps)
+        self.assertNotIn("lib-2.jar", text)
+        row = LEDGER.parse_log(text, "app-2.jar", runtime={"file": "app-2.jar", "engine": "native"})
+        self.assertEqual((row.verdict, LEDGER.label(row)), ("ran", LEDGER.NATIVE_OK))
+        # The batch's one `skipping` line can name the jar's file as a substring of
+        # a dependency's; a jar the runtime report says started is not refused.
+        joined = "skipping /mods/xapp-2.jar: no native entrypoint\nDone (1.0s)!\n"
+        row = LEDGER.parse_log(joined, "app-2.jar",
+                               runtime={"file": "app-2.jar", "engine": "native"})
+        self.assertEqual(row.verdict, "ran")
+        report = {"jars": [{"file": "app-2.jar", "engine": "native"},
+                           {"file": "lib-2.jar", "engine": "refused", "refusal": "x"}]}
+        self.assertEqual(LEDGER.dependency_refusals(report, deps, ("lib",)), ("lib",))
+        # A library dependency (Fabric API) has nothing for the server to run: the
+        # runner refuses its entrypoint by design, which is not a failed dependency.
+        report["jars"][1]["refusal"] = "no native entrypoint"
+        self.assertEqual(LEDGER.dependency_refusals(report, deps, ("lib",)), ())
+
+    def test_a_refusal_inside_a_dependency_names_that_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = Path(tmp) / "wizards.jar"
+            dep = Path(tmp) / "spell_power.jar"
+            for path, name in ((jar, "net/wizards/Entities.class"),
+                               (dep, "net/spell_power/api/SpellSchools.class")):
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr(name, b"\xca\xfe\xba\xbe")
+            linked = ('with the pack class path: Metadata("malformed floating-point marker '
+                      '(at net/spell_power/api/SpellSchools#createMagic +21)"); alone: '
+                      'uncaught exception java/lang/NullPointerException (at net/wizards/Entities#a +7)')
+            own = "uncaught exception java/lang/NullPointerException (at net/wizards/Entities#a +7)"
+            self.assertEqual(
+                LEDGER.blocking_dependency(linked, jar, (dep,), ("spell_power",)), "spell_power")
+            self.assertEqual(LEDGER.blocking_dependency(own, jar, (dep,), ("spell_power",)), "")
+            self.assertEqual(LEDGER.blocking_dependency("hard timeout", jar, (dep,), ("x",)), "")
+        row = LEDGER.Row("wizards.jar", reason=linked, blocked_in="spell_power")
+        self.assertTrue(LEDGER.why(row).endswith("in `spell_power`'s code"))
+
+    def test_a_both_ways_refusal_is_categorised_by_its_linked_cause(self):
+        reason = ("with the pack class path: uncaught exception java/lang/NullPointerException"
+                  " (at a/B); alone: Metadata(\"missing member lib/Config.name\")")
+        row = LEDGER.parse_log("Done (1s)!\n", "app.jar",
+                               runtime={"file": "app.jar", "engine": "refused", "refusal": reason})
+        self.assertEqual(LEDGER.reason_category(row), "uncaught")
+
+    def test_closure_fields_survive_the_text_ledger(self):
+        row = LEDGER.Row("app.jar", "app", "1", "refused", engine="refused",
+                         deps=("fabric-api", "lib"), dep_refused=("lib",), blocked_in="lib")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ledger.txt"
+            path.write_text(LEDGER.format_row(row) + "\n", encoding="utf-8")
+            stored = LEDGER.read_ledger(path)[0]
+        self.assertEqual((stored.deps, stored.dep_refused, stored.blocked_in),
+                         (("fabric-api", "lib"), ("lib",), "lib"))
+        # A one-jar row keeps the old format: no closure fields at all.
+        self.assertNotIn("deps=", LEDGER.format_row(LEDGER.Row("solo.jar")))
 
 
 if __name__ == "__main__":

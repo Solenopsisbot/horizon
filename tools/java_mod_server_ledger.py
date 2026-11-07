@@ -14,6 +14,18 @@ so a run also reads the `java-runtime.json` that role writes under the scratch h
 and asks `horizon-native-java --mixin-plans` how many of the jar's plans name a class
 the jar does not hold (the `target-outside-jar` count the label needs). A jar the log
 names after `skipping` did not start, whatever else the process reached.
+
+`--with-deps` runs each jar together with its declared dependency closure, the way a
+real loader would refuse to load it without one: the required ids of its
+`fabric.mod.json` (`depends`) or `mods.toml`/`neoforge.mods.toml` (mandatory/required
+`[[dependencies]]`), resolved through `provides` aliases and jar-in-jar modules
+against the jars of `--deps-dir` (by default the mod directory and the corpora under
+`~/horizon-corpus`). The row stays the jar under test's own outcome; the closure's
+ids and the ones the server refused are extra fields. A jar whose closure needs an
+id no corpus jar provides is not started and gets a fourth label,
+`missing-dependency`, instead of a `native-gap` that would blame native execution
+for what any loader refuses too. `--rerun LEDGER` picks the jars an earlier ledger
+labelled `--rerun-label` (default `native-gap`).
 """
 
 from __future__ import annotations
@@ -28,10 +40,11 @@ import sys
 import tempfile
 import time
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hybrid_pack  # noqa: E402  (jar declarations and the provider index)
 import lab  # noqa: E402
 
 MAX_OUTPUT = 512 * 1024
@@ -48,7 +61,10 @@ MAX_TABLE_REASON = 80
 NATIVE_OK = "native-ok"
 NEEDS_LOADER = "needs-loader"
 NATIVE_GAP = "native-gap"
-LABELS = (NATIVE_OK, NEEDS_LOADER, NATIVE_GAP)
+# Only `--with-deps` writes this one: the jar's declared closure needs an id no corpus
+# jar provides, so no loader (native or real) would start it and it was not run.
+MISSING_DEPENDENCY = "missing-dependency"
+LABELS = (NATIVE_OK, NEEDS_LOADER, NATIVE_GAP, MISSING_DEPENDENCY)
 # Labels earlier runs wrote; `read_ledger` normalises them.
 LEGACY_LABELS = {"native": NATIVE_OK, "loader": NEEDS_LOADER}
 
@@ -106,6 +122,16 @@ class Row:
     game_plans: int = 0
     # One of LABELS; empty until `parse_log` classifies the row.
     recommend: str = ""
+    # `--with-deps` only: the mod ids of the dependency closure the jar ran with,
+    # and the ones among them the server refused (a loader would refuse the jar too;
+    # the row's own verdict still says what native execution did with the jar).
+    deps: tuple[str, ...] = ()
+    dep_refused: tuple[str, ...] = ()
+    # `--with-deps` only: the closure mod whose class the refusal's `(at Class#method)`
+    # names, when the jar under test got that far into its dependency's code. The
+    # label stays the jar's (native execution still cannot carry the pack); this says
+    # whose code to fix.
+    blocked_in: str = ""
 
 
 def bounded(value: str, limit: int = MAX_REASON) -> str:
@@ -264,6 +290,125 @@ def runtime_row(report: dict, jar: Path) -> dict | None:
     return None
 
 
+# The corpora `--with-deps` looks for providers in when no `--deps-dir` is given,
+# besides the mod directory itself: the two ledger corpora, the dependency pool the
+# mega corpus was fetched with, and the other corpora a provider may only live in.
+# (`fabric-libs-*` are the game's and loader's Maven libraries, not mods.)
+DEFAULT_DEP_DIRS = tuple(Path.home() / "horizon-corpus" / name for name in (
+    "corpus-xl", "mega", "mega-deps", "corpus-xplus", "corpus-helix"))
+
+
+@dataclass(frozen=True)
+class Closure:
+    """The jars one jar needs beside it, and the ids no corpus jar provides.
+
+    `missing` maps each unresolved id to the mod id that required it (the jar under
+    test itself, or a dependency the closure pulled in).
+    """
+
+    jars: tuple[Path, ...] = ()
+    ids: tuple[str, ...] = ()
+    missing: tuple[tuple[str, str], ...] = ()
+
+
+def corpus_jars(directories: list[Path]) -> list[hybrid_pack.PackJar]:
+    """Every `.jar` of `directories` with its declaration, each real file once."""
+    seen: set[Path] = set()
+    jars: list[hybrid_pack.PackJar] = []
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir(), key=lambda item: item.name):
+            if path.suffix.lower() != ".jar" or not path.is_file():
+                continue
+            real = path.resolve()
+            if real in seen:
+                continue
+            seen.add(real)
+            jars.append(hybrid_pack.PackJar(path, None, hybrid_pack.read_declaration(path)))
+    return jars
+
+
+def provider_index(jars: list[hybrid_pack.PackJar]) -> dict[str, list[hybrid_pack.PackJar]]:
+    """Each id (own, `provides` alias or nested module) and its providers, best first.
+
+    The hybrid tool's order: a jar whose own id is the dependency first, then one
+    that carries it as a nested module, then the newest version.
+    """
+    return hybrid_pack._provider_index(jars)
+
+
+def canonical_provider(providers: list[hybrid_pack.PackJar]) -> hybrid_pack.PackJar:
+    """The provider a dependency should get, from the index's best-first list.
+
+    A mod that bundles a library as jar-in-jar provides every id the library
+    does: Distant Horizons nests Fabric API's root and its 44 modules, so the
+    index's "most nested ids" order would hand `fabric-api-base` to Distant
+    Horizons and run a whole second mod beside the jar under test. The library
+    itself is the provider: a candidate whose own id another candidate nests
+    wins, and the index's order breaks the remaining ties.
+    """
+    bundled = {ident.lower() for provider in providers
+               for ident in provider.declaration.nested_ids}
+    for provider in providers:
+        if provider.mod_id.lower() in bundled:
+            return provider
+    return providers[0]
+
+
+def dependency_closure(jar: Path, index: dict[str, list[hybrid_pack.PackJar]],
+                       declaration: hybrid_pack.Declaration | None = None) -> Closure:
+    """The declared dependency closure of `jar`, resolved against `index`.
+
+    Every required id is satisfied by the platform (`minecraft`, `fabricloader`,
+    `neoforge`, ...), by an id the closure already holds (the jar's own id, its
+    `provides` aliases and jar-in-jar modules, and the same for each provider it
+    pulled in), or by the best provider in the index; anything else is missing.
+    Version ranges are not checked: the newest provider stands in for the range,
+    which is what the corpus can offer.
+    """
+    root = declaration or hybrid_pack.read_declaration(jar)
+    target = hybrid_pack.PackJar(jar, None, root)
+    held = {target.mod_id.lower()} | {ident.lower() for ident in root.nested_ids}
+    chosen: dict[Path, hybrid_pack.PackJar] = {}
+    missing: dict[str, str] = {}
+    queue = [target]
+    while queue:
+        current = queue.pop(0)
+        for dependency in current.declaration.depends:
+            key = dependency.lower()
+            if key in hybrid_pack.PLATFORM_IDS or key in held:
+                continue
+            providers = [provider for provider in index.get(key, [])
+                         if provider.path.resolve() != jar.resolve()
+                         and provider.path not in chosen
+                         and provider.mod_id.lower() not in held]
+            if not providers:
+                missing.setdefault(key, current.mod_id)
+                continue
+            provider = canonical_provider(providers)
+            chosen[provider.path] = provider
+            held.add(provider.mod_id.lower())
+            held.update(ident.lower() for ident in provider.declaration.nested_ids)
+            queue.append(provider)
+    # An id first missed and then provided by a later provider's nested module
+    # is not missing after all.
+    missing = {key: by for key, by in missing.items() if key not in held}
+    deps = sorted(chosen.values(), key=lambda item: item.name)
+    return Closure(tuple(item.path for item in deps), tuple(item.mod_id for item in deps),
+                   tuple(sorted(missing.items())))
+
+
+def missing_dependency_row(jar: Path, closure: Closure) -> Row:
+    """The row of a jar the ledger did not start: its closure cannot be completed."""
+    ident, version = metadata(jar)
+    named = ", ".join(key if by.lower() == ident.lower() else f"{key} (needed by {by})"
+                      for key, by in closure.missing)
+    return Row(jar.name, ident, version, "unresolved", "", "?", reason=bounded(
+        f"missing-dependency: {named}", MAX_CAUSE), recommend=MISSING_DEPENDENCY,
+        deps=closure.ids)
+
+
 def read_runtime_report(home: Path) -> dict:
     """The role's runtime report, or an empty report when it wrote none."""
     try:
@@ -394,6 +539,11 @@ def parse_log(text: str, filename: str, *, seconds: float = 0.0, timed_out: bool
     # server can still reach Done: that line, not Done, is the row's outcome.
     refused_line = next((line for line in text.splitlines()
                          if "skipping " in line and filename in line), None)
+    if runtime is not None and runtime.get("engine") not in (None, "refused"):
+        # The runtime report says the jar started. A `skipping` line that names
+        # it can only be another jar's refusal sharing the batch's one line
+        # (`--with-deps` runs several jars), never this jar's.
+        refused_line = None
     reason = ""
     refusal = runtime.get("refusal") if runtime is not None else None
     whole = isinstance(refusal, str) and bool(refusal.strip())
@@ -476,6 +626,8 @@ LOADER_SKIP_REASONS = {"target-outside-jar", "target-missing", "game-class"}
 
 def recommendation(row: Row) -> str:
     """Choose the next compatibility path from the stable server outcome."""
+    if row.verdict == "unresolved":
+        return MISSING_DEPENDENCY
     if row.engine.lower() in {"loader", "jvm", "knot"}:
         return NEEDS_LOADER
     if row.verdict == "skipped" and row.subtype in {"client-only", "library"}:
@@ -495,13 +647,31 @@ def label(row: Row) -> str:
     return stored if stored in LABELS else recommendation(row)
 
 
+def own_reason(reason: str) -> str:
+    """The cause the game names first.
+
+    A jar refused both alone and with the pack class path carries both causes,
+    `with the pack class path: <linked>; alone: <alone>`; the linked one is the
+    blocker the batch hit, so the category reads that one only.
+    """
+    text = reason
+    marker = "with the pack class path: "
+    at = text.find(marker)
+    if at >= 0:
+        text = text[at + len(marker):]
+        text = text.split("; alone: ", 1)[0]
+    return text
+
+
 def reason_category(row: Row) -> str:
+    if row.verdict == "unresolved":
+        return "missing-dependency"
     if row.verdict == "ran":
         return "none"
     if row.verdict == "skipped":
         # The server role had no entrypoint to execute.
         return "no-entrypoint"
-    reason = row.reason.lower()
+    reason = own_reason(row.reason).lower()
     if "no native fabric or neoforge entrypoint" in reason or "no native entrypoint" in reason:
         return "no-entrypoint"
     if "timeout" in reason:
@@ -541,6 +711,7 @@ MEANING = {
     NATIVE_OK: "the dedicated server runs it on its own",
     NEEDS_LOADER: "it runs, but its plans target the game, so only a real loader applies them",
     NATIVE_GAP: "native execution cannot carry it yet",
+    MISSING_DEPENDENCY: "it requires a mod no corpus jar provides, so no loader starts it; not run",
 }
 
 # The clause a row adds to its label's `why`, in the generated summary table.
@@ -561,6 +732,7 @@ CAUSE_TEXT = {
     (NATIVE_GAP, "exit-code"): "exited before `Done (`",
     (NATIVE_GAP, "other"): "refused for another cause",
     (NATIVE_GAP, "none"): "refused for another cause",
+    (MISSING_DEPENDENCY, "missing-dependency"): "need an id outside the corpus",
 }
 
 # The per-jar table's short cause, before the ledger's own reason is appended.
@@ -575,6 +747,7 @@ GAP_TEXT = {
     "exit-code": "exited before `Done (`",
     "other": "refused",
     "none": "refused",
+    "missing-dependency": "not run: its closure is incomplete",
 }
 
 
@@ -605,7 +778,10 @@ def why(row: Row) -> str:
             return "library: nothing for the server to execute"
         return (f"ran; {row.skipped} plan(s) skipped, none aimed at the game"
                 if row.skipped else "ran; no plan skipped")
-    return GAP_TEXT[reason_category(row)]
+    text = GAP_TEXT[reason_category(row)]
+    if row.blocked_in:
+        text += f" in `{row.blocked_in}`'s code"
+    return text
 
 
 def doc_reason(reason: str) -> str:
@@ -710,10 +886,18 @@ def read_ledger(path: Path) -> list[Row]:
                 (),
                 0,
                 LEGACY_LABELS.get(stored, stored),
+                id_list(values.get("deps", "")),
+                id_list(values.get("dep_refused", "")),
+                values.get("blocked_in", ""),
             ))
         except (ValueError, IndexError) as error:
             raise ValueError(f"{path}:{number}: not a ledger row ({error})") from error
     return rows
+
+
+def id_list(value: str) -> tuple[str, ...]:
+    """A `deps=`/`dep_refused=` field: comma-separated mod ids, empty for none."""
+    return tuple(item for item in value.split(",") if item)
 
 
 def _kill_process(proc: subprocess.Popen[bytes]) -> None:
@@ -729,8 +913,73 @@ def _kill_process(proc: subprocess.Popen[bytes]) -> None:
             pass
 
 
+def closure_text(text: str, jar: Path, deps: tuple[Path, ...]) -> str:
+    """The log lines that can speak for `jar`: drop those naming only its dependencies.
+
+    One batch logs every jar it ran; a dependency's own refusal or entrypoint line
+    must not become the jar under test's reason. A line naming the jar too (the
+    batch's single `skipping a, b` line) stays.
+    """
+    if not deps:
+        return text
+    others = [dep.name for dep in deps if dep.name != jar.name]
+    return "\n".join(line for line in text.splitlines()
+                     if jar.name in line or not any(name in line for name in others))
+
+
+# A refusal that only says the server role has nothing to execute: Fabric API, a
+# config library with client entrypoints. A loader loads such a jar for its classes,
+# so a dependency refused this way is not a dependency that failed.
+NOTHING_TO_RUN = re.compile(r"no native (?:Fabric or NeoForge )?entrypoint|clientSideOnly mod cannot run",
+                            re.I)
+
+
+def dependency_refusals(report: dict, deps: tuple[Path, ...], ids: tuple[str, ...]) -> tuple[str, ...]:
+    """The closure's mod ids whose entrypoint the server refused.
+
+    A dependency with no server-role entrypoint is not counted: it is a library to
+    the server, and its classes still reach the pack class path.
+    """
+    refused = []
+    for dep, ident in zip(deps, ids):
+        row = runtime_row(report, dep)
+        if row is None or row.get("engine") != "refused":
+            continue
+        if NOTHING_TO_RUN.search(str(row.get("refusal") or "")):
+            continue
+        refused.append(ident)
+    return tuple(refused)
+
+
+def blocking_dependency(reason: str, jar: Path, deps: tuple[Path, ...],
+                        ids: tuple[str, ...]) -> str:
+    """The closure mod that holds the class a refusal stopped in, or "".
+
+    The runner names where it stopped as `(at owner/Class#method +pc)`. A class the
+    jar under test holds is its own refusal; a class only a dependency's jar holds
+    means the jar got into that dependency's code and the blocker is there.
+    """
+    match = re.search(r"\(at ([\w/$]+)#", own_reason(reason))
+    if not match:
+        return ""
+    entry = f"{match.group(1)}.class"
+
+    def holds(path: Path) -> bool:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                return entry in archive.namelist()
+        except (OSError, zipfile.BadZipFile):
+            return False
+
+    if holds(jar):
+        return ""
+    return next((ident for dep, ident in zip(deps, ids) if holds(dep)), "")
+
+
 def run_one(binary: Path, resources: Path, jar: Path, *, timeout: float, port: int,
-            probe: Path | None = None) -> Row:
+            probe: Path | None = None, closure: Closure | None = None) -> Row:
+    """Start one dedicated server for `jar` (and its closure's jars) and read its row."""
+    deps = closure.jars if closure is not None else ()
     with tempfile.TemporaryDirectory(prefix="horizon-ledger-") as scratch:
         root = Path(scratch)
         game_dir = root / "game"
@@ -748,8 +997,11 @@ def run_one(binary: Path, resources: Path, jar: Path, *, timeout: float, port: i
             XDG_DATA_HOME=root / "xdg-data",
             XDG_CONFIG_HOME=root / "xdg-config",
         )
+        # The jar under test comes first: the pack class path keeps the first
+        # jar that declares a class, as a JVM class path does.
+        mods = [arg for path in (jar, *deps) for arg in ("--java-mod", str(path))]
         command = [str(binary), "--resources", str(resources), "--game-dir", str(game_dir),
-                   "--home", str(home), "--java-mod", str(jar), "--dedicated", "--nogui",
+                   "--home", str(home), *mods, "--dedicated", "--nogui",
                    "--port", str(port), "--world", "ledger-world"]
         start = time.monotonic()
         log_path = root / "server.log"
@@ -783,9 +1035,16 @@ def run_one(binary: Path, resources: Path, jar: Path, *, timeout: float, port: i
         # A refused jar ran no weave, so its plans say nothing about the label.
         started = runtime is not None and runtime.get("engine") != "refused"
         plans = outside_plans(probe, jar, report) if started else 0
-        return parse_log(text, jar.name, seconds=time.monotonic() - start,
-                         timed_out=timed_out, exit_code=proc.returncode, jar=jar,
-                         runtime=runtime, game_plans=plans)
+        row = parse_log(closure_text(text, jar, deps), jar.name,
+                        seconds=time.monotonic() - start, timed_out=timed_out,
+                        exit_code=proc.returncode, jar=jar, runtime=runtime, game_plans=plans)
+        if closure is None:
+            return row
+        blocked = (blocking_dependency(row.reason, jar, closure.jars, closure.ids)
+                   if row.verdict == "refused" else "")
+        return replace(row, deps=closure.ids,
+                       dep_refused=dependency_refusals(report, closure.jars, closure.ids),
+                       blocked_in=blocked)
 
 
 def format_row(row: Row) -> str:
@@ -794,6 +1053,13 @@ def format_row(row: Row) -> str:
               f"engine={row.engine}", f"woven={row.woven}", f"skipped={row.skipped}",
               f"reason={bounded(row.reason, MAX_CAUSE)}", f"recommend={label(row)}",
               f"seconds={row.seconds:.3f}"]
+    # Only a `--with-deps` row names a closure, so a one-jar ledger keeps its format.
+    if row.deps:
+        values.append(f"deps={','.join(row.deps)}")
+    if row.dep_refused:
+        values.append(f"dep_refused={','.join(row.dep_refused)}")
+    if row.blocked_in:
+        values.append(f"blocked_in={row.blocked_in}")
     return "\t".join(value.replace("\t", " ") for value in values)
 
 
@@ -819,6 +1085,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="rewrite the marked table block of this markdown file")
     parser.add_argument("--table-limit", type=int, default=60,
                         help="per-jar rows in the table (0 means all)")
+    parser.add_argument("--with-deps", action="store_true",
+                        help="run each jar with its declared dependency closure")
+    parser.add_argument("--deps-dir", type=Path, action="append", default=None,
+                        help="where --with-deps looks for providers besides the mod directory "
+                             "(repeatable; default: the ~/horizon-corpus corpora that exist)")
+    parser.add_argument("--rerun", type=Path,
+                        help="only the jars this earlier text ledger labelled --rerun-label")
+    parser.add_argument("--rerun-label", default=NATIVE_GAP, choices=LABELS)
     args = parser.parse_args(argv)
 
     if args.reuse is not None:
@@ -843,6 +1117,15 @@ def main(argv: list[str] | None = None) -> int:
                       key=lambda p: p.name)
         if args.only:
             jars = [p for p in jars if args.only in p.name or args.only in metadata(p)[0]]
+        if args.rerun is not None:
+            if not args.rerun.is_file():
+                parser.error(f"ledger does not exist: {args.rerun}")
+            try:
+                wanted = {row.file for row in read_ledger(args.rerun)
+                          if label(row) == args.rerun_label}
+            except ValueError as error:
+                parser.error(str(error))
+            jars = [p for p in jars if p.name in wanted]
         if args.limit:
             jars = jars[: max(0, args.limit)]
         if not jars:
@@ -856,13 +1139,36 @@ def main(argv: list[str] | None = None) -> int:
                   "target-outside-jar counts fall back to the runtime report",
                   file=sys.stderr, flush=True)
 
+        index_by_id: dict[str, list[hybrid_pack.PackJar]] = {}
+        if args.with_deps:
+            # The mod directory always provides: a jar's dependency is often its neighbour.
+            pools = list(dict.fromkeys(
+                path.resolve() for path in [args.mods, *(args.deps_dir or DEFAULT_DEP_DIRS)]))
+            pool_jars = corpus_jars(pools)
+            index_by_id = provider_index(pool_jars)
+            print(f"dependency providers: {len(pool_jars)} jar(s) from "
+                  f"{', '.join(str(pool) for pool in pools if pool.is_dir())}",
+                  file=sys.stderr, flush=True)
+
         rows = []
         for index, jar in enumerate(jars):
-            print(f"[{index + 1}/{len(jars)}] {jar.name}", file=sys.stderr, flush=True)
+            closure = dependency_closure(jar, index_by_id) if args.with_deps else None
+            note = ""
+            if closure is not None:
+                note = (f" (missing: {', '.join(key for key, _ in closure.missing)})"
+                        if closure.missing else
+                        f" (+ {', '.join(closure.ids)})" if closure.ids else "")
+            print(f"[{index + 1}/{len(jars)}] {jar.name}{note}", file=sys.stderr, flush=True)
+            if closure is not None and closure.missing:
+                # A loader refuses a jar whose requirement nothing provides, so
+                # there is nothing native execution could be blamed for.
+                rows.append(missing_dependency_row(jar, closure))
+                continue
             rows.append(run_one(args.binary, args.resources, jar, timeout=args.timeout,
                                 port=args.port_base + index,
-                                probe=args.native_binary if args.native_binary.is_file() else None))
-        source = str(args.mods)
+                                probe=args.native_binary if args.native_binary.is_file() else None,
+                                closure=closure))
+        source = str(args.mods) + (" --with-deps" if args.with_deps else "")
 
     rows.sort(key=lambda row: row.file)
     counts = summary(rows)
