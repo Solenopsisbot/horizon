@@ -2277,6 +2277,8 @@ impl Game<'_> {
     /// and on servers), and the server's own (`native_window` is false
     /// there: the single player server thread, a dedicated server).
     pub(super) fn native_tick(&mut self) {
+        // The Java hook points that run without a `Game` read its role here.
+        self.java_hooks_tick();
         mod_api::dispatch_tick(self, mod_api::mods());
     }
     /// Before an eligible targeted block's selection outline is built.
@@ -2444,6 +2446,8 @@ impl Game<'_> {
     /// `WorldCloseFinal` follows once the worlds are saved. A server whose loop
     /// fails stops without this (`WorldCloseFailed` reports it). API 44.
     pub(super) fn native_server_stopping(&mut self, dedicated: bool) {
+        // A Java `@Inject` at `MinecraftServer.stopServer`'s HEAD.
+        self.java_hook_server_stopping();
         mod_api::dispatch_server_stopping(self, mod_api::mods(), dedicated);
     }
     /// The config files native mods keep (NeoForge's `registerConfig`):
@@ -2585,7 +2589,13 @@ impl Game<'_> {
         state: BlockStateId,
         canceled: &mut bool,
     ) {
-        mod_api::dispatch_left_click_block(self, mod_api::mods(), pos, face, state, canceled);
+        // A Java `@Inject` at `handleBlockBreakAction`'s HEAD runs first; its
+        // cancel returns before the body that tells the native mods.
+        if self.java_hook_left_click_block(pos, face) {
+            *canceled = true;
+        } else {
+            mod_api::dispatch_left_click_block(self, mod_api::mods(), pos, face, state, canceled);
+        }
     }
     /// A living player's server tick ends (`ServerPlayer.tick`): once a tick
     /// for every player in the world, after their digging, item use,
@@ -2594,6 +2604,8 @@ impl Game<'_> {
     /// does one killed earlier in the same tick. API 31.
     pub(super) fn native_player_tick(&mut self) {
         mod_api::dispatch_player_tick(self, mod_api::mods());
+        // A Java `@Inject` at `ServerPlayer.tick`'s TAIL (`java_game_hooks.rs`).
+        self.java_hook_player_tick();
     }
     /// The player-health HUD rows, once a frame the HUD draws them
     /// (`HealthHud::layout`, not under F1): `inputs` carries the health,
@@ -6180,15 +6192,21 @@ impl Game<'_> {
         attacker: u32,
         cancel: &mut bool,
     ) {
-        mod_api::dispatch_living_death(
-            self,
-            mod_api::mods(),
-            entity,
-            kind,
-            damage_type,
-            attacker,
-            cancel,
-        );
+        // A Java `@Inject` at `LivingEntity.die`'s HEAD runs first; its cancel
+        // returns before the body that tells the native mods.
+        if self.java_hook_living_death(entity, kind, damage_type) {
+            *cancel = true;
+        } else {
+            mod_api::dispatch_living_death(
+                self,
+                mod_api::mods(),
+                entity,
+                kind,
+                damage_type,
+                attacker,
+                cancel,
+            );
+        }
     }
 
     /// A mob is about to convert into another type (NeoForge's
@@ -6770,15 +6788,21 @@ impl Game<'_> {
         duration: &mut i32,
         canceled: &mut bool,
     ) {
-        mod_api::dispatch_living_entity_use_item_tick(
-            self,
-            mod_api::mods(),
-            stack,
-            entity,
-            hand,
-            duration,
-            canceled,
-        );
+        // A Java `@Inject` at `updatingUsingItem`'s HEAD runs first. Its cancel
+        // is this hook's: the item's tick is skipped and the use finishes.
+        if self.java_hook_use_item("living_entity_use_item_tick", entity) {
+            *canceled = true;
+        } else {
+            mod_api::dispatch_living_entity_use_item_tick(
+                self,
+                mod_api::mods(),
+                stack,
+                entity,
+                hand,
+                duration,
+                canceled,
+            );
+        }
     }
     /// `Item.onUseTick` of `stack`, used by `entity` with `remaining` ticks
     /// left, always above 0: what a mod's own item does each tick it is used
@@ -6814,15 +6838,21 @@ impl Game<'_> {
         duration: i32,
         canceled: &mut bool,
     ) {
-        mod_api::dispatch_living_entity_use_item_stop(
-            self,
-            mod_api::mods(),
-            stack,
-            entity,
-            hand,
-            duration,
-            canceled,
-        );
+        // A Java `@Inject` at `releaseUsingItem`'s HEAD runs first; its cancel
+        // skips the item's release.
+        if self.java_hook_use_item("living_entity_use_item_stop", entity) {
+            *canceled = true;
+        } else {
+            mod_api::dispatch_living_entity_use_item_stop(
+                self,
+                mod_api::mods(),
+                stack,
+                entity,
+                hand,
+                duration,
+                canceled,
+            );
+        }
     }
     /// NeoForge's `ArrowLooseEvent`: the player releases a bow `stack` with
     /// `has_ammo` and `charge` ticks held. Change `charge` or set `canceled`
@@ -6989,7 +7019,13 @@ impl Game<'_> {
         pos: [f64; 3],
         canceled: &mut bool,
     ) {
-        mod_api::dispatch_attack_entity(self, mod_api::mods(), entity, kind, pos, canceled);
+        // A Java `@Inject` at `Player.attack`'s HEAD runs first; its cancel
+        // returns before the body that tells the native mods.
+        if self.java_hook_attack_entity(entity, kind, pos) {
+            *canceled = true;
+        } else {
+            mod_api::dispatch_attack_entity(self, mod_api::mods(), entity, kind, pos, canceled);
+        }
     }
     /// A message from `player`'s client on `channel` (`mod_id:name`), within
     /// the caps (`native_net.rs`): check `channel`, and treat `data` as the
@@ -7038,6 +7074,8 @@ impl Game<'_> {
     /// 134.
     pub(super) fn native_level_unload(&mut self, dimension: &str) {
         mod_api::dispatch_level_unload(self, mod_api::mods(), dimension);
+        // A Java `@Inject` at `ServerLevel.close`'s TAIL.
+        self.java_hook_level_unload(dimension);
     }
     /// The server's difficulty changed, from `from` to `to` (`peaceful`,
     /// `easy`, `normal`, `hard`; NeoForge's `DifficultyChangeEvent`). It is
@@ -7078,6 +7116,8 @@ impl Game<'_> {
     /// Once a join, with no player's state swapped in. Server-side. API 57.
     pub(super) fn native_player_logged_in(&mut self, player: u128, name: &str) {
         mod_api::dispatch_player_logged_in(self, mod_api::mods(), player, name);
+        // A Java `@Inject` at `PlayerList.placeNewPlayer`'s TAIL.
+        self.java_hook_player_logged_in(player, name);
     }
     /// `player` (`name`) left the game (NeoForge's `PlayerLoggedOutEvent`), by
     /// any path: a lost connection, a kick, the server stopping or failing.
@@ -7087,6 +7127,8 @@ impl Game<'_> {
     /// Server-side. API 57.
     pub(super) fn native_player_logged_out(&mut self, player: u128, name: &str) {
         mod_api::dispatch_player_logged_out(self, mod_api::mods(), player, name);
+        // The Java hook tier's next player with this UUID is a new object.
+        self.java_hook_player_logged_out(player);
     }
     /// `player` (`name`) respawned (NeoForge's `PlayerRespawnEvent`): at the
     /// end of `PlayerList.respawn`, once they are placed and their health,
@@ -7141,6 +7183,8 @@ impl Game<'_> {
     /// cancellable.
     pub(super) fn native_player_clone(&mut self, player: u128, name: &str, was_death: bool) {
         mod_api::dispatch_player_clone(self, mod_api::mods(), player, name, was_death);
+        // A Java `@Inject` at `ServerPlayer.restoreFrom`'s TAIL.
+        self.java_hook_player_clone(player, name, was_death);
     }
     /// The number of players with the mod container at `pos` of `dimension`
     /// open went from `previous` to `viewers` (vanilla's
@@ -7210,6 +7254,11 @@ impl Game<'_> {
             menu,
             pos,
         );
+        // A Java `@Inject` at `ServerPlayer.openHorseInventory`'s TAIL: only a
+        // mount's inventory goes through that method.
+        if menu == "horizon:mount_inventory" {
+            self.java_hook_mount_inventory_open(player, name);
+        }
     }
     /// `player` (`name`) closed the menu `native_player_container_open` told
     /// of (NeoForge's `PlayerContainerEvent.Close`, posted in
@@ -7267,6 +7316,8 @@ impl Game<'_> {
             uuid,
             kind,
         );
+        // A Java `@Inject` at `ServerEntity.addPairing`'s TAIL.
+        self.java_hook_player_start_tracking(player, name, entity, uuid, kind);
     }
     /// A client stopped tracking an entity (NeoForge's
     /// `PlayerEvent.StopTracking`, posted at the end of
@@ -7339,6 +7390,8 @@ impl Game<'_> {
     /// every player of the world, whether death messages are shown or not.
     /// API 40.
     pub(super) fn native_player_died(&mut self, player: u128, cause: Option<&str>) {
+        // A Java `@Inject` at `ServerPlayer.die`'s HEAD.
+        self.java_hook_player_died(player, cause);
         mod_api::dispatch_player_died(self, mod_api::mods(), player, cause);
     }
     /// A new mob of `kind` joined `dimension` at `pos`: `natural` when the
@@ -7433,17 +7486,23 @@ impl Game<'_> {
         mounting: bool,
         canceled: &mut bool,
     ) {
-        mod_api::dispatch_entity_mount(
-            self,
-            mod_api::mods(),
-            dimension,
-            entity,
-            kind,
-            vehicle,
-            vehicle_kind,
-            mounting,
-            canceled,
-        );
+        // A Java `@Inject` at `Entity.removeVehicle`'s HEAD runs first for a
+        // dismount; its cancel keeps the rider riding.
+        if !mounting && self.java_hook_entity_dismount(dimension, entity, kind) {
+            *canceled = true;
+        } else {
+            mod_api::dispatch_entity_mount(
+                self,
+                mod_api::mods(),
+                dimension,
+                entity,
+                kind,
+                vehicle,
+                vehicle_kind,
+                mounting,
+                canceled,
+            );
+        }
     }
     /// Whether a mod listens to `native_entity_tick_pre` and `native_entity_tick_post`: a mod
     /// that hooks them hooks this one too and sets `listened` (HEAD, `*listened = true`).
@@ -7611,7 +7670,21 @@ impl Game<'_> {
         amount: &mut i32,
         cancel: &mut bool,
     ) {
-        mod_api::dispatch_item_damaged(self, mod_api::mods(), player, name, item, amount, cancel);
+        // A Java `@Inject` at `ItemStack.hurtAndBreak`'s HEAD runs first; its
+        // cancel means no wear at all.
+        if self.java_hook_item_damaged(player, name, item, *amount) {
+            *cancel = true;
+        } else {
+            mod_api::dispatch_item_damaged(
+                self,
+                mod_api::mods(),
+                player,
+                name,
+                item,
+                amount,
+                cancel,
+            );
+        }
     }
     /// `player` threw `count` of `item` (`Player.drop`: the drop key, a
     /// menu's throw...), not what scatters when they die. It only hears.
@@ -7629,7 +7702,13 @@ impl Game<'_> {
         count: u32,
         canceled: &mut bool,
     ) {
-        mod_api::dispatch_item_picked_up(self, mod_api::mods(), player, item, count, canceled);
+        // A Java `@Inject` at `ItemEntity.playerTouch`'s HEAD runs first; its
+        // cancel leaves the stack on the ground.
+        if self.java_hook_item_picked_up(player, item, count) {
+            *canceled = true;
+        } else {
+            mod_api::dispatch_item_picked_up(self, mod_api::mods(), player, item, count, canceled);
+        }
     }
     /// A dropped item reaches its lifetime on the server (`ItemEntity.tick`,
     /// NeoForge's `ItemExpireEvent`). Every mod may set or add to `extra_life`,
@@ -7925,18 +8004,31 @@ impl Game<'_> {
         z: &mut f64,
         canceled: &mut bool,
     ) {
-        mod_api::dispatch_living_knockback(
-            mod_api::mods(),
+        // A Java `@Inject` at `LivingEntity.knockback`'s HEAD runs first; its
+        // cancel returns before the body that tells the native mods.
+        if super::java_game_hooks::fire_living_knockback(
             entity,
             kind,
             damage_type,
-            causing,
-            direct,
-            strength,
-            x,
-            z,
-            canceled,
-        );
+            *strength,
+            *x,
+            *z,
+        ) {
+            *canceled = true;
+        } else {
+            mod_api::dispatch_living_knockback(
+                mod_api::mods(),
+                entity,
+                kind,
+                damage_type,
+                causing,
+                direct,
+                strength,
+                x,
+                z,
+                canceled,
+            );
+        }
     }
     /// LivingEntity.knockback before resistance and motion, after the unchanged v1 hook.
     /// Cancellation from either hook wins. Attacker is the attacking entity's network id,

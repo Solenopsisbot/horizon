@@ -162,6 +162,8 @@ mod item_draw;
 mod item_particles;
 mod item_use;
 mod java_content;
+mod java_game_hooks;
+pub(crate) use java_game_hooks::fire_living_jump as fire_java_living_jump;
 mod java_events;
 mod java_mods;
 mod java_payloads;

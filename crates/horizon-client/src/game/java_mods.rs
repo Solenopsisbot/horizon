@@ -25,9 +25,9 @@
 use super::execution_role::ExecutionRole;
 use horizon_client::mod_content::ContentMod;
 use horizon_mods::native::NativeDeclarations;
-use horizon_native_java::{GameHookRegistrations, LinkedClassTable, NativeJar, StdHost, Value};
+use horizon_native_java::{GameHookRegistrations, LinkedClassTable, NativeJar};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs::File,
     io::{Cursor, Read},
     path::{Path, PathBuf},
@@ -456,35 +456,8 @@ fn first_game_skip_reason(skipped: &[horizon_native_java::SkippedMixinPlan]) -> 
         })
 }
 
-/// One jar whose game-class callbacks the opt-in hook tier bound.
-///
-/// The jar and its host stay alive because [`NativeJar::run_game_hook`] resolves
-/// a callback from the jar's own classes and lets it write through the host's
-/// persistent class state, so a later firing sees what an earlier one wrote.
-// A host hook point calls `run_java_game_hook` once the game's own sites are
-// wired to this module (native_hooks.rs); until then the store has no reader.
-#[allow(dead_code)]
-struct JavaGameHookJar {
-    jar: Arc<NativeJar>,
-    registrations: GameHookRegistrations,
-    host: StdHost,
-}
-
-/// The game-class callbacks one execution role's batch bound, in path order.
-/// Keyed by role because the window and its server thread run different jars in
-/// the same process, exactly as the payload handler jars are.
-static JAVA_GAME_HOOKS: Mutex<BTreeMap<super::java_payloads::HandlerRole, Vec<JavaGameHookJar>>> =
-    Mutex::new(BTreeMap::new());
-
-/// What one firing of a host hook point did.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct JavaGameHookOutcome {
-    /// How many callbacks ran; a cancellation stops the ones after it.
-    pub(super) ran: usize,
-    /// Whether a callback cancelled the vanilla work at this point.
-    pub(super) cancelled: bool,
-}
+// The bound jars live with the code that fires them: `java_game_hooks.rs`.
+use super::java_game_hooks::{clear_java_game_hooks_as, publish_java_game_hooks};
 
 /// The environment variable that turns the game-class hook tier on. It is off
 /// by default: the default weave keeps every game-class plan a skip, because a
@@ -504,82 +477,6 @@ fn game_hook_flag(value: Option<std::ffi::OsString>) -> bool {
             "1" | "true" | "on" | "yes"
         )
     })
-}
-
-/// Forgets the game-class callbacks of a previous bootstrap for one role.
-pub(super) fn clear_java_game_hooks_as(role: super::java_payloads::HandlerRole) {
-    JAVA_GAME_HOOKS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&role);
-}
-
-/// Keeps one jar's bound callbacks for its role's host hook points.
-///
-/// The host is cloned after the entrypoints ran, so persistent class state and
-/// the seeded mod class path travel with the jar. Only a jar that bound a plan
-/// reaches here, so a pack without game-class mixins keeps nothing.
-pub(super) fn publish_java_game_hooks(
-    role: super::java_payloads::HandlerRole,
-    jar: Arc<NativeJar>,
-    registrations: GameHookRegistrations,
-    host: &StdHost,
-) {
-    if registrations.is_empty() {
-        return;
-    }
-    JAVA_GAME_HOOKS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(role)
-        .or_default()
-        .push(JavaGameHookJar {
-            jar,
-            registrations,
-            host: host.clone(),
-        });
-}
-
-/// Runs every callback the role bound at one host hook point, in registration
-/// order (Mixin apply order).
-///
-/// A point no jar registered at is `Ok(0)` rather than an error: the game may
-/// fire a hook no mod uses. A callback that cancels stops the ones after it,
-/// including those of later jars, which is what Mixin's `CallbackInfo.cancel`
-/// does at one injection point.
-#[allow(dead_code)]
-pub(super) fn run_java_game_hook(
-    role: super::java_payloads::HandlerRole,
-    hook: &str,
-    receiver: Option<Value>,
-    args: &[Value],
-) -> Result<JavaGameHookOutcome, String> {
-    let mut store = JAVA_GAME_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(jars) = store.get_mut(&role) else {
-        return Ok(JavaGameHookOutcome::default());
-    };
-    let mut outcome = JavaGameHookOutcome::default();
-    for entry in jars
-        .iter_mut()
-        .filter(|entry| !entry.registrations.entries(hook).is_empty())
-    {
-        let run = entry
-            .jar
-            .run_game_hook(
-                &entry.registrations,
-                hook,
-                receiver.clone(),
-                args,
-                &mut entry.host,
-            )
-            .map_err(|error| error.to_string())?;
-        outcome.ran += run.ran;
-        if run.cancelled {
-            outcome.cancelled = true;
-            break;
-        }
-    }
-    Ok(outcome)
 }
 
 /// The declaration rows of a cache entry, as the converter takes them.
@@ -1438,7 +1335,7 @@ fn adopt_run(
         let jar = Arc::new(jar);
         super::java_events::adopt(role, &report.jar, &jar, &host);
         if let Some(registrations) = game_hooks {
-            publish_java_game_hooks(id, jar, registrations, &host);
+            publish_java_game_hooks(id, &report.jar, jar, registrations, &host);
         }
         drop(host);
     }
