@@ -203,8 +203,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ItemEntity.class)
 public class WrongArgsMixin {
+    // Mixin's simple form (the callback info alone) is valid; an argument
+    // that is not the target's is not.
     @Inject(method = "playerTouch", at = @At("HEAD"))
-    private static void beforePickup(CallbackInfo ci) {
+    private static void beforePickup(int notThePlayer, CallbackInfo ci) {
         HookSink.mark("wrong_args");
     }
 }
