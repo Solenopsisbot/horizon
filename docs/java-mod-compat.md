@@ -319,6 +319,23 @@ captured lambda runs that lambda. The façade markers (`game/server`, `game/play
 the refusal. In the game, `game/java_events.rs` keeps the listening jars per role and the server's points fire
 them (see the status page's `horizon-client` list).
 
+Command registration is one of those listeners (`GameEvent::RegisterCommands`: Fabric's
+`CommandRegistrationCallback.EVENT`, NeoForge's and Forge's `RegisterCommandsEvent`), fired with the
+`brigadier/dispatcher` marker when the server builds its command tree. `brigadier.rs` answers the builder and
+dispatcher calls on an arena of node ids with Brigadier's own sharing and `addChild` merging, so
+`StdHost::command_tree` is the tree a JVM dispatcher would hold, typed (argument kinds and bounds, `requires` as a
+level or a lambda, `executes` as a callback marker). `NativeJar::run_command` runs one `Command.run` against a
+`brigadier/context` marker and a `brigadier/source/0` source stand-in, strictly: a member the façade does not model
+refuses the run instead of answering a neutral value, and a `CommandSyntaxException` keeps its text. Two
+interpreter rules came with it: a static field a jar class declares and never assigned reads the JVM default
+instead of asking the host, and an interface call on a lambda of the jar through an interface neither the jar
+nor the JDK model declares (log4j's `TriConsumer`) runs the lambda when the argument count is exactly the one its
+method takes. `game/java_commands.rs` merges the jars' trees, adds them to the native mods' command root (the
+players' tree) and runs them from `Game::run_command`. The fixture `tests/fixture_brigadier_commands.rs` compiles a
+jar with an operator-only `/greet <count> <name>`, a `requires` lambda and a command reaching past the façade;
+the game test in `java_commands.rs` checks the merged tree's report, permission-aware parsing and suggestions,
+and a run with the parsed value.
+
 The client surface (`client_surface.rs`) uses the same listeners for the window's events (`GameEvent::is_client`;
 a server counts them as events it never fires) and adds what a client entrypoint registers outside the event
 bus. A `KeyMapping` constructor records its name, `InputConstants` type and SDL-scancode key and its

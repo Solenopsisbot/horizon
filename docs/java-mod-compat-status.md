@@ -171,7 +171,34 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   later listeners without `receiveCanceled`. Priorities are not modelled (registration order). Over the 723-jar corpus, 83 of the 499 jars
   that bootstrap natively register 257 listeners the game can fire (`server_started` 38 jars, `server_starting`
   35, `player_join` 34, `server_stopped` 22, `player_leave` 21, `server_stopping` 19, `server_tick_end` 17); the
-  largest unfired families are client ticks and `CommandRegistrationCallback` (44 jars).
+  largest unfired family was client ticks. Command registration is a listener of its own
+  (`GameEvent::RegisterCommands`), fired at the server's command-tree build (next item).
+- **Commands** (`src/brigadier.rs`). A bounded Brigadier façade: `Commands.literal`/`argument` and the
+  `LiteralArgumentBuilder`/`RequiredArgumentBuilder` statics, `then`/`executes`/`requires`/`redirect`/`fork`/
+  `suggests`/`build`, `CommandDispatcher.register`/`getRoot` and `CommandNode` lookups, recorded on an arena with
+  Brigadier's own semantics (`then` builds the child at that call, `addChild` merges a same-named node with the
+  newer command winning, `register` returns the built node). `StdHost::command_tree` snapshots a typed tree:
+  literals; arguments of 25 modelled kinds (`Integer`/`Long`/`Float`/`Double`/`Bool` with bounds, word/quoted/
+  greedy strings, entity/player selectors, game profile, block/column pos, vec2/vec3, identifier, UUID,
+  dimension, item, block state, component, message, game mode, time, `resource`/`resourceOrTag` with their
+  registry, hex color), anything else `Unmodelled` by class; `executes`/`suggests` kept as callback markers.
+  `requires` keeps a level (`Commands.hasPermission(Commands.LEVEL_*)`, fabric-permissions-api's `require`) or a
+  lambda, which `requirement_level` classifies by running it against probe players of levels 0-4.
+  `NativeJar::run_command` runs one `Command.run` strictly (any unmodelled member refuses the run) with a
+  `CommandContext` whose `getArgument` and the type getters (`getInteger`, `getString`, `EntityArgument.getPlayer`,
+  `getBlockPos`, `getId`...) answer the game's parsed values, and a `CommandSourceStack` stand-in:
+  `sendSuccess` (its supplier runs after the command), `sendFailure`, `sendSystemMessage`, a player's
+  `sendSystemMessage`, `permissions()` (26.3's level-based `PermissionSet`, `Permissions.COMMANDS_*`,
+  `Permission.HasCommandLevel`), `getPlayer`/`getPlayerOrException` (vanilla's `permissions.requires.player`
+  `CommandSyntaxException` from the console), `getServer`/`getLevel` (the event façade's markers),
+  `registryAccess` (the server façade's). A `CommandSyntaxException` the jar throws (`SimpleCommandExceptionType`)
+  keeps its text. Message text is the interpreter's text-only component model: style and translation arguments
+  are dropped. Over the corpus (81 jars naming a command registration; 69 bootstrap natively alone), **55**
+  register a server command callback and **42** of them build a tree when it fires (48 root commands, 1,135
+  executable nodes, no argument of an unmodelled type once `resource`/`resourceOrTag`/`hexColor` were added);
+  6 register nothing on their own (Balm and JamLib forward to their own buses; spark), 7 refuse (Architectury's
+  event loop ×3, one unremapped 1.21.1 jar, one missing a sibling jar, two interpreter markers). Before this
+  change none reached Horizon's tree.
 - **Probe.** `horizon-native-java [--json] [--mixin-plans] [--weave <out.jar>] <jar> [kind] [class]` reports
   entrypoints, host calls, registrations, plans and skips, and can write a woven jar.
 
@@ -202,6 +229,28 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   in 28 s with no refusal; the 48 corpus jars with server listeners kept 138 listeners from 42 jars, of which 105
   were still enabled at stop after 13,865 runs in 45 s. Join, leave and death were covered by tests only, not by a
   run with a connected player. `java-runtime.json` does not carry listener counts yet (only the stop log line).
+- Java mods' commands join the server's command tree (`game/java_commands.rs`): the batch keeps every jar with a
+  command registration on its resident host (the one its listeners and payload handlers share). The first
+  command-tree build (`register_native_commands`, the native mods' extension point) runs the registrations, merges
+  the jars' trees the way `CommandNode.addChild` does (a later jar wins a command, children join), leaves out a
+  root vanilla or a native mod already has and an argument of an unmodelled type (each with a log line), and adds
+  the result to the native mods' root, so every player's `ClientboundCommandsPacket` carries the Java commands
+  their level allows and the client parses, colours and completes them. `Game::run_command` (players, the console,
+  command blocks) asks the Java tree first: the line is parsed with a Horizon dispatcher built from the same
+  tree, `requires` lambdas on the path run with the real source, selectors resolve to players (a non-player
+  selection refuses), and the jar's callback runs; its feedback goes where a vanilla command's does
+  (`send_command_feedback`, the console, operators for a broadcast). A refused run answers vanilla's
+  `command.failed` and logs the cause. Custom `SuggestionProvider`s do not run (clients complete from the argument
+  type), a redirect that changes the source (`fork`, a modifier) is refused, and `execute ... run` cannot reach a
+  Java command. A `requires` lambda that no probe player passes is owners-only in the tree and decided by the real
+  source when run. Measured on `--dedicated` (fast profile, flat world, console source, one jar per server): the
+  34 registering jars with a console-typable line ran 83 sampled lines; 3 jars did not start in game; of the
+  rest, **23 lines in 10 jars returned** (Pingwheel's `/pingwheel:server rate_limit 7` sets the value and the
+  read-back answers through the mod's own feedback callback), 16 lines in 6 more jars ended in the mod's own
+  `CommandSyntaxException` (mostly "A player is required to run this command here", correct for a console), 18
+  stopped at a `requires` that is false for the console, and 26 were refused (`CommandSourceStack#getPosition`,
+  a field a refused `SERVER_STARTED` listener never set, `Locale.ROOT`, `RegistryAccess#lookupOrThrow`). A
+  command run by a connected player was covered by tests only.
 - An opt-in NeoForge loader preflight: when `HORIZON_NEOFORGE_SERVER` (an installed server) and `HORIZON_JVM_BIN` are
   set, the integrated server runs `horizon-jvm --real-loader --entry-kind neoforge` once before its native batch in a
   bounded child process and reports what FancyModLoader saw (completion, mod count, sorted ids, first error).
@@ -855,7 +904,8 @@ than rows; the cache held 86 entries in 436 KiB.
    kept 138 listeners and 33 were refused at their first unmodelled call, mostly `MinecraftServer#getWorldPath`
    (6), `registryAccess` (6 with the level's), `getResourceManager` (2), and interpreter collection/stream markers.
    Use-block/item, attack, block-break, entity-load and level load/unload listeners are identified but not fired;
-   command registration (`CommandRegistrationCallback`, 44 jars) has no dispatch. Priorities are registration order.
+   Priorities are registration order. Commands registered through Brigadier reach the server's tree and run
+   (above), but through the same small façade: of 83 sampled console lines, 23 returned and 26 were refused.
    *Client surface (first slice).* The window fires client tick, level tick, started/stopping and join/disconnect
    listeners (Fabric `ClientTickEvents`/`ClientLifecycleEvents`/`ClientPlayConnectionEvents`, NeoForge
    `ClientTickEvent`/`ClientPlayerNetworkEvent`), lists key mappings (`KeyMappingHelper`, `RegisterKeyMappingsEvent`)
@@ -944,7 +994,9 @@ than rows; the cache held 86 entries in 436 KiB.
    so that total is not this change's alone. Next by count: saved data
    (`getDataStorage`, 8), `getCommands`, `getResourceManager`, `getRunningThread`, a `@Shadow` field, a handler's
    `player.connection` field read; then fire the identified use/attack/break/entity/level-load events
-   from their game points, and dispatch `CommandRegistrationCallback`. Gate: no façade refusal among the ten most
+   from their game points. Commands next: the source's position and rotation, `RegistryAccess` lookups, the
+   jar's own `SuggestionProvider`s answering `ask_server`, a player-run sample, and keeping a component's style
+   and translation arguments. Gate: no façade refusal among the ten most
    common listener causes on the corpus pack run.
 6. **Client surface.** First slice done: client events, key mappings in Controls and HUD drawing
    (`client_surface.rs`, `game/java_client.rs`). Next: the members the refusals name (`getTextureManager`,
