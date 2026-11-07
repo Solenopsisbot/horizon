@@ -126,8 +126,10 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   versions, dependencies, client-only markers and declared entrypoint kinds. Nested JiJ/JarJar jars are reported
   (the corpus probe extracts and probes them) but the game does not descend into them.
 - **Entrypoints.** Fabric `main`, `client` and `server` (string, object and array forms) and NeoForge `@Mod` classes.
-  The loader runs the first kind it finds for its role (`client`/`main`/`neoforge` on a client,
-  `server`/`main`/`neoforge` on a server). The Kotlin adapter is resolved to the default invocation contract (its
+  The loader runs the first kind it finds for its role: `client`/`main` on a client and `server`/`main` on a server
+  for a jar with `fabric.mod.json`, `neoforge` (its `@Mod` classes) for any other jar. A universal jar's `@Mod` class
+  never runs in place of Fabric entrypoints it lacks, as on Fabric Loader, which never reads `@Mod`
+  (`entrypoint_role.rs`). The Kotlin adapter is resolved to the default invocation contract (its
   classes compile to ordinary JVM bytecode), and an adapter it does not model is refused. `preLaunch` entrypoints
   are not run.
 - **Execution.** A bounded classfile interpreter with exact `long`/`float`/`double` arithmetic, exceptions, records,
@@ -192,8 +194,10 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   `Permission.HasCommandLevel`), `getPlayer`/`getPlayerOrException` (vanilla's `permissions.requires.player`
   `CommandSyntaxException` from the console), `getServer`/`getLevel` (the event façade's markers),
   `registryAccess` (the server façade's). A `CommandSyntaxException` the jar throws (`SimpleCommandExceptionType`)
-  keeps its text. Message text is the interpreter's text-only component model: style and translation arguments
-  are dropped. Over the corpus (81 jars naming a command registration; 69 bootstrap natively alone), **55**
+  keeps its text. A message keeps vanilla's component JSON (`facade_text.rs`): `Component.translatable(key,
+  args...)` with its arguments, `withStyle(ChatFormatting...)`, `withColor`, `append` siblings, `copy`/`plainCopy`;
+  the game decodes it as a server's chat component and sends it to vanilla clients unchanged, so feedback is
+  coloured and translated with its `%s` filled. A `Style`/`TextColor` object is not modelled yet. Over the corpus (81 jars naming a command registration; 69 bootstrap natively alone), **55**
   register a server command callback and **42** of them build a tree when it fires (48 root commands, 1,135
   executable nodes, no argument of an unmodelled type once `resource`/`resourceOrTag`/`hexColor` were added);
   6 register nothing on their own (Balm and JamLib forward to their own buses; spark), 7 refuse (Architectury's
@@ -879,8 +883,9 @@ than rows; the cache held 86 entries in 436 KiB.
    refused listeners fell from 62 to 57 of 325, failed game hooks from 28 to 23, and refusals on a lost collection
    (`got null`) from 11 to 3. servux keeps its `ServerInitHandler` list (one `ServuxInitHandler`), but its
    `server_stopping` callback still walks an empty `ServerHandler` list: the plan that fills it injects at
-   `DedicatedServer.<init>` `TAIL`, which has no hook site. A `<clinit>` that a strict hook firing refused leaves its
-   class half-initialised (jamlib's `Event#listeners`).
+   `DedicatedServer.<init>` `TAIL`, which has no hook site. A `<clinit>` that a strict hook firing refused no longer
+   leaves its class half-initialised (jamlib's `Event#listeners`): the class is erroneous and every later access is
+   refused with the same cause (`class_init.rs`).
 2. **Refusals.** The committed ledgers (an older binary) count 27 of 121 wide and 68 of 265 mega jars that declare a
    server entrypoint as failing (22%/26%). A fresh dedicated-server re-measure on 7 November 2026 (all workstreams'
    fixes, one server per jar, 60 s) counts **5 wide and 15 mega `native-gap` rows**. The entrypoint-exception bucket

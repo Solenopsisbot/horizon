@@ -667,8 +667,19 @@ generation moves on at `restoreFrom` and at logout, as a new `ServerPlayer` woul
   opens), a level's `getGameTime`/`getDayTime`, and `ServerPlayNetworking.canSend(player, type)` whether that
   player's client takes the channel (every declared client-bound channel for a Horizon client, none for any other
   client, which declared none). A registry, rule or channel the facts do not hold refuses rather than answering
-  empty. Sending a payload from a callback is not modelled: encoding through the payload's `StreamCodec` needs the
-  jar's own getters, so a `send` after a true `canSend` still stops there.
+  empty. Also answered from the server: `getDataStorage()` (server or level) is one saved-data storage
+  (`facade_saved_data.rs`) where `computeIfAbsent(SavedDataType)` runs vanilla's order (`get`, then the type's
+  constructor supplier in the interpreter, then `set`), `get`/`set` key by the type's id, and a `SavedData`'s
+  `setDirty`/`isDirty` keep its flag; it is **not persisted** (the type's `Codec` is opaque to the interpreter),
+  so every server starts with none, as a new world does, and a save call refuses. `getRunningThread()` is the
+  thread `Thread.currentThread()` answers and `execute(runnable)` runs the task at once, as vanilla's event loop
+  does on its own thread; `registries().compositeAccess()` is the registry access above; `getCommands()
+  .getDispatcher()` is the Brigadier façade's dispatcher; a player's `permissions()` is their op level's
+  permission set; and a façade player's `connection` field (read with its receiver through `Host::get_field`)
+  is that player's connection, so `canSend(player.connection, type)` answers too. Sending a payload from a
+  callback is not modelled: encoding through the payload's `StreamCodec` needs the jar's own getters, so a `send`
+  after a true `canSend` still stops there. `getResourceManager()` still refuses: it needs every jar's `data/`
+  files and a `Selector` callback.
 - A Mixin's `@Shadow`, abstract, `@Accessor` and `@Invoker` members (read back from the class bytes, because Mixin
   keeps those annotations `CLASS`-retained) stand for the game method of that name: they reach the same table. An
   interface the Mixin adds to its target is implemented on the object by the Mixin's body, and `instanceof` sees
@@ -962,7 +973,13 @@ last collection, it drops what nothing reaches from the jar's statics, the host'
 registrations, payload handlers, holders) or a game object's Mixin fields; a collectable marker is found wherever
 another value's text embeds it. Past 65,536 fields, 8,192 arrays or 32 MiB after collection the store is refused
 and the callback that grew it fails. Fields a Mixin adds to a game object stay per object in `GameHookState`.
-A failed callback keeps what it wrote, as a JVM would, including a class whose `<clinit>` it broke off.
+A failed callback keeps what it wrote, as a JVM would. Class initialization follows JVMS §5.5 (`src/class_init.rs`):
+the superclass and the superinterfaces that declare a default method first, then `<clinit>`; a same-thread re-entry
+sees the partly initialized class. A `<clinit>` that throws makes the class erroneous: the first access gets
+`ExceptionInInitializerError` (or the throw itself when it is an `Error`), every later one `NoClassDefFoundError:
+Could not initialize class a.b.C`. A `<clinit>` the interpreter refuses is not a Java exception: the class is erroneous
+with that refusal and every later access is refused the same way, so no entrypoint or callback runs on its
+half-written statics. The caught `ExceptionInInitializerError` has no `getCause`; the cause stays in the diagnostic.
 This is a real native execution boundary, not a claim of full JVM compatibility: general reflection,
 Kotlin runtime behavior, and loader APIs remain on the embedded-JVM path until their native host contracts are
 implemented. Class literals support bounded metadata queries (`getName`, `getSimpleName`, `getTypeName`,
@@ -1088,8 +1105,14 @@ from jar supertypes) versus `getDeclaredMethods`. `src/jdk_reflect_proxy.rs` bui
 interfaces the class model holds: a call on the proxy runs the handler's `invoke` with a `Method` and the boxed
 `Object[]` (null for no arguments), `Object`'s methods included; `MethodHandles.lookup`/`privateLookupIn`,
 `unreflect`/`unreflectSpecial`, `findStatic`/`findVirtual`/`findConstructor` over jar classes, `bindTo` and
-`invokeWithArguments` are modelled, a lookup of a JDK method is `NoSuchMethodException`, and handle combinators
-(`dropArguments`, `filterReturnValue`, `invoker`) and a runtime `LambdaMetafactory` are not. `src/guava_model.rs`
+`invokeWithArguments` are modelled. `src/method_handles.rs` adds what WorldEdit's piston builds its converters with:
+lookups of the JDK members a converter probe asks for (the boxes' `valueOf(String)` and `(String)` constructors,
+`String`, `BigInteger`, `BigDecimal`; any other JDK member is still `NoSuchMethodException`), `dropArguments`,
+`insertArguments`, `filterReturnValue`, `catchException`, `invoker`/`exactInvoker`, `MethodHandle.type`/`asType`/
+`invoke`/`invokeExact` (a call-site type other than the handle's is `WrongMethodTypeException`), `MethodType`
+queries, and `LambdaMetafactory.metafactory` called directly, whose lambda is the same callback object an
+`invokedynamic` site makes. A handle is a self-describing marker (`java/lang/invoke/MethodHandle#mh<json>`), so it
+survives captures, collections and the resident heap. `src/guava_model.rs`
 answers `Preconditions`, `TypeToken` (`of`, the `new TypeToken<T>() {}` idiom, equality by type), `CacheBuilder`
 and `LoadingCache` (a host map; a miss runs the loader once), `HashMultimap`/`LinkedHashMultimap`/
 `ArrayListMultimap` (value collections write through), `Sets.immutableEnumSet` and `Suppliers.memoize`.

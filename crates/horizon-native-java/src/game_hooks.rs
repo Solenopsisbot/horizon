@@ -736,6 +736,15 @@ impl<H: Host> GameHookHost<'_, H> {
                 object.name.as_deref().unwrap_or(&object.key)
             ))),
             ("getId", "()I") if entity => fact(object.entity_id.map(Value::Int)),
+            // `permissions()`: the player's level's permission set.
+            ("permissions", _) if player && object.uuid.is_some() => {
+                match object.uuid.and_then(|uuid| {
+                    facade_server::player_member(&self.context.server, uuid, r)
+                }) {
+                    Some(answer) => answer.map_err(|_| unmodelled(marker, r)),
+                    None => Err(unmodelled(marker, r)),
+                }
+            }
             ("getUUID", "()Ljava/util/UUID;") if entity => fact(
                 object
                     .uuid
@@ -1074,6 +1083,11 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        // The server's saved data (storage, types, a `SavedData`'s dirty
+        // flag) lives on the jar's bootstrap host, across firings.
+        if facade_saved_data::owns_call(r, expect_ref(receiver).map(String::as_str)) {
+            return self.inner.invoke_instance(r, receiver, args);
+        }
         if let Some(text) = expect_ref(receiver).cloned()
             && let Some(answer) = self.answer_value(&text, r, args)
         {
@@ -1445,6 +1459,17 @@ impl NativeJar {
                     let mut handler_args = vec![runtime.callback_infos.current(&marker)?];
                     handler_args.extend(values);
                     let result = runtime.invoke(
+                        &entry.callback.owner,
+                        &entry.callback.name,
+                        &entry.callback.descriptor,
+                        callback_receiver,
+                        &handler_args,
+                    )?;
+                    runtime.callback_infos.set_return(&marker, result.clone())?;
+                    results.push(result);
+                    continue;
+                }
+                let result = runtime.invoke(
                     &entry.callback.owner,
                     &entry.callback.name,
                     &entry.callback.descriptor,
