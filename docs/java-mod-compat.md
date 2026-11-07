@@ -553,6 +553,40 @@ At a cancellable site a callback's cancel sets the hook's own cancel flag and th
 point is skipped, as Mixin's cancel at `HEAD` returns before the method body that posts their event. A role whose
 jars bound nothing at a point pays one atomic load there and builds no value. Each firing has a 250 ms budget.
 
+**Value-returning shapes and Java-tier-only sites** (`crates/horizon-native-java/src/hook_shapes.rs`). A second,
+internal table, `JAVA_TIER_SITES`, holds the points a Java callback needs that the public table cannot carry: a
+vanilla method that returns a value, or a position no native mod has a hook for. It is **not** part of
+`native-hooks.json` and not a native-mod API: its rows carry no stamped version a native mod can depend on, their
+names start with `java_`, and they are fired only from `java_game_hooks.rs`. One row fires at one position
+(`HEAD`, or `RETURN`/`TAIL`), and a plan picks the row of its own anchor (`game_hook_site_at`), so
+`MinecraftServer#stopServer` maps `HEAD` onto the public `server_stopping` and `TAIL` onto `java_server_stopped`.
+
+| Hook point | Vanilla target | Position | Contract | Horizon point, and what a cancel or override does |
+|---|---|---|---|---|
+| `java_player_list_remove` | `PlayerList#remove` | `HEAD` | listen | `native_player_logged_out`, every leave; the player is already unlisted, so it carries its UUID and name only |
+| `java_server_stopped` | `MinecraftServer#stopServer` | `TAIL` | listen | an orderly stop, after the final save and the levels' close, before the stopped event |
+| `java_player_tick_head` | `ServerPlayer#tick` | `HEAD` | listen | `tick_guests`, where a living guest's tick starts (the population of `player_tick`) |
+| `java_base_player_tick_head` / `_tail` | `Player#tick` | `HEAD` / `TAIL` | listen | the same step: Horizon runs `ServerPlayer.tick` and `doTick`'s `Player.tick` as one, so these fire inside `ServerPlayer.tick`'s head and tail, server only |
+| `java_destroy_speed` | `Player#getDestroySpeed(BlockState)F` | `RETURN`/`TAIL` | override | the speed `tick_mining` and `destroy_progress` compute; a cancellable callback's `setReturnValue` is the speed the progress divides by hardness |
+| `java_grow_crop` | `BoneMealItem#growCrop` (static) | `HEAD` | cancel with a value | a player's and a dispenser's bone meal (not a farmer villager's, which Horizon decides in its brain); a cancel returns its value without growing or using up the meal, and `false` goes on to `growWaterPlant` as vanilla's caller does |
+
+A callback on a value-returning target takes a `CallbackInfoReturnable`. At a `RETURN`/`TAIL` row the game hands
+the method's own result in (`NativeJar::run_game_hook_returning`'s `actual`), `getReturnValue` reads it, and a
+cancellable callback's `setReturnValue` comes back as `GameHookRun::returned` in the method's declared shape
+(`Value::Float` for `F`); the game uses that value in its own code. At a `HEAD` row a cancellable callback's
+`setReturnValue` (or a bare `cancel()`, which returns the type's default) short-circuits: `returned` is set exactly
+when `cancelled` is, and the game skips its work for that value. A callback whose `@Inject` is not `cancellable`
+that calls `cancel()` or `setReturnValue()` fails the firing with Mixin's `CancellationException`, at every site.
+
+**Config plugins.** A Mixin config that names an `IMixinConfigPlugin` decides its Mixins in the plugin's own code,
+so the load weave refuses every plan it governs (`config-plugin`). The game-hook tier asks the plugin instead:
+`onLoad(package)` and `shouldApplyMixin(target, mixin)` run in the interpreter on a fresh strict host with a
+250 ms budget, and a plan binds only when the answer is `true`, the plugin is a jar class with no instance field,
+and its `preApply`/`postApply` are absent or empty (a plugin that edits bytecode there does work a hook point
+cannot). A throw, an unmodelled call or a `false` keeps `config-plugin`. The plugin is asked without the pack's
+mod list, so a compat Mixin that needs another mod stays off; a plugin that probes the loader with
+`Class.forName("net.fabricmc.api.EnvType")` (Collective) gets `ClassNotFoundException` and declines today.
+
 **The object model** (`crates/horizon-native-java/src/game_hooks.rs`). The game describes each object a firing
 passes as a `GameObject` (vanilla class, entity id, UUID, name, dimension, position, health, game mode, stack
 count), and the interpreter sees a stable marker: `game/player/<uuid>.<generation>`, `game/entity/<id>`,
@@ -582,13 +616,16 @@ running. A stopping server logs one line per jar and hook with how often it fire
 **Coverage rule.** A plan maps only when every one of these holds; the first failure is reported with its own
 reason:
 
-- the target names a site in `GAME_HOOK_SITES` (otherwise the plan keeps `target-outside-jar`);
+- the target names a site in `GAME_HOOK_SITES` or `JAVA_TIER_SITES` (otherwise the plan keeps
+  `target-outside-jar`), and the row is the one whose position answers the plan's anchor when there are two;
+- the plan's Mixin config lists it on this side, and a config plugin, if any, answers `true` (above);
 - the site's physical side is the weave side;
 - the plan's anchor is one the hook's position exposes (`HEAD` for a pre hook, `RETURN`/`TAIL` for a post one);
 - a cancellable plan needs a hook whose census contract is `cancel`, not `listen`;
-- the target returns `void`, because a hook point carries no result to override;
 - the plan has no `shift`, `slice` or `ordinal`, which a named hook cannot honour;
-- the callback mirrors the target's arguments and adds at most one trailing `CallbackInfo`, and returns `void`.
+- the callback mirrors the target's arguments and adds at most one trailing `CallbackInfo` (a
+  `CallbackInfoReturnable` when the target returns a value), and returns `void`; captured locals and MixinExtras'
+  `@Local`/`@Share` parameters do not mirror.
 
 Anything else is a `SkippedMixinPlan` with `MixinSkipReason::GameHookMismatch` and a bounded sentence saying which
 clause failed (the same shape a compatibility screen shows for `weaver-rejected`). A target with no site at all
@@ -611,20 +648,33 @@ attacked nothing and nobody died, so the cancellable sites have no real-jar firi
 working mod: objects an entrypoint built keep only their static fields after it returns, so servux's
 `server_stopping` iterated its listener list empty.
 
+Re-measured 7 November 2026 after the Java-tier rows, the value shapes and the plugin gate, with the static count
+of `game_hook_tier_measures_the_phase_two_loader_set` (a server-side plan is one whose callback's config is not
+client-only and whose target is outside the jar, the native score's rule): on the 80 unique loader-tier jars, the
+1,285 server-side game plans that **name a site** went from 111 to 167 and those that **bind through every gate**
+from 18 to 51 (21 at Java-tier rows: 8 `Player#tick` tail, 3 head, 3 `getDestroySpeed` overrides, 3
+`PlayerList#remove`, 3 `stopServer` tail, 1 `ServerPlayer#tick` head); across all 723 corpus-xl and mega jars
+(5,742 plans) from 173 to 266 named and 40 to 87 bound. Asking config plugins is 21 of the loader set's 33 new
+bindings. The largest gate left on a named plan is still `config-plugin` (144 of 173 unbound on the loader set):
+Collective's plugin declines at its `Class.forName("net.fabricmc.api.EnvType")` probe and Puzzles Lib's at Guava's
+`ImmutableSet.of`, which is also why the 16 `growCrop` plans bind none. These are static counts: no dedicated run
+with these jars and players has fired the new rows yet.
+
 What the tier does not fix, and does not pretend to:
 
 - A hook is only usable when its **population and position** equal the target's. `entity_tick_pre`/`_post` are
   batched per entity family and skip players, projectiles, orbs and TNT, so `Entity#tick` does not map onto them
   even though the names look close; `level_tick_pre` carries no `BooleanSupplier`, so `ServerLevel#tick` cannot
   be mapped either. Those stay `target-outside-jar`.
-- Post hooks cannot override a result, and pre hooks cannot supply arguments the hook payload does not carry.
-  Adding a site is a host change (add or extend the hook, then add the table row), never a parser change.
+- Only the `JAVA_TIER_SITES` rows return a value; a public hook still carries no result, and no hook supplies an
+  argument its payload does not carry. Adding a site is a host change (a game call site, then the table row), never
+  a parser change. `@ModifyReturnValue` and the other MixinExtras injectors are not discovered as plans at all.
 - The object model is what the bound callbacks reach first, not the game's API: a callback that goes further stops
   at a refusal. The tier does not build a bridge class, because there is no woven target to bridge into.
 
 The fixture `crates/horizon-native-java/tests/fixture_game_hook_tier.rs` compiles a jar with six `@Mixin`
 classes targeting game classes: `player_tick` (TAIL, maps), `item_picked_up` (HEAD, cancellable, maps),
-`Level#getBlockState` (no site, `target-outside-jar`), `ServerPlayer#tick` at `HEAD` (wrong position,
+`Level#getBlockState` (no site, `target-outside-jar`), `ServerPlayer#tick` at `RETURN` (wrong position,
 `game-hook-mismatch`), a cancellable `player_tick` (listen-only, `game-hook-mismatch`) and a `playerTouch`
 callback that drops the player argument (`game-hook-mismatch`). It then registers the two mapped callbacks,
 fires both points, checks the host saw the callback bodies, checks the cancellation surfaced, and checks a
@@ -634,6 +684,14 @@ per player, reaches an interface the Mixin adds, cancels from its argument's id,
 method, a `@Shadow` field and an object that is no longer live. The game-side tests
 (`java_game_hooks.rs`) fire the real knockback hook point: a bound callback cancels the push only for the entity
 and strength it tests, and a failing callback is disabled for its own hook only.
+`crates/horizon-native-java/tests/fixture_game_hook_shapes.rs` covers the value shapes: a `TAIL` callback reads
+`getDestroySpeed`'s own result, a cancellable `RETURN` one doubles it and the host gets the double back, a
+cancellable `growCrop` `HEAD` short-circuits with `true`, then with `false` for a bare `cancel()`, then not at all;
+a non-cancellable `setReturnValue` fails with `CancellationException`; a `HEAD` plan on a `RETURN` row, a
+`CallbackInfo` on a value target and a cancellable listen-only `TAIL` are refused; and a config plugin's answer
+decides two plans while a plugin with a working `postApply` keeps its plan refused. The game-side test
+(`a_bound_value_callback_overrides_what_the_game_uses`) binds a speed override and a `growCrop` answer and checks
+the values the game reads back, and that nothing bound leaves the game's own.
 
 Reproduce:
 

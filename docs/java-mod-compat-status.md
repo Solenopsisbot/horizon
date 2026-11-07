@@ -101,6 +101,11 @@ TMPDIR=$scratch HORIZON_NO_AUDIO=1 python3 tools/java_mod_server_ledger.py ~/hor
   --binary target/fast/horizon-client --native-binary target/fast/horizon-native-java \
   --resources .local/horizon-client/26.3 --timeout 60 --json --output ledger.txt > ledger.json
 
+# the same corpus's native-gap rows again, each jar with its declared dependency closure
+TMPDIR=$scratch HORIZON_NO_AUDIO=1 python3 tools/java_mod_server_ledger.py ~/horizon-corpus/corpus-xl --with-deps \
+  --rerun tools/real_mod_fixtures/LAST_SERVER_LEDGER_223.txt --binary target/fast/horizon-client \
+  --native-binary target/fast/horizon-native-java --resources .local/horizon-client/26.3 --output deps-ledger.txt
+
 # loader-tier proof (needs the pinned game jar, loader and libraries)
 python3 tools/java_mod_loader_ledger.py --mods-dir ~/horizon-corpus/corpus-xl \
   --binary target/fast/horizon-jvm --output tools/real_mod_fixtures/LAST_LOADER_LEDGER.txt
@@ -226,7 +231,8 @@ game's logging jars already provide, so the game's copy wins as in Fabric's own 
 
 `tools/real_mod_corpus.py` (outer + nested probe with a verdict per jar), `tools/java_mod_server_ledger.py` (one real
 dedicated server per jar, verdict from its log, `java-runtime.json` and plan report as
-`native-ok`/`needs-loader`/`native-gap`; `--docs` regenerates the
+`native-ok`/`needs-loader`/`native-gap`; `--with-deps` runs a jar with its declared closure and labels an
+unresolvable one `missing-dependency`; `--docs` regenerates the
 table below), `tools/java_mod_loader_ledger.py` (real Fabric loader),
 `tools/real_mod_fixtures/build.py` (source-only Fabric/NeoForge/legacy-Forge fixtures), the
 `real-mod-corpus` workflow (fixtures and harness self-test only, never third-party jars), the fixture suites under
@@ -272,13 +278,34 @@ client-only entrypoints, and malformed metadata.
 
 ## What runs native, what needs the loader, why
 
-Every ledger row ends in one of three labels, so a verdict says what to do instead of counting a refusal:
+Every ledger row ends in one of three labels (four with `--with-deps`), so a verdict says what to do instead of
+counting a refusal:
 
 - `native-ok`: the dedicated server runs the jar on its own. Either it executes its entrypoint and no skipped plan
   aims at the game, or it is a client-only jar or a library the server role never loads.
 - `needs-loader`: it runs, but at least half of its skipped mixin plans target game classes (`target-outside-jar`), so
   only a real loader applies them.
 - `native-gap`: native execution refuses it yet; [Known gaps](#known-gaps) and the row's reason say where.
+- `missing-dependency` (`--with-deps` only): the jar's declared closure needs a mod id no corpus jar provides, so no
+  loader would start it either; the ledger does not run it.
+
+The default ledger starts one server per jar, so a jar that declares a dependency (archers on `spell_engine`, zoomify
+on YACL) runs without it, which a real loader never does. `--with-deps` runs each jar with its declared closure
+(`fabric.mod.json` `depends`, `mods.toml`/`neoforge.mods.toml` required dependencies, resolved through `provides`
+aliases and jar-in-jar modules against the corpora under `~/horizon-corpus`); the row stays the jar's own, and
+`deps=`, `dep_refused=` (a dependency whose entrypoint was refused; libraries with nothing to run are not counted)
+and `blocked_in=` (the dependency whose class the refusal stopped in) say what the closure did. When a jar is refused
+both alone and with the pack class path and the two causes differ, the game reports
+`with the pack class path: <cause>; alone: <cause>`: the linked attempt runs the same code until the first class
+alone lacked, so its cause is the blocker the pack hits, and the ledger categorises the row by it.
+
+Measured on 7 November 2026 (one build, the 95 `native-gap` rows of the two committed ledgers): one jar per server,
+15 stay `native-gap` and 80 leave it from native fixes landed since those ledgers (68 run: 31 `native-ok`, 37
+`needs-loader`; 12 are now read as client-only, `native-ok`); with the closure, 14 stay `native-gap`, 1 more runs
+(archers, `needs-loader`) and none is `missing-dependency`. The closure moves the blocker more than the label:
+wizards and paladins now stop in `spell_power`'s `SpellSchools.createMagic`, zoomify in YACL's
+`JsonFileCodecConfig.saveToFile`. The native host already answers a required mod's presence, so most dependents
+ran alone too.
 
 The block below is generated from the wide corpus's committed ledger, and the tool rewrites it in place
 (`--docs`), so it cannot drift from the ledger format:
@@ -780,8 +807,11 @@ than rows; the cache held 86 entries in 436 KiB.
 1. **Game-class mixins do not apply.** The load weave only rewrites classes inside the jar; a plan whose target is a
    Minecraft class is skipped. That is every plan that matters (0 woven; 2,944 and 7,742 skipped), so `ran` means
    "entrypoint executed, mixins skipped, vanilla server reached `Done`", not "the mod works". The opt-in hook tier
-   (`HORIZON_JAVA_GAME_HOOKS=1`) fires its 19 sites from the game's own hook points, but across both corpora it binds
-   only 40 server-side plans in 23 jars, and a bound callback stops at the first member the hook tier does not model. On a
+   (`HORIZON_JAVA_GAME_HOOKS=1`) fires its 19 public sites and 7 internal Java-tier ones (value-returning
+   `getDestroySpeed` and `growCrop`, `PlayerList#remove`, `stopServer`'s tail, the player-tick heads and `Player#tick`)
+   from the game's own points, and asks a config's `IMixinConfigPlugin` natively, but across both corpora it binds
+   only 87 server-side plans (was 40; 51 of the loader tier's 1,285, was 18, statically counted), and a bound
+   callback stops at the first member the hook tier does not model. On a
    dedicated server with two bot players and eight of those jars, 4 jars' callbacks ran (appleskin and syncmatica
    `player_logged_in` 2 each, shogi `player_tick` 1,457, servux `server_stopping` 1) and the rest refused and were
    disabled (`ServerPlayNetworking.canSend`, `Connection#getRemoteAddress`, a `@Shadow` field, Guava's `Ordering`).
