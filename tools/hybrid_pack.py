@@ -236,6 +236,20 @@ def _native_content(raw: bytes) -> tuple[tuple[str, str, str], ...]:
     return tuple(sorted(set(content)))
 
 
+def _toml_value(raw: str) -> str:
+    """One TOML scalar without its quotes or a trailing `# comment`.
+
+    Mod templates write `modId = "almanac" #mandatory` and
+    `type="required" #mandatory (Can be one of ...)`; the comment is not part
+    of the value.
+    """
+    text = raw.strip()
+    if text[:1] in ('"', "'"):
+        end = text.find(text[0], 1)
+        return text[1:end] if end > 0 else text[1:]
+    return text.split("#", 1)[0].strip()
+
+
 def _toml_declarations(text: str, *, neoforge: bool = False) -> tuple[str, str, tuple[str, ...], bool]:
     """Bounded NeoForge/Forge metadata: first mod id, required deps, client-only.
 
@@ -280,7 +294,7 @@ def _toml_declarations(text: str, *, neoforge: bool = False) -> tuple[str, str, 
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
+        value = _toml_value(value)
         if section == "mods":
             if key == "modId" and not ident:
                 ident = value
@@ -302,13 +316,26 @@ def _toml_declarations(text: str, *, neoforge: bool = False) -> tuple[str, str, 
 
 
 def _nested_ids(jar: zipfile.ZipFile) -> tuple[str, ...]:
-    """Mod ids a jar carries as jar-in-jar modules (Fabric API's submodules)."""
+    """Mod ids a jar carries as jar-in-jar modules.
+
+    Fabric's `META-INF/jars/` (Fabric API's submodules) and NeoForge's
+    `META-INF/jarjar/` (mezz_config's standalone jar holds nothing but its
+    nested mod, which JEI requires).
+    """
     ids: list[str] = []
     for name in jar.namelist():
-        if not (name.startswith("META-INF/jars/") and name.endswith(".jar")):
+        if not (name.startswith(("META-INF/jars/", "META-INF/jarjar/")) and name.endswith(".jar")):
             continue
         try:
             with zipfile.ZipFile(io.BytesIO(jar.read(name))) as nested:
+                inner = set(nested.namelist())
+                toml = next((item for item in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml")
+                             if item in inner), None)
+                if "fabric.mod.json" not in inner and toml is not None:
+                    ident = _toml_declarations(nested.read(toml).decode("utf-8", errors="replace"))[0]
+                    if ident:
+                        ids.append(ident)
+                    continue
                 raw = nested.read("fabric.mod.json")
                 value = json.loads(_lenient_json(raw.decode("utf-8-sig", errors="replace")))
                 if isinstance(value, dict) and isinstance(value.get("id"), str):
@@ -361,6 +388,12 @@ def read_declaration(path: Path) -> Declaration:
                         path, ident, version or "?", depends, (), content, nested,
                         client_only,
                     )
+            if nested:
+                # A carrier with no metadata of its own (mezz_config's
+                # standalone jar): its JarJar modules still satisfy a
+                # dependency, so the ids survive the missing root file.
+                return Declaration(path, path.stem, nested_ids=nested,
+                                   error="no root fabric.mod.json or mods.toml")
     except (OSError, KeyError, ValueError, zipfile.BadZipFile) as error:
         # A jar the metadata reader cannot parse still belongs to the partition;
         # it just cannot contribute to the dependency/content check.

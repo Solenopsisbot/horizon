@@ -341,8 +341,21 @@ class HybridPackTests(unittest.TestCase):
                     '[[dependencies.neo]]\nmodId = "glitchcore"\nrequired=true\n'
                     '[[dependencies.neo]]\nmodId = "legacy-flag"\nmandatory = false\n'
                     '[[dependencies.neo]]\nmodId = "client-lib"\nside = "CLIENT"\n'
+                    # almanac's template comments: the comment is not the value.
+                    '[[dependencies.neo]] #mandatory\nmodId = "commented" #mandatory\n'
+                    'type="required" #mandatory (Can be one of "required", "optional")\n'
+                    '[[dependencies.neo]]\nmodId = "commented-optional"\ntype = "optional" # not needed\n'
                 ),
             )
+            # mezz_config's standalone jar: only a NeoForge JarJar module.
+            standalone = Path(tmp) / "standalone.jar"
+            inner = __import__("io").BytesIO()
+            with zipfile.ZipFile(inner, "w") as module:
+                module.writestr("META-INF/neoforge.mods.toml",
+                                '[[mods]]\nmodId = "mezz_config" #mandatory\n')
+            with zipfile.ZipFile(standalone, "w") as jar:
+                jar.writestr("META-INF/jarjar/mezz_config.jar", inner.getvalue())
+            carrier = HYBRID.read_declaration(standalone)
             forge = Path(tmp) / "forge.jar"
             with zipfile.ZipFile(forge, "w") as jar:
                 jar.writestr("META-INF/mods.toml", (
@@ -361,7 +374,9 @@ class HybridPackTests(unittest.TestCase):
         self.assertEqual((neo.mod_id, neo.version), ("neo", "2"))
         # The optional dependency is dropped, the two required forms are kept
         # (platform ids are filtered by the compatibility check, not the reader).
-        self.assertEqual(neo.depends, ("glitchcore", "legacy-flag", "mandatory-lib", "minecraft"))
+        self.assertEqual(neo.depends,
+                         ("commented", "glitchcore", "legacy-flag", "mandatory-lib", "minecraft"))
+        self.assertEqual(carrier.nested_ids, ("mezz_config",))
         # Legacy Forge keeps `mandatory`, default false.
         self.assertEqual(old.depends, ("kept",))
 
