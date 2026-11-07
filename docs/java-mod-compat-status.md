@@ -998,11 +998,14 @@ than rows; the cache held 86 entries in 436 KiB.
    their closure) reach `Done (` with their entrypoint run, so 8 rows are left. servercore (×2) now builds its
    DazzleConf config through generic reflection and proxies and stops at the game façade
    (`TextColor.fromLegacyFormat` answers null for a `@DefaultObject`). WorldEdit (×2) gets past Guava's
-   `TypeToken`, caches and multimaps and stops in piston's `ArgumentConverters`, which spins converters with
-   `MethodHandles` combinators and a runtime `LambdaMetafactory`. zoomify (×2) declares only client entrypoints in
-   `fabric.mod.json`, so the server falls back to its NeoForge `@Mod` bootstrap, which touches the client-only
-   `KeyMapping` (a real NeoForge server would fail the same way; a Fabric one runs nothing). cristellib's stage-1
-   init runs from a game-class mixin (`BootstrapMixin`), so its entrypoint finds its registry empty; whiteout's
+   `TypeToken`, caches and multimaps and, since `method_handles.rs`, past piston's `ArgumentConverters` (method
+   handle combinators and a runtime `LambdaMetafactory`); re-measured 8 November it stops in piston's
+   `CaseHelper.titleToSpacedLower` (Guava `Splitter.split` into `Streams.stream`, then `String.codePoints` and an
+   `IntStream` collect), which is stream and Guava modelling. zoomify (×2) declares only client entrypoints in
+   `fabric.mod.json`; the server no longer falls back to its NeoForge `@Mod` class (Fabric Loader never reads
+   `@Mod`), so both rows are now client-only skips. cristellib's stage-1 init runs from a game-class mixin
+   (`BootstrapMixin`, the `java_bootstrap_head` hook site, which fires only with the opt-in hook tier), so its
+   entrypoint still finds its registry empty in the default ledger; whiteout's
    entrypoint now runs: its Mixin config plugin runs before it, as on a loader.
 3. **Close runtime refusals.** The entrypoint-exception bucket is down to two missing-dependency rows (archers,
    wizards, and paladins in the same shape) that need the ledger to run a jar with its declared dependencies, and
@@ -1017,12 +1020,19 @@ than rows; the cache held 86 entries in 436 KiB.
    before and none after; `canSend` and `Connection#getRemoteAddress` blocked 3 hook callbacks before and none
    after (servux's and both weaponmaster copies' `player_logged_in` now run to the end, 4 firings each). All
    refusals went 99 → 82 while the other workstreams added sites and listeners (listener runs 10,989 → 15,567),
-   so that total is not this change's alone. Next by count: saved data
-   (`getDataStorage`, 8), `getCommands`, `getResourceManager`, `getRunningThread`, a `@Shadow` field, a handler's
-   `player.connection` field read; then fire the identified use/attack/break/entity/level-load events
-   from their game points. Commands next: the source's position and rotation, `RegistryAccess` lookups, the
-   jar's own `SuggestionProvider`s answering `ask_server`, a player-run sample, and keeping a component's style
-   and translation arguments. Gate: no façade refusal among the ten most
+   so that total is not this change's alone. Second round (7 November, 204 jars that listen, register a
+   command or bind a hook, five dedicated servers, four fight bots for 40 s each): saved data
+   (`getDataStorage` on the server 6 and a level 2), `getCommands` 3, `registries()` 2, a player's
+   `permissions()` 2, `canSend(player.connection, type)` 2, `getRunningThread` 2 and `execute` 1 blocked 20
+   callbacks before and none after (`facade_saved_data.rs`, `facade_server.rs`). All refusals went 94 → 91,
+   because those callbacks now run on to the next member: a game rule a mod registers (graves), a registry the facts do
+   not list, `getServerDirectory` (answered since), `ServerLevel#getChunkSource`. Command feedback keeps its
+   style and translation arguments (`facade_text.rs`). Next by count: `getResourceManager` (3: the jars'
+   `data/` files and a `Selector` callback), mod-registered game rules, saved data persisted through its
+   `Codec`, payload sends from a callback (`PacketSender#sendPacket`, `ServerPlayNetworking.send`), the
+   hook tier's `player.connection`. Then fire the identified use/attack/break/entity/level-load events from
+   their game points. Commands next: the source's position and rotation, the jar's own `SuggestionProvider`s
+   answering `ask_server`, a player-run sample. Gate: no façade refusal among the ten most
    common listener causes on the corpus pack run.
 6. **Client surface.** First slice done: client events, key mappings in Controls and HUD drawing
    (`client_surface.rs`, `game/java_client.rs`). Next: the members the refusals name (`getTextureManager`,
