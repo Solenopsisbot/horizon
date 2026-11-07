@@ -2429,6 +2429,14 @@ impl StdHost {
                 ("java.vm.name".into(), "Horizon native Java".into()),
                 ("os.name".into(), "Linux".into()),
                 ("file.separator".into(), "/".into()),
+                // The JVM always sets the working directory and home. Config
+                // libraries build their file from them
+                // (`Path.of(System.getProperty("user.dir"), "config", name)`
+                // in tcdcommons), and a null first part is an NPE in
+                // `Path.of`. The working directory is the game directory
+                // `FabricLoader.getGameDir()` answers, as under a loader.
+                ("user.dir".into(), "/horizon/game".into()),
+                ("user.home".into(), "/horizon/home".into()),
             ]),
             environment: BTreeMap::new(),
             resources: BTreeMap::new(),
@@ -2442,14 +2450,6 @@ impl StdHost {
             mods: BTreeMap::new(),
             environment_type: "CLIENT".into(),
             development_environment: false,
-                // The JVM always sets the working directory and home. Config
-                // libraries build their file from them
-                // (`Path.of(System.getProperty("user.dir"), "config", name)`
-                // in tcdcommons), and a null first part is an NPE in
-                // `Path.of`. The working directory is the game directory
-                // `FabricLoader.getGameDir()` answers, as under a loader.
-                ("user.dir".into(), "/horizon/game".into()),
-                ("user.home".into(), "/horizon/home".into()),
             calls: Vec::new(),
             invocations: Vec::new(),
             posted_events: Vec::new(),
@@ -33399,6 +33399,15 @@ mandatory = true
             name: "size".into(),
             descriptor: "()I".into(),
         };
+        // The seeded property adds one entry to the JVM-like defaults.
+        let mut defaults = StdHost::new();
+        let default_properties = defaults.invoke(&get_properties, &[]).unwrap();
+        let Value::Int(default_size) = defaults
+            .invoke_instance(&size, &default_properties, &[])
+            .unwrap()
+        else {
+            panic!("Properties.size is an int");
+        };
         assert_eq!(
             host.invoke_instance(&size, &properties, &[]).unwrap(),
             Value::Int(default_size + 1)
@@ -33469,15 +33478,6 @@ mandatory = true
                     &MethodRef {
                         owner: "java/lang/Thread".into(),
                         name: name.into(),
-        // The seeded property adds one entry to the JVM-like defaults.
-        let mut defaults = StdHost::new();
-        let default_properties = defaults.invoke(&get_properties, &[]).unwrap();
-        let Value::Int(default_size) = defaults
-            .invoke_instance(&size, &default_properties, &[])
-            .unwrap()
-        else {
-            panic!("Properties.size is an int");
-        };
                         descriptor: descriptor.into(),
                     },
                     &thread,
