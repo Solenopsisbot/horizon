@@ -29,17 +29,20 @@ callbacks and the client surface. The design and tier model are
 
 ### Coverage of the two gates (6 November 2026)
 
-| Corpus | Jars | `native-ok` | `needs-loader` | of those proven on the loader | `native-gap` | Phase 1 met? |
+| Corpus | Jars | `native-ok` | `needs-loader` | of those proven on the loader (7 Nov) | `native-gap` | Phase 1 met? |
 |---|---:|---:|---:|---:|---:|---|
-| wide (`corpus-xl`) | 223 | 151 (68%) | 45 (20%) | 25/45 (56%) | 27 (12%) | no |
-| mega (500 unique) | 500 | 346 (69%) | 86 (17%) | 25/86 (29%) | 68 (14%) | no |
+| wide (`corpus-xl`) | 223 | 151 (68%) | 45 (20%) | 36/36, and 9 are `environment: client` | 27 (12%) | no |
+| mega (500 unique) | 500 | 346 (69%) | 86 (17%) | 57/58, and 28 are `environment: client` | 68 (14%) | no |
 
-"Proven" counts a `needs-loader` jar only when one of the three committed loader ledgers
-(`LAST_LOADER_LEDGER.txt`, `LAST_LOADER_LEDGER_XPLUS.txt`, `LAST_LOADER_LEDGER_HELIX.txt`) has a row with
-`status=listed`, no `first_exception`, matched by file name or mod id. A row with `status=unlisted` (or `error`) is
-seen but not proven: 6 wide / 13 mega. A jar with no loader row at all is unmeasured: 14 wide / 48 mega. The loader
-ledgers cover other corpus slices (corpus-xl, corpus-xplus, Helix), not one run over both corpora, so these are
-evidence of the loader tier, not full proof of it.
+The label columns are the server ledgers'. "Proven" comes from the two loader proof ledgers
+(`LAST_LOADER_PROOF_223.txt`, `LAST_LOADER_PROOF_500.txt`), one real Fabric launch per jar's dependency closure
+over both whole corpora: the launch lists the jar's mod id, reaches `Done (`, and no failure line of that run
+names the mod. A `needs-loader` jar that declares `environment: client` needs no server proof, because Fabric
+never loads it on a dedicated server. The one unproven mega row is combat-hitboxes, whose `main` reaches client
+classes. The same proof also covers native refusals: 23 of the 27 wide and 57 of the 68 mega `native-gap` rows
+are listed by the loader (21 and 55 proven), which is how the tier coverage below reaches 0 `native-gap`. The
+full per-row result, including the 5 listed-but-unproven rows and why, is the generated
+[tier coverage](#tier-coverage-over-the-whole-corpus).
 
 The same runs show the distance to phase 2: 0 mixins were woven in either corpus, with 2,944 (wide) and 7,742 (mega)
 plans skipped, overwhelmingly `target-outside-jar`. Of the 121 wide and 265 mega jars that declare a server
@@ -53,13 +56,15 @@ entrypoint, 94 and 197 reached `Done`; the refusals are the `native-gap` rows ab
    uncaught exception in the entrypoint; mega adds one verifier refusal, two nested-jar-frame cases, one duplicate
    declaration and one unreadable metadata file. The gate is 0, so every row needs either a fix or a reclassification
    backed by a loader proof.
-2. **Loader proof is partial.** 25 of 45 wide and 25 of 86 mega `needs-loader` jars have a `listed` loader row; the
-   rest were seen but not listed, or never ran under the loader. Each needs a loader run that reaches `Done (`,
-   lists it and records no exception against it.
-3. **The hybrid session does not finish.** The 112-jar Helix pack splits into 75 native and 33 loader jars; the
-   loader half loads 67 mods and applies 346 mixins with 0 failures, but times out at 180 s while transforming
-   `NaturalSpawner`, and the static check reports 5 cross-partition dependency conflicts. A jar proven alone is not
-   yet proven in the pack a player runs.
+2. **Five loader rows are listed but not proven.** 169 of the 174 `needs-loader` rows of the tier coverage reach
+   `Done (` with no failure naming them. Four ship client code the server role loads (CreativeCore 2.14.16 twice,
+   sway, combat-hitboxes; a plain Fabric server fails on sway and CreativeCore too), so they need a client-role
+   loader proof, which needs a client launch the server corpus does not have. moderner_beta boots but logs an
+   empty-registry ERROR against itself.
+3. **The hybrid session completes on one pack, the server role only.** The 112-jar Helix pack now runs both
+   halves inside the 180 s bound with 0 static conflicts (71 native jars, 43 loader jars, the loader half at
+   `Done (` in 15 s; [Hybrid sessions](#hybrid-sessions-a-native-half-and-a-loader-half)). Sway stays out of
+   it (client code), seven Helix jars have no ledger row, and no client-role hybrid has been measured.
 4. **NeoForge is outside the measured corpus.** Both corpora are Fabric 26.3. If a NeoForge corpus joins phase 1,
    the dedicated role still lacks the FML preflight and there is no automatic intermediary-to-official remapping.
 
@@ -98,7 +103,9 @@ python3 tools/java_mod_loader_ledger.py --mods-dir ~/horizon-corpus/corpus-xl \
 # the hybrid session, both halves, on the measured pack
 python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   --ledger tools/real_mod_fixtures/LAST_SERVER_LEDGER_223.txt \
-  --ledger tools/real_mod_fixtures/LAST_SERVER_LEDGER_500.txt --match-by-hash --measure
+  --ledger tools/real_mod_fixtures/LAST_SERVER_LEDGER_500.txt \
+  --loader-ledger tools/real_mod_fixtures/LAST_LOADER_PROOF_223.txt \
+  --loader-ledger tools/real_mod_fixtures/LAST_LOADER_PROOF_500.txt --match-by-hash --measure
 ```
 
 ## What is ported
@@ -201,7 +208,9 @@ loader (classpath unlock, transformer chain, `--launch-game` against a real 26.3
 FancyModLoader/NeoForge lifecycle (`--real-loader`, `--list-fml-mods`, `--fml-report`), datagen entrypoints, bounded
 mixin-config registration and `--measure`. It is development/reference tooling: no game path runs a world or a jar's
 gameplay through it (the only in-game use is the opt-in FML preflight child above), so `backends.jvm` in
-`server-status` is always zero and a refused jar is skipped rather than handed to it.
+`server-status` is always zero and a refused jar is skipped rather than handed to it. A Knot-backed run hands Fabric
+a copy of any supplied jar that shades the platform logging classes (Axiom's slf4j 1.x), without the classes the
+game's logging jars already provide, so the game's copy wins as in Fabric's own class path order.
 
 ### Tools and tests
 
@@ -371,7 +380,7 @@ _Generated by `tools/hybrid_pack.py --coverage --docs docs/java-mod-compat-statu
 | `mega` | 500 | 382 | 115 | 0 | 3 |
 | union (SHA-256) | 599 | 446 | 150 | 0 | 3 |
 
-**Loader proof.** All 174 of 174 `needs-loader` rows are demonstrated by a real Fabric loader launch: 169 reached `Done (`, 5 were listed by a launch that did not boot (client-only code in the server role), and 0 have no loader evidence.
+**Loader proof.** 169 of 174 `needs-loader` rows are proven: a real Fabric loader launch lists the jar, reaches `Done (` and no failure line of that run names its mod id. 5 are listed without that proof (below), and 0 have no loader evidence.
 
 **Native refusals absorbed by the loader tier (80 rows).** They are `native-gap` in the server ledger; the real loader lists them, so the tier coverage counts them as `needs-loader`.
 
@@ -391,23 +400,32 @@ _Generated by `tools/hybrid_pack.py --coverage --docs docs/java-mod-compat-statu
 | `949fa8a29a-show-me-your-skin-2.0.3+26.2.jar` | `mega` | built for another game version (requires minecraft >=26.2 <26.3); it cannot run on 26.3 |
 | `c90f03eedd-noisium-fabric-2.8.5+mc26.2-pre-2.jar` | `mega` | built for another game version (requires minecraft ~26.2-); it cannot run on 26.3 |
 
-**Listed but not booted (5).** The loader discovered these jars, but the launch did not reach `Done (`.
+**Listed but not proven (5).** The loader discovered these jars, but the launch did not reach `Done (` or a failure line names them.
 
-| Jar | Corpus | Loader id |
-|---|---|---|
-| `02d17d2f1c-Axiom-6.1.5-for-MC26.3.jar` | `mega` | `axiom` |
-| `3c1a43daba-sway-2.4.5-fabric+26.3.jar` | `mega` | `sway` |
-| `4ed60c0212-combat-hitboxes-1.0.11.jar` | `mega` | `combat-hitboxes` |
-| `80a0fc2ac1-CreativeCore_FABRIC_v2.14.16_mc26.3.jar` | `mega` | `creativecore` |
-| `812809eb6f-Axiom-6.1.3-for-MC26.3.jar` | `mega` | `axiom` |
+| Jar | Corpus | Loader id | Why |
+|---|---|---|---|
+| `257814-8894326.jar` | `corpus-xl` | `creativecore` | native refused (runtime); the real Fabric loader lists it but the run did not boot (client-only code on a server) |
+| `3c1a43daba-sway-2.4.5-fabric+26.3.jar` | `mega` | `sway` | native refused (metadata); the real Fabric loader lists it but the run did not boot (client-only code on a server) |
+| `4ed60c0212-combat-hitboxes-1.0.11.jar` | `mega` | `combat-hitboxes` | the real Fabric loader lists it but the run did not boot (client-only code on a server) |
+| `80a0fc2ac1-CreativeCore_FABRIC_v2.14.16_mc26.3.jar` | `mega` | `creativecore` | native refused (runtime); the real Fabric loader lists it but the run did not boot (client-only code on a server) |
+| `moderner-beta-fabric-5.0.0-alpha.4+26.3.jar` | `corpus-xl` | `moderner_beta` | native refused (metadata); the real Fabric loader lists it and reached Done, but a failure names it: [11:12:13] [Thread-0/ERROR]: Registry 'moderner_beta:blocksource' was empty after loading |
 <!-- java-mod-coverage:end -->
 
 A row whose reason says `requires minecraft …` is out of scope: the jar was built for another game version
 (1.21, 26.2), so no 26.3 tier can carry it and it belongs out of the corpus rather than in a compatibility
-fix. The five `listed but not booted` rows are client-only code that declares a server entrypoint: the loader
-discovers and weaves them, then their `main` touches `net.minecraft.client` and the dedicated server stops.
-They are `needs-loader` because the loader half is what a client pack uses; proving them in a client launch
-needs a client game jar, which the server corpus does not carry.
+fix. Of the five `listed but not proven` rows, four ship client code the server role loads: CreativeCore 2.14.16
+(both copies) and sway put client mixins (`GameRenderer`, `LevelRenderer`) in a common config, and
+combat-hitboxes' `main` entrypoint reaches client classes. A plain `KnotServer` launch of sway or CreativeCore
+with Fabric API, outside Horizon, fails the same way, so this is the jar's side, not the runner. They stay
+`needs-loader` because a client pack uses the loader half; proving them needs a client launch, which the
+server corpus does not carry. The fifth, moderner_beta, reaches `Done (` but logs
+`Registry 'moderner_beta:blocksource' was empty after loading` at ERROR, which the proof does not wave through.
+
+Re-proved 7 November 2026 with every row launched again (`--reprove`): the previous ledgers had counted
+corpus-xl's CreativeCore as booted from a run that applied no mixins, and both Axiom versions as not booted.
+Axiom shades slf4j 1.x, which muted the launched server's log (fixed in `horizon-jvm`, see
+[Hybrid sessions](#hybrid-sessions-a-native-half-and-a-loader-half)); a launch now records the first failure
+line naming each mod (`exception=`), and a row with one is not proven.
 
 Regenerate it without starting a game:
 
@@ -421,9 +439,28 @@ python3 tools/hybrid_pack.py --coverage \
   --docs docs/java-mod-compat-status.md
 ```
 
-`--measure-proof` fills the proof ledgers: for every row without a listing it launches the real loader with
-the jar's declared dependency closure, splits a batch that cannot boot, and retries with each `--proof-loader`.
-`--strict` exits non-zero while a `native-gap` row remains.
+`--measure-proof` fills the proof ledgers: for every row without a proof it launches the real loader with
+the jar's declared dependency closure (`provides` aliases included), splits a batch that cannot boot, gives an
+unproven target one run of its own, and retries with each `--proof-loader`. `--reprove` launches every row
+again instead of trusting the committed listings, and `--proof-ledger NAME=PATH` writes a corpus's proof
+ledger in the committed format. The sweep that wrote the committed ledgers (about 190 launches, one JVM at a
+time, the runner's default `-Xmx1g`):
+
+```sh
+python3 tools/hybrid_pack.py --coverage \
+  --corpus corpus-xl=~/horizon-corpus/corpus-xl --corpus mega=~/horizon-corpus/mega \
+  --ledger tools/real_mod_fixtures/LAST_SERVER_LEDGER_223.txt \
+  --ledger tools/real_mod_fixtures/LAST_SERVER_LEDGER_500.txt \
+  --loader-ledger tools/real_mod_fixtures/LAST_LOADER_PROOF_223.txt \
+  --loader-ledger tools/real_mod_fixtures/LAST_LOADER_PROOF_500.txt \
+  --measure-proof --reprove --proof-universe ~/horizon-corpus/mega-deps \
+  --proof-loader ~/horizon-corpus/fabric-libs-98/net/fabricmc/fabric-loader/0.20.1/fabric-loader-0.20.1.jar \
+  --proof-loader ~/horizon-corpus/fabric-loader-0.19.5.jar \
+  --proof-ledger corpus-xl=tools/real_mod_fixtures/LAST_LOADER_PROOF_223.txt \
+  --proof-ledger mega=tools/real_mod_fixtures/LAST_LOADER_PROOF_500.txt
+```
+
+`--strict` exits non-zero while a `native-gap` or unproven row remains.
 
 ### Phase 2 score: native-only over the loader tier
 
@@ -597,29 +634,44 @@ python3 tools/hybrid_pack.py --native-score --docs docs/java-mod-compat-status.m
 ### Hybrid sessions: a native half and a loader half
 
 The label decides where a jar runs: `native-ok` in one `horizon-client --java-mod` process, `needs-loader` in
-`horizon-jvm --real-loader --launch-game`, and `native-gap` in neither unless `--gap-to-loader`.
+`horizon-jvm --real-loader --launch-game`, and `native-gap` in neither unless the loader proof lists it
+(`--loader-ledger`, a listing that reached `Done (`) or `--gap-to-loader` routes every refusal there.
 `tools/hybrid_pack.py` partitions a pack by these ledgers (falling back to SHA-256 when the pack's filenames differ
-from the corpus), closes each half over declared `depends`, checks the pack's own declarations, and `--measure` runs
-both halves. The design and the two launch commands are in
-[java-mod-compat.md](java-mod-compat.md#hybrid-sessions-a-native-half-and-a-loader-half).
+from the corpus), pulls every dependency of a loader jar into the loader half, moves a native jar whose dependency
+only the loader half runs into the loader half too (`follows-dependency`, repeated until no native jar is
+stranded), checks the pack's own declarations, and `--measure` runs both halves. The design and the two launch
+commands are in [java-mod-compat.md](java-mod-compat.md#hybrid-sessions-a-native-half-and-a-loader-half).
 
-Measured 6 November 2026 on the 112-jar Helix pack, matched to the two committed ledgers by content hash:
+Measured 7 November 2026 on the 112-jar Helix pack, matched to the two committed server ledgers by content hash
+and to the two proof ledgers (horizon-client and horizon-jvm built from this branch that day; server role, flat
+world, each half stops at `Done (`, 180 s bound):
 
-| Half | Jars | Entrypoints executed | Mixin plans applied | Wall |
+| Half | Jars | Executed | Mixin plans applied | Wall |
 |---|---:|---:|---:|---:|
-| native-only (native half) | 75 | 18 | 0 (976 skipped) | 2.1 s |
-| hybrid — native half | 75 | 18 | 0 (976 skipped) | 1.7 s |
-| hybrid — loader half | 33 | 67 mods loaded | 346 (45 configs, 200 targets, 0 failed) | timed out at 180 s |
+| native-only (native half) | 71 | 11 entrypoints | 0 (891 skipped) | 3.6 s |
+| hybrid — native half | 71 | 11 entrypoints | 0 (891 skipped) | 4.3 s |
+| hybrid — loader half | 43 | 74 mods loaded, `Done (` | 477 (53 configs, 254 targets, 0 failed) | 15.3 s |
 
-The partition routes 21 `needs-loader` jars to the loader, plus the 10 `native-ok` libraries their closure shares with
-the native half and 2 `native-gap` jars (`worldedit`, `xaeroworldmap`) that loader jars depend on; 7 `native-gap` and
-7 hash-unmatched jars stay out. The native half is unchanged and still applies no game mixins. The loader half loads
-67 mods and applies 346 mixins with 0 failures, but does not reach `Done (` within the runner's 180 s bound: it stops
-while transforming `NaturalSpawner` (architectury). The correction that moved 45 wide-corpus jars to `needs-loader`
-therefore makes the default hybrid a larger, slower session that is not yet a working one. The static check also
-reports 5 `cross-partition-dependency` conflicts: `litematica-printer` needs `litematica` and `malilib`,
-`pickupnotifier` needs `puzzleslib`, `stackrefill` needs `collective`, and `wakes` needs `baguettelib`, all of which
-run in the other half.
+Both halves complete. The loader half carries 21 `needs-loader` jars, 8 `native-gap` jars the loader proof lists
+(nochatreports, clientsort, collective, modernfix, puzzleslib, swinginglanterns, worldedit, xaeroworldmap), 10
+`native-ok` libraries shared with the native half, and 4 `native-ok` jars that follow their dependency
+(litematica-printer, pickupnotifier, stackrefill, wakes). The static check reports 0 conflicts (was 5
+`cross-partition-dependency`) and 42 warnings: 34 `declared-break` version ranges it does not evaluate, 7 jars with
+no ledger row, and the excluded sway. The loader half's log has one ERROR line, vanilla's
+`No key layers in MapLike[{}]` from the flat world, and no exception. The native half is the same process as before
+and still applies no game mixins; its entrypoint count moved from 18 to 11 because the four add-ons left it and the
+binary changed under concurrent work, so the two native rows are this build's, not a trend.
+
+The 6 November run that "timed out at 180 s while transforming `NaturalSpawner`" was not a hang. Axiom shades
+slf4j 1.x's `org/slf4j/LoggerFactory`; the launch kept the game's logging jars parent-visible only, so Knot's
+child-first lookup resolved Minecraft's logger from Axiom, SLF4J bound its NOP logger and every vanilla line,
+`Done (` included, vanished while the server ran (a thread dump showed it waiting for its next tick, and it wrote
+region files). Fabric's own launch adds the game's log jars to Knot before any mod, so the game's copy wins;
+`horizon-jvm` now hands Fabric a copy of such a jar without the classes a logging jar on the class path already
+provides. Axiom is the only corpus jar that shades them.
+
+What is not shown: a client-role hybrid (the native half as the window, the loader half as a client), a pack with
+players connected, and any pack but Helix. Sway stays out because it cannot boot a server under any loader.
 
 ## Measured efficiency
 
