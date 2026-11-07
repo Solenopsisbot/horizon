@@ -5104,9 +5104,14 @@ fn parse_fml_mods(stdout: &str) -> Vec<FmlMod> {
     mods
 }
 
+///
+/// FML's `ModLoadingException` puts its causes on the lines after
+/// `Loading errors encountered:`, one `- ...` item each; a heading that ends
+/// in `:` keeps those items, so the line says which mod needs what.
 fn first_fml_error_line(stderr: &str, stdout: &str) -> String {
     let mut fallback = None;
-    for line in stderr.lines().chain(stdout.lines()).map(str::trim) {
+    let mut lines = stderr.lines().chain(stdout.lines()).map(str::trim);
+    while let Some(line) = lines.next() {
         if line.is_empty() {
             continue;
         }
@@ -5123,7 +5128,18 @@ fn first_fml_error_line(stderr: &str, stdout: &str) -> String {
         .iter()
         .any(|needle| lower.contains(needle))
         {
-            return line.chars().take(400).collect();
+            let mut text = line.to_owned();
+            if line.ends_with(':') {
+                let items: Vec<&str> = lines
+                    .by_ref()
+                    .skip_while(|item| item.is_empty())
+                    .take_while(|item| item.starts_with('-'))
+                    .collect();
+                if !items.is_empty() {
+                    text = format!("{text} {}", items.join(" "));
+                }
+            }
+            return text.chars().take(400).collect();
         }
     }
     fallback.unwrap_or("no output").chars().take(400).collect()
@@ -10443,6 +10459,18 @@ mod fml_probe_tests {
             "java.lang.RuntimeException: boom"
         );
         assert_eq!(first_fml_error_line("", "plain output"), "plain output");
+        assert_eq!(
+            first_fml_error_line(
+                "Exception in thread \"main\" net.neoforged.fml.ModLoadingException: Loading errors encountered:\n\
+                 \t- Mod biomesoplenty requires glitchcore 26.3.0.0.1 or above\n\
+                 \t- Mod biomesoplenty requires terrablender 26.3.0.0.6 or above\n\
+                 \tat net.neoforged.fml.ModLoader.a(ModLoader.java:1)",
+                ""
+            ),
+            "Exception in thread \"main\" net.neoforged.fml.ModLoadingException: Loading errors encountered: \
+             - Mod biomesoplenty requires glitchcore 26.3.0.0.1 or above \
+             - Mod biomesoplenty requires terrablender 26.3.0.0.6 or above"
+        );
     }
 
     #[test]
