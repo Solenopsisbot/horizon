@@ -39,7 +39,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -109,9 +109,9 @@ static STORE: Mutex<Vec<ClientJar>> = Mutex::new(Vec::new());
 
 /// [`GameEvent::bit`]s with a live listener, plus [`HUD_BIT`] and
 /// [`KEYS_BIT`]: the fast path.
-static ACTIVE: AtomicU32 = AtomicU32::new(0);
+static ACTIVE: AtomicU64 = AtomicU64::new(0);
 /// Bit 31: an enabled HUD element. Client events stay below it (30 events).
-const HUD_BIT: u32 = 1 << 31;
+const HUD_BIT: u64 = 1 << 63;
 /// Bit 30's place is an event's, so mappings are flagged separately.
 static HAS_KEYS: AtomicBool = AtomicBool::new(false);
 /// New mappings joined Controls: the window copies the player's keys for
