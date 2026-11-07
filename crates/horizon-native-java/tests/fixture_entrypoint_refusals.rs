@@ -724,3 +724,228 @@ public final class Main {
         all_true(&["lower", "passthrough", "resource", "wrapper"])
     );
 }
+
+/// Deferred registration: a `Supplier` captures a `Function` and an id, and the
+/// function itself wraps another one (Collector's Album's
+/// `PlatformItemRegistry.registerItem`). Every layer must hand back the object
+/// the innermost constructor built.
+#[test]
+fn nested_captured_functions_return_the_constructed_object() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import java.util.Objects;
+import java.util.function.*;
+public final class Main {
+    static final class Props { int stack = 64; Props stacksTo(int n) { stack = n; return this; } }
+    static final class Album { final int stack; Album(Props props) { stack = props.stack; } }
+    static <R> Supplier<R> register(String name, Function<String, R> factory) {
+        return () -> factory.apply(name);
+    }
+    static <T> Supplier<T> registerItem(String name, Function<Props, T> factory) {
+        return register(name, id -> factory.apply(new Props()));
+    }
+    public static void main() {
+        Supplier<Album> album = registerItem("album", props -> new Album(props.stacksTo(1)));
+        Album built = Objects.requireNonNull(album.get());
+        Probe.check("built", built.stack == 1);
+    }
+}
+"#,
+    );
+    assert_eq!(run("nested-functions", sources, &[]), all_true(&["built"]));
+}
+
+/// A game builder chain (`CreativeModeTab.builder(...).title(...).build()`)
+/// never answers null in the game, and mods `requireNonNull` what they
+/// register from it.
+#[test]
+fn game_builder_chains_never_answer_null() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "net/minecraft/world/item/CreativeModeTab.java",
+        r#"package net.minecraft.world.item;
+public class CreativeModeTab {
+    public static Builder builder(int row, int column) { return null; }
+    public static class Builder {
+        public Builder title(String title) { return null; }
+        public CreativeModeTab build() { return null; }
+    }
+}
+"#,
+    );
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import java.util.Objects;
+import net.minecraft.world.item.CreativeModeTab;
+public final class Main {
+    public static void main() {
+        CreativeModeTab tab = CreativeModeTab.builder(0, 1).title("demo").build();
+        Objects.requireNonNull(tab);
+        Probe.check("built", tab != null);
+    }
+}
+"#,
+    );
+    assert_eq!(
+        run(
+            "builder",
+            sources,
+            &[
+                "net/minecraft/world/item/CreativeModeTab.class",
+                "net/minecraft/world/item/CreativeModeTab$Builder.class",
+            ],
+        ),
+        all_true(&["built"])
+    );
+}
+
+/// Reflection a config registry and a service binder use: listing a type's
+/// constructors by parameter count (Armor Hider), and a nested interface's
+/// simple name naming the field it binds to (REI's `Internals`).
+#[test]
+fn constructors_and_nested_simple_names_follow_the_class_file() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import java.lang.reflect.Constructor;
+public final class Main {
+    interface EntryProvider {}
+    static final class Item {
+        final String value;
+        Item() { this("default"); }
+        Item(String value) { this.value = value; }
+    }
+    public static void main() throws Exception {
+        Constructor<?> one = null, none = null;
+        for (Constructor<?> constructor : Item.class.getDeclaredConstructors()) {
+            if (constructor.getParameterCount() == 1) one = constructor;
+            else if (constructor.getParameterCount() == 0) none = constructor;
+        }
+        Probe.check("one", one != null && "x".equals(((Item) one.newInstance("x")).value));
+        Probe.check("none", none != null);
+        Probe.check("nested", "EntryProvider".equals(EntryProvider.class.getSimpleName()));
+        Probe.check("top", "Main".equals(Main.class.getSimpleName()));
+        Object anonymous = new Object() {};
+        Probe.check("anonymous", anonymous.getClass().getSimpleName().isEmpty());
+    }
+}
+"#,
+    );
+    assert_eq!(
+        run("constructors", sources, &[]),
+        all_true(&["anonymous", "nested", "none", "one", "top"])
+    );
+}
+
+/// Game-side values a mod's own registry needs: a registry key built from an
+/// id, Fabric's registry builder answering a registry of that id, DFU's
+/// `Pair` handing back what it holds, an `EnumMap` keeping its entries, a game
+/// type's `create*` factory and `NumberFormat.format(long)`.
+#[test]
+fn mod_registry_and_shipped_library_values_are_kept() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "net/minecraft/resources/Identifier.java",
+        r#"package net.minecraft.resources;
+public final class Identifier {
+    public static Identifier fromNamespaceAndPath(String namespace, String path) { return null; }
+    @Override public String toString() { return null; }
+}
+"#,
+    );
+    sources.insert(
+        "net/minecraft/resources/ResourceKey.java",
+        r#"package net.minecraft.resources;
+public final class ResourceKey<T> {
+    public static <T> ResourceKey<T> createRegistryKey(Identifier id) { return null; }
+    public Identifier identifier() { return null; }
+}
+"#,
+    );
+    sources.insert(
+        "net/minecraft/core/Registry.java",
+        "package net.minecraft.core;\npublic interface Registry<T> { net.minecraft.resources.ResourceKey<? extends Registry<T>> key(); }\n",
+    );
+    sources.insert(
+        "net/minecraft/core/WritableRegistry.java",
+        "package net.minecraft.core;\npublic interface WritableRegistry<T> extends Registry<T> {}\n",
+    );
+    sources.insert(
+        "net/fabricmc/fabric/api/event/registry/FabricRegistryBuilder.java",
+        r#"package net.fabricmc.fabric.api.event.registry;
+import net.minecraft.resources.ResourceKey;
+public final class FabricRegistryBuilder<T> {
+    public static <T> FabricRegistryBuilder<T> create(ResourceKey<?> key) { return null; }
+    public FabricRegistryBuilder<T> attribute(Object attribute) { return null; }
+    public net.minecraft.core.WritableRegistry<T> buildAndRegister() { return null; }
+}
+"#,
+    );
+    sources.insert(
+        "net/minecraft/sounds/SoundEvent.java",
+        "package net.minecraft.sounds;\npublic final class SoundEvent { public static SoundEvent createVariableRangeEvent(net.minecraft.resources.Identifier id) { return null; } }\n",
+    );
+    sources.insert(
+        "com/mojang/datafixers/util/Pair.java",
+        r#"package com.mojang.datafixers.util;
+public final class Pair<F, S> {
+    public static <F, S> Pair<F, S> of(F first, S second) { return null; }
+    public F getFirst() { return null; }
+    public S getSecond() { return null; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import com.mojang.datafixers.util.Pair;
+import java.text.NumberFormat;
+import java.util.*;
+import net.fabricmc.fabric.api.event.registry.FabricRegistryBuilder;
+import net.minecraft.core.Registry;
+import net.minecraft.resources.*;
+import net.minecraft.sounds.SoundEvent;
+public final class Main {
+    enum Side { CLIENT, SERVER }
+    public static void main() {
+        ResourceKey<Registry<Object>> key =
+            ResourceKey.createRegistryKey(Identifier.fromNamespaceAndPath("demo", "cards"));
+        Registry<Object> registry = FabricRegistryBuilder.create(key).attribute(null).buildAndRegister();
+        Probe.check("registry", registry != null
+            && "demo:cards".equals(registry.key().identifier().toString()));
+
+        Pair<Integer, String> pair = Pair.of(3, "field");
+        Probe.check("pair", pair.getFirst() == 3 && "field".equals(pair.getSecond()));
+
+        EnumMap<Side, List<String>> sides = new EnumMap<>(Side.class);
+        sides.put(Side.SERVER, new ArrayList<>());
+        Probe.check("enum-map", sides.get(Side.SERVER) != null && sides.get(Side.SERVER).isEmpty());
+
+        Probe.check("factory", SoundEvent.createVariableRangeEvent(
+            Identifier.fromNamespaceAndPath("demo", "flip")) != null);
+        Probe.check("format", "1,234,567".equals(NumberFormat.getIntegerInstance(Locale.US).format(1234567L)));
+    }
+}
+"#,
+    );
+    assert_eq!(
+        run(
+            "mod-registry",
+            sources,
+            &[
+                "net/minecraft/resources/Identifier.class",
+                "net/minecraft/resources/ResourceKey.class",
+                "net/minecraft/core/Registry.class",
+                "net/minecraft/core/WritableRegistry.class",
+                "net/fabricmc/fabric/api/event/registry/FabricRegistryBuilder.class",
+                "net/minecraft/sounds/SoundEvent.class",
+                "com/mojang/datafixers/util/Pair.class",
+            ],
+        ),
+        all_true(&["enum-map", "factory", "format", "pair", "registry"])
+    );
+}

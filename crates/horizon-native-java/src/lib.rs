@@ -15,13 +15,17 @@ use std::{
 
 mod annotation_values;
 mod declarations_content;
+mod dfu_pair;
 pub mod events;
+mod fabric_registry;
 mod game_hooks;
 mod java_regex;
 mod jdk_model;
 mod jdk_stream;
 mod map_compute;
+mod reflect_constructors;
 mod reflect_enum;
+mod reflect_names;
 mod stack_walk;
 mod vanilla_registries;
 pub mod weaver;
@@ -2401,6 +2405,8 @@ impl StdHost {
         }
         if self.strict_unknown_host_calls {
             Err(NativeError::UnknownHostCall(r.clone()))
+        } else if let Some(value) = game_builder_value(r) {
+            Ok(value)
         } else {
             Ok(self.neutral_unmodelled_result(&r.descriptor))
         }
@@ -3721,6 +3727,12 @@ impl Host for StdHost {
         if let Some(value) = jdk_model::static_call(r, args) {
             return value;
         }
+        if let Some(value) = dfu_pair::static_call(r, args) {
+            return value;
+        }
+        if let Some(value) = fabric_registry::static_call(r, args) {
+            return value;
+        }
         if let Some(value) = self.networking_register(r, args) {
             return Ok(value);
         }
@@ -4860,6 +4872,12 @@ impl Host for StdHost {
         if let Some(value) = jdk_model::instance_call(r, receiver, args) {
             return value;
         }
+        if let Some(value) = dfu_pair::instance_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = fabric_registry::instance_call(r, receiver) {
+            return value;
+        }
         // `Object.getClass` is the bridge from a value marker back to the
         // reflective class surface config code uses for field discovery.
         if r.owner == "java/lang/Object"
@@ -5126,7 +5144,13 @@ impl Host for StdHost {
                     "unsupported NumberFormat marker".into(),
                 ));
             }
-            let value = expect_int(r, Self::argument(r, args, 0)?)?;
+            // `format(long)` takes a `long` (`d2l` before the call); the
+            // `int` overload widens.
+            let value = if r.descriptor == "(J)Ljava/lang/String;" {
+                expect_long(r, Self::argument(r, args, 0)?)?
+            } else {
+                i64::from(expect_int(r, Self::argument(r, args, 0)?)?)
+            };
             return Ok(Value::Ref(Some(format_integer_us(value))));
         }
         if r.owner == "java/util/Locale" {
@@ -5995,9 +6019,13 @@ impl Host for StdHost {
                     }
                     return Ok(Value::Void);
                 }
+                // `EnumMap.put` is declared `(Enum, Object)`; it is the same put.
                 (owner, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;")
-                    if is_map_owner(owner) =>
-                {
+                | (
+                    owner @ "java/util/EnumMap",
+                    "put",
+                    "(Ljava/lang/Enum;Ljava/lang/Object;)Ljava/lang/Object;",
+                ) if is_map_owner(owner) => {
                     let key = Self::argument(r, args, 0)?.clone();
                     let value = Self::argument(r, args, 1)?.clone();
                     let values = self
@@ -8224,6 +8252,9 @@ impl Host for StdHost {
                 if r.name == "toString" && r.descriptor == "()Ljava/lang/String;" {
                     return Ok(Value::Ref(Some(value_text(receiver))));
                 }
+                if let Some(value) = game_builder_value(r) {
+                    return Ok(value);
+                }
                 // An unmodelled accessor that declares a collection or an array
                 // answers an empty modelled value: a null would fail on the
                 // caller's very next `iterator()`/`arraylength`.
@@ -9866,7 +9897,7 @@ fn expect_float(r: &MethodRef, value: &Value) -> Result<f64, NativeError> {
     })
 }
 
-fn format_integer_us(value: i32) -> String {
+fn format_integer_us(value: i64) -> String {
     let negative = value < 0;
     let digits = value.unsigned_abs().to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
@@ -9973,6 +10004,31 @@ fn java_float_text(scientific: String) -> String {
 
 /// The collection kind a reference return descriptor declares, when it is one
 /// of the `java.util` collections the host models.
+/// The opaque value an unmodelled step of a game builder chain (or a game
+/// type's own `create*` factory) answers.
+///
+/// The game's builders (`CreativeModeTab.builder(...).title(...).build()`)
+/// never answer null: every fluent step returns a builder and `build()` the
+/// built object. Mods register the result and `requireNonNull` it, so the
+/// chain answers a marker of the declared type instead of the neutral null.
+/// The marker names no behaviour; it only keeps the chain non-null.
+fn game_builder_value(r: &MethodRef) -> Option<Value> {
+    let result = result_descriptor(&r.descriptor)
+        .strip_prefix('L')?
+        .strip_suffix(';')?;
+    if !result.starts_with("net/minecraft/") {
+        return None;
+    }
+    let builder_step = result.ends_with("$Builder");
+    let build = r.name == "build"
+        && r.owner.starts_with("net/minecraft/")
+        && r.owner.strip_suffix("$Builder") == Some(result);
+    // A game type's own `create*` factory (`SoundEvent.createVariableRangeEvent`)
+    // constructs one; unlike a by-name lookup it has no "absent" answer.
+    let factory = r.name.starts_with("create") && r.owner == result;
+    (builder_step || build || factory).then(|| Value::Ref(Some(format!("{result}#builder"))))
+}
+
 /// The game's codec value types: a call or constant declared to answer one
 /// never answers null in the game.
 fn is_codec_type(name: &str) -> bool {
@@ -19364,6 +19420,12 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         if let Some(value) = self.invoke_reflect_enum(r, receiver)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_reflect_constructors(r, receiver)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_reflect_simple_name(r, receiver)? {
             return Ok(Some(value));
         }
         // `getSuperclass` walks the jar's own hierarchy: a config scanner that
