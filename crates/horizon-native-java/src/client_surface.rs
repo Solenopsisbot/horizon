@@ -39,17 +39,28 @@
 //! before this surface existed; `player` and `level` read `null` then, which
 //! is true while the client is starting.
 //!
-//! Chat components keep only their text (`component/literal/<text>` or
-//! `component/translatable/<key>`): a style (`withStyle`, `withColor`) is
-//! dropped, so a coloured component draws in the call's own colour.
+//! Chat components are text markers (`component/literal/<text>` or
+//! `component/translatable/<key>`); a style (`withStyle`, `withColor`,
+//! `Style`) is kept as legacy codes inside that text (`client_text.rs`).
 
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
-    ExecutionBudget, MethodRef, NativeError, NativeJar, StdHost, Value, component_value,
+    ExecutionBudget, MethodRef, NativeError, NativeJar, StdHost, Value, boolean_value,
+    component_value,
     events::{self, GameEvent, ListenerCallback},
     expect_ref, identifier_parts, parse_callback_marker, return_desc, stable_hash, uuid_value,
 };
+
+// The player's items and effects (`ItemStack`, `Inventory`, effects). A
+// submodule so the crate root's module list stays the interpreter's.
+#[path = "client_items.rs"]
+mod items;
+pub use items::{ClientEffect, ClientItem, ClientStack, ItemTable, StackSlot};
+// Styles on chat components, as legacy codes inside their text.
+#[path = "client_text.rs"]
+mod text;
+pub use text::split_codes;
 
 /// `Minecraft.getInstance()`, and every client listener's `Minecraft`.
 pub const MINECRAFT: &str = "client/minecraft";
@@ -76,6 +87,24 @@ const GAME_MODE: &str = "client/game-mode";
 /// `Minecraft.getDebugOverlay()`.
 const DEBUG: &str = "client/debug-overlay";
 const GAME_TYPE: &str = "net/minecraft/world/level/GameType";
+/// `Minecraft.gameRenderer`.
+const GAME_RENDERER: &str = "client/game-renderer";
+/// `gameRenderer.getMainCamera()`.
+const CAMERA: &str = "client/camera";
+/// `Minecraft.getTextureManager()`: a bounded stand-in that names textures
+/// but never uploads one.
+const TEXTURE_MANAGER: &str = "client/texture-manager";
+/// `Minecraft.getSingleplayerServer()` in single player. The server runs on
+/// its own thread; the window's callbacks see only that it exists.
+const INTEGRATED_SERVER: &str = "client/integrated-server";
+/// `Minecraft.getUser()`.
+const USER: &str = "client/user";
+/// `options.<name>()`: `client/option/<name>`.
+const OPTION: &str = "client/option/";
+/// A `Vec3` the façade handed out: `client/vec3/<x>,<y>,<z>`.
+const VEC3: &str = "client/vec3/";
+/// `Runnable`s one firing may queue with `Minecraft.execute`.
+const MAX_TASKS: usize = 64;
 /// A vanilla mapping read through `options.keyJump`...: `client/vanilla-key/key.jump`.
 const VANILLA_KEY: &str = "client/vanilla-key/";
 const CATEGORY: &str = "key-category/";
@@ -181,6 +210,35 @@ pub struct ClientPlayer {
     pub fall_flying: bool,
     /// Its `GameType` constant: `SURVIVAL`, `CREATIVE`, `ADVENTURE`, `SPECTATOR`.
     pub game_mode: String,
+    /// The main inventory, 36 stacks (0..8 the hotbar); an empty slot is
+    /// [`ClientStack::empty`].
+    pub inventory: Vec<ClientStack>,
+    /// The selected hotbar slot, 0..8.
+    pub selected: usize,
+    /// Armour: feet, legs, chest, head (`Inventory` slots 36..39).
+    pub armor: [ClientStack; 4],
+    pub offhand: ClientStack,
+    pub effects: Vec<ClientEffect>,
+    pub food: i32,
+    pub saturation: f32,
+    /// `getArmorValue`.
+    pub armor_value: i32,
+    pub absorption: f32,
+    pub air: i32,
+    pub max_air: i32,
+    pub xp_level: i32,
+    /// Progress to the next level, 0..1.
+    pub xp_progress: f32,
+    pub xp_total: i32,
+}
+
+/// The camera as the façade shows it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClientCamera {
+    pub pos: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub detached: bool,
 }
 
 /// The client level as the façade shows it.
@@ -190,6 +248,9 @@ pub struct ClientLevel {
     pub dimension: String,
     pub game_time: i64,
     pub day_time: i64,
+    /// `getMinY` and `getHeight`: the dimension's build limits.
+    pub min_y: i32,
+    pub height: i32,
 }
 
 /// What `Font.width` needs: the game font's advances and the translations a
@@ -229,7 +290,11 @@ impl TextMetrics {
     pub fn resolve<'a>(&'a self, text: &'a ClientText) -> &'a str {
         match text {
             ClientText::Literal(text) => text,
-            ClientText::Translatable(key) => self.translations.get(key).map_or(key, String::as_str),
+            // A styled key keeps its codes before it; the width skips them.
+            ClientText::Translatable(key) => {
+                let (_, key) = split_codes(key);
+                self.translations.get(key).map_or(key, String::as_str)
+            }
         }
     }
 }
@@ -246,6 +311,15 @@ pub struct ClientSnapshot {
     pub single_player: bool,
     /// `options.hideGui` (F1).
     pub hide_gui: bool,
+    /// `Hud.getGuiTicks`: the HUD's tick counter.
+    pub gui_ticks: i32,
+    /// `options.renderDistance()`, in chunks.
+    pub render_distance: i32,
+    /// `options.mainHand()`: the player's main arm is the left one.
+    pub left_handed: bool,
+    /// The camera: eye position, rotation (degrees) and whether it is
+    /// detached (third person).
+    pub camera: Option<ClientCamera>,
     /// A screen is open (`Minecraft.screen` / `gui.screen()` is not null):
     /// the title, a menu, chat, an inventory. The façade has no screen
     /// object, so a callback that reads it then refuses.
@@ -263,6 +337,11 @@ pub struct ClientSnapshot {
     /// The vanilla mappings held right now (`key.jump`...).
     pub vanilla_keys_down: Vec<String>,
     pub metrics: Arc<TextMetrics>,
+    /// Item facts by id, for stacks a callback builds itself and for
+    /// `Item` members; shared, built once by the game.
+    pub items: Arc<ItemTable>,
+    /// The stack a tooltip callback describes (`client/stack/tooltip`).
+    pub tooltip_stack: Option<ClientStack>,
 }
 
 /// One registered mapping's input state, in [`StdHost::client_key_mappings`]
@@ -304,6 +383,28 @@ pub enum DrawOp {
         top: u32,
         bottom: u32,
     },
+    /// `item`/`fakeItem` (`model`) or `itemDecorations` (`decorations`) of a
+    /// stack, its top left at `at`, 16 GUI pixels square times `scale`.
+    /// `slot` names where the stack came from so the game can draw the real
+    /// stack (its components, glint and trims); the façade's copy is the
+    /// fallback for a built one.
+    Item {
+        stack: ClientStack,
+        slot: Option<StackSlot>,
+        at: [f32; 2],
+        scale: [f32; 2],
+        model: bool,
+        /// `Some(count text)` draws the decorations; an inner `None` is the
+        /// stack's own count (`itemDecorations(font, stack, x, y)`).
+        decorations: Option<Option<String>>,
+    },
+    /// `blitSprite` of a GUI sprite (`hud/heart/full`, a mod's
+    /// `examplemod:gui/meter`) stretched into `rect`, tinted `argb`.
+    Sprite {
+        sprite: String,
+        rect: [f32; 4],
+        argb: u32,
+    },
 }
 
 /// A chat line or action-bar message a mod sent.
@@ -323,6 +424,10 @@ pub struct ClientFrameOutput {
     pub messages: Vec<ClientMessage>,
     /// The mappings' state after the callback (clicks it consumed are gone).
     pub keys: Vec<KeyPress>,
+    /// `Minecraft.execute(runnable)`s queued, in order: the game runs them
+    /// after the firing ([`NativeJar::run_client_task`]), as vanilla runs its
+    /// queued tasks later in the same tick.
+    pub tasks: Vec<Value>,
 }
 
 /// How a `KeyMapping` was constructed.
@@ -356,6 +461,11 @@ pub(crate) struct ClientState {
     draws: Vec<DrawOp>,
     messages: Vec<ClientMessage>,
     poses: Vec<Pose>,
+    /// Stacks the firing's callbacks built (`new ItemStack`).
+    made: items::MadeStacks,
+    /// A built stack's object marker → its slot.
+    made_aliases: BTreeMap<String, StackSlot>,
+    tasks: Vec<Value>,
 }
 
 fn marker(text: impl Into<String>) -> Value {
@@ -737,6 +847,9 @@ impl StdHost {
         state.draws.clear();
         state.messages.clear();
         state.poses.clear();
+        state.made.clear();
+        state.made_aliases.clear();
+        state.tasks.clear();
     }
 
     /// End the firing [`Self::begin_client_frame`] started: what the
@@ -745,10 +858,13 @@ impl StdHost {
         let state = &mut self.client;
         state.frame = None;
         state.poses.clear();
+        state.made.clear();
+        state.made_aliases.clear();
         ClientFrameOutput {
             draws: std::mem::take(&mut state.draws),
             messages: std::mem::take(&mut state.messages),
             keys: std::mem::take(&mut state.presses),
+            tasks: std::mem::take(&mut state.tasks),
         }
     }
 
@@ -763,6 +879,9 @@ impl StdHost {
         let state = &self.client;
         let frame = state.frame.as_deref();
         let refuse = || Some(Err(NativeError::UnknownHostCall(r.clone())));
+        if let Some(value) = text::text_static(r) {
+            return Some(Ok(value));
+        }
         match (r.owner.as_str(), r.name.as_str()) {
             (INPUT_TYPE, name @ ("KEYBOARD" | "MOUSE")) => {
                 Some(Ok(marker(format!("enum/{INPUT_TYPE}/{name}"))))
@@ -786,6 +905,7 @@ impl StdHost {
                 "gameMode" => frame
                     .and_then(|f| f.player.as_ref())
                     .map_or(Value::Ref(None), |_| marker(GAME_MODE)),
+                "gameRenderer" => marker(GAME_RENDERER),
                 _ if frame.is_some() => return refuse(),
                 _ => return None,
             })),
@@ -795,11 +915,43 @@ impl StdHost {
                 }
                 match (name, frame) {
                     ("hideGui", Some(frame)) => Some(Ok(flag(frame.hide_gui))),
+                    ("keyDebugModifier", _) => {
+                        Some(Ok(marker(format!("{VANILLA_KEY}key.debug.modifier"))))
+                    }
                     (_, Some(_)) => refuse(),
                     (_, None) => None,
                 }
             }
             (FONT_CLASS, "lineHeight") => Some(Ok(Value::Int(9))),
+            // Item, block and effect constants answer only in a firing: an
+            // entrypoint reading `Items.DIAMOND` keeps the answer it always got.
+            ("net/minecraft/world/item/Items", name) if frame.is_some() => Some(Ok(marker(
+                format!("{}{}", items::ITEM, items::constant_id(name)),
+            ))),
+            ("net/minecraft/world/level/block/Blocks", name) if frame.is_some() => Some(Ok(
+                marker(format!("{}{}", items::BLOCK, items::constant_id(name))),
+            )),
+            ("net/minecraft/world/effect/MobEffects", name) if frame.is_some() => {
+                Some(Ok(marker(format!(
+                    "{}{}",
+                    items::EFFECT_HOLDER,
+                    items::effect_constant_id(name)
+                ))))
+            }
+            ("net/minecraft/world/item/ItemStack", "EMPTY") if frame.is_some() => {
+                Some(Ok(marker(format!("{}empty", items::STACK))))
+            }
+            (
+                "net/minecraft/world/entity/player/Player"
+                | "net/minecraft/client/player/LocalPlayer"
+                | "net/minecraft/client/player/AbstractClientPlayer",
+                name,
+            ) if frame.is_some() => {
+                match frame.and_then(|frame| Self::client_player_field(frame, name)) {
+                    Some(value) => Some(Ok(value)),
+                    None => refuse(),
+                }
+            }
             ("net/minecraft/client/gui/Gui", "hud") => Some(Ok(marker(HUD))),
             _ => None,
         }
@@ -814,6 +966,9 @@ impl StdHost {
     ) -> Option<Result<Value, NativeError>> {
         if !self.client_environment() {
             return None;
+        }
+        if let Some(value) = text::text_invoke(r, args) {
+            return Some(Ok(value));
         }
         let state = &mut self.client;
         match (r.owner.as_str(), r.name.as_str()) {
@@ -868,10 +1023,39 @@ impl StdHost {
                     .insert(text, format!("{namespace}:{path}"));
                 return Some(Ok(Value::Void));
             }
+            // `new ItemStack(Items.CHEST)` in a firing: a stack of the frame.
+            if r.owner == "net/minecraft/world/item/ItemStack"
+                && let Some(frame) = self.client.frame.clone()
+            {
+                return Some(
+                    self.client_make_stack(&frame, &text, args)
+                        .map(|()| Value::Void)
+                        .ok_or_else(|| NativeError::UnknownHostCall(r.clone())),
+                );
+            }
             return None;
         }
-        // A component drawn through `getVisualOrderText` is still itself;
-        // a style is dropped (see the module docs).
+        // `BuiltInRegistries.ITEM.getKey(item)`: the item's identifier.
+        if r.name == "getKey"
+            && let Some(id) = args.first().and_then(expect_ref).and_then(|a| {
+                a.strip_prefix(items::ITEM)
+                    .or_else(|| a.strip_prefix(items::BLOCK))
+            })
+        {
+            return Some(Ok(marker(format!("identifier/{id}"))));
+        }
+        // A stack the frame built answers as its slot marker does.
+        if !text.starts_with("client/")
+            && let Some(frame) = self.client.frame.clone()
+            && let Some(slot) = self.client.made_aliases.get(&text).cloned()
+        {
+            let object = match slot {
+                StackSlot::Made(n) => format!("{}made/{n}", items::STACK),
+                _ => return None,
+            };
+            let answer = self.client_item_answer(&object, &frame, r, args).flatten();
+            return Some(answer.map_or_else(refuse, Ok));
+        }
         // `GameType` predicates on the enum constant `getPlayerMode` hands out.
         if let Some(mode) = text.strip_prefix(&format!("enum/{GAME_TYPE}/")) {
             let answer = match (r.name.as_str(), r.descriptor.as_str()) {
@@ -882,16 +1066,24 @@ impl StdHost {
             };
             return Some(Ok(flag(answer)));
         }
-        if text.starts_with("component/") {
-            return match (r.name.as_str(), return_desc(&r.descriptor)) {
-                ("getVisualOrderText", "Lnet/minecraft/util/FormattedCharSequence;") => {
-                    Some(Ok(receiver.clone()))
-                }
-                ("withStyle" | "withColor", "Lnet/minecraft/network/chat/MutableComponent;") => {
-                    Some(Ok(receiver.clone()))
-                }
-                _ => None,
-            };
+        // Components, styles, text colours and formatting constants
+        // (`client_text.rs`); an unlisted component member keeps the host's
+        // own component model.
+        if text.starts_with("component/")
+            || text.starts_with("client/style/")
+            || text.starts_with("client/text-color/")
+            || text.starts_with("enum/net/minecraft/ChatFormatting/")
+        {
+            if let Some(value) = text::text_call(&text, r, args) {
+                return Some(Ok(value));
+            }
+            if text.starts_with("component/")
+                || text.starts_with("enum/")
+                || self.client.frame.is_none()
+            {
+                return None;
+            }
+            return Some(refuse());
         }
         if let Some(event) = text.strip_prefix("game-event/") {
             return self.client_event_call(event, r, args);
@@ -1047,6 +1239,38 @@ impl StdHost {
         let double = |value: f64| Some(Value::Float(value));
         // A float return is rounded to f32 precision, as the interpreter's `F`.
         let float = |value: f32| Some(Value::Float(f64::from(value)));
+        if let Some(coords) = object.strip_prefix(VEC3) {
+            let v: Vec<f64> = coords.split(',').filter_map(|c| c.parse().ok()).collect();
+            let [x, y, z] = <[f64; 3]>::try_from(v).ok()?;
+            return match (name, returns) {
+                ("x", "D") => double(x),
+                ("y", "D") => double(y),
+                ("z", "D") => double(z),
+                ("distanceTo", "D") | ("distanceToSqr", "D") => {
+                    let o = expect_ref(args.first()?)?.strip_prefix(VEC3)?;
+                    let o: Vec<f64> = o.split(',').filter_map(|c| c.parse().ok()).collect();
+                    let d2 = (x - o.first()?).powi(2)
+                        + (y - o.get(1)?).powi(2)
+                        + (z - o.get(2)?).powi(2);
+                    double(if name == "distanceTo" { d2.sqrt() } else { d2 })
+                }
+                ("toString", _) => Some(marker(format!("({x}, {y}, {z})"))),
+                _ => None,
+            };
+        }
+        if let Some(option) = object.strip_prefix(OPTION) {
+            return match (option, name) {
+                ("renderDistance", "get") => {
+                    Some(marker(format!("integer:{}", frame.render_distance)))
+                }
+                ("mainHand", "get") => Some(marker(format!(
+                    "enum/net/minecraft/world/entity/HumanoidArm/{}",
+                    if frame.left_handed { "LEFT" } else { "RIGHT" }
+                ))),
+                ("hideGui", "get") => Some(boolean_value(frame.hide_gui)),
+                _ => None,
+            };
+        }
         if let Some(mapping) = object.strip_prefix(VANILLA_KEY) {
             return match (name, returns) {
                 ("isDown", "Z") => Some(flag(frame.vanilla_keys_down.iter().any(|k| k == mapping))),
@@ -1076,11 +1300,35 @@ impl StdHost {
                     Value::Ref(None)
                 }),
                 ("isSameThread", "Z") => Some(flag(true)),
+                ("getSingleplayerServer", _) => Some(if frame.single_player {
+                    marker(INTEGRATED_SERVER)
+                } else {
+                    Value::Ref(None)
+                }),
+                ("getTextureManager", _) => Some(marker(TEXTURE_MANAGER)),
+                ("getUser", _) if frame.player.is_some() => Some(marker(USER)),
+                ("execute", "V") | ("schedule" | "submit", _) => {
+                    let task = args.first()?.clone();
+                    if self.client.tasks.len() >= MAX_TASKS {
+                        return None;
+                    }
+                    self.client.tasks.push(task);
+                    // `submit` answers a future; nothing waits on it here.
+                    Some(if returns == "V" {
+                        Value::Void
+                    } else {
+                        Value::Ref(None)
+                    })
+                }
                 // `getCurrentServer` is null in single player and out of a
                 // world; a server's address and name are not in the façade.
                 ("getCurrentServer", _) if frame.single_player || frame.level.is_none() => {
                     Some(Value::Ref(None))
                 }
+                _ => None,
+            },
+            OPTIONS => match name {
+                "renderDistance" | "mainHand" => Some(marker(format!("{OPTION}{name}"))),
                 _ => None,
             },
             WINDOW => match (name, returns) {
@@ -1093,6 +1341,7 @@ impl StdHost {
             },
             GUI | HUD => match (name, returns) {
                 ("getChat", _) => Some(marker(CHAT)),
+                ("getGuiTicks", "I") => int(frame.gui_ticks),
                 // 26.3 reads the open screen through the GUI.
                 ("screen", _) if !frame.screen_open => Some(Value::Ref(None)),
                 ("setOverlayMessage", "V") => {
@@ -1117,6 +1366,9 @@ impl StdHost {
             },
             PLAYER => {
                 let p = frame.player.as_ref()?;
+                if let Some(value) = self.client_player_items(frame, name, returns, args) {
+                    return Some(value);
+                }
                 match (name, returns) {
                     ("displayClientMessage", "V") => {
                         let text = text_arg(args.first()?)?;
@@ -1133,6 +1385,8 @@ impl StdHost {
                         self.client.message(ClientMessage::Chat(text));
                         Some(Value::Void)
                     }
+                    ("position", _) => Some(vec3(p.pos)),
+                    ("getEyeY", "D") => double(p.pos[1] + if p.sneaking { 1.27 } else { 1.62 }),
                     ("getX", "D") => double(p.pos[0]),
                     ("getY", "D") => double(p.pos[1]),
                     ("getZ", "D") => double(p.pos[2]),
@@ -1169,6 +1423,52 @@ impl StdHost {
                         level.dimension
                     ))),
                     ("isClientSide", "Z") => Some(flag(true)),
+                    ("getMinY", "I") => int(level.min_y),
+                    ("getHeight", "I") => int(level.height),
+                    ("getMaxY", "I") => int(level.min_y + level.height - 1),
+                    _ => None,
+                }
+            }
+            GAME_RENDERER => match (name, returns) {
+                ("getMainCamera", _) if frame.camera.is_some() => Some(marker(CAMERA)),
+                _ => None,
+            },
+            CAMERA => {
+                let camera = frame.camera.as_ref()?;
+                match (name, returns) {
+                    ("position" | "getPosition", _) => Some(vec3(camera.pos)),
+                    ("xRot" | "getXRot", "F") => float(camera.pitch),
+                    ("yRot" | "getYRot" | "yaw", "F") => float(camera.yaw),
+                    ("isDetached", "Z") => Some(flag(camera.detached)),
+                    ("isInitialized", "Z") => Some(flag(true)),
+                    ("entity" | "getEntity", _) => Some(if frame.player.is_some() {
+                        marker(PLAYER)
+                    } else {
+                        Value::Ref(None)
+                    }),
+                    _ => None,
+                }
+            }
+            // Naming a texture is free; registering or uploading one is not
+            // modelled, and refuses.
+            TEXTURE_MANAGER => match (name, returns) {
+                ("getTexture", _) => {
+                    let (namespace, path) = identifier_parts(args.first()?);
+                    Some(marker(format!("client/texture/{namespace}:{path}")))
+                }
+                ("release", "V") => Some(Value::Void),
+                _ => None,
+            },
+            INTEGRATED_SERVER => match (name, returns) {
+                ("isDedicatedServer", "Z") => Some(flag(false)),
+                ("isSingleplayer", "Z") => Some(flag(true)),
+                _ => None,
+            },
+            USER => {
+                let p = frame.player.as_ref()?;
+                match (name, returns) {
+                    ("getName", _) => Some(marker(p.name.clone())),
+                    ("getProfileId", _) => uuid_value(&uuid_text(p.uuid)).ok(),
                     _ => None,
                 }
             }
@@ -1197,7 +1497,7 @@ impl StdHost {
             },
             GRAPHICS => self.graphics_call(frame, r, args),
             POSE => self.pose_call(r, args),
-            _ => None,
+            _ => self.client_item_answer(object, frame, r, args).flatten(),
         }
     }
 
@@ -1250,6 +1550,78 @@ impl StdHost {
                 let shadow = int_arg(args, 5).is_none_or(|v| v != 0);
                 state.text(text, v[0], v[1], v[2] as u32, shadow)
             }
+            ("horizontalLine", "(IIII)V") => {
+                let v = ints(0, 4)?;
+                let (x0, x1) = (v[0].min(v[1]), v[0].max(v[1]));
+                state.fill([x0, v[2], x1 + 1, v[2] + 1], v[3] as u32)
+            }
+            ("verticalLine", "(IIII)V") => {
+                let v = ints(0, 4)?;
+                let (y0, y1) = (v[1].min(v[2]), v[1].max(v[2]));
+                state.fill([v[0], y0 + 1, v[0] + 1, y1], v[3] as u32)
+            }
+            // A fill through an explicit pipeline (`RenderPipelines.GUI`).
+            ("fill", "(Lcom/mojang/blaze3d/pipeline/RenderPipeline;IIIII)V") => {
+                let v = ints(1, 5)?;
+                state.fill([v[0], v[1], v[2], v[3]], v[4] as u32)
+            }
+            ("item" | "fakeItem", descriptor)
+                if descriptor.starts_with("(Lnet/minecraft/world/item/ItemStack;II") =>
+            {
+                let slot = self.client_stack_slot(args.first()?)?;
+                let v = ints(1, 2)?;
+                return self
+                    .client_item_draw(frame, slot, [v[0], v[1]], true, None)
+                    .map(|()| Value::Void);
+            }
+            // `item(owner, stack, x, y, seed)`: the owner only seeds animation.
+            ("item", "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/item/ItemStack;III)V") => {
+                let slot = self.client_stack_slot(args.get(1)?)?;
+                let v = ints(2, 2)?;
+                return self
+                    .client_item_draw(frame, slot, [v[0], v[1]], true, None)
+                    .map(|()| Value::Void);
+            }
+            ("itemDecorations", descriptor)
+                if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;Lnet/minecraft/world/item/ItemStack;II") =>
+            {
+                let slot = self.client_stack_slot(args.get(1)?)?;
+                let v = ints(2, 2)?;
+                let count = args.get(4).map(|text| {
+                    text_arg(text).map(|t| match t {
+                        ClientText::Literal(s) | ClientText::Translatable(s) => s,
+                    })
+                });
+                return self
+                    .client_item_draw(frame, slot, [v[0], v[1]], false, Some(count.flatten()))
+                    .map(|()| Value::Void);
+            }
+            // `blitSprite(pipeline, sprite, x, y, w, h[, colour | alpha])`.
+            ("blitSprite", descriptor)
+                if descriptor.starts_with(
+                    "(Lcom/mojang/blaze3d/pipeline/RenderPipeline;Lnet/minecraft/resources/Identifier;IIII",
+                ) =>
+            {
+                let (namespace, path) = identifier_parts(args.get(1)?);
+                let v = ints(2, 4)?;
+                let argb = match (args.get(6), descriptor.contains("IIIIF)")) {
+                    (Some(alpha), true) => {
+                        let alpha = float_arg(std::slice::from_ref(alpha), 0)?;
+                        ((alpha.clamp(0.0, 1.0) * 255.0) as u32) << 24 | 0x00ff_ffff
+                    }
+                    (Some(Value::Int(colour)), false) => *colour as u32,
+                    _ => u32::MAX,
+                };
+                // A GUI sprite is named by its path under `textures/gui/sprites`;
+                // a mod's keeps its namespace.
+                let sprite = if namespace == "minecraft" {
+                    path.to_owned()
+                } else {
+                    format!("{namespace}:{path}")
+                };
+                let rect = state.posed_rect([v[0], v[1], v[0] + v[2], v[1] + v[3]]);
+                state.draw(DrawOp::Sprite { sprite, rect, argb })
+            }
             ("centeredText", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") =>
             {
@@ -1264,6 +1636,35 @@ impl StdHost {
             _ => return None,
         };
         drawn.ok().map(|()| Value::Void)
+    }
+
+    /// Records one item draw; `None` past [`MAX_DRAWS_PER_CALL`].
+    fn client_item_draw(
+        &mut self,
+        frame: &ClientSnapshot,
+        slot: StackSlot,
+        [x, y]: [i32; 2],
+        model: bool,
+        decorations: Option<Option<String>>,
+    ) -> Option<()> {
+        let stack = self.client_stack(frame, &slot);
+        // GuiGraphicsExtractor.item and itemDecorations draw nothing for an
+        // empty stack.
+        if stack.is_empty() {
+            return Some(());
+        }
+        let [sx, sy, tx, ty] = self.client.pose();
+        let made = matches!(slot, StackSlot::Made(_) | StackSlot::Empty);
+        self.client
+            .draw(DrawOp::Item {
+                stack,
+                slot: (!made).then_some(slot),
+                at: [x as f32 * sx + tx, y as f32 * sy + ty],
+                scale: [sx, sy],
+                model,
+                decorations,
+            })
+            .ok()
     }
 
     /// `Matrix3x2fStack` members the pose supports: push, pop, translate and
@@ -1328,6 +1729,11 @@ impl ClientState {
     }
 }
 
+/// A position the façade hands out as a `Vec3`.
+fn vec3([x, y, z]: [f64; 3]) -> Value {
+    marker(format!("{VEC3}{x},{y},{z}"))
+}
+
 fn uuid_text(uuid: u128) -> String {
     format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
@@ -1356,6 +1762,45 @@ impl NativeJar {
         host.client.poses.clear();
         let args = vec![marker(GRAPHICS), marker(DELTA)];
         let result = self.invoke_listener_callback(&layer.callback, args, host, budget);
+        host.truncate_call_log(marks);
+        result.map(|_| ())
+    }
+
+    /// Run one `Runnable` a callback queued with `Minecraft.execute`, through
+    /// `host` inside a client frame: a lambda of this jar, or an object of a
+    /// jar class with a `run()` method. Anything else (a JDK or game
+    /// runnable) is not a jar callback and refuses.
+    pub fn run_client_task(
+        &self,
+        task: &Value,
+        host: &mut StdHost,
+        budget: &ExecutionBudget,
+    ) -> Result<(), NativeError> {
+        let callback = match expect_ref(task) {
+            Some(text) if text.starts_with("@indy:") => {
+                parse_callback_marker(text)
+                    .ok()
+                    .map(|marker| ListenerCallback::Indy {
+                        target: marker.target,
+                        captures: marker.captures,
+                    })
+            }
+            _ => events::jar_object(self, task).and_then(|(class, value)| {
+                events::resolve_method(self, class, "run", "()V").map(|method| {
+                    ListenerCallback::Object {
+                        receiver: value.clone(),
+                        method,
+                    }
+                })
+            }),
+        };
+        let Some(callback) = callback else {
+            return Err(NativeError::Metadata(
+                "Minecraft.execute: the task is not a jar callback".into(),
+            ));
+        };
+        let marks = host.call_log_marks();
+        let result = self.invoke_listener_callback(&callback, Vec::new(), host, budget);
         host.truncate_call_log(marks);
         result.map(|_| ())
     }
@@ -1571,6 +2016,235 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The player's equipment, inventory and effects answer from the frame:
+    /// a damaged sword in the selected slot reads its durability, an armour
+    /// slot's item is the same marker `Items.<NAME>` reads, a built stack
+    /// starts from the item's facts, and an unlisted member still refuses.
+    #[test]
+    fn stacks_and_effects_answer_from_the_frame() {
+        let sword = ClientStack {
+            item: "minecraft:diamond_sword".into(),
+            count: 1,
+            damage: 400,
+            max_damage: 1561,
+            max_stack: 1,
+            name: "Diamond Sword".into(),
+            ..ClientStack::empty()
+        };
+        let helmet = ClientStack {
+            item: "minecraft:iron_helmet".into(),
+            count: 1,
+            max_damage: 165,
+            max_stack: 1,
+            ..ClientStack::empty()
+        };
+        let mut inventory = vec![ClientStack::empty(); 36];
+        inventory[2] = sword;
+        let frame = Arc::new(ClientSnapshot {
+            player: Some(ClientPlayer {
+                inventory,
+                selected: 2,
+                armor: [
+                    ClientStack::empty(),
+                    ClientStack::empty(),
+                    ClientStack::empty(),
+                    helmet,
+                ],
+                effects: vec![ClientEffect {
+                    id: "minecraft:speed".into(),
+                    amplifier: 1,
+                    duration: 600,
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
+                    category: "BENEFICIAL".into(),
+                    color: 0x33ebff,
+                }],
+                ..ClientPlayer::default()
+            }),
+            items: Arc::new(ItemTable::from([(
+                "minecraft:chest".into(),
+                ClientItem {
+                    max_stack: 64,
+                    max_damage: 0,
+                    name: "Chest".into(),
+                    block: true,
+                },
+            )])),
+            ..(*snapshot()).clone()
+        });
+        let mut host = StdHost::new();
+        host.begin_client_frame(frame, &[]);
+        let player = marker(PLAYER);
+        let call = |host: &mut StdHost,
+                    owner: &str,
+                    name: &str,
+                    desc: &str,
+                    receiver: &Value,
+                    args: &[Value]| {
+            host.client_call(&method(owner, name, desc), receiver, args)
+                .unwrap()
+                .unwrap()
+        };
+        const PLAYER_CLASS: &str = "net/minecraft/world/entity/player/Player";
+        const STACK_CLASS: &str = "net/minecraft/world/item/ItemStack";
+        let held = call(
+            &mut host,
+            PLAYER_CLASS,
+            "getMainHandItem",
+            "()Lnet/minecraft/world/item/ItemStack;",
+            &player,
+            &[],
+        );
+        assert_eq!(
+            call(&mut host, STACK_CLASS, "getMaxDamage", "()I", &held, &[]),
+            Value::Int(1561)
+        );
+        assert_eq!(
+            call(&mut host, STACK_CLASS, "getDamageValue", "()I", &held, &[]),
+            Value::Int(400)
+        );
+        assert_eq!(
+            call(&mut host, STACK_CLASS, "isDamaged", "()Z", &held, &[]),
+            Value::Int(1)
+        );
+        // Item.getBarWidth: round(13 - 400 * 13 / 1561) = 10.
+        assert_eq!(
+            call(&mut host, STACK_CLASS, "getBarWidth", "()I", &held, &[]),
+            Value::Int(10)
+        );
+        let head = call(
+            &mut host,
+            PLAYER_CLASS,
+            "getItemBySlot",
+            "(Lnet/minecraft/world/entity/EquipmentSlot;)Lnet/minecraft/world/item/ItemStack;",
+            &player,
+            &[marker("enum/net/minecraft/world/entity/EquipmentSlot/HEAD")],
+        );
+        let item = call(
+            &mut host,
+            STACK_CLASS,
+            "getItem",
+            "()Lnet/minecraft/world/item/Item;",
+            &head,
+            &[],
+        );
+        let constant = host
+            .client_static(&method(
+                "net/minecraft/world/item/Items",
+                "IRON_HELMET",
+                "Lnet/minecraft/world/item/Item;",
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(item, constant);
+        // The feet slot is empty: vanilla's empty stack counts 0.
+        let feet = call(
+            &mut host,
+            PLAYER_CLASS,
+            "getItemBySlot",
+            "(Lnet/minecraft/world/entity/EquipmentSlot;)Lnet/minecraft/world/item/ItemStack;",
+            &player,
+            &[marker("enum/net/minecraft/world/entity/EquipmentSlot/FEET")],
+        );
+        assert_eq!(
+            call(&mut host, STACK_CLASS, "isEmpty", "()Z", &feet, &[]),
+            Value::Int(1)
+        );
+        assert_eq!(
+            call(&mut host, STACK_CLASS, "getCount", "()I", &feet, &[]),
+            Value::Int(0)
+        );
+        // Inventory.getItem(39) is the head slot.
+        let inventory = call(
+            &mut host,
+            PLAYER_CLASS,
+            "getInventory",
+            "()Lnet/minecraft/world/entity/player/Inventory;",
+            &player,
+            &[],
+        );
+        let slot39 = call(
+            &mut host,
+            "net/minecraft/world/entity/player/Inventory",
+            "getItem",
+            "(I)Lnet/minecraft/world/item/ItemStack;",
+            &inventory,
+            &[Value::Int(39)],
+        );
+        assert_eq!(slot39, head);
+        // A built stack starts from the item's facts.
+        let chest = host
+            .client_static(&method(
+                "net/minecraft/world/level/block/Blocks",
+                "CHEST",
+                "Lnet/minecraft/world/level/block/Block;",
+            ))
+            .unwrap()
+            .unwrap();
+        let built = marker("net/minecraft/world/item/ItemStack#7");
+        call(
+            &mut host,
+            STACK_CLASS,
+            "<init>",
+            "(Lnet/minecraft/world/level/ItemLike;)V",
+            &built,
+            &[chest],
+        );
+        assert_eq!(
+            call(
+                &mut host,
+                STACK_CLASS,
+                "getMaxStackSize",
+                "()I",
+                &built,
+                &[]
+            ),
+            Value::Int(64)
+        );
+        assert_eq!(
+            call(&mut host, STACK_CLASS, "getCount", "()I", &built, &[]),
+            Value::Int(1)
+        );
+        // Effects: the active one reads its duration through its holder.
+        let speed = host
+            .client_static(&method(
+                "net/minecraft/world/effect/MobEffects",
+                "SPEED",
+                "Lnet/minecraft/core/Holder;",
+            ))
+            .unwrap()
+            .unwrap();
+        let effect = call(
+            &mut host,
+            PLAYER_CLASS,
+            "getEffect",
+            "(Lnet/minecraft/core/Holder;)Lnet/minecraft/world/effect/MobEffectInstance;",
+            &player,
+            &[speed],
+        );
+        assert_eq!(
+            call(
+                &mut host,
+                "net/minecraft/world/effect/MobEffectInstance",
+                "getDuration",
+                "()I",
+                &effect,
+                &[]
+            ),
+            Value::Int(600)
+        );
+        // An unlisted stack member refuses.
+        assert!(matches!(
+            host.client_call(
+                &method(STACK_CLASS, "getTooltipLines", "()Ljava/util/List;"),
+                &held,
+                &[]
+            ),
+            Some(Err(NativeError::UnknownHostCall(_)))
+        ));
     }
 
     #[test]

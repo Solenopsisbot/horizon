@@ -47,14 +47,16 @@ use std::{
 use horizon_client::{
     chat::ChatSource,
     hud::{HudBatch, rgba},
+    items::ItemStack,
     text::Text,
 };
 use horizon_client_input::mod_mappings;
 use horizon_native_java::{
     ExecutionBudget, NativeJar, StdHost,
     client_surface::{
-        ClientLevel, ClientMessage, ClientPlayer, ClientSnapshot, ClientText, DrawOp, HudLayer,
-        KeyPress, TextMetrics,
+        ClientCamera, ClientEffect, ClientItem, ClientLevel, ClientMessage, ClientPlayer,
+        ClientSnapshot, ClientStack, ClientText, DrawOp, HudLayer, ItemTable, KeyPress, StackSlot,
+        TextMetrics,
     },
     events::{EventContext, EventFacade, EventFiring, GameEvent, GameListener},
 };
@@ -391,6 +393,7 @@ fn run_listeners(
 ) -> (Vec<ClientMessage>, bool) {
     let event = firing.event;
     let presses: Vec<KeyPress> = keys.iter().map(|k| k.press).collect();
+    let firing_snapshot = Arc::clone(&snapshot);
     host.begin_client_frame(snapshot, &presses);
     let mut disabled_any = false;
     for slot in slots
@@ -427,11 +430,53 @@ fn run_listeners(
         slot.refusal = Some(reason);
         disabled_any = true;
     }
-    let out = host.end_client_frame();
-    for (key, press) in keys.iter_mut().zip(out.keys) {
+    let mut out = host.end_client_frame();
+    for (key, press) in keys.iter_mut().zip(std::mem::take(&mut out.keys)) {
         key.press = press;
     }
-    (out.messages, disabled_any)
+    let mut messages = out.messages;
+    messages.extend(run_tasks(file, jar, host, out.tasks, &firing_snapshot));
+    (messages, disabled_any)
+}
+
+/// Runs the `Minecraft.execute` tasks a firing queued, each in its own
+/// frame, as vanilla's `runAllTasks` runs them later in the same tick. A
+/// task may queue more; the rounds are bounded. A task that fails is
+/// logged and dropped (it ran once; there is nothing to disable). Returns
+/// the chat lines they sent.
+fn run_tasks(
+    file: &str,
+    jar: &NativeJar,
+    host: &mut StdHost,
+    mut tasks: Vec<horizon_native_java::Value>,
+    snapshot: &Arc<ClientSnapshot>,
+) -> Vec<ClientMessage> {
+    let mut messages = Vec::new();
+    for _ in 0..4 {
+        if tasks.is_empty() {
+            break;
+        }
+        let mut queued = Vec::new();
+        for task in tasks {
+            host.begin_client_frame(Arc::clone(snapshot), &[]);
+            let limit = ExecutionBudget::within(Duration::from_millis(10));
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                jar.run_client_task(&task, host, &limit)
+            }));
+            let out = host.end_client_frame();
+            match run {
+                Ok(Ok(())) => {
+                    RAN.fetch_add(1, Ordering::Relaxed);
+                    messages.extend(out.messages);
+                    queued.extend(out.tasks);
+                }
+                Ok(Err(error)) => refuse(file, "Minecraft.execute task", &error.to_string()),
+                Err(_) => refuse(file, "Minecraft.execute task", "panicked"),
+            }
+        }
+        tasks = queued;
+    }
+    messages
 }
 
 /// Logs one disabled callback, once.
@@ -490,6 +535,11 @@ impl Game<'_> {
         let max_health = self.player.as_mut().map_or(20.0, |p| {
             p.attribute("minecraft:max_health").unwrap_or(20.0) as f32
         });
+        let armor_value = self.player.as_mut().map_or(0, |p| {
+            p.attribute("minecraft:armor")
+                .or_else(|_| p.attribute("armor"))
+                .unwrap_or(0.0) as i32
+        });
         let player = if in_world {
             self.player.as_ref().map(|p| ClientPlayer {
                 uuid: self.remote.as_ref().map_or(0, |r| r.profile()),
@@ -516,6 +566,23 @@ impl Game<'_> {
                     horizon_client::command::args::GameMode::Spectator => "SPECTATOR",
                 }
                 .to_owned(),
+                inventory: (0..36)
+                    .map(|i| self.java_client_stack(self.inventory.get(i).and_then(Option::as_ref)))
+                    .collect(),
+                selected: self.selected.min(8),
+                // `armor` is head first; the façade keeps `Inventory`'s feet-first order.
+                armor: [3, 2, 1, 0].map(|i| self.java_client_stack(self.armor[i].as_ref())),
+                offhand: self.java_client_stack(self.offhand.as_ref()),
+                effects: self.java_client_effects(),
+                food: p.health.food.food,
+                saturation: p.health.food.saturation,
+                armor_value,
+                absorption: p.health.absorption(),
+                air: p.air,
+                max_air: 300,
+                xp_level: self.experience.level,
+                xp_progress: self.experience.progress,
+                xp_total: self.experience.total,
             })
         } else {
             None
@@ -524,6 +591,8 @@ impl Game<'_> {
             dimension: self.dim.id().to_owned(),
             game_time: self.world.game_time,
             day_time: self.world.day_time,
+            min_y: self.world.shape.min_y,
+            height: self.world.shape.height,
         });
         // Only the vanilla mappings `options.keyX` names are ever asked for.
         let vanilla = [
@@ -548,6 +617,18 @@ impl Game<'_> {
             paused: self.pause,
             single_player: self.integrated.is_some(),
             hide_gui: self.ui.hide_gui,
+            gui_ticks: self.visual_ticks() as i32,
+            render_distance: self.settings.render_distance,
+            left_handed: self.settings.main_hand_left,
+            camera: in_world
+                .then(|| self.eye_position())
+                .flatten()
+                .map(|pos| ClientCamera {
+                    pos,
+                    yaw: self.yaw,
+                    pitch: self.pitch,
+                    detached: !self.camera_type.first_person(),
+                }),
             screen_open: self.title.is_some() || self.screen != Screen::Playing,
             debug_screen: self.debug,
             gui_size: [gui[0] as i32, gui[1] as i32],
@@ -557,7 +638,88 @@ impl Game<'_> {
             fps: self.frame_reading().0 as i32,
             vanilla_keys_down,
             metrics: Arc::default(),
+            items: self.java_client_items(),
+            tooltip_stack: None,
         }
+    }
+
+    /// A stack as the façade shows it; `None` is an empty slot.
+    fn java_client_stack(&self, stack: Option<&ItemStack>) -> ClientStack {
+        let Some(stack) = stack.filter(|s| &*s.item != "minecraft:air" && s.count > 0) else {
+            return ClientStack::empty();
+        };
+        let info = self.res.items().get(&stack.item);
+        ClientStack {
+            item: stack.item.to_string(),
+            count: stack.count as i32,
+            damage: stack.damage as i32,
+            max_damage: info.map_or(0, |i| i.max_damage as i32),
+            max_stack: info.map_or(64, |i| i.max_stack as i32),
+            name: stack
+                .custom_name()
+                .unwrap_or_else(|| self.pack.names.display_item(&stack.item)),
+            foil: stack.has_foil(false),
+            enchanted: stack.has_any_enchantments(),
+            block: info.is_some_and(|i| i.block.is_some()),
+        }
+    }
+
+    /// The player's active effects, in the order the game keeps them.
+    fn java_client_effects(&self) -> Vec<ClientEffect> {
+        use horizon_client_core::potions::{Category, effect};
+        self.potions
+            .effects
+            .list
+            .iter()
+            .map(|e| {
+                let def = effect(e.id);
+                ClientEffect {
+                    id: horizon_client_core::potions::namespaced(e.id).to_owned(),
+                    amplifier: e.amplifier,
+                    duration: e.duration,
+                    ambient: e.ambient,
+                    visible: e.visible,
+                    // Horizon keeps no showIcon flag: every effect shows its icon.
+                    show_icon: true,
+                    category: match def.map(|d| d.category) {
+                        Some(Category::Beneficial) => "BENEFICIAL",
+                        Some(Category::Harmful) => "HARMFUL",
+                        _ => "NEUTRAL",
+                    }
+                    .to_owned(),
+                    color: def.map_or(0, |d| d.color as i32),
+                }
+            })
+            .collect()
+    }
+
+    /// Every item's facts, built once (names in the language of the first
+    /// firing) and shared by every snapshot.
+    fn java_client_items(&self) -> Arc<ItemTable> {
+        static TABLE: Mutex<Option<Arc<ItemTable>>> = Mutex::new(None);
+        let mut table = TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(table) = &*table {
+            return Arc::clone(table);
+        }
+        let items = self.res.items();
+        let built: ItemTable = items
+            .items
+            .values()
+            .map(|info| {
+                (
+                    info.id.to_string(),
+                    ClientItem {
+                        max_stack: info.max_stack as i32,
+                        max_damage: info.max_damage as i32,
+                        name: self.pack.names.display_item(&info.id),
+                        block: info.block.is_some(),
+                    },
+                )
+            })
+            .collect();
+        let built = Arc::new(built);
+        *table = Some(Arc::clone(&built));
+        built
     }
 
     /// Fires `event` at every jar's listeners, then shows what they sent.
@@ -741,6 +903,7 @@ impl Game<'_> {
         let base = self.java_client_snapshot(Some([batch.width, batch.height]));
         let mut advances: Option<Vec<f32>> = None;
         let mut draws = Vec::new();
+        let mut messages = Vec::new();
         let mut store = store();
         let mut disabled = false;
         for entry in store.iter_mut() {
@@ -780,6 +943,14 @@ impl Game<'_> {
                         for (key, press) in entry.keys.iter_mut().zip(out.keys) {
                             key.press = press;
                         }
+                        messages.extend(out.messages);
+                        messages.extend(run_tasks(
+                            &entry.file,
+                            &entry.jar,
+                            &mut host,
+                            out.tasks,
+                            &snapshot,
+                        ));
                         continue;
                     }
                     Ok(Err(error)) => error.to_string(),
@@ -800,6 +971,7 @@ impl Game<'_> {
         }
         drop(store);
         self.java_client_draw(batch, draws);
+        self.java_client_messages(messages);
     }
 
     /// Draws the recorded ops in order, through the HUD's own fill and text.
@@ -844,22 +1016,120 @@ impl Game<'_> {
                         batch.scale_since(start, 0.0, 0.0, sx, sy);
                     }
                 }
+                DrawOp::Sprite { sprite, rect, argb } => {
+                    // A sprite the GUI atlas lacks draws nothing (vanilla
+                    // would show its missing texture).
+                    let Some(r) = atlas.sprites.get(sprite.as_str()).copied() else {
+                        continue;
+                    };
+                    batch.rect_uv(rect[0], rect[1], rect[2], rect[3], r, color(argb));
+                }
+                DrawOp::Item {
+                    stack,
+                    slot,
+                    at,
+                    scale,
+                    model,
+                    decorations,
+                } => {
+                    let real = slot.and_then(|slot| self.java_client_slot_stack(&slot));
+                    let stack = real.unwrap_or_else(|| {
+                        let mut built =
+                            ItemStack::new(stack.item.as_str(), stack.count.max(0) as u32);
+                        built.damage = stack.damage.max(0) as u32;
+                        built
+                    });
+                    if self.res.items().get(&stack.item).is_none()
+                        || scale[0] == 0.0
+                        || scale[1] == 0.0
+                    {
+                        continue;
+                    }
+                    // Laid out at the unscaled spot, then scaled about the
+                    // origin, as text is.
+                    let start = batch.vertices.len();
+                    let (x, y) = (at[0] / scale[0], at[1] / scale[1]);
+                    if model {
+                        self.draw_item_model(batch, &stack, x, y);
+                    }
+                    if let Some(count) = decorations {
+                        self.draw_item_decorations(batch, &stack, x, y, count);
+                    }
+                    batch.scale_since(start, 0.0, 0.0, scale[0], scale[1]);
+                }
             }
+        }
+    }
+
+    /// The game's own stack in a façade slot, so a mod's item draws with its
+    /// components (glint, trims, dye).
+    fn java_client_slot_stack(&self, slot: &StackSlot) -> Option<ItemStack> {
+        match slot {
+            StackSlot::Inventory(i) => self.inventory.get(*i).cloned().flatten(),
+            StackSlot::MainHand => self.inventory.get(self.selected).cloned().flatten(),
+            StackSlot::OffHand => self.offhand.clone(),
+            // `armor` is head first; the façade's armour index is feet first.
+            StackSlot::Armor(i) => self.armor.get(3usize.checked_sub(*i)?).cloned().flatten(),
+            StackSlot::Tooltip | StackSlot::Empty | StackSlot::Made(_) => None,
         }
     }
 }
 
-/// A mod's text as the HUD and chat draw it: a string's `§` codes format it;
-/// a translatable key reads through the game's language, then the mod's own
-/// lang lines, else shows the key (vanilla's missing translation).
+/// A mod's text as the HUD and chat draw it: a string's `§` codes format it
+/// (`client_text.rs` writes a component's style as them, an RGB colour as
+/// `§#rrggbb`); a translatable key, after its own codes, reads through the
+/// game's language, then the mod's own lang lines, else shows the key
+/// (vanilla's missing translation).
 fn java_text(text: &ClientText) -> Text {
     match text {
-        ClientText::Literal(s) if s.contains('§') => Text::legacy(s),
-        ClientText::Literal(s) => Text::literal(s.clone()),
+        ClientText::Literal(s) => styled_text(s),
         ClientText::Translatable(key) => {
-            Text::literal(mod_mappings::translation(key).unwrap_or_else(|| key.clone()))
+            let (codes, key) = horizon_native_java::client_surface::split_codes(key);
+            let shown = mod_mappings::translation(key).unwrap_or_else(|| key.to_owned());
+            styled_text(&format!("{codes}{shown}"))
         }
     }
+}
+
+/// Legacy-coded text with the client surface's `§#rrggbb` colour code.
+fn styled_text(s: &str) -> Text {
+    use horizon_client::text::{Span, Style, legacy_format};
+    if !s.contains('§') {
+        return Text::literal(s.to_owned());
+    }
+    let mut out = Text::default();
+    let mut style = Style::default();
+    let mut current = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '§' {
+            current.push(c);
+            continue;
+        }
+        let Some(code) = chars.next() else { break };
+        if !current.is_empty() {
+            out.spans.push(Span {
+                text: std::mem::take(&mut current),
+                style: style.clone(),
+            });
+        }
+        if code == '#' {
+            let hex: String = chars.by_ref().take(6).collect();
+            if let Ok(rgb) = u32::from_str_radix(&hex, 16) {
+                // A colour clears the decorations, as a legacy colour does.
+                style = Style::color(rgb);
+            }
+            continue;
+        }
+        style = legacy_format(&style, code, &Style::default());
+    }
+    if !current.is_empty() {
+        out.spans.push(Span {
+            text: current,
+            style,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1086,6 +1356,8 @@ mod tests {
                 dimension: "minecraft:overworld".into(),
                 game_time: 1000,
                 day_time: 1000,
+                min_y: -64,
+                height: 384,
             }),
             gui_size: [427, 240],
             window_size: [854, 480],
