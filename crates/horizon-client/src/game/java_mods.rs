@@ -1124,13 +1124,54 @@ fn link_nested_jars(
         }
         *nested_total = nested_total.saturating_add(bytes.len() as u64);
         found += 1;
-        if let Err(error) =
-            table.link_classes(format!("{outer_id}!/{name}"), nested_classes(&bytes))
-        {
-            log::debug!(
+        match table.link_classes(format!("{outer_id}!/{name}"), nested_classes(&bytes)) {
+            Ok(_) => link_nested_services(table, &bytes),
+            Err(error) => log::debug!(
                 "Horizon: Java class path skipped nested jar {name} in {}: {error}",
                 path.display()
-            );
+            ),
+        }
+    }
+}
+
+/// Service files one nested jar's `META-INF/services` folder may hold, and the
+/// bytes one of them may take. A service file is a short list of class names.
+const MAX_NESTED_SERVICE_FILES: usize = 256;
+const MAX_NESTED_SERVICE_FILE_BYTES: u64 = 64 << 10;
+
+/// Seeds the `META-INF/services` rows of one nested jar into `table`.
+///
+/// A loader puts a JiJ/JarJar jar on the class path, so `ServiceLoader` sees
+/// its provider rows: Xaero's maps find their platform helper through the
+/// bundled `xaerolib`'s own service file. The native host answers an empty
+/// loader for a mod's service type with no seeded rows, so a nested library's
+/// rows have to be here or the loader would wrongly look empty.
+fn link_nested_services(table: &mut LinkedClassTable, bytes: &[u8]) {
+    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(bytes)) else {
+        return;
+    };
+    let mut files = 0usize;
+    for index in 0..archive.len() {
+        let Ok(entry) = archive.by_index(index) else {
+            continue;
+        };
+        let Ok(name) = entry.name() else {
+            continue;
+        };
+        let name = name.into_owned();
+        if !name.starts_with("META-INF/services/") || entry.size() > MAX_NESTED_SERVICE_FILE_BYTES {
+            continue;
+        }
+        if files >= MAX_NESTED_SERVICE_FILES {
+            return;
+        }
+        files += 1;
+        let mut data = Vec::new();
+        if std::io::Read::take(entry, MAX_NESTED_SERVICE_FILE_BYTES)
+            .read_to_end(&mut data)
+            .is_ok()
+        {
+            table.link_service_file(&name, &data);
         }
     }
 }

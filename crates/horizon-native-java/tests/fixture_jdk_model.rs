@@ -1,0 +1,422 @@
+//! JDK and logging-library modelling a mod's config bootstrap reaches,
+//! compiled from real Java at test time.
+//!
+//! Each probe method is ordinary Java the JVM answers one way; the expected
+//! strings below are what `java` prints for the same code, not values read
+//! back from the interpreter. The cases come from real refused jars:
+//! NightConfig's class-typed calls into interface defaults and its own
+//! `Reader` subclass (TerraBlender), `Collectors.toMap` (Legacy4J), a
+//! spliterator-backed service stream (rrls), a null charset or logger in a
+//! builder's `requireNonNull` (servercore, Xaero's maps), and a mod's own
+//! service type with no providers (main-menu-credits).
+//!
+//! The logging stubs are compiled for `javac` but left out of the jar: the jar
+//! must reach the host's logger model, as a real mod reaches the platform's.
+
+use horizon_native_java::{NativeJar, StdHost, Value};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use zip::write::SimpleFileOptions;
+
+const LOG4J_MANAGER: &str = r#"package org.apache.logging.log4j;
+public class LogManager {
+    public static Logger getLogger(Class<?> type) { return null; }
+}
+"#;
+
+const LOG4J_LOGGER: &str = r#"package org.apache.logging.log4j;
+public interface Logger {
+    String getName();
+    boolean isDebugEnabled();
+    void info(String message, Object argument);
+}
+"#;
+
+const SLF4J_FACTORY: &str = r#"package org.slf4j;
+public class LoggerFactory {
+    public static Logger getLogger(String name) { return null; }
+}
+"#;
+
+const SLF4J_LOGGER: &str = r#"package org.slf4j;
+public interface Logger {
+    String getName();
+    boolean isInfoEnabled();
+    void warn(String message);
+}
+"#;
+
+const PROBE: &str = r#"package demo;
+
+import java.io.IOException;
+import java.io.Reader;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.ServiceLoader;
+import java.util.Spliterators;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
+
+interface Parser {
+    default String parse(String text) { return "parsed:" + text; }
+}
+
+final class TomlLikeParser implements Parser {}
+
+interface Shape {
+    String name();
+}
+
+abstract class BaseShape implements Shape {
+    String describe() { return "shape:" + name(); }
+}
+
+final class Square extends BaseShape {
+    public String name() { return "square"; }
+}
+
+/** A jar `Reader` over a string, the shape of NightConfig's `FastStringReader`. */
+final class TextReader extends Reader {
+    private final String text;
+    private int cursor;
+    TextReader(String text) { this.text = text; }
+    @Override public int read() { return cursor < text.length() ? text.charAt(cursor++) : -1; }
+    @Override public int read(char[] buffer, int offset, int length) { return -1; }
+    @Override public void close() {}
+}
+
+/** Counts 0, 1, 2 through `tryAdvance`, like rrls's service spliterator. */
+final class Counting extends Spliterators.AbstractSpliterator<Integer> {
+    private int next;
+    Counting() { super(Long.MAX_VALUE, 0); }
+    @Override public boolean tryAdvance(Consumer<? super Integer> action) {
+        if (next >= 3) return false;
+        action.accept(next++);
+        return true;
+    }
+}
+
+interface Integration {}
+
+public final class Probe {
+    public static String defaults() {
+        return new TomlLikeParser().parse("x") + "|" + new Square().describe();
+    }
+
+    public static String readerSubclass() throws IOException {
+        Reader reader = new TextReader("abc");
+        StringBuilder out = new StringBuilder();
+        int c;
+        while ((c = reader.read()) != -1) {
+            out.append((char) c);
+        }
+        return out.toString();
+    }
+
+    public static String instanceOf() {
+        Object number = Integer.valueOf(3);
+        Object list = new ArrayList<String>();
+        Object map = new HashMap<String, Integer>();
+        Object flag = Boolean.valueOf(true);
+        return (number instanceof Number) + "|" + (number instanceof Integer) + "|"
+            + (number instanceof String) + "|" + (list instanceof List) + "|"
+            + (list instanceof Map) + "|" + (map instanceof Map) + "|"
+            + (flag instanceof Boolean) + "|" + (flag instanceof Number);
+    }
+
+    public static String charSequence() {
+        CharSequence text = "hello";
+        StringBuilder builder = new StringBuilder("ab");
+        CharSequence built = builder;
+        return text.length() + "|" + text.charAt(1) + "|" + built.length() + "|"
+            + text.subSequence(1, 3);
+    }
+
+    public static String toMap() {
+        Map<String, Integer> lengths = List.of("a", "bb", "ccc").stream()
+            .collect(Collectors.toMap(s -> s, String::length));
+        String duplicate;
+        try {
+            List.of("x", "x").stream().collect(Collectors.toMap(s -> s, s -> 1));
+            duplicate = "no-throw";
+        } catch (IllegalStateException error) {
+            duplicate = "duplicate";
+        }
+        Map<String, Integer> merged = List.of("x", "y", "x").stream()
+            .collect(Collectors.toMap(s -> s, s -> 1, Integer::sum));
+        return lengths.size() + "|" + lengths.get("bb") + "|" + duplicate + "|"
+            + merged.get("x") + "|" + merged.get("y");
+    }
+
+    public static String spliteratorStream() {
+        List<Integer> values = StreamSupport.stream(new Counting(), false)
+            .collect(Collectors.toList());
+        return values.size() + "|" + values.get(0) + "|" + values.get(2);
+    }
+
+    public static String charsets() {
+        Charset utf8 = Objects.requireNonNull(StandardCharsets.UTF_8, "charset");
+        String unsupported;
+        try {
+            Charset.forName("no-such-charset");
+            unsupported = "found";
+        } catch (IllegalArgumentException error) {
+            unsupported = "unsupported";
+        }
+        return utf8.name() + "|" + Charset.forName("utf8").equals(utf8) + "|"
+            + StandardCharsets.ISO_8859_1.name() + "|" + unsupported;
+    }
+
+    public static String loggers() {
+        org.apache.logging.log4j.Logger log4j =
+            org.apache.logging.log4j.LogManager.getLogger(Probe.class);
+        org.slf4j.Logger slf4j = org.slf4j.LoggerFactory.getLogger("demo-config");
+        log4j.info("value {}", "x");
+        slf4j.warn("careful");
+        return (log4j != null) + "|" + log4j.getName() + "|" + log4j.isDebugEnabled() + "|"
+            + slf4j.getName() + "|" + slf4j.isInfoEnabled();
+    }
+
+    public static String emptyService() {
+        ServiceLoader<Integration> loader = ServiceLoader.load(Integration.class);
+        Iterator<Integration> providers = loader.iterator();
+        return String.valueOf(providers.hasNext());
+    }
+
+    public static String resolveSibling() {
+        return Path.of("/cfg/a.json").resolveSibling("b.json").toString();
+    }
+
+    public static String subList() {
+        List<Integer> values = new ArrayList<>();
+        values.add(1);
+        values.add(2);
+        values.add(3);
+        values.add(4);
+        List<Integer> middle = values.subList(1, 3);
+        String reversed;
+        try {
+            values.subList(3, 1);
+            reversed = "no-throw";
+        } catch (IllegalArgumentException error) {
+            reversed = "illegal";
+        }
+        return middle.size() + "|" + middle.get(0) + "|" + middle.get(1) + "|" + reversed;
+    }
+
+    public static String constructorReference() {
+        Supplier<Map<String, Integer>> factory = HashMap::new;
+        Map<String, Integer> map = factory.get();
+        map.put("a", 1);
+        map.put("b", 2);
+        return (map != null) + "|" + map.size() + "|" + map.get("b");
+    }
+}
+"#;
+
+fn javac() -> PathBuf {
+    std::env::var_os("JAVA_HOME")
+        .map(|home| PathBuf::from(home).join("bin/javac"))
+        .unwrap_or_else(|| "javac".into())
+}
+
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    fs::read_dir(root)
+        .unwrap()
+        .flat_map(|entry| {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files_under(&path)
+            } else {
+                vec![path]
+            }
+        })
+        .collect()
+}
+
+struct Fixture {
+    root: PathBuf,
+    jar: NativeJar,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+impl Fixture {
+    fn build(test: &str) -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-native-java-jdk-{test}-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut fixture = Self {
+            root,
+            jar: NativeJar::default(),
+        };
+        let classes = fixture.root.join("classes");
+        let sources = [
+            ("org/apache/logging/log4j/LogManager.java", LOG4J_MANAGER),
+            ("org/apache/logging/log4j/Logger.java", LOG4J_LOGGER),
+            ("org/slf4j/LoggerFactory.java", SLF4J_FACTORY),
+            ("org/slf4j/Logger.java", SLF4J_LOGGER),
+            ("demo/Probe.java", PROBE),
+        ];
+        let mut javac = Command::new(javac());
+        javac.args(["--release", "21", "-d"]).arg(&classes);
+        for (path, source) in sources {
+            let file = fixture.root.join("src").join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, source).unwrap();
+            javac.arg(file);
+        }
+        let status = javac.status().unwrap();
+        assert!(status.success(), "javac failed for jdk fixture {test}");
+
+        let jar_path = fixture.root.join("jdk.jar");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&jar_path).unwrap());
+        zip.start_file("fabric.mod.json", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(
+            br#"{"id":"jdk-fixture","version":"1.0","entrypoints":{"main":"demo.Probe"}}"#,
+        )
+        .unwrap();
+        // Only the mod's own classes ship: the logging stubs exist for javac.
+        for class in files_under(&classes.join("demo")) {
+            let entry = class
+                .strip_prefix(&classes)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            zip.start_file(entry, SimpleFileOptions::default()).unwrap();
+            zip.write_all(&fs::read(class).unwrap()).unwrap();
+        }
+        zip.finish().unwrap();
+
+        fixture.jar = NativeJar::from_path(&jar_path).unwrap();
+        fixture
+    }
+
+    fn text(&self, method: &str) -> String {
+        let mut host = self.jar.seed_host(StdHost::new());
+        match self
+            .jar
+            .invoke_method_with_args(
+                "demo/Probe",
+                method,
+                "()Ljava/lang/String;",
+                None,
+                &[],
+                &mut host,
+            )
+            .unwrap_or_else(|error| panic!("{method} failed: {error}"))
+        {
+            Value::Ref(Some(text)) => text,
+            other => panic!("{method} did not return a string: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn class_typed_calls_reach_interface_defaults_and_receiver_overrides() {
+    // `TomlLikeParser.parse` is only an interface default; `BaseShape.name()`
+    // is only declared (abstractly) by `Shape`, so the receiver picks it.
+    let fixture = Fixture::build("defaults");
+    assert_eq!(fixture.text("defaults"), "parsed:x|shape:square");
+}
+
+#[test]
+fn a_jar_reader_subclass_runs_its_own_read() {
+    // The call site is `java/io/Reader.read()`; the JVM selects the override.
+    let fixture = Fixture::build("reader");
+    assert_eq!(fixture.text("readerSubclass"), "abc");
+}
+
+#[test]
+fn instanceof_sees_boxed_and_collection_supertypes() {
+    let fixture = Fixture::build("instanceof");
+    assert_eq!(
+        fixture.text("instanceOf"),
+        "true|true|false|true|false|true|true|false"
+    );
+}
+
+#[test]
+fn char_sequence_calls_answer_from_the_text() {
+    let fixture = Fixture::build("charseq");
+    assert_eq!(fixture.text("charSequence"), "5|e|2|el");
+}
+
+#[test]
+fn collectors_to_map_keys_values_rejects_duplicates_and_merges() {
+    let fixture = Fixture::build("tomap");
+    assert_eq!(fixture.text("toMap"), "3|2|duplicate|2|1");
+}
+
+#[test]
+fn stream_support_drains_a_jar_spliterator() {
+    let fixture = Fixture::build("spliterator");
+    assert_eq!(fixture.text("spliteratorStream"), "3|0|2");
+}
+
+#[test]
+fn standard_charsets_are_real_values_and_unknown_names_throw() {
+    let fixture = Fixture::build("charsets");
+    assert_eq!(
+        fixture.text("charsets"),
+        "UTF-8|true|ISO-8859-1|unsupported"
+    );
+}
+
+#[test]
+fn logger_factories_answer_named_disabled_loggers() {
+    let fixture = Fixture::build("loggers");
+    assert_eq!(
+        fixture.text("loggers"),
+        "true|demo.Probe|false|demo-config|false"
+    );
+}
+
+#[test]
+fn a_mod_service_with_no_providers_is_an_empty_loader() {
+    let fixture = Fixture::build("service");
+    assert_eq!(fixture.text("emptyService"), "false");
+}
+
+#[test]
+fn path_resolve_sibling_replaces_the_file_name() {
+    let fixture = Fixture::build("sibling");
+    assert_eq!(fixture.text("resolveSibling"), "/cfg/b.json");
+}
+
+#[test]
+fn sub_list_copies_the_range_and_checks_bounds() {
+    let fixture = Fixture::build("sublist");
+    assert_eq!(fixture.text("subList"), "2|2|3|illegal");
+}
+
+#[test]
+fn a_jdk_constructor_reference_builds_a_usable_collection() {
+    let fixture = Fixture::build("ctor-ref");
+    assert_eq!(fixture.text("constructorReference"), "true|2|2");
+}

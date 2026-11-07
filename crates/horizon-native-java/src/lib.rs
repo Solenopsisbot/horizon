@@ -18,6 +18,7 @@ pub mod weaver;
 mod declarations_content;
 mod game_hooks;
 mod java_regex;
+mod jdk_model;
 mod stack_walk;
 
 pub use game_hooks::{
@@ -2142,6 +2143,21 @@ const MAX_INVOKE_HOOKS: usize = 128;
 /// malformed.  A jar's own hierarchy is a handful of classes; the bound only
 /// stops a class file whose `super_class` chain loops.
 const MAX_SUPERCLASS_WALK: usize = 32;
+
+/// The methods `java.lang.Enum` declares itself. An enum's superclass answers
+/// these, so an interface default of the same name never applies to it.
+const ENUM_DECLARED_METHODS: &[&str] = &[
+    "name",
+    "ordinal",
+    "compareTo",
+    "equals",
+    "hashCode",
+    "toString",
+    "getDeclaringClass",
+    "describeConstable",
+    "clone",
+    "finalize",
+];
 /// Exception-table rows one method may declare before the table is refused.
 /// A real `try`/`catch` chain has a handful; the bound keeps a crafted class
 /// from making every throw walk an unbounded table.
@@ -3542,6 +3558,9 @@ impl Host for StdHost {
         if let Some(value) = self.game_event_static(r) {
             return Ok(value);
         }
+        if let Some(value) = jdk_model::static_field(&r.owner, &r.name) {
+            return Ok(value);
+        }
         // Registry statics get a stable marker instead of a null constant so
         // registration calls downstream can name their target registry.
         if let Some(id) = registry_static_id(&r.owner, &r.name) {
@@ -3683,6 +3702,9 @@ impl Host for StdHost {
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
+        if let Some(value) = jdk_model::static_call(r, args) {
+            return value;
+        }
         if let Some(value) = self.networking_register(r, args) {
             return Ok(value);
         }
@@ -3695,11 +3717,21 @@ impl Host for StdHost {
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             // ServiceLoader is deterministic only when its provider set is
             // explicitly seeded. Never inspect the host JVM class path.
+            //
+            // A service type no host root models (a mod's own API interface)
+            // can only have providers in the mod jars, and the seeded table
+            // already holds every `META-INF/services` row of the running jar
+            // and of the pack's linked jars: that set *is* the class path, so
+            // an empty one is the JVM's answer, an empty loader. A JDK or game
+            // service could have providers the native path never sees, so it
+            // is still refused.
             ("java/util/ServiceLoader", "load" | "loadInstalled", descriptor)
                 if descriptor.starts_with("(Ljava/lang/Class;") =>
             {
                 let service = expect_string(Self::argument(r, args, 0)?).replace('.', "/");
-                if !self.merged_service_providers(&service).is_empty() {
+                if !self.merged_service_providers(&service).is_empty()
+                    || !host_models_class(&service)
+                {
                     Ok(Value::Ref(Some(format!("service-loader/{service}"))))
                 } else {
                     Err(NativeError::Metadata(format!(
@@ -4751,6 +4783,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(value) = jdk_model::instance_call(r, receiver, args) {
+            return value;
+        }
         // `Object.getClass` is the bridge from a value marker back to the
         // reflective class surface config code uses for field discovery.
         if r.owner == "java/lang/Object"
@@ -5504,6 +5539,9 @@ impl Host for StdHost {
                     }
                     return Ok(values[0].clone());
                 }
+                (owner, "subList", "(II)Ljava/util/List;") if is_list_like_owner(owner) => {
+                    return self.sub_list(r, marker, args);
+                }
                 (owner, "add", "(Ljava/lang/Object;)Z") if is_list_like_owner(owner) => {
                     let value = Self::argument(r, args, 0)?.clone();
                     self.mutable_collections
@@ -6056,7 +6094,7 @@ impl Host for StdHost {
             })?;
             if r.name == "iterator" && r.descriptor == "()Ljava/util/Iterator;" {
                 let providers = self.merged_service_providers(service);
-                if providers.is_empty() {
+                if providers.is_empty() && host_models_class(service) {
                     return Err(NativeError::Metadata(format!(
                         "unknown seeded ServiceLoader service {service}"
                     )));
@@ -6075,6 +6113,10 @@ impl Host for StdHost {
                 && let Some(provider) = self.merged_service_providers(service).first()
             {
                 return Ok(Value::Ref(Some(format!("optional/{provider}"))));
+            }
+            // No provider: `Optional.empty()`, which this host models as null.
+            if r.name == "findFirst" && r.descriptor == "()Ljava/util/Optional;" {
+                return Ok(Value::Ref(None));
             }
             if r.name == "reload" && r.descriptor == "()V" {
                 return Ok(Value::Void);
@@ -9142,7 +9184,9 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         | "java/lang/ArrayStoreException"
         | "java/util/NoSuchElementException"
         | "java/io/UncheckedIOException" => "java/lang/RuntimeException",
-        "java/lang/NumberFormatException" => "java/lang/IllegalArgumentException",
+        "java/lang/NumberFormatException"
+        | "java/nio/charset/UnsupportedCharsetException"
+        | "java/nio/charset/IllegalCharsetNameException" => "java/lang/IllegalArgumentException",
         "java/lang/IllegalMonitorStateException" => "java/lang/RuntimeException",
         "java/lang/ArrayIndexOutOfBoundsException"
         | "java/lang/StringIndexOutOfBoundsException"
@@ -11780,36 +11824,47 @@ impl LinkedClassTable {
     /// must not cost the whole jar its classes.
     fn link_services(&mut self, jar: &NativeJar) {
         for name in jar.resources.keys() {
-            let Some(service) = name.strip_prefix("META-INF/services/") else {
-                continue;
-            };
-            if service.is_empty() || service.contains('/') {
+            if let Some(bytes) = jar.resource_bytes.get(name) {
+                self.link_service_file(name, bytes);
+            }
+        }
+    }
+
+    /// Seed the providers one `META-INF/services/<service>` file declares.
+    ///
+    /// [`Self::link_jar`] calls this for a library jar's own files; a caller
+    /// that links a nested (JiJ/JarJar) jar through [`Self::link_classes`]
+    /// passes the nested jar's service files here, because a loader puts the
+    /// nested jar on the class path and `ServiceLoader` sees its rows too. Any
+    /// other entry name is ignored, and past [`Self::MAX_PROVIDERS`] seeding
+    /// stops, so a hostile file costs nothing but its own rows.
+    pub fn link_service_file(&mut self, name: &str, bytes: &[u8]) {
+        let Some(service) = name.strip_prefix("META-INF/services/") else {
+            return;
+        };
+        if service.is_empty() || service.contains('/') {
+            return;
+        }
+        let service = service.replace('.', "/");
+        if is_platform_class(&service) {
+            return;
+        }
+        for line in String::from_utf8_lossy(bytes).lines() {
+            if self.providers >= Self::MAX_PROVIDERS {
+                return;
+            }
+            let provider = line.split_once('#').map_or(line, |(line, _)| line).trim();
+            if provider.is_empty() {
                 continue;
             }
-            let Some(bytes) = jar.resource_bytes.get(name) else {
-                continue;
-            };
-            let service = service.replace('.', "/");
-            if is_platform_class(&service) {
+            let providers = self.services.entry(service.clone()).or_default();
+            let provider = provider.replace('.', "/");
+            if is_platform_class(&provider) {
                 continue;
             }
-            for line in String::from_utf8_lossy(bytes).lines() {
-                if self.providers >= Self::MAX_PROVIDERS {
-                    return;
-                }
-                let provider = line.split_once('#').map_or(line, |(line, _)| line).trim();
-                if provider.is_empty() {
-                    continue;
-                }
-                let providers = self.services.entry(service.clone()).or_default();
-                let provider = provider.replace('.', "/");
-                if is_platform_class(&provider) {
-                    continue;
-                }
-                if !providers.contains(&provider) {
-                    providers.push(provider);
-                    self.providers += 1;
-                }
+            if !providers.contains(&provider) {
+                providers.push(provider);
+                self.providers += 1;
             }
         }
     }
@@ -18361,6 +18416,9 @@ impl<H: Host> Runtime<'_, H> {
         let Some(marker) = expect_ref(marker) else {
             return Ok(None);
         };
+        if marker.starts_with(jdk_model::COLLECTING_CONSUMER_PREFIX) {
+            return self.collecting_consumer_accept(marker, args);
+        }
         // A composition marker closes over the two callbacks it joined. Running
         // it means running both, in the order the combinator defines — not
         // answering the marker itself.
@@ -18419,19 +18477,29 @@ impl<H: Host> Runtime<'_, H> {
             values.extend_from_slice(args);
             let expected = arg_count(&callback.target.descriptor);
             if values.len() == expected && callback.target.name != "<init>" {
+                jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut values);
                 return self.host.invoke(&callback.target, &values).map(Some);
+            }
+            // A constructor reference (`GameClass::new`, `HashMap::new`) is a
+            // factory whose effective result is the constructed object, even
+            // though `<init>` itself returns void. The class is outside the
+            // jar, so there is no body to run: build the object marker and run
+            // the host's constructor on it with every value as an argument,
+            // exactly what `new` + `invokespecial <init>` does, so a JDK
+            // collection is registered with the host like a `new` one. A
+            // zero-argument `Supplier` (`HashMap::new`) has no values at all,
+            // so this comes before the receiver split below.
+            if callback.target.name == "<init>" {
+                let object = self.new_object(&callback.target.owner);
+                self.host
+                    .invoke_instance(&callback.target, &object, &values)?;
+                return Ok(Some(object));
             }
             let Some((receiver, rest)) = values.split_first() else {
                 return Ok(None);
             };
-            let (receiver, rest) = (receiver.clone(), rest.to_vec());
-            // A constructor reference (`GameClass::new`) is a factory whose
-            // effective result is the constructed object, even though `<init>`
-            // itself returns void. The class is outside the jar, so there is no
-            // body to run: answer the object marker the host models for it.
-            if callback.target.name == "<init>" {
-                return Ok(Some(self.new_object(&callback.target.owner)));
-            }
+            let (receiver, mut rest) = (receiver.clone(), rest.to_vec());
+            jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut rest);
             if callback.target.name == "stream"
                 && callback.target.descriptor == "()Ljava/util/stream/Stream;"
                 && is_collection_owner(&callback.target.owner)
@@ -21271,6 +21339,14 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Some((owner, true));
         }
+        // A call site typed by a platform class (`Reader.read()`,
+        // `Writer.write(String)`, `InputStream.read()`) on an object of a jar
+        // subclass: the JVM selects the subclass's override, so a jar
+        // `Reader` such as NightConfig's `FastStringReader` reads its own
+        // string instead of the host's neutral `0` forever.
+        if let Some(owner) = self.platform_override_owner(r, opcode, receiver) {
+            return Some((owner, true));
+        }
         self.member_owner(&r.owner, &r.name, &r.descriptor)
     }
 
@@ -21288,14 +21364,74 @@ impl<H: Host> Runtime<'_, H> {
 
     fn member_owner(&self, class: &str, name: &str, descriptor: &str) -> Option<(String, bool)> {
         let mut current = class.to_owned();
+        let mut chain = Vec::new();
         for _ in 0..MAX_SUPERCLASS_WALK {
             let Some(file) = self.class(&current) else {
+                // No class in the chain declares the member. The JVM's next
+                // step is the superinterfaces' default methods, but only once
+                // the host superclass is known not to declare it itself:
+                // `Object` and `Record` cannot (an interface may not default
+                // their public methods), and `Enum`'s own methods are final.
+                let host_cannot_declare = match current.as_str() {
+                    "java/lang/Object" | "java/lang/Record" => true,
+                    "java/lang/Enum" => !ENUM_DECLARED_METHODS.contains(&name),
+                    _ => false,
+                };
+                if host_cannot_declare
+                    && let Some(owner) = self.inherited_default_owner(&chain, name, descriptor)
+                {
+                    return Some((owner, true));
+                }
                 return Some((current, false));
             };
             if file.method(name, descriptor).is_some() {
                 return Some((current, true));
             }
+            chain.push(current.clone());
             current = file.super_name.clone();
+        }
+        None
+    }
+
+    /// The jar interface whose default method a class in `chain` inherits.
+    ///
+    /// A class-typed call site (`invokevirtual Impl.parse(String)`) reaches a
+    /// method `Impl` inherits from an interface default, such as
+    /// NightConfig's `ConfigParser.parse(String)`. Without this the walk ended
+    /// at `java/lang/Object` and the host answered a neutral `null` for a body
+    /// the jar ships. Interfaces are searched breadth first from the classes'
+    /// own declarations, so a sub-interface's override is found before the
+    /// default it overrides; the search is bounded by
+    /// [`MAX_SUPERCLASS_WALK`] interfaces.
+    fn inherited_default_owner(
+        &self,
+        chain: &[String],
+        name: &str,
+        descriptor: &str,
+    ) -> Option<String> {
+        let mut queue = std::collections::VecDeque::new();
+        for class in chain {
+            if let Some(file) = self.class(class) {
+                queue.extend(file.interface_names());
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(interface) = queue.pop_front() {
+            if seen.len() >= MAX_SUPERCLASS_WALK {
+                break;
+            }
+            if !seen.insert(interface.clone()) {
+                continue;
+            }
+            let Some(file) = self.class(&interface) else {
+                continue;
+            };
+            if file.method(name, descriptor).is_some_and(|method| {
+                method.code.is_some() && !method.is_static() && method.access & 0x0002 == 0
+            }) {
+                return Some(interface);
+            }
+            queue.extend(file.interface_names());
         }
         None
     }
@@ -21378,6 +21514,9 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.stream_support_stream(r, args, class, method)? {
+            return Ok(Some(value));
+        }
         if r.owner == "java/util/Optional"
             && r.name == "stream"
             && r.descriptor == "()Ljava/util/stream/Stream;"
@@ -21689,6 +21828,9 @@ impl<H: Host> Runtime<'_, H> {
                             .collect::<Vec<_>>()
                             .join(delimiter);
                         Value::Ref(Some(format!("{prefix}{text}{suffix}")))
+                    }
+                    collector if collector.starts_with("collector/to-map/") => {
+                        return self.collect_to_map(collector, &values);
                     }
                     _ => return Ok(None),
                 }
@@ -22673,6 +22815,7 @@ impl<H: Host> Runtime<'_, H> {
                     let matches = expect_ref(&value).is_some_and(|marker| {
                         self.object_is_instance_of(marker, &wanted)
                             || self.host.host_instance_of(marker, &wanted)
+                            || jdk_model::platform_instance_of(marker, &wanted)
                             || generic_type_instance_of(marker, &wanted)
                             || (wanted == "java/lang/Class"
                                 && class_marker_like(marker, self.classes, &self.linked))
@@ -22871,9 +23014,10 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = self.invoke_arrays(&r, &args, class, method)? {
                         value
-                    } else if let Some(value) =
-                        self.invoke_stream(&r, receiver.as_ref(), &args, class, method)?
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_stream(&r, receiver.as_ref(), &args, class, method)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -22906,6 +23050,10 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) =
                         self.invoke_string_builder(&r, receiver.as_ref(), &args)?
+                    {
+                        value
+                    } else if let Some(value) =
+                        self.invoke_char_sequence(&r, receiver.as_ref(), &args)?
                     {
                         value
                     } else if let Some(value) = self.invoke_game_enum_values(&r, class, method) {
@@ -29125,7 +29273,9 @@ mandatory = true
                 name: name.into(),
                 descriptor: descriptor.into(),
             };
-            let error = host.invoke(&method, &[Value::Ref(Some("demo/Provider".into()))]);
+            // A JDK service could have providers on a real class path the
+            // native runtime never sees, so it stays refused.
+            let error = host.invoke(&method, &[Value::Ref(Some("java/sql/Driver".into()))]);
             assert!(matches!(
                 error,
                 Err(NativeError::Metadata(message))
@@ -29133,6 +29283,50 @@ mandatory = true
                         && message.contains("host classpath scanning is disabled")
             ));
         }
+    }
+
+    #[test]
+    fn standard_host_answers_an_empty_loader_for_an_unprovided_mod_service() {
+        // A mod's own API interface with no `META-INF/services` row in any
+        // seeded or linked jar: the JVM's loader iterates nothing.
+        let mut host = StdHost::new();
+        let load = MethodRef {
+            owner: "java/util/ServiceLoader".into(),
+            name: "load".into(),
+            descriptor: "(Ljava/lang/Class;)Ljava/util/ServiceLoader;".into(),
+        };
+        let loader = host
+            .invoke(&load, &[Value::Ref(Some("demo/api/Integration".into()))])
+            .unwrap();
+        let iterator = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "java/util/ServiceLoader".into(),
+                    name: "iterator".into(),
+                    descriptor: "()Ljava/util/Iterator;".into(),
+                },
+                &loader,
+                &[],
+            )
+            .unwrap();
+        let has_next = MethodRef {
+            owner: "java/util/Iterator".into(),
+            name: "hasNext".into(),
+            descriptor: "()Z".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&has_next, &iterator, &[]).unwrap(),
+            Value::Int(0)
+        );
+        let first = MethodRef {
+            owner: "java/util/ServiceLoader".into(),
+            name: "findFirst".into(),
+            descriptor: "()Ljava/util/Optional;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&first, &loader, &[]).unwrap(),
+            Value::Ref(None)
+        );
     }
 
     #[test]
