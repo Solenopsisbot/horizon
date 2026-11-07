@@ -1,7 +1,9 @@
 # Horizon loader proof ledger
 # One row per corpus jar that native execution refused or that needs the loader;
-# done= is the run's own outcome (a real Fabric loader launch of its pack).
-mod=axiom	status=listed	jar=02d17d2f1c-Axiom-6.1.5-for-MC26.3.jar	done=false
+# done= is the run's own outcome (a real Fabric loader launch of its pack), and
+# exception= is the first failure line of that run naming the jar's mod id.
+# Written by `tools/hybrid_pack.py --coverage --measure-proof --proof-ledger NAME=PATH`.
+mod=axiom	status=listed	jar=02d17d2f1c-Axiom-6.1.5-for-MC26.3.jar	done=true
 mod=baguettelib	status=listed	jar=03280769d5-baguettelib-26.3-Fabric-2.0.7.jar	done=true
 mod=fancymenu	status=listed	jar=0610f18c4f-fancymenu_fabric_3.9.14_MC_26.3.jar	done=true
 mod=poses	status=listed	jar=0c6898e27d-armor-stand-poses-fabric-26.3-1.4.0.jar	done=true
@@ -30,22 +32,22 @@ mod=midnightlib	status=listed	jar=2c0e2ba8a9-midnightlib-fabric-1.9.3+26.3-rc-2.
 mod=cropsloverain	status=listed	jar=2c3f5e1a56-cropsloverain-3.2.1.jar	done=true
 mod=notenoughcrashes	status=listed	jar=31c30c5d21-notenoughcrashes-fabric-4.5.1+26.3.jar	done=true
 mod=letmedespawn	status=listed	jar=3678d44132-letmedespawn-fabric-26.3-1.26.9.2.jar	done=true
-mod=carryon	status=listed	jar=36e8de6c68-carryon-fabric-26.3-2.12.0.jar	done=true
+mod=carryon	status=listed	jar=36e8de6c68-carryon-fabric-26.3-2.12.0.jar	done=true	error=client-only code on a server
 mod=jei	status=listed	jar=3b90f638d6-jei-26.3-fabric-31.9.0.61.jar	done=true
-mod=sway	status=listed	jar=3c1a43daba-sway-2.4.5-fabric+26.3.jar	done=false
+mod=sway	status=listed	jar=3c1a43daba-sway-2.4.5-fabric+26.3.jar	done=false	error=client-only code on a server	exception=launch-game: failed java.lang.reflect.InvocationTargetException <- java.lang.RuntimeException: Mixin transformation of net.minecraft.server.Main failed <- org.spongepowered.asm.mixin.throwables.Mixin…
 mod=appleskin	status=listed	jar=3d19e40c5f-appleskin-fabric-mc26.3-3.0.10.jar	done=true
 mod=archers	status=listed	jar=4881abae4b-archers-fabric-3.1.4+26.3.jar	done=true
-mod=combat-hitboxes	status=listed	jar=4ed60c0212-combat-hitboxes-1.0.11.jar	done=false
+mod=combat-hitboxes	status=listed	jar=4ed60c0212-combat-hitboxes-1.0.11.jar	done=false	error=client-only code on a server	exception=java.lang.RuntimeException: Could not execute entrypoint stage 'main' due to errors, provided by 'combat-hitboxes' at 'me.sootysplash.box.Main'!
 mod=betterstats	status=listed	jar=53d859f95b-betterstats-5.6.0-beta.2+fn-26.3.jar	done=true
 mod=syncmatica	status=listed	jar=554319fbea-syncmatica-fabric-26.3-0.3.20.jar	done=true
-mod=carpet	status=listed	jar=564c46b80e-carpet-26.3.jar	done=true
+mod=carpet	status=listed	jar=564c46b80e-carpet-26.3.jar	done=true	error=client-only code on a server
 mod=shogi	status=listed	jar=5a24c09a6b-shogi-fabric-26.3-26.3.0.3.jar	done=true
-mod=betterstats	status=listed	jar=5a2f06f60a-betterstats-5.8.0+fn-26.3.jar	done=true
+mod=betterstats	status=listed	jar=5a2f06f60a-betterstats-5.8.0+fn-26.3.jar	done=true	error=client-only code on a server
 mod=waystones	status=listed	jar=5de88d705e-waystones-fabric-26.3-26.3.0.1.jar	done=true
 mod=konkrete	status=listed	jar=61412064ba-konkrete_fabric_1.11.1_MC_26.3.jar	done=true
 mod=easymagic	status=listed	jar=619dfae706-easymagic-v26.3.0-mc26.3.x+fabric.jar	done=true
 mod=servux	status=listed	jar=63e0462bf6-servux-fabric-26.3-0.12.2.jar	done=true
-mod=clientcommands	status=listed	jar=6571ed9b65-clientcommands-2.16.2.jar	done=true
+mod=clientcommands	status=listed	jar=6571ed9b65-clientcommands-2.16.2.jar	done=true	error=client-only code on a server
 mod=farmersdelight	status=listed	jar=65ac95d621-FarmersDelight-26.3-3.6.28+refabricated.jar	done=true
 mod=farmersdelight	status=listed	jar=691967a54e-FarmersDelight-26.3-3.6.30+refabricated.jar	done=true
 mod=cpm	status=listed	jar=6c14dd4e5a-CustomPlayerModels-Fabric-26.3-0.6.27e.jar	done=true
@@ -58,15 +60,14 @@ mod=tcdcommons	status=listed	jar=7397370582-tcdcommons-5.6.0-beta.2+fn-26.3.jar	
 mod=bettercombat	status=listed	jar=74e2f4053d-bettercombat-fabric-3.2.2+26.3.jar	done=true
 mod=locator-heads	status=listed	jar=7751ee3925-locator-heads-2.5.0.jar	done=true
 mod=worldedit	status=listed	jar=7b10411d20-worldedit-7.4.6-beta-02.jar	done=true
-mod=runes	status=listed	jar=7b1bf05fde-runes-fabric-1.3.2+26.3.jar	done=true
+mod=runes	status=listed	jar=7b1bf05fde-runes-fabric-1.3.2+26.3.jar	done=true	error=client-only code on a server
 mod=minecart-trains-fork	status=listed	jar=7b2f7c67f2-minecart-trains-fork-2.5.0+26.3.jar	done=true
-mod=biolith	status=listed	jar=7edf4f3c5c-biolith-fabric-3.8.0-beta.1.jar	done=true
+mod=biolith	status=listed	jar=7edf4f3c5c-biolith-fabric-3.8.0-beta.1.jar	done=true	error=client-only code on a server
 mod=zoomify	status=listed	jar=7f18090fea-zoomify-2.17.0+mc26.3-universal.jar	done=true
-mod=creativecore	status=listed	jar=80a0fc2ac1-CreativeCore_FABRIC_v2.14.16_mc26.3.jar	done=false
-mod=axiom	status=listed	jar=812809eb6f-Axiom-6.1.3-for-MC26.3.jar	done=false
-mod=resourcefullib	status=listed	jar=825dce0c0b-ResourcefulLib-6.0.1.jar	done=true
+mod=creativecore	status=listed	jar=80a0fc2ac1-CreativeCore_FABRIC_v2.14.16_mc26.3.jar	done=false	error=client-only code on a server	exception=launch-game: failed java.lang.reflect.InvocationTargetException <- java.lang.RuntimeException: Mixin transformation of net.minecraft.server.Main failed <- org.spongepowered.asm.mixin.throwables.Mixin…
+mod=axiom	status=listed	jar=812809eb6f-Axiom-6.1.3-for-MC26.3.jar	done=true
+mod=resourcefullib	status=listed	jar=825dce0c0b-ResourcefulLib-6.0.1.jar	done=true	error=client-only code on a server
 mod=kreno-fpatcher	status=listed	jar=8505adf224-kreno_fpatcher-26.2.0+26.1.jar	done=true
-mod=8b648b1aa3-macos-input-fixes-1.16	status=unlisted	jar=8b648b1aa3-macos-input-fixes-1.16.jar	done=false
 mod=hideexperimentalwarning	status=listed	jar=8b73533f63-hideexperimentalwarning-26.3.0-1.3.jar	done=true
 mod=collective	status=listed	jar=8bdd75360a-collective-26.3.0-8.42.jar	done=true
 mod=architectury	status=listed	jar=8c5f566e32-architectury-fabric-22.0.5.jar	done=true
@@ -78,11 +79,11 @@ mod=worldedit	status=listed	jar=8f7962199e-worldedit-mod-7.4.6.jar	done=true
 mod=sit-oth3r	status=listed	jar=9124091b2c-sit--1.2.6.4+26.3.jar	done=true
 mod=emotecraft	status=listed	jar=92815a8e4c-emotecraft-for-MC26.3-3.5.0-a.build.171.jar	done=true
 mod=showmeyourskin	status=unlisted	jar=949fa8a29a-show-me-your-skin-2.0.3+26.2.jar	done=false	error=requires minecraft >=26.2 <26.3
-mod=scholar	status=listed	jar=96512caad3-scholar-fabric-26.3-1.2.12.jar	done=true
+mod=scholar	status=listed	jar=96512caad3-scholar-fabric-26.3-1.2.12.jar	done=true	error=client-only code on a server
 mod=clientsort	status=listed	jar=96cbf8e292-clientsort-fabric-3.104.1+26.3.jar	done=true
 mod=xaeroworldmap	status=listed	jar=9ace0b0646-xaeroworldmap-fabric-26.3-1.47.0.jar	done=true
 mod=xaerominimap	status=listed	jar=9b44e5718f-xaerominimap-fabric-26.3-26.6.2.jar	done=true
-mod=bkups	status=listed	jar=9c77a694f8-bkupsV3-fabric-mod-26.3.jar	done=true
+mod=bkups	status=listed	jar=9c77a694f8-bkupsV3-fabric-mod-26.3.jar	done=true	error=client-only code on a server
 mod=cristellib	status=listed	jar=9cc655e54a-cristellib-fabric-26.3-3.1.13.jar	done=true
 mod=particular	status=listed	jar=9ce277e691-particular-26.3-Fabric-1.5.7.jar	done=true
 mod=leavesbegone	status=listed	jar=a0d33c0e9a-leavesbegone-v26.3.0-mc26.3.x+fabric.jar	done=true
@@ -92,7 +93,7 @@ mod=voicechat	status=listed	jar=b11edf2591-voicechat-fabric-2.6.26+26.3.jar	done
 mod=universal-graves	status=listed	jar=b182027030-graves-3.13.0+26.3.jar	done=true
 mod=clientcommands	status=listed	jar=b1b136006d-clientcommands-2.16.3.jar	done=true
 mod=modernfix	status=listed	jar=b63337e801-modernfix-5.27.20-build.2.jar	done=true
-mod=roughlyenoughitems	status=listed	jar=b7bfe27288-RoughlyEnoughItems-26.3.824.jar	done=true
+mod=roughlyenoughitems	status=listed	jar=b7bfe27288-RoughlyEnoughItems-26.3.824.jar	done=true	error=client-only code on a server
 mod=tcdcommons	status=listed	jar=b9fde00565-tcdcommons-5.8.0+fn-26.3.jar	done=true
 mod=collective	status=listed	jar=bdc7223ca2-collective-26.3.0-8.67.jar	done=true
 mod=connectiblechains	status=listed	jar=c09b30ad82-connectiblechains-2.4.4+26.3-fabric.jar	done=true
@@ -102,7 +103,7 @@ mod=fullbrightnesstoggle	status=listed	jar=cc53b1cd2b-fullbrightnesstoggle-26.3.
 mod=mc-armor-hud	status=listed	jar=cc6bad23aa-mc-armor-hud-8.1.1.6-26.3-fabric.jar	done=true
 mod=yo_hooks	status=listed	jar=cdf3c7f2f0-yo_hooks-5.3.0.jar	done=true
 mod=wizards	status=listed	jar=d068d42039-wizards-fabric-3.1.4+26.3.jar	done=true
-mod=chunkloaders	status=listed	jar=d584723a3e-chunkloaders-1.2.9-fabric-mc26.3.jar	done=true
+mod=chunkloaders	status=listed	jar=d584723a3e-chunkloaders-1.2.9-fabric-mc26.3.jar	done=true	error=client-only code on a server
 mod=pickupnotifications	status=listed	jar=d82f07c8b3-pickupnotifications-fabric-3.0.1+26.3.jar	done=true
 mod=jade	status=listed	jar=da61413c58-Jade-mc26.3-Fabric-26.3.5.jar	done=true
 mod=crash_assistant	status=listed	jar=dea53a10e5-CrashAssistant-fabric-26.2-26.3-1.11.14.jar	done=true

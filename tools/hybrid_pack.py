@@ -713,6 +713,8 @@ class RunResult:
     # Non-INFO log lines that name an exception, a crash or an error (see
     # `crash_lines`); a proof row looks for its own mod id in them.
     exceptions: tuple[str, ...] = ()
+    # Mod id -> minecraft range the resolver rejected (`minecraft_requirements`).
+    minecraft: dict[str, str] = field(default_factory=dict)
 
 
 def _kill(proc: subprocess.Popen[bytes]) -> None:
@@ -836,9 +838,23 @@ def exception_naming(mod_id: str, lines: tuple[str, ...]) -> str:
     """The first failure line naming `mod_id` as a whole word, bounded."""
     pattern = re.compile(rf"(?<![a-z0-9_]){re.escape(mod_id.lower())}(?![a-z0-9_])")
     for line in lines:
-        if pattern.search(line.lower()):
+        lower = line.lower()
+        # The failure word must stand outside the id: a mod called
+        # `notenoughcrashes` or `crash_assistant` is not a crash by name.
+        if pattern.search(lower) and CRASH_WORD.search(pattern.sub(" ", lower)):
             return bounded(line)
     return ""
+
+
+MINECRAFT_DEP = re.compile(r"HARD_DEP\w* (\S+) \S+ \{depends minecraft @ \[([^\]]+)\]")
+
+
+def minecraft_requirements(text: str) -> dict[str, str]:
+    """Mod id -> the minecraft range Fabric's resolver says it failed."""
+    out: dict[str, str] = {}
+    for subject, requirement in MINECRAFT_DEP.findall(text):
+        out.setdefault(subject.lower(), requirement)
+    return out
 
 
 def failure_hint(text: str) -> str:
@@ -847,9 +863,13 @@ def failure_hint(text: str) -> str:
         return "client-only code on a server"
     match = HARD_DEP.search(text)
     if match:
-        _, dependency, requirement = match.groups()
+        subject, dependency, requirement = match.groups()
         if dependency == "minecraft":
-            return f"requires minecraft {requirement}"
+            # Whose requirement it is matters: the coverage calls a jar out of
+            # scope only for its own range (`minecraft_requirements`), never
+            # because a library in its closure (or a loader that did not
+            # detect the game at all) failed the check.
+            return f"{subject} requires minecraft {requirement}"
         return f"missing dependency {dependency} {requirement}"
     if "HARD_DEP_NO_CANDIDATE" in text:
         match = re.search(r"HARD_DEP_NO_CANDIDATE (\S+)", text)
@@ -965,7 +985,7 @@ def run_loader(part: Partition, *, binary: Path, loader: Path, libs: Path, game:
     parsed = parse_loader(text, part.loader, len(part.loader))
     return RunResult("loader", command, seconds, code, timed_out, len(part.loader),
                      log=log, failure=failure_hint(text), exceptions=crash_lines(text),
-                     **parsed)
+                     minecraft=minecraft_requirements(text), **parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -1145,8 +1165,10 @@ def merge_loader_evidence(rows: list[LoaderRow]) -> dict[str, LoaderRow]:
         if not row.jar:
             continue
         current = by_jar.get(row.jar)
-        if (current is None or row.rank > current.rank
-                or (row.rank == current.rank and row.error and not current.error)):
+        # On equal rank the later row wins: ledgers are read in order and a
+        # sweep appends its fresh runs last, so a newer measurement replaces
+        # an older one (a stale error included) unless it is worse.
+        if current is None or row.rank >= current.rank:
             by_jar[row.jar] = row
     return by_jar
 
@@ -1420,8 +1442,10 @@ def _loader_proof_rows(batch: list[PackJar], run: RunResult) -> list[LoaderRow]:
     rows = []
     for jar in batch:
         status = "listed" if jar.mod_id.lower() in listed else "unlisted"
+        own = run.minecraft.get(jar.mod_id.lower())
+        failure = f"requires minecraft {own}" if own else run.failure
         rows.append(LoaderRow(jar.name, jar.mod_id, status, 0, done,
-                              str(run.log.parent) if run.log else "", run.failure,
+                              str(run.log.parent) if run.log else "", failure,
                               exception_naming(jar.mod_id, run.exceptions)))
     return rows
 

@@ -177,6 +177,9 @@ class HybridPackTests(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertIn("jei plugin", HYBRID.exception_naming("jei", lines))
         self.assertEqual(HYBRID.exception_naming("peek", lines), "")
+        warning = ("[10:00:00] [Thread-0/WARN]: Compatibility level JAVA_21 specified by "
+                   "crash_assistant.mixins.json is higher than the maximum level supported",)
+        self.assertEqual(HYBRID.exception_naming("crash_assistant", warning), "")
         # A whole-word match: `objects` in a line does not name a mod called `object`.
         self.assertEqual(HYBRID.exception_naming("object", lines), "")
         with tempfile.TemporaryDirectory() as tmp:

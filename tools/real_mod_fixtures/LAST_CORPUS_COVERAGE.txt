@@ -4,8 +4,8 @@
 # out-of-scope: built for another game version, so no 26.3 tier can carry it.
 # Sources: LAST_SERVER_LEDGER_223.txt, LAST_SERVER_LEDGER_500.txt, LAST_LOADER_PROOF_223.txt, LAST_LOADER_PROOF_500.txt
 
-corpus=corpus-xl	jars=223	native-ok=164	needs-loader=59	native-gap=0	out-of-scope=0	proven=59	partial=0	unproven=0
-corpus=mega	jars=500	native-ok=382	needs-loader=115	native-gap=0	out-of-scope=3	proven=110	partial=5	unproven=0
+corpus=corpus-xl	jars=223	native-ok=164	needs-loader=59	native-gap=0	out-of-scope=0	proven=57	partial=2	unproven=0
+corpus=mega	jars=500	native-ok=382	needs-loader=115	native-gap=0	out-of-scope=3	proven=112	partial=3	unproven=0
 union	digests=599	native-ok=446	needs-loader=150	native-gap=0	out-of-scope=3
 corpus-xl/1005914-8891048.jar	mod=fzzy_config	native=native-ok	tier=native-ok
 corpus-xl/1312687-7927503.jar	mod=1312687-7927503	native=native-ok	tier=native-ok	no native entrypoint (available: none)
@@ -173,7 +173,7 @@ corpus-xl/xplus-autofish-2.0.0-fabric-mc26.3.jar	mod=autofish	native=native-ok	t
 corpus-xl/zmatcomp-1.1.2+26.3.jar	mod=zmatcomp	native=native-ok	tier=native-ok	no native entrypoint (available: none)
 corpus-xl/1283899-8898481.jar	mod=player_animation_library	native=needs-loader	tier=needs-loader	proof=proven	loader_id=player_animation_library	cause=no server ledger row	the real Fabric loader lists it and reached Done
 corpus-xl/248787-8907912.jar	mod=appleskin	native=needs-loader	tier=needs-loader	proof=proven	loader_id=appleskin	cause=no server ledger row	the real Fabric loader lists it and reached Done
-corpus-xl/257814-8894326.jar	mod=creativecore	native=native-gap	tier=needs-loader	proof=proven	loader_id=creativecore	cause=runtime	native refused (runtime); the real Fabric loader lists it and reached Done
+corpus-xl/257814-8894326.jar	mod=creativecore	native=native-gap	tier=needs-loader	proof=partial	loader_id=creativecore	cause=runtime	native refused (runtime); the real Fabric loader lists it but the run did not boot (client-only code on a server)
 corpus-xl/326652-8890593.jar	mod=cupboard	native=needs-loader	tier=needs-loader	proof=proven	loader_id=cupboard	cause=no server ledger row	the real Fabric loader lists it and reached Done
 corpus-xl/342584-8921261.jar	mod=collective	native=native-gap	tier=needs-loader	proof=proven	loader_id=collective	cause=runtime	native refused (runtime); the real Fabric loader lists it and reached Done
 corpus-xl/348831-8926733.jar	mod=doubledoors	native=needs-loader	tier=needs-loader	proof=proven	loader_id=doubledoors	cause=no server ledger row	the real Fabric loader lists it and reached Done
@@ -212,7 +212,7 @@ corpus-xl/fix-keyboard-on-linux-1.0.2.jar	mod=fix-keyboard-on-linux	native=needs
 corpus-xl/jei-26.3-fabric-31.16.0.83.jar	mod=jei	native=needs-loader	tier=needs-loader	proof=proven	loader_id=jei	cause=no server ledger row	the real Fabric loader lists it and reached Done
 corpus-xl/kreno_fpatcher-26.2.0+26.1.jar	mod=kreno-fpatcher	native=native-gap	tier=needs-loader	proof=proven	loader_id=kreno-fpatcher	cause=runtime	native refused (runtime); the real Fabric loader lists it and reached Done
 corpus-xl/mcwifipnp-2.1.4-26.3-fabric.jar	mod=mcwifipnp	native=needs-loader	tier=needs-loader	proof=proven	loader_id=mcwifipnp	cause=no server ledger row	the real Fabric loader lists it and reached Done
-corpus-xl/moderner-beta-fabric-5.0.0-alpha.4+26.3.jar	mod=moderner_beta	native=native-gap	tier=needs-loader	proof=proven	loader_id=moderner_beta	cause=metadata	native refused (metadata); the real Fabric loader lists it and reached Done
+corpus-xl/moderner-beta-fabric-5.0.0-alpha.4+26.3.jar	mod=moderner_beta	native=native-gap	tier=needs-loader	proof=partial	loader_id=moderner_beta	cause=metadata	native refused (metadata); the real Fabric loader lists it and reached Done, but a failure names it: [11:12:13] [Thread-0/ERROR]: Registry 'moderner_beta:blocksource' was empty after loading
 corpus-xl/modernregsyncfix-2.0.0.jar	mod=modernregsyncfix	native=needs-loader	tier=needs-loader	proof=proven	loader_id=modernregsyncfix	cause=no server ledger row	the real Fabric loader lists it and reached Done
 corpus-xl/naturally_trimmed-3.6.1+26.3-fabric.jar	mod=naturally_trimmed	native=needs-loader	tier=needs-loader	proof=proven	loader_id=naturally_trimmed	cause=no server ledger row	the real Fabric loader lists it and reached Done
 corpus-xl/peek-fabric-1.6.0+26.3.jar	mod=peek	native=needs-loader	tier=needs-loader	proof=proven	loader_id=peek	cause=no server ledger row	the real Fabric loader lists it and reached Done
@@ -455,7 +455,7 @@ mega/8a2ebb77d4-treeharvester-26.3.0-10.3.jar	mod=treeharvester	native=native-ok
 mega/8a2fe6b71f-ukulib-fabric-2.2.1+26.3.jar	mod=ukulib	native=native-ok	tier=native-ok	no native entrypoint (available: client, modmenu)
 mega/8aded6da11-camerautils-fabric-1.1.2+26.3.jar	mod=camerautils	native=native-ok	tier=native-ok	no native entrypoint (available: client)
 mega/8ae77404a0-freelook-1.4.4.jar	mod=freelook	native=native-ok	tier=native-ok	no native entrypoint (available: client, modmenu)
-mega/8b648b1aa3-macos-input-fixes-1.16.jar	mod=8b648b1aa3-macos-input-fixes-1.16	native=native-gap	tier=native-ok	loader_id=8b648b1aa3-macos-input-fixes-1.16	cause=no entrypoint	no native entrypoint; the dedicated server has nothing to run
+mega/8b648b1aa3-macos-input-fixes-1.16.jar	mod=macos_input_fixes_helper	native=native-gap	tier=native-ok	cause=no entrypoint	no native entrypoint; the dedicated server has nothing to run
 mega/8cd7b7bf6b-BetterAddServer-26.1.2-fabric-1.2.6.jar	mod=betteraddserver	native=native-ok	tier=native-ok	no native entrypoint (available: none)
 mega/8da055eec2-libjf-26.3.1.jar	mod=libjf	native=native-ok	tier=native-ok	no native entrypoint (available: none)
 mega/8e075c2fe9-polyplus-1.4.4+26.3.jar	mod=polyplus	native=native-ok	tier=native-ok	no native entrypoint (available: client, debugify, preLaunch, voicechat)
@@ -612,7 +612,7 @@ mega/fd6935e1fe-entity_model_features-3.3.7-26.3-fabric.jar	mod=entity_model_fea
 mega/fe1fff399f-ArmorPoser-fabric-26.3-16.0.1.jar	mod=armorposer	native=native-ok	tier=native-ok
 mega/ff2056f222-sodium-extra-fabric-0.9.4+mc26.3.jar	mod=sodium-extra	native=native-ok	tier=native-ok	no native entrypoint (available: client, sodium:config_api_user)
 mega/fff33c05fb-DnT-woodland-mansion-overhaul-2.2.1__Fabric_.jar	mod=mr_dungeons_andtavernswoodlandmansionoverhaul	native=native-ok	tier=native-ok	no native entrypoint (available: none)
-mega/02d17d2f1c-Axiom-6.1.5-for-MC26.3.jar	mod=axiom	native=needs-loader	tier=needs-loader	proof=partial	loader_id=axiom	cause=no server ledger row	the real Fabric loader lists it but the run did not boot
+mega/02d17d2f1c-Axiom-6.1.5-for-MC26.3.jar	mod=axiom	native=needs-loader	tier=needs-loader	proof=proven	loader_id=axiom	cause=no server ledger row	the real Fabric loader lists it and reached Done
 mega/03280769d5-baguettelib-26.3-Fabric-2.0.7.jar	mod=baguettelib	native=needs-loader	tier=needs-loader	proof=proven	loader_id=baguettelib	cause=no server ledger row	the real Fabric loader lists it and reached Done
 mega/0610f18c4f-fancymenu_fabric_3.9.14_MC_26.3.jar	mod=fancymenu	native=needs-loader	tier=needs-loader	proof=proven	loader_id=fancymenu	cause=no server ledger row	the real Fabric loader lists it and reached Done
 mega/0c6898e27d-armor-stand-poses-fabric-26.3-1.4.0.jar	mod=poses	native=needs-loader	tier=needs-loader	proof=proven	loader_id=poses	cause=no server ledger row	the real Fabric loader lists it and reached Done
@@ -642,10 +642,10 @@ mega/31c30c5d21-notenoughcrashes-fabric-4.5.1+26.3.jar	mod=notenoughcrashes	nati
 mega/3678d44132-letmedespawn-fabric-26.3-1.26.9.2.jar	mod=letmedespawn	native=needs-loader	tier=needs-loader	proof=proven	loader_id=letmedespawn	cause=no server ledger row	the real Fabric loader lists it and reached Done
 mega/36e8de6c68-carryon-fabric-26.3-2.12.0.jar	mod=carryon	native=native-gap	tier=needs-loader	proof=proven	loader_id=carryon	cause=runtime	native refused (runtime); the real Fabric loader lists it and reached Done
 mega/3b90f638d6-jei-26.3-fabric-31.9.0.61.jar	mod=jei	native=needs-loader	tier=needs-loader	proof=proven	loader_id=jei	cause=no server ledger row	the real Fabric loader lists it and reached Done
-mega/3c1a43daba-sway-2.4.5-fabric+26.3.jar	mod=sway	native=native-gap	tier=needs-loader	proof=partial	loader_id=sway	cause=metadata	native refused (metadata); the real Fabric loader lists it but the run did not boot
+mega/3c1a43daba-sway-2.4.5-fabric+26.3.jar	mod=sway	native=native-gap	tier=needs-loader	proof=partial	loader_id=sway	cause=metadata	native refused (metadata); the real Fabric loader lists it but the run did not boot (client-only code on a server)
 mega/3d19e40c5f-appleskin-fabric-mc26.3-3.0.10.jar	mod=appleskin	native=needs-loader	tier=needs-loader	proof=proven	loader_id=appleskin	cause=no server ledger row	the real Fabric loader lists it and reached Done
 mega/4881abae4b-archers-fabric-3.1.4+26.3.jar	mod=archers	native=native-gap	tier=needs-loader	proof=proven	loader_id=archers	cause=runtime	native refused (runtime); the real Fabric loader lists it and reached Done
-mega/4ed60c0212-combat-hitboxes-1.0.11.jar	mod=combat-hitboxes	native=needs-loader	tier=needs-loader	proof=partial	loader_id=combat-hitboxes	cause=no server ledger row	the real Fabric loader lists it but the run did not boot
+mega/4ed60c0212-combat-hitboxes-1.0.11.jar	mod=combat-hitboxes	native=needs-loader	tier=needs-loader	proof=partial	loader_id=combat-hitboxes	cause=no server ledger row	the real Fabric loader lists it but the run did not boot (client-only code on a server)
 mega/53d859f95b-betterstats-5.6.0-beta.2+fn-26.3.jar	mod=betterstats	native=native-gap	tier=needs-loader	proof=proven	loader_id=betterstats	cause=runtime	native refused (runtime); the real Fabric loader lists it and reached Done
 mega/554319fbea-syncmatica-fabric-26.3-0.3.20.jar	mod=syncmatica	native=needs-loader	tier=needs-loader	proof=proven	loader_id=syncmatica	cause=no server ledger row	the real Fabric loader lists it and reached Done
 mega/564c46b80e-carpet-26.3.jar	mod=carpet	native=native-gap	tier=needs-loader	proof=proven	loader_id=carpet	cause=runtime	native refused (runtime); the real Fabric loader lists it and reached Done
@@ -672,8 +672,8 @@ mega/7b1bf05fde-runes-fabric-1.3.2+26.3.jar	mod=runes	native=native-gap	tier=nee
 mega/7b2f7c67f2-minecart-trains-fork-2.5.0+26.3.jar	mod=minecart-trains-fork	native=needs-loader	tier=needs-loader	proof=proven	loader_id=minecart-trains-fork	cause=no server ledger row	the real Fabric loader lists it and reached Done
 mega/7edf4f3c5c-biolith-fabric-3.8.0-beta.1.jar	mod=biolith	native=needs-loader	tier=needs-loader	proof=proven	loader_id=biolith	cause=no server ledger row	the real Fabric loader lists it and reached Done
 mega/7f18090fea-zoomify-2.17.0+mc26.3-universal.jar	mod=zoomify	native=native-gap	tier=needs-loader	proof=proven	loader_id=zoomify	cause=metadata	native refused (metadata); the real Fabric loader lists it and reached Done
-mega/80a0fc2ac1-CreativeCore_FABRIC_v2.14.16_mc26.3.jar	mod=creativecore	native=native-gap	tier=needs-loader	proof=partial	loader_id=creativecore	cause=runtime	native refused (runtime); the real Fabric loader lists it but the run did not boot
-mega/812809eb6f-Axiom-6.1.3-for-MC26.3.jar	mod=axiom	native=needs-loader	tier=needs-loader	proof=partial	loader_id=axiom	cause=no server ledger row	the real Fabric loader lists it but the run did not boot
+mega/80a0fc2ac1-CreativeCore_FABRIC_v2.14.16_mc26.3.jar	mod=creativecore	native=native-gap	tier=needs-loader	proof=partial	loader_id=creativecore	cause=runtime	native refused (runtime); the real Fabric loader lists it but the run did not boot (client-only code on a server)
+mega/812809eb6f-Axiom-6.1.3-for-MC26.3.jar	mod=axiom	native=needs-loader	tier=needs-loader	proof=proven	loader_id=axiom	cause=no server ledger row	the real Fabric loader lists it and reached Done
 mega/825dce0c0b-ResourcefulLib-6.0.1.jar	mod=resourcefullib	native=needs-loader	tier=needs-loader	proof=proven	loader_id=resourcefullib	cause=no server ledger row	the real Fabric loader lists it and reached Done
 mega/8505adf224-kreno_fpatcher-26.2.0+26.1.jar	mod=kreno-fpatcher	native=native-gap	tier=needs-loader	proof=proven	loader_id=kreno-fpatcher	cause=runtime	native refused (runtime); the real Fabric loader lists it and reached Done
 mega/8b73533f63-hideexperimentalwarning-26.3.0-1.3.jar	mod=hideexperimentalwarning	native=needs-loader	tier=needs-loader	proof=proven	loader_id=hideexperimentalwarning	cause=no server ledger row	the real Fabric loader lists it and reached Done

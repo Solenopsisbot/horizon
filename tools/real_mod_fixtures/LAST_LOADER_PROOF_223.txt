@@ -1,9 +1,11 @@
 # Horizon loader proof ledger
 # One row per corpus jar that native execution refused or that needs the loader;
-# done= is the run's own outcome (a real Fabric loader launch of its pack).
+# done= is the run's own outcome (a real Fabric loader launch of its pack), and
+# exception= is the first failure line of that run naming the jar's mod id.
+# Written by `tools/hybrid_pack.py --coverage --measure-proof --proof-ledger NAME=PATH`.
 mod=player_animation_library	status=listed	jar=1283899-8898481.jar	done=true
 mod=appleskin	status=listed	jar=248787-8907912.jar	done=true
-mod=creativecore	status=listed	jar=257814-8894326.jar	done=true
+mod=creativecore	status=listed	jar=257814-8894326.jar	done=false	error=client-only code on a server	exception=launch-game: failed java.lang.reflect.InvocationTargetException <- java.lang.RuntimeException: Mixin transformation of net.minecraft.server.Main failed <- org.spongepowered.asm.mixin.throwables.Mixin…
 mod=cupboard	status=listed	jar=326652-8890593.jar	done=true
 mod=collective	status=listed	jar=342584-8921261.jar	done=true
 mod=doubledoors	status=listed	jar=348831-8926733.jar	done=true
@@ -42,7 +44,7 @@ mod=fix-keyboard-on-linux	status=listed	jar=fix-keyboard-on-linux-1.0.2.jar	done
 mod=jei	status=listed	jar=jei-26.3-fabric-31.16.0.83.jar	done=true
 mod=kreno-fpatcher	status=listed	jar=kreno_fpatcher-26.2.0+26.1.jar	done=true
 mod=mcwifipnp	status=listed	jar=mcwifipnp-2.1.4-26.3-fabric.jar	done=true
-mod=moderner_beta	status=listed	jar=moderner-beta-fabric-5.0.0-alpha.4+26.3.jar	done=true
+mod=moderner_beta	status=listed	jar=moderner-beta-fabric-5.0.0-alpha.4+26.3.jar	done=true	exception=[11:12:13] [Thread-0/ERROR]: Registry 'moderner_beta:blocksource' was empty after loading
 mod=modernregsyncfix	status=listed	jar=modernregsyncfix-2.0.0.jar	done=true
 mod=naturally_trimmed	status=listed	jar=naturally_trimmed-3.6.1+26.3-fabric.jar	done=true
 mod=peek	status=listed	jar=peek-fabric-1.6.0+26.3.jar	done=true
