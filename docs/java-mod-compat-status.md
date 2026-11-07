@@ -165,9 +165,10 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   lambdas and method references, `register(Object|Class)` and `@EventBusSubscriber` `@SubscribeEvent` methods,
   Forge EventBus 7's per-event `BUS`). `NativeJar::run_game_listener` runs one with the jar's own statics, under a
   time budget, against bounded façade markers (server, player list, level, player, join handler, NeoForge event
-  object); a façade call outside that surface refuses the listener by name. Fabric `boolean`/`InteractionResult`
-  callbacks stop at the first deciding answer, NeoForge `setCanceled` skips later listeners without
-  `receiveCanceled`. Priorities are not modelled (registration order). Over the 723-jar corpus, 83 of the 499 jars
+  object; world path, game rules, registry access, level clock and `ServerPlayNetworking.canSend` answer from the
+  server's own state through `facade_server.rs`); a façade call outside that surface refuses the listener by name.
+  Fabric `boolean`/`InteractionResult` callbacks stop at the first deciding answer, NeoForge `setCanceled` skips
+  later listeners without `receiveCanceled`. Priorities are not modelled (registration order). Over the 723-jar corpus, 83 of the 499 jars
   that bootstrap natively register 257 listeners the game can fire (`server_started` 38 jars, `server_starting`
   35, `player_join` 34, `server_stopped` 22, `player_leave` 21, `server_stopping` 19, `server_tick_end` 17); the
   largest unfired families are client ticks and `CommandRegistrationCallback` (44 jars).
@@ -921,8 +922,15 @@ than rows; the cache held 86 entries in 436 KiB.
 4. **Finish content.** Type `BlockEntityType` builders and the jar's opaque items so more recipes resolve (check
    recipes across the pack, not per jar); NeoForge data components and attachments through their deferred suppliers;
    let a guest without the jars build a root from the manifest; then mod hot reload.
-5. **Event surface.** Grow the listener façade by the refusals the dedicated pack run logs (world path, registry
-   access, resource manager, game rules, `execute`), fire the identified use/attack/break/entity/level-load events
+5. **Event surface.** Grow the listener façade by the refusals the dedicated pack run logs. World path, registry
+   access and game rules are modelled (`facade_server.rs`): measured 7 November on four dedicated servers with the
+   172 corpus jars that listen or bind a hook (4 `fight` bots, 40 s each), they blocked 18, 11 and 4 callbacks
+   before and none after; `canSend` and `Connection#getRemoteAddress` blocked 3 hook callbacks before and none
+   after (servux's and both weaponmaster copies' `player_logged_in` now run to the end, 4 firings each). All
+   refusals went 99 → 82 while the other workstreams added sites and listeners (listener runs 10,989 → 15,567),
+   so that total is not this change's alone. Next by count: saved data
+   (`getDataStorage`, 8), `getCommands`, `getResourceManager`, `getRunningThread`, a `@Shadow` field, a handler's
+   `player.connection` field read; then fire the identified use/attack/break/entity/level-load events
    from their game points, and dispatch `CommandRegistrationCallback`. Gate: no façade refusal among the ten most
    common listener causes on the corpus pack run.
 6. **Client surface.** Compile the façade client families (HUD, keys, tooltips, screens, renderers, models) into the

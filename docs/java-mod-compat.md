@@ -598,7 +598,21 @@ generation moves on at `restoreFrom` and at logout, as a new `ServerPlayer` woul
   `getX`/`getY`/`getZ`, `isAlive`, `isRemoved`, `getHealth`, `isSpectator`, `isCreative`, `getScoreboardName`,
   `getName`/`getDisplayName`, `level`/`serverLevel`, `getServer`, `isClientSide`, `isDedicatedServer`, an item
   entity's `getItem`, a stack's `getCount`/`isEmpty`, `Object`'s `equals`/`hashCode`/`toString`, and
-  `sendSystemMessage`, which the game applies as a chat line after the firing.
+  `sendSystemMessage`, which the game applies as a chat line after the firing. The swapped-in player also answers
+  `getMainHandItem`/`getOffhandItem` (a stack's `getItem`, `is(Item)`, and `BuiltInRegistries.ITEM.getKey(item)`),
+  `getGameProfile` (`id`/`name`); a login's `Connection` its `getRemoteAddress` (a guest's IPv4 peer, as
+  `InetSocketAddress.toString` prints it) and its cookie `gameProfile()`; `Identifier` values their text and parts.
+- Server-wide members answer from a `ServerFacts` snapshot the game sets on the firing (`facade_server.rs`, shared
+  with the event listeners' façade): `getWorldPath(LevelResource)` is the world folder in the interpreter's virtual
+  game folder with the resource id resolved under it as vanilla does (`/horizon/game/world/.` for `ROOT`; a jar's
+  own `new LevelResource(id)` keeps its id), `getGameRules().get(GameRules.X)` the rule's current boxed value,
+  `registryAccess().lookupOrThrow(key)` a registry the game lists (`containsKey`, `keySet`, `size`; blocks,
+  items, entity types, biomes and the other command registries, or blocks/items/entity types before the world
+  opens), a level's `getGameTime`/`getDayTime`, and `ServerPlayNetworking.canSend(player, type)` whether that
+  player's client takes the channel (every declared client-bound channel for a Horizon client, none for any other
+  client, which declared none). A registry, rule or channel the facts do not hold refuses rather than answering
+  empty. Sending a payload from a callback is not modelled: encoding through the payload's `StreamCodec` needs the
+  jar's own getters, so a `send` after a true `canSend` still stops there.
 - A Mixin's `@Shadow`, abstract, `@Accessor` and `@Invoker` members (read back from the class bytes, because Mixin
   keeps those annotations `CLASS`-retained) stand for the game method of that name: they reach the same table. An
   interface the Mixin adds to its target is implemented on the object by the Mixin's body, and `instanceof` sees
