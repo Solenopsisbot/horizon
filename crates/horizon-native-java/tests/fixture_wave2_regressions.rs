@@ -80,6 +80,17 @@ public class Probe {
             + "|" + (String.class.getComponentType() == null) + "|" + proxy.fire("tick");
     }
 
+    static String ran = "";
+
+    public static String platformProxy() {
+        Class<?> runnable = Probe.<Runnable>componentOf();
+        Runnable proxy = (Runnable) Proxy.newProxyInstance(Probe.class.getClassLoader(), new Class<?>[] {runnable},
+            (self, method, args) -> { ran += method.getName() + (args == null) + ";"; return null; });
+        proxy.run();
+        proxy.run();
+        return runnable.getName() + "|" + (proxy instanceof Runnable) + "|" + ran;
+    }
+
     public static String workingDirectory() {
         String dir = System.getProperty("user.dir");
         Path config = Path.of(dir, "config", "tcdcommons.json");
@@ -189,8 +200,14 @@ fn an_array_names_its_component_class_and_a_proxy_can_implement_it() {
 
 #[test]
 fn the_working_directory_is_set_so_a_config_path_resolves() {
+    assert_eq!(run("workdir", "workingDirectory"), "true|true|true|true");
+}
+
+#[test]
+fn a_proxy_implements_a_platform_interface_the_class_model_does_not_hold() {
+    // Architectury's `EventFactory.createLoop()` over `Runnable` listeners.
     assert_eq!(
-        run("workdir", "workingDirectory"),
-        "true|true|true|true"
+        run("platform-proxy", "platformProxy"),
+        "java.lang.Runnable|true|runtrue;runtrue;"
     );
 }

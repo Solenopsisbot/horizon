@@ -154,21 +154,18 @@ impl<H: Host> Runtime<'_, H> {
                 .class(&name)
                 .and_then(crate::jdk_model::class_access_flags)
                 .is_some_and(|flags| flags & 0x0200 != 0);
-            if !is_interface {
-                // The JVM refuses a class here; an interface outside the class
-                // model (a game or JDK interface) has no method table to proxy.
-                return Err(if self.class(&name).is_some() {
-                    NativeError::UncaughtException {
-                        class: "java/lang/IllegalArgumentException".into(),
-                        message: Some(format!("{} is not an interface", name.replace('/', "."))),
-                        frame: None,
-                    }
-                } else {
-                    NativeError::Metadata(format!(
-                        "Proxy.newProxyInstance over {name}, an interface outside the class model"
-                    ))
+            if !is_interface && self.class(&name).is_some() {
+                // The JVM refuses a class here.
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some(format!("{} is not an interface", name.replace('/', "."))),
+                    frame: None,
                 });
             }
+            // An interface outside the class model (a JDK or game interface:
+            // Architectury's `createLoop` proxies `Runnable`) has no method
+            // table here, but the proxy needs none to exist: a call on it
+            // names its own method, which `invoke_on_proxy` hands the handler.
             names.push(Value::Ref(Some(name)));
         }
         let proxy = self.new_object(PROXY_CLASS);
@@ -259,6 +256,13 @@ impl<H: Host> Runtime<'_, H> {
         } else {
             match self.proxy_declaring_interface(marker, &r.name, &r.descriptor) {
                 Some(interface) => interface,
+                // A call through an interface the class model does not hold
+                // is that interface's own method.
+                None if self.class(&r.owner).is_none()
+                    && self.proxy_interfaces(marker).contains(&r.owner) =>
+                {
+                    r.owner.clone()
+                }
                 None if r.owner == "java/lang/Object" && r.name == "getClass" => {
                     return Ok(Value::Ref(Some(PROXY_CLASS.into())));
                 }
