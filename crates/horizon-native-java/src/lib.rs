@@ -29,6 +29,7 @@ mod reflect_constructors;
 mod reflect_enum;
 mod reflect_names;
 mod stack_walk;
+mod type_switch;
 mod vanilla_registries;
 pub mod weaver;
 
@@ -23400,6 +23401,14 @@ impl<H: Host> Runtime<'_, H> {
                         .map(|_| pop(&mut stack, class, method, at))
                         .collect::<Result<Vec<_>, _>>()?;
                     captured.reverse();
+                    // A pattern-matching `switch` site answers the matching
+                    // label's index (`type_switch`).
+                    if let Some(labels) = file.type_switch_labels(index)
+                        && let [value, Value::Int(restart)] = captured.as_slice()
+                    {
+                        stack.push(Value::Int(self.type_switch_index(&labels, value, *restart)));
+                        continue;
+                    }
                     // A string-concat site joins its captured values into the
                     // recipe's text instead of leaving an opaque marker: mods
                     // build keys, ids and exception messages through these

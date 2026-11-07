@@ -64,8 +64,10 @@ fn build_jar(
         paths.push(path);
     }
     let status = Command::new(javac())
+        // 21: pattern-matching `switch` (`SwitchBootstraps.typeSwitch`) is a
+        // Java 21 feature, and real 26.3 mods target 21 or later.
         .arg("--release")
-        .arg("17")
+        .arg("21")
         .arg("-d")
         .arg(&classes)
         .args(paths)
@@ -1027,5 +1029,47 @@ public final class Main {
             ],
         ),
         all_true(&["black", "block", "item", "light-blue", "white"])
+    );
+}
+
+/// A pattern-matching `switch` over a config default's type (ShulkerBoxTooltip's
+/// `makeNbtReader`): the `typeSwitch` site answers the first matching label,
+/// `-1` for null and the label count (the `default` arm) for no match.
+#[test]
+fn pattern_switch_selects_the_first_matching_label() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+public final class Main {
+    enum Mode { ON }
+    static String kind(Object value) {
+        return switch (value) {
+            case null -> "null";
+            case Enum<?> e -> "enum";
+            case Boolean b -> "boolean";
+            case String s -> "string";
+            case Integer i when i > 10 -> "big";
+            case Integer i -> "int";
+            default -> "other";
+        };
+    }
+    public static void main() {
+        Probe.check("enum", "enum".equals(kind(Mode.ON)));
+        Probe.check("boolean", "boolean".equals(kind(Boolean.TRUE)));
+        Probe.check("string", "string".equals(kind("text")));
+        Probe.check("guard", "big".equals(kind(Integer.valueOf(42))));
+        Probe.check("int", "int".equals(kind(Integer.valueOf(3))));
+        Probe.check("null", "null".equals(kind(null)));
+        Probe.check("default", "other".equals(kind(new Object())));
+    }
+}
+"#,
+    );
+    assert_eq!(
+        run("type-switch", sources, &[]),
+        all_true(&[
+            "boolean", "default", "enum", "guard", "int", "null", "string"
+        ])
     );
 }
