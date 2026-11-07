@@ -116,15 +116,21 @@ fn layered_java(
     (java, has_server_java)
 }
 
-/// Joins a namespace's server-role rows to the client-role content already
-/// layered for it: one jar's two entrypoint sets register into one mod, so a
-/// row either role already declared is not a clash.
+/// Joins a namespace's code-declared rows to the content already layered for
+/// it: one jar's two entrypoint sets (client and server role) register into
+/// one mod, and two jars may declare into one namespace, so a row either side
+/// already declared is not a clash.
 fn merge_java_content(
     target: &mut horizon_client::mod_content::ContentMod,
     source: horizon_client::mod_content::ContentMod,
 ) {
     let id = source.id.clone();
     let horizon_client::mod_content::ContentMod { content, .. } = source;
+    // Generated data files (recipes) carry their bytes; a name the client
+    // role already generated stays as it is.
+    if let Err(e) = target.content.merge_generated(&content) {
+        log::warn!("Horizon: Java mod {id} data files not joined to its namespace: {e}");
+    }
     let blocks: Vec<_> = content
         .blocks
         .into_iter()
@@ -142,7 +148,7 @@ fn merge_java_content(
         .filter(|item| !target.content.items.iter().any(|known| known.id == item.id))
         .collect();
     if let Err(e) = target.content.declare(&blocks, &items) {
-        log::warn!("Horizon: Java mod {id} server declarations not merged: {e}");
+        log::warn!("Horizon: Java mod {id} declarations not joined to its namespace: {e}");
         return;
     }
     for effect in content.effects {
@@ -185,10 +191,19 @@ fn merge_java_content(
             target.content.creative_tabs.push(tab);
         }
     }
-    for file in content.files {
-        if !target.content.files.contains(&file) {
-            target.content.files.push(file);
-        }
+    let types: Vec<_> = content
+        .block_entity_types
+        .into_iter()
+        .filter(|kind| {
+            !target
+                .content
+                .block_entity_types
+                .iter()
+                .any(|known| known.id == kind.id)
+        })
+        .collect();
+    if let Err(e) = target.content.declare_block_entity_types(&types) {
+        log::warn!("Horizon: Java mod {id} block entity types not joined to its namespace: {e}");
     }
 }
 
@@ -341,6 +356,18 @@ fn accept_java(
     };
     for candidate in java {
         let id = candidate.id.clone();
+        // Two jars may declare into one namespace (an add-on's recipes for its
+        // parent mod's namespace, two versions of one mod): code-declared rows
+        // join that namespace's content instead of clashing and refusing the
+        // whole of whichever came second.
+        if let Some(existing) = mods
+            .iter_mut()
+            .find(|known| known.id == id && known.content.is_code())
+            && candidate.content.is_code()
+        {
+            merge_java_content(existing, candidate);
+            continue;
+        }
         match horizon_client::mod_content::accept_mod(&mut mods, candidate, known) {
             Ok(()) => {}
             Err(e) => log::warn!("Horizon: Java mod {id} content not loaded: {e}"),
@@ -900,6 +927,50 @@ mod tests {
                 .is_none()
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Two jars declaring into one namespace join it: an add-on's recipe for
+    /// its parent's namespace lands beside the parent's blocks instead of
+    /// clashing and refusing whichever content came second.
+    #[test]
+    fn java_content_of_one_namespace_from_two_jars_joins() {
+        use horizon_mods::native::NativeDeclarations;
+        let mut parent = NativeDeclarations::default();
+        parent
+            .add_block(
+                "pie:crate",
+                "minecraft:barrel",
+                &std::collections::BTreeMap::new(),
+                true,
+            )
+            .unwrap();
+        let mut addon = NativeDeclarations::default();
+        addon
+            .add_recipe(
+                "pie:crate_from_sticks",
+                r#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:stick"],"result":{"id":"minecraft:barrel"}}"#,
+            )
+            .unwrap();
+        let java: Vec<horizon_client::mod_content::ContentMod> = [parent, addon]
+            .iter()
+            .flat_map(|declarations| declarations.content_mods().unwrap())
+            .map(|(id, content)| horizon_client::mod_content::ContentMod { id, content })
+            .collect();
+        assert_eq!(java.len(), 2);
+        let root = std::env::temp_dir().join(format!("horizon-java-join-{}", std::process::id()));
+        let mods = accept_java(&root, java, &mut None);
+        assert_eq!(mods.len(), 1, "one namespace, one content mod");
+        assert_eq!(mods[0].content.blocks[0].id, "pie:crate");
+        assert_eq!(
+            mods[0].content.files,
+            ["data/pie/recipe/crate_from_sticks.json"]
+        );
+        assert!(
+            mods[0]
+                .content
+                .file("data/pie/recipe/crate_from_sticks.json")
+                .is_ok()
+        );
     }
 
     /// The integrated server role's rows are published after the window built

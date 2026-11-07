@@ -665,6 +665,10 @@ impl Game<'_> {
             .filter(|(_, m)| m.show)
             .map(|(k, _)| k.clone())
             .collect();
+        // A guest's server-declared Java content (the applied login manifest).
+        if self.remote.is_some() {
+            super::java_content::extend_registries(&mut self.ui.registries);
+        }
     }
     /// The block the player is looking at, for coordinate suggestions, and
     /// the entity, for entity arguments (ClientSuggestionProvider).

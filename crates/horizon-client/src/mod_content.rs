@@ -678,6 +678,8 @@ struct Plan<'a> {
     effects: Vec<&'a MobEffect>,
     entity_types: Vec<&'a EntityType>,
     menu_types: Vec<&'a MenuType>,
+    /// The block entity type ids mods declare in code, sorted.
+    block_entity_types: Vec<String>,
     /// Vanilla's state count (the tables' length before).
     states: usize,
     /// Each vanilla block's default state.
@@ -1229,6 +1231,16 @@ impl<'a> Plan<'a> {
             effects: mob_effects(mods),
             entity_types: entity_types(mods),
             menu_types: menu_types(mods),
+            block_entity_types: {
+                let mut ids: Vec<String> = mods
+                    .iter()
+                    .flat_map(|m| &m.content.block_entity_types)
+                    .map(|kind| kind.id.clone())
+                    .collect();
+                ids.sort();
+                ids.dedup();
+                ids
+            },
             states: names.len(),
             defaults,
             sounds,
@@ -1558,10 +1570,19 @@ impl<'a> Plan<'a> {
                 // carries the type of each block's entity.
                 let new_items = self.items.iter().map(|i| i.rename.to.clone());
                 let new_blocks: Vec<_> = self.blocks.iter().map(|b| b.decl.id.clone()).collect();
+                // Then the block entity types mods declare in code (a Java
+                // jar's `BlockEntityType`), by id, so those ids resolve too; one
+                // named as its block already has its number.
+                let mut entity_types = new_blocks.clone();
+                for kind in &self.block_entity_types {
+                    if !entity_types.contains(kind) {
+                        entity_types.push(kind.clone());
+                    }
+                }
                 let mut registries = vec![
                     ("minecraft:item", new_items.collect::<Vec<_>>()),
-                    ("minecraft:block", new_blocks.clone()),
-                    ("minecraft:block_entity_type", new_blocks),
+                    ("minecraft:block", new_blocks),
+                    ("minecraft:block_entity_type", entity_types),
                 ];
                 if !self.effects.is_empty() {
                     let new_effects = self.effects.iter().map(|e| e.id.clone());
@@ -2695,6 +2716,7 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
         || !plan.effects.is_empty()
         || !plan.entity_types.is_empty()
         || !plan.menu_types.is_empty()
+        || !plan.block_entity_types.is_empty()
     {
         overlay.write(crate::content_identity::MARKER, b"1")?;
     }
@@ -2800,6 +2822,7 @@ pub fn live_switch(content: &Content) -> std::result::Result<(), &'static str> {
         || !content.entity_types.is_empty()
         || !content.menu_types.is_empty()
         || !content.creative_tabs.is_empty()
+        || !content.block_entity_types.is_empty()
     {
         return Err("horizon.mods.switch.registries");
     }
@@ -2855,11 +2878,23 @@ fn stamp(base: &Path, mods: &[ContentMod]) -> Result<String> {
     }
     for m in mods {
         parts.push(m.id.clone());
-        // What it declares, so blocks and items from code count too.
-        parts.push(format!("{:?} {:?}", m.content.blocks, m.content.items));
+        // What it declares, so blocks, items and block entity types from code
+        // count too.
+        parts.push(format!(
+            "{:?} {:?} {:?}",
+            m.content.blocks, m.content.items, m.content.block_entity_types
+        ));
         let source = m.content.source();
         if m.content.files.is_empty() {
             // Declared in code only: nothing to read.
+        } else if m.content.is_code() {
+            // Files generated from declarations (a Java jar's recipes) live in
+            // memory: their bytes are the stamp, there is no file to stat.
+            let mut reader = m.content.reader()?;
+            for file in &m.content.files {
+                let bytes = reader.read(file)?;
+                parts.push(format!("{file} {:x}", Sha256::digest(&bytes)));
+            }
         } else if source.is_dir() {
             for file in &m.content.files {
                 parts.push(meta(&source.join(file))?);

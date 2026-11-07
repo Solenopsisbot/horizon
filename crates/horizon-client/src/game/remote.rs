@@ -3239,7 +3239,9 @@ impl Game<'_> {
                 if self.remote.is_some() {
                     match java_content::apply(&p.data) {
                         Ok(java_content::Outcome::Applied(count)) => {
-                            log::info!("Horizon: server declared {count} Java content id(s)")
+                            log::info!("Horizon: server declared {count} Java content id(s)");
+                            // Local parsing and suggestions see the server's ids.
+                            java_content::extend_registries(&mut self.ui.registries);
                         }
                         Ok(java_content::Outcome::Refused(reason)) => {
                             java_content::warn_refused_once(&reason)

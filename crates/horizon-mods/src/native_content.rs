@@ -157,7 +157,8 @@ pub fn recipe_refusal(recipe: &serde_json::Value, items: &BTreeSet<&str>) -> Opt
     let Some(kind) = object.get("type").and_then(serde_json::Value::as_str) else {
         return Some("has no type".into());
     };
-    if !kind.starts_with("minecraft:") {
+    // An id without a namespace is vanilla's (`Identifier.parse`).
+    if kind.contains(':') && !kind.starts_with("minecraft:") {
         return Some(format!(
             "type {kind} is a mod's own recipe serializer, which is code"
         ));
@@ -259,6 +260,8 @@ mod tests {
             recipe_refusal(&foreign, &items).as_deref(),
             Some("names ruby:ore, which no declaration provides")
         );
+        let bare = json!({"type": "crafting_shapeless", "ingredients": ["stick"], "result": {"id": "ruby:gem"}});
+        assert_eq!(recipe_refusal(&bare, &items), None);
         let serializer = json!({"type": "farmersdelight:cutting", "result": []});
         assert!(
             recipe_refusal(&serializer, &items)

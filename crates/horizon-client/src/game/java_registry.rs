@@ -3,13 +3,15 @@
 //! The snapshot is the bounded, deterministic view of every declared row the
 //! run's Java mods produced. It is built beside the content root, from the same
 //! [`NativeDeclarations`], so diagnostics, the compatibility summary and the
-//! content model never disagree. Rows the content model cannot express yet
-//! (block entities, recipes, ingredients) are kept here so they stay visible
-//! instead of silently disappearing.
+//! content model never disagree. Besides the content tables it keeps the
+//! declared data components and attachments (which travel in the login
+//! manifest, not the content root), and the recipe ids, so every declared row
+//! stays visible instead of silently disappearing.
 #![allow(dead_code)]
 use horizon_mods::content::{Block, EntityType, Item, MobEffect};
 use horizon_mods::native::{
-    BlockEntityDeclaration, MAX_NATIVE_DECLARATIONS, MenuDeclaration, NativeDeclarations,
+    AttachmentDeclaration, BlockEntityDeclaration, DataComponentDeclaration,
+    MAX_NATIVE_DECLARATIONS, MenuDeclaration, NativeDeclarations,
 };
 use std::{
     collections::BTreeMap,
@@ -24,12 +26,18 @@ pub(super) struct JavaRegistrySnapshot {
     pub(super) entities: Vec<String>,
     pub(super) menus: Vec<String>,
     pub(super) block_entities: Vec<String>,
+    /// Declared recipe ids, applied to the content root or not.
+    pub(super) recipes: Vec<String>,
+    pub(super) data_components: Vec<String>,
+    pub(super) attachments: Vec<String>,
     pub(super) block_templates: Vec<Block>,
     pub(super) item_templates: Vec<Item>,
     pub(super) effect_templates: Vec<MobEffect>,
     pub(super) entity_templates: Vec<EntityType>,
     pub(super) menu_templates: Vec<MenuDeclaration>,
     pub(super) block_entity_templates: Vec<BlockEntityDeclaration>,
+    pub(super) data_component_templates: Vec<DataComponentDeclaration>,
+    pub(super) attachment_templates: Vec<AttachmentDeclaration>,
     /// Rows folded away while coalescing duplicates, by table name. Sorted, so
     /// two batches that coalesce the same rows report the same map.
     pub(super) coalesced: BTreeMap<String, usize>,
@@ -59,6 +67,20 @@ impl JavaRegistrySnapshot {
                 .extend(declarations.menus.iter().map(|row| row.id.clone()));
             next.block_entities
                 .extend(declarations.block_entities.iter().map(|row| row.id.clone()));
+            next.recipes
+                .extend(declarations.recipes.iter().map(|row| row.id.clone()));
+            next.data_components.extend(
+                declarations
+                    .data_components
+                    .iter()
+                    .map(|row| row.id.clone()),
+            );
+            next.attachments
+                .extend(declarations.attachments.iter().map(|row| row.id.clone()));
+            next.data_component_templates
+                .extend(declarations.data_components.iter().cloned());
+            next.attachment_templates
+                .extend(declarations.attachments.iter().cloned());
             next.block_templates
                 .extend(declarations.blocks.iter().cloned());
             next.item_templates
@@ -77,7 +99,10 @@ impl JavaRegistrySnapshot {
             + next.effects.len()
             + next.entities.len()
             + next.menus.len()
-            + next.block_entities.len();
+            + next.block_entities.len()
+            + next.recipes.len()
+            + next.data_components.len()
+            + next.attachments.len();
         if rows > MAX_NATIVE_DECLARATIONS {
             return Err(format!(
                 "java registry has {rows} rows, over the {MAX_NATIVE_DECLARATIONS} declaration bound"
@@ -90,6 +115,9 @@ impl JavaRegistrySnapshot {
             &mut next.entities,
             &mut next.menus,
             &mut next.block_entities,
+            &mut next.recipes,
+            &mut next.data_components,
+            &mut next.attachments,
         ] {
             ids.sort();
             ids.dedup();
@@ -129,12 +157,28 @@ impl JavaRegistrySnapshot {
                 row.id.as_str()
             })?,
         );
+        note_coalesced(
+            &mut coalesced,
+            "data components",
+            coalesce_typed(
+                &mut next.data_component_templates,
+                "data component",
+                |row| row.id.as_str(),
+            )?,
+        );
+        note_coalesced(
+            &mut coalesced,
+            "attachments",
+            coalesce_typed(&mut next.attachment_templates, "attachment", |row| {
+                row.id.as_str()
+            })?,
+        );
         next.coalesced = coalesced;
         Ok(next)
     }
 
     /// Counts per table, in a fixed order, for the compatibility summary.
-    pub(super) fn counts(&self) -> [(&'static str, usize); 6] {
+    pub(super) fn counts(&self) -> [(&'static str, usize); 9] {
         [
             ("blocks", self.blocks.len()),
             ("items", self.items.len()),
@@ -142,6 +186,9 @@ impl JavaRegistrySnapshot {
             ("entities", self.entities.len()),
             ("menus", self.menus.len()),
             ("block entities", self.block_entities.len()),
+            ("recipes", self.recipes.len()),
+            ("data components", self.data_components.len()),
+            ("attachments", self.attachments.len()),
         ]
     }
 
@@ -185,6 +232,47 @@ pub(super) fn publish(declarations: &[NativeDeclarations]) -> Result<(), String>
 /// The snapshot the last published batch produced.
 pub(super) fn snapshot() -> JavaRegistrySnapshot {
     state().read().expect("java registry lock poisoned").clone()
+}
+
+/// Logs, for one jar, the declared rows the content root leaves out and why:
+/// recipes [`NativeDeclarations::recipe_report`] refuses, block entity types
+/// naming blocks the jar did not declare, and ingredients, which no vanilla
+/// data folder reads. What does apply is one info line, so a corpus run can
+/// count it.
+pub(super) fn log_unapplied(path: &std::path::Path, declarations: &NativeDeclarations) {
+    let jar = path.display();
+    let report = declarations.recipe_report();
+    let block_entities: Vec<(String, String)> = declarations
+        .block_entities
+        .iter()
+        .filter_map(|row| Some((row.id.clone(), declarations.block_entity_refusal(row)?)))
+        .collect();
+    let applied_types = declarations.block_entities.len() - block_entities.len();
+    if !report.applied.is_empty() || applied_types > 0 {
+        log::info!(
+            "Horizon: Java mod {jar} adds {} recipe(s) and {applied_types} block entity type(s) to the content root",
+            report.applied.len()
+        );
+    }
+    if let Some((id, reason)) = report.refused.first() {
+        log::warn!(
+            "Horizon: Java mod {jar}: {} of {} recipe(s) left out of the content root (first: {id} {reason})",
+            report.refused.len(),
+            declarations.recipes.len()
+        );
+    }
+    if let Some((id, reason)) = block_entities.first() {
+        log::warn!(
+            "Horizon: Java mod {jar}: {} block entity type(s) left out of the content root (first: {id}: {reason})",
+            block_entities.len()
+        );
+    }
+    if !declarations.ingredients.is_empty() {
+        log::warn!(
+            "Horizon: Java mod {jar} declares {} ingredient row(s); they are kept as declarations, no vanilla data folder reads them",
+            declarations.ingredients.len()
+        );
+    }
 }
 
 /// Typed rows are validated before coalescing: only a row that agrees on every

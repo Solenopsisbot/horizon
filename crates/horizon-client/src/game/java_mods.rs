@@ -366,6 +366,12 @@ pub(super) fn declarations_from_entries(
                     "block_entity" | "block-entity" | "blockentity" => {
                         declarations.add_block_entity(&entry.id, properties)?
                     }
+                    "data_component" | "data-component" | "data_component_type" => {
+                        declarations.add_data_component(&entry.id, properties)?
+                    }
+                    "attachment" | "attachment_type" => {
+                        declarations.add_attachment(&entry.id, properties)?
+                    }
                     _ => declarations.add_custom(&entry.registry, &entry.id, kind, properties)?,
                 }
             }
@@ -892,20 +898,8 @@ fn bootstrap_jar(
     // transactionally so a conflicting id stops this jar, not the game.
     let mut declarations = declarations_from_entries(&typed)?;
     declarations.merge(declarations_from_entries(&jar.native_declarations)?)?;
-    // The current content model has no table for these yet; name them so a
-    // mod's rows are not silently dropped.
-    if !declarations.block_entities.is_empty()
-        || !declarations.recipes.is_empty()
-        || !declarations.ingredients.is_empty()
-    {
-        log::warn!(
-            "Horizon: Java mod {} declares {} block entity, {} recipe and {} ingredient row(s) the content model does not express yet",
-            path.display(),
-            declarations.block_entities.len(),
-            declarations.recipes.len(),
-            declarations.ingredients.len()
-        );
-    }
+    // Name the rows the content root leaves out, so none is silently dropped.
+    super::java_registry::log_unapplied(path, &declarations);
     let content: Vec<ContentMod> = declarations
         .content_mods()?
         .into_iter()

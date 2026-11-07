@@ -161,10 +161,11 @@ impl JavaContentManifest {
             items: capped_ids(items),
             effects: capped_ids(snapshot.effects.clone()),
             entity_types: capped_ids(snapshot.entities.clone()),
-            // The current native declaration vocabulary has no data-component
-            // or attachment table; the v1 body still carries the section.
-            data_components: Vec::new(),
-            attachments: Vec::new(),
+            // The typed data-component and attachment tables travel as ids:
+            // their codecs are Java objects no guest can rebuild, but the ids
+            // let a guest resolve and list them as the host does.
+            data_components: capped_ids(snapshot.data_components.clone()),
+            attachments: capped_ids(snapshot.attachments.clone()),
             menus: capped_ids(snapshot.menus.clone()),
             block_entity_types: capped_ids(snapshot.block_entities.clone()),
             block_entities: capped_rows(
@@ -852,7 +853,72 @@ pub(super) fn host_manifest() -> JavaContentManifest {
     manifest
 }
 
+/// Adds the ids an applied server manifest declares to a client's command
+/// registries: items (`/give`, item arguments), blocks (block states with no
+/// properties, as the manifest carries none), mob effects, entity types and
+/// data component types, both in the typed lists and in `by_registry`, sorted
+/// and once. Nothing changes until a manifest was applied: a host's own
+/// declarations are already in its content root, and so in the tables the
+/// registries were built from.
+///
+/// This feeds local parsing and suggestions only. The server still parses
+/// and runs the command; a guest without the jars has no model or network id
+/// for those items, so its creative tab and item tables stay its own root's.
+pub(super) fn extend_registries(reg: &mut horizon_client::command::Registries) -> usize {
+    let store = store();
+    let Some(content) = store.as_ref() else {
+        return 0;
+    };
+    extend_registries_with(reg, content)
+}
+
+fn extend_registries_with(
+    reg: &mut horizon_client::command::Registries,
+    content: &DeclaredContent,
+) -> usize {
+    fn join(list: &mut Vec<String>, ids: &[String]) -> usize {
+        let before = list.len();
+        list.extend(
+            ids.iter()
+                .filter(|id| !list.contains(id))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        list.sort();
+        list.dedup();
+        list.len() - before
+    }
+    let ids = &content.ids;
+    let mut added = join(&mut reg.items, &ids.items);
+    for block in &ids.blocks {
+        if !reg.blocks.contains_key(block) {
+            reg.blocks.insert(block.clone(), Vec::new());
+            added += 1;
+        }
+    }
+    added += join(&mut reg.effects, &ids.effects);
+    added += join(&mut reg.entity_types, &ids.entity_types);
+    for (registry, list) in [
+        ("minecraft:item", &ids.items),
+        ("minecraft:block", &ids.blocks),
+        ("minecraft:mob_effect", &ids.effects),
+        ("minecraft:entity_type", &ids.entity_types),
+        ("minecraft:data_component_type", &ids.data_components),
+        ("minecraft:menu", &ids.menus),
+        ("minecraft:block_entity_type", &ids.block_entity_types),
+    ] {
+        if !list.is_empty() {
+            join(
+                &mut reg.by_registry.entry(registry.into()).or_default().ids,
+                list,
+            );
+        }
+    }
+    added
+}
+
 /// The declared-content epoch of the last v3 manifest this client applied, 0
+/// until one is./// The declared-content epoch of the last v3 manifest this client applied, 0
 /// until one is. A later post-login re-send uses it to tell "the host's
 /// declarations changed" from "the same content again".
 static APPLIED_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -1680,6 +1746,49 @@ mod tests {
         other.blocks = vec!["ruby:other".into()];
         assert!(other.apply().is_err());
         assert_eq!(stored().ids.blocks, ["ruby:block"]);
+    }
+
+    #[test]
+    fn an_applied_manifest_reaches_the_command_registries() {
+        let _guard = lock();
+        clear_declared_java_content();
+        let mut reg = horizon_client::command::Registries {
+            items: vec!["minecraft:stick".into()],
+            ..Default::default()
+        };
+        let parses = |reg: &horizon_client::command::Registries| {
+            horizon_client::command::item::parse_stack(
+                &mut horizon_client::command::Reader {
+                    string: "ruby:gem",
+                    cursor: 0,
+                },
+                reg,
+            )
+            .is_ok()
+        };
+        // Nothing applied: the client's own root already lists its content.
+        assert_eq!(extend_registries(&mut reg), 0);
+        assert!(!parses(&reg), "an unknown item does not parse");
+        let mut manifest = manifest();
+        manifest.data_components = vec!["ruby:charge".into()];
+        manifest.apply().unwrap();
+        let added = extend_registries(&mut reg);
+        assert_eq!(reg.items, ["minecraft:stick", "ruby:block", "ruby:gem"]);
+        assert!(reg.blocks.get("ruby:block").is_some_and(Vec::is_empty));
+        assert_eq!(
+            reg.by_registry["minecraft:item"].ids,
+            ["ruby:block", "ruby:gem"]
+        );
+        assert_eq!(
+            reg.by_registry["minecraft:data_component_type"].ids,
+            ["ruby:charge"]
+        );
+        // The give argument now parses the server's item.
+        assert!(parses(&reg));
+        // A second pass adds nothing.
+        assert!(added >= 3);
+        assert_eq!(extend_registries(&mut reg), 0);
+        clear_declared_java_content();
     }
 
     #[test]

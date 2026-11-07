@@ -786,6 +786,25 @@ impl RecipeIndex {
                 Some((format!("minecraft:{}", file.name), v))
             })
             .collect();
+        // Content mods' recipes, `<ns>:<name>`, as the crafting loader reads
+        // them (`Recipes::sources`): a recipe it crafts is one the book knows
+        // and `/recipe` gives.
+        for namespace in crate::mod_content::namespaces(root) {
+            let Ok(folder) =
+                crate::json_folder::read(&root.join(format!("data/{namespace}/recipe")))
+            else {
+                continue;
+            };
+            for file in &folder.files {
+                if let Some(v) = file
+                    .bytes()
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                {
+                    sources.push((format!("{namespace}:{}", file.name), v));
+                }
+            }
+        }
         for (id, files) in overlay.kind("recipe") {
             match serde_json::from_slice::<serde_json::Value>(PackOverlay::top(files)) {
                 Ok(v) => match sources.iter_mut().find(|(n, _)| n == id) {
