@@ -13,13 +13,17 @@ use std::{
     sync::Arc,
 };
 
-pub mod events;
-pub mod weaver;
+mod annotation_values;
 mod declarations_content;
+pub mod events;
 mod game_hooks;
 mod java_regex;
 mod jdk_model;
+mod map_compute;
+mod reflect_enum;
 mod stack_walk;
+mod vanilla_registries;
+pub mod weaver;
 
 pub use game_hooks::{
     GAME_OBJECT_PREFIX, GameHookContext, GameHookEffect, GameHookState, GameObject, GameObjectKind,
@@ -4258,6 +4262,64 @@ impl Host for StdHost {
             | ("java/util/Collections", "unmodifiableMap", "(Ljava/util/Map;)Ljava/util/Map;") => {
                 Ok(Self::argument(r, args, 0)?.clone())
             }
+            // commons-io ships with the game too; `IOUtils.toString(stream,
+            // charset)` drains a bundled resource stream the host opened (the
+            // text is decoded as UTF-8, the charset every caller passes).
+            (
+                "org/apache/commons/io/IOUtils",
+                "toString",
+                "(Ljava/io/InputStream;Ljava/nio/charset/Charset;)Ljava/lang/String;"
+                | "(Ljava/io/InputStream;Ljava/lang/String;)Ljava/lang/String;",
+            ) => {
+                let Some(marker) = expect_ref(Self::argument(r, args, 0)?).cloned() else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("inputStream".into()),
+                        frame: None,
+                    });
+                };
+                match self.resource_stream_text(&marker) {
+                    Some(text) => Ok(Value::Ref(Some(text))),
+                    None => self.unknown_host_call(r),
+                }
+            }
+            // commons-lang3 ships with the game, and settings libraries box a
+            // field's type through it (Carpet's `ParsedRule`). A primitive's
+            // class marker is its name, as the wrapper `TYPE` statics answer.
+            (
+                "org/apache/commons/lang3/ClassUtils",
+                "primitiveToWrapper" | "wrapperToPrimitive",
+                "(Ljava/lang/Class;)Ljava/lang/Class;",
+            ) => {
+                const PAIRS: &[(&str, &str)] = &[
+                    ("boolean", "java/lang/Boolean"),
+                    ("byte", "java/lang/Byte"),
+                    ("char", "java/lang/Character"),
+                    ("short", "java/lang/Short"),
+                    ("int", "java/lang/Integer"),
+                    ("long", "java/lang/Long"),
+                    ("float", "java/lang/Float"),
+                    ("double", "java/lang/Double"),
+                    ("void", "java/lang/Void"),
+                ];
+                let class = Self::argument(r, args, 0)?;
+                let name = expect_string(class).replace('.', "/");
+                let to_wrapper = r.name == "primitiveToWrapper";
+                let mapped = PAIRS.iter().find_map(|(primitive, wrapper)| {
+                    if to_wrapper {
+                        (name == *primitive).then_some(*wrapper)
+                    } else {
+                        (name == *wrapper).then_some(*primitive)
+                    }
+                });
+                Ok(match mapped {
+                    Some(mapped) => Value::Ref(Some(mapped.to_owned())),
+                    // A non-primitive passes through `primitiveToWrapper`
+                    // unchanged; `wrapperToPrimitive` answers null for it.
+                    None if to_wrapper => class.clone(),
+                    None => Value::Ref(None),
+                })
+            }
             // `Pattern.matches(regex, input)` is `String.matches` spelled
             // statically; the same bounded subset answers it.
             (
@@ -6973,6 +7035,14 @@ impl Host for StdHost {
             ("java/lang/String", "toUpperCase", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
                 expect_string(receiver).to_ascii_uppercase(),
             ))),
+            // The `Locale` overloads (`Locale.ROOT` in ids and file names): the
+            // root locale is Unicode's default case mapping, no locale tailoring.
+            ("java/lang/String", "toLowerCase", "(Ljava/util/Locale;)Ljava/lang/String;") => {
+                Ok(Value::Ref(Some(expect_string(receiver).to_lowercase())))
+            }
+            ("java/lang/String", "toUpperCase", "(Ljava/util/Locale;)Ljava/lang/String;") => {
+                Ok(Value::Ref(Some(expect_string(receiver).to_uppercase())))
+            }
             ("java/lang/String", "equals", "(Ljava/lang/Object;)Z") => {
                 let other = Self::argument(r, args, 0)?;
                 Ok(Value::Int(
@@ -7455,6 +7525,31 @@ impl Host for StdHost {
                     }
                     _ => Ok(Value::default_for(&r.descriptor)),
                 }
+            }
+            // A `registry/<id>` marker is both a registry (`BuiltInRegistries.X`)
+            // and its key (`Registries.X`), so `registry.key()` is the marker
+            // itself and the key's identifier is the registry id. Libraries
+            // index their registry wrappers by `registry.key().identifier()`;
+            // the neutral null made every wrapper `minecraft:` and the second
+            // one a duplicate.
+            (
+                "net/minecraft/core/Registry"
+                | "net/minecraft/core/DefaultedRegistry"
+                | "net/minecraft/core/WritableRegistry"
+                | "net/minecraft/core/MappedRegistry"
+                | "net/minecraft/core/DefaultedMappedRegistry",
+                "key",
+                "()Lnet/minecraft/resources/ResourceKey;",
+            ) if expect_string(receiver).starts_with("registry/") => Ok(receiver.clone()),
+            (
+                "net/minecraft/resources/ResourceKey",
+                "identifier" | "location",
+                "()Lnet/minecraft/resources/Identifier;"
+                | "()Lnet/minecraft/resources/ResourceLocation;",
+            ) if expect_string(receiver).starts_with("registry/") => {
+                let id = expect_string(receiver).trim_start_matches("registry/");
+                let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
+                Ok(identifier_value(namespace, path))
             }
             ("net/minecraft/resources/ResourceKey", name, descriptor) => {
                 let marker = expect_string(receiver);
@@ -8488,6 +8583,9 @@ fn registry_static_id(owner: &str, field: &str) -> Option<&'static str> {
     REGISTRY_STATICS
         .iter()
         .find_map(|(name, id)| (*name == field).then_some(*id))
+        // Every other vanilla registry field answers its own id too, so a
+        // wrapper over `BuiltInRegistries.FLUID` is not a null registry.
+        .or_else(|| vanilla_registries::registry_id(owner, field))
 }
 
 fn tag_key_value(registry: &str, location: &str) -> Value {
@@ -17044,6 +17142,26 @@ fn functional_composition_marker(
             "@fn:function.then:{receiver_marker}|{}",
             other().unwrap_or("@fn:function.empty")
         )))),
+        // The two-argument forms compose the same way: running the composite
+        // hands both arguments to each consumer, and a `BiFunction`'s result to
+        // the `Function` after it. Without these the combinator ran the
+        // receiver with the second callback as its only argument.
+        (
+            "java/util/function/BiConsumer",
+            "andThen",
+            "(Ljava/util/function/BiConsumer;)Ljava/util/function/BiConsumer;",
+        ) => Some(Value::Ref(Some(format!(
+            "@fn:consumer.then:{receiver_marker}|{}",
+            other().unwrap_or("@fn:consumer.empty")
+        )))),
+        (
+            "java/util/function/BiFunction",
+            "andThen",
+            "(Ljava/util/function/Function;)Ljava/util/function/BiFunction;",
+        ) => Some(Value::Ref(Some(format!(
+            "@fn:function.then:{receiver_marker}|{}",
+            other().unwrap_or("@fn:function.empty")
+        )))),
         _ => None,
     }
 }
@@ -19222,6 +19340,9 @@ impl<H: Host> Runtime<'_, H> {
                 return Ok(Some(Value::Int(i32::from(assignable))));
             }
         }
+        if let Some(value) = self.invoke_reflect_enum(r, receiver)? {
+            return Ok(Some(value));
+        }
         // `getSuperclass` walks the jar's own hierarchy: a config scanner that
         // recurses until it reaches `Object.class` must reach it. A class the
         // runtime does not hold (a game or JDK class) answers `Object`, the one
@@ -19694,7 +19815,7 @@ impl<H: Host> Runtime<'_, H> {
     /// parser keeps are answerable: `annotationType`, strings, ints and
     /// booleans. Everything else is a bounded diagnostic, not a made-up value.
     fn annotation_member(
-        &self,
+        &mut self,
         annotation: &Annotation,
         r: &MethodRef,
     ) -> Result<Value, NativeError> {
@@ -19706,23 +19827,14 @@ impl<H: Host> Runtime<'_, H> {
                 .unwrap_or(&annotation.descriptor);
             return Ok(Value::Ref(Some(name.to_owned())));
         }
-        let value = annotation.values.get(&r.name).ok_or_else(|| {
+        // The use site's value, else the interface's `default`, converted to
+        // the member's declared type (`annotation_values`).
+        self.annotation_member_value(annotation, r)?.ok_or_else(|| {
             NativeError::Metadata(format!(
                 "annotation {} has no member {}",
                 annotation.descriptor, r.name
             ))
-        })?;
-        match value {
-            AnnotationValue::String(value) => Ok(Value::Ref(Some(value.clone()))),
-            AnnotationValue::Bool(value) => Ok(Value::Int(i32::from(*value))),
-            AnnotationValue::Int(value) => Ok(Value::Int(*value)),
-            AnnotationValue::Long(value) => Ok(Value::Long(*value)),
-            AnnotationValue::Float(value) => Ok(Value::Float(*value)),
-            _ => Err(NativeError::Metadata(format!(
-                "annotation {}#{}{} is outside the bounded annotation value model",
-                annotation.descriptor, r.name, r.descriptor
-            ))),
-        }
+        })
     }
 
     /// Answer `values()` for the game enums the native path models.
@@ -23032,6 +23144,10 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_stack_walker(&r, receiver.as_ref(), &args))
+                    {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_map_compute(&r, receiver.as_ref(), &args))
                     {
                         value
                     } else if let Some(value) =

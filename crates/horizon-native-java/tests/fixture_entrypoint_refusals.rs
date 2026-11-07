@@ -465,3 +465,262 @@ public final class Main {
         all_true(&["composite", "constant"])
     );
 }
+
+/// Registry wrappers are indexed by `registry.key().identifier()`
+/// (supermartijn642's `Registries`). Each built-in registry must answer its
+/// own id; a shared null id made the second wrapper a duplicate.
+#[test]
+fn registry_key_identifier_names_the_registry() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "net/minecraft/resources/Identifier.java",
+        "package net.minecraft.resources;\npublic final class Identifier { @Override public String toString() { return null; } }\n",
+    );
+    sources.insert(
+        "net/minecraft/resources/ResourceKey.java",
+        "package net.minecraft.resources;\npublic final class ResourceKey<T> { public Identifier identifier() { return null; } }\n",
+    );
+    sources.insert(
+        "net/minecraft/core/Registry.java",
+        "package net.minecraft.core;\npublic interface Registry<T> { net.minecraft.resources.ResourceKey<? extends Registry<T>> key(); }\n",
+    );
+    sources.insert(
+        "net/minecraft/core/DefaultedRegistry.java",
+        "package net.minecraft.core;\npublic interface DefaultedRegistry<T> extends Registry<T> {}\n",
+    );
+    sources.insert(
+        "net/minecraft/core/registries/BuiltInRegistries.java",
+        r#"package net.minecraft.core.registries;
+import net.minecraft.core.*;
+public final class BuiltInRegistries {
+    public static DefaultedRegistry<Object> BLOCK;
+    public static DefaultedRegistry<Object> ITEM;
+}
+"#,
+    );
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+public final class Main {
+    public static void main() {
+        Identifier block = BuiltInRegistries.BLOCK.key().identifier();
+        Identifier item = BuiltInRegistries.ITEM.key().identifier();
+        Probe.check("block", "minecraft:block".equals(block.toString()));
+        Probe.check("distinct", !block.equals(item));
+    }
+}
+"#,
+    );
+    assert_eq!(
+        run(
+            "registry-key",
+            sources,
+            &[
+                "net/minecraft/resources/Identifier.class",
+                "net/minecraft/resources/ResourceKey.class",
+                "net/minecraft/core/Registry.class",
+                "net/minecraft/core/DefaultedRegistry.class",
+                "net/minecraft/core/registries/BuiltInRegistries.class",
+            ],
+        ),
+        all_true(&["block", "distinct"])
+    );
+}
+
+/// Per-mod registration helpers are cached with
+/// `map.computeIfAbsent(modid, Handler::new)`: the constructor reference runs
+/// with the key as its argument, so the cached helper knows its mod id.
+#[test]
+fn compute_if_absent_constructor_reference_receives_the_key() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import java.util.HashMap;
+import java.util.Map;
+public final class Main {
+    static final Map<String, Main.Handler> HANDLERS = new HashMap<>();
+    static final class Handler {
+        final String modid;
+        private Handler(String modid) { this.modid = modid; }
+    }
+    public static void main() {
+        Handler first = HANDLERS.computeIfAbsent("demo", Handler::new);
+        Probe.check("modid", "demo".equals(first.modid));
+        Probe.check("cached", HANDLERS.computeIfAbsent("demo", Handler::new) == first);
+    }
+}
+"#,
+    );
+    assert_eq!(
+        run("compute-if-absent", sources, &[]),
+        all_true(&["cached", "modid"])
+    );
+}
+
+/// Carpet's settings manager: a rule annotation read for members the use site
+/// left at their defaults (an empty `Class[]`, an enum, a string), an enum
+/// field type recognised with `isEnum` and listed with `getEnumConstants`, and
+/// a converter table built with `Map.ofEntries(Map.entry(...))`.
+#[test]
+fn settings_annotations_enums_and_entry_maps_answer_like_the_jvm() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "demo/Rule.java",
+        r#"package demo;
+import java.lang.annotation.*;
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Rule {
+    String desc() default "none";
+    Class<?>[] condition() default {};
+    Class<?> type() default String.class;
+    Mode mode() default Mode.FAST;
+    String[] options() default {"a", "b"};
+    int weight() default 3;
+}
+"#,
+    );
+    sources.insert(
+        "demo/Mode.java",
+        "package demo;\npublic enum Mode { FAST, SLOW { @Override public String toString() { return \"slow\"; } } }\n",
+    );
+    sources.insert(
+        "demo/Settings.java",
+        r#"package demo;
+public final class Settings {
+    @Rule(desc = "speed") public static int speed = 1;
+    @Rule(mode = Mode.SLOW, options = {}) public static Mode mode = Mode.FAST;
+}
+"#,
+    );
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import java.util.Map;
+public final class Main {
+    public static void main() throws Exception {
+        Rule speed = Settings.class.getField("speed").getAnnotation(Rule.class);
+        Probe.check("explicit", "speed".equals(speed.desc()));
+        Probe.check("default-array", speed.condition().length == 0);
+        Probe.check("default-class", speed.type() == String.class);
+        Probe.check("default-enum", speed.mode() == Mode.FAST);
+        Probe.check("default-strings", speed.options().length == 2 && "b".equals(speed.options()[1]));
+        Probe.check("default-int", speed.weight() == 3);
+        Rule mode = Settings.class.getField("mode").getAnnotation(Rule.class);
+        Probe.check("explicit-enum", mode.mode() == Mode.SLOW);
+        Probe.check("explicit-empty", mode.options().length == 0);
+
+        Probe.check("is-enum", Mode.class.isEnum() && !Settings.class.isEnum());
+        Object[] constants = Mode.class.getEnumConstants();
+        Probe.check("constants", constants.length == 2 && constants[1] == Mode.SLOW);
+        Probe.check("not-enum-constants", Settings.class.getEnumConstants() == null);
+
+        Map<Class<?>, String> converters = Map.ofEntries(
+            Map.entry(String.class, "string"), Map.entry(Integer.class, "int"));
+        Probe.check("entries", "int".equals(converters.get(Integer.class)) && converters.size() == 2);
+    }
+}
+"#,
+    );
+    assert_eq!(
+        run("settings", sources, &[]),
+        all_true(&[
+            "constants",
+            "default-array",
+            "default-class",
+            "default-enum",
+            "default-int",
+            "default-strings",
+            "entries",
+            "explicit",
+            "explicit-empty",
+            "explicit-enum",
+            "is-enum",
+            "not-enum-constants",
+        ])
+    );
+}
+
+/// `BiConsumer.andThen` runs both consumers with both arguments, and
+/// `BiFunction.andThen` feeds the result on (supermartijn642's registry
+/// override handlers chain their field patchers this way).
+#[test]
+fn two_argument_functional_composition_runs_both_sides() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import java.util.function.*;
+public final class Main {
+    static int sum;
+    public static void main() {
+        BiConsumer<Integer, Integer> first = (a, b) -> sum += a * b;
+        BiConsumer<Integer, Integer> both = first.andThen((a, b) -> sum += a + b);
+        both.accept(3, 4);
+        Probe.check("consumers", sum == 19);
+        BiFunction<Integer, Integer, Integer> times = (a, b) -> a * b;
+        Probe.check("function", times.andThen(x -> x + 1).apply(5, 6) == 31);
+    }
+}
+"#,
+    );
+    assert_eq!(
+        run("bi-compose", sources, &[]),
+        all_true(&["consumers", "function"])
+    );
+}
+
+/// Libraries the game ships (commons-lang3, commons-io) and the `Locale`
+/// case overloads, as Carpet's script loader uses them to name and read its
+/// bundled modules.
+#[test]
+fn bundled_library_helpers_answer() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "org/apache/commons/lang3/ClassUtils.java",
+        "package org.apache.commons.lang3;\npublic final class ClassUtils { public static Class<?> primitiveToWrapper(Class<?> c) { return null; } }\n",
+    );
+    sources.insert(
+        "org/apache/commons/io/IOUtils.java",
+        "package org.apache.commons.io;\npublic final class IOUtils { public static String toString(java.io.InputStream s, java.nio.charset.Charset c) { return null; } }\n",
+    );
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import java.nio.charset.StandardCharsets;
+import java.util.Locale;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.ClassUtils;
+public final class Main {
+    public static void main() throws Exception {
+        Probe.check("wrapper", ClassUtils.primitiveToWrapper(int.class) == Integer.class);
+        Probe.check("passthrough", ClassUtils.primitiveToWrapper(String.class) == String.class);
+        Probe.check("lower", "Camera.SC".toLowerCase(Locale.ROOT).equals("camera.sc"));
+        String text = IOUtils.toString(
+            Main.class.getClassLoader().getResourceAsStream("assets/demo/hello.sc"),
+            StandardCharsets.UTF_8);
+        Probe.check("resource", "print('hi')".equals(text));
+    }
+}
+"#,
+    );
+    let jar = NativeJar::from_path(&build_jar(
+        "library-helpers",
+        sources,
+        &[("assets/demo/hello.sc", "print('hi')")],
+        &[
+            "org/apache/commons/lang3/ClassUtils.class",
+            "org/apache/commons/io/IOUtils.class",
+        ],
+    ))
+    .unwrap();
+    let mut host = jar.seed_host(StdHost::new());
+    jar.execute("demo.Main", Some("main"), "main", &mut host)
+        .unwrap();
+    assert_eq!(
+        checks(&host),
+        all_true(&["lower", "passthrough", "resource", "wrapper"])
+    );
+}
