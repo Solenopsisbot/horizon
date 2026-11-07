@@ -94,6 +94,33 @@ pub enum GameEvent {
     BlockBreakBefore,
     /// A player broke a block.
     BlockBreakAfter,
+    /// A player starts digging (left-clicks) a block; result-returning
+    /// (Fabric `AttackBlockCallback`, NeoForge `PlayerInteractEvent.LeftClickBlock`).
+    AttackBlock,
+    /// A player uses (right-clicks) an entity; result-returning (Fabric
+    /// `UseEntityCallback`, NeoForge `PlayerInteractEvent.EntityInteract`).
+    UseEntity,
+    /// A [`GameEvent::BlockBreakBefore`] listener cancelled the break
+    /// (Fabric `PlayerBlockBreakEvents.CANCELED`).
+    BlockBreakCanceled,
+    /// An entity left a level (Fabric `ENTITY_UNLOAD`, NeoForge
+    /// `EntityLeaveLevelEvent`).
+    EntityUnload,
+    /// A living entity is about to be hurt; cancellable (Fabric
+    /// `ALLOW_DAMAGE`, NeoForge `LivingIncomingDamageEvent`).
+    LivingAllowDamage,
+    /// A living entity was hurt (Fabric `AFTER_DAMAGE`, NeoForge
+    /// `LivingDamageEvent.Post`).
+    LivingAfterDamage,
+    /// A player respawned or came back from the End (Fabric `AFTER_RESPAWN`,
+    /// NeoForge `PlayerRespawnEvent`).
+    PlayerRespawn,
+    /// The respawned player copies what it keeps from the old one (Fabric
+    /// `COPY_FROM`, NeoForge `PlayerEvent.Clone`).
+    PlayerCopy,
+    /// A player moved to another dimension (Fabric
+    /// `AFTER_PLAYER_CHANGE_LEVEL`, NeoForge `PlayerChangedDimensionEvent`).
+    PlayerChangeLevel,
     /// The server builds its command tree (Fabric `CommandRegistrationCallback`,
     /// NeoForge/Forge `RegisterCommandsEvent`): the listener registers on the
     /// Brigadier façade (`brigadier.rs`).
@@ -131,7 +158,7 @@ pub enum GameEvent {
 
 impl GameEvent {
     /// Every event, in declaration order (the bit order of [`Self::bit`]).
-    pub const ALL: [GameEvent; 31] = [
+    pub const ALL: [GameEvent; 40] = [
         GameEvent::ServerStarting,
         GameEvent::ServerStarted,
         GameEvent::ServerStopping,
@@ -152,6 +179,15 @@ impl GameEvent {
         GameEvent::AttackEntity,
         GameEvent::BlockBreakBefore,
         GameEvent::BlockBreakAfter,
+        GameEvent::AttackBlock,
+        GameEvent::UseEntity,
+        GameEvent::BlockBreakCanceled,
+        GameEvent::EntityUnload,
+        GameEvent::LivingAllowDamage,
+        GameEvent::LivingAfterDamage,
+        GameEvent::PlayerRespawn,
+        GameEvent::PlayerCopy,
+        GameEvent::PlayerChangeLevel,
         GameEvent::RegisterCommands,
         GameEvent::ClientStarted,
         GameEvent::ClientStopping,
@@ -188,6 +224,15 @@ impl GameEvent {
             GameEvent::AttackEntity => "attack_entity",
             GameEvent::BlockBreakBefore => "block_break_before",
             GameEvent::BlockBreakAfter => "block_break_after",
+            GameEvent::AttackBlock => "attack_block",
+            GameEvent::UseEntity => "use_entity",
+            GameEvent::BlockBreakCanceled => "block_break_canceled",
+            GameEvent::EntityUnload => "entity_unload",
+            GameEvent::LivingAllowDamage => "living_allow_damage",
+            GameEvent::LivingAfterDamage => "living_after_damage",
+            GameEvent::PlayerRespawn => "player_respawn",
+            GameEvent::PlayerCopy => "player_copy",
+            GameEvent::PlayerChangeLevel => "player_change_level",
             GameEvent::RegisterCommands => "register_commands",
             GameEvent::ClientStarted => "client_started",
             GameEvent::ClientStopping => "client_stopping",
@@ -202,9 +247,10 @@ impl GameEvent {
         }
     }
 
-    /// One bit per event, for a caller's "does anything listen" mask.
-    pub fn bit(self) -> u32 {
-        1 << (self as u32)
+    /// One bit per event, for a caller's "does anything listen" mask (the
+    /// top bits stay free for a caller's own flags).
+    pub fn bit(self) -> u64 {
+        1 << (self as u64)
     }
 
     /// Whether a NeoForge/Forge listener's `setCanceled(true)` means anything.
@@ -216,6 +262,11 @@ impl GameEvent {
                 | GameEvent::UseItem
                 | GameEvent::AttackEntity
                 | GameEvent::BlockBreakBefore
+                | GameEvent::AttackBlock
+                | GameEvent::UseEntity
+                | GameEvent::LivingAllowDamage
+                // NeoForge's `EntityJoinLevelEvent` keeps the entity out.
+                | GameEvent::EntityLoad
         )
     }
 
@@ -770,7 +821,7 @@ pub struct GameListeners {
 
 impl GameListeners {
     /// Bitmask of the events with at least one listener ([`GameEvent::bit`]).
-    pub fn mask(&self) -> u32 {
+    pub fn mask(&self) -> u64 {
         self.listeners
             .iter()
             .fold(0, |mask, listener| mask | listener.event.bit())
@@ -2032,7 +2083,7 @@ mod tests {
 
     #[test]
     fn event_bits_are_distinct() {
-        let mask = GameEvent::ALL.iter().fold(0u32, |mask, event| {
+        let mask = GameEvent::ALL.iter().fold(0u64, |mask, event| {
             assert_eq!(mask & event.bit(), 0, "{event:?}");
             mask | event.bit()
         });

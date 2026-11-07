@@ -23,7 +23,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicI32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -65,7 +65,7 @@ struct EventJar {
 static STORE: Mutex<BTreeMap<HandlerRole, Vec<EventJar>>> = Mutex::new(BTreeMap::new());
 
 /// The events any role has a listener for ([`GameEvent::bit`]): the fast path.
-static LISTENED: AtomicU32 = AtomicU32::new(0);
+static LISTENED: AtomicU64 = AtomicU64::new(0);
 
 /// `MinecraftServer.getTickCount()` for the façade: ticks since the server
 /// started, counted at the tick-start point.
