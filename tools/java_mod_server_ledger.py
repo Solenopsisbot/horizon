@@ -254,6 +254,12 @@ def read_jar_entrypoints(path: Path | None) -> JarEntrypoints | None:
                 # The server has something to execute (or the jar says it is
                 # client-only); no class scan can change that verdict.
                 return JarEntrypoints(kinds, False, client_side_only)
+            if "fabric.mod.json" in names:
+                # A jar with Fabric metadata runs only its Fabric entrypoints,
+                # as on Fabric Loader, which never reads `@Mod`; a universal
+                # jar's NeoForge class is not a server entrypoint
+                # (`entrypoint_role.rs`).
+                return JarEntrypoints(kinds, False, client_side_only)
             neoforge = False
             for name in names:
                 if (

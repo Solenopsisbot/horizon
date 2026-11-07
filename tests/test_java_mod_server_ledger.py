@@ -270,6 +270,24 @@ class JavaModServerLedgerTests(unittest.TestCase):
                 "multi.jar", jar=jar)
         self.assertEqual((row.verdict, row.subtype), ("skipped", "client-only"))
 
+    def test_a_universal_jar_with_only_client_fabric_entrypoints_is_client_only(self):
+        # zoomify's shape: Fabric declares only `client`, the jar also ships a
+        # NeoForge `@Mod` class. Fabric Loader never reads `@Mod`, so a server
+        # has nothing to run and the native path says so.
+        with tempfile.TemporaryDirectory() as tmp:
+            jar = self._jar(
+                tmp, "universal.jar",
+                fabric={"schemaVersion": 1, "id": "universal",
+                        "entrypoints": {"client": ["demo.Client"]}},
+                neoforge='modLoader = "javafml"\n[[mods]]\nmodId = "universal"\n',
+                mod_class=True,
+            )
+            row = LEDGER.parse_log(
+                "[Server thread/WARN]: Horizon: dedicated Java compatibility: skipping "
+                "/mods/universal.jar: /mods/universal.jar: no native entrypoint\nDone (1.0s)!",
+                "universal.jar", jar=jar)
+        self.assertEqual((row.verdict, row.subtype), ("skipped", "client-only"))
+
     def test_fabric_metadata_with_a_byte_order_mark_is_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             jar = self._jar(
