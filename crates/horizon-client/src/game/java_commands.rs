@@ -791,6 +791,17 @@ enum Ran {
 }
 
 fn text_of(text: &CommandText) -> Text {
+    // A styled component or one with translation arguments: vanilla's JSON,
+    // decoded as a server's chat component is, and sent to vanilla clients
+    // as the jar built it.
+    if let Some(json) = text
+        .component
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Json>(json).ok())
+    {
+        return horizon_client::component::to_text(&json, &mut |s| Text::literal(s))
+            .with_component(json);
+    }
     if text.translate {
         Text::translate(&text.text, &[])
     } else {
@@ -1098,6 +1109,26 @@ mod tests {
     use super::*;
     use horizon_client::command::Registries;
     use std::{io::Write, path::PathBuf, process::Command};
+
+    #[test]
+    fn a_styled_component_shows_its_colours_and_reaches_vanilla_unchanged() {
+        let json = json!({
+            "text": "Set to ",
+            "color": "gray",
+            "extra": [{"text": "7", "color": "gold", "bold": true}],
+        });
+        let text = text_of(&CommandText {
+            text: "Set to 7".into(),
+            translate: false,
+            component: Some(json.to_string()),
+        });
+        assert_eq!(text.plain(), "Set to 7");
+        // Gray parent, gold bold sibling: ChatFormatting's GRAY and GOLD.
+        assert_eq!(text.spans[0].style.color, Some(0xAAAAAA));
+        assert_eq!(text.spans[1].style.color, Some(0xFFAA00));
+        assert_eq!(text.spans[1].style.bold, Some(true));
+        assert_eq!(text.component(), json);
+    }
 
     /// The Brigadier, game and loader classes the mod compiles against; only
     /// the mod's own classes go into the jar (the host answers these).

@@ -237,6 +237,8 @@ impl StdHost {
         out.extend(self.resource_streams.keys().map(String::as_str));
         // The command tree's callbacks and requirement lambdas (`brigadier.rs`).
         self.brigadier_root_texts(out);
+        // A server's saved data (`facade_saved_data.rs`).
+        self.saved_data.root_texts(out);
     }
 }
 

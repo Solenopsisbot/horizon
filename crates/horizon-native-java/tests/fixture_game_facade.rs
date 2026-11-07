@@ -313,6 +313,7 @@ fn a_login_callback_reads_the_server_from_its_facts_and_refuses_the_rest() {
         client_channels: BTreeMap::from([(alex, BTreeSet::from(["demo:sync".to_owned()]))]),
         game_time: Some(1200),
         day_time: Some(6000),
+        ..ServerFacts::default()
     });
     // Lenient, so the compile-only `HookSink` calls are recorded; every
     // answer and refusal below is the hook tier's own.

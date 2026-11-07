@@ -30,6 +30,24 @@
 //! - **Networking.** `ServerPlayNetworking.canSend(player, type)` answers
 //!   whether that player's client takes the channel ([`ServerFacts::client_channels`]).
 //!
+//! A second round (same corpus pack grown to 204 jars, 94 refused callbacks)
+//! added what came next by count:
+//!
+//! - **Saved data.** `getDataStorage()` (server or level) is the one storage
+//!   `facade_saved_data.rs` keeps (8 callbacks).
+//! - **The server thread.** A callback runs on the server thread, so
+//!   `getRunningThread()` is the thread `Thread.currentThread()` answers, and
+//!   `execute(runnable)`/`executeIfPossible` run the runnable at once, as
+//!   vanilla's `BlockableEventLoop.execute` does on its own thread
+//!   ([`Runtime::invoke_server_facade`]).
+//! - **Layered registries.** `registries()` is a `LayeredRegistryAccess`
+//!   whose `compositeAccess()` is the registry access above.
+//! - **Commands.** `getCommands().getDispatcher()` is the Brigadier
+//!   façade's dispatcher (`brigadier.rs`), so a command registered there
+//!   lands in the jar's command arena like a `CommandRegistrationCallback`'s.
+//! - **Permissions.** A player's `permissions()` is the permission set of
+//!   their level ([`ServerFacts::permission_levels`]).
+//!
 //! A member of these markers that is not listed refuses with
 //! [`NativeError::UnknownHostCall`] naming it, like every other façade call:
 //! a neutral value would let a callback carry on with state the game never
@@ -71,6 +89,9 @@ pub struct ServerFacts {
     /// overworld's clock, as vanilla's derived levels do.
     pub game_time: Option<i64>,
     pub day_time: Option<i64>,
+    /// Per player UUID, their permission level (0-4, vanilla's op levels).
+    /// A player with no entry refuses `permissions()`.
+    pub permission_levels: BTreeMap<u128, u8>,
 }
 
 /// The rules marker every `getGameRules()` answers: vanilla's levels read the
@@ -79,6 +100,13 @@ const RULES: &str = "game/rules/main";
 /// The registry-access marker every `registryAccess()` answers.
 const REGISTRIES: &str = "game/registries/main";
 const REGISTRY: &str = "game/registry/";
+/// `MinecraftServer.registries()`: the layered access over the same lists.
+const LAYERED: &str = "game/registries/layered";
+/// `MinecraftServer.getCommands()`.
+const COMMANDS: &str = "game/commands";
+/// The marker `Thread.currentThread()` answers: callbacks run on the server
+/// thread, so it is also the server's running thread.
+const THREAD: &str = "thread/main";
 const GAME_RULE: &str = "game-rule/";
 const LEVEL_RESOURCE: &str = "level-resource/";
 
@@ -166,6 +194,8 @@ pub(crate) fn with_level_resources(
 pub(crate) fn owns(text: &str) -> bool {
     text == RULES
         || text == REGISTRIES
+        || text == LAYERED
+        || text == COMMANDS
         || text.starts_with(REGISTRY)
         || text.starts_with(GAME_RULE)
         || text.starts_with(LEVEL_RESOURCE)
@@ -208,8 +238,51 @@ pub(crate) fn server_member(
                 Ok(marker(REGISTRIES))
             }
         }
+        ("getDataStorage", "()Lnet/minecraft/world/level/storage/SavedDataStorage;") => {
+            Ok(marker(crate::facade_saved_data::STORAGE))
+        }
+        ("getRunningThread", "()Ljava/lang/Thread;") => Ok(marker(THREAD)),
+        // The server's folder: the one the world folder sits in, as a
+        // dedicated server's `<level-name>` sits in its working directory.
+        ("getServerDirectory", "()Ljava/nio/file/Path;") => {
+            match facts
+                .world_dir
+                .as_deref()
+                .and_then(|dir| dir.rsplit_once('/'))
+            {
+                Some((parent, _)) if !parent.is_empty() => Ok(path_value(parent)),
+                _ => refuse(r),
+            }
+        }
+        ("registries", "()Lnet/minecraft/core/LayeredRegistryAccess;") => {
+            if facts.registries.is_empty() {
+                refuse(r)
+            } else {
+                Ok(marker(LAYERED))
+            }
+        }
+        ("getCommands", "()Lnet/minecraft/commands/Commands;") => Ok(marker(COMMANDS)),
         _ => return None,
     })
+}
+
+/// A player's server-wide member, by the player's UUID: `permissions()`.
+/// `None` when `r` is not one.
+pub(crate) fn player_member(
+    facts: &ServerFacts,
+    player: u128,
+    r: &MethodRef,
+) -> Option<Result<Value, NativeError>> {
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("permissions", "()Lnet/minecraft/server/permissions/PermissionSet;") => {
+            Some(match facts.permission_levels.get(&player) {
+                // The Brigadier façade's permission set answers its queries.
+                Some(level) => Ok(marker(format!("brigadier/permission-set/{level}"))),
+                None => refuse(r),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// The id a registry key argument names: `registry/<id>` (a `Registries`
@@ -290,6 +363,22 @@ pub(crate) fn answer(
             _ => refuse(r),
         };
     }
+    if text == LAYERED {
+        return match (r.name.as_str(), descriptor) {
+            ("compositeAccess", "()Lnet/minecraft/core/RegistryAccess$Frozen;") => {
+                Ok(marker(REGISTRIES))
+            }
+            _ => refuse(r),
+        };
+    }
+    if text == COMMANDS {
+        return match (r.name.as_str(), descriptor) {
+            ("getDispatcher", "()Lcom/mojang/brigadier/CommandDispatcher;") => {
+                Ok(marker(crate::brigadier::DISPATCHER))
+            }
+            _ => refuse(r),
+        };
+    }
     if text == REGISTRIES {
         return match (r.name.as_str(), descriptor) {
             (
@@ -363,6 +452,106 @@ pub(crate) fn channel_of(
     identifier_text(value).or_else(|| expect_ref(value).and_then(|marker| type_id(marker)))
 }
 
+impl crate::StdHost {
+    /// A field of a façade object read with its receiver during a firing:
+    /// a player's `connection` is that player's connection marker, and a
+    /// connection's `player` its player (`ServerPlayNetworking.canSend`
+    /// takes either). `None` for any other read.
+    pub(crate) fn facade_field(&self, receiver: &Value, r: &MethodRef) -> Option<Value> {
+        self.game_event.as_deref()?;
+        let text = expect_ref(receiver)?;
+        match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            (
+                "net/minecraft/server/level/ServerPlayer",
+                "connection",
+                "Lnet/minecraft/server/network/ServerGamePacketListenerImpl;",
+            ) => Some(marker(format!(
+                "game/connection/{}",
+                text.strip_prefix("game/player/")?
+            ))),
+            (
+                "net/minecraft/server/network/ServerGamePacketListenerImpl",
+                "player",
+                "Lnet/minecraft/server/level/ServerPlayer;",
+            ) => Some(marker(format!(
+                "game/player/{}",
+                text.strip_prefix("game/connection/")?
+            ))),
+            _ => None,
+        }
+    }
+
+    /// Instance calls of the server façade that keep state on the jar's
+    /// resident host or read the firing's facts directly: the saved data
+    /// (`facade_saved_data.rs`) and a façade player's `permissions()`.
+    /// `None` leaves the call to the listener façade (`events.rs`).
+    pub(crate) fn server_facade_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        if let Some(answer) = self.saved_data.call(r, receiver, args) {
+            return Some(answer);
+        }
+        let player = expect_ref(receiver)?.strip_prefix("game/player/")?;
+        let player = u128::from_str_radix(player, 16).ok()?;
+        let firing = self.game_event.as_deref()?;
+        player_member(&firing.facade.server, player, r)
+    }
+}
+
+/// Owners whose `execute(Runnable)` is the server's own event loop.
+const EVENT_LOOPS: &[&str] = &[
+    "net/minecraft/server/MinecraftServer",
+    "net/minecraft/server/dedicated/DedicatedServer",
+    "net/minecraft/util/thread/ReentrantBlockableEventLoop",
+    "net/minecraft/util/thread/BlockableEventLoop",
+];
+
+impl<H: crate::Host> crate::Runtime<'_, H> {
+    /// Server-façade calls that run jar code, which the host cannot do: a
+    /// saved-data type's constructor (`facade_saved_data.rs`) and a
+    /// runnable handed to the server's event loop. `None` for every other
+    /// call.
+    pub(crate) fn invoke_server_facade(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_saved_data(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        // Chat components with style and arguments (`facade_text.rs`).
+        if let Some(value) = self.invoke_text(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        // `server.execute(task)` on the server thread: vanilla's
+        // `scheduleExecutables()` is false there (outside a running task),
+        // so the task runs now rather than being queued. Only a façade
+        // server (a `game/` marker) is the running one.
+        let on_server = receiver
+            .and_then(expect_ref)
+            .is_some_and(|text| text.starts_with("game/"));
+        if on_server
+            && EVENT_LOOPS.contains(&r.owner.as_str())
+            && matches!(r.name.as_str(), "execute" | "executeIfPossible")
+            && r.descriptor == "(Ljava/lang/Runnable;)V"
+            && let [task] = args
+        {
+            return match self.invoke_callback(task, &[])? {
+                Some(_) => Ok(Some(Value::Void)),
+                None => Err(NativeError::Metadata(format!(
+                    "{}#{} got a task the interpreter cannot run: {task:?}",
+                    r.owner, r.name
+                ))),
+            };
+        }
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +612,16 @@ mod tests {
         assert_eq!(
             server_member(&facts(), &get, &[data]).unwrap().unwrap(),
             path_value("/horizon/game/world/players/data")
+        );
+        // The server's own folder holds the world folder.
+        let directory = call(
+            "net/minecraft/server/MinecraftServer",
+            "getServerDirectory",
+            "()Ljava/nio/file/Path;",
+        );
+        assert_eq!(
+            server_member(&facts(), &directory, &[]).unwrap().unwrap(),
+            path_value("/horizon/game")
         );
         // No world folder, or a resource the model did not build: refuse.
         let none = ServerFacts::default();

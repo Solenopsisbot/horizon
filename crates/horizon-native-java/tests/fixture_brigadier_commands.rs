@@ -158,12 +158,20 @@ const STUBS: &[(&str, &str)] = &[
     (
         "net/minecraft/network/chat/Component.java",
         "package net.minecraft.network.chat;\n\
-         public interface Component { static MutableComponent literal(String s) { return null; } }",
+         public interface Component { static MutableComponent literal(String s) { return null; }\n\
+           static MutableComponent translatable(String k, Object... args) { return null; } }",
     ),
     (
         "net/minecraft/network/chat/MutableComponent.java",
         "package net.minecraft.network.chat;\n\
-         public class MutableComponent implements Component {}",
+         public class MutableComponent implements Component {\n\
+           public MutableComponent withStyle(net.minecraft.ChatFormatting f) { return this; }\n\
+           public MutableComponent append(Component c) { return this; }\n\
+           public MutableComponent append(String s) { return this; } }",
+    ),
+    (
+        "net/minecraft/ChatFormatting.java",
+        "package net.minecraft;\npublic enum ChatFormatting { AQUA, GOLD, BOLD }",
     ),
     (
         "net/minecraft/server/level/ServerPlayer.java",
@@ -201,7 +209,11 @@ public final class CmdMod {
         .requires(source -> source.permissions().hasPermission(Permissions.COMMANDS_MODERATOR))
         .executes(ctx -> {
           String name = ctx.getSource().getPlayerOrException().getScoreboardName();
-          ctx.getSource().sendSystemMessage(Component.literal("You are " + name + ", greeted " + greeted));
+          // Styled, with a translated sibling that takes arguments.
+          ctx.getSource().sendSystemMessage(Component.literal("You are ")
+            .append(Component.literal(name).withStyle(net.minecraft.ChatFormatting.AQUA))
+            .append(", greeted " + greeted)
+            .append(Component.translatable("demo.times", greeted, name).withStyle(net.minecraft.ChatFormatting.GOLD)));
           return 1;
         }));
       dispatcher.register(Commands.literal("boom").executes(ctx -> {
@@ -394,7 +406,8 @@ fn a_registration_callback_builds_a_typed_tree_and_its_commands_run() {
             kind: MessageKind::Success { broadcast: true },
             text: CommandText {
                 text: "Hello Bob x3".into(),
-                translate: false
+                translate: false,
+                component: None,
             },
         }]
     );
@@ -415,7 +428,25 @@ fn a_registration_callback_builds_a_typed_tree_and_its_commands_run() {
     );
     assert_eq!(as_player.outcome, CommandOutcome::Returned(1));
     assert_eq!(as_player.messages[0].kind, MessageKind::System);
-    assert_eq!(as_player.messages[0].text.text, "You are Ana, greeted 3");
+    // The plain text reads the key as is; the component keeps the colours,
+    // the sibling order and the translation's arguments as vanilla's JSON.
+    assert_eq!(
+        as_player.messages[0].text.text,
+        "You are Ana, greeted 3demo.times"
+    );
+    let component: serde_json::Value =
+        serde_json::from_str(as_player.messages[0].text.component.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        component,
+        serde_json::json!({
+            "text": "You are ",
+            "extra": [
+                {"text": "Ana", "color": "aqua"},
+                {"text": ", greeted 3"},
+                {"translate": "demo.times", "with": [3, "Ana"], "color": "gold"},
+            ],
+        })
+    );
     let as_console = jar.run_command(
         &whoami_command,
         &CommandInvocation {
@@ -431,7 +462,8 @@ fn a_registration_callback_builds_a_typed_tree_and_its_commands_run() {
         as_console.outcome,
         CommandOutcome::Syntax(CommandText {
             text: "permissions.requires.player".into(),
-            translate: true
+            translate: true,
+            component: None,
         })
     );
 
