@@ -886,6 +886,23 @@ reflection path without opening the process classpath.
 The native reflection surface also retains declared fields and exposes bounded
 `getFields`/`getDeclaredFields`, `getField`/`getDeclaredField`, and
 `Field.getName`/`getType`/`getModifiers` markers.
+Settings and platform libraries reach a little further before their first registration, and the class-file model
+answers those queries the JVM's way: `getSuperclass` walks the jar's hierarchy and ends at `Object`;
+`isAssignableFrom` sees jar subclasses; `isEnum`/`getEnumConstants` follow the class file (constants from the enum's
+own `values()`); `getDeclaredConstructors`/`getConstructors` list the real `<init>` methods; `getSimpleName` of a
+nested class reads its `InnerClasses` entry; `isAnnotationPresent`/`getAnnotation` answer for classes, fields (read
+on demand from the field's attribute table) and methods, with `CLASS`-retention annotations invisible; and an
+annotation member the use site left out answers the interface's `AnnotationDefault`, converted to the member's type
+(class literals, enum constants, arrays, nested annotations). A method reference to a JDK method gets its captures
+followed by the call's arguments (a static reference is told apart by arity), `invokevirtual` on a concrete base
+method reaches the override of a constructed jar subclass, and a Mixin `static` accessor's placeholder body is
+replaced by the generated contract. `StackWalker.walk` sees the interpreter's own jar frames (innermost first; host
+frames do not exist natively and are not invented). `String.matches`/`Pattern.matches` answer a bounded, exact regex
+subset (literals, classes, groups, alternation, greedy and lazy quantifiers) and name any other pattern instead of
+guessing. Game values that are never null in the game answer an opaque marker of their declared type when the host
+does not model them: codecs, steps of a `...$Builder` chain and its `build()`, and a game type's own `create*`
+factory; every vanilla `Registries`/`BuiltInRegistries` field answers its registry id, and a mod registry made with
+`ResourceKey.createRegistryKey` and `FabricRegistryBuilder` carries its id.
 `NativeJar::resource_names` exposes the sorted bundled paths for game-owned adapters; the native host never
 opens resource bytes or arbitrary filesystem paths. The same seeded resource table backs `ClassLoader.getResources` and `getSystemResources` through a
 bounded `Enumeration`; missing names are empty, and the host never scans additional classpath locations.

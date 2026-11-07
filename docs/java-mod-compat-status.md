@@ -785,11 +785,27 @@ than rows; the cache held 86 entries in 436 KiB.
    disabled (`ServerPlayNetworking.canSend`, `Connection#getRemoteAddress`, a `@Shadow` field, Guava's `Ordering`).
    Objects an entrypoint built keep only their static fields after it returns, so a callback that reads a
    listener list the entrypoint filled (servux's) sees it empty.
-2. **Refusals.** 27 of 121 wide and 68 of 265 mega jars that declare a server entrypoint still fail (22%/26%). The
-   causes are named above and in the ledgers. The raw log line is bounded at 160 characters, so a human sees a clipped
-   cause; the ledger recovers the skip class from the jar's own metadata.
+2. **Refusals.** The committed ledgers (an older binary) count 27 of 121 wide and 68 of 265 mega jars that declare a
+   server entrypoint as failing (22%/26%). A fresh dedicated-server re-measure on 7 November 2026 (all workstreams'
+   fixes, one server per jar, 60 s) counts **5 wide and 15 mega `native-gap` rows**. The entrypoint-exception bucket
+   (54 rows across both ledgers: null-config/listener NPEs, `Unexpected subclass`, loader-detection guards,
+   `AssertionError`s, `No value present`, invalid ids, the nested-frame bound, `StackUnderflow`, the duplicate item)
+   fell from 22 still failing to 4: static Mixin accessors run their generated contract, reflection answers the
+   class file (superclass, assignability, enums, constructors, nested simple names, annotations with defaults,
+   `Modifier`), JDK method references keep their arguments, concrete virtual calls reach overrides, pattern-matching
+   `switch` sites answer, `String.matches` has a bounded regex, `StackWalker` sees jar frames, and game codecs,
+   builders, registry keys, `BlockItemId`/`ColorCollection` ids and mod registries are never null. The four left:
+   archers and wizards read `spell_engine`'s config classes, which a lone jar does not have (both reach `Done` with
+   `spell_engine` and `structure_pool_api` beside them; a real loader would refuse them alone for the missing
+   dependency, so they need a dependency-aware ledger row, not an interpreter fix); both WorldEdit builds need a
+   Guava collector in `Stream.collect` (stream modelling). Paladins fails the same way as archers. Jars whose
+   `fabric.mod.json` says `"environment": "client"` are now client-only skips on a server, as on a real Fabric
+   server, including a multi-loader jar's NeoForge `@Mod` class: 16 wide and 54 mega rows that used to "run" there
+   moved to `skipped`. The raw log line is bounded at 160 characters, so a human sees a clipped cause; the ledger
+   recovers the skip class from the jar's own metadata.
 3. **Nested and non-server entrypoints.** Nested JiJ/JarJar jars are probed but never bootstrapped in-game (`preLaunch`
-   is not run either); two mega jars now fail the interpreter's 128-nested-jar-frame bound. The Kotlin entrypoint
+   is not run either); the two mega jars that hit the 128-nested-jar-frame bound (ShulkerBoxTooltip) now run, the
+   bound itself is unchanged. The Kotlin entrypoint
    adapter runs, but an adapter the runtime still does not model is refused.
 4. **Callbacks.** Entrypoints, received-payload handlers and server-side event listeners execute. Servers fire
    lifecycle, server/level tick, player join/leave and living-death listeners (Fabric, NeoForge, Forge EventBus 7),
@@ -847,9 +863,10 @@ than rows; the cache held 86 entries in 436 KiB.
 2. **Close metadata refusals.** Bounded native collection/stream markers, `ServiceLoader`, exact `Integer.parseInt`,
    `String.split`/`Map#keySet` receivers, `Gson` appendables and tighter `fabric.mod.json` bounds. Gate: metadata
    refusals 38 → 0 across both corpora.
-3. **Close runtime refusals.** Entrypoint static-init failures (null config/listener phase, reflection on a null
-   class), the `StackUnderflow` verifier gap, the nested-jar-frame bound and duplicate declarations. Gate: refused share
-   of in-scope server jars below 5% (currently 22%/26%).
+3. **Close runtime refusals.** The entrypoint-exception bucket is down to two missing-dependency rows (archers,
+   wizards, and paladins in the same shape) that need the ledger to run a jar with its declared dependencies, and
+   WorldEdit's Guava collector. Gate: refused share of in-scope server jars below 5% (committed ledgers 22%/26%;
+   fresh re-measure 5 wide / 15 mega rows).
 4. **Finish content.** Type `BlockEntityType` builders and the jar's opaque items so more recipes resolve (check
    recipes across the pack, not per jar); NeoForge data components and attachments through their deferred suppliers;
    let a guest without the jars build a root from the manifest; then mod hot reload.
