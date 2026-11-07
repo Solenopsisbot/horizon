@@ -14,6 +14,8 @@ use std::{
 };
 
 mod annotation_values;
+mod block_item_id;
+mod color_collection;
 mod declarations_content;
 mod dfu_pair;
 pub mod events;
@@ -3733,6 +3735,9 @@ impl Host for StdHost {
         if let Some(value) = fabric_registry::static_call(r, args) {
             return value;
         }
+        if let Some(value) = self.block_item_id_static(r, args) {
+            return value;
+        }
         if let Some(value) = self.networking_register(r, args) {
             return Ok(value);
         }
@@ -4876,6 +4881,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = fabric_registry::instance_call(r, receiver) {
+            return value;
+        }
+        if let Some(value) = self.block_item_id_instance(r, receiver) {
             return value;
         }
         // `Object.getClass` is the bridge from a value marker back to the
@@ -7593,19 +7601,20 @@ impl Host for StdHost {
             }
             ("net/minecraft/resources/ResourceKey", name, descriptor) => {
                 let marker = expect_string(receiver);
+                // A key `ResourceKey.create(registry, id)` built names `id`;
+                // any other marker keeps the opaque answer it had.
+                let identifier = resource_key_identifier(receiver).map_or_else(
+                    || identifier_value("minecraft", marker),
+                    |(namespace, path)| identifier_value(namespace, path),
+                );
                 match (name, descriptor) {
                     (
-                        "identifier",
+                        "identifier" | "location",
                         "()Lnet/minecraft/resources/Identifier;"
                         | "()Lnet/minecraft/resources/ResourceLocation;",
-                    ) => Ok(identifier_value("minecraft", marker)),
+                    ) => Ok(identifier),
                     (
                         "registry",
-                        "()Lnet/minecraft/resources/Identifier;"
-                        | "()Lnet/minecraft/resources/ResourceLocation;",
-                    ) => Ok(identifier_value("minecraft", marker)),
-                    (
-                        "location",
                         "()Lnet/minecraft/resources/Identifier;"
                         | "()Lnet/minecraft/resources/ResourceLocation;",
                     ) => Ok(identifier_value("minecraft", marker)),
@@ -23243,6 +23252,11 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_map_compute(&r, receiver.as_ref(), &args))
                     {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_color_collection(&r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) =
                         self.invoke_callback_info(&r, receiver.as_ref(), &args)?

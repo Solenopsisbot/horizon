@@ -949,3 +949,83 @@ public final class Main {
         all_true(&["enum-map", "factory", "format", "pair", "registry"])
     );
 }
+
+/// Vanilla 26.3's id helpers as Farmer's Delight registers its blocks: a
+/// `BlockItemId`'s block key names the id it was created from, and a
+/// `ColorCollection` derives sixteen coloured ids through a jar function.
+#[test]
+fn block_item_ids_and_color_collections_name_their_ids() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "net/minecraft/resources/Identifier.java",
+        r#"package net.minecraft.resources;
+public final class Identifier {
+    public static Identifier fromNamespaceAndPath(String namespace, String path) { return null; }
+    @Override public String toString() { return null; }
+}
+"#,
+    );
+    sources.insert(
+        "net/minecraft/resources/ResourceKey.java",
+        "package net.minecraft.resources;\npublic final class ResourceKey<T> { public Identifier identifier() { return null; } }\n",
+    );
+    sources.insert(
+        "net/minecraft/references/BlockItemId.java",
+        r#"package net.minecraft.references;
+import net.minecraft.resources.*;
+public final class BlockItemId {
+    public static BlockItemId create(Identifier block, Identifier item) { return null; }
+    public ResourceKey<Object> block() { return null; }
+    public ResourceKey<Object> item() { return null; }
+}
+"#,
+    );
+    sources.insert(
+        "net/minecraft/world/level/block/ColorCollection.java",
+        r#"package net.minecraft.world.level.block;
+public final class ColorCollection<T> {
+    public static <T> ColorCollection<T> create(T value) { return null; }
+    public static ColorCollection<String> prefixWithColor(ColorCollection<String> names) { return null; }
+    public <U> ColorCollection<U> map(java.util.function.Function<T, U> function) { return null; }
+    public T white() { return null; }
+    public T lightBlue() { return null; }
+    public T black() { return null; }
+}
+"#,
+    );
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+import net.minecraft.references.BlockItemId;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.ColorCollection;
+public final class Main {
+    static Identifier id(String path) { return Identifier.fromNamespaceAndPath("demo", path); }
+    public static void main() {
+        BlockItemId stove = BlockItemId.create(id("stove"), id("stove_item"));
+        Probe.check("block", "demo:stove".equals(stove.block().identifier().toString()));
+        Probe.check("item", "demo:stove_item".equals(stove.item().identifier().toString()));
+        ColorCollection<BlockItemId> signs = ColorCollection
+            .prefixWithColor(ColorCollection.create("canvas_sign"))
+            .map(name -> BlockItemId.create(id(name), id(name)));
+        Probe.check("white", "demo:white_canvas_sign".equals(signs.white().block().identifier().toString()));
+        Probe.check("light-blue", "demo:light_blue_canvas_sign".equals(signs.lightBlue().block().identifier().toString()));
+        Probe.check("black", "demo:black_canvas_sign".equals(signs.black().item().identifier().toString()));
+    }
+}
+"#,
+    );
+    assert_eq!(
+        run(
+            "block-item-ids",
+            sources,
+            &[
+                "net/minecraft/resources/Identifier.class",
+                "net/minecraft/resources/ResourceKey.class",
+                "net/minecraft/references/BlockItemId.class",
+                "net/minecraft/world/level/block/ColorCollection.class",
+            ],
+        ),
+        all_true(&["black", "block", "item", "light-blue", "white"])
+    );
+}
