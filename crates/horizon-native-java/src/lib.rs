@@ -16,6 +16,7 @@ use std::{
 mod annotation_values;
 mod block_item_id;
 pub mod brigadier;
+mod class_init;
 pub mod client_surface;
 mod color_collection;
 mod declarations_content;
@@ -15231,6 +15232,10 @@ impl NativeJar {
                 }
             }
         });
+        // A real loader has run every Mixin config plugin by now, on the
+        // mod's own class loader (`mixin_plugins.rs`); a failing one is
+        // rolled back and never refuses the jar.
+        self.prepare_config_plugins_for_entrypoint(kind, host);
         let (persistent_static_fields, persistent_initialized_classes) =
             host.persistent_class_state();
         let mut runtime = Runtime {
@@ -15874,6 +15879,9 @@ impl NativeJar {
             && callback_args[..target_args.len()] == target_args[..]
         {
             values.push(Value::Ref(Some(callback_info_marker(&entry.target))));
+        } else if callback_args.len() == 1 && callback_args[0] == info && !target_args.is_empty() {
+            // Mixin's simple callback: the info alone, none of the arguments.
+            values = vec![Value::Ref(Some(callback_info_marker(&entry.target)))];
         } else if callback_args != target_args {
             return Err(NativeError::Metadata(format!(
                 "native game hook callback {}#{}{} must mirror {}'s arguments and may add one trailing CallbackInfo or CallbackInfoReturnable",
@@ -18165,26 +18173,8 @@ impl<H: Host> Runtime<'_, H> {
             || (!self.host.models_class(name) && self.linked.contains_key(name))
     }
 
-    /// Run a jar-owned class initializer once before the first active use.
-    ///
-    /// Fabric and NeoForge entrypoints commonly keep identifiers, registry
-    /// keys, or deferred registers in static fields initialized by `<clinit>`.
-    /// Treating those fields as host-owned defaults silently turns a valid
-    /// bootstrap into a no-op, so the bounded runtime models only this JVM
-    /// initialization rule while retaining its per-invocation lifetime.
-    fn ensure_initialized(&mut self, class: &str) -> Result<(), NativeError> {
-        if !self.has_class(class) || !self.initialized_classes.insert(class.to_owned()) {
-            return Ok(());
-        }
-        if self
-            .class(class)
-            .and_then(|file| file.method("<clinit>", "()V"))
-            .is_some()
-        {
-            self.invoke(class, "<clinit>", "()V", None, &[])?;
-        }
-        Ok(())
-    }
+    // `ensure_initialized`, the JVM's class-initialization procedure, lives in
+    // `class_init.rs`.
 
     /// Commit jar-owned class state to the resident host after an invocation.
     /// The host applies its own bounded retention policy; a failed commit is
@@ -25203,10 +25193,13 @@ fn game_hook_callback(
     let target_args = descriptor_arguments(site.target_descriptor);
     let callback_args = descriptor_arguments(&callback.descriptor);
     let info = site.callback_info_descriptor();
+    // Mixin also takes a handler with the callback info alone (its "simple"
+    // callback descriptor), whatever arguments the target has.
     let mirrors = callback_args == target_args
         || (callback_args.len() == target_args.len() + 1
             && callback_args.last().is_some_and(|arg| arg == info)
-            && callback_args[..target_args.len()] == target_args[..]);
+            && callback_args[..target_args.len()] == target_args[..])
+        || (callback_args.len() == 1 && callback_args[0] == info);
     if !mirrors {
         return Err(MixinSkipReason::GameHookMismatch(bounded_weave_reason(
             &format!(
