@@ -929,9 +929,13 @@ than rows; the cache held 86 entries in 436 KiB.
 1. **Game-class mixins do not apply.** The load weave only rewrites classes inside the jar; a plan whose target is a
    Minecraft class is skipped. That is every plan that matters (0 woven; 2,944 and 7,742 skipped), so `ran` means
    "entrypoint executed, mixins skipped, vanilla server reached `Done`", not "the mod works". The opt-in hook tier
-   (`HORIZON_JAVA_GAME_HOOKS=1`) fires its 19 public sites and 7 internal Java-tier ones (value-returning
-   `getDestroySpeed` and `growCrop`, `PlayerList#remove`, `stopServer`'s tail, the player-tick heads and `Player#tick`)
-   from the game's own points (more since, from the sites work), runs a config's `IMixinConfigPlugin` the way Mixin
+   (`HORIZON_JAVA_GAME_HOOKS=1`) fires its 19 public sites and 22 internal Java-tier ones (value-returning
+   `getDestroySpeed`, `growCrop` and `hurtServer`, `PlayerList#remove`, `stopServer`'s tail, the player-tick heads,
+   `Player#tick`, the server and level ticks, the server's constructor tails, `Bootstrap`, `Block#playerDestroy`,
+   `ServerExplosion#explode`, `dropAllDeathLoot` and `LivingEntity#die`'s tail) from the game's own points; on a
+   live dedicated server a probe jar's cancels and overrides held at `hurtServer`, `playerDestroy`,
+   `getDestroySpeed` and `growCrop`, while the corpus callbacks there ran or refused as listed in
+   [java-mod-compat.md](java-mod-compat.md). It runs a config's `IMixinConfigPlugin` the way Mixin
    does and binds MixinExtras' `@ModifyReturnValue`. Statically counted on 7 November 2026 (`plugin_census` in
    `mixin_plugins.rs`): of the loader tier's 1,285 server-side game plans, 224 name a site in a served shape and
    190 bind (was 167 and 51; 155 of the 190 pass a plugin's session, and plans stopped at `config-plugin` fell
@@ -951,7 +955,7 @@ than rows; the cache held 86 entries in 436 KiB.
    refused listeners fell from 62 to 57 of 325, failed game hooks from 28 to 23, and refusals on a lost collection
    (`got null`) from 11 to 3. servux keeps its `ServerInitHandler` list (one `ServuxInitHandler`), but its
    `server_stopping` callback still walks an empty `ServerHandler` list: the plan that fills it injects at
-   `DedicatedServer.<init>` `TAIL`, which has no hook site. A `<clinit>` that a strict hook firing refused no longer
+   `DedicatedServer.<init>` `TAIL` (`java_dedicated_server_constructed`), which fires but refuses at `RegistryAccess.EMPTY`. A `<clinit>` that a strict hook firing refused no longer
    leaves its class half-initialised (jamlib's `Event#listeners`): the class is erroneous and every later access is
    refused with the same cause (`class_init.rs`).
 2. **Refusals.** The committed ledgers (an older binary) count 27 of 121 wide and 68 of 265 mega jars that declare a

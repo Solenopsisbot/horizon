@@ -604,6 +604,20 @@ names start with `java_`, and they are fired only from `java_game_hooks.rs`. One
 | `java_base_player_tick_head` / `_tail` | `Player#tick` | `HEAD` / `TAIL` | listen | the same step: Horizon runs `ServerPlayer.tick` and `doTick`'s `Player.tick` as one, so these fire inside `ServerPlayer.tick`'s head and tail, server only |
 | `java_destroy_speed` | `Player#getDestroySpeed(BlockState)F` | `RETURN`/`TAIL` | override | the speed `tick_mining` and `destroy_progress` compute; a cancellable callback's `setReturnValue` is the speed the progress divides by hardness |
 | `java_grow_crop` | `BoneMealItem#growCrop` (static) | `HEAD` | cancel with a value | a player's and a dispenser's bone meal (not a farmer villager's, which Horizon decides in its brain); a cancel returns its value without growing or using up the meal, and `false` goes on to `growWaterPlant` as vanilla's caller does |
+| `java_server_tick_head` / `_tail` | `MinecraftServer#tickServer(BooleanSupplier)V` | `HEAD` / `TAIL` | listen | `native_server_tick`'s start and end phases; `haveTime` is null (the host has no supplier) |
+| `java_level_tick_head` / `_tail` | `ServerLevel#tick(BooleanSupplier)V` | `HEAD` / `TAIL` | listen | `native_level_tick_pre`/`_post`, once per dimension a tick; `haveTime` is null |
+| `java_server_constructed` | `MinecraftServer#<init>` | `TAIL` | listen | once per server start, after the Java batch and before the configs and `native_server_about_to_start`; game arguments are identities, the thread, game rules and proxy are null |
+| `java_dedicated_server_constructed` | `DedicatedServer#<init>` | `TAIL` | listen | right after `java_server_constructed`, dedicated only |
+| `java_bootstrap_head` / `_tail` | `Bootstrap#bootStrap` (static) | `HEAD` / `TAIL` | listen | each jar's own host, after seeding and before its entrypoints (vanilla's `Main` bootstraps before Fabric starts the server entrypoints); a jar hears its own firing, not one before every jar's entrypoints |
+| `java_living_hurt` | `LivingEntity#hurtServer(ServerLevel,DamageSource,F)Z` | `HEAD` | cancel with a value | `hurt_server`, the native damage hook, so only past hurtServer's invulnerable, dead and fire-resistance guards; a cancel refuses the hit whatever value it set (Horizon's callers know no "landed without damage"); the level is an identity without a dimension |
+| `java_block_player_destroy` | `Block#playerDestroy` | `HEAD` | cancel | a survival harvest in `break_block_as_player`; a cancel keeps back the mined statistic, the exhaustion, the drops, the experience and an infested block's silverfish, not a beehive's, turtle egg's or ice's own part after their `super` call |
+| `java_block_player_destroyed` | `Block#playerDestroy` | `TAIL` | listen | the same harvest after its drops and experience, unless the HEAD was cancelled |
+| `java_explosion_explode` | `ServerExplosion#explode()I` | `HEAD` | listen | `server_explode_as`, before the blast is heard; the explosion is an identity |
+| `java_drop_death_loot_head` / `_tail` | `LivingEntity#dropAllDeathLoot` | `HEAD` / `TAIL` | listen | `mob_died` around the loot, equipment and experience; a player's death drops do not fire them yet |
+| `java_living_died` | `LivingEntity#die` | `TAIL` | listen | the end of `mob_died` (vanilla's `ServerPlayer.die` never calls it, so a player does not either), unless `living_death` cancelled |
+
+A callback may also take the callback info alone, Mixin's simple form (`(CallbackInfo)V` on `tick(BooleanSupplier)`).
+A hook name can stand for several vanilla methods (`living_jump`); a plan registers at the row of its own target.
 
 A callback on a value-returning target takes a `CallbackInfoReturnable`. At a `RETURN`/`TAIL` row the game hands
 the method's own result in (`NativeJar::run_game_hook_returning`'s `actual`), `getReturnValue` reads it, and a
@@ -726,9 +740,9 @@ appleskin's and syncmatica's `player_logged_in` (2 firings each), shogi's `playe
 `ShogiCooldowns` map kept per player) and servux's `server_stopping` (1). servux's `player_logged_in` refused at
 `Connection#getRemoteAddress` and was disabled; in other runs weaponmaster refused at
 `ServerPlayNetworking.canSend`, CustomPlayerModels at a `@Shadow` field, jamlib at Guava's `Ordering`. The bots
-attacked nothing and nobody died, so the cancellable sites have no real-jar firing yet. A ran callback is not a
+attacked nothing and nobody died in that run (the cancellable sites' live firing is measured below). A ran callback is not a
 working mod: servux's `server_stopping` iterates an empty `ServerHandler` list, because the plan that fills it
-(`DedicatedServer.<init>` `TAIL`) has no hook site. Its entrypoint's own objects now survive (the resident heap
+(`DedicatedServer.<init>` `TAIL`, now `java_dedicated_server_constructed`) refuses at `RegistryAccess.EMPTY`. Its entrypoint's own objects now survive (the resident heap
 below): its `ServerInitHandler` keeps the `ServuxInitHandler` it registered.
 
 Re-measured 7 November 2026 after the Java-tier rows, the value shapes and the plugin gate, with the static count
@@ -740,15 +754,49 @@ from 18 to 51 (21 at Java-tier rows: 8 `Player#tick` tail, 3 head, 3 `getDestroy
 (5,742 plans) from 173 to 266 named and 40 to 87 bound. Asking config plugins is 21 of the loader set's 33 new
 bindings. The largest gate left on a named plan is still `config-plugin` (144 of 173 unbound on the loader set):
 Collective's plugin declines at its `Class.forName("net.fabricmc.api.EnvType")` probe and Puzzles Lib's at Guava's
-`ImmutableSet.of`, which is also why the 16 `growCrop` plans bind none. These are static counts: no dedicated run
-with these jars and players has fired the new rows yet.
+`ImmutableSet.of`, which is also why the 16 `growCrop` plans bind none.
+
+The 15 server rows above (8 November 2026, same census) took the loader set from 167 to **224 named** (all 57 from
+the new rows) and both corpora from 266 to **356** (90 new); of the new rows' plans, 49 bind on the loader set and
+68 across both corpora (the config-plugin sessions moved the total to 190 and 267 bound at the same time). Ranked
+first by plan count, `Player#die` stays unnamed on purpose: `ServerPlayer.die` never calls it, so it would never
+fire for a player.
+
+*Fired on a real server* (8 November, `--dedicated`, flat world, three `horizon-bots` fight bots and two dig bots
+in survival, console-driven mobs, TNT and a bone-meal dispenser; Collective 8.67, Puzzles Lib 26.3.15,
+Architectury 22.0.5, servux, cristellib, carpet, chunksmith, baguettelib, collectorsalbum, TerraBlender,
+ExplorersCompass and a probe jar built from the unit-test fixtures). Per-site counts from the stop log:
+
+| Site | Jar | Fired | Cancelled / overridden | In game |
+|---|---|---:|---:|---|
+| `java_server_tick_head` / `_tail` | ExplorersCompass | 2,111 / 2,111 | | |
+| `java_server_tick_tail` | chunksmith | 2,111 | | its head refused at `System.nanoTime` |
+| `java_explosion_explode` | carpet | 3 | | three primed TNT |
+| `java_drop_death_loot_head` | Collective | 16 | | killed zombies and pigs |
+| `java_block_player_destroy` | Puzzles Lib | 85 | | the dig bots' slime-block harvests |
+| `java_block_player_destroy` | probe | 85 | 85 / – | no slime block dropped |
+| `java_living_hurt` | probe | 380 | 3 / 3 | a sheep took three 10-damage `/damage` hits and kept 8.0 health |
+| `java_destroy_speed` | probe | 3,454 | 3,454 / 3,454 | every mining tick used the tripled speed |
+| `java_grow_crop` | probe | 5 | 5 / 5 | the wheat stayed at age 0 and the dispenser kept 64 bone meal |
+
+Every other bound corpus callback at the new rows was disabled at its first firing on a member the tier does not
+model: `Level#getBlockState` (Collective's and Puzzles Lib's `growCrop`), `LivingEntity#level`, `isRemoved`,
+`DamageSource#getEntity` (the death and hurt rows), Puzzles Lib's `@Shadow lastHurtByPlayerMemoryTime`,
+`RegistryAccess.EMPTY` and `lookupOrThrow` (servux's and TerraBlender's constructor tails, so servux's stop-listener
+list stays empty), `SharedConstants.getCurrentVersion` (cristellib's `Bootstrap` tail, whose entrypoint still fails
+at its own `<clinit>`), `EventResult#value` (Architectury's hurt) and a Fabric event's invoker (below). The run
+also found two bugs, both fixed: registration looked a site up by hook name alone, so a `MagmaCube#jumpFromGround`
+plan met the `LivingEntity` row and refused Collective and Puzzles Lib whole; and a call on `Event.invoker()`'s
+marker answered the descriptor's default, so Collective's `playerDestroy` read `false` from its own empty
+`BLOCK_DESTROY` event and cancelled all 87 harvests' drops. That call now fails the firing; running the jar's own
+array-backed invoker over its listeners is still to do.
 
 What the tier does not fix, and does not pretend to:
 
 - A hook is only usable when its **population and position** equal the target's. `entity_tick_pre`/`_post` are
   batched per entity family and skip players, projectiles, orbs and TNT, so `Entity#tick` does not map onto them
-  even though the names look close; `level_tick_pre` carries no `BooleanSupplier`, so `ServerLevel#tick` cannot
-  be mapped either. Those stay `target-outside-jar`.
+  even though the names look close; that stays `target-outside-jar`. (`ServerLevel#tick` maps onto the internal
+  `java_level_tick_*` rows, which hand a null `BooleanSupplier`.)
 - Only the `JAVA_TIER_SITES` rows return a value; a public hook still carries no result, and no hook supplies an
   argument its payload does not carry. Adding a site is a host change (a game call site, then the table row), never
   a parser change. Of the MixinExtras injectors only `@ModifyReturnValue` binds (above).
