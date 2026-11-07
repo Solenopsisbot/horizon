@@ -1076,18 +1076,47 @@ impl Game<'_> {
 }
 
 /// A mod's text as the HUD and chat draw it: a string's `§` codes format it
-/// (`client_text.rs` writes a component's style as them, an RGB colour as
-/// `§#rrggbb`); a translatable key, after its own codes, reads through the
-/// game's language, then the mod's own lang lines, else shows the key
-/// (vanilla's missing translation).
+/// (`§#rrggbb` is the client surface's RGB colour); a translatable key reads
+/// through the game's language, then the mod's own lang lines, else shows
+/// the key (vanilla's missing translation); a styled component is vanilla's
+/// component JSON.
 fn java_text(text: &ClientText) -> Text {
     match text {
         ClientText::Literal(s) => styled_text(s),
         ClientText::Translatable(key) => {
-            let (codes, key) = horizon_native_java::client_surface::split_codes(key);
-            let shown = mod_mappings::translation(key).unwrap_or_else(|| key.to_owned());
-            styled_text(&format!("{codes}{shown}"))
+            Text::literal(mod_mappings::translation(key).unwrap_or_else(|| key.clone()))
         }
+        // The same decoder a server's chat component goes through; a key
+        // the game's language lacks reads from the mod's own lang lines.
+        ClientText::Json(json) => match serde_json::from_str::<serde_json::Value>(json) {
+            Ok(mut json) => {
+                with_mod_fallbacks(&mut json);
+                horizon_client::component::to_text(&json, &mut |_| Text::empty())
+            }
+            Err(_) => Text::literal(json.clone()),
+        },
+    }
+}
+
+/// Gives every translatable part of a component the mod's own line as its
+/// `fallback` (vanilla's `translatableWithFallback`), so a key only the
+/// mod's lang file knows reads as that line, as it does with the mod's
+/// resources loaded.
+fn with_mod_fallbacks(json: &mut serde_json::Value) {
+    match json {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::String(key)) = object.get("translate")
+                && !object.contains_key("fallback")
+                && let Some(line) = mod_mappings::translation(key)
+            {
+                object.insert("fallback".into(), serde_json::Value::String(line));
+            }
+            for value in object.values_mut() {
+                with_mod_fallbacks(value);
+            }
+        }
+        serde_json::Value::Array(list) => list.iter_mut().for_each(with_mod_fallbacks),
+        _ => {}
     }
 }
 

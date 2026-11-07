@@ -60,7 +60,6 @@ pub use items::{ClientEffect, ClientItem, ClientStack, ItemTable, StackSlot};
 // Styles on chat components, as legacy codes inside their text.
 #[path = "client_text.rs"]
 mod text;
-pub use text::split_codes;
 
 /// `Minecraft.getInstance()`, and every client listener's `Minecraft`.
 pub const MINECRAFT: &str = "client/minecraft";
@@ -287,14 +286,41 @@ impl TextMetrics {
 
     /// The text a [`ClientText`] reads as: a translatable one's translation,
     /// else its key (vanilla shows the key of a missing translation).
-    pub fn resolve<'a>(&'a self, text: &'a ClientText) -> &'a str {
+    pub fn resolve<'a>(&'a self, text: &'a ClientText) -> std::borrow::Cow<'a, str> {
         match text {
-            ClientText::Literal(text) => text,
-            // A styled key keeps its codes before it; the width skips them.
-            ClientText::Translatable(key) => {
-                let (_, key) = split_codes(key);
-                self.translations.get(key).map_or(key, String::as_str)
+            ClientText::Literal(text) => text.as_str().into(),
+            ClientText::Translatable(key) => self
+                .translations
+                .get(key)
+                .map_or(key.as_str(), String::as_str)
+                .into(),
+            ClientText::Json(json) => {
+                let mut out = String::new();
+                if let Ok(json) = serde_json::from_str(json) {
+                    self.flatten(&json, &mut out);
+                }
+                out.into()
             }
+        }
+    }
+
+    /// A component JSON's text in order, translations resolved (their
+    /// arguments are not substituted for the width).
+    fn flatten(&self, json: &serde_json::Value, out: &mut String) {
+        use serde_json::Value as Json;
+        match json {
+            Json::String(text) => out.push_str(text),
+            Json::Object(object) => {
+                if let Some(Json::String(text)) = object.get("text") {
+                    out.push_str(text);
+                } else if let Some(Json::String(key)) = object.get("translate") {
+                    out.push_str(self.translations.get(key).map_or(key, String::as_str));
+                }
+                if let Some(Json::Array(extra)) = object.get("extra") {
+                    extra.iter().for_each(|part| self.flatten(part, out));
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -361,6 +387,8 @@ pub enum ClientText {
     Literal(String),
     /// A translatable component's key.
     Translatable(String),
+    /// A styled component as vanilla's component JSON (`facade_text.rs`).
+    Json(String),
 }
 
 /// One recorded `GuiGraphicsExtractor` call, in GUI pixels after the pose.
@@ -504,6 +532,10 @@ fn text_arg(value: &Value) -> Option<ClientText> {
     }
     if let Some(key) = text.strip_prefix("component/translatable/") {
         return Some(ClientText::Translatable(cut(key)));
+    }
+    if let Some(json) = text.strip_prefix(crate::facade_text::JSON_PREFIX) {
+        // Bounded by the component model itself (64 KiB).
+        return Some(ClientText::Json(json.to_owned()));
     }
     Some(ClientText::Literal(cut(text)))
 }
@@ -1486,7 +1518,7 @@ impl StdHost {
             FONT => match (name, returns) {
                 ("width", "I") => {
                     let text = text_arg(args.first()?)?;
-                    int(frame.metrics.width(frame.metrics.resolve(&text)))
+                    int(frame.metrics.width(&frame.metrics.resolve(&text)))
                 }
                 _ => None,
             },
@@ -1590,6 +1622,9 @@ impl StdHost {
                 let count = args.get(4).map(|text| {
                     text_arg(text).map(|t| match t {
                         ClientText::Literal(s) | ClientText::Translatable(s) => s,
+                        ClientText::Json(json) => serde_json::from_str(&json)
+                            .map(|json| crate::facade_text::plain(&json))
+                            .unwrap_or_default(),
                     })
                 });
                 return self
@@ -1630,7 +1665,7 @@ impl StdHost {
                 };
                 let v = ints(2, 3)?;
                 // `x - font.width(text) / 2`, Java's integer division.
-                let width = frame.metrics.width(frame.metrics.resolve(&text));
+                let width = frame.metrics.width(&frame.metrics.resolve(&text));
                 state.text(text, v[0] - width / 2, v[1], v[2] as u32, true)
             }
             _ => return None,

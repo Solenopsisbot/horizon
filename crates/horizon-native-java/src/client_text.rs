@@ -1,28 +1,20 @@
-//! Styled chat components on the client surface.
+//! Styles on the client surface: `Style`, `TextColor` and the
+//! `ChatFormatting` constants a client callback styles text with.
 //!
-//! A component is a text marker (`component/literal/<text>`,
-//! `component/translatable/<key>`); the interpreter's own component model
-//! keeps text only and concatenates on `append`. The client keeps a style
-//! inside that text as vanilla's legacy formatting codes, which every drawing
-//! path already reads (`Font.width` skips them, the HUD and chat format by
-//! them): `Component.literal("Day").withStyle(ChatFormatting.GOLD)` is
-//! `component/literal/§6Day`, a translatable one keeps its codes before the
-//! key (`component/translatable/§6key.example`), and an RGB colour
-//! (`withColor(0x33ebff)`, `TextColor.fromRgb`) is the client-only code
-//! `§#33ebff`, which the game reads as that colour.
+//! A component's own style lives in the interpreter's component model
+//! (`facade_text.rs`): `withStyle(ChatFormatting)`, `withColor(int)` and
+//! `append` build vanilla's component JSON there, `component/json/<json>`.
+//! What that model leaves to the host is the style *objects*, and those are
+//! answered here: `Style.EMPTY` and every derived style is
+//! `client/style/<codes>`, its formatting kept as legacy codes (an RGB
+//! colour as the client-only `§#rrggbb`); `TextColor.fromRgb(rgb)` /
+//! `fromLegacyFormat(f)` is `client/text-color/<code>`. A component styled
+//! with one (`withStyle(style)`, `setStyle(style)`) becomes the same JSON
+//! component the façade builds, with the style's keys set.
 //!
-//! What this cannot say: a sibling appended after a styled child inherits the
-//! child's codes instead of the parent's style (vanilla gives it the
-//! parent's), and `getString()` returns the codes with the text. Both only
-//! touch text a mod builds from several differently styled parts.
-//!
-//! The objects:
-//!
-//! - `ChatFormatting.<NAME>` is its enum marker; `toString()` is its code
-//!   (`§6`), so `ChatFormatting.GOLD + "Day"` is the same styled string;
-//! - `Style.EMPTY` and every derived style is `client/style/<codes>`;
-//! - `TextColor.fromRgb(rgb)` / `fromLegacyFormat(f)` is
-//!   `client/text-color/<code>`.
+//! `ChatFormatting.<NAME>.toString()` is its code (`§6`), so
+//! `ChatFormatting.GOLD + "Day"` is a legacy-coded string, which every client
+//! drawing path formats by.
 
 use crate::{MethodRef, Value, expect_ref, return_desc};
 
@@ -99,14 +91,62 @@ fn boxed_true(value: Option<&Value>) -> Option<bool> {
     }
 }
 
-/// A component with `codes` put before its text (a translatable's before
-/// its key).
-fn styled(component: &str, codes: &str) -> Option<Value> {
-    let (kind, text) = component
-        .strip_prefix("component/")?
-        .split_once('/')
-        .unwrap_or(("literal", ""));
-    Some(marker(format!("component/{kind}/{codes}{text}")))
+/// A component with a style's `codes` applied over its own style, as
+/// `MutableComponent.withStyle(Style)` merges them (`Style.applyTo`): the
+/// codes' keys win.
+fn styled(component: &Value, codes: &str) -> Option<Value> {
+    use serde_json::{Map, Value as Json, json};
+    let mut object = match crate::facade_text::to_json(component)? {
+        Json::Object(object) => object,
+        Json::String(text) => Map::from_iter([("text".to_owned(), Json::String(text))]),
+        _ => return None,
+    };
+    let mut chars = codes.chars();
+    while let Some(c) = chars.next() {
+        if c != '§' {
+            continue;
+        }
+        let Some(code) = chars.next() else { break };
+        if code == '#' {
+            let hex: String = chars.by_ref().take(6).collect();
+            object.insert(
+                "color".into(),
+                json!(format!("#{}", hex.to_ascii_uppercase())),
+            );
+            continue;
+        }
+        let key = match code {
+            'l' => "bold",
+            'o' => "italic",
+            'n' => "underlined",
+            'm' => "strikethrough",
+            'k' => "obfuscated",
+            'r' => {
+                for key in [
+                    "color",
+                    "bold",
+                    "italic",
+                    "underlined",
+                    "strikethrough",
+                    "obfuscated",
+                ] {
+                    object.remove(key);
+                }
+                continue;
+            }
+            colour => {
+                if let Some((name, ..)) = FORMATS
+                    .iter()
+                    .find(|(_, c, rgb)| *c == colour && rgb.is_some())
+                {
+                    object.insert("color".into(), json!(name.to_ascii_lowercase()));
+                }
+                continue;
+            }
+        };
+        object.insert(key.into(), json!(true));
+    }
+    Some(crate::facade_text::from_json(&Json::Object(object)))
 }
 
 /// Static fields: `ChatFormatting.<NAME>` and `Style.EMPTY`.
@@ -157,13 +197,12 @@ pub(super) fn text_call(object: &str, r: &MethodRef, args: &[Value]) -> Option<V
     let name = r.name.as_str();
     let returns = return_desc(&r.descriptor);
     if object.starts_with("component/") {
+        // `withStyle(ChatFormatting)` and `withColor(int)` are the
+        // interpreter's (`facade_text.rs`); a style object is ours.
         return match (name, returns) {
-            ("getVisualOrderText", _) => Some(marker(object)),
-            ("withStyle" | "withColor" | "setStyle", _) => {
-                // `withStyle(ChatFormatting...)` hands an array: its codes
-                // are not readable here, so the text keeps its own style.
-                let codes = args.first().and_then(codes_of).unwrap_or_default();
-                styled(object, &codes)
+            ("withStyle" | "setStyle", _) => {
+                let codes = expect_ref(args.first()?)?.strip_prefix(STYLE)?;
+                styled(&marker(object), codes)
             }
             ("getStyle", _) => Some(marker(STYLE)),
             _ => None,
@@ -228,27 +267,6 @@ pub(super) fn text_call(object: &str, r: &MethodRef, args: &[Value]) -> Option<V
     }
 }
 
-/// A translatable payload's key without the style codes before it, and the
-/// codes.
-pub fn split_codes(text: &str) -> (&str, &str) {
-    let mut end = 0;
-    while let Some(after) = text[end..].strip_prefix('§') {
-        let len = if after.starts_with('#')
-            && after.is_char_boundary(7.min(after.len()))
-            && after.len() >= 7
-        {
-            7
-        } else {
-            match after.chars().next() {
-                Some(c) => c.len_utf8(),
-                None => break,
-            }
-        };
-        end += '§'.len_utf8() + len;
-    }
-    (&text[..end], &text[end..])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,50 +280,52 @@ mod tests {
     }
 
     #[test]
-    fn styles_become_codes_before_the_text() {
+    fn a_style_object_styles_a_component_as_vanilla_json() {
+        let with_color = method(
+            "net/minecraft/network/chat/Style",
+            "withColor",
+            "(I)Lnet/minecraft/network/chat/Style;",
+        );
+        let style = text_call(STYLE, &with_color, &[Value::Int(0x33ebff)]).unwrap();
+        assert_eq!(style, marker("client/style/§#33ebff"));
+        let bold = text_call(
+            expect_ref(&style).unwrap(),
+            &method(
+                "net/minecraft/network/chat/Style",
+                "withBold",
+                "(Ljava/lang/Boolean;)Lnet/minecraft/network/chat/Style;",
+            ),
+            &[marker("boolean:true")],
+        )
+        .unwrap();
+        let with_style = method(
+            "net/minecraft/network/chat/MutableComponent",
+            "withStyle",
+            "(Lnet/minecraft/network/chat/Style;)Lnet/minecraft/network/chat/MutableComponent;",
+        );
+        let styled = text_call("component/literal/Day 3", &with_style, &[bold]).unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            expect_ref(&styled)
+                .unwrap()
+                .strip_prefix("component/json/")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"text": "Day 3", "color": "#33EBFF", "bold": true})
+        );
+        // `ChatFormatting.GOLD + "x"` concatenates its code.
         let gold = text_static(&method(
             FORMATTING,
             "GOLD",
             "Lnet/minecraft/ChatFormatting;",
         ))
         .unwrap();
-        let with_style = method(
-            "net/minecraft/network/chat/MutableComponent",
-            "withStyle",
-            "(Lnet/minecraft/ChatFormatting;)Lnet/minecraft/network/chat/MutableComponent;",
-        );
-        assert_eq!(
-            text_call(
-                "component/literal/Day 3",
-                &with_style,
-                std::slice::from_ref(&gold)
-            ),
-            Some(marker("component/literal/§6Day 3"))
-        );
-        // A translatable keeps its key after the codes.
-        assert_eq!(
-            text_call(
-                "component/translatable/key.a",
-                &with_style,
-                std::slice::from_ref(&gold)
-            ),
-            Some(marker("component/translatable/§6key.a"))
-        );
-        assert_eq!(split_codes("§6§lkey.a"), ("§6§l", "key.a"));
-        assert_eq!(split_codes("§#33ebffkey.a"), ("§#33ebff", "key.a"));
-        // `ChatFormatting.GOLD + "x"` concatenates its code.
         let to_string = method(FORMATTING, "toString", "()Ljava/lang/String;");
-        let gold_name = expect_ref(&gold).unwrap().clone();
-        assert_eq!(text_call(&gold_name, &to_string, &[]), Some(marker("§6")));
-        // An RGB colour through a style.
-        let with_color = method(
-            "net/minecraft/network/chat/Style",
-            "withColor",
-            "(I)Lnet/minecraft/network/chat/Style;",
-        );
         assert_eq!(
-            text_call(STYLE, &with_color, &[Value::Int(0x33ebff)]),
-            Some(marker("client/style/§#33ebff"))
+            text_call(expect_ref(&gold).unwrap(), &to_string, &[]),
+            Some(marker("§6"))
         );
     }
 }
