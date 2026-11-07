@@ -59,11 +59,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lab  # noqa: E402
 
 # The labels the server ledger writes. Older ledgers used `native` and
-# `loader`; `read_ledger` normalises both.
+# `loader`; `read_ledger` normalises both. `--with-deps` adds
+# `missing-dependency`: the jar's declared closure needs an id no corpus jar
+# provides, so the ledger never started it. Any loader refuses such a jar too,
+# so it stays out of both halves and is never sent for loader proof; coverage
+# counts it as uncovered with a "missing dependency" cause, not as a native
+# refusal.
 NATIVE_OK = "native-ok"
 NEEDS_LOADER = "needs-loader"
 NATIVE_GAP = "native-gap"
-LABELS = (NATIVE_OK, NEEDS_LOADER, NATIVE_GAP)
+MISSING_DEPENDENCY = "missing-dependency"
+LABELS = (NATIVE_OK, NEEDS_LOADER, NATIVE_GAP, MISSING_DEPENDENCY)
 LEGACY_LABELS = {"native": NATIVE_OK, "loader": NEEDS_LOADER}
 
 # Ids the loader/game itself provides, so no pack jar has to carry them.
@@ -488,7 +494,10 @@ def partition_pack(pack: Path, rows: dict[str, LedgerRow], *,
         elif jar.row.label == NATIVE_OK:
             result.native.append(jar)
         elif jar.row.label == NEEDS_LOADER or (jar.row.label == NATIVE_GAP and (
-                gap_to_loader or jar.row.file in (loader_proven or ()))):
+                gap_to_loader or jar.row.file in (loader_proven or ()))) or (
+                # The ledger's corpus lacked an id this pack may carry: only a
+                # loader run that proved the jar moves it, never `gap_to_loader`.
+                jar.row.label == MISSING_DEPENDENCY and jar.row.file in (loader_proven or ())):
             result.loader.append(jar)
         else:
             result.excluded.append(jar)
@@ -593,7 +602,8 @@ def check_compatibility(part: Partition) -> list[Issue]:
     for jar in part.excluded + part.unlabelled:
         reason = "no ledger row" if jar.row is None else jar.row.reason
         severity = "warning"
-        code = "unlabelled" if jar.row is None else "native-gap"
+        code = "unlabelled" if jar.row is None else (
+            MISSING_DEPENDENCY if jar.row.label == MISSING_DEPENDENCY else NATIVE_GAP)
         issues.append(Issue(severity, code, (jar.name,), bounded(reason) or "left out of both halves"))
 
     # Deterministic order and no duplicate rows.
@@ -1209,6 +1219,8 @@ def native_cause(reason: str) -> str:
         return "declaration"
     if text.startswith("no native entrypoint"):
         return "no entrypoint"
+    if text.startswith("missing-dependency"):
+        return "missing dependency"
     return "other"
 
 
@@ -1233,6 +1245,16 @@ def classify_jar(corpus: str, jar: PackJar, digest: str,
         return CoverageRow(corpus, jar.name, mod_id, digest, label, NATIVE_OK,
                            NOT_NEEDED, proof_row.mod_id if proof_row else "", 0, "no entrypoint",
                            "no native entrypoint; the dedicated server has nothing to run")
+    if label == MISSING_DEPENDENCY and not (proof_row is not None and proof_row.listed):
+        # The ledger never started it: its closure needs an id outside the
+        # corpus, which a real loader refuses as well. Uncovered, but the
+        # cause is the corpus, not native execution.
+        loader = proof_row.error if proof_row is not None and proof_row.error else (
+            "the loader did not list it" if proof_row is not None else "no loader run covered it")
+        return CoverageRow(corpus, jar.name, mod_id, digest, label, NATIVE_GAP,
+                           UNPROVEN, proof_row.mod_id if proof_row else "", 0, "missing dependency",
+                           bounded(f"not run ({row.reason}); {loader}" if row and row.reason
+                                   else f"not run: its dependency closure is incomplete; {loader}"))
     if jar.declaration.client_only:
         # Fabric never loads an `environment: client` mod on a dedicated
         # server, whatever entrypoint kinds it declares. The server role has
@@ -1752,6 +1774,9 @@ def coverage_main(args: argparse.Namespace) -> int:
                 by_jar = merge_loader_evidence(fresh_evidence if args.reprove else evidence)
 
                 def needs_proof(jar: PackJar) -> bool:
+                    # A `missing-dependency` row is not sent: the proof
+                    # universe lacks the id its closure needs, so the
+                    # loader would refuse it for the same reason.
                     if jar.row is None or jar.row.label in (NEEDS_LOADER, NATIVE_GAP):
                         if jar.declaration.client_only:
                             return False

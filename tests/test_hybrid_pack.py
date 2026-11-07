@@ -268,6 +268,47 @@ class HybridPackTests(unittest.TestCase):
         self.assertEqual(next(i for i in issues if i.code == "declared-break").severity,
                          "warning")
 
+    def test_a_missing_dependency_row_stays_out_and_counts_as_a_corpus_gap(self):
+        # The row exactly as `java_mod_server_ledger.py --with-deps` writes it
+        # for a jar whose closure needs an id no corpus jar provides.
+        spec = importlib.util.spec_from_file_location(
+            "server_ledger_tool", ROOT / "tools" / "java_mod_server_ledger.py")
+        ledger_tool = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = ledger_tool  # its dataclasses look their module up
+        before = list(sys.path)
+        spec.loader.exec_module(ledger_tool)
+        sys.path[:] = before
+        with tempfile.TemporaryDirectory() as tmp:
+            addon = _jar(tmp, "addon.jar", fabric={"id": "addon", "version": "1",
+                                                   "depends": {"absent": "*"}})
+            _jar(tmp, "ok.jar", fabric={"id": "ok", "version": "1"})
+            row = ledger_tool.missing_dependency_row(
+                addon, ledger_tool.Closure(missing=(("absent", "addon"),)))
+            ledger = Path(tmp) / "ledger.txt"
+            ledger.write_text(
+                ledger_tool.format_row(row) + "\n"
+                + "ok.jar\trecommend=native-ok\tid=ok\tverdict=ran\tskipped=0\n"
+                + "summary\ttotal=2\n", encoding="utf-8")
+            rows = HYBRID.read_ledger(ledger)
+            # `gap_to_loader` moves refusals, not jars any loader refuses too.
+            part = HYBRID.partition_pack(Path(tmp), rows, gap_to_loader=True)
+            proven_part = HYBRID.partition_pack(Path(tmp), rows, loader_proven={"addon.jar"})
+            issues = HYBRID.check_compatibility(part)
+            jar = next(item for item in HYBRID.load_pack(Path(tmp), rows) if item.name == "addon.jar")
+            uncovered = HYBRID.classify_jar("c", jar, "d", {})
+            listed = HYBRID.classify_jar("c", jar, "d", {
+                "addon.jar": HYBRID.LoaderRow("addon.jar", "addon", "listed", 0, True)})
+        self.assertEqual(rows["addon.jar"].label, "missing-dependency")
+        self.assertEqual([item.name for item in part.native], ["ok.jar"])
+        self.assertEqual([item.name for item in part.excluded], ["addon.jar"])
+        self.assertEqual([item.name for item in proven_part.loader], ["addon.jar"])
+        issue = next(item for item in issues if item.jars == ("addon.jar",))
+        self.assertEqual((issue.severity, issue.code), ("warning", "missing-dependency"))
+        self.assertEqual((uncovered.tier, uncovered.cause), ("native-gap", "missing dependency"))
+        self.assertIn("absent", uncovered.reason)
+        # A pack whose loader run lists the jar carries it in the loader tier.
+        self.assertEqual((listed.tier, listed.proof), ("needs-loader", "proven"))
+
     def test_native_gap_is_a_warning_not_a_conflict(self):
         with tempfile.TemporaryDirectory() as tmp:
             _jar(tmp, "ok.jar", fabric={"id": "ok", "version": "1"})
