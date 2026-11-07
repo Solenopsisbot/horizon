@@ -676,6 +676,9 @@ fn platform_supertypes(class: &str) -> &'static [&'static str] {
 /// `marker instanceof wanted` for a boxed value or a JDK collection object
 /// (`java/util/ArrayList#3`, `java/util/LinkedHashMap#neutral0`).
 pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
+    if crate::reflect_generic::annotated_type_instance_of(marker, wanted) {
+        return true;
+    }
     let class = if let Some((class, _)) = marker.split_once('#') {
         class
     } else {
@@ -692,7 +695,10 @@ pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
         }
     };
     let known = platform_supertypes(class);
-    !known.is_empty() && (class == wanted || known.contains(&wanted))
+    if known.is_empty() {
+        return crate::library_dispatch::fastutil_instance_of(class, wanted);
+    }
+    class == wanted || known.contains(&wanted)
 }
 
 /// Unbox the arguments a method reference to a JDK method receives, the way
@@ -727,7 +733,7 @@ pub(crate) fn unbox_for_descriptor(descriptor: &str, args: &mut [Value]) {
 
 /// A parsed class's `access_flags`, read back from its bytes (the parser
 /// keeps the raw class file and skips the field for every other use).
-fn class_access_flags(file: &crate::ClassFile) -> Option<u16> {
+pub(crate) fn class_access_flags(file: &crate::ClassFile) -> Option<u16> {
     let mut reader = crate::Reader::new(&file.raw);
     if reader.u4().ok()? != 0xCAFE_BABE {
         return None;

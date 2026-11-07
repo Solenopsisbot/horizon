@@ -44,7 +44,7 @@ pub(crate) fn leave() {
 }
 
 /// The frames a walk sees, innermost first.
-fn snapshot() -> Vec<(String, String)> {
+pub(crate) fn snapshot() -> Vec<(String, String)> {
     FRAMES.with(|frames| frames.borrow().iter().rev().cloned().collect())
 }
 

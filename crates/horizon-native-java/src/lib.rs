@@ -28,6 +28,7 @@ mod heap;
 mod hook_shapes;
 mod java_regex;
 mod jdk_model;
+mod jdk_reflect_proxy;
 mod library_dispatch;
 mod jdk_stream;
 mod map_compute;
@@ -19309,19 +19310,23 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether an interface, or one it extends, is `wanted`.
+    ///
+    /// An interface's parents are the interfaces its class file lists (its
+    /// `super_class` is always `Object`), so the walk is breadth first over
+    /// those, bounded by [`MAX_SUPERCLASS_WALK`] interfaces.
     fn interface_extends(&self, interface: &str, wanted: &str) -> bool {
-        let mut current = interface.to_owned();
-        for _ in 0..MAX_SUPERCLASS_WALK {
+        let mut queue = std::collections::VecDeque::from([interface.to_owned()]);
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(current) = queue.pop_front() {
             if current == wanted {
                 return true;
             }
-            let Some(file) = self.class(&current) else {
-                return false;
-            };
-            if file.super_name.is_empty() {
-                return false;
+            if seen.len() >= MAX_SUPERCLASS_WALK || !seen.insert(current.clone()) {
+                continue;
             }
-            current = file.super_name.clone();
+            if let Some(file) = self.class(&current) {
+                queue.extend(file.interface_names());
+            }
         }
         false
     }
@@ -23362,7 +23367,7 @@ impl<H: Host> Runtime<'_, H> {
                     // keeps the interpreter's previous neutral answer.
                     // A box the runtime keeps unboxed (`Double.valueOf`
                     // answers a `Float` value) is still a reference here.
-                    let unboxed = library_dispatch::unboxed_instance_of(&value, &wanted);
+                    let unboxed = self.library_instance_of(&value, &wanted);
                     let matches = unboxed || expect_ref(&value).is_some_and(|marker| {
                         self.object_is_instance_of(marker, &wanted)
                             || self.host.host_instance_of(marker, &wanted)
