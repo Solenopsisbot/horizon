@@ -16,6 +16,28 @@ pub const MAX_UNCOMPRESSED: usize = 8_388_608;
 /// length prefix, and with compression enabled the uncompressed-length
 /// field (0 when below the threshold).
 pub fn encode(body: &[u8], threshold: Option<usize>) -> Result<Vec<u8>> {
+    // The common uncompressed path used to copy `body` into `contents`, then
+    // copy it again while adding the frame length. Prefix it directly so a
+    // packet body crosses the allocator and memcpy boundary once.
+    if threshold.is_none() {
+        if body.len() > MAX_FRAME {
+            return Err(Error::new(format!("packet too large: {} bytes", body.len())));
+        }
+        return Ok(prefixed(body));
+    }
+    if let Some(t) = threshold
+        && body.len() < t
+    {
+        let inner_len = body.len() + 1;
+        if inner_len > MAX_FRAME {
+            return Err(Error::new(format!("packet too large: {inner_len} bytes")));
+        }
+        let mut out = Vec::with_capacity(inner_len + 3);
+        write_varint(&mut out, inner_len as i32);
+        out.push(0);
+        out.extend_from_slice(body);
+        return Ok(out);
+    }
     Ok(prefixed(&contents(body, threshold)?))
 }
 
@@ -184,6 +206,16 @@ mod tests {
         let mut z = ZlibEncoder::new(v, Compression::default());
         z.write_all(body).unwrap();
         z.finish().unwrap()
+    }
+
+    #[test]
+    fn direct_uncompressed_and_below_threshold_frames_match_contents() {
+        let body: Vec<u8> = (0..257).map(|i| i as u8).collect();
+        assert_eq!(encode(&body, None).unwrap(), prefixed(&body));
+        assert_eq!(
+            encode(&body, Some(body.len() + 1)).unwrap(),
+            prefixed(&contents(&body, Some(body.len() + 1)).unwrap())
+        );
     }
 
     /// The kept compressor writes the bytes a new one does, whatever it

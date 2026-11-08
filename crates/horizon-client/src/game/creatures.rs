@@ -1226,11 +1226,9 @@ impl Game<'_> {
                 horizon_client::mobs::seen_grid::SeenGrid::new(snapshot.iter().map(|s| s.bounds));
             // All but the snapshot is the same for every mob of the tick, so
             // build it once: the player view and the teams scan every UUID.
-            self.leash_boats = self
-                .boats
-                .iter()
-                .map(super::boat_leads::boat_state)
-                .collect();
+            self.leash_boats.clear();
+            self.leash_boats
+                .extend(self.boats.iter().map(super::boat_leads::boat_state));
             let mut base = self.mob_world_base(&[]);
             let path_changes = horizon_client::mobs::collision_changes(&base, &path_writes);
             let mut path_change_buckets = horizon_client::fast_hash::FxHashMap::default();
