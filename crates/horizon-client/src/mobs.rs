@@ -2859,6 +2859,35 @@ pub fn blocks_changed(m: &mut Mob, changed: &[[i32; 3]]) {
         }
     }
 }
+/// The same check using a chunk-bucketed write list. The bucket is only a
+/// conservative broad phase; [`Mob::should_recompute_path`] remains the
+/// authoritative predicate and the small-list path keeps the original order.
+pub fn blocks_changed_bucketed(
+    m: &mut Mob,
+    changed: &[[i32; 3]],
+    buckets: &crate::fast_hash::FxHashMap<(i32, i32), Vec<[i32; 3]>>,
+) {
+    if changed.len() <= 64 || m.ai.nav.is_done() {
+        blocks_changed(m, changed);
+        return;
+    }
+    let Some((min_x, max_x, min_z, max_z)) = m.path_change_chunk_bounds() else {
+        return;
+    };
+    for cx in min_x..=max_x {
+        for cz in min_z..=max_z {
+            let Some(candidates) = buckets.get(&(cx, cz)) else {
+                continue;
+            };
+            for &at in candidates {
+                if m.should_recompute_path(at) {
+                    m.queue_path_recompute();
+                    return;
+                }
+            }
+        }
+    }
+}
 /// The writes of `writes` that changed the block's collision shape, in order:
 /// `sendBlockUpdated` compares the two shapes once per write, not per mob.
 pub fn collision_changes(w: &MobWorld, writes: &[((i32, i32, i32), u32, u32)]) -> Vec<[i32; 3]> {

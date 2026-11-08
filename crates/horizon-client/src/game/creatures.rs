@@ -1231,6 +1231,13 @@ impl Game<'_> {
                 .collect();
             let mut base = self.mob_world_base(&[]);
             let path_changes = horizon_client::mobs::collision_changes(&base, &path_writes);
+            let mut path_change_buckets = horizon_client::fast_hash::FxHashMap::default();
+            for &at in &path_changes {
+                path_change_buckets
+                    .entry((at[0].div_euclid(16), at[2].div_euclid(16)))
+                    .or_insert_with(Vec::new)
+                    .push(at);
+            }
             // Each mob keeps its snapshot slot all tick; the first slot of an
             // id answers, as a scan would.
             let mut index = horizon_client::fast_hash::FxHashMap::<u32, u32>::default();
@@ -1328,7 +1335,11 @@ impl Game<'_> {
                     }
                 };
                 horizon_client::mobs::apply_mob_pushes(m, &mut pushes);
-                horizon_client::mobs::blocks_changed(m, &path_changes);
+                horizon_client::mobs::blocks_changed_bucketed(
+                    m,
+                    &path_changes,
+                    &path_change_buckets,
+                );
                 let from = events.len();
                 // The guest's view is lent to the mob for its tick, not copied:
                 // the tick only reads it (`&MobWorld`), and it goes back to the

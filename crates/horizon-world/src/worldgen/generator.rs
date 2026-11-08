@@ -1527,7 +1527,7 @@ where
             self.settings.sea_level,
         );
         let mut clock = std::time::Instant::now();
-        let mut neighbors = Vec::with_capacity(9);
+        let mut neighbors: Vec<Arc<BiomeChunk<BiomeId>>> = Vec::with_capacity(9);
         // The biome ids present, as a bitset: ascending like a sorted set.
         let mut seen: Vec<u64> = Vec::new();
         // Build the neighbours no other thread is building first, then wait
@@ -1560,7 +1560,7 @@ where
                     }
                     section += 1;
                 }
-                neighbors.push((*chunk).clone());
+                neighbors.push(chunk);
             }
         }
         let possible = seen.iter().enumerate().flat_map(|(word, &bits)| {
@@ -1573,9 +1573,11 @@ where
                 })
             })
         });
-        let mut center = neighbors[4].clone();
-        let biomes =
-            BiomeRegion::new(neighbors, obfuscate_seed(self.seed)).map_err(stage("biomes"))?;
+        // Terrain generation may mutate the center's biome cells; keep one
+        // private center copy while the read-only region shares all snapshots.
+        let mut center = (*neighbors[4]).clone();
+        let biomes = BiomeRegion::new_shared(neighbors, obfuscate_seed(self.seed))
+            .map_err(stage("biomes"))?;
         let possible = possible.map(|id| data.biome_name(id).to_owned()).collect();
         worker.timings.biomes += lap(&mut clock);
         let mut chunk = TerrainChunk::new(

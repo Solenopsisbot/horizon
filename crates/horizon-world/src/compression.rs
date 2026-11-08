@@ -1,5 +1,5 @@
 //! Region codecs, including lz4-java's block framing (not the LZ4 frame format).
-use flate2::{Compression as Level, Decompress, FlushDecompress, Status};
+use flate2::{Compression as Level, Decompress, FlushDecompress, Status, write::ZlibEncoder};
 use std::{
     io::{self, Read, Write},
     sync::atomic::{AtomicU8, Ordering},
@@ -110,14 +110,29 @@ impl Compression {
                 encoder.write_all(bytes)?;
                 encoder.finish()
             }
-            Self::Zlib => {
-                let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), Level::default());
-                encoder.write_all(bytes)?;
-                encoder.finish()
-            }
+            Self::Zlib => zlib_encode(bytes),
             Self::Lz4 => Ok(encode_lz4(bytes)),
         }
     }
+}
+
+thread_local! {
+    /// The disk writer's zlib state, reset between records. The output vector
+    /// is still returned to the caller, while the deflater's window and tables
+    /// stay on the save worker thread for the next record.
+    static ZLIB_ENCODER: std::cell::RefCell<Option<ZlibEncoder<Vec<u8>>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn zlib_encode(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    ZLIB_ENCODER.with_borrow_mut(|slot| {
+        let mut encoder = slot
+            .take()
+            .unwrap_or_else(|| ZlibEncoder::new(Vec::new(), Level::default()));
+        encoder.write_all(bytes)?;
+        let output = encoder.reset(Vec::new())?;
+        *slot = Some(encoder);
+        Ok(output)
+    })
 }
 
 thread_local! {
@@ -430,6 +445,18 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn zlib_reuse_keeps_independent_stream_bytes() {
+        let inputs = [b"first region record".as_slice(), &[0; 131_073], b"last"];
+        let expected: Vec<_> = inputs
+            .iter()
+            .map(|bytes| Compression::Zlib.encode(bytes).unwrap())
+            .collect();
+        for (bytes, want) in inputs.iter().zip(expected) {
+            assert_eq!(Compression::Zlib.encode(bytes).unwrap(), want);
         }
     }
     /// The zlib decoder before it inflated in place: a new inflater for

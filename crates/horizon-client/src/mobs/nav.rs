@@ -491,6 +491,34 @@ impl Mob {
         );
         super::doors::closer_to_center(pos, middle, (path.nodes.len() - path.next) as f64)
     }
+    /// The chunk rectangle that can contain a block accepted by
+    /// [`should_recompute_path`]. It is deliberately conservative; callers
+    /// still run the exact sphere test for each candidate.
+    pub fn path_change_chunk_bounds(&self) -> Option<(i32, i32, i32, i32)> {
+        let nav = &self.ai.nav;
+        if nav.delayed_recompute {
+            return None;
+        }
+        let path = nav.path.as_ref().filter(|p| !p.is_done())?;
+        let end = path.nodes.last()?;
+        let position = self.navigation_position();
+        let middle = Vec3::new(
+            (f64::from(end.x) + position.x) / 2.0,
+            (f64::from(end.y) + position.y) / 2.0,
+            (f64::from(end.z) + position.z) / 2.0,
+        );
+        let distance = (path.nodes.len() - path.next) as f64;
+        let min_x = (middle.x - distance - 0.5).floor() as i32;
+        let max_x = (middle.x + distance - 0.5).ceil() as i32;
+        let min_z = (middle.z - distance - 0.5).floor() as i32;
+        let max_z = (middle.z + distance - 0.5).ceil() as i32;
+        Some((
+            min_x.div_euclid(16),
+            max_x.div_euclid(16),
+            min_z.div_euclid(16),
+            max_z.div_euclid(16),
+        ))
+    }
     /// `ServerLevel.sendBlockUpdated` for a mob that should re-path: the
     /// recompute happens at the start of its next navigation tick.
     pub fn queue_path_recompute(&mut self) {

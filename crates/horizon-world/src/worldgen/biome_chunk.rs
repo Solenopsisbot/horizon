@@ -4,7 +4,10 @@ use horizon_core::{
     biome::BiomeZoom,
     position::{BlockPos, ChunkPos},
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 #[derive(Clone, Debug)]
 pub struct BiomeChunk<T> {
@@ -133,7 +136,7 @@ fn index(x: i32, y: i32, z: i32) -> usize {
 /// Resident biome sections shared by decoration selection and block biome zoom.
 /// The seed is already obfuscated, as for `BiomeZoom` and the client protocol.
 pub struct BiomeRegion<T> {
-    chunks: BTreeMap<(i32, i32), BiomeChunk<T>>,
+    chunks: BTreeMap<(i32, i32), Arc<BiomeChunk<T>>>,
     zoom: BiomeZoom,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +152,16 @@ impl std::fmt::Display for BiomeRegionError {
 impl std::error::Error for BiomeRegionError {}
 impl<T: Clone> BiomeRegion<T> {
     pub fn new(chunks: Vec<BiomeChunk<T>>, obfuscated_seed: i64) -> Result<Self, BiomeRegionError> {
+        Self::new_shared(chunks.into_iter().map(Arc::new).collect(), obfuscated_seed)
+    }
+
+    /// Build a region from immutable chunk snapshots without cloning their
+    /// quart cells. `chunk_mut` remains copy-on-write for callers that need to
+    /// edit a region.
+    pub fn new_shared(
+        chunks: Vec<Arc<BiomeChunk<T>>>,
+        obfuscated_seed: i64,
+    ) -> Result<Self, BiomeRegionError> {
         if chunks.is_empty() || chunks.len() > 4096 {
             return Err(BiomeRegionError::InvalidChunks);
         }
@@ -174,11 +187,13 @@ impl<T: Clone> BiomeRegion<T> {
     pub fn chunk(&self, p: ChunkPos) -> Result<&BiomeChunk<T>, BiomeRegionError> {
         self.chunks
             .get(&(p.x, p.z))
+            .map(Arc::as_ref)
             .ok_or(BiomeRegionError::MissingChunk(p))
     }
     pub fn chunk_mut(&mut self, p: ChunkPos) -> Result<&mut BiomeChunk<T>, BiomeRegionError> {
         self.chunks
             .get_mut(&(p.x, p.z))
+            .map(Arc::make_mut)
             .ok_or(BiomeRegionError::MissingChunk(p))
     }
     pub fn noise_biome(&self, quart: [i32; 3]) -> Result<&T, BiomeRegionError> {

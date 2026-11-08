@@ -8666,34 +8666,37 @@ impl Renderer {
         }
         if self.animated_textures {
             self.active_animated_layers.fill(0);
-            for v in &visible {
-                let s = self.sections.get(v.slot);
-                for &layer in &*s.animated_layers {
+            let mut mark = |layers: &[u16]| {
+                for &layer in layers {
                     let layer = layer as usize;
                     self.active_animated_layers[layer / u64::BITS as usize] |=
                         1_u64 << (layer % u64::BITS as usize);
                 }
-            }
-            for v in &visible_lods {
-                if let Some(tile) = self.lods.get(&v.key) {
-                    for &layer in &*tile.drawn().animated_layers {
-                        let layer = layer as usize;
-                        self.active_animated_layers[layer / u64::BITS as usize] |=
-                            1_u64 << (layer % u64::BITS as usize);
-                    }
-                    for &layer in &*tile.mesh.animated_layers {
-                        let layer = layer as usize;
-                        self.active_animated_layers[layer / u64::BITS as usize] |=
-                            1_u64 << (layer % u64::BITS as usize);
+            };
+            if gpu_frame {
+                // GPU culling does not return the sections it will draw. Use
+                // every resident section and LOD mesh as a conservative union:
+                // newly visible animated sprites are never left frozen, while
+                // unused pack animations can still be skipped.
+                for s in self.sections.values() {
+                    mark(&s.animated_layers);
+                }
+                for tile in self.lods.values() {
+                    mark(&tile.drawn().animated_layers);
+                    mark(&tile.mesh.animated_layers);
+                }
+            } else {
+                for v in &visible {
+                    mark(&self.sections.get(v.slot).animated_layers);
+                }
+                for v in &visible_lods {
+                    if let Some(tile) = self.lods.get(&v.key) {
+                        mark(&tile.drawn().animated_layers);
+                        mark(&tile.mesh.animated_layers);
                     }
                 }
-            }
-            for v in &shadow_visible {
-                let s = self.sections.get(v.slot);
-                for &layer in &*s.animated_layers {
-                    let layer = layer as usize;
-                    self.active_animated_layers[layer / u64::BITS as usize] |=
-                        1_u64 << (layer % u64::BITS as usize);
+                for v in &shadow_visible {
+                    mark(&self.sections.get(v.slot).animated_layers);
                 }
             }
             // Visibility is collected before terrain draw commands are recorded,
