@@ -174,7 +174,12 @@ pub(super) fn load_core(
                 horizon_client::mobs::EntityModelDocument::load(root).map_err(|e| e.to_string())
             })
         });
-        let assets = startup::time("core.assets", || Assets::load(root));
+        let assets = scope.spawn(|| {
+            startup::time("core.assets", || Assets::load(root)).map_err(|e| e.to_string())
+        });
+        let assets = assets
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e));
         let models = models.map(|m| m.join().unwrap_or_else(|e| std::panic::resume_unwind(e)));
         let entity_models = entity_models
             .map(|m| m.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
@@ -184,7 +189,7 @@ pub(super) fn load_core(
     });
     let assets = match assets {
         Ok(assets) => assets,
-        Err(e) => return Ok(Err(e.to_string())),
+        Err(e) => return Ok(Err(e)),
     };
     progress.set(1);
     let registry = assets.registry;
@@ -257,10 +262,12 @@ pub(super) fn load_core(
                 startup::time("core.collision", || collisions::load(root, registry))
                     .map_err(|e| e.to_string())
             });
-            let gameplay = gameplay_tables(root, assets, parallel, progress);
+            let gameplay = Step::spawn(scope, parallel, "gameplay", || {
+                gameplay_tables(root, assets, parallel, progress)
+            });
             (
                 render.join(),
-                gameplay,
+                gameplay.join(),
                 visibility.join(),
                 biomes.join(),
                 environment.join(),

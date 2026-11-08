@@ -448,6 +448,10 @@ impl PlayerSender {
             }
         }
     }
+    /// Queue one immutable body without cloning its payload for this recipient.
+    pub fn send_shared(&self, body: Arc<[u8]>) {
+        self.send_shared_many(std::iter::once(body));
+    }
     /// Several packets in order, as [`Self::send`] each: under one lock
     /// while the tick holds them.
     pub fn send_many(&self, bodies: impl IntoIterator<Item = Vec<u8>>) {

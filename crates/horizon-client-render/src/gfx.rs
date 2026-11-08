@@ -1408,6 +1408,8 @@ pub struct Renderer {
     lod_retiring: crate::fast_hash::FxHashSet<SectionKey>,
     /// Removed sections fading out over far terrain (`leave_section`).
     lod_leaving: Vec<(SectionKey, std::time::Instant)>,
+    /// Reusable column keys for the per-frame visibility walk.
+    lod_leaving_keys: FxHashSet<(i32, i32)>,
     /// A mod's hold on the terrain's picture (`hold_world`, gfx/hold.rs) and the new meshes
     /// waiting behind it.
     hold: hold::Hold<HeldMesh>,
@@ -5076,6 +5078,7 @@ impl Renderer {
             lod_cutout: Default::default(),
             lod_retiring: Default::default(),
             lod_leaving: Vec::new(),
+            lod_leaving_keys: Default::default(),
             hold: Default::default(),
             lod_pending: None,
             detail_columns: Default::default(),
@@ -8572,11 +8575,10 @@ impl Renderer {
         let cutout = &self.lod_cutout;
         // Sections fading out (`leave_section`) are past the render distance:
         // drawn there until they have, or they popped out at once.
-        let leaving: crate::fast_hash::FxHashSet<(i32, i32)> = self
-            .lod_leaving
-            .iter()
-            .map(|&((x, _, z), _)| (x, z))
-            .collect();
+        self.lod_leaving_keys.clear();
+        self.lod_leaving_keys
+            .extend(self.lod_leaving.iter().map(|&((x, _, z), _)| (x, z)));
+        let leaving = &self.lod_leaving_keys;
         let mut visible = std::mem::take(&mut self.visible);
         visible.clear();
         crate::spans::time("visibility", || {

@@ -830,17 +830,17 @@ impl Hub {
             }
             return;
         }
-        let body = packet.encode();
+        let body: Arc<[u8]> = Arc::from(packet.encode());
         for g in self.guests.iter().filter(|g| g.placed) {
-            g.sender.send(body.clone());
+            g.sender.send_shared(body.clone());
         }
     }
     /// [`Self::broadcast`] to the held players as well, which keep a picture of
     /// the players and the entities while they wait for their hand-over.
     pub fn broadcast_watching(&self, packet: &C) {
-        let body = packet.encode();
+        let body: Arc<[u8]> = Arc::from(packet.encode());
         for g in self.guests.iter().filter(|g| g.placed || g.held) {
-            g.sender.send(body.clone());
+            g.sender.send_shared(body.clone());
         }
     }
     /// MinecraftServer.onGameRuleChanged: every player is told when
@@ -979,23 +979,24 @@ impl Hub {
     /// `PlayerList.broadcastAll(packet, dimension)`: the players in the
     /// level in place.
     pub fn broadcast_level(&self, packet: &C) {
-        let body = packet.encode();
+        let body: Arc<[u8]> = Arc::from(packet.encode());
         for g in self.guests.iter().filter(|g| self.watches(g)) {
-            g.sender.send(body.clone());
+            g.sender.send_shared(body.clone());
         }
     }
     /// `DedicatedServer.sendLowDiskSpaceWarning`: the players with
     /// `PermissionLevel.ADMINS` (3) or more get `ClientboundLowDiskSpaceWarningPacket`.
     pub fn send_low_disk_space_warning(&self) {
-        let body = C::LowDiskSpaceWarning(horizon_protocol::packets::Empty).encode();
+        let body: Arc<[u8]> =
+            Arc::from(C::LowDiskSpaceWarning(horizon_protocol::packets::Empty).encode());
         for g in self.guests.iter().filter(|g| g.placed && g.permission >= 3) {
-            g.sender.send(body.clone());
+            g.sender.send_shared(body.clone());
         }
     }
     pub fn broadcast_except(&self, conn: u32, packet: &C) {
-        let body = packet.encode();
+        let body: Arc<[u8]> = Arc::from(packet.encode());
         for g in self.guests.iter().filter(|g| g.placed && g.conn != conn) {
-            g.sender.send(body.clone());
+            g.sender.send_shared(body.clone());
         }
     }
     /// PlayerList.broadcastSystemMessage.
@@ -1008,25 +1009,29 @@ impl Hub {
     /// A system message for the guests `hears` picks by name
     /// (`PlayerList.broadcastSystemToTeam` and its kin).
     pub fn system_message_to(&self, content: Tag, hears: impl Fn(&str) -> bool) {
-        let body = C::SystemChat(play::SystemChat {
-            content,
-            overlay: false,
-        })
-        .encode();
+        let body: Arc<[u8]> = Arc::from(
+            C::SystemChat(play::SystemChat {
+                content,
+                overlay: false,
+            })
+            .encode(),
+        );
         for g in self.guests.iter().filter(|g| g.placed && hears(&g.name)) {
-            g.sender.send(body.clone());
+            g.sender.send_shared(body.clone());
         }
     }
     /// `ServerPlayer.sendSystemMessage` to the guest with `uuid`, in any
     /// dimension.
     pub fn system_message_to_player(&self, uuid: u128, content: Tag) {
-        let body = C::SystemChat(play::SystemChat {
-            content,
-            overlay: false,
-        })
-        .encode();
+        let body: Arc<[u8]> = Arc::from(
+            C::SystemChat(play::SystemChat {
+                content,
+                overlay: false,
+            })
+            .encode(),
+        );
         for g in self.guests.iter().filter(|g| g.placed && g.uuid == uuid) {
-            g.sender.send(body.clone());
+            g.sender.send_shared(body.clone());
         }
     }
     /// `ServerPlayer.sendOverlayMessage` to every guest (the action bar).

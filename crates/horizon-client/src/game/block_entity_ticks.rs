@@ -15,8 +15,21 @@ use horizon_client::{
 use horizon_core::position::BlockPos;
 use horizon_world::registry::BlockStateId;
 
+#[derive(Default)]
+pub(super) struct TickScratch {
+    spawners: Vec<Pos>,
+    trial_spawners: Vec<Pos>,
+}
+
 impl Game<'_> {
     pub(super) fn tick_block_entities(&mut self) -> Result<()> {
+        let mut scratch = std::mem::take(&mut self.block_entity_tick_scratch);
+        let result = self.tick_block_entities_with_scratch(&mut scratch);
+        self.block_entity_tick_scratch = scratch;
+        result
+    }
+
+    fn tick_block_entities_with_scratch(&mut self, scratch: &mut TickScratch) -> Result<()> {
         self.tick_mount_menu();
         self.tick_craft_table();
         self.tick_container_reach();
@@ -38,8 +51,8 @@ impl Game<'_> {
             self.forget_gone_hoppers();
         }
         let ticking = self.block_ticking_area();
-        let mut spawners = Vec::new();
-        let mut trial_spawners = Vec::new();
+        scratch.spawners.clear();
+        scratch.trial_spawners.clear();
         self.item_columns = Some(Default::default());
         self.pass_mobs = Some(Default::default());
         for slot in self.world.block_entity_tickers().iter().copied() {
@@ -62,11 +75,11 @@ impl Game<'_> {
                 Some(BlockEntity::CreakingHeart(_)) => self.tick_creaking_heart(pos)?,
                 Some(BlockEntity::Spawner(_)) => {
                     self.tick_spawner(pos)?;
-                    spawners.push(pos);
+                    scratch.spawners.push(pos);
                 }
                 Some(BlockEntity::TrialSpawner(_)) => {
                     self.tick_trial_spawner(pos)?;
-                    trial_spawners.push(pos);
+                    scratch.trial_spawners.push(pos);
                 }
                 Some(BlockEntity::Vault(_)) => self.tick_vault(pos)?,
                 Some(BlockEntity::Beehive(_)) => self.tick_beehive(pos),
@@ -94,8 +107,8 @@ impl Game<'_> {
         // The client ticks (particles, sounds, the turning mob) are for a
         // window; a dedicated or integrated server has none.
         if self.options.dedicated.is_none() {
-            self.client_tick_spawners(&spawners);
-            for key in trial_spawners {
+            self.client_tick_spawners(&scratch.spawners);
+            for key in scratch.trial_spawners.drain(..) {
                 self.client_tick_trial_spawner(key);
             }
         }

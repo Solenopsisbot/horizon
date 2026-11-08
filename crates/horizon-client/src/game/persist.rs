@@ -2237,12 +2237,16 @@ pub(super) fn vehicle_tree(root: u32, mounts: &[(u32, Option<u32>)]) -> Vec<u32>
     let mut k = 0;
     while k < tree.len() {
         let v = tree[k];
-        let riders: Vec<u32> = mounts
-            .iter()
-            .filter(|(id, m)| *m == Some(v) && !tree.contains(id))
-            .map(|(id, _)| *id)
-            .collect();
-        tree.extend(riders);
+        // Vanilla appends one passenger layer at a time.  Keep the current
+        // tree length as the duplicate boundary so repeated mount records
+        // have the same first-match behavior as the old temporary Vec, while
+        // avoiding a short-lived allocation for every vehicle layer.
+        let before = tree.len();
+        for &(id, mount) in mounts {
+            if mount == Some(v) && !tree[..before].contains(&id) {
+                tree.push(id);
+            }
+        }
         k += 1;
     }
     tree
