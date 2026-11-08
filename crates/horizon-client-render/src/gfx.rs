@@ -820,15 +820,19 @@ fn hold_fading(
 /// GPU culling switched off (`Renderer::set_gpu_culling`): no section keeps a
 /// record or a flag, and those it flagged get back the walk marks they have
 /// while it is off (`SectionGpu::listed`). `rows`: the level's sections.
-fn forget_records(sections: &mut resident::Resident<SectionGpu>, rows: usize) {
-    let mut marks = Vec::new();
+fn forget_records(
+    sections: &mut resident::Resident<SectionGpu>,
+    rows: usize,
+    marks: &mut Vec<(SectionKey, bool)>,
+) {
+    marks.clear();
     for (key, s, _) in sections.iter_mut() {
         s.gpu_id = None;
         if std::mem::take(&mut s.gpu_fading) {
             marks.push((key, s.listed(key, rows)));
         }
     }
-    for (key, marked) in marks {
+    for (key, marked) in marks.drain(..) {
         sections.set_marked(key, marked);
     }
 }
@@ -1412,6 +1416,8 @@ pub struct Renderer {
     lod_leaving_done: Vec<(SectionKey, std::time::Instant)>,
     /// Reusable column keys for the per-frame visibility walk.
     lod_leaving_keys: FxHashSet<(i32, i32)>,
+    /// Reusable walk-mark updates when GPU culling is disabled.
+    gpu_forget_marks: Vec<(SectionKey, bool)>,
     /// A mod's hold on the terrain's picture (`hold_world`, gfx/hold.rs) and the new meshes
     /// waiting behind it.
     hold: hold::Hold<HeldMesh>,
@@ -5082,6 +5088,7 @@ impl Renderer {
             lod_leaving: Vec::new(),
             lod_leaving_done: Vec::new(),
             lod_leaving_keys: Default::default(),
+            gpu_forget_marks: Vec::new(),
             hold: Default::default(),
             lod_pending: None,
             detail_columns: Default::default(),
@@ -5560,7 +5567,11 @@ impl Renderer {
     pub fn set_gpu_culling(&mut self, on: bool) -> Result<()> {
         if !on {
             if self.gpu_culling.take().is_some() {
-                forget_records(&mut self.sections, self.layout.sections());
+                forget_records(
+                    &mut self.sections,
+                    self.layout.sections(),
+                    &mut self.gpu_forget_marks,
+                );
             }
             self.gpu_frame = false;
             return Ok(());
@@ -14185,6 +14196,7 @@ mod tests {
             sections: super::resident::Resident<SectionGpu>,
             records: gpu_culling::Records,
             fades: gpu_culling::Fades,
+            forget_marks: Vec<(SectionKey, bool)>,
             uploaded: FxHashMap<SectionKey, Instant>,
             retiring: FxHashSet<SectionKey>,
         }
@@ -14377,7 +14389,7 @@ mod tests {
         // Switched off with sections still flagged: none keeps a record or a
         // flag, and each is marked as while GPU culling is off.
         assert!(sim.records.fading() > 0, "none flagged at the end");
-        forget_records(&mut sim.sections, ROWS);
+        forget_records(&mut sim.sections, ROWS, &mut sim.forget_marks);
         for (k, s, _) in sim.sections.iter() {
             assert!(s.gpu_id.is_none() && !s.gpu_fading, "{k:?}: kept once off");
             let off = s.translucent > 0 || !s.gpu_recorded(k, ROWS);
