@@ -1402,6 +1402,12 @@ fn process_infos<W: PlacementContext>(
         .processors
         .iter()
         .any(|p| p.evaluates_entire_piece());
+    // Capped processors run after the ordinary chain and only need the original
+    // template position. Keeping that position avoids cloning the full block
+    // (including optional NBT) for every processed block.
+    // Copy the processor references once because each processor may mutate the
+    // placement settings while it runs.
+    let processors = settings.processors.clone();
     let mut original = Vec::new();
     let mut processed = Vec::new();
     for info in template.palettes()[palette].blocks() {
@@ -1420,8 +1426,7 @@ fn process_infos<W: PlacementContext>(
             state: info.state,
             nbt: info.nbt.clone(),
         });
-        let processors = settings.processors.clone();
-        for processor in processors {
+        for &processor in &processors {
             let Some(value) = current.take() else { break };
             current = process_block(
                 processor, world, resources, position, reference, info.pos, value, settings,
@@ -1429,11 +1434,10 @@ fn process_infos<W: PlacementContext>(
         }
         if let Some(value) = current {
             processed.push(value);
-            original.push(info.clone());
+            original.push(info.pos);
         }
     }
-    let processors = settings.processors.clone();
-    for processor in processors {
+    for &processor in &processors {
         let Processor::Capped { delegate, limit } = processor else {
             continue;
         };
@@ -1470,7 +1474,7 @@ fn process_infos<W: PlacementContext>(
                 resources,
                 position,
                 reference,
-                original[index].pos,
+                original[index],
                 before.clone(),
                 settings,
             )?;

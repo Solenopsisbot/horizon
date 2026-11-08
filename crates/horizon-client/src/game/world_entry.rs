@@ -249,11 +249,14 @@ impl Game<'_> {
         let mut items = Items::load(root, self.pack.assets.registry, self.res.facts(), &overlay)?;
         // Item damage predicates use the same frozen registry as player hurt.
         Arc::make_mut(&mut items.enchantments).bind_damage_catalog(&health.damage);
-        // The recipe tables, the stations and the recipe book read one folder:
-        // hold its files so it is read once.
-        let _recipe_files = horizon_client::json_folder::read(&root.join("data/minecraft/recipe"));
-        let recipes = Recipes::load(root, &items, &overlay)?;
-        let stations = horizon_client::stations::StationData::load(root, &items, &overlay);
+        let recipe_sources = Recipes::sources(root, &overlay)?;
+        let recipes = Recipes::from_source_refs(root, &items, &overlay, &recipe_sources)?;
+        let stations = horizon_client::stations::StationData::load_with_sources(
+            root,
+            &items,
+            &overlay,
+            &recipe_sources,
+        );
         let mut data_map_types = Vec::new();
         self.native_data_map_types(&mut data_map_types);
         let data_maps = native_data_maps::DataMaps::load(

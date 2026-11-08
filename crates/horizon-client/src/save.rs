@@ -51,6 +51,32 @@ use std::{
 
 pub const VERSION_NAME: &str = horizon_core::VANILLA_VERSION;
 
+/// Index the first entry for each position while preserving the `find` semantics
+/// used by save overlays. Loaded chunks can contain repeated positions in their
+/// retained side tables; the first one is the one vanilla-compatible save code
+/// has always selected.
+fn first_position_indices<T>(
+    entries: &[((i32, i32, i32), T)],
+) -> crate::fast_hash::FxHashMap<(i32, i32, i32), usize> {
+    let mut indices = crate::fast_hash::FxHashMap::default();
+    indices.reserve(entries.len());
+    for (index, (position, _)) in entries.iter().enumerate() {
+        indices.entry(*position).or_insert(index);
+    }
+    indices
+}
+
+fn first_rolled_loot_indices(
+    entries: &[crate::chunk::RolledLoot],
+) -> crate::fast_hash::FxHashMap<(i32, i32, i32), usize> {
+    let mut indices = crate::fast_hash::FxHashMap::default();
+    indices.reserve(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        indices.entry(entry.pos).or_insert(index);
+    }
+    indices
+}
+
 mod gateway;
 #[cfg(test)]
 mod loot_tests;
@@ -1470,6 +1496,26 @@ pub fn encode_with(
             .state(chunk.block(p.0 & 15, p.1, p.2 & 15))
             .map_or_else(String::new, |s| s.name.clone())
     };
+    let block_name_indices = if chunk.block_entities.is_empty() {
+        None
+    } else {
+        Some(first_position_indices(&chunk.block_names))
+    };
+    let (source_indices, attachment_indices, rolled_loot_indices) =
+        if chunk.block_entities.is_empty() {
+            (None, None, None)
+        } else {
+            extras.map_or_else(
+                || (None, None, None),
+                |extras| {
+                    (
+                        Some(first_position_indices(&extras.block_entity_sources)),
+                        Some(first_position_indices(&extras.block_entity_attachments)),
+                        Some(first_rolled_loot_indices(&extras.rolled_loot)),
+                    )
+                },
+            )
+        };
     let mut block_entities: Vec<Tag> = chunk
         .block_entities
         .iter()
@@ -1479,14 +1525,22 @@ pub fn encode_with(
         .map(|(p, e)| {
             let block = block_name(p);
             let mut current = encode_block_entity(*p, e, &block);
-            if let Some((_, name)) = chunk.block_names.iter().find(|(q, _)| q == p)
+            if let Some(&name_index) = block_name_indices.as_ref().and_then(|i| i.get(p))
                 && let Tag::Compound(map) = &mut current
             {
+<<<<<<< HEAD
                 map.insert("CustomName".into(), name.clone());
+=======
+                map.insert(
+                    "CustomName".into(),
+                    chunk.block_names[name_index].1.clone(),
+                );
+>>>>>>> d1a50a813d (perf: remove repeated startup and hot-path work)
             }
-            let source = extras
-                .and_then(|x| x.block_entity_sources.iter().find(|(q, _)| q == p))
-                .map(|(_, tag)| tag)
+            let source = source_indices
+                .as_ref()
+                .and_then(|indices| indices.get(p))
+                .and_then(|&index| extras.map(|x| &x.block_entity_sources[index].1))
                 .filter(|tag| {
                     crate::block_entity_nbt::id(tag) == crate::block_entity_nbt::id(&current)
                 });
@@ -1519,8 +1573,10 @@ pub fn encode_with(
                 None => current,
             };
             let mut saved = crate::block_entity_nbt::canonical(&merged).unwrap_or(merged);
-            if let Some((_, attachments)) =
-                extras.and_then(|e| e.block_entity_attachments.iter().find(|(pos, _)| pos == p))
+            if let Some(attachments) = attachment_indices
+                .as_ref()
+                .and_then(|indices| indices.get(p))
+                .and_then(|&index| extras.map(|e| &e.block_entity_attachments[index].1))
                 && let Tag::Compound(map) = &mut saved
                 && attachment_compound(map.get(&ATTACHMENTS_KEY.into())).is_ok()
             {
@@ -1531,7 +1587,10 @@ pub fn encode_with(
                     map.insert(ATTACHMENTS_KEY.into(), Tag::Compound(data));
                 }
             }
-            if let Some(r) = extras.and_then(|x| x.rolled_loot.iter().find(|r| r.pos == *p))
+            if let Some(r) = rolled_loot_indices
+                .as_ref()
+                .and_then(|indices| indices.get(p))
+                .and_then(|&index| extras.map(|x| &x.rolled_loot[index]))
                 && let Tag::Compound(map) = &mut saved
                 && !r.restore(map)
             {

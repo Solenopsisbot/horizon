@@ -1459,7 +1459,25 @@ impl BlockEntityRenderer {
         registry: &BlockRegistry,
         visibility: FaceVisibility,
     ) -> Result<Self> {
-        let all: Value = serde_json::from_slice(&std::fs::read(root.join("entity-models.json"))?)?;
+        Self::load_with_visibility_and_data(root, registry, visibility, None, None)
+    }
+    /// Load block-entity renderers while reusing startup's parsed model and
+    /// item-default documents. `None` keeps the standalone loader behavior.
+    pub fn load_with_visibility_and_data(
+        root: &Path,
+        registry: &BlockRegistry,
+        visibility: FaceVisibility,
+        entity_models: Option<&Value>,
+        item_defaults: Option<&horizon_world::item_defaults::Defaults>,
+    ) -> Result<Self> {
+        let owned_models;
+        let all = if let Some(entity_models) = entity_models {
+            entity_models
+        } else {
+            owned_models =
+                serde_json::from_slice(&std::fs::read(root.join("entity-models.json"))?)?;
+            &owned_models
+        };
         let models = MODELS
             .iter()
             .filter_map(|(key, layer)| all.get(*layer).map(|v| (*key, ModelPart::parse(v))))
@@ -1469,12 +1487,18 @@ impl BlockEntityRenderer {
         // The packs' custom entity models (`.jem` files), before anything draws.
         renderer.set_shapes(renderer.shapes_for(root));
         // Sherd items: provides_pottery_pattern -> decorated_pot_pattern asset id.
-        let items = match horizon_world::item_defaults::read(root) {
-            Ok(items) => items,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
-            Err(e) => return Err(e.into()),
+        let owned_items;
+        let items = if let Some(item_defaults) = item_defaults {
+            item_defaults
+        } else {
+            owned_items = match horizon_world::item_defaults::read(root) {
+                Ok(items) => items,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+                Err(e) => return Err(e.into()),
+            };
+            &owned_items
         };
-        for (item, components) in &items {
+        for (item, components) in items {
             let Some(pattern) = components["minecraft:provides_pottery_pattern"].as_str() else {
                 continue;
             };

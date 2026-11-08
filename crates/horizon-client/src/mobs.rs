@@ -538,24 +538,25 @@ impl MobTypes {
         };
         // The Allay's InventoryCarrier loading needs item limits before a
         // Game exists. Other mob-only resource sets need no item data.
-        let items: HashMap<String, Value> = if types.get("minecraft:allay").is_some() {
-            serde_json::from_slice(&fs::read(root.join("items.json"))?)?
+        let items = if types.get("minecraft:allay").is_some() {
+            Some(horizon_world::item_defaults::shared(root)?)
         } else {
-            HashMap::new()
+            None
         };
-        let item_stack_limits: Arc<HashMap<String, u32>> = Arc::new(
-            items
-                .into_iter()
+        let item_stack_limits: Arc<HashMap<String, u32>> = Arc::new(match items {
+            Some(items) => items
+                .iter()
                 .map(|(id, components)| {
                     (
-                        id,
+                        id.clone(),
                         components["minecraft:max_stack_size"]
                             .as_u64()
                             .unwrap_or(64) as u32,
                     )
                 })
                 .collect(),
-        );
+            None => HashMap::new(),
+        });
         let mut out = HashMap::new();
         // A content mod's living type (its row names a vanilla `template`) is
         // its template's mob under its own id: the template's model, sounds
@@ -2897,24 +2898,36 @@ pub fn apply_mob_pushes(m: &mut Mob, pending: &mut PendingPushes) {
 /// index `from` on), at once: vanilla sets them on the other entity during
 /// the tick, before the mobs after it tick.
 pub fn apply_brain_events(mobs: &mut [Mob], events: &mut Vec<MobEvent>, from: usize) {
+    apply_brain_events_indexed(mobs, events, from, None);
+}
+
+/// As [`apply_brain_events`], using the tick's already-built id-to-slot index
+/// where it is available. Events can refer to mobs spawned during the pass, so
+/// the helper retains a linear fallback for ids absent from that snapshot.
+pub fn apply_brain_events_indexed(
+    mobs: &mut [Mob],
+    events: &mut Vec<MobEvent>,
+    from: usize,
+    index: Option<&crate::fast_hash::FxHashMap<u32, u32>>,
+) {
     let mut i = from;
     while i < events.len() {
         match events[i] {
             MobEvent::BreedTarget { mob, partner } => {
-                if let Some(m) = mobs.iter_mut().find(|m| m.id == mob) {
+                if let Some(m) = find_mob_mut(mobs, index, mob) {
                     animal_brain::set_breed_partner(m, partner);
                 }
                 events.remove(i);
             }
             MobEvent::LockGaze { mob, partner } => {
-                if let Some(m) = mobs.iter_mut().find(|m| m.id == mob) {
+                if let Some(m) = find_mob_mut(mobs, index, mob) {
                     animal_brain::lock_gaze(m, partner);
                     villager_brain::lock_gaze_half(m, Who::Mob(partner));
                 }
                 events.remove(i);
             }
             MobEvent::Retreat { mob, from, at } => {
-                if let Some(m) = mobs.iter_mut().find(|m| m.id == mob) {
+                if let Some(m) = find_mob_mut(mobs, index, mob) {
                     piglin::receive_retreat(m, from, at);
                 }
                 events.remove(i);
@@ -2928,7 +2941,7 @@ pub fn apply_brain_events(mobs: &mut [Mob], events: &mut Vec<MobEvent>, from: us
                 events.remove(i);
             }
             MobEvent::SchoolSize { leader, by } => {
-                if let Some(m) = mobs.iter_mut().find(|m| m.id == leader) {
+                if let Some(m) = find_mob_mut(mobs, index, leader) {
                     m.extra.followers += by;
                 }
                 events.remove(i);
@@ -2938,7 +2951,7 @@ pub fn apply_brain_events(mobs: &mut [Mob], events: &mut Vec<MobEvent>, from: us
             MobEvent::Breed {
                 parent, partner, ..
             } => {
-                if let Some(m) = mobs.iter_mut().find(|m| m.id == partner) {
+                if let Some(m) = find_mob_mut(mobs, index, partner) {
                     m.extra.age = 6000;
                     m.extra.in_love = 0;
                     animal_brain::forget_breed_target(m, parent);
@@ -2958,9 +2971,7 @@ pub fn apply_brain_events(mobs: &mut [Mob], events: &mut Vec<MobEvent>, from: us
             } => {
                 let mut sound = None;
                 let mut raised = Vec::new();
-                let (aim, fish_pos, fish_silent) = mobs
-                    .iter()
-                    .find(|m| m.id == mob)
+                let (aim, fish_pos, fish_silent) = find_mob(mobs, index, mob)
                     .map(|m| {
                         (
                             Aim {
@@ -2974,7 +2985,7 @@ pub fn apply_brain_events(mobs: &mut [Mob], events: &mut Vec<MobEvent>, from: us
                     })
                     .map(|(aim, pos, silent)| (Some(aim), Some(pos), silent))
                     .unwrap_or((None, None, true));
-                if let Some(t) = mobs.iter_mut().find(|m| m.id == target)
+                if let Some(t) = find_mob_mut(mobs, index, target)
                     && t.damage_aimed(amount, source, aim)
                 {
                     t.add_effect("minecraft:poison", poison_ticks, 0);
@@ -2996,6 +3007,34 @@ pub fn apply_brain_events(mobs: &mut [Mob], events: &mut Vec<MobEvent>, from: us
             _ => i += 1,
         }
     }
+}
+
+fn find_mob<'a>(
+    mobs: &'a [Mob],
+    index: Option<&crate::fast_hash::FxHashMap<u32, u32>>,
+    id: u32,
+) -> Option<&'a Mob> {
+    if let Some(&slot) = index.and_then(|index| index.get(&id))
+        && let Some(m) = mobs.get(slot as usize)
+        && m.id == id
+    {
+        return Some(m);
+    }
+    mobs.iter().find(|m| m.id == id)
+}
+
+fn find_mob_mut<'a>(
+    mobs: &'a mut [Mob],
+    index: Option<&crate::fast_hash::FxHashMap<u32, u32>>,
+    id: u32,
+) -> Option<&'a mut Mob> {
+    if let Some(&slot) = index.and_then(|index| index.get(&id)) {
+        let slot = slot as usize;
+        if slot < mobs.len() && mobs[slot].id == id {
+            return Some(&mut mobs[slot]);
+        }
+    }
+    mobs.iter_mut().find(|m| m.id == id)
 }
 /// The player as mobs see it.
 #[derive(Clone, Debug)]
@@ -4582,7 +4621,7 @@ impl EntityModelDocument {
     }
 
     /// The parsed document, for loaders that read several keys from it.
-    pub(crate) fn value(&self) -> &Value {
+    pub fn value(&self) -> &Value {
         &self.0
     }
 }

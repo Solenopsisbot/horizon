@@ -309,8 +309,8 @@ impl Enchantments {
             .map(|(i, e)| (e.id.clone(), i))
             .collect();
         let mut props = HashMap::new();
-        if let Ok(raw) = horizon_world::item_defaults::read(root) {
-            for (id, c) in raw {
+        if let Ok(raw) = horizon_world::item_defaults::shared(root) {
+            for (id, c) in raw.iter() {
                 props.insert(
                     Arc::from(id.as_str()),
                     ItemProps {

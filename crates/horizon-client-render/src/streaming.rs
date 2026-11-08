@@ -2094,18 +2094,24 @@ impl Streaming {
             candidates.push((self.distance(x, z), x, z, sections));
         }
         // Nearest first, and only as many sections as the workers can chew.
-        // Every ready column used to be submitted at once, so at a wide
-        // render distance the queue — and `meshing`, and each job's 3x3
-        // region snapshot — grew with the number of loaded columns and the
-        // jobs went stale long before a worker reached them (#3629). What
-        // stays dirty is asked for again, from the current centre, as
-        // capacity frees; `requeue` then has a small queue to keep close.
+        // The budget is in sections, while candidates are columns: selecting
+        // whole columns lets a tall column exceed it by every other dirty
+        // section in the column. Keep the unsubmitted section bits dirty so
+        // the next update chooses them again from the current centre.
         let room = (self.workers * 32).saturating_sub(self.meshing.len());
-        nearest_first(&mut candidates, room);
+        candidates.sort_unstable();
+        let mut submitted = 0;
         for (_, x, z, sections) in candidates {
+            if submitted == room {
+                break;
+            }
             let Some(region) = Self::region(world, x, z) else {
                 continue;
             };
+            let (sections, deferred) = take_sections(sections, room - submitted);
+            if sections.is_empty() {
+                continue;
+            }
             world.dirty_sections.take_column(x, z);
             for sy in sections.iter().map(|sy| sy as i32) {
                 let first = self.meshed.insert((x, z));
@@ -2136,6 +2142,12 @@ impl Streaming {
                     ),
                 );
             }
+            if !deferred.is_empty() {
+                for sy in deferred.iter().map(|sy| sy as i32) {
+                    world.dirty_sections.insert((x, sy, z));
+                }
+            }
+            submitted += sections.len();
         }
         self.cover_current = false;
         (uploads, removed)
@@ -3043,6 +3055,15 @@ fn nearest_first<T: Ord>(candidates: &mut Vec<T>, room: usize) {
     }
     candidates.sort_unstable();
 }
+
+/// Take the lowest section indexes that fit in `room`, returning the bits that
+/// must remain dirty for a later mesh pass. Keeping this operation on the mask
+/// (rather than truncating columns) makes the scheduler's section budget exact.
+fn take_sections(mask: SectionMask, room: usize) -> (SectionMask, SectionMask) {
+    let selected: SectionMask = mask.iter().take(room).collect();
+    (selected, mask & !selected)
+}
+
 /// What `keep_unchanged_sections` found changed.
 #[derive(Debug, Default, PartialEq)]
 struct Resent {
@@ -3624,6 +3645,19 @@ mod tests {
         let mut past = expected.clone();
         nearest_first(&mut past, expected.len() + 10);
         assert_eq!(past, expected);
+    }
+
+    #[test]
+    fn mesh_section_budget_splits_a_tall_column() {
+        let mask: SectionMask = [0, 1, 7, 23, 24].into_iter().collect();
+        let (selected, deferred) = take_sections(mask, 3);
+        assert_eq!(selected.iter().collect::<Vec<_>>(), [0, 1, 7]);
+        assert_eq!(deferred.iter().collect::<Vec<_>>(), [23, 24]);
+        assert_eq!(selected.len() + deferred.len(), mask.len());
+
+        let (all, none) = take_sections(mask, usize::MAX);
+        assert_eq!(all, mask);
+        assert!(none.is_empty());
     }
 
     /// What the scheduler counts as ready to light: every neighbour a

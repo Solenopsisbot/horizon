@@ -92,8 +92,8 @@ impl Banners {
             });
         }
         banners.no_item_required = read_tag(root, "no_item_required", 0);
-        if let Ok(raw) = horizon_world::item_defaults::read(root) {
-            for (item, c) in raw {
+        if let Ok(raw) = horizon_world::item_defaults::shared(root) {
+            for (item, c) in raw.iter() {
                 let id: Arc<str> = Arc::from(item.as_str());
                 if let Some(dye) = c["minecraft:dye"].as_str() {
                     banners.dyes.insert(id.clone(), Arc::from(dye));

@@ -48,12 +48,19 @@ const COPPER_GOLEM_LAYERS: [(&str, &str); 4] = [
     ("copper_golem_star", "minecraft:copper_golem_star#main"),
 ];
 
-pub(super) fn load_parts(root: &Path) -> HashMap<String, ModelPart> {
-    let Ok(all) = std::fs::read(root.join("entity-models.json"))
-        .map_err(|_| ())
-        .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|_| ()))
-    else {
-        return HashMap::new();
+pub(super) fn load_parts(root: &Path, document: Option<&Value>) -> HashMap<String, ModelPart> {
+    let owned;
+    let all = if let Some(document) = document {
+        document
+    } else {
+        let Ok(value) = std::fs::read(root.join("entity-models.json"))
+            .map_err(|_| ())
+            .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|_| ()))
+        else {
+            return HashMap::new();
+        };
+        owned = value;
+        &owned
     };
     LAYERS
         .iter()

@@ -25,7 +25,16 @@ impl SpriteAnimation {
     /// Material categories follow the selected colour frame, without colour interpolation.
     pub(crate) fn material_pixels(&self, kind: usize, tick: u64) -> Option<&[u8]> {
         let frames = self.materials[kind].as_ref()?;
-        Some(&frames[self.frame(tick) % frames.len()])
+        Some(&frames[self.material_frame(kind, tick)?])
+    }
+    /// The discrete material frame selected at `tick`.
+    ///
+    /// Material maps deliberately follow the selected colour frame without
+    /// interpolation. Keeping the index separate lets the renderer avoid
+    /// rebuilding a material map when only the interpolated colour changes.
+    pub(crate) fn material_frame(&self, kind: usize, tick: u64) -> Option<usize> {
+        let frames = self.materials[kind].as_ref()?;
+        Some(self.frame(tick) % frames.len())
     }
     pub fn frame(&self, tick: u64) -> usize {
         self.clip.sample(tick).frame as usize

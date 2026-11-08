@@ -17617,6 +17617,7 @@ fn load_world_rest(
     behaviour_json: &serde_json::Value,
     gameplay_projection: &[horizon_client::blocks::GameplayProjection],
     entity_models: Option<&horizon_client::mobs::EntityModelDocument>,
+    item_defaults: &horizon_world::item_defaults::Defaults,
     visibility: horizon_world::block_render::FaceVisibility,
     progress: &Progress,
     started: Instant,
@@ -17636,12 +17637,17 @@ fn load_world_rest(
         let items = startup::time("rest.items", || Items::load(root, registry, facts, overlay))?;
         log::info!("load items: {:.2}s", started.elapsed().as_secs_f32());
         progress.set(7);
-        // The recipe tables, the stations and the recipe book read one folder:
-        // hold its files so it is read once.
-        let _recipe_files = horizon_client::json_folder::read(&root.join("data/minecraft/recipe"));
-        let recipes = startup::time("rest.recipes", || Recipes::load(root, &items, overlay))?;
+        let recipe_sources = Recipes::sources(root, overlay)?;
+        let recipes = startup::time("rest.recipes", || {
+            Recipes::from_source_refs(root, &items, overlay, &recipe_sources)
+        })?;
         let stations = startup::time("rest.stations", || {
-            horizon_client::stations::StationData::load(root, &items, overlay)
+            horizon_client::stations::StationData::load_with_sources(
+                root,
+                &items,
+                overlay,
+                &recipe_sources,
+            )
         });
         Ok((items, recipes, stations))
     };
@@ -17655,7 +17661,13 @@ fn load_world_rest(
         if !draws {
             return Ok(Default::default());
         }
-        let mut renderer = BlockEntityRenderer::load_with_visibility(root, registry, visibility)?;
+        let mut renderer = BlockEntityRenderer::load_with_visibility_and_data(
+            root,
+            registry,
+            visibility,
+            entity_models.map(|document| document.value()),
+            Some(item_defaults),
+        )?;
         renderer.add_mod_signs(facts, registry);
         Ok(renderer)
     };

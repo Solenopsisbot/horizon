@@ -113,7 +113,9 @@ impl SamplerContext {
     /// Cached scalar/volume results and world bindings must not cross chunks or
     /// graphs, whose cache IDs can refer to different functions.
     pub fn reset(&mut self) {
-        self.caches = self.caches.as_ref().map(|_| Vec::new());
+        if let Some(caches) = &mut self.caches {
+            caches.iter_mut().for_each(cache::CacheCell::reset);
+        }
         self.fields = WorldFields::default();
         if let Some(planes) = &mut self.planes {
             planes.clear();
@@ -122,6 +124,14 @@ impl SamplerContext {
     /// Release retained storage between worlds or after unusually large work.
     pub fn clear_scratch(&mut self) {
         self.scratch.clear();
+    }
+
+    #[cfg(test)]
+    fn cache_capacity(&self, id: usize) -> Option<usize> {
+        self.caches
+            .as_ref()
+            .and_then(|caches| caches.get(id))
+            .map(cache::CacheCell::capacity)
     }
 }
 

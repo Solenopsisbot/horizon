@@ -1453,7 +1453,7 @@ impl Recipes {
 
     pub fn load(root: &Path, items: &Items, overlay: &PackOverlay) -> Result<Self> {
         let sources = Self::sources(root, overlay)?;
-        Self::from_sources(root, items, overlay, sources)
+        Self::from_source_refs(root, items, overlay, &sources)
     }
     /// The recipe files the tables are built from, each id once: vanilla's by
     /// bare name, then the content mods' as `<ns>:<name>`, the world's packs'
@@ -1536,24 +1536,36 @@ impl Recipes {
         root: &Path,
         items: &Items,
         overlay: &PackOverlay,
-        mut sources: Vec<(String, Value)>,
+        sources: Vec<(String, Value)>,
+    ) -> Result<Self> {
+        Self::from_source_refs(root, items, overlay, &sources)
+    }
+    /// Build the crafting tables from an already parsed, filtered recipe
+    /// source. The same source can be passed to stations and the recipe book,
+    /// avoiding three JSON parses during startup.
+    pub fn from_source_refs(
+        root: &Path,
+        items: &Items,
+        overlay: &PackOverlay,
+        sources: &[(String, Value)],
     ) -> Result<Self> {
         // Every table in registration order, whatever order the sources come
         // in (the world's packs' files after the game's own).
-        sources.sort_by_cached_key(|(name, _)| registration_key(name));
+        let mut order: Vec<_> = sources.iter().collect();
+        order.sort_by_cached_key(|(name, _)| registration_key(name));
         let mut crafting = Vec::new();
         let mut cooking = Vec::new();
         let mut custom: HashMap<String, Vec<CustomRecipe>> = HashMap::new();
         let mut meta = HashMap::new();
-        for (name, v) in sources {
+        for (name, v) in order {
             if let Some(kind) = custom_type(&v) {
                 let id = if name.contains(':') {
-                    name
+                    name.to_owned()
                 } else {
                     format!("minecraft:{name}")
                 };
                 let kind = kind.to_owned();
-                let json = Arc::new(v);
+                let json = Arc::new(v.clone());
                 custom
                     .entry(kind)
                     .or_default()
@@ -1561,7 +1573,7 @@ impl Recipes {
                 continue;
             }
             let text = |k: &str| v[k].as_str().unwrap_or("").to_owned();
-            meta.insert(name.clone(), (text("category"), text("group")));
+            meta.insert(name.to_owned(), (text("category"), text("group")));
             let ing = |k: &str| Ingredient::parse(&v[k], items);
             let result = || Template::parse(&v["result"]);
             let special = |recipe: Option<Special>| recipe.map(Recipe::Special);
@@ -1723,7 +1735,7 @@ impl Recipes {
                 | "minecraft:campfire_cooking") => {
                     if let (Some(ingredient), Some(result)) = (ing("ingredient"), result()) {
                         cooking.push(Cooking {
-                            id: name.clone(),
+                            id: name.to_owned(),
                             category: text("category"),
                             group: text("group"),
                             kind: kind.to_owned(),
@@ -1738,7 +1750,7 @@ impl Recipes {
                 _ => None,
             };
             if let Some(recipe) = parsed {
-                crafting.push((name, recipe));
+                crafting.push((name.to_owned(), recipe));
             }
         }
         let facts = items

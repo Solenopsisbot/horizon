@@ -26,13 +26,23 @@ pub struct StationData {
 }
 impl StationData {
     pub fn load(root: &Path, items: &Items, overlay: &PackOverlay) -> Self {
+        let sources = crate::crafting::Recipes::sources(root, overlay).unwrap_or_default();
+        Self::load_with_sources(root, items, overlay, &sources)
+    }
+    /// Load all workstation data using the already parsed recipe source.
+    pub fn load_with_sources(
+        root: &Path,
+        items: &Items,
+        overlay: &PackOverlay,
+        sources: &[(String, Value)],
+    ) -> Self {
         Self {
             enchantments: std::sync::Arc::clone(&items.enchantments),
-            recipes: StationRecipes::load(root, items, overlay),
+            recipes: StationRecipes::load_from_sources(root, items, sources),
             brewing: crate::brewing::Brewing::load(root, items, overlay),
             trades: crate::merchant::Trades::load(root, overlay),
             banners: crate::banner::Banners::load(root),
-            recipe_index: crate::recipe_book::RecipeIndex::load(root, overlay),
+            recipe_index: crate::recipe_book::RecipeIndex::load_from_sources(sources),
         }
     }
 }
@@ -693,52 +703,15 @@ fn ingredient(v: &Value, items: &Items) -> Ingredient {
 }
 impl StationRecipes {
     pub fn load(root: &Path, items: &Items, overlay: &PackOverlay) -> Self {
-        // Vanilla's recipes, then the content mods' (docs/modpacks.md).
-        let mut files = Vec::new();
-        let namespaces =
-            std::iter::once("minecraft".to_owned()).chain(crate::mod_content::namespaces(root));
-        // NeoForge's load conditions: a file whose don't hold is silently
-        // absent (`mod_loaded` asks which mods' data is in this root).
-        let mods: Vec<String> = {
-            let mut mods = horizon_items::content_namespaces::mod_ids(root);
-            if !mods.iter().any(|m| m == "minecraft") {
-                mods.push("minecraft".to_owned());
-            }
-            mods
-        };
-        let conditions_hold = |v: &Value| {
-            horizon_world::conditions::conditions_hold(v, &|id: &str| mods.iter().any(|m| m == id))
-        };
-        for namespace in namespaces {
-            let dir = root.join(format!("data/{namespace}/recipe"));
-            if let Ok(folder) = crate::json_folder::read(&dir) {
-                files.push((namespace, folder));
-            }
-        }
-        let mut sources: Vec<(String, Value)> = files
+        let sources = crate::crafting::Recipes::sources(root, overlay).unwrap_or_default();
+        Self::load_from_sources(root, items, &sources)
+    }
+    /// Build workstation recipes from the shared parsed recipe source.
+    pub fn load_from_sources(root: &Path, items: &Items, sources: &[(String, Value)]) -> Self {
+        let mut sources: Vec<(String, &Value)> = sources
             .iter()
-            .flat_map(|(namespace, folder)| folder.files.iter().map(move |f| (namespace, f)))
-            .filter_map(|(namespace, file)| {
-                let v = serde_json::from_slice::<Value>(file.bytes().ok()?).ok()?;
-                Some((format!("{namespace}:{}", file.name), v))
-            })
+            .map(|(id, value)| (crate::crafting::recipe_id(id), value))
             .collect();
-        // The world's packs' recipes over the game's own: the top pack's
-        // file for each id replaces it (`SimpleJsonResourceReloadListener`).
-        // The gate answers the merged file, as the crafting loader's does:
-        // a false-conditioned pack file leaves the lower one gone too.
-        for (id, files) in overlay.kind("recipe") {
-            let Ok(v) = serde_json::from_slice::<Value>(PackOverlay::top(files)) else {
-                continue;
-            };
-            match sources.iter_mut().find(|(n, _)| n == id) {
-                Some(slot) => slot.1 = v,
-                None => sources.push((id.to_owned(), v)),
-            }
-        }
-        // The data's recipe filters, over the final set.
-        let filters = horizon_items::recipe_filters::RecipeFilters::load(root, overlay);
-        sources.retain_mut(|(id, v)| conditions_hold(v) && filters.apply(id, v));
         // Registration order, not the game's files before the packs': the
         // stonecutter lists its recipes in it and smithing takes the first match.
         sources.sort_by_cached_key(|(id, _)| crate::crafting::registration_key(id));

@@ -20,6 +20,26 @@ impl Default for CacheCell {
         }
     }
 }
+impl CacheCell {
+    /// Invalidate cached values while retaining the sample buffer's capacity.
+    ///
+    /// Density graphs are rebuilt for each chunk, so cache IDs cannot retain
+    /// any value or volume across a reset. The buffers are comparatively large
+    /// and reused by the next chunk, however; clearing the length keeps their
+    /// allocation available without exposing stale samples.
+    pub(super) fn reset(&mut self) {
+        self.volume = None;
+        self.buffer.clear();
+        self.value_key = 0;
+        self.value = f32::NAN;
+        self.active = false;
+    }
+
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
+}
 impl SamplerContext {
     /// Cache cells belong to this evaluation context, never to shared samplers.
     pub fn cached() -> Self {
@@ -46,7 +66,7 @@ impl SamplerContext {
     }
     pub fn clear_caches(&mut self) {
         if let Some(caches) = &mut self.caches {
-            caches.clear();
+            caches.iter_mut().for_each(CacheCell::reset);
         }
     }
     fn prepare_cache(&mut self, id: usize) -> Result<bool, SampleError> {

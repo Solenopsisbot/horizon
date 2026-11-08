@@ -723,6 +723,11 @@ impl RecipeIndex {
     /// Reads vanilla and content namespaces' recipes under `root`, with
     /// the world's packs' recipe files over them (`overlay`).
     pub fn load(root: &std::path::Path, overlay: &PackOverlay) -> Self {
+        let sources = crate::crafting::Recipes::sources(root, overlay).unwrap_or_default();
+        Self::load_from_sources(&sources)
+    }
+    /// Build the recipe-book index from the shared parsed recipe source.
+    pub fn load_from_sources(sources: &[(String, serde_json::Value)]) -> Self {
         let mut recipes = std::collections::BTreeMap::new();
         let mut insert = |id: String, v: &serde_json::Value| {
             let kind = v["type"].as_str().unwrap_or_default();
@@ -758,61 +763,8 @@ impl RecipeIndex {
                 },
             );
         };
-        let dir = root.join("data/minecraft/recipe");
-        // NeoForge's load conditions: the book lists only what loaded; a
-        // recipe gated on an absent mod isn't in the manager either.
-        let mods: Vec<String> = {
-            let mut mods = horizon_items::content_namespaces::mod_ids(root);
-            if !mods.iter().any(|m| m == "minecraft") {
-                mods.push("minecraft".to_owned());
-            }
-            mods
-        };
-        let conditions_hold = |v: &serde_json::Value| {
-            horizon_world::conditions::conditions_hold(v, &|id: &str| mods.iter().any(|m| m == id))
-        };
-        // The whole folder, `brewing/` under it too, in id order
-        // (`SimpleJsonResourceReloadListener` walks it recursively): a
-        // subfolder's recipe keeps it in its id, `minecraft:brewing/<name>`.
-        // The packs' files replace first and the gate answers the merged
-        // file, as the crafting loader's does: a false-conditioned pack
-        // file leaves the lower one gone too.
-        let folder = crate::json_folder::read(&dir).ok();
-        let mut sources: Vec<(String, serde_json::Value)> = folder
-            .iter()
-            .flat_map(|folder| &folder.files)
-            .filter_map(|file| {
-                let v = serde_json::from_slice::<serde_json::Value>(file.bytes().ok()?).ok()?;
-                Some((format!("minecraft:{}", file.name), v))
-            })
-            .collect();
-        for namespace in crate::mod_content::namespaces(root) {
-            if namespace == "minecraft" {
-                continue;
-            }
-            if let Ok(folder) =
-                crate::json_folder::read(&root.join(format!("data/{namespace}/recipe")))
-            {
-                sources.extend(folder.files.iter().filter_map(|file| {
-                    let v = serde_json::from_slice::<serde_json::Value>(file.bytes().ok()?).ok()?;
-                    Some((format!("{namespace}:{}", file.name), v))
-                }));
-            }
-        }
-        for (id, files) in overlay.kind("recipe") {
-            match serde_json::from_slice::<serde_json::Value>(PackOverlay::top(files)) {
-                Ok(v) => match sources.iter_mut().find(|(n, _)| n == id) {
-                    Some(slot) => slot.1 = v,
-                    None => sources.push((id.to_owned(), v)),
-                },
-                Err(e) => log::warn!("Horizon: pack recipe {id} not shown in the book: {e}"),
-            }
-        }
-        let filters = horizon_items::recipe_filters::RecipeFilters::load(root, overlay);
-        for (id, mut v) in sources {
-            if conditions_hold(&v) && filters.apply(&id, &mut v) {
-                insert(id, &v);
-            }
+        for (id, v) in sources {
+            insert(crate::crafting::recipe_id(id), v);
         }
         // RecipeManager.unpackRecipeInfo numbers the displays in registration
         // order (path, then namespace), not in the order of the ids' text.

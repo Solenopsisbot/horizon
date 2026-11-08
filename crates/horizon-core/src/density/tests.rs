@@ -802,11 +802,13 @@ fn reset_retains_scratch_but_discards_graph_caches_and_world_bindings() {
             Ok(())
         })
         .unwrap();
+    let cache_capacity = context.cache_capacity(0).unwrap();
     let allocation = context.scratch[0].as_ptr();
     let capacity = context.scratch[0].capacity();
     context.reset();
     assert!(lifetime.upgrade().is_none());
-    assert!(context.caches.as_ref().unwrap().is_empty());
+    assert_eq!(context.caches.as_ref().unwrap().len(), 16);
+    assert_eq!(context.cache_capacity(0), Some(cache_capacity));
     assert_eq!(context.scratch[0].as_ptr(), allocation);
     assert_eq!(context.scratch[0].capacity(), capacity);
     // Same coordinates and cache ID must resolve the new context's fallback.

@@ -1364,6 +1364,12 @@ pub struct Renderer {
     lightmap_sampler: wgpu::Sampler,
     animations: animate::SpriteAnimator,
     material_animations: Vec<SpriteAnimation>,
+    /// Last discrete material frame uploaded for each material animation.
+    /// `None` means the first eligible frame has not been written yet.
+    material_shown: Vec<[Option<usize>; 2]>,
+    /// Material layers rewritten by the last animation pass. Diffuse layers
+    /// can change while their nearest-sampled material frame stays the same.
+    material_changed: Vec<u32>,
     active_animated_layers: Vec<u64>,
     uploads: upload::Uploads,
     /// Section meshes are staged through their own belt into
@@ -3447,7 +3453,7 @@ impl Renderer {
                 )
             })
             .collect();
-        let material_animations = animations
+        let material_animations: Vec<SpriteAnimation> = animations
             .iter()
             .filter(|a| a.has_materials())
             .cloned()
@@ -5039,6 +5045,8 @@ impl Renderer {
             lightmap_view,
             lightmap_sampler,
             animations,
+            material_shown: vec![[None; 2]; material_animations.len()],
+            material_changed: Vec::new(),
             material_animations,
             active_animated_layers: vec![0; active_layer_words],
             uploads,
@@ -7770,18 +7778,28 @@ impl Renderer {
             active,
             self.own_timing.as_mut(),
         );
+        self.material_changed.clear();
         if let Some(arrays) = &self.pbr_maps {
-            for animation in &self.material_animations {
+            for (index, animation) in self.material_animations.iter().enumerate() {
                 if !self.animations.changed().contains(&animation.layer) {
                     continue;
                 }
                 let Some(pair) = arrays.get((animation.layer / self.sprite_split) as usize) else {
                     continue;
                 };
+                let mut changed = false;
                 for kind in 0..2 {
                     let Some(pixels) = animation.material_pixels(kind, tick) else {
                         continue;
                     };
+                    let frame = animation
+                        .material_frame(kind, tick)
+                        .expect("material_pixels returned a frame");
+                    if self.material_shown[index][kind] == Some(frame) {
+                        continue;
+                    }
+                    self.material_shown[index][kind] = Some(frame);
+                    changed = true;
                     let texture = &pair[kind];
                     let from = (pixels.len() / 4).isqrt() as u32;
                     for level in 0..texture.mip_level_count() {
@@ -7805,6 +7823,9 @@ impl Renderer {
                         );
                     }
                 }
+                if changed {
+                    self.material_changed.push(animation.layer);
+                }
             }
             if let Some(atlases) = &self.pack_material_atlases {
                 for kind in 0..2 {
@@ -7813,7 +7834,7 @@ impl Renderer {
                         &self.device,
                         encoder,
                         &arrays,
-                        self.animations.changed().iter().copied(),
+                        self.material_changed.iter().copied(),
                     );
                 }
             }

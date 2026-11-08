@@ -38,6 +38,36 @@ pub enum PathType {
     BigMobsCloseToDanger,
 }
 pub const PATH_TYPES: usize = 27;
+/// Path types in their declaration order, matching Java's `EnumSet` iteration.
+const ALL_PATH_TYPES: [PathType; PATH_TYPES] = [
+    PathType::Blocked,
+    PathType::Open,
+    PathType::Walkable,
+    PathType::WalkableDoor,
+    PathType::Trapdoor,
+    PathType::PowderSnow,
+    PathType::OnTopOfPowderSnow,
+    PathType::Fence,
+    PathType::Lava,
+    PathType::Water,
+    PathType::WaterBorder,
+    PathType::Rail,
+    PathType::UnpassableRail,
+    PathType::FireInNeighbor,
+    PathType::Fire,
+    PathType::DamagingInNeighbor,
+    PathType::Damaging,
+    PathType::DoorOpen,
+    PathType::DoorWoodClosed,
+    PathType::DoorIronClosed,
+    PathType::Breach,
+    PathType::Leaves,
+    PathType::StickyHoney,
+    PathType::Cocoa,
+    PathType::DamageCautious,
+    PathType::OnTopOfTrapdoor,
+    PathType::BigMobsCloseToDanger,
+];
 impl PathType {
     pub fn from_name(name: &str) -> Self {
         match name {
@@ -555,8 +585,8 @@ impl<'a, 'w> Finder<'a, 'w> {
         }
         t
     }
-    fn within_bb(&self, x: i32, y: i32, z: i32) -> Vec<PathType> {
-        let mut out = Vec::with_capacity(4);
+    fn within_bb(&self, x: i32, y: i32, z: i32) -> u32 {
+        let mut out = 0u32;
         let mp = self.mob.block_position();
         for dx in 0..self.entity_width {
             for dy in 0..self.entity_height {
@@ -577,9 +607,7 @@ impl<'a, 'w> Finder<'a, 'w> {
                     {
                         t = PathType::UnpassableRail;
                     }
-                    if !out.contains(&t) {
-                        out.push(t);
-                    }
+                    out |= 1u32 << (t as u32);
                 }
             }
         }
@@ -590,28 +618,30 @@ impl<'a, 'w> Finder<'a, 'w> {
         if let Evaluator::Swim { .. } = self.eval {
             return self.swim_path_type(x, y, z);
         }
-        let mut types = self.within_bb(x, y, z);
+        let types = self.within_bb(x, y, z);
         // EnumSet iteration follows declaration order.
-        types.sort_by_key(|t| *t as u8);
-        if types.len() == 1 {
-            return types[0];
+        if types.count_ones() == 1 {
+            return ALL_PATH_TYPES[types.trailing_zeros() as usize];
         }
-        if types.contains(&PathType::Fence) {
+        if types & (1 << PathType::Fence as u32) != 0 {
             return PathType::Fence;
         }
-        if types.contains(&PathType::UnpassableRail) {
+        if types & (1 << PathType::UnpassableRail as u32) != 0 {
             return PathType::UnpassableRail;
         }
         let mut highest = PathType::Blocked;
         let mut highest_malus = self.malus(highest);
-        for t in &types {
-            let m = self.malus(*t);
+        for t in ALL_PATH_TYPES {
+            if types & (1 << t as u32) == 0 {
+                continue;
+            }
+            let m = self.malus(t);
             if m < 0.0 {
-                return *t;
+                return t;
             }
             if m >= highest_malus {
                 highest_malus = m;
-                highest = *t;
+                highest = t;
             }
         }
         let current = self.path_type(x, y, z);
