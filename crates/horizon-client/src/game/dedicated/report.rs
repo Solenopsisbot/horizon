@@ -9,6 +9,7 @@
 //! UUIDs or addresses, no seed and no world name. It runs beside the game: nothing restarts.
 use super::super::{Dim, Game, tick_profile};
 use horizon_client::{
+    lan::entity::tracking_stats,
     spans::{self, Span},
     streaming::job_stats,
 };
@@ -54,6 +55,7 @@ impl Recording {
         tick_profile::want_spans(tick_profile::SPANS_REPORT, true);
         job_stats::enable(true);
         job_stats::take();
+        tracking_stats::enable(true);
         tick_profile::take();
         Self {
             seconds,
@@ -358,12 +360,14 @@ impl Game<'_> {
         // Off unless `HORIZON_SPIKES` or a mod (`native_spans`) still wants them.
         tick_profile::want_spans(tick_profile::SPANS_REPORT, false);
         job_stats::enable(false);
+        tracking_stats::enable(false);
         let window_s = r.started.elapsed().as_secs_f64();
         let (ticks, spans, worst) = tick_summary(&r, window_s);
         let costs = tick_profile::take();
         let mob_samples = costs.iter().map(|c| c.mob_ticks).sum();
         let jobs = job_stats::take();
         let (max_queue_depth, stale_meshes) = job_stats::take_queue_stats();
+        let tracking = tracking_stats::take();
         let cpu = horizon_bench::cpu_seconds(std::process::id())
             .zip(r.cpu_s)
             .map(|(end, start)| round((end - start) / window_s.max(1e-9)));
@@ -382,6 +386,14 @@ impl Game<'_> {
             "chunk_queue": {
                 "max_depth": max_queue_depth,
                 "stale_meshes": stale_meshes,
+            },
+            "entity_tracking": {
+                "sees_checks": tracking.sees_checks,
+                "full_viewers": tracking.full_viewers,
+                "dense_viewers": tracking.dense_viewers,
+                "sparse_viewers": tracking.sparse_viewers,
+                "flag_bytes": tracking.flag_bytes,
+                "relation_checks": tracking.relation_checks,
             },
             "network": network(&r.wire_start, &self.wire_bytes(), window_s),
             "overhead": overhead(&r, mob_samples, span_ns, mob_ns),

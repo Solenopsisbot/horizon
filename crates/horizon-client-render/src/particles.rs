@@ -1296,6 +1296,18 @@ pub struct ParticleEngine {
     /// and cobweb models, resolved for the ground), one per model layer.
     pub item_sprites: HashMap<ParticleType, Vec<String>>,
 }
+
+/// CPU expansion pressure from one particle render pass.
+///
+/// This keeps the current vertex path unchanged while giving the GPU-instance
+/// prototype a stable baseline: the instance path should produce one compact
+/// record per quad instead of four [`Vertex`] values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParticleRenderStats {
+    pub quads: usize,
+    pub vertices: usize,
+    pub vertex_bytes: usize,
+}
 /// `ParticleGroup.MAX_PARTICLES` (per render group; one group here).
 const MAX_PARTICLES: usize = 16384;
 /// `ParticleLimit.SPORE_BLOSSOM`, the only limited particle.
@@ -4668,6 +4680,28 @@ impl ParticleEngine {
             light_at,
             out,
         );
+    }
+
+    /// Render through the compatibility vertex path and report the amount of
+    /// CPU-expanded geometry. This is intended for particle-instance
+    /// experiments and benchmarks; it does not alter rendering or simulation.
+    pub fn render_profiled(
+        &self,
+        camera: DVec3,
+        yaw: f32,
+        pitch: f32,
+        partial: f32,
+        light_at: &dyn Fn([i32; 3]) -> u8,
+        out: &mut Vec<Vertex>,
+    ) -> ParticleRenderStats {
+        let before = out.len();
+        self.render(camera, yaw, pitch, partial, light_at, out);
+        let vertices = out.len().saturating_sub(before);
+        ParticleRenderStats {
+            quads: vertices / 4,
+            vertices,
+            vertex_bytes: vertices * std::mem::size_of::<Vertex>(),
+        }
     }
 
     /// Render particles after rejecting view-frustum misses and any particles

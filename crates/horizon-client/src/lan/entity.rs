@@ -18,6 +18,95 @@ use horizon_protocol::{
 };
 use std::sync::Arc;
 
+/// Opt-in counters for comparing dense and sparse viewer tracking. The normal
+/// entity pass pays only the relaxed branch in `sees`; counters are enabled by
+/// the dedicated performance report and reset when it starts/finishes.
+pub mod tracking_stats {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static SEES_CHECKS: AtomicU64 = AtomicU64::new(0);
+    static FULL_VIEWERS: AtomicU64 = AtomicU64::new(0);
+    static DENSE_VIEWERS: AtomicU64 = AtomicU64::new(0);
+    static SPARSE_VIEWERS: AtomicU64 = AtomicU64::new(0);
+    static FLAG_BYTES: AtomicU64 = AtomicU64::new(0);
+    static RELATION_CHECKS: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Stats {
+        pub sees_checks: u64,
+        pub full_viewers: u64,
+        pub dense_viewers: u64,
+        pub sparse_viewers: u64,
+        pub flag_bytes: u64,
+        pub relation_checks: u64,
+    }
+
+    pub fn enable(on: bool) {
+        ENABLED.store(on, Ordering::Relaxed);
+        if on {
+            take();
+        }
+    }
+    fn enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+    pub(super) fn sees_check() {
+        if enabled() {
+            SEES_CHECKS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub(super) fn viewer(full: bool, dense: bool, flag_bytes: usize, relation_checks: usize) {
+        if !enabled() {
+            return;
+        }
+        if full {
+            FULL_VIEWERS.fetch_add(1, Ordering::Relaxed);
+        } else if dense {
+            DENSE_VIEWERS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            SPARSE_VIEWERS.fetch_add(1, Ordering::Relaxed);
+        }
+        FLAG_BYTES.fetch_add(flag_bytes as u64, Ordering::Relaxed);
+        RELATION_CHECKS.fetch_add(relation_checks as u64, Ordering::Relaxed);
+    }
+    pub fn take() -> Stats {
+        Stats {
+            sees_checks: SEES_CHECKS.swap(0, Ordering::Relaxed),
+            full_viewers: FULL_VIEWERS.swap(0, Ordering::Relaxed),
+            dense_viewers: DENSE_VIEWERS.swap(0, Ordering::Relaxed),
+            sparse_viewers: SPARSE_VIEWERS.swap(0, Ordering::Relaxed),
+            flag_bytes: FLAG_BYTES.swap(0, Ordering::Relaxed),
+            relation_checks: RELATION_CHECKS.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn counters_are_opt_in_and_resettable() {
+            enable(true);
+            sees_check();
+            viewer(false, true, 12, 4);
+            assert_eq!(
+                take(),
+                Stats {
+                    sees_checks: 1,
+                    dense_viewers: 1,
+                    flag_bytes: 12,
+                    relation_checks: 4,
+                    ..Stats::default()
+                }
+            );
+            enable(false);
+            sees_check();
+            assert_eq!(take(), Stats::default());
+        }
+    }
+}
+
 /// The attribute instances of `now` that differ from what `sent` held (an
 /// instance is never removed: one that disappears is left as it was sent).
 pub fn changed_attributes(
@@ -927,6 +1016,7 @@ fn broadcast_to_player(v: &Viewer, p: &Probe) -> bool {
 /// each of the tick's chunks whether the client has it (0: not looked up
 /// yet, 1: no, 2: yes), so each chunk is looked up once per client.
 fn sees(v: &Viewer, p: &Probe, chunks: &[(i32, i32)], held: &mut [u8]) -> bool {
+    tracking_stats::sees_check();
     let range = f64::from(p.range.min(v.view_distance * 16));
     let (dx, dz) = (v.position[0] - p.x, v.position[2] - p.z);
     dx * dx + dz * dz <= range * range && broadcast_to_player(v, p) && {
@@ -1240,6 +1330,7 @@ impl Entities {
                     .states
                     .get(&v.entity_id)
                     .is_none_or(|s| s.seen != now || self.is_moved[s.index]);
+            let dense = !all && v.tracker.seen.len() * 4 > self.probes.len();
             if all {
                 // `sees` caps the range at its view distance, so only the
                 // entities in chunks that far from its own can be seen; the
@@ -1269,7 +1360,7 @@ impl Entities {
                         }
                     }
                 }
-            } else if v.tracker.seen.len() * 4 > self.probes.len() {
+            } else if dense {
                 // Otherwise its pairs stay as they were, but for the entities
                 // that appeared or changed section; a client tracking much
                 // of the level goes through it in order.
@@ -1313,6 +1404,16 @@ impl Entities {
                     }
                 }
             }
+            tracking_stats::viewer(
+                all,
+                dense,
+                flags.len(),
+                if all || dense {
+                    self.probes.len()
+                } else {
+                    v.tracker.seen.len() + self.moved.len()
+                },
+            );
             // Usually the client still sees all it tracks.
             let mut removed = Vec::new();
             if kept != v.tracker.seen.len() {
