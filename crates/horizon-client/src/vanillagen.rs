@@ -906,6 +906,16 @@ impl ChunkGenerator for VanillaTerrain {
             ("carver_biomes", c.carver_entries, None),
             ("start_chunks", c.start_chunks, None),
             ("start_lists", c.start_lists, None),
+            ("biome_cache_hits", c.biome_hits as usize, None),
+            ("biome_cache_misses", c.biome_misses as usize, None),
+            ("biome_lock_wait_ns", c.biome_lock_wait_ns as usize, None),
+            ("biome_evictions", c.biome_evictions as usize, None),
+            ("biome_eviction_ns", c.biome_eviction_ns as usize, None),
+            ("carver_cache_hits", c.carver_hits as usize, None),
+            ("carver_cache_misses", c.carver_misses as usize, None),
+            ("carver_lock_wait_ns", c.carver_lock_wait_ns as usize, None),
+            ("carver_evictions", c.carver_evictions as usize, None),
+            ("carver_eviction_ns", c.carver_eviction_ns as usize, None),
         ]
     }
     fn proto_heap_bytes(&self, proto: &Proto) -> ([usize; 6], [usize; 16]) {

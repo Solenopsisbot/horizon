@@ -56,7 +56,11 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs, io,
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 
 #[derive(Debug)]
@@ -938,6 +942,7 @@ struct Pipeline<R: RandomSource> {
     biome_cache: BiomeCache,
     biome_work: ChunkWork,
     carver_cache: Mutex<HashMap<(i32, i32), BiomeId>>,
+    cache_stats: Arc<CacheStats>,
     pub(super) decoration: Option<Arc<super::generator_decoration::Decoration>>,
     pub(super) structures: Option<super::generator_structures::StructureState>,
     /// Definitions for explicit placement when automatic structure starts are off.
@@ -990,6 +995,55 @@ pub struct CacheCensus {
     /// Chunks in the structure start cache, and how many of them hold starts.
     pub start_chunks: usize,
     pub start_lists: usize,
+    pub biome_hits: u64,
+    pub biome_misses: u64,
+    pub biome_lock_wait_ns: u64,
+    pub biome_evictions: u64,
+    pub biome_eviction_ns: u64,
+    pub carver_hits: u64,
+    pub carver_misses: u64,
+    pub carver_lock_wait_ns: u64,
+    pub carver_evictions: u64,
+    pub carver_eviction_ns: u64,
+}
+
+#[derive(Default)]
+struct CacheStats {
+    biome_hits: AtomicU64,
+    biome_misses: AtomicU64,
+    biome_lock_wait_ns: AtomicU64,
+    biome_evictions: AtomicU64,
+    biome_eviction_ns: AtomicU64,
+    carver_hits: AtomicU64,
+    carver_misses: AtomicU64,
+    carver_lock_wait_ns: AtomicU64,
+    carver_evictions: AtomicU64,
+    carver_eviction_ns: AtomicU64,
+}
+
+static CACHE_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+fn cache_stats_enabled() -> bool {
+    *CACHE_STATS_ENABLED.get_or_init(|| std::env::var_os("HORIZON_WORLDGEN_CACHE_STATS").is_some())
+}
+
+impl CacheStats {
+    fn census(&self) -> CacheCensus {
+        CacheCensus {
+            biome_hits: self.biome_hits.load(Ordering::Relaxed),
+            biome_misses: self.biome_misses.load(Ordering::Relaxed),
+            biome_lock_wait_ns: self.biome_lock_wait_ns.load(Ordering::Relaxed),
+            biome_evictions: self.biome_evictions.load(Ordering::Relaxed),
+            biome_eviction_ns: self.biome_eviction_ns.load(Ordering::Relaxed),
+            carver_hits: self.carver_hits.load(Ordering::Relaxed),
+            carver_misses: self.carver_misses.load(Ordering::Relaxed),
+            carver_lock_wait_ns: self.carver_lock_wait_ns.load(Ordering::Relaxed),
+            carver_evictions: self.carver_evictions.load(Ordering::Relaxed),
+            carver_eviction_ns: self.carver_eviction_ns.load(Ordering::Relaxed),
+            ..CacheCensus::default()
+        }
+    }
 }
 /// Coordinates only equal missing neighbour keys. Weak entries retain no
 /// computed values across eviction or explicit invalidation. Only one work
@@ -1228,6 +1282,7 @@ where
             biome_cache: Mutex::new(HashMap::new()),
             biome_work: ChunkWork::new(),
             carver_cache: Mutex::new(HashMap::new()),
+            cache_stats: Arc::new(CacheStats::default()),
             decoration: None,
             structures: None,
             manual_structures: std::sync::OnceLock::new(),
@@ -1353,8 +1408,25 @@ where
         pos: ChunkPos,
         wait: bool,
     ) -> Result<Option<Arc<BiomeChunk<BiomeId>>>, GeneratorError> {
-        if let Some(chunk) = self.biome_cache.lock().unwrap().get(&(pos.x, pos.z)) {
+        let stats = cache_stats_enabled();
+        let started = stats.then(Instant::now);
+        let cache = self.biome_cache.lock().unwrap();
+        if let Some(started) = started {
+            self.cache_stats
+                .biome_lock_wait_ns
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        if let Some(chunk) = cache.get(&(pos.x, pos.z)) {
+            if stats {
+                self.cache_stats.biome_hits.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(Some(chunk.clone()));
+        }
+        drop(cache);
+        if stats {
+            self.cache_stats
+                .biome_misses
+                .fetch_add(1, Ordering::Relaxed);
         }
         // An old chunk keeps the biomes it was saved with.
         if let Some(old) = self
@@ -1374,9 +1446,17 @@ where
                 Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
             }
         };
-        if let Some(chunk) = self.biome_cache.lock().unwrap().get(&(pos.x, pos.z)) {
+        let started = stats.then(Instant::now);
+        let cache = self.biome_cache.lock().unwrap();
+        if let Some(started) = started {
+            self.cache_stats
+                .biome_lock_wait_ns
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        if let Some(chunk) = cache.get(&(pos.x, pos.z)) {
             return Ok(Some(chunk.clone()));
         }
+        drop(cache);
         let (min, height) = (self.settings.level_min_y, self.settings.level_height);
         let mut chunk = BiomeChunk::new(pos, min, height, BiomeId(0)).map_err(stage("biomes"))?;
         let mut resolver = self.source.resolver(
@@ -1424,22 +1504,48 @@ where
         let chunk = Arc::new(chunk);
         let mut cache = self.biome_cache.lock().unwrap();
         if cache.len() >= CACHE_LIMIT {
+            let started = stats.then(Instant::now);
             cache.clear();
+            if let Some(started) = started {
+                self.cache_stats
+                    .biome_evictions
+                    .fetch_add(1, Ordering::Relaxed);
+                self.cache_stats
+                    .biome_eviction_ns
+                    .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
         }
         cache.insert((pos.x, pos.z), chunk.clone());
         Ok(Some(chunk))
     }
     fn carver_biome(&self, worker: &mut WorkerState, origin: ChunkPos) -> Result<BiomeId, String> {
         let key = (origin.x, origin.z);
+        let stats = cache_stats_enabled();
         if let Some(id) = worker.carver_biomes.get(&key) {
             return Ok(*id);
         }
         if worker.carver_biomes.len() >= 4096 {
             worker.carver_biomes.clear();
         }
-        if let Some(id) = self.carver_cache.lock().unwrap().get(&key) {
+        let started = stats.then(Instant::now);
+        let cache = self.carver_cache.lock().unwrap();
+        if let Some(started) = started {
+            self.cache_stats
+                .carver_lock_wait_ns
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        if let Some(id) = cache.get(&key) {
+            if stats {
+                self.cache_stats.carver_hits.fetch_add(1, Ordering::Relaxed);
+            }
             worker.carver_biomes.insert(key, *id);
             return Ok(*id);
+        }
+        drop(cache);
+        if stats {
+            self.cache_stats
+                .carver_misses
+                .fetch_add(1, Ordering::Relaxed);
         }
         let mut resolver = self.source.resolver(
             &self.climate,
@@ -1456,7 +1562,16 @@ where
         let id = self.data.biome_id(name).ok_or_else(|| name.to_owned())?;
         let mut cache = self.carver_cache.lock().unwrap();
         if cache.len() >= CACHE_LIMIT * 4 {
+            let started = stats.then(Instant::now);
             cache.clear();
+            if let Some(started) = started {
+                self.cache_stats
+                    .carver_evictions
+                    .fetch_add(1, Ordering::Relaxed);
+                self.cache_stats
+                    .carver_eviction_ns
+                    .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
         }
         cache.insert(key, id);
         worker.carver_biomes.insert(key, id);
@@ -2623,17 +2738,17 @@ where
             .structures
             .as_ref()
             .map_or((0, 0), |s| s.start_census());
-        CacheCensus {
-            biome_chunks: biomes.len(),
-            biome_bytes: biomes
-                .values()
-                .map(|b| std::mem::size_of::<BiomeChunk<BiomeId>>() + b.heap_bytes())
-                .sum::<usize>()
-                + biomes.capacity() * std::mem::size_of::<((i32, i32), usize)>(),
-            carver_entries: self.carver_cache.lock().unwrap().len(),
-            start_chunks,
-            start_lists,
-        }
+        let mut census = self.cache_stats.census();
+        census.biome_chunks = biomes.len();
+        census.biome_bytes = biomes
+            .values()
+            .map(|b| std::mem::size_of::<BiomeChunk<BiomeId>>() + b.heap_bytes())
+            .sum::<usize>()
+            + biomes.capacity() * std::mem::size_of::<((i32, i32), usize)>();
+        census.carver_entries = self.carver_cache.lock().unwrap().len();
+        census.start_chunks = start_chunks;
+        census.start_lists = start_lists;
+        census
     }
     fn end_island_origins(&self, chunk: ChunkPos) -> Vec<[i32; 3]> {
         let Some(decoration) = &self.decoration else {

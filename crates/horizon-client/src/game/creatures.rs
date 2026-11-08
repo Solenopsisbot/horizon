@@ -108,6 +108,9 @@ pub(super) struct Creatures {
     /// The snapshot's buffer between ticks, empty: ~400 bytes a mob, so
     /// thousands of mobs would allocate and free megabytes every tick.
     seen_buf: Vec<Seen>,
+    /// Per-tick scratch retained between creature ticks.
+    gone_buf: Vec<(u32, Vec3, f64, f64, Option<Mob>)>,
+    keep_buf: Vec<bool>,
     /// The targets the mobs had before their ticks, kept between ticks
     /// (empty) as `seen_buf` is: `native_living_change_target` hears a change.
     target_buf: Vec<Option<Who>>,
@@ -1214,14 +1217,17 @@ impl Game<'_> {
         // 🤖 Agent: the last field is the grown slime, magma cube or sulfur
         // cube the body leaves behind (`AbstractCubeMob.remove`), captured as
         // the body goes because it has left the list by the time it splits.
-        let mut gone = Vec::new();
+        let mut gone = std::mem::take(&mut self.creatures.gone_buf);
+        gone.clear();
         let level_random;
         {
             // The level random, lent to the mobs (brain behaviours draw from
             // it) and taken back after their ticks.
             let mut scratch = self.world.random.clone();
             let mut pushes = horizon_client::mobs::PendingPushes::default();
-            let mut keep = Vec::with_capacity(mobs.len());
+            let mut keep = std::mem::take(&mut self.creatures.keep_buf);
+            keep.clear();
+            keep.reserve(mobs.len());
             let mut grid =
                 horizon_client::mobs::seen_grid::SeenGrid::new(snapshot.iter().map(|s| s.bounds));
             // All but the snapshot is the same for every mob of the tick, so
@@ -1536,8 +1542,10 @@ impl Game<'_> {
                 }
             }
             laps.lap("creature_loop");
-            let mut flags = keep.into_iter();
+            let mut flags = keep.drain(..);
             mobs.retain(|_| flags.next().unwrap_or(true));
+            drop(flags);
+            self.creatures.keep_buf = keep;
             for m in &mut mobs {
                 horizon_client::mobs::apply_mob_pushes(m, &mut pushes);
             }
@@ -1572,7 +1580,7 @@ impl Game<'_> {
         // ... and entity event 60 goes out as it is: the poof.
         // 🤖 Agent: the split follows the poof, as `LivingEntity.tickDeath`
         // broadcasts event 60 before it calls `remove`.
-        for (id, at, width, height, split) in gone {
+        for (id, at, width, height, split) in gone.drain(..) {
             let at = [at.x, at.y, at.z];
             self.lan_entity_event(id as i32, 60, at);
             self.death_poof(at, width, height);
@@ -1580,6 +1588,7 @@ impl Game<'_> {
                 self.split_dead_cube(&m);
             }
         }
+        self.creatures.gone_buf = gone;
         laps.lap("creature_retain");
         self.sync_riders();
         self.tick_skeleton_traps();
