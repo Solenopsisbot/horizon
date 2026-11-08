@@ -1152,11 +1152,24 @@ impl Game<'_> {
         // Connected to a server (single player's own included), the chat on
         // screen is the connection's: the game's own messages join it.
         if self.remote.is_some() {
-            self.chat_line(text, ChatSource::Server);
+            self.add_chat_line(text, ChatSource::Server);
             return;
         }
         // The Chat option's Hidden level takes the server's messages too.
         self.local_chat_line(text, Some(SYSTEM_INDICATOR), ChatSource::Server);
+    }
+    /// `ChatComponent.addClientSystemMessage`: a line the client adds itself.
+    /// It joins the connection's chat and its history, with the system
+    /// marker; the Chat option's server-message filter does not hide it
+    /// (`GuiMessageSource.SYSTEM_CLIENT`). Vanilla fires
+    /// `ClientChatReceivedEvent` from `ChatListener` for the lines the server
+    /// sent, so this path does not tell `client_chat_received`.
+    pub(super) fn chat_line(&mut self, text: Text) {
+        if self.remote.is_some() {
+            self.add_chat_line(text, ChatSource::Client);
+        } else {
+            self.local_chat_line(text, Some(SYSTEM_INDICATOR), ChatSource::Client);
+        }
     }
     /// A player's chat line on the window's own chat: a guest's message on
     /// the server's own chat (`HostEvent::Chat`). `ChatListener`

@@ -34,6 +34,17 @@ pub trait NetworkClientHost {
     #[access(WorldOnly)]
     fn net_send_to_server(&mut self, channel: &str, data: &[u8]) -> Result<(), String>;
     /// Side: client.
+    /// Adds `line` to this client's chat HUD and history (vanilla's
+    /// `ChatComponent.addClientSystemMessage`): it shows here only, so
+    /// nothing is sent to the server. The Chat option's server-message filter
+    /// doesn't hide it (`GuiMessageSource.SYSTEM_CLIENT`), and
+    /// `client_chat_received` is not told: vanilla fires that event from
+    /// `ChatListener` for lines the server sent, not for lines the client adds
+    /// itself.
+    #[access(WorldOnly)]
+    /// Refuses text deeper than 512 component nodes before applying any changes.
+    fn chat_line(&mut self, line: Text) -> Result<(), TextFormError>;
+    /// Side: client.
     /// A mod's chat line or command (`/` first), sent as `send_chat` sends
     /// it (ClientPacketListener.sendChat / sendCommand), to any server: no
     /// chat history, and no client chat event (vanilla's `ClientChatEvent`

@@ -1859,7 +1859,7 @@ impl Game<'_> {
     /// A line in the connection's chat, with its styles, click and hover
     /// events (ChatComponent.addMessage). The lines the Chat option hides
     /// are dropped there (its `visibleMessageFilter`).
-    pub(super) fn chat_line(
+    pub(super) fn add_chat_line(
         &mut self,
         content: horizon_client::text::Text,
         source: horizon_client::chat::ChatSource,
@@ -5447,7 +5447,8 @@ impl Game<'_> {
                 if p.overlay {
                     self.say_system_queued(&text);
                     self.titles.set_overlay(text, false);
-                } else if self.chat_line(text.clone(), horizon_client::chat::ChatSource::Server) {
+                } else if self.add_chat_line(text.clone(), horizon_client::chat::ChatSource::Server)
+                {
                     // handleSystemMessage: said once the chat takes it.
                     self.say_system_chat_queued(&text);
                 }
@@ -11300,7 +11301,7 @@ impl Game<'_> {
             _ => {
                 // Unsupported menu: tell the server we closed it.
                 self.remote_reject_container(p.container);
-                self.chat_line(
+                self.add_chat_line(
                     horizon_client::text::Text::literal(format!(
                         "(Horizon cannot show {menu} screens yet)"
                     )),
@@ -13318,6 +13319,47 @@ mod tests {
             assert!(mod_api::prelude::NetworkClientHost::send_chat(game, "/warp spawn").is_ok());
             game.settings.chat_visibility = 2;
             assert!(mod_api::prelude::NetworkClientHost::send_chat(game, "/warp spawn").is_err());
+        });
+    }
+
+    /// `ChatComponent.addClientSystemMessage`: the line joins this client's
+    /// chat history and no packet leaves for the server.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_mod_chat_line_shows_locally_and_sends_nothing() {
+        use super::super::{execution_role::ExecutionRole, native_entity_refs::tests::with_game};
+        use horizon_protocol::connection::{Connection, Pipe};
+
+        with_game(|game| {
+            game.options.execution_role = ExecutionRole::Client;
+            let (client, server) = Pipe::pair();
+            game.connect_local(client, "ChatLineTest").unwrap();
+            // Whatever connecting wrote is not this line's; drain it until the
+            // client waits for the login answer, so the check below is about
+            // `chat_line` alone.
+            let (mut reader, _writer) = Connection::local(server).split();
+            reader
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            while reader.recv().is_ok() {}
+            mod_api::prelude::NetworkClientHost::chat_line(
+                game,
+                mod_api::Text::literal("local only"),
+            )
+            .unwrap();
+            let history: Vec<_> = game
+                .remote
+                .as_ref()
+                .unwrap()
+                .chat
+                .iter()
+                .map(|(line, _)| line.clone())
+                .collect();
+            assert_eq!(history, ["local only"]);
+            assert!(
+                reader.recv().unwrap_err().is_timed_out(),
+                "a local chat line sends nothing to the server"
+            );
         });
     }
 
