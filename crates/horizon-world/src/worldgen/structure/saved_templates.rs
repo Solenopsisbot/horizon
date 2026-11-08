@@ -46,9 +46,10 @@ fn flag(tag: &Tag, key: &str) -> bool {
 }
 
 fn mirror(tag: &Tag, key: &str) -> Option<Mirror> {
+    let name = text(tag, key)?;
     [Mirror::None, Mirror::LeftRight, Mirror::FrontBack]
         .into_iter()
-        .find(|m| Some(m.saved_name()) == text(tag, key).as_deref())
+        .find(|m| m.saved_name() == name)
 }
 
 /// `TemplateStructurePiece(StructurePieceType, CompoundTag, ...)` and its subclasses' tag
@@ -75,14 +76,15 @@ pub(crate) fn read(
     let name = match id {
         "wmp" => format!("minecraft:woodland_mansion/{name}"),
         "ecp" => format!("minecraft:end_city/{name}"),
-        _ => crate::worldgen::tags::identifier(&name).ok()?,
+        _ => name,
     };
     let name = crate::worldgen::tags::identifier(&name).ok()?;
     let template = resources.template(&name)?;
     let rotation_key = if id == "rupo" { "Rotation" } else { "Rot" };
+    let rotation_name = text(tag, rotation_key)?;
     let rotation = Rotation::ALL
         .into_iter()
-        .find(|r| Some(r.saved_name()) == text(tag, rotation_key).as_deref())?;
+        .find(|r| r.saved_name() == rotation_name)?;
     let mut mirror_value = Mirror::None;
     let mut pivot = [0; 3];
     let mut processors = Arc::new(ProcessorList::default());

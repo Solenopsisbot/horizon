@@ -845,7 +845,7 @@ fn mark_fades(
     rows: usize,
     f: FadeInputs<'_>,
 ) {
-    let mut marks = Vec::new();
+    fades.marks.clear();
     if fades.fade_ms != Some(f.fade_ms) {
         fades.clear();
         fades.fade_ms = Some(f.fade_ms);
@@ -857,7 +857,7 @@ fn mark_fades(
             if fading != s.gpu_fading {
                 s.gpu_fading = fading;
                 records.set_fading(id, fading);
-                marks.push((key, s.listed(key, rows)));
+                fades.marks.push((key, s.listed(key, rows)));
             }
         }
     } else {
@@ -873,10 +873,10 @@ fn mark_fades(
             }
             s.gpu_fading = false;
             records.set_fading(s.gpu_id.expect("flagged sections have records"), false);
-            marks.push((key, s.listed(key, rows)));
+            fades.marks.push((key, s.listed(key, rows)));
         }
     }
-    for (key, marked) in marks {
+    for (key, marked) in fades.marks.drain(..) {
         sections.set_marked(key, marked);
     }
 }

@@ -783,6 +783,8 @@ impl Records {
 pub(super) struct Fades {
     due: BinaryHeap<Reverse<(Instant, SectionKey)>>,
     pub fade_ms: Option<u64>,
+    /// Reused section mark updates emitted by `gfx::mark_fades`.
+    pub marks: Vec<(SectionKey, bool)>,
 }
 
 impl Fades {
