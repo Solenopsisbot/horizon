@@ -25,8 +25,8 @@ mod entrypoint_role;
 pub mod events;
 mod fabric_registry;
 mod facade_saved_data;
-mod facade_text;
 mod facade_server;
+mod facade_text;
 mod game_hooks;
 mod guava_model;
 mod heap;
@@ -8861,7 +8861,8 @@ fn component_text(value: &Value) -> String {
     let raw = expect_ref(value).map_or("", |value| value.as_str());
     // A styled component or one with arguments (`facade_text.rs`).
     if raw.starts_with(facade_text::JSON_PREFIX) {
-        return facade_text::to_json(value).map_or_else(String::new, |json| facade_text::plain(&json));
+        return facade_text::to_json(value)
+            .map_or_else(String::new, |json| facade_text::plain(&json));
     }
     raw.strip_prefix("component/literal/")
         .or_else(|| raw.strip_prefix("component/translatable/"))
@@ -23859,9 +23860,10 @@ impl<H: Host> Runtime<'_, H> {
                         invoke_or_catch!(at, self.invoke_map_compute(&r, receiver.as_ref(), &args))
                     {
                         value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_server_facade(&r, receiver.as_ref(), &args))
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_server_facade(&r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,

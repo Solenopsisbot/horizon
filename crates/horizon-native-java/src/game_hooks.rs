@@ -738,9 +738,10 @@ impl<H: Host> GameHookHost<'_, H> {
             ("getId", "()I") if entity => fact(object.entity_id.map(Value::Int)),
             // `permissions()`: the player's level's permission set.
             ("permissions", _) if player && object.uuid.is_some() => {
-                match object.uuid.and_then(|uuid| {
-                    facade_server::player_member(&self.context.server, uuid, r)
-                }) {
+                match object
+                    .uuid
+                    .and_then(|uuid| facade_server::player_member(&self.context.server, uuid, r))
+                {
                     Some(answer) => answer.map_err(|_| unmodelled(marker, r)),
                     None => Err(unmodelled(marker, r)),
                 }

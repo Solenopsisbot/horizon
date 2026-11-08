@@ -145,7 +145,8 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Ok(Some(collection_value("set", &unique)))
             }
-            "com/google/common/collect/ImmutableSet" | "com/google/common/collect/ImmutableMap"
+            "com/google/common/collect/ImmutableSet"
+            | "com/google/common/collect/ImmutableMap"
             | "com/google/common/collect/ImmutableBiMap"
                 if r.name == "of" =>
             {
