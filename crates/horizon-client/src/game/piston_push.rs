@@ -99,9 +99,9 @@ impl Game<'_> {
     /// moves itself: every entity the sweeping lid box meets moves out along
     /// the box's facing by the box's own size plus 0.01
     /// (`Entity.move(MoverType.SHULKER_BOX, …)`).
-    pub(super) fn push_shulker_entities(&mut self, pushes: Vec<ShulkerPush>) {
+    pub(super) fn push_shulker_entities(&mut self, pushes: &[ShulkerPush]) {
         let steps = self.push_step_heights();
-        for (pos, facing, lid) in pushes {
+        for &(pos, facing, lid) in pushes {
             self.push_for_shulker(pos, facing, lid, &steps);
         }
     }

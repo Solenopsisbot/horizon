@@ -19,6 +19,9 @@ use horizon_world::registry::BlockStateId;
 pub(super) struct TickScratch {
     spawners: Vec<Pos>,
     trial_spawners: Vec<Pos>,
+    shulker_positions: Vec<[i32; 3]>,
+    shulker_pushes: Vec<super::piston_push::ShulkerPush>,
+    shulker_gone: Vec<[i32; 3]>,
 }
 
 impl Game<'_> {
@@ -116,9 +119,9 @@ impl Game<'_> {
         // animates. Their grown collision shape reaches the collision queries
         // through `World::shulkers`, and an opening lid pushes what it runs
         // into (`moveCollidedEntities`), as a moving piston does.
-        let pushes = self.tick_shulkers();
+        self.tick_shulkers(scratch);
         self.sync_shulkers();
-        self.push_shulker_entities(pushes);
+        self.push_shulker_entities(&scratch.shulker_pushes);
         Ok(())
     }
     /// `ShulkerBoxBlockEntity.tick` for the boxes in block-ticking chunks, in
@@ -127,15 +130,18 @@ impl Game<'_> {
     /// The boxes are those the level animates: a box opens (`start_open` and
     /// block event 1) before it has one, exactly as vanilla's block entity is
     /// there from the start.
-    fn tick_shulkers(&mut self) -> Vec<super::piston_push::ShulkerPush> {
+    fn tick_shulkers(&mut self, scratch: &mut TickScratch) {
         let ticking = self.block_ticking_area();
-        let mut pushes = Vec::new();
-        let mut gone = Vec::new();
-        let positions: Vec<[i32; 3]> = self.be_anims.shulkers.keys().copied().collect();
-        for pos in positions {
+        scratch.shulker_positions.clear();
+        scratch
+            .shulker_positions
+            .extend(self.be_anims.shulkers.keys().copied());
+        scratch.shulker_pushes.clear();
+        scratch.shulker_gone.clear();
+        for pos in scratch.shulker_positions.drain(..) {
             let state = self.world.block(pos[0], pos[1], pos[2]);
             let Some(Ticker::Shulker { facing }) = self.be_anims.ticker(state.0) else {
-                gone.push(pos);
+                scratch.shulker_gone.push(pos);
                 continue;
             };
             if !ticking(pos[0], pos[2])
@@ -149,13 +155,12 @@ impl Game<'_> {
                 .get_mut(&pos)
                 .map(|shulker| shulker.tick(pos, facing));
             if let Some(push) = tick.and_then(|tick| tick.push) {
-                pushes.push((pos, facing, push));
+                scratch.shulker_pushes.push((pos, facing, push));
             }
         }
-        for pos in gone {
+        for pos in scratch.shulker_gone.drain(..) {
             self.be_anims.shulkers.remove(&pos);
         }
-        pushes
     }
     /// Copies the shulker box lids into the world, where the collision queries
     /// read them (`SceneCollisions::shulker_collision_state`), as
