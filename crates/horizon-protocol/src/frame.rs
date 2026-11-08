@@ -21,7 +21,10 @@ pub fn encode(body: &[u8], threshold: Option<usize>) -> Result<Vec<u8>> {
     // packet body crosses the allocator and memcpy boundary once.
     if threshold.is_none() {
         if body.len() > MAX_FRAME {
-            return Err(Error::new(format!("packet too large: {} bytes", body.len())));
+            return Err(Error::new(format!(
+                "packet too large: {} bytes",
+                body.len()
+            )));
         }
         return Ok(prefixed(body));
     }
