@@ -359,7 +359,7 @@ fn capture_log(f: impl FnOnce()) -> Vec<String> {
 const JAVA_PREFIX: &str = "Horizon: dedicated Java compatibility: ";
 
 /// The longest refused-jar detail a log line carries.
-const MAX_JAVA_FAILURE: usize = 160;
+const MAX_JAVA_FAILURE: usize = 512;
 
 /// The rows [`load_java_mods`] returned, taken once by the content-root build
 /// after startup: a server has no window whose resource load would read them,
