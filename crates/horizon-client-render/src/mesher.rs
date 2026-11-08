@@ -1362,10 +1362,127 @@ struct Layer {
     /// Each resolver's colour of every cell of `zoomed`, filled on first use:
     /// a cell is in the blend square of up to `(2r+1)^2` columns.
     cells: [Vec<u32>; 4],
+    /// Fenwick trees of RGB sums and known-cell counts for each resolver. The fourth
+    /// component lets repeated lookups skip the neighbourhood walk once its cells are
+    /// already populated.
+    sums: [Vec<[u32; 4]>; 4],
     /// `BiomeZoom::corner_jitter` of the quart cells `zoomed` reaches, by
     /// their offset from the first: each is shared by up to 16 cells of the layer.
     jitter: Vec<Option<[[f64; 3]; 8]>>,
     colors: [[u32; 256]; 4],
+}
+
+/// Add one cell to a resolver's two-dimensional Fenwick tree.
+fn tint_sum_add(tree: &mut [[u32; 4]], dim: usize, x: usize, z: usize, value: [u32; 4]) {
+    let side = dim + 1;
+    let mut z = z + 1;
+    while z <= dim {
+        let mut x = x + 1;
+        while x <= dim {
+            let cell = &mut tree[z * side + x];
+            for (sum, value) in cell.iter_mut().zip(value) {
+                *sum += value;
+            }
+            x += x & x.wrapping_neg();
+        }
+        z += z & z.wrapping_neg();
+    }
+}
+
+/// Sum the half-open rectangle `[0, x) × [0, z)` in a resolver's tree.
+fn tint_sum_prefix(tree: &[[u32; 4]], dim: usize, x: usize, z: usize) -> [u32; 4] {
+    let side = dim + 1;
+    let mut out = [0; 4];
+    let mut z = z.min(dim);
+    while z > 0 {
+        let mut x = x.min(dim);
+        while x > 0 {
+            for (sum, value) in out.iter_mut().zip(tree[z * side + x]) {
+                *sum += value;
+            }
+            x &= x - 1;
+        }
+        z &= z - 1;
+    }
+    out
+}
+
+/// Sum an inclusive rectangle in constant tree-query time.
+fn tint_sum_rect(
+    tree: &[[u32; 4]],
+    dim: usize,
+    x0: usize,
+    z0: usize,
+    x1: usize,
+    z1: usize,
+) -> [u32; 4] {
+    let a = tint_sum_prefix(tree, dim, x1 + 1, z1 + 1);
+    let b = tint_sum_prefix(tree, dim, x0, z1 + 1);
+    let c = tint_sum_prefix(tree, dim, x1 + 1, z0);
+    let d = tint_sum_prefix(tree, dim, x0, z0);
+    std::array::from_fn(|i| a[i] + d[i] - b[i] - c[i])
+}
+
+fn tint_sum_direct(
+    cells: &[u32],
+    dim: usize,
+    x0: usize,
+    z0: usize,
+    x1: usize,
+    z1: usize,
+) -> [u32; 4] {
+    let mut out = [0; 4];
+    for z in z0..=z1 {
+        for x in x0..=x1 {
+            let c = cells[z * dim + x];
+            out[0] += c >> 16 & 255;
+            out[1] += c >> 8 & 255;
+            out[2] += c & 255;
+            out[3] += 1;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tint_sum_tests {
+    use super::*;
+
+    #[test]
+    fn fenwick_rectangles_match_direct_rgb_sums() {
+        const DIM: usize = 4;
+        let mut tree = vec![[0; 4]; (DIM + 1) * (DIM + 1)];
+        let mut values = [[[0_u32; 3]; DIM]; DIM];
+        for z in 0..DIM {
+            for x in 0..DIM {
+                let value = [x as u32 + 1, (z * 3) as u32 + 2, (x + z) as u32];
+                values[z][x] = value;
+                tint_sum_add(&mut tree, DIM, x, z, [value[0], value[1], value[2], 1]);
+            }
+        }
+        for z0 in 0..DIM {
+            for z1 in z0..DIM {
+                for x0 in 0..DIM {
+                    for x1 in x0..DIM {
+                        let mut expected = [0; 4];
+                        for row in &values[z0..=z1] {
+                            for value in &row[x0..=x1] {
+                                expected[0] += value[0];
+                                expected[1] += value[1];
+                                expected[2] += value[2];
+                                expected[3] += 1;
+                            }
+                        }
+                        assert_eq!(
+                            tint_sum_rect(&tree, DIM, x0, z0, x1, z1),
+                            expected,
+                            "rectangle x={x0}..={x1}, z={z0}..={z1}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 /// `ClientLevel.calculateBlockTint` behind a per-layer `BlockTintCache`: each
 /// block averages the colours of the biomes `BiomeManager.getBiome` picks (the
@@ -1490,6 +1607,7 @@ impl<'a> Tints<'a> {
             Box::new(Layer {
                 zoomed: vec![NO_BIOME; dim * dim],
                 cells: Default::default(),
+                sums: Default::default(),
                 jitter: Vec::new(),
                 colors: [[UNSET; 256]; 4],
             })
@@ -1501,62 +1619,83 @@ impl<'a> Tints<'a> {
         }
         let [cx, cz, base_y] = self.origin;
         let (bx, by, bz) = (cx * 16, base_y + y, cz * 16);
-        let (mut red, mut green, mut blue) = (0, 0, 0);
         let cells = &mut layer.cells[resolver as usize];
         if cells.is_empty() {
             cells.resize(dim * dim, UNSET);
         }
-        for dz in -r..=r {
-            for dx in -r..=r {
-                let cell = ((z + dz + r) as usize) * dim + (x + dx + r) as usize;
-                let known = cells[cell];
-                if known != UNSET {
-                    red += known >> 16 & 255;
-                    green += known >> 8 & 255;
-                    blue += known & 255;
-                    continue;
-                }
-                let mut biome = layer.zoomed[cell];
-                if biome == NO_BIOME {
-                    // BiomeManager.getBiome over the loaded chunks (plains
-                    // where there is none): `quart_at_block`, its cell's
-                    // corner jitter mixed once per layer.
-                    let block = BlockPos::new(bx + x + dx, by, bz + z + dz);
-                    let base = [block.x, block.y, block.z].map(|v| v.wrapping_sub(2) >> 2);
-                    let first = [bx - r, bz - r].map(|v| v.wrapping_sub(2) >> 2);
-                    let span = dim / 4 + 2;
-                    let at = (base[2] - first[1]) as usize * span + (base[0] - first[0]) as usize;
-                    if layer.jitter.is_empty() {
-                        layer.jitter.resize(span * span, None);
+        let sums = &mut layer.sums[resolver as usize];
+        if sums.is_empty() {
+            sums.resize((dim + 1) * (dim + 1), [0; 4]);
+        }
+        let x0 = (x - r) as usize;
+        let z0 = (z - r) as usize;
+        let x1 = (x + r) as usize;
+        let z1 = (z + r) as usize;
+        let area = ((2 * r + 1) * (2 * r + 1)) as u32;
+        // Small neighborhoods are cheaper to sum directly than to traverse four
+        // Fenwick prefixes. Larger blend radii use the cached rectangle sums.
+        let direct = area <= 64;
+        if direct || tint_sum_rect(sums, dim, x0, z0, x1, z1)[3] != area {
+            for dz in -r..=r {
+                for dx in -r..=r {
+                    let cell_x = (x + dx + r) as usize;
+                    let cell_z = (z + dz + r) as usize;
+                    let cell = cell_z * dim + cell_x;
+                    if cells[cell] != UNSET {
+                        continue;
                     }
-                    let jitter =
-                        layer.jitter[at].get_or_insert_with(|| self.zoom.corner_jitter(base));
-                    let corner = BiomeZoom::select_corner(block, jitter);
-                    let q = [
-                        base[0].wrapping_add((corner >> 2 & 1) as i32),
-                        base[1].wrapping_add((corner >> 1 & 1) as i32),
-                        base[2].wrapping_add((corner & 1) as i32),
-                    ];
-                    biome = Self::quart_biome(self.region, self.plains, [cx, cz], q);
-                    layer.zoomed[cell] = biome;
-                }
-                let c = match resolver {
-                    Resolver::Grass => {
-                        self.biomes
-                            .grass(biome, f64::from(bx + x + dx), f64::from(bz + z + dz))
+                    let mut biome = layer.zoomed[cell];
+                    if biome == NO_BIOME {
+                        // BiomeManager.getBiome over the loaded chunks (plains
+                        // where there is none): `quart_at_block`, its cell's
+                        // corner jitter mixed once per layer.
+                        let block = BlockPos::new(bx + x + dx, by, bz + z + dz);
+                        let base = [block.x, block.y, block.z].map(|v| v.wrapping_sub(2) >> 2);
+                        let first = [bx - r, bz - r].map(|v| v.wrapping_sub(2) >> 2);
+                        let span = dim / 4 + 2;
+                        let at =
+                            (base[2] - first[1]) as usize * span + (base[0] - first[0]) as usize;
+                        if layer.jitter.is_empty() {
+                            layer.jitter.resize(span * span, None);
+                        }
+                        let jitter =
+                            layer.jitter[at].get_or_insert_with(|| self.zoom.corner_jitter(base));
+                        let corner = BiomeZoom::select_corner(block, jitter);
+                        let q = [
+                            base[0].wrapping_add((corner >> 2 & 1) as i32),
+                            base[1].wrapping_add((corner >> 1 & 1) as i32),
+                            base[2].wrapping_add((corner & 1) as i32),
+                        ];
+                        biome = Self::quart_biome(self.region, self.plains, [cx, cz], q);
+                        layer.zoomed[cell] = biome;
                     }
-                    Resolver::Foliage => self.biomes.get(biome).foliage,
-                    Resolver::Dry => self.biomes.get(biome).dry_foliage,
-                    Resolver::Water => self.biomes.get(biome).water,
-                };
-                cells[cell] = c;
-                red += c >> 16 & 255;
-                green += c >> 8 & 255;
-                blue += c & 255;
+                    let c = match resolver {
+                        Resolver::Grass => {
+                            self.biomes
+                                .grass(biome, f64::from(bx + x + dx), f64::from(bz + z + dz))
+                        }
+                        Resolver::Foliage => self.biomes.get(biome).foliage,
+                        Resolver::Dry => self.biomes.get(biome).dry_foliage,
+                        Resolver::Water => self.biomes.get(biome).water,
+                    };
+                    cells[cell] = c;
+                    tint_sum_add(
+                        sums,
+                        dim,
+                        cell_x,
+                        cell_z,
+                        [c >> 16 & 255, c >> 8 & 255, c & 255, 1],
+                    );
+                }
             }
         }
-        let n = ((2 * r + 1) * (2 * r + 1)) as u32;
-        let color = (red / n) << 16 | (green / n) << 8 | (blue / n);
+        let [red, green, blue, known] = if direct {
+            tint_sum_direct(cells, dim, x0, z0, x1, z1)
+        } else {
+            tint_sum_rect(sums, dim, x0, z0, x1, z1)
+        };
+        debug_assert_eq!(known, area);
+        let color = (red / area) << 16 | (green / area) << 8 | (blue / area);
         layer.colors[resolver as usize][slot] = color;
         color
     }

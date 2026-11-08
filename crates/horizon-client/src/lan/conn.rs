@@ -10,7 +10,7 @@ use super::{
     Joined, NetEvent, Out, Shared,
     data::{CORE_PACK, SyncData},
     forwarding,
-    io_pool::{self, Session as _},
+    io_pool::{self, Body, Session as _},
 };
 use horizon_client_core::text::Text;
 use horizon_protocol::{
@@ -346,7 +346,7 @@ pub struct PlayerSender {
     pub undrained: Arc<Undrained>,
     /// The bytes of the bodies sent and not framed yet.
     pub pending: Arc<AtomicUsize>,
-    held: Arc<Mutex<Vec<Vec<u8>>>>,
+    held: Arc<Mutex<Vec<Body>>>,
     to: To,
     /// The connection's bytes on the wire (after compression and encryption), counted by its
     /// network thread: `horizon-report`'s network use per player. None for a test's channel.
@@ -400,7 +400,7 @@ impl PlayerSender {
             outbox.send(Vec::new(), Some(io_pool::End::Close));
         }
     }
-    fn held(&self) -> std::sync::MutexGuard<'_, Vec<Vec<u8>>> {
+    fn held(&self) -> std::sync::MutexGuard<'_, Vec<Body>> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
     pub fn send(&self, body: Vec<u8>) {
@@ -409,12 +409,42 @@ impl PlayerSender {
         };
         self.pending.fetch_add(body.len(), Ordering::Relaxed);
         if HOLDING.get() {
-            self.held().push(body);
+            self.held().push(Body::Owned(body));
         } else {
             self.flush();
             match &self.to {
                 To::Channel(tx) => drop(tx.send(Out::Packet(body))),
-                To::Pool(outbox, _) => outbox.send(vec![body], None),
+                To::Pool(outbox, _) => outbox.send(vec![Body::Owned(body)], None),
+            }
+        }
+    }
+    /// Queue immutable bodies shared by a fan-out operation. Packet hooks are
+    /// still honored by falling back to owned sends while any watcher is active.
+    pub fn send_shared_many(&self, bodies: impl IntoIterator<Item = Arc<[u8]>>) {
+        if WATCHED.load(Ordering::Relaxed) != 0 {
+            for body in bodies {
+                self.send(body.to_vec());
+            }
+            return;
+        }
+        let bodies: Vec<_> = bodies.into_iter().map(Body::Shared).collect();
+        let bytes: usize = bodies.iter().map(Body::len).sum();
+        self.pending.fetch_add(bytes, Ordering::Relaxed);
+        if HOLDING.get() {
+            self.held().extend(bodies);
+        } else {
+            self.flush();
+            if let To::Pool(outbox, _) = &self.to {
+                outbox.send(bodies, None);
+            } else if let To::Channel(tx) = &self.to {
+                drop(
+                    tx.send(Out::Packets(
+                        bodies
+                            .into_iter()
+                            .map(|body| body.as_bytes().to_vec())
+                            .collect(),
+                    )),
+                );
             }
         }
     }
@@ -429,7 +459,7 @@ impl PlayerSender {
         let mut held = self.held();
         for body in bodies {
             self.pending.fetch_add(body.len(), Ordering::Relaxed);
-            held.push(body);
+            held.push(Body::Owned(body));
         }
     }
     /// Hand the held packets to the network thread.
@@ -437,7 +467,13 @@ impl PlayerSender {
         let held = std::mem::take(&mut *self.held());
         if !held.is_empty() {
             match &self.to {
-                To::Channel(tx) => drop(tx.send(Out::Packets(held))),
+                To::Channel(tx) => drop(
+                    tx.send(Out::Packets(
+                        held.into_iter()
+                            .map(|body| body.as_bytes().to_vec())
+                            .collect(),
+                    )),
+                ),
                 To::Pool(outbox, _) => outbox.send(held, None),
             }
         }
@@ -451,7 +487,7 @@ impl PlayerSender {
             To::Pool(outbox, _) => {
                 let body = play::Clientbound::Disconnect(cfg::Disconnect { reason }).encode();
                 self.pending.fetch_add(body.len(), Ordering::Relaxed);
-                outbox.send(vec![body], Some(io_pool::End::Disconnect));
+                outbox.send(vec![Body::Owned(body)], Some(io_pool::End::Disconnect));
             }
         }
     }
@@ -480,7 +516,13 @@ pub fn flush_all<'a>(senders: impl IntoIterator<Item = &'a PlayerSender>) {
             continue;
         }
         match &s.to {
-            To::Channel(tx) => drop(tx.send(Out::Packets(held))),
+            To::Channel(tx) => drop(
+                tx.send(Out::Packets(
+                    held.into_iter()
+                        .map(|body| body.as_bytes().to_vec())
+                        .collect(),
+                )),
+            ),
             To::Pool(outbox, _) => {
                 if let Some(worker) = outbox.push(held, None)
                     && !wake.iter().any(|w| Arc::ptr_eq(w, worker))

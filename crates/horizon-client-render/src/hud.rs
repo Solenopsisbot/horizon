@@ -906,14 +906,14 @@ impl HudAtlas {
     fn slots(images: &mut Vec<PackedImage>, trim: (u32, u32), mod_image: bool) {
         for i in 0..MAP_SLOTS {
             let name = map_slot_sprite(i).unwrap_or_default();
-            images.push((name.into(), 128, 128, vec![0; 128 * 128 * 4]));
+            images.push((name.into(), 128, 128, Vec::new()));
         }
         // The minimap extra's image (game/extras.rs).
         images.push((
             MINIMAP_SPRITE.into(),
             crate::minimap::SIZE as u32,
             crate::minimap::SIZE as u32,
-            vec![0; crate::minimap::SIZE * crate::minimap::SIZE * 4],
+            Vec::new(),
         ));
         // A mod's own image (native `mod_image`), only when a mod is loaded.
         if mod_image {
@@ -921,45 +921,29 @@ impl HudAtlas {
                 MOD_IMAGE_SPRITE.into(),
                 MOD_IMAGE_SIZE,
                 MOD_IMAGE_SIZE,
-                vec![0; (MOD_IMAGE_SIZE * MOD_IMAGE_SIZE * 4) as usize],
+                Vec::new(),
             ));
         }
         // Downloaded skins (game/scoreboard.rs).
         for i in 0..SKIN_SLOTS {
-            images.push((format!("horizon/skin{i}"), 64, 64, vec![0; 64 * 64 * 4]));
+            images.push((format!("horizon/skin{i}"), 64, 64, Vec::new()));
         }
         for i in 0..TRIM_SLOTS {
-            images.push((
-                format!("horizon/trim{i}"),
-                trim.0,
-                trim.1,
-                vec![0; (trim.0 * trim.1 * 4) as usize],
-            ));
+            images.push((format!("horizon/trim{i}"), trim.0, trim.1, Vec::new()));
         }
         for i in 0..WORLD_ICON_SLOTS {
-            images.push((
-                format!("horizon/world-icon{i}"),
-                64,
-                64,
-                vec![0; 64 * 64 * 4],
-            ));
+            images.push((format!("horizon/world-icon{i}"), 64, 64, Vec::new()));
         }
-        let side = PACK_ICON_SIZE as usize;
         for i in 0..PACK_ICON_SLOTS {
             images.push((
                 format!("horizon/pack-icon{i}"),
                 PACK_ICON_SIZE,
                 PACK_ICON_SIZE,
-                vec![0; side * side * 4],
+                Vec::new(),
             ));
         }
         // The on-screen keyboard's text and corner masks (ui_theme), rasterized at run time.
-        images.push((
-            "horizon/ui-text".into(),
-            2048,
-            1024,
-            vec![0; 2048 * 1024 * 4],
-        ));
+        images.push(("horizon/ui-text".into(), 2048, 1024, Vec::new()));
     }
     /// Only the font's metrics, for a game that draws nothing (the
     /// integrated or dedicated server): text measures as with the full atlas,
@@ -1520,10 +1504,15 @@ impl HudAtlas {
             {
                 translucent.insert(name.clone());
             }
-            for row in 0..*h {
-                let src = &data[(row * w * 4) as usize..((row + 1) * w * 4) as usize];
-                let dst = (((py + row) * width + px) * 4) as usize;
-                pixels[dst..dst + (w * 4) as usize].copy_from_slice(src);
+            // Runtime slots start transparent and receive their first image through
+            // `upload_patches`; leaving their staging buffers empty avoids reserving
+            // tens of megabytes of zeroed CPU memory during every resource load.
+            if !data.is_empty() {
+                for row in 0..*h {
+                    let src = &data[(row * w * 4) as usize..((row + 1) * w * 4) as usize];
+                    let dst = (((py + row) * width + px) * 4) as usize;
+                    pixels[dst..dst + (w * 4) as usize].copy_from_slice(src);
+                }
             }
             let b = u32::from(bordered.contains(name));
             let (px, py, w, h) = (px + b, py + b, w - 2 * b, h - 2 * b);
@@ -3092,6 +3081,19 @@ mod coverage_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_slots_start_without_staging_buffers() {
+        let mut images = Vec::new();
+        HudAtlas::slots(&mut images, (32, 32), false);
+        assert!(!images.is_empty());
+        assert!(images.iter().all(|(_, _, _, pixels)| pixels.is_empty()));
+
+        let mut with_mod = Vec::new();
+        HudAtlas::slots(&mut with_mod, (32, 32), true);
+        assert_eq!(with_mod.len(), images.len() + 1);
+        assert!(with_mod.iter().all(|(_, _, _, pixels)| pixels.is_empty()));
+    }
 
     #[test]
     fn object_skin_revision_tracks_changes_and_capacity_clear() {

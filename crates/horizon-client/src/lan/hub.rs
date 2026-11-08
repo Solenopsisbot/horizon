@@ -2753,10 +2753,14 @@ impl Hub {
             })
             .collect();
         self.encoder.warm(&columns.chunks);
-        let mut encoded = self.encoder.bodies_with(&columns.chunks, world, &|x, z| {
-            ctx.streaming.and_then(|s| s.proto_sections(x, z))
-        });
-        let uses = &mut columns.uses;
+        let encoded: Vec<Arc<[u8]>> = self
+            .encoder
+            .bodies_with(&columns.chunks, world, &|x, z| {
+                ctx.streaming.and_then(|s| s.proto_sections(x, z))
+            })
+            .into_iter()
+            .map(Arc::<[u8]>::from)
+            .collect();
         let chunks = &columns.chunks;
         for (i, taken, far, batch) in batches {
             let g = &mut self.guests[i];
@@ -2766,20 +2770,16 @@ impl Hub {
             if size > 0 {
                 g.batch_quota -= size as f32;
                 g.send(&C::ChunkBatchStart(horizon_protocol::packets::Empty));
-                g.sender.send_many(batch.into_iter().map(|body| match body {
-                    Body::Level(j) => {
-                        if memory {
-                            super::handoff::offer(chunks[j]);
-                        }
-                        uses[j] -= 1;
-                        if uses[j] == 0 {
-                            std::mem::take(&mut encoded[j])
-                        } else {
+                g.sender
+                    .send_shared_many(batch.into_iter().map(|body| match body {
+                        Body::Level(j) => {
+                            if memory {
+                                super::handoff::offer(chunks[j]);
+                            }
                             encoded[j].clone()
                         }
-                    }
-                    Body::Saved(body) => body.to_vec(),
-                }));
+                        Body::Saved(body) => body,
+                    }));
                 g.send(&C::ChunkBatchFinished(play::ChunkBatchFinished {
                     size: size as i32,
                 }));
