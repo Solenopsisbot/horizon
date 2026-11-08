@@ -895,23 +895,22 @@ fn tickets(m: &Mob, w: &MobWorld, p: [i32; 3]) -> usize {
         }
     }
     if let Some(others) = w.villager_tickets {
-        if let Some(&i) = w.others_index.and_then(|index| index.get(&m.id)) {
-            if let Some(o) = w.others.get(i as usize)
-                && o.id == m.id
-                && o.alive
-                && o.species == Species::Villager
+        if let Some(&i) = w.others_index.and_then(|index| index.get(&m.id))
+            && let Some(o) = w.others.get(i as usize)
+            && o.id == m.id
+            && o.alive
+            && o.species == Species::Villager
+        {
+            n += others.get(&p).copied().unwrap_or(0);
+            for q in [o.job, o.bed, o.potential_job, o.meeting]
+                .into_iter()
+                .flatten()
             {
-                n += others.get(&p).copied().unwrap_or(0);
-                for q in [o.job, o.bed, o.potential_job, o.meeting]
-                    .into_iter()
-                    .flatten()
-                {
-                    if q == p {
-                        n = n.saturating_sub(1);
-                    }
+                if q == p {
+                    n = n.saturating_sub(1);
                 }
-                return n;
             }
+            return n;
         }
         return n + others.get(&p).copied().unwrap_or(0);
     }

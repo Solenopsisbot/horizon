@@ -78,6 +78,18 @@ pub mod job_stats {
             STALE_MESHES.swap(0, Ordering::Relaxed),
         )
     }
+    /// (kind, nanoseconds, count) since the last call; resets them.
+    pub fn take() -> Vec<(&'static str, u64, u64)> {
+        (0..KINDS.len())
+            .map(|i| {
+                (
+                    KINDS[i],
+                    NANOS[i].swap(0, Ordering::Relaxed),
+                    COUNT[i].swap(0, Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -92,18 +104,6 @@ pub mod job_stats {
             assert_eq!(take_queue_stats(), (0, 0));
             enable(false);
         }
-    }
-    /// (kind, nanoseconds, count) since the last call; resets them.
-    pub fn take() -> Vec<(&'static str, u64, u64)> {
-        (0..KINDS.len())
-            .map(|i| {
-                (
-                    KINDS[i],
-                    NANOS[i].swap(0, Ordering::Relaxed),
-                    COUNT[i].swap(0, Ordering::Relaxed),
-                )
-            })
-            .collect()
     }
 }
 /// A chunk under generation, opaque to the streamer.

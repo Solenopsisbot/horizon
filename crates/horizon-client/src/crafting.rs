@@ -1558,7 +1558,7 @@ impl Recipes {
         let mut custom: HashMap<String, Vec<CustomRecipe>> = HashMap::new();
         let mut meta = HashMap::new();
         for (name, v) in order {
-            if let Some(kind) = custom_type(&v) {
+            if let Some(kind) = custom_type(v) {
                 let id = if name.contains(':') {
                     name.to_owned()
                 } else {
