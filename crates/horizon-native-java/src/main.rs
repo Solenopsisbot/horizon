@@ -1,6 +1,6 @@
 use horizon_native_java::{
-    ClassFile, MethodRef, MixinInjectionPlan, NativeJar, StdHost, mixin_plans_in_weave_order,
-    weave_class_with_extras, weave_classes_with_extras,
+    ClassFile, Entrypoint, MethodRef, MixinInjectionPlan, NativeJar, StdHost,
+    mixin_plans_in_weave_order, weave_class_with_extras, weave_classes_with_extras,
 };
 use std::{
     collections::BTreeMap,
@@ -558,6 +558,44 @@ fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
     })
 }
 
+fn execution_json(
+    kind: &str,
+    entrypoints: &[Entrypoint],
+    calls: usize,
+    host: &StdHost,
+    jar: &NativeJar,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "ok",
+        "kind": kind,
+        "entrypoints": entrypoints.iter().map(|entry| &entry.class).collect::<Vec<_>>(),
+        "host_calls": calls,
+        "unknown_host_call_count": host.unknown_host_call_count(),
+        "unknown_host_calls": host.unknown_host_calls(),
+        "payload_directions": host
+            .payload_registrations()
+            .iter()
+            .map(|registration| registration.direction.clone())
+            .collect::<Vec<_>>(),
+        "registrations": host
+            .registrations()
+            .iter()
+            .map(|entry| serde_json::json!({
+                "registry": entry.registry,
+                "id": entry.id,
+                "typed": entry.declaration.is_some(),
+            }))
+            .collect::<Vec<_>>(),
+        "listeners": host.listener_registrations().count(),
+        "events": host.posted_events().len(),
+        "mixin_targets": mixin_target_labels(
+            jar.discovered_mixin_targets().iter()
+        ),
+        "mixin_plans": jar.mixin_injection_plans().len(),
+        "mixin_configs": jar.mixin_configs().len(),
+    })
+}
+
 fn main() -> ExitCode {
     let Some(cli) = Cli::parse(std::env::args().skip(1)) else {
         eprintln!(
@@ -656,41 +694,15 @@ fn main() -> ExitCode {
         None => {
             if json {
                 let commands = command_summary(&jar, &host, kind != "client");
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "status": "ok",
-                        "kind": kind,
-                        "entrypoints": entrypoints.iter().map(|entry| &entry.class).collect::<Vec<_>>(),
-                        "host_calls": calls,
-                        "payload_directions": host
-                            .payload_registrations()
-                            .iter()
-                            .map(|registration| registration.direction.clone())
-                            .collect::<Vec<_>>(),
-                        "registrations": host
-                            .registrations()
-                            .iter()
-                            .map(|entry| serde_json::json!({
-                                "registry": entry.registry,
-                                "id": entry.id,
-                                "typed": entry.declaration.is_some(),
-                            }))
-                            .collect::<Vec<_>>(),
-                        "listeners": host.listener_registrations().count(),
-                        // The listeners the game can fire, by event name, and
-                        // the registrations on events it never fires.
-                        "game_listeners": game_listener_counts(&host, &jar, kind != "client"),
-                        // The command tree its registration callbacks build.
-                        "commands": commands,
-                        "events": host.posted_events().len(),
-                        "mixin_targets": mixin_target_labels(
-                            jar.discovered_mixin_targets().iter()
-                        ),
-                        "mixin_plans": jar.mixin_injection_plans().len(),
-                        "mixin_configs": jar.mixin_configs().len(),
-                    })
-                );
+                println!("{}", {
+                    let mut report = execution_json(&kind, &entrypoints, calls, &host, &jar);
+                    // The listeners the game can fire, by event name, and
+                    // the registrations on events it never fires.
+                    report["game_listeners"] = game_listener_counts(&host, &jar, kind != "client");
+                    // The command tree its registration callbacks build.
+                    report["commands"] = commands;
+                    report
+                });
             } else {
                 println!(
                     "native {} entrypoint(s) ran ({} host calls)",
@@ -1201,6 +1213,46 @@ mod tests {
             errors[0][1].as_str().unwrap().contains("JSON object"),
             "reason names the shape: {}",
             errors[0][1]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn execution_report_carries_unknown_host_call_counts() {
+        use super::execution_json;
+        use horizon_native_java::{Entrypoint, Host, NativeJar, StdHost};
+
+        let root = scratch("unknown_host_report");
+        let jar_path = root.join("report.jar");
+        write_zip(
+            &jar_path,
+            &[(
+                "fabric.mod.json",
+                br#"{"id":"demo","entrypoints":{"main":["demo.Entry"]}}"#,
+            )],
+        );
+
+        let jar = NativeJar::from_path(&jar_path).unwrap();
+        let mut host = StdHost::new();
+        let unknown = MethodRef {
+            owner: "demo/Unmodelled".into(),
+            name: "test".into(),
+            descriptor: "()V".into(),
+        };
+        let _ = host.invoke(&unknown, &[]);
+
+        let entrypoints = vec![Entrypoint {
+            class: "demo.Entry".into(),
+            method: None,
+            adapter: None,
+        }];
+        let report = execution_json("main", &entrypoints, 1, &host, &jar);
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["host_calls"], 1);
+        assert_eq!(report["unknown_host_call_count"], 1);
+        assert_eq!(
+            report["unknown_host_calls"],
+            serde_json::json!([["demo/Unmodelled#test()V", 1]])
         );
         let _ = std::fs::remove_dir_all(root);
     }
