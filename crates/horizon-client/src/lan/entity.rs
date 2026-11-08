@@ -971,7 +971,7 @@ pub struct Viewer<'a> {
     pub chunks: &'a crate::fast_hash::FxHashSet<(i32, i32)>,
     pub tracker: &'a mut Tracker,
     /// What the tick sends it, in order.
-    pub out: &'a mut Vec<Vec<u8>>,
+    pub out: &'a mut Vec<Arc<[u8]>>,
     /// Where the entities it stops tracking were last sent, when asked (the prediction's replay).
     pub gone: Option<&'a mut Vec<[f64; 3]>>,
 }
@@ -1066,16 +1066,21 @@ pub struct Entities {
     is_moved: Vec<bool>,
     /// One entity's packets and their bodies, kept between entities.
     packets: Vec<play::Clientbound>,
-    bodies: Vec<Vec<u8>>,
+    bodies: Vec<Arc<[u8]>>,
 }
 
 /// The client sees the entity this tick, and already tracked it.
 const SEES: u8 = 1;
 const TRACKS: u8 = 2;
 
-fn encode_all(packets: &[play::Clientbound], bodies: &mut Vec<Vec<u8>>) {
+fn encode_all(packets: &[play::Clientbound], bodies: &mut Vec<Arc<[u8]>>) {
     bodies.clear();
-    bodies.extend(packets.iter().map(play::Clientbound::encode));
+    bodies.extend(
+        packets
+            .iter()
+            .map(play::Clientbound::encode)
+            .map(Arc::<[u8]>::from),
+    );
 }
 
 impl Entities {
@@ -1123,7 +1128,7 @@ impl Entities {
                 (e.position[0].floor() as i32) >> 4,
                 (e.position[2].floor() as i32) >> 4,
             )];
-            let mut bodies = None;
+            let mut bodies: Option<Vec<Arc<[u8]>>> = None;
             for v in &mut *viewers {
                 if v.entity_id == e.id
                     || v.tracker.is_tracking(e.id)
@@ -1140,6 +1145,7 @@ impl Entities {
                     packets
                         .iter()
                         .map(play::Clientbound::encode)
+                        .map(Arc::<[u8]>::from)
                         .collect::<Vec<_>>()
                 });
                 v.out.extend(bodies.iter().cloned());
@@ -1436,10 +1442,10 @@ impl Entities {
                 });
             }
             if !removed.is_empty() {
-                v.out.push(
+                v.out.push(Arc::from(
                     play::Clientbound::RemoveEntities(play::RemoveEntities { ids: removed })
                         .encode(),
-                );
+                ));
             }
         }
         for (index, e) in entities.iter().enumerate() {
@@ -1474,7 +1480,7 @@ impl Entities {
                 continue;
             }
             let mut encoded = false;
-            let mut pairing: Option<Vec<Vec<u8>>> = None;
+            let mut pairing: Option<Vec<Arc<[u8]>>> = None;
             for (v, flags) in viewers.iter_mut().zip(&self.flags) {
                 let f = flags[index];
                 if f & TRACKS != 0 {
@@ -1493,7 +1499,11 @@ impl Entities {
                     let bodies = pairing.get_or_insert_with(|| {
                         let mut packets = Vec::new();
                         s.pairing(e, kind, riding, &mut packets);
-                        packets.iter().map(play::Clientbound::encode).collect()
+                        packets
+                            .iter()
+                            .map(play::Clientbound::encode)
+                            .map(Arc::<[u8]>::from)
+                            .collect()
                     });
                     v.out.extend(bodies.iter().cloned());
                     if synced && !self.packets.is_empty() {
@@ -2027,8 +2037,9 @@ mod tests {
             for out in &mut self.out {
                 out.clear();
             }
+            let mut shared_out: [Vec<Arc<[u8]>>; 2] = Default::default();
             let [t0, t1] = &mut self.trackers;
-            let [o0, o1] = &mut self.out;
+            let [o0, o1] = &mut shared_out;
             let mut viewers = [
                 Viewer {
                     entity_id: 1,
@@ -2056,6 +2067,10 @@ mod tests {
                 },
             ];
             level.tick(entities, &Riding::default(), &mut viewers, |_| Some(100));
+            drop(viewers);
+            for (out, shared) in self.out.iter_mut().zip(shared_out) {
+                out.extend(shared.into_iter().map(|body| body.to_vec()));
+            }
         }
     }
 

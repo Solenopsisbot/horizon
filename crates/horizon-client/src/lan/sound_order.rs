@@ -6,6 +6,7 @@ use horizon_protocol::{
     ids::play::clientbound as ids,
     packets::play::{self, Clientbound as C},
 };
+use std::sync::Arc;
 
 #[derive(Default)]
 pub(super) struct SoundOrder {
@@ -95,13 +96,13 @@ impl Hub {
 
     /// Entity tracking already builds packet bodies. Split its removal batch
     /// without decoding or changing any of its pairing/movement packets.
-    pub(super) fn hold_sound_removals(&self, conn: u32, packets: &mut Vec<Vec<u8>>) {
+    pub(super) fn hold_sound_removals(&self, conn: u32, packets: &mut Vec<Arc<[u8]>>) {
         let mut order = self.sound_order.lock().unwrap();
         if order.protected.is_empty() {
             return;
         }
         packets.retain_mut(|body| {
-            let mut reader = Reader::new(body);
+            let mut reader = Reader::new(body.as_ref());
             if reader.varint().unwrap() != ids::REMOVE_ENTITIES {
                 return true;
             }
@@ -128,7 +129,7 @@ impl Hub {
                 return false;
             }
             debug_assert!(packet.ids.len() < original);
-            *body = C::RemoveEntities(packet).encode();
+            *body = Arc::from(C::RemoveEntities(packet).encode());
             true
         });
     }

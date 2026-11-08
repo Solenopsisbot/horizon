@@ -424,7 +424,7 @@ pub struct Hub {
     /// before the level's ChunkMap.tick (`Entities::synced`).
     pub synced: Vec<(i32, i32)>,
     /// What one tick of entity tracking sends each guest, kept between ticks.
-    entity_out: Vec<Vec<Vec<u8>>>,
+    entity_out: Vec<Vec<Arc<[u8]>>>,
     /// Each placed guest's entities gone this tick, where they were last sent (only while the
     /// prediction records).
     entity_gone: Vec<Vec<[f64; 3]>>,
@@ -3397,7 +3397,7 @@ impl Hub {
             return;
         }
         let dimension = &self.config.dimension;
-        let mut outs: Vec<Vec<Vec<u8>>> = self
+        let mut outs: Vec<Vec<Arc<[u8]>>> = self
             .guests
             .iter()
             .filter(|g| self.here(g))
@@ -3429,7 +3429,7 @@ impl Hub {
         });
         drop(viewers);
         for (g, out) in self.guests.iter().filter(|g| self.here(g)).zip(&mut outs) {
-            g.sender.send_many(out.drain(..));
+            g.sender.send_shared_many(out.drain(..));
         }
     }
 
@@ -3531,7 +3531,7 @@ impl Hub {
         drop(viewers);
         for (g, out) in self.guests.iter().filter(|g| here(g)).zip(outs.iter_mut()) {
             self.hold_sound_removals(g.conn, out);
-            g.sender.send_many(out.drain(..));
+            g.sender.send_shared_many(out.drain(..));
         }
         let ticks = self.ticks;
         for (g, gone) in self
