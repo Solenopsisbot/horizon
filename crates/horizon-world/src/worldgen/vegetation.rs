@@ -125,7 +125,7 @@ impl VegetationPatchFeature {
         let mut surface = self.ground_patch(world, random, origin, x_radius, z_radius)?;
         if self.waterlogged {
             let mut water = PosSet::default();
-            for p in surface.to_vec() {
+            for p in surface.iter() {
                 let mut exposed = false;
                 for direction in [
                     Direction::North,
@@ -152,18 +152,17 @@ impl VegetationPatchFeature {
                 .blocks
                 .default_state("minecraft:water")
                 .ok_or(FeatureExecutionError::InvalidState)?;
-            for p in water.to_vec() {
+            for p in water.iter() {
                 write(world, p, water_state, 2)?;
             }
             surface = water;
         }
-        let positions = surface.to_vec();
-        for p in &positions {
+        for p in surface.iter() {
             if self.vegetation_chance > 0.0 && random.next_float() < self.vegetation_chance {
-                self.place_vegetation(world, random, *p, nested)?;
+                self.place_vegetation(world, random, p, nested)?;
             }
         }
-        Ok(!positions.is_empty())
+        Ok(!surface.is_empty())
     }
     fn place_vegetation<W: FeatureWorld + PlacementContext, R: RandomSource>(
         &self,
