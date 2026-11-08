@@ -385,7 +385,8 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
             return Ok(state);
         }
         let previous = self.set_block_raw(x, y, z, state)?;
-        let mut missing = Vec::new();
+        let mut missing = [HeightmapType::WorldSurfaceWg; HeightmapType::ALL.len()];
+        let mut missing_len = 0;
         for &kind in self.stage.heightmaps() {
             match self.heightmap(kind) {
                 // `Heightmap::update` would return at once: no state is read.
@@ -397,11 +398,14 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
                 Some(_) => {
                     self.update_heightmap(kind, x & 15, y, z & 15, state)?;
                 }
-                None => missing.push(kind),
+                None => {
+                    missing[missing_len] = kind;
+                    missing_len += 1;
+                }
             }
         }
-        if !missing.is_empty() {
-            self.prime_heightmaps(&missing)?;
+        if missing_len != 0 {
+            self.prime_heightmaps(&missing[..missing_len])?;
         }
         Ok(previous)
     }
