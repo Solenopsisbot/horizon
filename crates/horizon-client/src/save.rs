@@ -1409,7 +1409,7 @@ pub fn encode_with(
     shape: LevelShape,
 ) -> NamedTag {
     let sky_light = shape.sky_light;
-    let mut sections = Vec::new();
+    let mut sections = Vec::with_capacity(chunk.sections.len());
     let air = tables.map_or(0, |t| t.air);
     // Sky layers below the highest section with light other than 15 are
     // written (even all-zero ones): vanilla derives missing layers from the
@@ -1516,84 +1516,90 @@ pub fn encode_with(
                 },
             )
         };
-    let mut block_entities: Vec<Tag> = chunk
-        .block_entities
-        .iter()
-        // A mod block entity a native mod is ticking right now
-        // (`tick_mod_block_entity`): its data is out of the world.
-        .filter(|(_, e)| !matches!(e, crate::containers::BlockEntity::Mod(m) if m.id.is_empty()))
-        .map(|(p, e)| {
-            let block = block_name(p);
-            let mut current = encode_block_entity(*p, e, &block);
-            if let Some(&name_index) = block_name_indices.as_ref().and_then(|i| i.get(p))
-                && let Tag::Compound(map) = &mut current
-            {
-                map.insert("CustomName".into(), chunk.block_names[name_index].1.clone());
-            }
-            let source = source_indices
-                .as_ref()
-                .and_then(|indices| indices.get(p))
-                .and_then(|&index| extras.map(|x| &x.block_entity_sources[index].1))
-                .filter(|tag| {
-                    crate::block_entity_nbt::id(tag) == crate::block_entity_nbt::id(&current)
-                });
-            let merged = match source {
-                Some(original) => {
-                    let loaded = decode_block_entity(original).map_or_else(
-                        || current.clone(),
-                        |(q, e)| {
-                            let mut loaded = encode_block_entity(q, &e, &block);
-                            if !matches!(
-                                e,
-                                crate::containers::BlockEntity::Banner(_)
-                                    | crate::containers::BlockEntity::Sign(_)
-                                    | crate::containers::BlockEntity::Mod(_)
-                            ) && let Some(name) = original
-                                .get("CustomName")
-                                .and_then(crate::block_entity_nbt::component)
-                                && let Tag::Compound(map) = &mut loaded
-                            {
-                                // BaseContainerBlockEntity.loadAdditional: the
-                                // external name is also part of the loaded model.
-                                // Its removal must win over the source overlay.
-                                map.insert("CustomName".into(), name);
-                            }
-                            loaded
-                        },
-                    );
-                    merge_block_entity(original, &loaded, &current)
+    let mut block_entities: Vec<Tag> = Vec::with_capacity(
+        chunk.block_entities.len() + extras.map_or(0, |e| e.block_entities.len()),
+    );
+    block_entities.extend(
+        chunk
+            .block_entities
+            .iter()
+            // A mod block entity a native mod is ticking right now
+            // (`tick_mod_block_entity`): its data is out of the world.
+            .filter(
+                |(_, e)| !matches!(e, crate::containers::BlockEntity::Mod(m) if m.id.is_empty()),
+            )
+            .map(|(p, e)| {
+                let block = block_name(p);
+                let mut current = encode_block_entity(*p, e, &block);
+                if let Some(&name_index) = block_name_indices.as_ref().and_then(|i| i.get(p))
+                    && let Tag::Compound(map) = &mut current
+                {
+                    map.insert("CustomName".into(), chunk.block_names[name_index].1.clone());
                 }
-                None => current,
-            };
-            let mut saved = crate::block_entity_nbt::canonical(&merged).unwrap_or(merged);
-            if let Some(attachments) = attachment_indices
-                .as_ref()
-                .and_then(|indices| indices.get(p))
-                .and_then(|&index| extras.map(|e| &e.block_entity_attachments[index].1))
-                && let Tag::Compound(map) = &mut saved
-                && attachment_compound(map.get(&ATTACHMENTS_KEY.into())).is_ok()
-            {
-                let data = attachments.to_nbt();
-                if data.is_empty() {
-                    map.remove(&ATTACHMENTS_KEY.into());
-                } else {
-                    map.insert(ATTACHMENTS_KEY.into(), Tag::Compound(data));
+                let source = source_indices
+                    .as_ref()
+                    .and_then(|indices| indices.get(p))
+                    .and_then(|&index| extras.map(|x| &x.block_entity_sources[index].1))
+                    .filter(|tag| {
+                        crate::block_entity_nbt::id(tag) == crate::block_entity_nbt::id(&current)
+                    });
+                let merged = match source {
+                    Some(original) => {
+                        let loaded = decode_block_entity(original).map_or_else(
+                            || current.clone(),
+                            |(q, e)| {
+                                let mut loaded = encode_block_entity(q, &e, &block);
+                                if !matches!(
+                                    e,
+                                    crate::containers::BlockEntity::Banner(_)
+                                        | crate::containers::BlockEntity::Sign(_)
+                                        | crate::containers::BlockEntity::Mod(_)
+                                ) && let Some(name) = original
+                                    .get("CustomName")
+                                    .and_then(crate::block_entity_nbt::component)
+                                    && let Tag::Compound(map) = &mut loaded
+                                {
+                                    // BaseContainerBlockEntity.loadAdditional: the
+                                    // external name is also part of the loaded model.
+                                    // Its removal must win over the source overlay.
+                                    map.insert("CustomName".into(), name);
+                                }
+                                loaded
+                            },
+                        );
+                        merge_block_entity(original, &loaded, &current)
+                    }
+                    None => current,
+                };
+                let mut saved = crate::block_entity_nbt::canonical(&merged).unwrap_or(merged);
+                if let Some(attachments) = attachment_indices
+                    .as_ref()
+                    .and_then(|indices| indices.get(p))
+                    .and_then(|&index| extras.map(|e| &e.block_entity_attachments[index].1))
+                    && let Tag::Compound(map) = &mut saved
+                    && attachment_compound(map.get(&ATTACHMENTS_KEY.into())).is_ok()
+                {
+                    let data = attachments.to_nbt();
+                    if data.is_empty() {
+                        map.remove(&ATTACHMENTS_KEY.into());
+                    } else {
+                        map.insert(ATTACHMENTS_KEY.into(), Tag::Compound(data));
+                    }
                 }
-            }
-            if let Some(r) = rolled_loot_indices
-                .as_ref()
-                .and_then(|indices| indices.get(p))
-                .and_then(|&index| extras.map(|x| &x.rolled_loot[index]))
-                && let Tag::Compound(map) = &mut saved
-                && !r.restore(map)
-            {
-                // A loaded source still carries the table; kept, it rolls again on load.
-                map.remove(&"LootTable".into());
-                map.remove(&"LootTableSeed".into());
-            }
-            saved
-        })
-        .collect();
+                if let Some(r) = rolled_loot_indices
+                    .as_ref()
+                    .and_then(|indices| indices.get(p))
+                    .and_then(|&index| extras.map(|x| &x.rolled_loot[index]))
+                    && let Tag::Compound(map) = &mut saved
+                    && !r.restore(map)
+                {
+                    // A loaded source still carries the table; kept, it rolls again on load.
+                    map.remove(&"LootTable".into());
+                    map.remove(&"LootTableSeed".into());
+                }
+                saved
+            }),
+    );
     if let Some(extras) = extras {
         for raw in &extras.block_entities {
             let pos = (
