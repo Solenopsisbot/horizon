@@ -1408,6 +1408,8 @@ pub struct Renderer {
     lod_retiring: crate::fast_hash::FxHashSet<SectionKey>,
     /// Removed sections fading out over far terrain (`leave_section`).
     lod_leaving: Vec<(SectionKey, std::time::Instant)>,
+    /// Reusable release list for sections whose fade has elapsed.
+    lod_leaving_done: Vec<(SectionKey, std::time::Instant)>,
     /// Reusable column keys for the per-frame visibility walk.
     lod_leaving_keys: FxHashSet<(i32, i32)>,
     /// A mod's hold on the terrain's picture (`hold_world`, gfx/hold.rs) and the new meshes
@@ -5078,6 +5080,7 @@ impl Renderer {
             lod_cutout: Default::default(),
             lod_retiring: Default::default(),
             lod_leaving: Vec::new(),
+            lod_leaving_done: Vec::new(),
             lod_leaving_keys: Default::default(),
             hold: Default::default(),
             lod_pending: None,
@@ -6637,15 +6640,19 @@ impl Renderer {
     }
     /// Releases the sections that have faded out (`leave_section`).
     fn release_left(&mut self, now: std::time::Instant) {
-        let mut done = Vec::new();
-        self.lod_leaving.retain(|&(key, since)| {
+        self.lod_leaving_done.clear();
+        let mut leaving = std::mem::take(&mut self.lod_leaving);
+        leaving.retain(|&(key, since)| {
             let left = now.saturating_duration_since(since) >= lod::FADE;
             if left {
-                done.push((key, since));
+                self.lod_leaving_done.push((key, since));
             }
             !left
         });
-        for (key, since) in done {
+        self.lod_leaving = leaving;
+        let done = std::mem::take(&mut self.lod_leaving_done);
+        for index in 0..done.len() {
+            let (key, since) = done[index];
             // Meshed again since (the player came back): it stays.
             if self
                 .sections
@@ -6655,6 +6662,7 @@ impl Renderer {
                 self.release_section(key);
             }
         }
+        self.lod_leaving_done = done;
     }
     pub fn remove_columns(&mut self, columns: impl IntoIterator<Item = (i32, i32)>) {
         let columns: Vec<(i32, i32)> = columns.into_iter().collect();

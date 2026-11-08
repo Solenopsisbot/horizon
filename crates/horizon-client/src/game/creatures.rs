@@ -114,6 +114,8 @@ pub(super) struct Creatures {
     /// The targets the mobs had before their ticks, kept between ticks
     /// (empty) as `seen_buf` is: `native_living_change_target` hears a change.
     target_buf: Vec<Option<Who>>,
+    /// LAN guest entity ids used by the mob tick, retained between ticks.
+    guest_ids_buf: Vec<(u32, u32)>,
     /// The mobs whose own tick ran in the last `tick_creature_entities`:
     /// `ServerLevel.tick` ticks only the entities in entity-ticking range, so
     /// what the passes after the loop do for a mob's `aiStep`, goals or brain
@@ -1132,6 +1134,16 @@ impl Game<'_> {
     /// The entity phase of `tick_creatures`: every mob's tick, deaths, and the
     /// projectiles and effects that follow from them.
     pub(super) fn tick_creature_entities(&mut self) -> Result<()> {
+        let mut guest_ids = std::mem::take(&mut self.creatures.guest_ids_buf);
+        guest_ids.clear();
+        let result = self.tick_creature_entities_with_guest_ids(&mut guest_ids);
+        self.creatures.guest_ids_buf = guest_ids;
+        result
+    }
+    fn tick_creature_entities_with_guest_ids(
+        &mut self,
+        guest_ids: &mut Vec<(u32, u32)>,
+    ) -> Result<()> {
         // Its steps as spans for `horizon-report` (nothing is read while spans are off).
         let mut laps = horizon_client::spans::laps();
         // LivingEntity.die runs when the killing blow lands: mobs killed
@@ -1197,15 +1209,9 @@ impl Game<'_> {
         };
         // The guests' entity ids by connection, for the shulker bullets fired
         // at the guest a mob sees.
-        let guest_ids: Vec<(u32, u32)> = match self.lan.as_ref() {
-            Some(host) if !guests.is_empty() => host
-                .hub
-                .guests
-                .iter()
-                .map(|g| (g.conn, g.entity_id as u32))
-                .collect(),
-            _ => Vec::new(),
-        };
+        if let Some(host) = self.lan.as_ref().filter(|_| !guests.is_empty()) {
+            guest_ids.extend(host.hub.guests.iter().map(|g| (g.conn, g.entity_id as u32)));
+        }
         let mut guest_events = Vec::new();
         // The block writes since the last tick: mobs re-path around them.
         let path_writes = self
