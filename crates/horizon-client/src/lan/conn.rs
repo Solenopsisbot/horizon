@@ -1997,12 +1997,19 @@ pub(super) fn frame_body(
     };
     let body = &body[..];
     match writer.threshold {
+        None => writer.frame_plain_into(body, out),
         Some(t) if body.len() >= t.max(SHARED_FRAME_MIN) => {
             writer.frame_into(&SharedFrames::get().contents(body, t)?, out);
+            Ok(())
         }
-        threshold => writer.frame_into(&horizon_protocol::frame::contents(body, threshold)?, out),
+        Some(threshold) => {
+            writer.frame_into(
+                &horizon_protocol::frame::contents(body, Some(threshold))?,
+                out,
+            );
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// The keep-alive clock of a play connection, shared by its network thread

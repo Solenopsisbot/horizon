@@ -5159,6 +5159,19 @@ impl Game<'_> {
     /// everywhere.
     fn update_chunk_tickets(&mut self) {
         let rule = self.ui.rules.bool("spectators_generate_chunks");
+        // A title/menu client has no level player or local LAN guests. The
+        // normal path below builds several source vectors before discovering
+        // that client execution has no ticket sources; keep that idle path
+        // allocation-free while still clearing tickets left by a closed world.
+        let has_player = self.player.is_some()
+            || self
+                .lan
+                .as_ref()
+                .is_some_and(|h| h.hub.guests.iter().any(|g| h.hub.here(g)));
+        if self.options.execution_role.is_client() && !has_player {
+            self.tickets.update(None);
+            return;
+        }
         let mut players: Vec<((i32, i32), bool)> = self.lan.as_ref().map_or_else(Vec::new, |h| {
             h.hub
                 .guests
@@ -17736,14 +17749,14 @@ fn load_world_rest(
             });
             let animate = named_scope(scope, "animate", || text(load_animate()));
             let mobs = named_scope(scope, "mobs", || text(load_mobs()));
-            let transformers = text(load_transformers());
+            let transformers = named_scope(scope, "transformers", || text(load_transformers()));
             (
                 items.join().unwrap(),
                 behaviours.join().unwrap(),
                 block_entity_render.join().unwrap(),
                 animate.join().unwrap(),
                 mobs.join().unwrap(),
-                transformers,
+                transformers.join().unwrap(),
             )
         })
     } else {

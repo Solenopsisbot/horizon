@@ -56,6 +56,11 @@ pub struct RegionFile {
     file: File,
     path: PathBuf,
     position: ChunkPos,
+    /// Reused header encoding scratch. Region writes update one header for
+    /// every changed chunk; retaining it avoids zeroing and allocating an
+    /// 8 KiB temporary buffer on each write while the authoritative offsets
+    /// and timestamps remain in the typed arrays below.
+    header: [u8; HEADER],
     offsets: [u32; 1024],
     timestamps: [u32; 1024],
     /// The sectors in use (`RegionBitmap`): the header's two and every
@@ -168,6 +173,7 @@ impl RegionFile {
             file,
             path,
             position,
+            header,
             offsets,
             timestamps,
             used: Vec::new(),
@@ -299,14 +305,13 @@ impl RegionFile {
     /// `RegionFile.writeHeader`: both header sectors from memory, so the
     /// entries dropped as invalid when the file was opened are zero on disk too.
     fn write_header(&mut self) -> io::Result<()> {
-        let mut header = [0; HEADER];
         for i in 0..1024 {
-            header[i * 4..i * 4 + 4].copy_from_slice(&self.offsets[i].to_be_bytes());
-            header[SECTOR + i * 4..SECTOR + i * 4 + 4]
+            self.header[i * 4..i * 4 + 4].copy_from_slice(&self.offsets[i].to_be_bytes());
+            self.header[SECTOR + i * 4..SECTOR + i * 4 + 4]
                 .copy_from_slice(&self.timestamps[i].to_be_bytes());
         }
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&header)
+        self.file.write_all(&self.header)
     }
 
     pub fn chunks(&self) -> impl Iterator<Item = (ChunkPos, u32)> + '_ {

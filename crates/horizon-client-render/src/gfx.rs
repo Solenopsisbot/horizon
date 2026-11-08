@@ -5,7 +5,7 @@ use crate::{
     Result,
     block_entity_render::{StaticCacheFrameStats, StaticSectionRevision, StaticSectionSnapshot},
     environment::Sky,
-    fast_hash::FxHashMap,
+    fast_hash::{FxHashMap, FxHashSet},
     graphics::GraphicsApi,
     hud::{HudBatch, HudRenderer},
     mesher::{Part as Quads, SectionMesh, Sides, TerrainVertex, Vertex, packed},
@@ -1443,6 +1443,11 @@ pub struct Renderer {
     visible_lods: Vec<lod::Visible>,
     /// The sections a shader pack's shadow camera sees (`pack_post::ShadowView`).
     shadow_visible: Vec<resident::Visible>,
+    /// Reusable shadow visibility candidates and deduplication keys.
+    shadow_candidates: Vec<resident::Visible>,
+    shadow_seen: FxHashSet<SectionKey>,
+    /// Reusable translucent shadow draw descriptions.
+    shadow_translucent: Vec<(u64, [u32; 5], (u32, Option<u32>))>,
     translucent_draws: Vec<(u64, usize, [u32; 5], (u32, Option<u32>))>,
     origins: Vec<[f32; 4]>,
     /// `DrawIndexedIndirectArgs` words: index count, instance count, first
@@ -5089,6 +5094,9 @@ impl Renderer {
             visible: Vec::new(),
             visible_lods: Vec::new(),
             shadow_visible: Vec::new(),
+            shadow_candidates: Vec::new(),
+            shadow_seen: FxHashSet::default(),
+            shadow_translucent: Vec::new(),
             translucent_draws: Vec::new(),
             origins: Vec::new(),
             draws: Vec::new(),
@@ -8635,12 +8643,23 @@ impl Renderer {
                         &mut shadow_visible,
                     );
                 }
-                let mut boxed = Vec::new();
-                self.sections
-                    .visible(camera, radius, &light, |_| true, |_, _| false, &mut boxed);
-                let seen: std::collections::HashSet<_> =
-                    shadow_visible.iter().map(|s| s.key).collect();
-                shadow_visible.extend(boxed.into_iter().filter(|s| !seen.contains(&s.key)));
+                self.shadow_candidates.clear();
+                self.sections.visible(
+                    camera,
+                    radius,
+                    &light,
+                    |_| true,
+                    |_, _| false,
+                    &mut self.shadow_candidates,
+                );
+                self.shadow_seen.clear();
+                self.shadow_seen
+                    .extend(shadow_visible.iter().map(|s| s.key));
+                for candidate in self.shadow_candidates.drain(..) {
+                    if !self.shadow_seen.contains(&candidate.key) {
+                        shadow_visible.push(candidate);
+                    }
+                }
             });
             // Nearest the light first, so the depth test rejects what lies under it.
             let light = v.light;
@@ -9114,7 +9133,7 @@ impl Renderer {
         // them for `every_face`), then translucent ones (in their last sorted order; depth
         // decides there).
         let shadow_first = self.draws.len() as u32;
-        let mut shadow_translucent = Vec::new();
+        self.shadow_translucent.clear();
         self.shadow_runs.clear();
         if let Some(view) = &shadow_view {
             let base = listed;
@@ -9158,7 +9177,7 @@ impl Renderer {
                 self.shadow_runs.push(distance, s.page, before, len, [0; 3]);
                 if let Some((index_page, index_start)) = s.sorted_indices {
                     let (page, start) = s.translucent_at;
-                    shadow_translucent.push((
+                    self.shadow_translucent.push((
                         distance,
                         [
                             s.translucent * 6,
@@ -9176,7 +9195,7 @@ impl Renderer {
         self.shadow_runs
             .regroup(&mut self.draws, &mut self.draw_pages, shadow_first as usize);
         self.shadow_runs.clear();
-        for (distance, draw, pages) in shadow_translucent {
+        for (distance, draw, pages) in self.shadow_translucent.drain(..) {
             self.shadow_runs
                 .push(distance, pages.0, self.draws.len(), 1, [0; 3]);
             self.draws.push(draw);

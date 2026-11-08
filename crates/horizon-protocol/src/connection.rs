@@ -701,6 +701,31 @@ impl ConnWriter {
             .bytes_out
             .fetch_add((out.len() - at) as i64, Ordering::Relaxed);
     }
+    /// Frame an already assembled, uncompressed packet body directly.
+    ///
+    /// The ordinary `frame_body` path first builds `frame::contents`, then
+    /// copies that buffer into this output.  Uncompressed packets need no
+    /// intermediate contents buffer, so append the outer length and body in
+    /// one allocation while preserving encryption and wire counters.
+    pub fn frame_plain_into(&mut self, body: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        if body.len() > frame::MAX_FRAME {
+            return Err(Error::new(format!(
+                "packet too large: {} bytes",
+                body.len()
+            )));
+        }
+        let at = out.len();
+        crate::buf::write_varint(out, body.len() as i32);
+        out.extend_from_slice(body);
+        if let Some(c) = &mut self.encrypt {
+            c.encrypt(&mut out[at..]);
+        }
+        self.counters.sent.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .bytes_out
+            .fetch_add((out.len() - at) as i64, Ordering::Relaxed);
+        Ok(())
+    }
     pub fn shutdown(&self) {
         self.stream.shutdown();
     }

@@ -57,7 +57,7 @@ use std::{
     fs, io,
     path::Path,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -941,7 +941,7 @@ struct Pipeline<R: RandomSource> {
     zoom: BiomeZoom,
     biome_cache: BiomeCache,
     biome_work: ChunkWork,
-    carver_cache: Mutex<HashMap<(i32, i32), BiomeId>>,
+    carver_cache: RwLock<HashMap<(i32, i32), BiomeId>>,
     cache_stats: Arc<CacheStats>,
     pub(super) decoration: Option<Arc<super::generator_decoration::Decoration>>,
     pub(super) structures: Option<super::generator_structures::StructureState>,
@@ -1076,7 +1076,7 @@ impl ChunkWork {
     }
 }
 
-type BiomeCache = Mutex<HashMap<(i32, i32), Arc<BiomeChunk<BiomeId>>>>;
+type BiomeCache = RwLock<HashMap<(i32, i32), Arc<BiomeChunk<BiomeId>>>>;
 
 /// `NoiseGeneratorSettings`' `default_block` and `default_fluid`: a block state
 /// in 26.3's form, the id alone or `{"id", "properties"}`.
@@ -1279,9 +1279,9 @@ where
             noises,
             extensions,
             picker,
-            biome_cache: Mutex::new(HashMap::new()),
+            biome_cache: RwLock::new(HashMap::new()),
             biome_work: ChunkWork::new(),
-            carver_cache: Mutex::new(HashMap::new()),
+            carver_cache: RwLock::new(HashMap::new()),
             cache_stats: Arc::new(CacheStats::default()),
             decoration: None,
             structures: None,
@@ -1410,7 +1410,7 @@ where
     ) -> Result<Option<Arc<BiomeChunk<BiomeId>>>, GeneratorError> {
         let stats = cache_stats_enabled();
         let started = stats.then(Instant::now);
-        let cache = self.biome_cache.lock().unwrap();
+        let cache = self.biome_cache.read().unwrap();
         if let Some(started) = started {
             self.cache_stats
                 .biome_lock_wait_ns
@@ -1447,7 +1447,7 @@ where
             }
         };
         let started = stats.then(Instant::now);
-        let cache = self.biome_cache.lock().unwrap();
+        let cache = self.biome_cache.read().unwrap();
         if let Some(started) = started {
             self.cache_stats
                 .biome_lock_wait_ns
@@ -1502,7 +1502,7 @@ where
             })
             .map_err(stage("biomes"))?;
         let chunk = Arc::new(chunk);
-        let mut cache = self.biome_cache.lock().unwrap();
+        let mut cache = self.biome_cache.write().unwrap();
         if cache.len() >= CACHE_LIMIT {
             let started = stats.then(Instant::now);
             cache.clear();
@@ -1528,7 +1528,7 @@ where
             worker.carver_biomes.clear();
         }
         let started = stats.then(Instant::now);
-        let cache = self.carver_cache.lock().unwrap();
+        let cache = self.carver_cache.read().unwrap();
         if let Some(started) = started {
             self.cache_stats
                 .carver_lock_wait_ns
@@ -1560,7 +1560,7 @@ where
             .sample(&mut worker.carver_context, quart)
             .map_err(|e| e.to_string())?;
         let id = self.data.biome_id(name).ok_or_else(|| name.to_owned())?;
-        let mut cache = self.carver_cache.lock().unwrap();
+        let mut cache = self.carver_cache.write().unwrap();
         if cache.len() >= CACHE_LIMIT * 4 {
             let started = stats.then(Instant::now);
             cache.clear();
@@ -2728,12 +2728,12 @@ where
     }
     fn release_caches(&self) {
         // Taken out under the lock, dropped after it.
-        let biomes = std::mem::take(&mut *self.biome_cache.lock().unwrap());
-        let carvers = std::mem::take(&mut *self.carver_cache.lock().unwrap());
+        let biomes = std::mem::take(&mut *self.biome_cache.write().unwrap());
+        let carvers = std::mem::take(&mut *self.carver_cache.write().unwrap());
         drop((biomes, carvers));
     }
     fn cache_census(&self) -> CacheCensus {
-        let biomes = self.biome_cache.lock().unwrap();
+        let biomes = self.biome_cache.read().unwrap();
         let (start_chunks, start_lists) = self
             .structures
             .as_ref()
@@ -2745,7 +2745,7 @@ where
             .map(|b| std::mem::size_of::<BiomeChunk<BiomeId>>() + b.heap_bytes())
             .sum::<usize>()
             + biomes.capacity() * std::mem::size_of::<((i32, i32), usize)>();
-        census.carver_entries = self.carver_cache.lock().unwrap().len();
+        census.carver_entries = self.carver_cache.read().unwrap().len();
         census.start_chunks = start_chunks;
         census.start_lists = start_lists;
         census
@@ -5043,7 +5043,7 @@ mod tests {
         }
         // Force the existing whole-cache biome eviction threshold.
         {
-            let mut cache = pipeline.biome_cache.lock().unwrap();
+            let mut cache = pipeline.biome_cache.write().unwrap();
             cache.clear();
             for x in 0..CACHE_LIMIT as i32 {
                 cache.insert((x, 10000), biomes.clone());
@@ -5052,7 +5052,7 @@ mod tests {
         let mut worker = generator.worker();
         let rebuilt = pipeline.biome_chunk(&mut worker.state, pos).unwrap();
         assert!(!Arc::ptr_eq(biomes, &rebuilt));
-        assert_eq!(pipeline.biome_cache.lock().unwrap().len(), 1);
+        assert_eq!(pipeline.biome_cache.read().unwrap().len(), 1);
         for section in 0..24 {
             assert_eq!(biomes.section(section), rebuilt.section(section));
         }
