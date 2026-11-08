@@ -200,6 +200,13 @@ impl Enchantments {
     /// files) overrides definitions and joins enchantment tags in pack order, a
     /// `replace` file dropping the lower sources' (`TagLoader.load`).
     pub fn load_with(root: &Path, overlay: &horizon_world::loot::PackOverlay) -> Self {
+        Self::load_with_defaults(root, overlay, None)
+    }
+    pub(crate) fn load_with_defaults(
+        root: &Path,
+        overlay: &horizon_world::loot::PackOverlay,
+        defaults: Option<&horizon_world::item_defaults::Defaults>,
+    ) -> Self {
         let data = root.join("data/minecraft");
         let mut raw_tags = read_tag_dir(&data.join("tags/enchantment"));
         for (id, files) in overlay.tag_kind("enchantment") {
@@ -309,7 +316,11 @@ impl Enchantments {
             .map(|(i, e)| (e.id.clone(), i))
             .collect();
         let mut props = HashMap::new();
-        if let Ok(raw) = horizon_world::item_defaults::shared(root) {
+        let owned_defaults = defaults
+            .is_none()
+            .then(|| horizon_world::item_defaults::shared(root).ok())
+            .flatten();
+        if let Some(raw) = defaults.or_else(|| owned_defaults.as_deref()) {
             for (id, c) in raw.iter() {
                 props.insert(
                     Arc::from(id.as_str()),
