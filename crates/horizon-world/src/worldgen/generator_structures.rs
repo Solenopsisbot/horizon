@@ -782,16 +782,19 @@ impl StructureState {
         chunk: ChunkPos,
     ) -> Vec<Arc<StructureStart>> {
         let (bx, bz) = (chunk.x * 16, chunk.z * 16);
-        let around: Vec<ChunkPos> = (chunk.x - 8..=chunk.x + 8)
-            .flat_map(|sx| (chunk.z - 8..=chunk.z + 8).map(move |sz| ChunkPos::new(sx, sz)))
-            .collect();
+        // The search window is always the fixed vanilla 17×17 neighborhood;
+        // keep its coordinates on the stack instead of allocating a Vec per
+        // chunk reference query.
+        let around: [ChunkPos; 17 * 17] = std::array::from_fn(|i| {
+            let sx = chunk.x - 8 + (i / 17) as i32;
+            let sz = chunk.z - 8 + (i % 17) as i32;
+            ChunkPos::new(sx, sz)
+        });
         // Workers generating neighbouring chunks ask for the same starts in the
         // same order: build those no other worker is building first, and wait
         // for the others only then, rather than all queueing behind each one.
-        let found: Vec<Option<Starts>> = around
-            .iter()
-            .map(|&at| self.build_starts(context, at, false))
-            .collect();
+        let found: [Option<Starts>; 17 * 17] =
+            std::array::from_fn(|i| self.build_starts(context, around[i], false));
         let mut out = Vec::new();
         for (&at, found) in around.iter().zip(found) {
             let starts = found.unwrap_or_else(|| self.starts_at(context, at));

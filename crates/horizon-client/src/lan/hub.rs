@@ -3010,9 +3010,9 @@ impl Hub {
             let Some(chunk) = world.chunks.get(&(x, z)) else {
                 continue;
             };
-            let body = self.encoder.light_update(chunk, sections);
+            let body: Arc<[u8]> = Arc::from(self.encoder.light_update(chunk, sections));
             for &i in &viewers {
-                self.guests[i].sender.send(body.clone());
+                self.guests[i].sender.send_shared(body.clone());
             }
         }
     }
@@ -3061,9 +3061,9 @@ impl Hub {
                 if viewers.is_empty() {
                     continue;
                 }
-                let body = self.encoder.body_in(chunk, world);
+                let body: Arc<[u8]> = Arc::from(self.encoder.body_in(chunk, world));
                 for &i in &viewers {
-                    self.guests[i].sender.send(body.clone());
+                    self.guests[i].sender.send_shared(body.clone());
                 }
                 if recording {
                     // The prediction's replay excuses a client near the column: any of its blocks may have
@@ -3147,9 +3147,9 @@ impl Hub {
                         .collect(),
                 })
             };
-            let body = packet.encode();
+            let body: Arc<[u8]> = Arc::from(packet.encode());
             for &i in &viewers {
-                self.guests[i].sender.send(body.clone());
+                self.guests[i].sender.send_shared(body.clone());
             }
             if recording {
                 for &i in &viewers {
@@ -3184,14 +3184,16 @@ impl Hub {
                 let Some(kind) = self.encoder.entity_type(state) else {
                     continue;
                 };
-                let body = C::BlockEntityData(play::BlockEntityData {
-                    pos: [x, y, z],
-                    kind,
-                    tag,
-                })
-                .encode();
+                let body: Arc<[u8]> = Arc::from(
+                    C::BlockEntityData(play::BlockEntityData {
+                        pos: [x, y, z],
+                        kind,
+                        tag,
+                    })
+                    .encode(),
+                );
                 for &i in &viewers {
-                    self.guests[i].sender.send(body.clone());
+                    self.guests[i].sender.send_shared(body.clone());
                 }
             }
         }
