@@ -17773,6 +17773,41 @@ fn load_world_rest(
     let (animate, fog) = animate?;
     let (mob_types, mob_data) = mobs?;
     let (transformers, (player_type, player_arm, player_arm_slim, spin_attack)) = transformers?;
+    // These tables are independent of the gameplay tables above.  On a
+    // multi-worker launch, read them together so slow pack files do not make
+    // the title wait on five sequential directory walks and JSON decodes.
+    let (providers, music, ambient, nether_environment, end_environment) = if threads > 1 {
+        std::thread::scope(|scope| {
+            let providers = named_scope(scope, "providers", || Providers::load(root));
+            let music = named_scope(scope, "music", || {
+                horizon_client::music::MusicTables::load(root)
+            });
+            let ambient = named_scope(scope, "ambient", || {
+                horizon_client::ambience::AmbientTables::load(root)
+            });
+            let nether = named_scope(scope, "nether_environment", || {
+                Environment::load_dimension(root, "the_nether", false).map_err(|e| e.to_string())
+            });
+            let end = named_scope(scope, "end_environment", || {
+                Environment::load_dimension(root, "the_end", false).map_err(|e| e.to_string())
+            });
+            Ok::<_, String>((
+                providers.join().unwrap(),
+                music.join().unwrap(),
+                ambient.join().unwrap(),
+                nether.join().unwrap()?,
+                end.join().unwrap()?,
+            ))
+        })?
+    } else {
+        (
+            Providers::load(root),
+            horizon_client::music::MusicTables::load(root),
+            horizon_client::ambience::AmbientTables::load(root),
+            Environment::load_dimension(root, "the_nether", false)?,
+            Environment::load_dimension(root, "the_end", false)?,
+        )
+    };
     log::info!(
         "Horizon: resources loaded in {:.1}s; {} block states, {} items, {} biomes; {} worker threads",
         started.elapsed().as_secs_f32(),
@@ -17788,14 +17823,14 @@ fn load_world_rest(
         items,
         recipes,
         transformers,
-        providers: Providers::load(root),
+        providers,
         block_entity_render: block_entity_render?,
         animate,
         fog,
-        music: horizon_client::music::MusicTables::load(root),
-        ambient: horizon_client::ambience::AmbientTables::load(root),
-        nether_environment: Environment::load_dimension(root, "the_nether", false)?,
-        end_environment: Environment::load_dimension(root, "the_end", false)?,
+        music,
+        ambient,
+        nether_environment,
+        end_environment,
         behaviours: behaviours?,
         mob_types,
         mob_data,
