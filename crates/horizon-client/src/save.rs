@@ -1528,14 +1528,7 @@ pub fn encode_with(
             if let Some(&name_index) = block_name_indices.as_ref().and_then(|i| i.get(p))
                 && let Tag::Compound(map) = &mut current
             {
-<<<<<<< HEAD
-                map.insert("CustomName".into(), name.clone());
-=======
-                map.insert(
-                    "CustomName".into(),
-                    chunk.block_names[name_index].1.clone(),
-                );
->>>>>>> d1a50a813d (perf: remove repeated startup and hot-path work)
+                map.insert("CustomName".into(), chunk.block_names[name_index].1.clone());
             }
             let source = source_indices
                 .as_ref()
