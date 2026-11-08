@@ -241,6 +241,7 @@ mod tests {
             others_index: None,
             others_villagers: None,
             others_solid: None,
+            villager_tickets: None,
             daylight: true,
             monsters_burn: false,
             game_time: 1000,

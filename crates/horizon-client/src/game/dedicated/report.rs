@@ -363,6 +363,7 @@ impl Game<'_> {
         let costs = tick_profile::take();
         let mob_samples = costs.iter().map(|c| c.mob_ticks).sum();
         let jobs = job_stats::take();
+        let (max_queue_depth, stale_meshes) = job_stats::take_queue_stats();
         let cpu = horizon_bench::cpu_seconds(std::process::id())
             .zip(r.cpu_s)
             .map(|(end, start)| round((end - start) / window_s.max(1e-9)));
@@ -378,6 +379,10 @@ impl Game<'_> {
             "mob_costs": mob_costs(&costs, r.sampled_ticks),
             "mob_sampled_ticks": r.sampled_ticks,
             "chunk_workers": worker_jobs(&jobs, window_s),
+            "chunk_queue": {
+                "max_depth": max_queue_depth,
+                "stale_meshes": stale_meshes,
+            },
             "network": network(&r.wire_start, &self.wire_bytes(), window_s),
             "overhead": overhead(&r, mob_samples, span_ns, mob_ns),
             "players": players,

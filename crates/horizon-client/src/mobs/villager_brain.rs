@@ -10,7 +10,7 @@
 //! other `GateBehavior`s shuffle with a random of their own, seeded with
 //! `Brain::shuffle_seed` when the brain is built.
 use super::{
-    Mob, MobEvent, MobWorld, Species, Who,
+    Mob, MobEvent, MobWorld, Seen, Species, Who,
     brain::{Timed, living_near},
     path::{Path, PathNode},
 };
@@ -880,7 +880,7 @@ fn poi_matches(m: &Mob, f: PoiFilter, p: Poi) -> bool {
 }
 /// Tickets taken on a POI: by this villager's memories and by others'
 /// (counted once per search by [`others_tickets`]).
-fn tickets(m: &Mob, others: &crate::fast_hash::FxHashMap<[i32; 3], usize>, p: [i32; 3]) -> usize {
+fn tickets(m: &Mob, w: &MobWorld, p: [i32; 3]) -> usize {
     let mut n = 0;
     if let Some(mm) = mem_ref(m) {
         for s in [
@@ -894,7 +894,72 @@ fn tickets(m: &Mob, others: &crate::fast_hash::FxHashMap<[i32; 3], usize>, p: [i
             }
         }
     }
-    n + others.get(&p).copied().unwrap_or(0)
+    if let Some(others) = w.villager_tickets {
+        if let Some(&i) = w.others_index.and_then(|index| index.get(&m.id)) {
+            if let Some(o) = w.others.get(i as usize)
+                && o.id == m.id
+                && o.alive
+                && o.species == Species::Villager
+            {
+                n += others.get(&p).copied().unwrap_or(0);
+                for q in [o.job, o.bed, o.potential_job, o.meeting]
+                    .into_iter()
+                    .flatten()
+                {
+                    if q == p {
+                        n = n.saturating_sub(1);
+                    }
+                }
+                return n;
+            }
+        }
+        return n + others.get(&p).copied().unwrap_or(0);
+    }
+    n + others_tickets(m, w).get(&p).copied().unwrap_or(0)
+}
+
+/// Add or remove the four POI memories held by one snapshot villager.
+pub fn update_tickets(
+    tickets: &mut crate::fast_hash::FxHashMap<[i32; 3], usize>,
+    old: &Seen,
+    new: &Seen,
+) {
+    if old.alive && old.species == Species::Villager {
+        for p in [old.job, old.bed, old.potential_job, old.meeting]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(n) = tickets.get_mut(&p) {
+                *n -= 1;
+                if *n == 0 {
+                    tickets.remove(&p);
+                }
+            }
+        }
+    }
+    if new.alive && new.species == Species::Villager {
+        for p in [new.job, new.bed, new.potential_job, new.meeting]
+            .into_iter()
+            .flatten()
+        {
+            *tickets.entry(p).or_insert(0) += 1;
+        }
+    }
+}
+
+pub fn tickets_for(others: &[Seen]) -> crate::fast_hash::FxHashMap<[i32; 3], usize> {
+    let mut tickets = crate::fast_hash::FxHashMap::default();
+    for o in others {
+        if o.alive && o.species == Species::Villager {
+            for p in [o.job, o.bed, o.potential_job, o.meeting]
+                .into_iter()
+                .flatten()
+            {
+                *tickets.entry(p).or_insert(0) += 1;
+            }
+        }
+    }
+    tickets
 }
 /// The tickets the other living villagers' POIs take, by POI.
 pub(super) fn others_tickets(
@@ -952,8 +1017,6 @@ fn pois_in_range(
 ) -> Vec<(Poi, [i32; 3])> {
     let c = block_of(m.position);
     let mut found = Vec::new();
-    // Every candidate asks how taken it is: count the others' once.
-    let mut taken = None;
     let r2 = i64::from(radius) * i64::from(radius);
     let (cx, cz) = (c[0] >> 4, c[2] >> 4);
     let chunks = radius.div_euclid(16) + 1;
@@ -966,8 +1029,7 @@ fn pois_in_range(
                     || (p[2] - c[2]).abs() > radius
                     || dist_sqr(p, c) > r2
                     || !poi_matches(m, f, poi)
-                    || tickets(m, taken.get_or_insert_with(|| others_tickets(m, w)), p)
-                        >= poi.max_tickets()
+                    || tickets(m, w, p) >= poi.max_tickets()
                 {
                     return;
                 }

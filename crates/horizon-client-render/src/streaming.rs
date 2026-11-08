@@ -36,8 +36,14 @@ pub mod job_stats {
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static NANOS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
     static COUNT: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    static MAX_QUEUE: AtomicU64 = AtomicU64::new(0);
+    static STALE_MESHES: AtomicU64 = AtomicU64::new(0);
     pub fn enable(on: bool) {
         ENABLED.store(on, Ordering::Relaxed);
+        if on {
+            MAX_QUEUE.store(0, Ordering::Relaxed);
+            STALE_MESHES.store(0, Ordering::Relaxed);
+        }
     }
     pub(super) fn enabled() -> bool {
         ENABLED.load(Ordering::Relaxed)
@@ -45,6 +51,47 @@ pub mod job_stats {
     pub(super) fn add(kind: usize, nanos: u64) {
         NANOS[kind].fetch_add(nanos, Ordering::Relaxed);
         COUNT[kind].fetch_add(1, Ordering::Relaxed);
+    }
+    pub(super) fn observe_queue(depth: usize) {
+        if !enabled() {
+            return;
+        }
+        let depth = depth as u64;
+        let mut old = MAX_QUEUE.load(Ordering::Relaxed);
+        while depth > old {
+            match MAX_QUEUE.compare_exchange_weak(old, depth, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(current) => old = current,
+            }
+        }
+    }
+    pub(super) fn stale_mesh() {
+        if enabled() {
+            STALE_MESHES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    /// Maximum queued depth and stale mesh results since the last enable.
+    pub fn take_queue_stats() -> (u64, u64) {
+        (
+            MAX_QUEUE.swap(0, Ordering::Relaxed),
+            STALE_MESHES.swap(0, Ordering::Relaxed),
+        )
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn queue_stats_capture_opt_in_depth_and_stale_results() {
+            enable(true);
+            observe_queue(3);
+            observe_queue(1);
+            stale_mesh();
+            assert_eq!(take_queue_stats(), (3, 1));
+            assert_eq!(take_queue_stats(), (0, 0));
+            enable(false);
+        }
     }
     /// (kind, nanoseconds, count) since the last call; resets them.
     pub fn take() -> Vec<(&'static str, u64, u64)> {
@@ -1310,13 +1357,18 @@ impl Streaming {
     fn submit(&mut self, at: Option<(i32, i32)>, bias: i64, job: Job) {
         self.order += 1;
         let priority = at.map_or(i64::MIN, |(x, z)| self.distance(x, z) * 4 + bias);
-        self.shared.queue.lock().unwrap().push(Queued {
+        let mut queue = self.shared.queue.lock().unwrap();
+        queue.push(Queued {
             priority,
             at,
             bias,
             order: self.order,
             job,
         });
+        if job_stats::enabled() {
+            job_stats::observe_queue(queue.len());
+        }
+        drop(queue);
         self.jobs.notify();
     }
     /// Rank the queued jobs again when what their priorities were computed
@@ -1738,6 +1790,7 @@ impl Streaming {
                 }
                 Done::Meshed(x, sy, z, mesh, seq) => {
                     if self.meshing.get(&(x, sy, z)) != Some(&seq) {
+                        job_stats::stale_mesh();
                         stale.push(((x, sy, z), mesh));
                         continue;
                     }

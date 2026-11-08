@@ -3214,6 +3214,8 @@ pub struct MobWorld<'a> {
     /// The slots of `others` that may stop a moving mob
     /// ([`Seen::may_block_mobs`]), when the caller keeps them; None: any.
     pub others_solid: Option<&'a [u32]>,
+    /// Counts of POI tickets held by the snapshot villagers, maintained for a mob tick.
+    pub villager_tickets: Option<&'a crate::fast_hash::FxHashMap<[i32; 3], usize>>,
     pub daylight: bool,
     /// The `gameplay/monsters_burn` attribute: the overworld day timeline's
     /// step track, false in every other dimension.

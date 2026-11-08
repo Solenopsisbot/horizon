@@ -135,6 +135,14 @@ struct Cells {
     horizontal: [i32; 12],
 }
 
+/// Surface-level samples on the regular quart lattice prepared for this
+/// aquifer. Queries outside the prepared rectangle use `surfaces` below.
+struct SurfacePlane {
+    low: [i32; 2],
+    sizes: [i32; 2],
+    values: Vec<i32>,
+}
+
 pub struct NoiseBasedAquifer<P, F, B> {
     samplers: AquiferSamplers,
     picker: P,
@@ -147,6 +155,7 @@ pub struct NoiseBasedAquifer<P, F, B> {
     locations: Vec<i64>,
     /// Each drawn location as `BlockPos.getX/Y/Z` read it back.
     points: Vec<[i32; 3]>,
+    surface_plane: Option<SurfacePlane>,
     surfaces: HashMap<i64, i32>,
     /// The anchor `cells` holds, once all 12 of its cells are in the grid.
     anchor: Option<[i32; 3]>,
@@ -218,6 +227,7 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
             statuses,
             locations,
             points,
+            surface_plane: None,
             surfaces: HashMap::new(),
             anchor: None,
             column: [0; 2],
@@ -253,7 +263,22 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
             .zip(self.statuses.iter().copied())
     }
     pub fn cached_surfaces(&self) -> impl Iterator<Item = (i64, i32)> + '_ {
-        self.surfaces.iter().map(|(key, value)| (*key, *value))
+        let plane = self.surface_plane.iter().flat_map(|plane| {
+            (0..plane.sizes[1]).flat_map(move |z| {
+                (0..plane.sizes[0]).map(move |x| {
+                    let index = (z * plane.sizes[0] + x) as usize;
+                    (
+                        ChunkPos::new(
+                            plane.low[0].wrapping_add(x).wrapping_shl(2),
+                            plane.low[1].wrapping_add(z).wrapping_shl(2),
+                        )
+                        .pack(),
+                        plane.values[index],
+                    )
+                })
+            })
+        });
+        plane.chain(self.surfaces.iter().map(|(key, value)| (*key, *value)))
     }
     pub fn should_schedule_fluid_update(&self) -> bool {
         self.schedule
@@ -293,6 +318,16 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
     ) -> Result<i32, AquiferError> {
         let x = (x >> 2).wrapping_shl(2);
         let z = (z >> 2).wrapping_shl(2);
+        if let Some(plane) = &self.surface_plane {
+            let px = x >> 2;
+            let pz = z >> 2;
+            let dx = px.wrapping_sub(plane.low[0]);
+            let dz = pz.wrapping_sub(plane.low[1]);
+            if dx >= 0 && dx < plane.sizes[0] && dz >= 0 && dz < plane.sizes[1] {
+                let index = (dz * plane.sizes[0] + dx) as usize;
+                return Ok(plane.values[index]);
+            }
+        }
         let key = ChunkPos::new(x, z).pack();
         if let Some(level) = self.surfaces.get(&key) {
             return Ok(*level);
@@ -328,25 +363,43 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
         self.samplers
             .get(AquiferField::SurfaceLevel)
             .sample_volume(context, &mut buffer, volume)?;
-        self.surfaces
-            .try_reserve(volume.size())
-            .map_err(|_| AquiferError::Allocation)?;
+        // Keep the old map path for a grid whose quart-coordinate range wraps
+        // i32. The packed keys would then alias, while the dense plane assumes
+        // one distinct coordinate per cell.
+        let dense = sizes
+            .iter()
+            .zip(low)
+            .all(|(&size, start)| start.checked_add(size.saturating_sub(1)).is_some());
+        let mut values = Vec::new();
+        if dense {
+            values
+                .try_reserve_exact(volume.size())
+                .map_err(|_| AquiferError::Allocation)?;
+            values.resize(volume.size(), 0);
+        }
         let mut maximum = i32::MIN;
         let mut index = 0;
         for z in 0..sizes[1] {
             for x in 0..sizes[0] {
                 let value = (buffer[index] as f64).floor() as i32;
                 index += 1;
-                self.surfaces.insert(
-                    ChunkPos::new(
-                        low[0].wrapping_add(x).wrapping_shl(2),
-                        low[1].wrapping_add(z).wrapping_shl(2),
-                    )
-                    .pack(),
-                    value,
-                );
+                if dense {
+                    values[(z * sizes[0] + x) as usize] = value;
+                } else {
+                    self.surfaces.insert(
+                        ChunkPos::new(
+                            low[0].wrapping_add(x).wrapping_shl(2),
+                            low[1].wrapping_add(z).wrapping_shl(2),
+                        )
+                        .pack(),
+                        value,
+                    );
+                }
                 maximum = maximum.max(value);
             }
+        }
+        if dense {
+            self.surface_plane = Some(SurfacePlane { low, sizes, values });
         }
         Ok(maximum)
     }
