@@ -449,11 +449,14 @@ impl Game<'_> {
     /// Keep the player's model in step with the player (`LivingEntity.tick`
     /// body turning, `WalkAnimationState`, the swing and the pose).
     pub(super) fn tick_player_model(&mut self) {
-        let scale = self
-            .player
-            .as_mut()
-            .and_then(|p| p.attribute("minecraft:scale").ok())
-            .unwrap_or(1.0) as f32;
+        let (scale, name_tag, below_name) = self.player.as_mut().map_or((1.0, 64.0, 10.0), |p| {
+            (
+                p.attribute("minecraft:scale").unwrap_or(1.0),
+                p.attribute("minecraft:name_tag_distance").unwrap_or(64.0),
+                p.attribute("minecraft:below_name_distance").unwrap_or(10.0),
+            )
+        });
+        let scale = scale as f32;
         let Some(p) = self.player.as_ref() else {
             self.player_model = None;
             return;
@@ -516,6 +519,8 @@ impl Game<'_> {
         };
         m.extra.ints[1] = bed;
         m.extra.model_scale = scale;
+        m.extra.nameplate.name_tag = Some(name_tag);
+        m.extra.nameplate.below_name = Some(below_name);
         // The crouch flag is still last tick's here.
         let (from, at) =
             player_model_positions(previous_position, position, m.extra.crouching, crouching);

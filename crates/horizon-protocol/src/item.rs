@@ -66,6 +66,8 @@ pub mod component {
     pub const CUSTOM_NAME: i32 = 6;
     pub const ITEM_NAME: i32 = 9;
     pub const ITEM_MODEL: i32 = 10;
+    /// `minecraft:tooltip_style`: an `Identifier` naming the tooltip sprites.
+    pub const TOOLTIP_STYLE: i32 = 35;
     pub const LORE: i32 = 11;
     pub const RARITY: i32 = 12;
     pub const ENCHANTMENTS: i32 = 13;
@@ -383,6 +385,9 @@ impl Component {
             CUSTOM_NAME | ITEM_NAME => Self::Text(r.nbt()?),
             CUSTOM_DATA => Self::Nbt(r.nbt()?),
             ITEM_MODEL => Self::Ident(r.string(32767)?),
+            // `tooltip_style`: an `Identifier` naming the style's
+            // `tooltip/<path>_background` and `_frame` sprites.
+            TOOLTIP_STYLE => Self::Ident(r.string(32767)?),
             LORE => {
                 let n = r.count(256)?;
                 Self::Lore((0..n).map(|_| r.nbt()).collect::<Result<_>>()?)
@@ -1571,6 +1576,19 @@ mod tests {
         assert!(!rest.is_empty());
         let mut again = Writer::new();
         read.write(component::POTION_CONTENTS, &mut again);
+        assert_eq!(again.data, w.data);
+    }
+
+    #[test]
+    fn tooltip_style_reads_as_an_identifier() {
+        let mut w = Writer::new();
+        w.string("sunfall:rare");
+        let mut r = Reader::new(&w.data);
+        let read = Component::read(component::TOOLTIP_STYLE, &mut r).unwrap();
+        assert_eq!(read, Component::Ident("sunfall:rare".into()));
+        assert_eq!(r.remaining(), 0);
+        let mut again = Writer::new();
+        read.write(component::TOOLTIP_STYLE, &mut again);
         assert_eq!(again.data, w.data);
     }
 

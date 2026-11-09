@@ -22,9 +22,28 @@ struct NineSlice {
     border: [u32; 4],
     stretch_inner: bool,
 }
+/// `GuiSpriteScaling.Tile`: the sprite's GUI size, repeated over the box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Tile {
+    width: u32,
+    height: u32,
+}
 /// Nine-slice scaling from `.png.mcmeta` files.
 static NINE_SLICE: RwLock<Option<HashMap<String, NineSlice>>> = RwLock::new(None);
+/// `type: "tile"` scaling from `.png.mcmeta` files.
+static TILE: RwLock<Option<HashMap<String, Tile>>> = RwLock::new(None);
 
+/// A `gui.scaling` section of type `tile`.
+fn parse_tile(v: &serde_json::Value) -> Option<Tile> {
+    let s = &v["gui"]["scaling"];
+    if s["type"] != "tile" {
+        return None;
+    }
+    Some(Tile {
+        width: u32::try_from(s["width"].as_u64()?).ok()?,
+        height: u32::try_from(s["height"].as_u64()?).ok()?,
+    })
+}
 /// A `gui.scaling` section of type `nine_slice`.
 fn parse_nine_slice(v: &serde_json::Value) -> Option<NineSlice> {
     let s = &v["gui"]["scaling"];
@@ -57,72 +76,109 @@ fn parse_nine_slice(v: &serde_json::Value) -> Option<NineSlice> {
 pub fn load_metadata(root: &Path) {
     set_metadata(read_metadata(root));
 }
-/// The GUI sprites' nine-slice metadata of a resource root, read off the
-/// render thread by a pack reload ([`read_metadata`]) and put in use with
-/// [`set_metadata`].
-pub struct UiMetadata(HashMap<String, NineSlice>);
+/// The GUI sprites' `gui.scaling` metadata of a resource root: nine-slice and
+/// tile sizes, read off the render thread by a pack reload
+/// ([`read_metadata`]) and put in use with [`set_metadata`].
+pub struct UiMetadata {
+    nine_slice: HashMap<String, NineSlice>,
+    tile: HashMap<String, Tile>,
+}
 /// Puts read metadata in use ([`load_metadata`] in two halves).
 pub fn set_metadata(metadata: UiMetadata) {
-    *NINE_SLICE.write().unwrap_or_else(|e| e.into_inner()) = Some(metadata.0);
+    *NINE_SLICE.write().unwrap_or_else(|e| e.into_inner()) = Some(metadata.nine_slice);
+    *TILE.write().unwrap_or_else(|e| e.into_inner()) = Some(metadata.tile);
 }
 /// Reads the metadata [`load_metadata`] puts in use, without putting it in use.
 pub fn read_metadata(root: &Path) -> UiMetadata {
-    let mut map = HashMap::new();
-    let base = root.join("assets/minecraft/textures");
-    let sprites = base.join("gui/sprites");
-    // A prepared root's: from its data file, without listing the disk.
-    let files: Vec<PathBuf> = match horizon_core::prepared_files::files_under(&sprites) {
-        Some(files) => files
-            .iter()
-            .filter(|file| file.ends_with(".png.mcmeta"))
-            .map(|file| sprites.join(file))
-            .collect(),
-        None => {
-            let mut files = Vec::new();
-            let mut stack = vec![sprites];
-            while let Some(dir) = stack.pop() {
-                let Ok(entries) = std::fs::read_dir(&dir) else {
-                    continue;
-                };
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if p.is_dir() {
-                        stack.push(p);
-                    } else if p.to_string_lossy().ends_with(".png.mcmeta") {
-                        files.push(p);
+    let mut nine_slice = HashMap::new();
+    let mut tile = HashMap::new();
+    let assets = root.join("assets");
+    let Ok(namespaces) = std::fs::read_dir(&assets) else {
+        return UiMetadata { nine_slice, tile };
+    };
+    for ns in namespaces.flatten() {
+        let namespace = ns.file_name().to_string_lossy().into_owned();
+        let sprites = ns.path().join("textures/gui/sprites");
+        // A prepared root's: from its data file, without listing the disk.
+        let files: Vec<PathBuf> = match horizon_core::prepared_files::files_under(&sprites) {
+            Some(files) => files
+                .iter()
+                .filter(|file| file.ends_with(".png.mcmeta"))
+                .map(|file| sprites.join(file))
+                .collect(),
+            None => {
+                let mut files = Vec::new();
+                let mut stack = vec![sprites.clone()];
+                while let Some(dir) = stack.pop() {
+                    let Ok(entries) = std::fs::read_dir(&dir) else {
+                        continue;
+                    };
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if p.is_dir() {
+                            stack.push(p);
+                        } else if p.to_string_lossy().ends_with(".png.mcmeta") {
+                            files.push(p);
+                        }
                     }
                 }
+                files
             }
-            files
+        };
+        for p in files {
+            let name = p.to_string_lossy().into_owned();
+            let Some(stripped) = name.strip_suffix(".png.mcmeta") else {
+                continue;
+            };
+            let Ok(text) = horizon_core::prepared_files::read_to_string(&p) else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let Some(rel) = Path::new(stripped)
+                .strip_prefix(&sprites)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+            else {
+                continue;
+            };
+            // The atlas names the default namespace's sprites by their
+            // `gui/sprites/` path and every other namespace's as
+            // `namespace:<path under gui/sprites>`; keep both spellings a
+            // lookup may use.
+            let keys = if namespace == "minecraft" {
+                [format!("gui/sprites/{rel}"), rel]
+            } else {
+                [
+                    format!("{namespace}:{rel}"),
+                    format!("{namespace}:gui/sprites/{rel}"),
+                ]
+            };
+            if let Some(n) = parse_nine_slice(&json) {
+                for key in keys {
+                    nine_slice.insert(key, n);
+                }
+            } else if let Some(t) = parse_tile(&json) {
+                for key in keys {
+                    tile.insert(key, t);
+                }
+            }
         }
-    };
-    for p in files {
-        let name = p.to_string_lossy().into_owned();
-        let Some(stripped) = name.strip_suffix(".png.mcmeta") else {
-            continue;
-        };
-        let Ok(text) = horizon_core::prepared_files::read_to_string(&p) else {
-            continue;
-        };
-        let Some(nine_slice) = serde_json::from_str(&text)
-            .ok()
-            .as_ref()
-            .and_then(parse_nine_slice)
-        else {
-            continue;
-        };
-        let key = Path::new(stripped)
-            .strip_prefix(&base)
-            .map(|r| r.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
-        map.insert(key, nine_slice);
     }
-    UiMetadata(map)
+    UiMetadata { nine_slice, tile }
 }
 /// The sprite's nine-slice metadata, when its `.png.mcmeta` has any.
 fn nine_slice_metadata(sprite: &str) -> Option<NineSlice> {
     NINE_SLICE
         .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(sprite).copied())
+}
+/// The sprite's `type: "tile"` metadata, when its `.png.mcmeta` has any.
+fn tile_metadata(sprite: &str) -> Option<Tile> {
+    TILE.read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .and_then(|m| m.get(sprite).copied())
@@ -197,12 +253,16 @@ pub fn nine_slice(
     color: u32,
 ) {
     if let Some(r) = atlas.sprites.get(sprite) {
-        draw_nine_slice(batch, *r, scaling(sprite, r), [x, y, w, h], color);
+        if let Some(t) = tile_metadata(sprite) {
+            tile_sprite(batch, *r, t, [x, y, w, h], color);
+        } else {
+            draw_nine_slice(batch, *r, scaling(sprite, r), [x, y, w, h], color);
+        }
     }
 }
 /// `GuiGraphicsExtractor.blitSprite`: a sprite over `w` × `h` as its
-/// `gui.scaling` says, nine-sliced, or stretched when it has no metadata.
-/// (`tile`, which no vanilla sprite uses, isn't read yet: it stretches.)
+/// `gui.scaling` says: tiled, nine-sliced, or stretched when it has no
+/// metadata.
 pub fn blit_sprite(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
@@ -214,7 +274,11 @@ pub fn blit_sprite(
     color: u32,
 ) {
     if let Some(r) = atlas.sprites.get(sprite) {
-        draw_sprite(batch, *r, nine_slice_metadata(sprite), [x, y, w, h], color);
+        if let Some(t) = tile_metadata(sprite) {
+            tile_sprite(batch, *r, t, [x, y, w, h], color);
+        } else {
+            draw_sprite(batch, *r, nine_slice_metadata(sprite), [x, y, w, h], color);
+        }
     }
 }
 /// `GuiGraphicsExtractor.blit(location, x, y, u, v, width, height, textureWidth,
@@ -234,6 +298,19 @@ pub fn blit_sprite_region(
     if let Some(r) = atlas.sprites.get(sprite) {
         let size = [r.w as f32, r.h as f32];
         batch.rect_uv(x, y, w, h, sub(*r, size, src), color);
+    }
+}
+fn tile_sprite(batch: &mut HudBatch, r: Rect, t: Tile, [x, y, w, h]: [f32; 4], color: u32) {
+    let size = [t.width as f32, t.height as f32];
+    if size[0] > 0.0 && size[1] > 0.0 {
+        tile(
+            batch,
+            r,
+            size,
+            [0.0, 0.0, size[0], size[1]],
+            [x, y, w, h],
+            color,
+        );
     }
 }
 fn draw_sprite(
@@ -1165,31 +1242,92 @@ fn tooltip_box(
     h: f32,
 ) {
     crate::widgets::frame_tooltip(lines);
-    nine_slice(
-        batch,
-        atlas,
-        "gui/sprites/tooltip/background",
-        x - 12.0,
-        y - 12.0,
-        w + 24.0,
-        h + 24.0,
-        u32::MAX,
-    );
-    nine_slice(
-        batch,
-        atlas,
-        "gui/sprites/tooltip/frame",
-        x - 12.0,
-        y - 12.0,
-        w + 24.0,
-        h + 24.0,
-        u32::MAX,
-    );
+    tooltip_background(batch, atlas, None, x, y, w, h);
     let mut ly = y;
     for (i, line) in lines.iter().enumerate() {
         batch.text_styled(atlas, line, x, ly, u32::MAX, true);
         ly += if i == 0 { 12.0 } else { 10.0 };
     }
+}
+/// `TooltipRenderUtil.extractTooltipBackground`: the background and frame
+/// sprites around a tooltip's content box. `style` is the
+/// `minecraft:tooltip_style` component's `Identifier`: its background and
+/// frame are `<namespace>:tooltip/<path>_background` and `_frame`; without
+/// one (or without those sprites in the pack), the default pair.
+pub fn tooltip_background(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    style: Option<&str>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) {
+    let (background, frame) = tooltip_sprites(atlas, style);
+    blit_sprite(
+        batch,
+        atlas,
+        &background,
+        x - 12.0,
+        y - 12.0,
+        w + 24.0,
+        h + 24.0,
+        u32::MAX,
+    );
+    blit_sprite(
+        batch,
+        atlas,
+        &frame,
+        x - 12.0,
+        y - 12.0,
+        w + 24.0,
+        h + 24.0,
+        u32::MAX,
+    );
+}
+/// The two places a style's sprite may be named: vanilla's logical
+/// `tooltip/<path>_<suffix>` id, and the atlas's `gui/sprites/...` path for
+/// the default namespace.
+fn tooltip_sprite_candidates(namespace: &str, path: &str, suffix: &str) -> [String; 2] {
+    if namespace == "minecraft" {
+        [
+            format!("gui/sprites/tooltip/{path}_{suffix}"),
+            format!("tooltip/{path}_{suffix}"),
+        ]
+    } else {
+        [
+            format!("{namespace}:tooltip/{path}_{suffix}"),
+            format!("{namespace}:gui/sprites/tooltip/{path}_{suffix}"),
+        ]
+    }
+}
+/// `TooltipRenderUtil.getBackgroundSprite`/`getFrameSprite`: the style's
+/// sprite, or the default one when the component is absent or the pack does
+/// not ship it.
+fn tooltip_sprites(atlas: &HudAtlas, style: Option<&str>) -> (String, String) {
+    tooltip_sprites_in(&atlas.sprites, style)
+}
+/// [`tooltip_sprites`] over an atlas's sprite set.
+fn tooltip_sprites_in(sprites: &HashMap<String, Rect>, style: Option<&str>) -> (String, String) {
+    let (default_background, default_frame) = (
+        "gui/sprites/tooltip/background".to_owned(),
+        "gui/sprites/tooltip/frame".to_owned(),
+    );
+    let Some(style) = style else {
+        return (default_background, default_frame);
+    };
+    let (namespace, path) = style.split_once(':').unwrap_or(("minecraft", style));
+    let path = path.strip_prefix("tooltip/").unwrap_or(path);
+    let pick = |suffix: &str, default: String| {
+        tooltip_sprite_candidates(namespace, path, suffix)
+            .into_iter()
+            .find(|candidate| sprites.contains_key(candidate))
+            .unwrap_or(default)
+    };
+    (
+        pick("background", default_background),
+        pick("frame", default_frame),
+    )
 }
 
 /// The EditBox text field.
@@ -2144,6 +2282,88 @@ mod tests {
         assert_eq!(q.len(), 2);
         assert_quad(q[0], ([0.0, 5.0, 32.0, 7.0], [0.0, 0.0, 1.0, 1.0]));
         assert_quad(q[1], ([32.0, 5.0, 40.0, 7.0], [0.0, 0.0, 0.25, 1.0]));
+    }
+    #[test]
+    fn a_tile_scaling_section_reads_its_gui_size() {
+        let json = serde_json::json!({"gui": {"scaling": {
+            "type": "tile", "width": 16, "height": 8}}});
+        assert_eq!(
+            parse_tile(&json),
+            Some(Tile {
+                width: 16,
+                height: 8
+            })
+        );
+        // A nine-slice is not a tile.
+        let json = serde_json::json!({"gui": {"scaling": {
+            "type": "nine_slice", "width": 16, "height": 16, "border": 2}}});
+        assert!(parse_tile(&json).is_none());
+    }
+    #[test]
+    fn a_tiled_sprite_repeats_across_the_box() {
+        let mut batch = HudBatch::new([640, 480]);
+        tile_sprite(
+            &mut batch,
+            sprite(16, 16),
+            Tile {
+                width: 16,
+                height: 16,
+            },
+            [0.0, 0.0, 34.0, 18.0],
+            u32::MAX,
+        );
+        let q = quads(&batch);
+        assert_eq!(q.len(), 6);
+        assert_quad(q[0], ([0.0, 0.0, 16.0, 16.0], [0.0, 0.0, 1.0, 1.0]));
+        assert_quad(q[1], ([16.0, 0.0, 32.0, 16.0], [0.0, 0.0, 1.0, 1.0]));
+        assert_quad(q[2], ([32.0, 0.0, 34.0, 16.0], [0.0, 0.0, 0.125, 1.0]));
+        assert_quad(q[5], ([32.0, 16.0, 34.0, 18.0], [0.0, 0.0, 0.125, 0.125]));
+    }
+    #[test]
+    fn tooltip_style_sprite_names_follow_vanilla() {
+        assert_eq!(
+            tooltip_sprite_candidates("minecraft", "default", "background"),
+            [
+                "gui/sprites/tooltip/default_background".to_owned(),
+                "tooltip/default_background".to_owned()
+            ]
+        );
+        assert_eq!(
+            tooltip_sprite_candidates("sunfall", "rare", "frame"),
+            [
+                "sunfall:tooltip/rare_frame".to_owned(),
+                "sunfall:gui/sprites/tooltip/rare_frame".to_owned()
+            ]
+        );
+    }
+    #[test]
+    fn a_tooltip_style_uses_its_pack_sprites_when_present() {
+        let rect = Rect {
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 1.0,
+            w: 16,
+            h: 16,
+        };
+        let mut sprites = HashMap::new();
+        sprites.insert("sunfall:tooltip/rare_background".to_owned(), rect);
+        sprites.insert("sunfall:tooltip/rare_frame".to_owned(), rect);
+        assert_eq!(
+            tooltip_sprites_in(&sprites, Some("sunfall:rare")),
+            (
+                "sunfall:tooltip/rare_background".to_owned(),
+                "sunfall:tooltip/rare_frame".to_owned()
+            )
+        );
+        // A style the pack does not ship falls back to the default pair.
+        assert_eq!(
+            tooltip_sprites_in(&sprites, Some("sunfall:common")),
+            (
+                "gui/sprites/tooltip/background".to_owned(),
+                "gui/sprites/tooltip/frame".to_owned()
+            )
+        );
     }
     #[test]
     fn a_border_that_leaves_no_centre_slice_is_no_metadata() {

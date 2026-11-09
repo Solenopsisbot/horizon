@@ -252,10 +252,12 @@ impl Game<'_> {
                 }
                 None => return None,
             };
-            // The tag's 64 block distance is measured to the entity: copy the
-            // name only for a mob the frame can show it on.
+            // The tag's distance is the entity's `minecraft:name_tag_distance`
+            // (vanilla's default 64), measured to the entity: copy the name
+            // only for a mob the frame can show it on.
             let at = glam::DVec3::new(m.position.x, m.position.y, m.position.z);
-            (at.distance_squared(camera) < 64.0 * 64.0).then_some((m, name, false))
+            let max = m.name_tag_distance();
+            (at.distance_squared(camera) < max * max).then_some((m, name, false))
         });
         let own = self.own_name_tag().map(|(m, _)| m.id);
         let players = players
@@ -289,6 +291,7 @@ impl Game<'_> {
                 distance_sqr,
                 (lo - camera - inflate).as_vec3(),
                 (hi - camera + inflate).as_vec3(),
+                m.name_tag_distance(),
             ) {
                 continue;
             }
@@ -335,10 +338,10 @@ impl Game<'_> {
             // `ClientMannequin.belowNameDisplay`: the description is `scoreText`, drawn
             // within the below-name distance (10) whether the name shows or not.
             let description = (m.species() == horizon_client::mobs::Species::Mannequin
-                && distance_sqr < 10.0 * 10.0)
-                .then(|| m.extra.description.component())
-                .flatten()
-                .map(|tag| horizon_client::entity_nbt::name_text(&tag).resolve_legacy());
+                && distance_sqr < m.below_name_distance().powi(2))
+            .then(|| m.extra.description.component())
+            .flatten()
+            .map(|tag| horizon_client::entity_nbt::name_text(&tag).resolve_legacy());
             let is_own = Some(m.id) == own;
             let name_shown = sb::name_shown(team, viewer, view)
                 && (!is_own || !view.is_vehicle)
@@ -403,7 +406,7 @@ impl Game<'_> {
                     lines.push((text, 0.0));
                     lift = f64::from(9.0f32 * 1.15 * 0.025);
                 }
-            } else if distance_sqr < 10.0 * 10.0
+            } else if distance_sqr < m.below_name_distance().powi(2)
                 && let Some(score) = holder.and_then(|h| self.below_name_text(&h))
             {
                 lines.push((score.resolve_legacy(), 0.0));
@@ -462,6 +465,7 @@ impl Game<'_> {
                 distance_sqr,
                 (origin - half).as_vec3(),
                 (origin + glam::DVec3::new(half.x, height + grow, half.z)).as_vec3(),
+                a.name_tag_distance(),
             ) {
                 continue;
             }
@@ -503,7 +507,7 @@ impl Game<'_> {
             let mut lines = Vec::new();
             let mut lift = 0.0;
             let holder = self.persist.uuids.get(&a.id).map(|u| uuid_text(*u));
-            if distance_sqr < 10.0 * 10.0
+            if distance_sqr < a.below_name_distance().powi(2)
                 && let Some(score) = holder.and_then(|h| self.below_name_text(&h))
             {
                 lines.push((score.resolve_legacy(), 0.0));
@@ -825,8 +829,10 @@ fn name_tag_in_view(
     distance_sqr: f64,
     min: glam::Vec3,
     max: glam::Vec3,
+    max_distance: f64,
 ) -> bool {
-    distance_sqr < 64.0 * 64.0 && frustum.is_none_or(|view| view.intersects(min, max))
+    distance_sqr < max_distance * max_distance
+        && frustum.is_none_or(|view| view.intersects(min, max))
 }
 
 fn first_mob_indices(mobs: &[Mob]) -> std::collections::HashMap<u32, usize> {
@@ -1108,7 +1114,8 @@ mod tests {
             Some(&View),
             181.0,
             glam::Vec3::new(-0.8, 8.5, -10.8),
-            glam::Vec3::new(0.8, 11.3, -9.2)
+            glam::Vec3::new(0.8, 11.3, -9.2),
+            64.0
         ));
         for (offset, distance, expected) in [
             ([0.0, 0.0, -10.0], 100.0, true),
@@ -1124,11 +1131,20 @@ mod tests {
                     Some(&View),
                     distance,
                     glam::Vec3::from_array(offset) - glam::Vec3::splat(0.5),
-                    glam::Vec3::from_array(offset) + glam::Vec3::splat(0.5)
+                    glam::Vec3::from_array(offset) + glam::Vec3::splat(0.5),
+                    64.0
                 ),
                 expected
             );
         }
+        // `minecraft:name_tag_distance` 5 hides a tag 6 blocks away.
+        assert!(!name_tag_in_view(
+            Some(&View),
+            36.0,
+            glam::Vec3::splat(-0.5),
+            glam::Vec3::splat(0.5),
+            5.0
+        ));
     }
 
     #[test]

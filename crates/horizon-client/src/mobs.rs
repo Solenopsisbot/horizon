@@ -31,6 +31,7 @@ pub mod creaking;
 pub mod creaking_heart;
 pub mod cube;
 pub mod data;
+pub mod death_effects;
 pub mod dolphin;
 pub mod doors;
 pub mod drops;
@@ -58,6 +59,7 @@ pub mod living;
 pub mod llama;
 pub mod model_layers;
 pub mod monster_brain;
+pub mod nameplate;
 pub mod nautilus;
 pub mod nav;
 pub mod nether;
@@ -110,6 +112,7 @@ pub mod zombie_villager;
 
 use crate::{blocks::BlockFacts, mesher::Vertex, world::World};
 pub use data::MobData;
+use death_effects::totem_death_effects;
 use horizon_core::{
     geometry::{Aabb, Vec3},
     random::{LegacyRandom, RandomSource},
@@ -1087,6 +1090,8 @@ pub struct Extra {
     pub from_bucket: bool,
     /// Command-created armor instances, shared by commands and runtime damage.
     pub armor_attributes: Option<Box<horizon_world::attributes::entity::EntityAttributes>>,
+    /// `NAME_TAG_DISTANCE` and `BELOW_NAME_DISTANCE` from the server's attribute updates.
+    pub nameplate: nameplate::NameplateDistances,
     /// `Mob.lootTable`: the table its death rolls instead of its type's
     /// (saved as `DeathLootTable`).
     pub death_loot_table: Option<String>,
@@ -1434,31 +1439,6 @@ impl Extra {
         self.main_hand_stack = None;
         self.main_hand.take()
     }
-}
-
-/// `DeathProtection.TOTEM_EFFECTS`: clear, then regeneration II, absorption II
-/// and fire resistance.
-fn totem_death_effects() -> Vec<crate::items::ConsumeEffect> {
-    use crate::items::{ConsumeEffect, ConsumeEffectSpec};
-    let spec = |id: &str, duration, amplifier| ConsumeEffectSpec {
-        id: id.to_owned(),
-        duration,
-        amplifier,
-        ambient: false,
-        show_particles: true,
-        show_icon: true,
-    };
-    vec![
-        ConsumeEffect::ClearAllEffects,
-        ConsumeEffect::ApplyEffects {
-            effects: vec![
-                spec("minecraft:regeneration", 900, 1),
-                spec("minecraft:absorption", 100, 1),
-                spec("minecraft:fire_resistance", 800, 0),
-            ],
-            probability: 1.0,
-        },
-    ]
 }
 
 /// How far the boxes of a set of mobs reach from their positions: the widest reach sideways, below

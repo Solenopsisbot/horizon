@@ -82,6 +82,7 @@ fn slime_at(world: &World, facts: &BlockFacts, position: BlockPos) -> bool {
 }
 
 mod fluids;
+mod nameplate;
 pub use fluids::{fluid_flow, update_entity_fluids, water_clip};
 
 #[cfg(test)]
@@ -2092,6 +2093,8 @@ pub struct ArmorStand {
     /// (`getAttribute`) on the stand's first server tick, and a save that lists
     /// it loads it back, so a stand summoned this tick has none yet.
     pub speed_instance: bool,
+    /// `NAME_TAG_DISTANCE` and `BELOW_NAME_DISTANCE` from the server's attribute updates.
+    pub nameplate: nameplate::NameplateDistances,
 }
 /// The fluid a stand travels in (`LivingEntity.travelInFluid`: water first,
 /// then lava), from the heights `Entity::push_by_fluid` measured.
@@ -2175,20 +2178,6 @@ impl ArmorStand {
     }
 }
 impl ArmorStand {
-    /// `NameTagItem.interactLivingEntity`: a custom name handles the use;
-    /// only a living target changes. Stack consumption belongs to the caller.
-    pub fn name_with_tag(&mut self, stack: &ItemStack) -> bool {
-        if &*stack.item != "minecraft:name_tag" {
-            return false;
-        }
-        let Some(name) = stack.data().and_then(|data| data.custom_name.as_ref()) else {
-            return false;
-        };
-        if self.health > 0.0 {
-            self.custom_name = Some(crate::component::name_text(name));
-        }
-        true
-    }
     pub const SLOTS: [&'static str; 6] = ["mainhand", "offhand", "feet", "legs", "chest", "head"];
     /// The `Pose` compound's keys.
     pub const POSE_KEYS: [&'static str; 6] =
@@ -2345,6 +2334,7 @@ impl ArmorStand {
             enchantment_equipment: Default::default(),
             support: Default::default(),
             speed_instance: false,
+            nameplate: Default::default(),
         }
     }
     /// `Entity.getOnPos(0.2)` (`getOnPosLegacy`): the supporting block's
