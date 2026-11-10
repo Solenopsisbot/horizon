@@ -1190,31 +1190,98 @@ fn tooltip_box(
     h: f32,
 ) {
     crate::widgets::frame_tooltip(lines);
-    nine_slice(
-        batch,
-        atlas,
-        "gui/sprites/tooltip/background",
-        x - 12.0,
-        y - 12.0,
-        w + 24.0,
-        h + 24.0,
-        u32::MAX,
-    );
-    nine_slice(
-        batch,
-        atlas,
-        "gui/sprites/tooltip/frame",
-        x - 12.0,
-        y - 12.0,
-        w + 24.0,
-        h + 24.0,
-        u32::MAX,
-    );
+    tooltip_background(batch, atlas, None, x, y, w, h);
     let mut ly = y;
     for (i, line) in lines.iter().enumerate() {
         batch.text_styled(atlas, line, x, ly, u32::MAX, true);
         ly += if i == 0 { 12.0 } else { 10.0 };
     }
+}
+
+/// `TooltipRenderUtil.extractTooltipBackground`: the background and frame
+/// sprites around a tooltip's content box. `style` is the
+/// `minecraft:tooltip_style` component's `Identifier`: its background and
+/// frame are `<namespace>:tooltip/<path>_background` and `_frame`; without
+/// one (or without those sprites in the pack), the default pair.
+pub fn tooltip_background(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    style: Option<&str>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) {
+    let (background, frame) = tooltip_sprites(atlas, style);
+    blit_sprite(
+        batch,
+        atlas,
+        &background,
+        x - 12.0,
+        y - 12.0,
+        w + 24.0,
+        h + 24.0,
+        u32::MAX,
+    );
+    blit_sprite(
+        batch,
+        atlas,
+        &frame,
+        x - 12.0,
+        y - 12.0,
+        w + 24.0,
+        h + 24.0,
+        u32::MAX,
+    );
+}
+
+/// The two places a style's sprite may be named: vanilla's logical
+/// `tooltip/<path>_<suffix>` id, and the atlas's `gui/sprites/...` path for
+/// the default namespace.
+fn tooltip_sprite_candidates(namespace: &str, path: &str, suffix: &str) -> [String; 2] {
+    if namespace == "minecraft" {
+        [
+            format!("gui/sprites/tooltip/{path}_{suffix}"),
+            format!("tooltip/{path}_{suffix}"),
+        ]
+    } else {
+        [
+            format!("{namespace}:tooltip/{path}_{suffix}"),
+            format!("{namespace}:gui/sprites/tooltip/{path}_{suffix}"),
+        ]
+    }
+}
+
+/// `TooltipRenderUtil.getBackgroundSprite`/`getFrameSprite`: the style's
+/// sprite, or the default one when the component is absent or the pack does
+/// not ship it.
+fn tooltip_sprites(atlas: &HudAtlas, style: Option<&str>) -> (String, String) {
+    tooltip_sprites_in(&atlas.sprites, style)
+}
+
+/// [`tooltip_sprites`] over an atlas's sprite set.
+fn tooltip_sprites_in(sprites: &HashMap<String, Rect>, style: Option<&str>) -> (String, String) {
+    let (default_background, default_frame) = (
+        "gui/sprites/tooltip/background".to_owned(),
+        "gui/sprites/tooltip/frame".to_owned(),
+    );
+    let Some(style) = style else {
+        return (default_background, default_frame);
+    };
+    let (namespace, path) = style.split_once(':').unwrap_or(("minecraft", style));
+    // `TooltipRenderUtil.getBackgroundSprite`/`getFrameSprite` prefix
+    // `tooltip/` to the complete identifier path, so a style that already
+    // names `tooltip/…` resolves `tooltip/tooltip/…`.
+    let pick = |suffix: &str, default: String| {
+        tooltip_sprite_candidates(namespace, path, suffix)
+            .into_iter()
+            .find(|candidate| sprites.contains_key(candidate))
+            .unwrap_or(default)
+    };
+    (
+        pick("background", default_background),
+        pick("frame", default_frame),
+    )
 }
 
 /// The EditBox text field.
@@ -2407,6 +2474,76 @@ mod tests {
         let q = quads(&batch);
         assert_eq!(q.len(), 1);
         assert_quad(q[0], ([0.0, 0.0, 27.0, 18.0], [0.0, 0.0, 1.0, 1.0]));
+    }
+    #[test]
+    fn tooltip_style_sprite_names_follow_vanilla() {
+        assert_eq!(
+            tooltip_sprite_candidates("minecraft", "default", "background"),
+            [
+                "gui/sprites/tooltip/default_background".to_owned(),
+                "tooltip/default_background".to_owned()
+            ]
+        );
+        assert_eq!(
+            tooltip_sprite_candidates("sunfall", "rare", "frame"),
+            [
+                "sunfall:tooltip/rare_frame".to_owned(),
+                "sunfall:gui/sprites/tooltip/rare_frame".to_owned()
+            ]
+        );
+    }
+    #[test]
+    fn a_tooltip_style_uses_its_pack_sprites_when_present() {
+        let rect = Rect {
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 1.0,
+            w: 16,
+            h: 16,
+        };
+        let mut sprites = HashMap::new();
+        sprites.insert("sunfall:tooltip/rare_background".to_owned(), rect);
+        sprites.insert("sunfall:tooltip/rare_frame".to_owned(), rect);
+        assert_eq!(
+            tooltip_sprites_in(&sprites, Some("sunfall:rare")),
+            (
+                "sunfall:tooltip/rare_background".to_owned(),
+                "sunfall:tooltip/rare_frame".to_owned()
+            )
+        );
+        // A style the pack does not ship falls back to the default pair.
+        assert_eq!(
+            tooltip_sprites_in(&sprites, Some("sunfall:common")),
+            (
+                "gui/sprites/tooltip/background".to_owned(),
+                "gui/sprites/tooltip/frame".to_owned()
+            )
+        );
+    }
+    #[test]
+    fn a_tooltip_style_keeps_the_complete_path_when_prefixed() {
+        // Vanilla prefixes `tooltip/` to the whole path: a style that names
+        // `tooltip/rare` resolves `tooltip/tooltip/rare_*`, not `tooltip/rare_*`.
+        let rect = Rect {
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 1.0,
+            w: 16,
+            h: 16,
+        };
+        let mut sprites = HashMap::new();
+        sprites.insert("sunfall:tooltip/tooltip/rare_background".to_owned(), rect);
+        sprites.insert("sunfall:tooltip/tooltip/rare_frame".to_owned(), rect);
+        sprites.insert("sunfall:tooltip/rare_background".to_owned(), rect);
+        assert_eq!(
+            tooltip_sprites_in(&sprites, Some("sunfall:tooltip/rare")),
+            (
+                "sunfall:tooltip/tooltip/rare_background".to_owned(),
+                "sunfall:tooltip/tooltip/rare_frame".to_owned()
+            )
+        );
     }
     #[test]
     fn borders_shrink_to_half_the_drawn_size() {

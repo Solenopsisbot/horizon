@@ -1095,6 +1095,32 @@ mod tests {
         assert!(emerald.test(&ItemStack::new("minecraft:emerald", 2)));
     }
 
+    #[test]
+    fn tooltip_style_crosses_the_wire() {
+        let mut components = vec![String::new(); component::TOOLTIP_STYLE as usize + 1];
+        components[component::TOOLTIP_STYLE as usize] = "minecraft:tooltip_style".into();
+        let builtin = Builtin {
+            registries: [
+                (
+                    "minecraft:item".into(),
+                    Ids::from_names(vec!["minecraft:stone".into()]),
+                ),
+                (
+                    "minecraft:data_component_type".into(),
+                    Ids::from_names(components),
+                ),
+            ]
+            .into(),
+        };
+        let mut wire = Stack::new(0, 1);
+        wire.added.push((
+            component::TOOLTIP_STYLE,
+            Component::Ident("sunfall:rare".into()),
+        ));
+        let stack = from_network(&wire, &builtin, &Dynamic::default());
+        assert_eq!(stack.tooltip_style().as_deref(), Some("sunfall:rare"));
+    }
+
     /// A bundle's contents cross the wire, so a server's client can draw
     /// its tooltip (BundleContents' stream codec: a list of templates).
     #[test]

@@ -323,6 +323,19 @@ impl ItemStack {
     pub fn data(&self) -> Option<&StackData> {
         self.extra.as_deref()
     }
+    /// `ItemStack.get(DataComponents.TOOLTIP_STYLE)`: the `Identifier` naming
+    /// the tooltip background and frame sprites (`tooltip/<path>_background`
+    /// and `_frame`); None when absent or removed.
+    pub fn tooltip_style(&self) -> Option<String> {
+        let data = self.data()?;
+        if data.other("!minecraft:tooltip_style").is_some() {
+            return None;
+        }
+        match data.other("minecraft:tooltip_style")? {
+            Tag::String(s) => Some(s.to_string_lossy()),
+            _ => None,
+        }
+    }
     /// The patch the server sent for this stack, while the stack is still what
     /// it decoded to (its count aside); None once anything else changed.
     pub fn wire_patch(&self) -> Option<Arc<[u8]>> {
@@ -2386,6 +2399,36 @@ mod tests {
         let extra = extra.expect("data");
         assert_eq!(extra.base_color.as_deref(), Some("red"));
         assert_eq!(extra.banner_patterns, stack.data().unwrap().banner_patterns);
+    }
+
+    #[test]
+    fn tooltip_style_round_trips() {
+        let components = Tag::compound([(
+            "minecraft:tooltip_style",
+            Tag::String("sunfall:rare".into()),
+        )]);
+        let (_, extra) = decode_components(Some(&components));
+        let mut stack = ItemStack::new("minecraft:stone", 1);
+        stack.extra = extra;
+        assert_eq!(stack.tooltip_style().as_deref(), Some("sunfall:rare"));
+        let encoded = encode_components(&stack).expect("the style is saved");
+        assert_eq!(
+            encoded.get("minecraft:tooltip_style"),
+            Some(&Tag::String("sunfall:rare".into()))
+        );
+
+        // A removal marker wins over a style the prototype may have.
+        let removed = Tag::compound([
+            (
+                "minecraft:tooltip_style",
+                Tag::String("sunfall:rare".into()),
+            ),
+            ("!minecraft:tooltip_style", Tag::String("".into())),
+        ]);
+        let (_, extra) = decode_components(Some(&removed));
+        let mut stack = ItemStack::new("minecraft:stone", 1);
+        stack.extra = extra;
+        assert_eq!(stack.tooltip_style(), None);
     }
 
     #[test]
