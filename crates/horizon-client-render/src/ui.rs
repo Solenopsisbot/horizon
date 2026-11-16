@@ -1,16 +1,14 @@
 //! Shared GUI widgets drawn as HUD quads: nine-slice sprites (gui.scaling
 //! metadata), buttons, sliders, tiled menu backgrounds, separators and the
 //! EditBox text field with vanilla cursor, selection and scrolling.
+pub mod frame_button;
+
 use crate::{
     hud::{HudAtlas, HudBatch, Rect, rgba},
     text::Text,
 };
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::RwLock,
-    time::Instant,
-};
+use horizon_assets::resource_source::ResourceSource;
+use std::{collections::HashMap, sync::RwLock, time::Instant};
 
 /// `GuiSpriteScaling.NineSlice`: the sprite's size in GUI pixels, whatever
 /// its texture's resolution, its borders (left, top, right, bottom) in the
@@ -92,7 +90,7 @@ fn parse_scaling(v: &serde_json::Value) -> Option<Scaling> {
     }
 }
 /// Read `gui.scaling` metadata for every GUI sprite under `root`.
-pub fn load_metadata(root: &Path) {
+pub fn load_metadata(root: &ResourceSource) {
     set_metadata(read_metadata(root));
 }
 /// The GUI sprites' `gui.scaling` metadata of a resource root, read off the
@@ -103,89 +101,49 @@ pub struct UiMetadata(HashMap<String, Scaling>);
 pub fn set_metadata(metadata: UiMetadata) {
     *SCALING.write().unwrap_or_else(|e| e.into_inner()) = Some(metadata.0);
 }
-/// Reads the metadata [`load_metadata`] puts in use, without putting it in use.
-pub fn read_metadata(root: &Path) -> UiMetadata {
+/// Reads the metadata [`load_metadata`] puts in use, without putting it in use. Another
+/// namespace's sprites are named with it (`lobby:gui/sprites/...`), as the GUI atlas packs them.
+pub fn read_metadata(root: &ResourceSource) -> UiMetadata {
     let mut map = HashMap::new();
-    let assets = root.join("assets");
-    let Ok(namespaces) = std::fs::read_dir(&assets) else {
-        return UiMetadata(map);
-    };
-    for ns in namespaces.flatten() {
-        let namespace = ns.file_name().to_string_lossy().into_owned();
-        let sprites = ns.path().join("textures/gui/sprites");
-        // A prepared root's: from its data file, without listing the disk.
-        let files: Vec<PathBuf> = match horizon_core::prepared_files::files_under(&sprites) {
-            Some(files) => files
-                .iter()
-                .filter(|file| file.ends_with(".png.mcmeta"))
-                .map(|file| sprites.join(file))
-                .collect(),
-            None => {
-                let mut files = Vec::new();
-                let mut stack = vec![sprites.clone()];
-                while let Some(dir) = stack.pop() {
-                    let Ok(entries) = std::fs::read_dir(&dir) else {
-                        continue;
-                    };
-                    for e in entries.flatten() {
-                        let p = e.path();
-                        if p.is_dir() {
-                            stack.push(p);
-                        } else if p.to_string_lossy().ends_with(".png.mcmeta") {
-                            files.push(p);
-                        }
-                    }
-                }
-                files
-            }
+    for namespace in root.namespaces("assets") {
+        let base = format!("assets/{namespace}/textures/");
+        let prefix = match namespace.as_str() {
+            "minecraft" => String::new(),
+            namespace => format!("{namespace}:"),
         };
-        for p in files {
-            let name = p.to_string_lossy().into_owned();
+        for name in root.list(&format!("{base}gui/sprites/")) {
             let Some(stripped) = name.strip_suffix(".png.mcmeta") else {
                 continue;
             };
-            let Ok(text) = horizon_core::prepared_files::read_to_string(&p) else {
+            let Ok(text) = root.read_to_string(&name) else {
                 continue;
             };
-            let Ok(json) = crate::packs::first_json::<serde_json::Value>(text.as_bytes()) else {
-                continue;
-            };
-            let Some(rel) = Path::new(stripped)
-                .strip_prefix(&sprites)
+            let Some(scaling) = crate::packs::first_json::<serde_json::Value>(text.as_bytes())
                 .ok()
-                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .as_ref()
+                .and_then(parse_scaling)
             else {
                 continue;
             };
-            // The atlas keys a GUI sprite by its path under `textures`:
-            // `gui/sprites/<rel>` for the default namespace and
-            // `<namespace>:gui/sprites/<rel>` for another. Store exactly that
-            // one key: a second alias would let `foo.png` and
-            // `gui/sprites/foo.png` (which atlas as `gui/sprites/foo` and
-            // `gui/sprites/gui/sprites/foo`) overwrite each other's scaling.
-            let key = if namespace == "minecraft" {
-                format!("gui/sprites/{rel}")
-            } else {
-                format!("{namespace}:gui/sprites/{rel}")
-            };
-            let Some(scaling) = parse_scaling(&json) else {
-                continue;
-            };
-            map.insert(key, scaling);
+            let key = stripped.strip_prefix(base.as_str()).unwrap_or_default();
+            map.insert(format!("{prefix}{key}"), scaling);
         }
     }
     UiMetadata(map)
+}
+/// The sprite's scaling metadata, when its `.png.mcmeta` has any.
+fn scaling_metadata(sprite: &str) -> Option<Scaling> {
+    SCALING
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(sprite).copied())
 }
 /// The sprite's scaling. A `nine_slice` caller keeps the existing widget
 /// border fallbacks when metadata is absent; `blit_sprite` passes `false` so
 /// an unannotated sprite stretches as vanilla does.
 fn scaling(sprite: &str, r: &Rect, widget_fallback: bool) -> Scaling {
-    let metadata = SCALING
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .and_then(|m| m.get(sprite).copied());
-    if let Some(metadata) = metadata {
+    if let Some(metadata) = scaling_metadata(sprite) {
         return metadata;
     }
     if !widget_fallback {
@@ -925,6 +883,7 @@ pub fn slider_value(x: f32, w: f32, cx: f32) -> f32 {
 }
 /// Screen.renderMenuBackground: in a world the translucent dark texture,
 /// otherwise the dirt-like menu texture, tiled at 32 pixels.
+#[horizon_mod_api_macros::replaceable]
 pub fn menu_background(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
@@ -1289,6 +1248,60 @@ fn tooltip_size(atlas: &HudAtlas, lines: &[Text]) -> (f32, f32) {
     };
     (w, h)
 }
+/// `TooltipRenderUtil.getBackgroundSprite` and `getFrameSprite` of a tooltip style
+/// (`<namespace>:<path>`): `tooltip/<path>_background` and `tooltip/<path>_frame` in the style's
+/// namespace, named as the GUI atlas packs them.
+pub fn tooltip_style_sprites(namespace: &str, path: &str) -> [String; 2] {
+    let prefix = match namespace {
+        "minecraft" => String::new(),
+        namespace => format!("{namespace}:"),
+    };
+    ["background", "frame"].map(|part| format!("{prefix}gui/sprites/tooltip/{path}_{part}"))
+}
+/// `TooltipRenderUtil.renderTooltipBackground`: the background sprite, then the frame sprite,
+/// each drawn by `blitSprite` (nine-sliced as its `gui.scaling` says, stretched without it)
+/// 12 pixels out from the tooltip's contents `[x, y, w, h]` (`PADDING` 3 and `MARGIN` 9 on
+/// every side). Whether the atlas has both sprites; one that lacks either draws nothing.
+pub fn tooltip_sprites(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    [background, frame]: [&str; 2],
+    [x, y, w, h]: [f32; 4],
+) -> bool {
+    if ![background, frame]
+        .iter()
+        .all(|sprite| atlas.sprites.contains_key(*sprite))
+    {
+        return false;
+    }
+    for sprite in [background, frame] {
+        blit_sprite(
+            batch,
+            atlas,
+            sprite,
+            x - 12.0,
+            y - 12.0,
+            w + 24.0,
+            h + 24.0,
+            u32::MAX,
+        );
+    }
+    true
+}
+/// Vanilla's tooltip panel round content at `rect` (`TooltipRenderUtil`): its background and
+/// frame sprites, from the resource packs, reaching 12 GUI pixels out. For anything drawn as a
+/// tooltip that isn't lines of text beside the cursor.
+pub fn tooltip_panel(batch: &mut HudBatch, atlas: &HudAtlas, rect: [f32; 4]) {
+    tooltip_sprites(
+        batch,
+        atlas,
+        [
+            "gui/sprites/tooltip/background",
+            "gui/sprites/tooltip/frame",
+        ],
+        rect,
+    );
+}
 fn tooltip_box(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
@@ -1299,26 +1312,7 @@ fn tooltip_box(
     h: f32,
 ) {
     crate::widgets::frame_tooltip(lines);
-    nine_slice(
-        batch,
-        atlas,
-        "gui/sprites/tooltip/background",
-        x - 12.0,
-        y - 12.0,
-        w + 24.0,
-        h + 24.0,
-        u32::MAX,
-    );
-    nine_slice(
-        batch,
-        atlas,
-        "gui/sprites/tooltip/frame",
-        x - 12.0,
-        y - 12.0,
-        w + 24.0,
-        h + 24.0,
-        u32::MAX,
-    );
+    tooltip_panel(batch, atlas, [x, y, w, h]);
     let mut ly = y;
     for (i, line) in lines.iter().enumerate() {
         batch.text_styled(atlas, line, x, ly, u32::MAX, true);
@@ -1329,15 +1323,12 @@ fn tooltip_box(
 /// The EditBox text field.
 #[derive(Clone, Debug)]
 pub struct EditBox {
-    pub value: String,
-    /// Cursor and selection anchor, in characters.
-    pub cursor: usize,
-    pub highlight: usize,
+    /// The text, cursor, selection anchor, maximum length and whether line breaks are kept (a
+    /// book page's `MultiLineEditBox`): the editing core mods' text fields share. Its fields
+    /// read and write through the box (`edit_box.value`).
+    pub edit: mod_api::client::widgets::TextEdit,
     display: usize,
-    pub max_length: usize,
     pub bordered: bool,
-    /// `MultiLineEditBox`: a book page keeps line breaks. A single-line box strips them.
-    pub multiline: bool,
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -1547,90 +1538,11 @@ pub fn append_field(
         }
     }
 }
-fn byte_index(s: &str, chars: usize) -> usize {
-    s.char_indices().nth(chars).map_or(s.len(), |(i, _)| i)
-}
-pub fn char_len(s: &str) -> usize {
-    s.chars().count()
-}
-/// Java's `String.length()`: UTF-16 code units, the unit `EditBox.maxLength`
-/// counts. A character outside the BMP — an emoji, say — is two of them, so
-/// a box with room for one more character takes an `a` and rejects a `😀`.
-pub fn utf16_len(s: &str) -> usize {
-    s.encode_utf16().count()
-}
-/// The longest prefix of `s` that fits `max` UTF-16 code units without
-/// splitting a character. `EditBox.insertText` drops the half surrogate it
-/// would otherwise keep, so this is what vanilla inserts; Rust strings cannot
-/// hold the lone surrogate that `setValue`'s unguarded `substring` may leave,
-/// so a value too long by half a character keeps the whole characters before
-/// the cut.
-pub fn utf16_prefix(s: &str, max: usize) -> String {
-    let mut units = 0;
-    for (i, c) in s.char_indices() {
-        let n = c.len_utf16();
-        if units + n > max {
-            return s[..i].to_owned();
-        }
-        units += n;
-    }
-    s.to_owned()
-}
-/// `EditBox.getWordPosition(dir, from)`: the character index `dir` words away
-/// from `from`. Forward, past the rest of the word and its spaces; backward,
-/// over any spaces to the start of the word.
-pub fn word_position(value: &str, dir: isize, from: usize) -> usize {
-    let chars: Vec<char> = value.chars().collect();
-    let mut pos = from.min(chars.len());
-    if dir < 0 {
-        while pos > 0 && chars[pos - 1] == ' ' {
-            pos -= 1;
-        }
-        while pos > 0 && chars[pos - 1] != ' ' {
-            pos -= 1;
-        }
-    } else {
-        while pos < chars.len() && chars[pos] != ' ' {
-            pos += 1;
-        }
-        while pos < chars.len() && chars[pos] == ' ' {
-            pos += 1;
-        }
-    }
-    pos
-}
-/// `MultilineTextField.getPreviousWord` / `getNextWord`'s `beginIndex` (a book page): any
-/// whitespace, line breaks included, separates words, and the search starts from the cursor
-/// clamped to the last character, as vanilla's does.
-pub fn multiline_word_position(value: &str, dir: isize, from: usize) -> usize {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.is_empty() {
-        return 0;
-    }
-    let mut pos = from.min(chars.len() - 1);
-    if dir < 0 {
-        while pos > 0 && java_whitespace(chars[pos - 1]) {
-            pos -= 1;
-        }
-        while pos > 0 && !java_whitespace(chars[pos - 1]) {
-            pos -= 1;
-        }
-    } else {
-        while pos < chars.len() && !java_whitespace(chars[pos]) {
-            pos += 1;
-        }
-        while pos < chars.len() && java_whitespace(chars[pos]) {
-            pos += 1;
-        }
-    }
-    pos
-}
-/// `Character.isWhitespace`: Unicode spaces and line breaks but not the no-break spaces, plus
-/// the ASCII separators U+001C to U+001F.
-pub(crate) fn java_whitespace(c: char) -> bool {
-    (c.is_whitespace() && !matches!(c, '\u{85}' | '\u{a0}' | '\u{2007}' | '\u{202f}'))
-        || ('\u{1c}'..='\u{1f}').contains(&c)
-}
+// The editing core's helpers, shared with mods' text fields (`mod_api::client::widgets`).
+use mod_api::client::widgets::byte_index;
+pub use mod_api::client::widgets::{
+    char_len, java_whitespace, multiline_word_position, utf16_len, utf16_prefix, word_position,
+};
 /// `EditBox.deleteWords(dir)` for an append-only field, whose caret is at the
 /// end: removes the word in that direction. True when the value changed.
 pub fn delete_words(value: &mut String, dir: isize) -> bool {
@@ -1648,7 +1560,7 @@ impl crate::clipboard::Editable for EditBox {
         self.highlight = 0;
     }
     fn selected_text(&self) -> String {
-        EditBox::selected_text(self)
+        self.edit.selected_text()
     }
     fn insert(&mut self, text: &str) -> bool {
         let before = self.value.clone();
@@ -1656,16 +1568,23 @@ impl crate::clipboard::Editable for EditBox {
         self.value != before
     }
 }
+impl std::ops::Deref for EditBox {
+    type Target = mod_api::client::widgets::TextEdit;
+    fn deref(&self) -> &Self::Target {
+        &self.edit
+    }
+}
+impl std::ops::DerefMut for EditBox {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.edit
+    }
+}
 impl EditBox {
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
         Self {
-            value: String::new(),
-            cursor: 0,
-            highlight: 0,
+            edit: mod_api::client::widgets::TextEdit::default(),
             display: 0,
-            max_length: 32,
             bordered: true,
-            multiline: false,
             x,
             y,
             width,
@@ -1716,47 +1635,25 @@ impl EditBox {
     pub fn cursor_visible(&self) -> bool {
         self.focused && (self.focused_at.elapsed().as_millis() / 300).is_multiple_of(2)
     }
+    /// After the core moved the cursor once: scroll to it and restart the blink, as
+    /// `EditBox.moveCursorTo` does.
+    fn moved(&mut self) {
+        self.scroll_to(self.edit.cursor);
+        self.reset_blink();
+    }
     pub fn set_value(&mut self, value: &str) {
-        self.value = utf16_prefix(value, self.max_length);
-        self.move_cursor_to_end(false);
-    }
-    fn selected(&self) -> (usize, usize) {
-        (
-            self.cursor.min(self.highlight),
-            self.cursor.max(self.highlight),
-        )
-    }
-    pub fn selected_text(&self) -> String {
-        let (a, b) = self.selected();
-        self.value.chars().skip(a).take(b - a).collect()
+        self.edit.set_value(value);
+        self.moved();
     }
     /// EditBox.insertText: replace the selection, respecting the maximum
     /// length. The limit is in UTF-16 code units, as Java's `String.length()`
     /// counts them.
     pub fn insert_text(&mut self, text: &str) {
-        // `EditBox.charTyped` only inserts through `canConsumeInput`, which a
-        // read-only box fails; the screens here hand typed text to this method
-        // directly.
         if !self.editable {
             return;
         }
-        let (a, b) = self.selected();
-        let filtered = crate::clipboard::filter_text(text, self.multiline);
-        let selected_units: usize = self
-            .value
-            .chars()
-            .skip(a)
-            .take(b - a)
-            .map(char::len_utf16)
-            .sum();
-        let room = self
-            .max_length
-            .saturating_sub(utf16_len(&self.value) - selected_units);
-        let insert = utf16_prefix(&filtered, room);
-        let (ba, bb) = (byte_index(&self.value, a), byte_index(&self.value, b));
-        self.value.replace_range(ba..bb, &insert);
-        let pos = a + char_len(&insert);
-        self.set_cursor(pos, false);
+        self.edit.insert_text(text);
+        self.moved();
     }
     /// Delete `n` characters (negative: backwards) or the selection. A
     /// read-only box consumes the key without changing its value.
@@ -1764,38 +1661,16 @@ impl EditBox {
         if !self.editable {
             return;
         }
-        if self.cursor != self.highlight {
-            self.insert_text("");
-            return;
-        }
-        let target = (self.cursor as isize + n).clamp(0, char_len(&self.value) as isize) as usize;
-        let (a, b) = (self.cursor.min(target), self.cursor.max(target));
-        let (ba, bb) = (byte_index(&self.value, a), byte_index(&self.value, b));
-        self.value.replace_range(ba..bb, "");
-        self.set_cursor(a, false);
-    }
-    /// EditBox.getWordPosition from the cursor.
-    pub fn word_position(&self, dir: isize) -> usize {
-        self.word_position_from(dir, self.cursor)
-    }
-    /// EditBox.getWordPosition(dir, from), or MultilineTextField's word for a book page.
-    fn word_position_from(&self, dir: isize, from: usize) -> usize {
-        if self.multiline {
-            multiline_word_position(&self.value, dir, from)
-        } else {
-            word_position(&self.value, dir, from)
-        }
+        self.edit.delete_chars(n);
+        self.moved();
     }
     pub fn set_cursor(&mut self, pos: usize, select: bool) {
-        self.cursor = pos.min(char_len(&self.value));
-        if !select {
-            self.highlight = self.cursor;
-        }
-        self.scroll_to(self.cursor);
-        self.reset_blink();
+        self.edit.set_cursor(pos, select);
+        self.moved();
     }
     pub fn move_cursor_to_end(&mut self, select: bool) {
-        self.set_cursor(char_len(&self.value), select);
+        self.edit.move_cursor_to_end(select);
+        self.moved();
     }
     /// EditBox.findClickedPositionInText: the character boundary under GUI `x`.
     pub fn position_at(&mut self, atlas: &HudAtlas, x: f32) -> usize {
@@ -1814,10 +1689,7 @@ impl EditBox {
     pub fn click(&mut self, atlas: &HudAtlas, x: f32, shift: bool, double: bool) {
         let pos = self.position_at(atlas, x);
         if double {
-            let (start, end) = (
-                self.word_position_from(-1, pos),
-                self.word_position_from(1, pos),
-            );
+            let (start, end) = self.edit.word_at(pos);
             self.set_cursor(start, false);
             self.set_cursor(end, true);
         } else {
@@ -1847,7 +1719,12 @@ impl EditBox {
     fn scroll_to(&mut self, pos: usize) {
         // EditBox.scrollTo without font access is completed in `layout`.
         self.display = self.display.min(char_len(&self.value));
-        if pos < self.display {
+        if pos == self.display && pos > 0 {
+            // A cursor on the first shown character steps back about a field's width
+            // (`displayPos -= plainSubstrByWidth(value, width, true).length()`): `layout` scrolls
+            // forward from the start until the cursor is at the right edge.
+            self.display = 0;
+        } else if pos < self.display {
             self.display = pos;
         }
     }
@@ -1868,53 +1745,26 @@ impl EditBox {
     }
     /// Keyboard editing shared by every text field. Returns true if handled.
     pub fn key(&mut self, key: winit::keyboard::KeyCode, ctrl: bool, shift: bool) -> bool {
+        use mod_api::client::widgets::EditKey;
         use winit::keyboard::KeyCode as K;
-        match key {
-            K::Backspace => {
-                if self.editable {
-                    let n = if ctrl {
-                        self.word_position(-1) as isize - self.cursor as isize
-                    } else {
-                        -1
-                    };
-                    self.delete_chars(n);
-                }
-            }
-            K::Delete => {
-                if self.editable {
-                    let n = if ctrl {
-                        self.word_position(1) as isize - self.cursor as isize
-                    } else {
-                        1
-                    };
-                    self.delete_chars(n);
-                }
-            }
-            K::ArrowLeft => {
-                let p = if ctrl {
-                    self.word_position(-1)
-                } else {
-                    self.cursor.saturating_sub(1)
-                };
-                self.set_cursor(p, shift);
-            }
-            K::ArrowRight => {
-                let p = if ctrl {
-                    self.word_position(1)
-                } else {
-                    self.cursor + 1
-                };
-                self.set_cursor(p, shift);
-            }
-            K::Home => self.set_cursor(0, shift),
-            K::End => self.move_cursor_to_end(shift),
-            K::KeyA if ctrl => {
-                self.move_cursor_to_end(false);
-                self.highlight = 0;
-            }
+        let key = match key {
+            K::Backspace => EditKey::Backspace,
+            K::Delete => EditKey::Delete,
+            K::ArrowLeft => EditKey::Left,
+            K::ArrowRight => EditKey::Right,
+            K::Home => EditKey::Home,
+            K::End => EditKey::End,
+            K::KeyA => EditKey::SelectAll,
             _ => return false,
+        };
+        if !self.editable && matches!(key, EditKey::Backspace | EditKey::Delete) {
+            return true;
         }
-        true
+        let handled = self.edit.key(key, ctrl, shift);
+        if handled {
+            self.moved();
+        }
+        handled
     }
     /// Ctrl+A/C/V/X (`EditBox.keyPressed`). True when the value changed.
     pub fn shortcut(
@@ -1948,9 +1798,36 @@ impl EditBox {
     }
     /// Draw the field; `format` styles the visible text (command colouring).
     pub fn draw(&mut self, batch: &mut HudBatch, atlas: &HudAtlas, format: Option<&Text>) {
-        self.draw_with_skin(batch, atlas, format, None);
+        let caret = self.cursor_visible();
+        self.draw_with_caret(batch, atlas, format, caret);
     }
-
+    /// The first character shown (`EditBox.displayPos`): a field kept outside the box (a
+    /// mod's) hands back the scroll its last draw answered.
+    pub fn set_scroll(&mut self, first: usize) {
+        self.display = first.min(char_len(&self.value));
+    }
+    /// After a draw: the first character shown and the GUI x of each shown character
+    /// boundary, from the start of the shown text to its end.
+    pub fn shown_edges(&self, atlas: &HudAtlas) -> (usize, Vec<f32>) {
+        let rest: String = self.value.chars().skip(self.display).collect();
+        let shown = atlas.font.fit(&rest, self.inner_width());
+        let edges = (0..=shown)
+            .map(|n| self.text_x() + atlas.font.width(&rest.chars().take(n).collect::<String>()))
+            .collect();
+        (self.display, edges)
+    }
+    /// [`Self::draw`] with the caret's blink decided by the caller: `caret` shows it (when it
+    /// is in view) for a field whose blink a mod keeps.
+    pub fn draw_with_caret(
+        &mut self,
+        batch: &mut HudBatch,
+        atlas: &HudAtlas,
+        format: Option<&Text>,
+        caret: bool,
+    ) {
+        self.draw_skinned_caret(batch, atlas, format, caret, None);
+    }
+    /// Draw with a custom nine-slice background and the field's own caret blink.
     pub fn draw_with_skin(
         &mut self,
         batch: &mut HudBatch,
@@ -1958,18 +1835,26 @@ impl EditBox {
         format: Option<&Text>,
         skin: Option<&str>,
     ) {
+        let caret = self.cursor_visible();
+        self.draw_skinned_caret(batch, atlas, format, caret, skin);
+    }
+    fn draw_skinned_caret(
+        &mut self,
+        batch: &mut HudBatch,
+        atlas: &HudAtlas,
+        format: Option<&Text>,
+        caret: bool,
+        skin: Option<&str>,
+    ) {
         self.layout(atlas);
-        crate::widgets::target_as(
-            [self.x, self.y, self.width, self.height],
-            crate::widgets::Kind::Field,
-        );
+        // The focus outline and a press go round the box's frame where it has one.
+        let rect = self
+            .frame
+            .unwrap_or([self.x, self.y, self.width, self.height]);
+        crate::widgets::target_as(rect, crate::widgets::Kind::Field);
         crate::widgets::narratable(|| {
-            crate::widgets::Narratable::edit_box(
-                self.message.clone(),
-                self.value.clone(),
-                [self.x, self.y, self.width, self.height],
-            )
-            .focused(self.focused)
+            crate::widgets::Narratable::edit_box(self.message.clone(), self.value.clone(), rect)
+                .focused(self.focused)
         });
         if self.bordered {
             let sprite = skin.unwrap_or(if self.focused {
@@ -1998,9 +1883,7 @@ impl EditBox {
         let displayed: String = rest.chars().take(shown_len).collect();
         let rel_cursor = self.cursor as isize - self.display as isize;
         let on_screen = rel_cursor >= 0 && rel_cursor as usize <= shown_len;
-        let show_cursor = self.focused
-            && (self.focused_at.elapsed().as_millis() / 300).is_multiple_of(2)
-            && on_screen;
+        let show_cursor = caret && on_screen;
         let styled = |from: usize, to: usize| -> Text {
             match format {
                 Some(t) => t.slice(self.display + from, self.display + to),
@@ -2105,6 +1988,7 @@ impl EditBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn notes_after_a_sprites_metadata_keep_its_nine_slice() {
@@ -2119,7 +2003,7 @@ mod tests {
              \"border\": {\"left\": 34, \"top\": 8, \"right\": 34, \"bottom\": 8}}}}\n\n// 0  10\n// 1  8\n",
         )
         .unwrap();
-        let metadata = read_metadata(&root);
+        let metadata = read_metadata(&ResourceSource::directory(root.clone()));
         std::fs::remove_dir_all(&root).unwrap();
         let Some(Scaling::NineSlice(slice)) =
             metadata.0.get("gui/sprites/widget/button_highlighted")
@@ -2196,7 +2080,10 @@ mod tests {
     }
 
     fn atlas() -> HudAtlas {
-        HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets")).unwrap()
+        HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+            (std::path::Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+        ))
+        .unwrap()
     }
 
     /// `defaultScrollingHelper` draws an overflowing label from `left` less the
@@ -2217,7 +2104,7 @@ mod tests {
     #[test]
     fn an_active_icon_button_is_a_focus_target_and_a_disabled_one_is_not() {
         let atlas = atlas();
-        let mut batch = HudBatch::new([640, 480]);
+        let mut batch = HudBatch::scratch([640, 480]);
         // Whatever this thread drew before is the last frame's, then gone.
         crate::widgets::end_frame(u64::MAX - 1);
         button(
@@ -2255,11 +2142,11 @@ mod tests {
         let atlas = atlas();
         crate::widgets::set_action_glyphs(true);
         let label = Text::literal("Done");
-        let mut plain = HudBatch::new([640, 480]);
+        let mut plain = HudBatch::scratch([640, 480]);
         button(
             &mut plain, &atlas, 10.0, 20.0, 150.0, 20.0, &label, true, false,
         );
-        let mut declared = HudBatch::new([640, 480]);
+        let mut declared = HudBatch::scratch([640, 480]);
         action_button(
             &mut declared,
             &atlas,
@@ -2280,7 +2167,7 @@ mod tests {
         let atlas = atlas();
         let label = Text::literal("Graphics API: Prefer Vulkan (Experimental)");
         assert!(atlas.font.width_text(&label.resolved()) > 96.0);
-        let mut batch = HudBatch::new([640, 480]);
+        let mut batch = HudBatch::scratch([640, 480]);
         scrolling_text_at(
             &mut batch,
             &atlas,
@@ -2302,7 +2189,7 @@ mod tests {
             );
         }
         // A label that fits is centred and not cut: every glyph is drawn.
-        let mut batch = HudBatch::new([640, 480]);
+        let mut batch = HudBatch::scratch([640, 480]);
         let short = Text::literal("Done");
         scrolling_text_at(
             &mut batch,
@@ -2355,7 +2242,7 @@ mod tests {
             (false, true, 10.0, u32::MAX),
             (false, false, 10.0, 0xFFA0_A0A0),
         ] {
-            let mut tab = HudBatch::new([640, 480]);
+            let mut tab = HudBatch::scratch([640, 480]);
             menu_tab_label(
                 &mut tab,
                 &atlas,
@@ -2365,7 +2252,7 @@ mod tests {
                 active,
                 0,
             );
-            let mut want = HudBatch::new([640, 480]);
+            let mut want = HudBatch::scratch([640, 480]);
             want.text_styled(&atlas, &label.resolved(), left, y, color, true);
             let glyphs = |b: &HudBatch| -> Vec<([u32; 2], u32)> {
                 b.vertices
@@ -2418,7 +2305,7 @@ mod tests {
     }
     #[test]
     fn separator_tiles_sample_both_rows_and_clip_the_last_column() {
-        let mut batch = HudBatch::new([640, 480]);
+        let mut batch = HudBatch::scratch([640, 480]);
         tile(
             &mut batch,
             sprite(32, 2),
@@ -2431,6 +2318,117 @@ mod tests {
         assert_eq!(q.len(), 2);
         assert_quad(q[0], ([0.0, 5.0, 32.0, 7.0], [0.0, 0.0, 1.0, 1.0]));
         assert_quad(q[1], ([32.0, 5.0, 40.0, 7.0], [0.0, 0.0, 0.25, 1.0]));
+    }
+    #[test]
+    fn a_border_that_leaves_no_centre_slice_is_no_metadata() {
+        // NineSlice.validate rejects 12 + 12 >= 20, so the sprite has none.
+        let json = serde_json::json!({"gui": {"scaling": {
+            "type": "nine_slice", "width": 20, "height": 20, "border": 12}}});
+        assert!(parse_nine_slice(&json).is_none());
+        // 9 + 9 < 20 still leaves a centre slice.
+        let json = serde_json::json!({"gui": {"scaling": {
+            "type": "nine_slice", "width": 20, "height": 20, "border": 9}}});
+        assert_eq!(parse_nine_slice(&json).unwrap().border, [9; 4]);
+    }
+    #[test]
+    fn a_high_resolution_button_slices_in_its_gui_units() {
+        // Faithful 32x's widget/button: 400x40 texels, gui.scaling 200x20.
+        let n = faithful(
+            r#"{"gui":{"scaling":{"type":"nine_slice","width":200,"height":20,
+                "border":{"left":20,"top":4,"right":20,"bottom":4}}}}"#,
+        );
+        let mut batch = HudBatch::scratch([640, 480]);
+        draw_nine_slice(
+            &mut batch,
+            sprite(400, 40),
+            n,
+            [10.0, 5.0, 150.0, 20.0],
+            u32::MAX,
+        );
+        let q = quads(&batch);
+        // Full height: left border, the centre tiled, right border
+        // (blitNineSlicedSprite's height == nineSlice.height case).
+        assert_quad(q[0], ([10.0, 5.0, 30.0, 25.0], [0.0, 0.0, 0.1, 1.0]));
+        assert_quad(q[1], ([30.0, 5.0, 140.0, 25.0], [0.1, 0.0, 0.65, 1.0]));
+        assert_quad(q[2], ([140.0, 5.0, 160.0, 25.0], [0.9, 0.0, 1.0, 1.0]));
+        assert_eq!(q.len(), 3);
+    }
+    #[test]
+    fn nine_slice_corners_and_a_stretched_centre() {
+        // Faithful 32x's tooltip/frame: 200x200 texels, 100x100, border 12, stretched.
+        let n = faithful(
+            r#"{"gui":{"scaling":{"type":"nine_slice","width":100,"height":100,"border":12,"stretch_inner":true}}}"#,
+        );
+        let mut batch = HudBatch::scratch([640, 480]);
+        draw_nine_slice(
+            &mut batch,
+            sprite(200, 200),
+            n,
+            [0.0, 0.0, 300.0, 40.0],
+            u32::MAX,
+        );
+        let q = quads(&batch);
+        assert_eq!(q.len(), 9);
+        // Top left corner: 12 GUI pixels, 12/100 of the sprite.
+        assert_quad(q[0], ([0.0, 0.0, 12.0, 12.0], [0.0, 0.0, 0.12, 0.12]));
+        // The centre is one stretched quad (blitNineSliceInnerSegment, stretch_inner).
+        assert_quad(q[7], ([12.0, 12.0, 288.0, 28.0], [0.12, 0.12, 0.88, 0.88]));
+        // Bottom right corner.
+        assert_quad(q[5], ([288.0, 28.0, 300.0, 40.0], [0.88, 0.88, 1.0, 1.0]));
+    }
+    #[test]
+    fn a_sprite_drawn_at_its_own_size_is_one_quad() {
+        let n = NineSlice {
+            width: 50,
+            height: 50,
+            border: [10; 4],
+            stretch_inner: false,
+        };
+        let mut batch = HudBatch::scratch([640, 480]);
+        draw_nine_slice(
+            &mut batch,
+            sprite(100, 100),
+            n,
+            [4.0, 4.0, 50.0, 50.0],
+            u32::MAX,
+        );
+        let q = quads(&batch);
+        assert_eq!(q.len(), 1);
+        assert_quad(q[0], ([4.0, 4.0, 54.0, 54.0], [0.0, 0.0, 1.0, 1.0]));
+    }
+    #[test]
+    fn blit_sprite_nine_slices_a_sprite_whose_metadata_says_so() {
+        // Vanilla's tooltip/frame: 100x100, border 10, stretched centre.
+        let n = faithful(
+            r#"{"gui":{"scaling":{"type":"nine_slice","width":100,"height":100,"border":10,"stretch_inner":true}}}"#,
+        );
+        let mut batch = HudBatch::scratch([640, 480]);
+        draw_scaling(
+            &mut batch,
+            sprite(100, 100),
+            Scaling::NineSlice(n),
+            [10.0, 10.0, 160.0, 26.0],
+            u32::MAX,
+        );
+        let q = quads(&batch);
+        assert_eq!(q.len(), 9);
+        // The corners keep their 10 pixels instead of stretching with the box.
+        assert_quad(q[0], ([10.0, 10.0, 20.0, 20.0], [0.0, 0.0, 0.1, 0.1]));
+        assert_quad(q[5], ([160.0, 26.0, 170.0, 36.0], [0.9, 0.9, 1.0, 1.0]));
+    }
+    #[test]
+    fn blit_sprite_stretches_a_sprite_without_metadata() {
+        let mut batch = HudBatch::scratch([640, 480]);
+        draw_scaling(
+            &mut batch,
+            sprite(9, 9),
+            Scaling::Stretch,
+            [0.0, 0.0, 27.0, 18.0],
+            u32::MAX,
+        );
+        let q = quads(&batch);
+        assert_eq!(q.len(), 1);
+        assert_quad(q[0], ([0.0, 0.0, 27.0, 18.0], [0.0, 0.0, 1.0, 1.0]));
     }
     #[test]
     fn tile_scaling_reads_its_gui_size() {
@@ -2458,7 +2456,7 @@ mod tests {
     }
     #[test]
     fn scaling_dispatch_tiles_the_whole_sprite() {
-        let mut batch = HudBatch::new([640, 480]);
+        let mut batch = HudBatch::scratch([640, 480]);
         draw_scaling(
             &mut batch,
             sprite(16, 16),
@@ -2496,30 +2494,33 @@ mod tests {
     }
     #[test]
     fn gui_scaling_metadata_reads_each_namespace_with_atlas_keys() {
-        let root = std::env::temp_dir().join(format!(
-            "horizon-ui-scaling-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let minecraft = root.join("assets/minecraft/textures/gui/sprites/widget");
-        let sunfall = root.join("assets/sunfall/textures/gui/sprites/panel");
-        std::fs::create_dir_all(&minecraft).unwrap();
-        std::fs::create_dir_all(&sunfall).unwrap();
-        std::fs::write(
-            minecraft.join("tile.png.mcmeta"),
-            r#"{"gui":{"scaling":{"type":"tile","width":16,"height":8}}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            sunfall.join("nine.png.mcmeta"),
-            r#"{"gui":{"scaling":{"type":"nine_slice","width":20,"height":20,"border":2}}}"#,
-        )
-        .unwrap();
-
-        let metadata = read_metadata(&root);
+        use horizon_assets::resource_source::Resource;
+        let source = ResourceSource::indexed(std::collections::BTreeMap::from([
+            (
+                "assets/minecraft/textures/gui/sprites/widget/tile.png.mcmeta".to_owned(),
+                Resource::bytes(
+                    br#"{"gui":{"scaling":{"type":"tile","width":16,"height":8}}}"#.to_vec(),
+                ),
+            ),
+            (
+                "assets/sunfall/textures/gui/sprites/panel/nine.png.mcmeta".to_owned(),
+                Resource::bytes(
+                    br#"{"gui":{"scaling":{"type":"nine_slice","width":20,"height":20,"border":2}}}"#
+                        .to_vec(),
+                ),
+            ),
+            // A sprite whose own path starts with `gui/sprites/` keeps its own
+            // atlas key: it must not overwrite the first sprite's metadata.
+            (
+                "assets/minecraft/textures/gui/sprites/gui/sprites/widget/tile.png.mcmeta"
+                    .to_owned(),
+                Resource::bytes(
+                    br#"{"gui":{"scaling":{"type":"nine_slice","width":20,"height":20,"border":2}}}"#
+                        .to_vec(),
+                ),
+            ),
+        ]));
+        let metadata = read_metadata(&source);
         let tile = Scaling::Tile {
             width: 16,
             height: 8,
@@ -2535,133 +2536,10 @@ mod tests {
             metadata.0.get("sunfall:gui/sprites/panel/nine"),
             Some(&nine)
         );
-        // A sprite whose path itself starts with `gui/sprites/` has its own
-        // atlas key: it must not overwrite the first sprite's metadata.
-        let nested = root.join("assets/minecraft/textures/gui/sprites/gui/sprites/widget");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(
-            nested.join("tile.png.mcmeta"),
-            r#"{"gui":{"scaling":{"type":"nine_slice","width":20,"height":20,"border":2}}}"#,
-        )
-        .unwrap();
-        let metadata = read_metadata(&root);
-        assert_eq!(metadata.0.get("gui/sprites/widget/tile"), Some(&tile));
         assert_eq!(
             metadata.0.get("gui/sprites/gui/sprites/widget/tile"),
             Some(&nine)
         );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn a_border_that_leaves_no_centre_slice_is_no_metadata() {
-        // NineSlice.validate rejects 12 + 12 >= 20, so the sprite has none.
-        let json = serde_json::json!({"gui": {"scaling": {
-            "type": "nine_slice", "width": 20, "height": 20, "border": 12}}});
-        assert!(parse_nine_slice(&json).is_none());
-        // 9 + 9 < 20 still leaves a centre slice.
-        let json = serde_json::json!({"gui": {"scaling": {
-            "type": "nine_slice", "width": 20, "height": 20, "border": 9}}});
-        assert_eq!(parse_nine_slice(&json).unwrap().border, [9; 4]);
-    }
-    #[test]
-    fn a_high_resolution_button_slices_in_its_gui_units() {
-        // Faithful 32x's widget/button: 400x40 texels, gui.scaling 200x20.
-        let n = faithful(
-            r#"{"gui":{"scaling":{"type":"nine_slice","width":200,"height":20,
-                "border":{"left":20,"top":4,"right":20,"bottom":4}}}}"#,
-        );
-        let mut batch = HudBatch::new([640, 480]);
-        draw_nine_slice(
-            &mut batch,
-            sprite(400, 40),
-            n,
-            [10.0, 5.0, 150.0, 20.0],
-            u32::MAX,
-        );
-        let q = quads(&batch);
-        // Full height: left border, the centre tiled, right border
-        // (blitNineSlicedSprite's height == nineSlice.height case).
-        assert_quad(q[0], ([10.0, 5.0, 30.0, 25.0], [0.0, 0.0, 0.1, 1.0]));
-        assert_quad(q[1], ([30.0, 5.0, 140.0, 25.0], [0.1, 0.0, 0.65, 1.0]));
-        assert_quad(q[2], ([140.0, 5.0, 160.0, 25.0], [0.9, 0.0, 1.0, 1.0]));
-        assert_eq!(q.len(), 3);
-    }
-    #[test]
-    fn nine_slice_corners_and_a_stretched_centre() {
-        // Faithful 32x's tooltip/frame: 200x200 texels, 100x100, border 12, stretched.
-        let n = faithful(
-            r#"{"gui":{"scaling":{"type":"nine_slice","width":100,"height":100,"border":12,"stretch_inner":true}}}"#,
-        );
-        let mut batch = HudBatch::new([640, 480]);
-        draw_nine_slice(
-            &mut batch,
-            sprite(200, 200),
-            n,
-            [0.0, 0.0, 300.0, 40.0],
-            u32::MAX,
-        );
-        let q = quads(&batch);
-        assert_eq!(q.len(), 9);
-        // Top left corner: 12 GUI pixels, 12/100 of the sprite.
-        assert_quad(q[0], ([0.0, 0.0, 12.0, 12.0], [0.0, 0.0, 0.12, 0.12]));
-        // The centre is one stretched quad (blitNineSliceInnerSegment, stretch_inner).
-        assert_quad(q[7], ([12.0, 12.0, 288.0, 28.0], [0.12, 0.12, 0.88, 0.88]));
-        // Bottom right corner.
-        assert_quad(q[5], ([288.0, 28.0, 300.0, 40.0], [0.88, 0.88, 1.0, 1.0]));
-    }
-    #[test]
-    fn a_sprite_drawn_at_its_own_size_is_one_quad() {
-        let n = NineSlice {
-            width: 50,
-            height: 50,
-            border: [10; 4],
-            stretch_inner: false,
-        };
-        let mut batch = HudBatch::new([640, 480]);
-        draw_nine_slice(
-            &mut batch,
-            sprite(100, 100),
-            n,
-            [4.0, 4.0, 50.0, 50.0],
-            u32::MAX,
-        );
-        let q = quads(&batch);
-        assert_eq!(q.len(), 1);
-        assert_quad(q[0], ([4.0, 4.0, 54.0, 54.0], [0.0, 0.0, 1.0, 1.0]));
-    }
-    #[test]
-    fn blit_sprite_nine_slices_a_sprite_whose_metadata_says_so() {
-        // Vanilla's tooltip/frame: 100x100, border 10, stretched centre.
-        let n = faithful(
-            r#"{"gui":{"scaling":{"type":"nine_slice","width":100,"height":100,"border":10,"stretch_inner":true}}}"#,
-        );
-        let mut batch = HudBatch::new([640, 480]);
-        draw_scaling(
-            &mut batch,
-            sprite(100, 100),
-            Scaling::NineSlice(n),
-            [10.0, 10.0, 160.0, 26.0],
-            u32::MAX,
-        );
-        let q = quads(&batch);
-        assert_eq!(q.len(), 9);
-        // The corners keep their 10 pixels instead of stretching with the box.
-        assert_quad(q[0], ([10.0, 10.0, 20.0, 20.0], [0.0, 0.0, 0.1, 0.1]));
-        assert_quad(q[5], ([160.0, 26.0, 170.0, 36.0], [0.9, 0.9, 1.0, 1.0]));
-    }
-    #[test]
-    fn blit_sprite_stretches_a_sprite_without_metadata() {
-        let mut batch = HudBatch::new([640, 480]);
-        draw_scaling(
-            &mut batch,
-            sprite(9, 9),
-            Scaling::Stretch,
-            [0.0, 0.0, 27.0, 18.0],
-            u32::MAX,
-        );
-        let q = quads(&batch);
-        assert_eq!(q.len(), 1);
-        assert_quad(q[0], ([0.0, 0.0, 27.0, 18.0], [0.0, 0.0, 1.0, 1.0]));
     }
     #[test]
     fn borders_shrink_to_half_the_drawn_size() {
@@ -2671,7 +2549,7 @@ mod tests {
             border: [8; 4],
             stretch_inner: true,
         };
-        let mut batch = HudBatch::new([640, 480]);
+        let mut batch = HudBatch::scratch([640, 480]);
         // 9 wide: borders of floor(9 / 2) = 4, as vanilla's integer division.
         draw_nine_slice(
             &mut batch,
@@ -2687,7 +2565,10 @@ mod tests {
     #[test]
     fn append_fields_highlight_the_whole_value_and_blink_their_cursor() {
         use crate::hud::Blend;
-        let atlas = HudAtlas::build(Path::new("/nonexistent/horizon-test-assets")).unwrap();
+        let atlas = HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+            (Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+        ))
+        .unwrap();
         let end = 10.0 + HudBatch::text_width(&atlas, "abc") + 1.0;
         let span = |b: &HudBatch, r: &std::ops::Range<u32>| {
             let v = &b.vertices[r.start as usize..r.end as usize];
@@ -2702,7 +2583,7 @@ mod tests {
         };
         // Select All in the creative search: inverted white, then blue added,
         // from one pixel before the text to the cursor, 11 high.
-        let mut b = HudBatch::new([854, 480]);
+        let mut b = HudBatch::scratch([854, 480]);
         append_field(
             &mut b,
             &atlas,
@@ -2720,7 +2601,7 @@ mod tests {
             assert_eq!(span(&b, r), (9.0, end, 19.0, 30.0));
         }
         // The anvil keeps its text colour; 300 ms later the cursor is hidden.
-        let mut b = HudBatch::new([854, 480]);
+        let mut b = HudBatch::scratch([854, 480]);
         append_field(
             &mut b,
             &atlas,
@@ -2735,7 +2616,7 @@ mod tests {
         let blends: Vec<_> = b.blends.iter().map(|(_, blend)| *blend).collect();
         assert_eq!(blends, vec![Blend::Additive]);
         let quads = |ms| {
-            let mut b = HudBatch::new([854, 480]);
+            let mut b = HudBatch::scratch([854, 480]);
             append_field(
                 &mut b,
                 &atlas,
@@ -2751,7 +2632,7 @@ mod tests {
         };
         assert!(quads(300) < quads(600));
         // A full field shows a bar on its last pixel instead of an underscore.
-        let mut b = HudBatch::new([854, 480]);
+        let mut b = HudBatch::scratch([854, 480]);
         append_field(
             &mut b,
             &atlas,
@@ -2790,7 +2671,10 @@ mod tests {
     }
     #[test]
     fn edit_box_clicks_place_the_cursor_and_select() {
-        let atlas = HudAtlas::build(Path::new("/nonexistent/horizon-test-assets")).unwrap();
+        let atlas = HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+            (Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+        ))
+        .unwrap();
         let mut e = EditBox::new(10.0, 0.0, 200.0, 20.0);
         e.set_value("hello world");
         let at = |e: &EditBox, s: &str| e.text_x() + atlas.font.width(s);
@@ -2807,6 +2691,31 @@ mod tests {
         e.click(&atlas, at(&e, "hello "), false, false);
         e.drag_to(&atlas, e.text_x() - 5.0);
         assert_eq!((e.cursor, e.highlight), (0, 6));
+    }
+    /// `EditBox.scrollTo`: a cursor on the first shown character steps back a field's width,
+    /// so replacing all of a scrolled text shows the new text, and walking left past the
+    /// shown start pages back.
+    #[test]
+    fn edit_box_steps_back_when_the_cursor_reaches_the_first_shown_character() {
+        let atlas = HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+            (Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+        ))
+        .unwrap();
+        let mut e = EditBox::new(0.0, 0.0, 60.0, 20.0);
+        e.set_value("the quick brown fox jumps over");
+        e.layout(&atlas);
+        let scrolled = e.display;
+        assert!(scrolled > 0);
+        assert!(e.key(winit::keyboard::KeyCode::KeyA, true, false));
+        e.insert_text("a");
+        e.layout(&atlas);
+        assert_eq!((e.value.as_str(), e.cursor, e.display), ("a", 1, 0));
+        e.set_value("the quick brown fox jumps over");
+        e.layout(&atlas);
+        e.set_cursor(scrolled, false);
+        e.layout(&atlas);
+        assert!(e.display < scrolled);
+        assert!(e.cursor > e.display);
     }
     #[test]
     fn edit_box_editing() {
@@ -2949,6 +2858,99 @@ mod tests {
         assert_eq!(
             menu_tooltip_position(screen, (100, 200), [100, 200, 150, 20], size),
             (112, 180)
+        );
+    }
+    #[test]
+    fn nine_slice_metadata_reads_resolved_resource_names_without_files() {
+        use horizon_assets::resource_source::Resource;
+        let source = ResourceSource::indexed(std::collections::BTreeMap::from([
+            ("assets/minecraft/textures/gui/sprites/widget/button.png.mcmeta".to_owned(),
+             Resource::bytes(br#"{"gui":{"scaling":{"type":"nine_slice","width":20,"height":12,"border":3}}}"#.to_vec())),
+            ("assets/minecraft/textures/gui/sprites/broken.png.mcmeta".to_owned(), Resource::bytes(b"invalid".to_vec())),
+            ("assets/minecraft/textures/block/stone.png.mcmeta".to_owned(), Resource::bytes(b"{}".to_vec())),
+            ("assets/lobby/textures/gui/sprites/tooltip/gold_frame.png.mcmeta".to_owned(),
+             Resource::bytes(br#"{"gui":{"scaling":{"type":"nine_slice","width":40,"height":40,"border":6}}}"#.to_vec())),
+        ]));
+        let metadata = read_metadata(&source);
+        assert_eq!(metadata.0.len(), 2);
+        let Some(Scaling::NineSlice(button)) = metadata.0.get("gui/sprites/widget/button") else {
+            panic!("the button's nine-slice metadata");
+        };
+        assert_eq!(
+            (button.width, button.height, button.border),
+            (20, 12, [3; 4])
+        );
+        // Another namespace's sprite is named with it, as the GUI atlas packs it.
+        let Some(Scaling::NineSlice(frame)) =
+            metadata.0.get("lobby:gui/sprites/tooltip/gold_frame")
+        else {
+            panic!("the frame's nine-slice metadata");
+        };
+        assert_eq!((frame.width, frame.border), (40, [6; 4]));
+    }
+    /// A tooltip style names its sprites as `TooltipRenderUtil` does, in the GUI atlas's names;
+    /// the box draws the background, then the frame, 12 pixels out from the contents, each
+    /// stretched when it has no `gui.scaling` (`GuiMetadataSection.DEFAULT`), and nothing
+    /// without either sprite.
+    #[test]
+    fn a_tooltip_style_draws_its_own_background_and_frame() {
+        assert_eq!(
+            tooltip_style_sprites("minecraft", "fancy"),
+            [
+                "gui/sprites/tooltip/fancy_background",
+                "gui/sprites/tooltip/fancy_frame"
+            ]
+        );
+        let [background, frame] = tooltip_style_sprites("lobby", "gold");
+        assert_eq!(
+            [background.as_str(), frame.as_str()],
+            [
+                "lobby:gui/sprites/tooltip/gold_background",
+                "lobby:gui/sprites/tooltip/gold_frame"
+            ]
+        );
+        let mut atlas = atlas();
+        let mut batch = HudBatch::scratch([640, 480]);
+        assert!(!tooltip_sprites(
+            &mut batch,
+            &atlas,
+            [&background, &frame],
+            [20.0, 20.0, 50.0, 8.0]
+        ));
+        assert!(batch.vertices.is_empty());
+        // Two 16 × 16 sprites without metadata, in different places on the atlas.
+        let region = |u0: f32| Rect {
+            u0,
+            v0: 0.0,
+            u1: u0 + 0.25,
+            v1: 0.25,
+            w: 16,
+            h: 16,
+        };
+        // A background without its frame would draw a box with no border.
+        atlas.sprites.insert(background.clone(), region(0.0));
+        assert!(!tooltip_sprites(
+            &mut batch,
+            &atlas,
+            [&background, &frame],
+            [20.0, 20.0, 50.0, 8.0]
+        ));
+        assert!(batch.vertices.is_empty());
+        atlas.sprites.insert(frame.clone(), region(0.5));
+        assert!(tooltip_sprites(
+            &mut batch,
+            &atlas,
+            [&background, &frame],
+            [20.0, 20.0, 50.0, 8.0]
+        ));
+        // Each is one stretched picture over the whole box, the background under the frame.
+        let box_ = [8.0, 8.0, 82.0, 40.0];
+        assert_eq!(
+            quads(&batch),
+            [
+                (box_, [0.0, 0.0, 0.25, 0.25]),
+                (box_, [0.5, 0.0, 0.75, 0.25])
+            ]
         );
     }
 
