@@ -222,11 +222,6 @@ impl<P: Copy, S: Copy> Lines<P, S> {
         }
         self.y += style::GROUP_GAP;
     }
-    /// A group of rows under its page's own name (`list`'s `page_name`), for pages named at run
-    /// time, such as a resource pack's config entries (`pack_options_ui`).
-    pub(crate) fn titled(&mut self, page: P, rows: Vec<S>) {
-        self.group(page, "", rows);
-    }
     /// The lines and the content's height.
     pub(crate) fn finish(self) -> (Vec<Line<P, S>>, f32) {
         (self.lines, (self.y - style::GROUP_GAP).max(0.0))
@@ -237,7 +232,7 @@ impl<P: Copy, S: Copy> Lines<P, S> {
 pub(crate) fn backdrop(batch: &mut HudBatch, atlas: &HudAtlas, in_world: bool) {
     let (w, h) = (batch.width, batch.height);
     ui::menu_background(batch, atlas, 0.0, 0.0, w, h, in_world);
-    style::fill(batch, atlas, [0.0, 0.0, w, h], style::veil());
+    style::veil_over(batch, atlas, [0.0, 0.0, w, h], in_world);
 }
 
 /// The mark and the screen's name over the search field.
@@ -273,8 +268,7 @@ pub(crate) fn page_tab(
         crate::widgets::target_as(rect, crate::widgets::Kind::Tab(open));
     }
     if open {
-        style::fill(batch, atlas, rect, style::open());
-        style::fill(batch, atlas, [px, py, 2.0, ph], style::accent());
+        style::open_page(batch, atlas, rect);
     }
     let color = match (open || hover, has) {
         (true, _) => style::WHITE,
@@ -301,15 +295,27 @@ pub(crate) fn search_field(
     let rect = cols.search();
     style::well(batch, atlas, rect);
     search.focused = focused;
-    let [x, y, _, h] = rect;
+    let [x, y, w, h] = rect;
     let clear = cols.clear();
     (search.x, search.y) = (x + 5.0, y + ((h - 8.0) / 2.0).floor());
     search.width = clear[0] - search.x;
     search.text_color = style::WHITE;
-    // The clear button isn't the field's: a click at the field's end must not press it.
-    let frame = [x, y, clear[0] - x, h];
+    // The whole field, but for the clear button while it shows: a click there must not press it.
+    let frame = [
+        x,
+        y,
+        if search.value.is_empty() {
+            w
+        } else {
+            clear[0] - x
+        },
+        h,
+    ];
     search.frame = Some(frame);
     search.draw(batch, atlas, None);
+    if ui::hovered(cursor, x, y, frame[2], h) {
+        crate::widgets::text_cursor(true, true);
+    }
     if search.value.is_empty() && !focused {
         let hint = Text::literal(search.message.clone());
         batch.text_styled(atlas, &hint, x + 5.0, search.y, style::muted(), true);
@@ -334,23 +340,16 @@ pub(crate) fn search_field(
     }
 }
 
-/// The plate, with the open page's name (or the search's) over its list.
+/// The open page's name (or the search's) and rule, over its already-painted plate.
 pub(crate) fn plate(batch: &mut HudBatch, atlas: &HudAtlas, cols: &Columns, heading: &str) {
     let [px, py, pw, _] = cols.plate;
-    style::panel(batch, atlas, cols.plate);
     let heading = Text::literal(style::fit(atlas, heading, pw - 24.0));
     batch.text_styled(atlas, &heading, px + 12.0, py + 10.0, style::WHITE, true);
-    style::fill(
-        batch,
-        atlas,
-        [px + 8.0, py + 24.0, pw - 16.0, 1.0],
-        style::head_rule(),
-    );
+    style::heading_rule(batch, atlas, [px + 8.0, py + 24.0, pw - 16.0, 1.0]);
 }
 
 /// The list, clipped to its view: each group's panel, then its names and rows on it. `row`
-/// draws a setting at its `y`; `page_name` names a page, and a group without a name of its own
-/// (`Lines::titled`), in the player's language.
+/// draws a setting at its `y`; `page_name` names a page, in the player's language.
 pub(crate) fn list<P: Copy, S: Copy>(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
@@ -383,7 +382,6 @@ pub(crate) fn list<P: Copy, S: Copy>(
         }
         let Some(setting) = line.setting else {
             let (name, color, dy) = match line.group {
-                Some(("", _)) => (page_name(line.page), style::muted(), 3.0),
                 Some((name, _)) => (lang::get(name), style::muted(), 3.0),
                 None => (page_name(line.page), style::accent(), 4.0),
             };
@@ -393,7 +391,7 @@ pub(crate) fn list<P: Copy, S: Copy>(
         };
         if !after_name {
             let rule = [cols.list_x + 8.0, y, cols.list_w - 16.0, 1.0];
-            style::fill(batch, atlas, rule, style::row_rule());
+            style::rule(batch, atlas, rule);
         }
         row(batch, setting, y);
     }
@@ -499,7 +497,7 @@ pub(crate) fn row(batch: &mut HudBatch, atlas: &HudAtlas, cols: &Columns, y: f32
     let active = live && (hover || focused || held);
     if active {
         let lit = [rect[0] + 2.0, y + 1.0, rect[2] - 4.0, style::ROW - 2.0];
-        style::fill(batch, atlas, lit, style::hover());
+        style::lit(batch, atlas, lit);
     }
     // AbstractSliderButton.handleCursor: a dragged slider resizes, buttons point.
     if slider.is_some() {
@@ -543,16 +541,16 @@ pub(crate) fn row(batch: &mut HudBatch, atlas: &HudAtlas, cols: &Columns, y: f32
         // Where the control starts, and the value's text for a slider at rest.
         let start = match (switch, slider) {
             (Some(_), _) => right - style::CONTROL_H,
-            (None, Some(_)) if active => tx,
+            (None, Some(_)) if active || style::vanilla_surfaces() => tx,
             (None, Some(_)) => right - vw,
-            (None, None) => right - vw - 18.0,
+            (None, None) => right - style::value_w(atlas, value),
         };
         match (switch, slider) {
-            (Some(on), _) => style::checkbox(batch, atlas, right, y, on, live),
+            (Some(on), _) => style::checkbox(batch, atlas, right, y, on, (lit, live)),
             // A slider shows its track, the value on it, while it is pointed at, focused or held.
             (None, Some(position)) => {
                 let value = Text::literal(value);
-                if active {
+                if active || style::vanilla_surfaces() {
                     style::slider(batch, atlas, control, &value, position, (lit, live));
                 } else {
                     batch.text_styled(atlas, &value, start, ty, soft, true);
@@ -564,7 +562,7 @@ pub(crate) fn row(batch: &mut HudBatch, atlas: &HudAtlas, cols: &Columns, y: f32
                     Some(true) => value.with_color(crate::text::YELLOW),
                     _ => value,
                 };
-                let chip = [start, y + 3.0, vw + 18.0, 14.0];
+                let chip = style::value_rect(start, right, y);
                 style::button(batch, atlas, chip, &value, (lit, live, false));
             }
             (None, None) => {
@@ -572,7 +570,7 @@ pub(crate) fn row(batch: &mut HudBatch, atlas: &HudAtlas, cols: &Columns, y: f32
                 style::cycler(
                     batch,
                     atlas,
-                    [start, y + 3.0, vw + 18.0, 14.0],
+                    style::value_rect(start, right, y),
                     &value,
                     (lit, live),
                 );
@@ -612,12 +610,7 @@ fn short_of_reset(cols: &Columns, y: f32, resets: bool) -> [f32; 4] {
 
 /// A row's lit background while it is pointed at or focused.
 fn lit(batch: &mut HudBatch, atlas: &HudAtlas, [x, y, w, _]: [f32; 4]) {
-    style::fill(
-        batch,
-        atlas,
-        [x + 2.0, y + 1.0, w - 4.0, style::ROW - 2.0],
-        style::hover(),
-    );
+    style::lit(batch, atlas, [x + 2.0, y + 1.0, w - 4.0, style::ROW - 2.0]);
 }
 
 /// A value to read ([`Value::Read`]) at `y`: its name, and the value at the right, cut short to
@@ -949,22 +942,10 @@ pub(crate) fn dock_note(
     }
 }
 
-/// Done or Undo at the foot of the page list.
+/// Done, Undo or Apply at the foot of the page list, registered for a controller. Its label
+/// leaves `room` at its left for a controller's glyph: a button that declared its job gets one,
+/// as vanilla's do (`ui::action_button`), which a half-width Undo or Apply needs.
 pub(crate) fn foot_button(
-    batch: &mut HudBatch,
-    atlas: &HudAtlas,
-    rect: [f32; 4],
-    label: &Text,
-    cursor: (f32, f32),
-    flags: (bool, bool),
-) {
-    foot_button_with_room(batch, atlas, rect, label, cursor, flags, 0.0);
-}
-
-/// A foot button whose label leaves `room` at its left for a controller's glyph: a button that
-/// declared its job gets one, as vanilla's do (`ui::action_button`), which a half-width Undo or
-/// Apply needs.
-fn foot_button_with_room(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
     rect: [f32; 4],
@@ -1475,7 +1456,18 @@ pub(crate) trait Hosted {
     /// it, as the arrow keys do, rather than press it.
     fn clicks_step(&mut self, on: bool);
     /// `waiting`: the binding the host waits on.
-    fn draw(
+    fn discard_draw(&mut self);
+    fn draw_background(
+        &mut self,
+        s: &Settings,
+        batch: &mut HudBatch,
+        atlas: &HudAtlas,
+        in_world: bool,
+        waiting: Option<Capture>,
+    );
+    fn draw_contents(&mut self, batch: &mut HudBatch, atlas: &HudAtlas, cursor: (f32, f32));
+    #[cfg(test)]
+    fn draw_test_frame(
         &mut self,
         s: &Settings,
         batch: &mut HudBatch,
@@ -1483,7 +1475,13 @@ pub(crate) trait Hosted {
         cursor: (f32, f32),
         in_world: bool,
         waiting: Option<Capture>,
-    );
+        phases: &mut dyn FnMut(crate::screen_draw::RenderPhase, &mut HudBatch),
+    ) {
+        self.draw_background(s, batch, atlas, in_world, waiting);
+        phases(crate::screen_draw::RenderPhase::Background, batch);
+        self.draw_contents(batch, atlas, cursor);
+        phases(crate::screen_draw::RenderPhase::Foreground, batch);
+    }
     /// A press (or a drag with `drag`) at `at`.
     fn click(
         &mut self,
@@ -1606,6 +1604,8 @@ pub(crate) struct Shell<S: Screen> {
     waiting: Option<Capture>,
     /// The rows as last built, and what for.
     built: Option<(Built<S::Page, S::Row>, Rc<View<S::Page, S::Row>>)>,
+    /// This frame's prepared view, consumed before the foreground hook.
+    frame_draw: Option<Rc<View<S::Page, S::Row>>>,
     /// The settings as the screen found them, for Undo (`Screen::undoes`), and whether it
     /// changed them since.
     before: Option<Box<Settings>>,
@@ -1641,6 +1641,7 @@ impl<S: Screen + Default> Default for Shell<S> {
             picked: None,
             waiting: None,
             built: None,
+            frame_draw: None,
             before: None,
             changed: false,
             focus_next: None,
@@ -1928,9 +1929,7 @@ impl<S: Screen> Shell<S> {
         if let Some((strip, shown)) = &list.strip {
             // The row's page is open: lit as the list's open page is.
             if list.lit == Some(*shown) {
-                let row @ [x, y, _, h] = strip.area;
-                style::fill(batch, atlas, row, style::open());
-                style::fill(batch, atlas, [x, y, 2.0, h], style::accent());
+                style::open_page(batch, atlas, strip.area);
             }
             tabs::draw(batch, atlas, strip);
         }
@@ -2263,7 +2262,6 @@ impl<S: Screen> Shell<S> {
         let [x, y, w, _] = cols.dock;
         let left = x + DOCK_INSET;
         let top = y + DOCK_NAME_Y;
-        style::panel(batch, atlas, cols.dock);
         let row = described.map(|i| &view.rows[i]);
         let why = row.and_then(|row| row.why.as_deref().filter(|_| !row.live));
         let said = row.map(|row| self.strip_text(row));
@@ -2306,15 +2304,18 @@ impl<S: Screen + Default> Hosted for Shell<S> {
     fn open(&mut self) {
         *self = Self::default();
     }
-    fn draw(
+    fn discard_draw(&mut self) {
+        self.frame_draw = None;
+    }
+    fn draw_background(
         &mut self,
         s: &Settings,
         batch: &mut HudBatch,
         atlas: &HudAtlas,
-        cursor: (f32, f32),
         in_world: bool,
         waiting: Option<Capture>,
     ) {
+        self.frame_draw = None;
         self.waiting = waiting;
         self.keep(s);
         let size = (batch.width, batch.height);
@@ -2341,6 +2342,16 @@ impl<S: Screen + Default> Hosted for Shell<S> {
         }
         let cols = view.cols;
         backdrop(batch, atlas, in_world);
+        style::sheet(batch, atlas, cols.plate);
+        style::sheet(batch, atlas, cols.dock);
+        self.frame_draw = Some(view);
+    }
+    fn draw_contents(&mut self, batch: &mut HudBatch, atlas: &HudAtlas, cursor: (f32, f32)) {
+        let view = self
+            .frame_draw
+            .take()
+            .expect("shell background before contents");
+        let cols = view.cols;
         let current = self.current(&view);
         self::mark(batch, atlas, &cols, &lang::get(self.screen.title()));
         let pages = self.page_list(&view, Some(atlas));
@@ -2411,7 +2422,7 @@ impl<S: Screen + Default> Hosted for Shell<S> {
                 }
                 None => 0.0,
             };
-            foot_button_with_room(batch, atlas, rect, &label, cursor, flags, room);
+            foot_button(batch, atlas, rect, &label, cursor, flags, room);
         }
     }
     fn click(

@@ -38,6 +38,9 @@ address. The script then checks, from both sides, what a guest's game used to ge
 - arrows:    the guest and the host shoot each other with a bow; with the pvp game rule off, nothing (#484);
 - flame-arrows: an arrow the host or the guest shoots from a Flame bow burns in flight on both sides
              (Entity.DATA_SHARED_FLAGS_ID's fire flag), one from a plain bow doesn't (#7356);
+- server-profile: a guest at operator level 4 starts and stops a capture of the host's server over horizon:perf and
+             the host's reports/ gets the file; at level 3 it is refused and no file is written; the host's log names
+             the guest at the start and the end.
 - looks:     mobs look on both sides as the server has them (their synched data): a calf is a
              baby, a red sheep is sheared, a size 4 slime, a tamed wolf sits with its blue collar, a
              cow on fire burns and goes out; then the wither's health drops when it is hurt, the
@@ -394,7 +397,7 @@ CHECKS = ['tab', 'self', 'armour', 'nametags', 'walls', 'placement', 'chest', 'm
           'worn', 'blast', 'blast-projectiles', 'barter', 'piglin_offspring', 'deflect', 'fireball', 'light', 'time', 'swings', 'cracks', 'plates', 'plate-projectiles', 'effects',
           'portals', 'distance', 'growth', 'doors', 'flight', 'ladder', 'boats', 'boat_ice_reboard', 'boat_shoved', 'minecarts', 'frames', 'hands',
           'lightning', 'riding', 'occupied_horse', 'mounts', 'worldspawn', 'beds', 'shield', 'deathmining', 'contacts', 'absorption',
-          'breath', 'lava', 'levels', 'drops', 'underwater', 'fireworks', 'rocket-walls', 'rocket-ceilings', 'tag-query']
+          'breath', 'lava', 'levels', 'drops', 'underwater', 'fireworks', 'rocket-walls', 'rocket-ceilings', 'tag-query', 'server-profile']
 
 
 class Game:
@@ -620,7 +623,8 @@ def check_menu_transfer(host, guest, out):
         guest.raw('key', 'e', 'tap')
         guest.raw('wait-for', 'screen', 'inventory', '--timeout', 10)
         inventory = guest('screen')
-        stale = [s for s in inventory.get('slots', []) if s.get('slot', 0) >= 300]
+        # 300-499 are a container's slots; 500-504 are the player's own armor and offhand.
+        stale = [s for s in inventory.get('slots', []) if 300 <= s.get('slot', 0) < 500]
         diamonds = guest('inventory')['counts'].get('minecraft:diamond', 0)
         guest.shot(out, f'menu-transfer-{label}')
         guest.raw('key', 'esc', 'tap')
@@ -647,6 +651,10 @@ def check_menu_transfer(host, guest, out):
         settled('respawn')
     finally:
         back_to_game(guest)
+        # A failure after the trip must not leave the guest in the Nether for the checks that follow.
+        if guest('state').get('dimension') != OVERWORLD:
+            guest('command', command=f'execute in {OVERWORLD} run tp @s {home[0]:.2f} {home[1]:.2f} {home[2]:.2f}')
+            wait_dimension(guest, OVERWORLD, 400)
         guest('command', command=f'execute in {OVERWORLD} run setblock {chest[0]} {chest[1]} {chest[2]} minecraft:air')
     return results
 
@@ -1264,11 +1272,16 @@ def check_damage(host, guest, out):
     guest.wait(10)
     before = remote(guest)['health']
     x, y, z = pos_of(guest)
+    guest('command', command=f'setblock {int(x // 1)} {int(y // 1) - 1} {int(z // 1)} minecraft:stone')
+    fall_sound = 'minecraft:block.stone.fall'
+    heard_before = {p.name: heard(p, fall_sound) for p in (host, guest)}
     guest('command', command=f'tp @s {x:.2f} {y + 12:.2f} {z:.2f}')
     guest.wait(50)
     after = remote(guest)['health']
     guest.shot(out, 'damage')
     assert after < before, f'health {before} -> {after} after a 12-block fall'
+    for p in (host, guest):
+        assert heard(p, fall_sound) - heard_before[p.name] == 1, f'{p.name}: expected one stone fall sound'
     # Into water: the fall does no damage.
     x, y, z = pos_of(guest)
     guest('command', command=f'setblock {int(x // 1)} {int(y // 1)} {int(z // 1)} minecraft:water')
@@ -7112,6 +7125,77 @@ def check_worn(host, guest, out):
     return taken
 
 
+def refused_host_start(host):
+    try:
+        host.raw('profile', 'server', 'start')
+    except Failed as e:
+        return str(e)
+    raise AssertionError('the host started a second server capture')
+
+
+def check_server_profile(host, guest, out):
+    """A guest asks the host's server for a capture over horizon:perf: at operator level 4 it gets one in the host's
+    reports/, at level 3 it is refused and no file is written, a second request while one runs is refused, and the
+    host's log names the guest at the start and at the end."""
+    import gzip
+    reports = host.work / 'home' / 'reports'
+    log = host.socket.with_suffix('.log')
+
+    def files():
+        return sorted(p.name for p in reports.glob('profile-*.hzperf')) if reports.exists() else []
+
+    def log_text():
+        return log.read_text(errors='replace') if log.exists() else ''
+
+    def refused(*words):
+        try:
+            guest.raw(*words)
+        except Failed as e:
+            return str(e)
+        raise AssertionError(f'{words} was not refused')
+
+    def idle():
+        return guest.until(lambda: guest.raw('profile', 'status'), lambda s: not s['capturing'], ticks=400)
+
+    before = files()
+    host.raw('lan', 'op', GUEST_NAME, 3)
+    why = refused('profile', 'server', 'start', '--seconds', 30)
+    assert 'operator level 4' in why, why
+    assert files() == before, f'a level 3 guest left {sorted(set(files()) - set(before))}'
+    assert f'{GUEST_NAME} asked for a server profile and was refused' in log_text(), 'the host log does not name the refused guest'
+    assert guest.raw('profile', 'status')['capturing'] is False
+
+    host.raw('lan', 'op', GUEST_NAME, 4)
+    started = guest.raw('profile', 'server', 'start', '--seconds', 30, '--no-samples')
+    assert started['sides'] == ['server'] and started['path'].startswith('reports/profile-'), started
+    running = guest.raw('profile', 'status')
+    assert running['capturing'] is True and running['sides'] == ['server'] and running['path'] == started['path'], running
+    assert 'already' in refused('profile', 'server', 'start'), 'a second request while one runs is accepted'
+    assert 'already' in refused_host_start(host), "the host started a capture over the guest's"
+    stopped = guest.raw('profile', 'server', 'stop')
+    assert stopped['sides'] == ['server'] and stopped['path'].startswith('reports/profile-'), (started, stopped)
+    made = sorted(set(files()) - set(before))
+    assert made == [Path(started['path']).name], (made, started)
+    data = gzip.decompress((reports / made[0]).read_bytes())
+    assert data, "the host's copy is empty"
+    received = guest.work / 'home' / stopped['path']
+    assert received.is_file(), f"the guest has no copy at {received}"
+    assert (reports / made[0]).read_bytes() == received.read_bytes(), "the guest's copy is not the host's file as it is"
+    assert idle()['sides'] == []
+    text = log_text()
+    assert f'{GUEST_NAME} started a server profile (30 s, samples off)' in text, 'the host log does not name the guest at the start'
+    assert f"{GUEST_NAME}'s server profile saved to {started['path']}" in text, 'the host log does not name the guest at the end'
+
+    again = guest.raw('profile', 'server', 'start', '--seconds', 2)
+    assert again['seconds'] == 2, again
+    idle()
+    assert len(files()) == len(before) + 2, files()
+    assert f"{GUEST_NAME}'s server profile saved to {again['path']}" in log_text(), 'a window that ended the capture is not logged'
+
+    host.raw('lan', 'op', GUEST_NAME, 2)
+    return {'files': sorted(set(files()) - set(before)), 'inflated_bytes': len(data)}
+
+
 CHECK_FNS = {'tab': check_tab, 'self': check_self, 'armour': check_armour,
              'nametags': check_nametags, 'chest': check_chest, 'menu-transfer': check_menu_transfer, 'crafting': check_crafting,
              'spawned': check_spawned,
@@ -7158,7 +7242,7 @@ CHECK_FNS = {'tab': check_tab, 'self': check_self, 'armour': check_armour,
              'particles': check_particles, 'fireworks': check_fireworks,
              'rocket-walls': check_rocket_walls, 'rocket-ceilings': check_rocket_ceilings,
              'piston-slide': check_piston_slide,
-             'tag-query': check_tag_query}
+             'tag-query': check_tag_query, 'server-profile': check_server_profile}
 
 
 
@@ -7364,7 +7448,7 @@ def main():
     if args.bin_dir:
         bins = Path(args.bin_dir).resolve()
     else:
-        subprocess.run(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-client', '-p', 'horizon-client-lib',
+        subprocess.run(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-game', '-p', 'horizon-client-lib',
                         '--bin', 'horizon-client', '--bin', 'horizon-ctl'],
                        cwd=ROOT, check=True)
         meta = json.loads(subprocess.run(['cargo', 'metadata', '--format-version', '1', '--no-deps'], cwd=ROOT,
@@ -14142,7 +14226,9 @@ def check_ride_seats(host, guest, out):
     """RideCommand.mount forces the ride (startRiding(vehicle, true, true)), so an item display, an
     armor stand or a marker takes a rider: the guest sits on the vehicle's passenger point (its box
     height, less the player's 0.6 vehicle attachment), follows it when it is moved, and gets off on top
-    of it on sneak (Entity.getDismountLocationForPassenger); a mob rides a marker the same way."""
+    of it on sneak (Entity.getDismountLocationForPassenger). A marker is the exception:
+    Marker.couldAcceptPassenger() is false and Entity.startRiding checks it before `force`, so a mob
+    cannot ride one."""
     x, y, z = (int(v // 1) for v in pos_of(host))
     x, z = x + 4, z + 4
     host('command', command=f'fill {x - 2} {y - 1} {z - 2} {x + 6} {y - 1} {z + 2} minecraft:stone')
@@ -14192,7 +14278,7 @@ def check_ride_seats(host, guest, out):
         assert abs(r['followed']) < 0.01, f'the guest follows the moved {kind}: {seen}'
         # Off on top of the vehicle, then falling to the floor below like any player (10 ticks later).
         assert r['off'] and -0.01 <= r['off_y'] <= r['expected'][1] + 0.01, f'the guest gets off the {kind}: {seen}'
-    assert any('started riding' in line for line in seen['zombie on marker'] or []), f'a mob rides a marker: {seen}'
+    assert any("couldn't start riding" in line for line in seen['zombie on marker'] or []), f'a marker refuses a mob: {seen}'
     return seen
 
 

@@ -464,3 +464,41 @@ fn a_config_folder_behind_a_link_still_opens() {
     assert!(lock_at(&real.join("horizon-launcher-location/location.json"), true).is_err());
     drop(reader);
 }
+
+/// A link above the data folder (a ~/.local/share on another disk) is not refused: only the root
+/// itself may not be one.
+#[cfg(unix)]
+#[test]
+fn a_link_above_the_root_is_followed() {
+    let base = std::env::temp_dir().join(format!("horizon-dl-link-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("disk/data")).unwrap();
+    std::os::unix::fs::symlink(base.join("disk"), base.join("share")).unwrap();
+    let checked = checked_path(&base.join("share/data")).unwrap();
+    assert_eq!(checked, fs::canonicalize(base.join("disk/data")).unwrap());
+    std::os::unix::fs::symlink(base.join("disk/data"), base.join("disk/linked")).unwrap();
+    assert!(
+        checked_path(&base.join("share/linked")).is_err(),
+        "the root itself"
+    );
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// No unit test reaches the player's real folders: with no home of its own, a test's launcher
+/// data, build folders and native build log are all under the temporary folder.
+#[test]
+fn unit_tests_never_resolve_the_real_profile() {
+    let home = test_home();
+    for path in [
+        crate::backend::data_dir(),
+        crate::backend::build_dir(),
+        crate::native_mods::log_path(),
+    ] {
+        assert!(
+            path.starts_with(&home),
+            "{} is outside {}",
+            path.display(),
+            home.display()
+        );
+    }
+}

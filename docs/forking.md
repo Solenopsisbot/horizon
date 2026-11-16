@@ -1,29 +1,35 @@
-# Forking: Horizon's extras and the vanilla game
+# Forking: Horizon's extras and this fork
 
-Horizon is the vanilla game plus a few things of its own: cosmetics, Play with Friends, the
-official server in the list, its settings pages. In the code they sit behind one Cargo feature,
-`horizon-extras`, on by default, so a fork can build without them or delete them. Players always
-get the full Horizon: there is no setting, flag or variable that turns the extras off.
-Optimizations are not extras; they are part of the game in every build.
+Upstream introduced a `horizon-extras` Cargo feature in
+horizon-rust/horizon#12055 to group its cosmetics, emotes, presence, server-list
+promotions and settings pages. This fork deliberately differs: excluded features
+are removed, not compiled behind a switch.
 
-## Building without Horizon's extras
+Cosmetics, wardrobe, emotes, partner ads, sponsor cards, telemetry and Discord
+presence are not part of this fork. No Cargo feature restores them. The Mods and
+Horizon Settings pages remain available independently of the client's default
+features; disabling audio or controllers does not hide mod management.
+
+## Build features
+
+The client's default features are `audio`, `controllers` and `friends`.
+Play with Friends remains independently selectable. For example, a client without
+audio or controllers can be built with:
 
 ```sh
-cargo build --release -p horizon-client --no-default-features --features audio,controllers
+cargo build --release -p horizon-game --no-default-features --features friends
 ```
 
-Best effort: CI builds and tests the default only. The server build (`--no-default-features`,
-docs/server.md) compiles the same gates, so the code keeps compiling, but nobody plays it as a
-client before a release. [horizon-rust/horizon-plain](https://github.com/horizon-rust/horizon-plain)
-builds it from each official release tag, unsigned.
+The dedicated server uses `--no-default-features`. Neither build mode introduces
+a telemetry placeholder or an official-build promotion in the options screen.
 
-What changes in that build:
+## Modding and rendering
 
 | Extra | Where it lives | The gate |
 |---|---|---|
 | Cosmetics, emotes and the emote wheel, "Show me as a Horizon player" | `game/cosmetics.rs` (+ `cosmetics/fx.rs`, `cosmetics/emotes.rs`, `cosmetics/emote_wheel.rs`), crate `horizon-cosmetics` | `game::cosmetics::enabled()`: the service is never asked, nothing is drawn, B opens no wheel |
 | The official server added to the server list, the withdrawn partner server taken out; the "Start Horizon from the launcher" screen of a game without its prepared files, with its Download button (`get_the_game` hook) | crate `horizon-official-servers` | registered only by the official executable (`horizon-official`); horizon-client's own executable has none |
-| Horizon Settings (Extras, PvP & HUD, Splitscreen, Studio, AI Agent) and Mods (with the registry browser) | `options_ui.rs` (`Page::Horizon` and below), `extras_ui.rs`, `extras.rs`, `pvp.rs`, `game/extras.rs`, `game/tweaks.rs`, `extras_hud.rs` | the Options screen shows vanilla's greyed Telemetry Data instead (`options_ui::HORIZON_EXTRAS`, set in `entry.rs`) |
+| Horizon Settings (Extras, PvP & HUD, Splitscreen, Studio, AI Agent) and Mods (with the registry browser) | `options_ui.rs` (`Page::Horizon` and below), `extras_ui.rs`, `extras.rs`, `pvp.rs`, `game/extras.rs` and `game/extras/`, `extras_hud.rs` | the Options screen shows vanilla's greyed Telemetry Data instead (`options_ui::HORIZON_EXTRAS`, set in `entry.rs`) |
 | Discord Rich Presence and its switch | crate `horizon-discord` | registered only by the official executable (`horizon-official`); horizon-client's own executable has none |
 | Play with Friends | hosting: `game/friends.rs`, `game/friends/screen.rs`; joining: crate `horizon-friends` (`game`) | hosting: the `friends` feature (`game/friends_off.rs` stands in); joining: only the official executable registers it ([layers.md](layers.md#how-a-horizon-crate-plugs-in)) |
 | The anonymous "I'm playing" ping | crate `horizon-heartbeat` | not in horizon-client at all: only the official executable (`horizon-official`) registers it ([layers.md](layers.md#how-a-horizon-crate-plugs-in)) |

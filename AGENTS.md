@@ -34,8 +34,9 @@ Feature → files → harness for the most-changed areas: [docs/architecture.md]
 - Everything players run is Rust. Python/Java only for dev tools and harness drivers in `tools/`.
 - Horizon-only features follow [docs/design-system.md](docs/design-system.md) and are off by default where
   they would change the vanilla look.
-- Small PRs (< ~500 lines). Labels: `feature` (players get something new), `skip-release` (they see no
-  change), none for a fix. Agents never add `release-now`: the maintainer decides it. Merges ship in batches of 5, or after
+- PRs under ~3000 lines of code (docs, test files, inline test modules and moved lines don't count:
+  [CONTRIBUTING.md](CONTRIBUTING.md#pull-requests)). Labels: `feature` (players get something new), `skip-release`
+  (they see no change), none for a fix. Agents never add `release-now`: the maintainer decides it. Merges ship in batches of 5, or after
   6 hours ([docs/release-flow.md](docs/release-flow.md)).
 - **No hardcoded user-facing strings.** Keep UI translation-ready from the start. In the launcher (`launcher/`), wrap visible text with `tr("...")` or `trf("... {arg} ...", &[("arg", &val)])` from `crate::i18n` instead of raw string literals or `format!`. In the game, use translation keys (`Text::tr`, `lang::get`), never hardcoded English strings.
 - **Claim before you start**: comment `/claim` on the issue (no issue yet: open one, then claim it). An assigned
@@ -102,11 +103,12 @@ Game workspace (root `Cargo.toml`); `launcher/` and `crates/horizon-telemetry-se
 | `horizon-shader-api` | Horizon's own WGSL shader packs ([docs/api/shaders.md](docs/api/shaders.md)): `horizon-shaders.toml`, the `.hshader` package; shared by the game, the launcher and the registry |
 | `horizon-shaders` | Shader packs (the `shaders/` folder format), rebuilt clean-room from a written spec of the format; no wgpu |
 | `horizon-theme` | Design tokens and fonts for the launcher, the game's own menus and the website |
+| `horizon-perf-format` | The `.hzperf` capture contract ([docs/perf-platform.md](docs/perf-platform.md) §3): `proto/horizon/perf/v1/capture.proto`, its generated types, the gzip writer and its thread. No Horizon dependencies; nothing in the game reads a capture |
 | `horizon-telemetry`, `horizon-telemetry-server`, `horizon-bench` | Opt-in data collection, its ingest server, the benchmark report format |
 | `horizon-system` | The machine the game runs on (OS, CPU, memory, drive, power, GPU maker and memory), for the crash report, the renderer's GPU info and telemetry |
 | `horizon-platform` | The platform's public API: what the Horizon layer may use of the engine ([docs/layers.md](docs/layers.md)); re-exports `horizon-system` today |
 | `horizon-hooks`, `horizon-game`, `horizon-official`, `horizon-heartbeat` | The layer seam: the engine's hooks for crates above it, the game an executable starts, the official executable (shipped as `horizon-client`) that registers Horizon's in-game parts, the first of them ([docs/layers.md](docs/layers.md#how-a-horizon-crate-plugs-in)) |
-| `horizon-dualsense`, `horizon-threads`, `horizon-release-sign`, `horizon-bots`, `xtask` | DualSense output, thread priorities, signed release checksums, load-test bots, repo tasks |
+| `horizon-dualsense`, `horizon-threads`, `horizon-release-sign`, `horizon-bots`, `xtask` | DualSense and Xbox One output, thread priorities, signed release checksums, load-test bots, repo tasks |
 | `launcher/` | GPUI launcher: `main.rs` (UI), `backend.rs` (installs, updates), `cli.rs`, `mcp.rs`, `*_page.rs` |
 
 Other top-level folders: `tools/` (harnesses and dev scripts), `tests/` (Python unit tests: `python3 -m
@@ -213,7 +215,7 @@ state stays separate from the library tests. This compiles gameplay twice for ex
 | Resource packs | L: `packs.rs` + `packs/`, `pack_screen.rs`, `atlas_sources.rs`, `sprites.rs`, `mipmap.rs`, `model_library.rs`, `font.rs`, `mobs/cem.rs` + `mobs/cem_anim.rs` (OptiFine/EMF entity models and their animations); `horizon-client-core/src/lang.rs`; crates `horizon-assets`, `horizon-optifine`; G: `packs.rs` |
 | Agent control | L: `control.rs` (socket), `bin/horizon-ctl/`; G: `control.rs`, `agent.rs`, `events.rs`, `ui_control.rs` ([docs/agent-control.md](docs/agent-control.md)) |
 | Mods | crate `horizon-mods`; G: `mods.rs`; L: `mod_content.rs`, `mod_list.rs` |
-| Horizon extras, settings | L: `extras.rs`, `graphics.rs`, `settings.rs`, `minimap.rs`; G: `extras.rs`, `tweaks.rs`, `options.rs` |
+| Horizon extras, settings | L: `extras.rs`, `graphics.rs`, `settings.rs`, `minimap.rs`; G: `extras.rs` + `extras/` (each extra's glue: `mouse_tweaks.rs`, `sorting.rs`, `pvp.rs`, `reconnect.rs`), `options.rs` |
 
 ## How `Game` is organised
 

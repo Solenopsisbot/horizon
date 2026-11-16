@@ -2,7 +2,10 @@
 //! uncompressed `servers.dat`: `{servers: [{name, ip, icon?, acceptTextures?,
 //! acceptedCodeOfConduct?, hidden}]}`. Hidden entries (servers joined by
 //! Direct Connection or quick play) are not shown but keep their settings.
-use horizon_world::nbt::{self, JavaString, NamedTag, Tag};
+use horizon_core::{
+    nbt,
+    nbt::{JavaString, NamedTag, Tag},
+};
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -215,7 +218,8 @@ fn insert(
 }
 fn write(path: &Path, root: &NamedTag) -> std::io::Result<()> {
     let bytes = nbt::write_named(root, nbt::Limits::default()).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("dat_tmp");
+    // Its own temporary file: another game on the same folder writes at the same time.
+    let tmp = path.with_extension(format!("dat_tmp.{}", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(tmp, path)
 }
@@ -250,6 +254,26 @@ pub fn parse_address(text: &str) -> Option<(String, u16)> {
         Some(_) => Some((text.to_owned(), 25565)),
         None => Some((text.to_owned(), 25565)),
     }
+}
+
+/// ServerAddress.isValidAddress, which the Add/Edit Server screen's Done button
+/// and the Direct Connection screen's Join Server button ask: the text parses as
+/// a host (and port) and `java.net.IDN.toASCII` accepts the host. Only a host
+/// made of ASCII is checked here (an empty label other than the last one, or a
+/// label over 63 characters, is refused); a host with a non-ASCII character is
+/// taken as valid, because the nameprep and punycode steps are not ported.
+pub fn is_valid_address(text: &str) -> bool {
+    parse_address(text).is_some_and(|(host, _)| idn_accepts(&host))
+}
+
+/// The ASCII half of `java.net.IDN.toASCII`: one trailing dot is allowed (a lone
+/// dot too), every other label must be 1 to 63 characters long.
+fn idn_accepts(host: &str) -> bool {
+    if !host.is_ascii() {
+        return true;
+    }
+    let labels = host.strip_suffix('.').unwrap_or(host);
+    labels.is_empty() || labels.split('.').all(|l| (1..=63).contains(&l.len()))
 }
 
 /// HostAndPort uses the default for an empty port, refuses a leading plus,
@@ -378,5 +402,45 @@ mod tests {
         assert_eq!(parse_address("host:-0"), Some(("host".into(), 0)));
         assert_eq!(parse_address("host:0"), Some(("host".into(), 0)));
         assert_eq!(parse_address("[::1]:65535"), Some(("::1".into(), 65535)));
+    }
+
+    #[test]
+    fn the_server_screens_refuse_a_host_idn_refuses() {
+        let label63 = "x".repeat(63);
+        let label64 = "x".repeat(64);
+        // Each verdict was taken from java.net.IDN.toASCII on the same host.
+        for host in [
+            "localhost".to_owned(),
+            "a.b.c".to_owned(),
+            "a.b.".to_owned(),
+            ".".to_owned(),
+            "-a.a-.a_b".to_owned(),
+            "::1".to_owned(),
+            "127.0.0.1".to_owned(),
+            label63.clone(),
+            format!("{label63}.{label63}.{label63}.{label63}"),
+        ] {
+            assert!(is_valid_address(&host), "{host}");
+            assert!(is_valid_address(&format!("{host}:25570")), "{host}");
+        }
+        for host in [
+            "a..b".to_owned(),
+            ".a".to_owned(),
+            "a..".to_owned(),
+            "..".to_owned(),
+            label64.clone(),
+            format!("{label64}."),
+            format!("{label63}.{label64}"),
+        ] {
+            assert!(!is_valid_address(&host), "{host}");
+            assert!(!is_valid_address(&format!("{host}:25570")), "{host}");
+            // ServerAddress.parseString does not ask IDN, so the parser still reads it.
+            assert!(parse_address(&host).is_some(), "{host}");
+        }
+        // What parse_address refuses stays refused.
+        assert!(!is_valid_address(""));
+        assert!(!is_valid_address("host:notaport"));
+        // A non-ASCII host is not checked here.
+        assert!(is_valid_address("m\u{fc}nchen.de"));
     }
 }

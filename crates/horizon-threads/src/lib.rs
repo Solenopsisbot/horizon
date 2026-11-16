@@ -1,13 +1,29 @@
 //! Scheduling hints for the game's threads and its allocator: the few OS calls
 //! that the other crates, which forbid unsafe code, can't make themselves.
 
+pub mod alloc_count;
+#[cfg(feature = "test-allocation-probe")]
+pub mod allocation_probe;
+pub mod allocator_stats;
 /// The game window's boot screen, before wgpu's first frame paints over it.
 #[cfg(target_os = "windows")]
 pub mod boot_paint;
+pub mod callgrind;
 pub mod heap_census;
+#[cfg(target_os = "linux")]
+pub mod heap_sample;
 pub mod jobs;
 pub mod process_memory;
+#[cfg(target_os = "linux")]
+pub mod profile;
+#[cfg(target_os = "linux")]
+pub mod sampler;
 pub mod stack_dump;
+/// Alt+Space and a bare Alt never open the window's system menu, as in GLFW.
+#[cfg(target_os = "windows")]
+pub mod system_menu;
+pub mod unwind;
+pub mod work;
 
 use std::sync::{
     OnceLock,
@@ -33,7 +49,7 @@ pub fn worker_count() -> usize {
 /// `HORIZON_SERIAL_TICK=all`: every [`par_chunks_mut`] keeps its chunks on the
 /// calling thread, in order — the serial reference a parallel phase of the
 /// tick is checked against, tick by tick (#8158).
-fn serial_tick_all() -> bool {
+pub fn serial_tick_all() -> bool {
     static ALL: OnceLock<bool> = OnceLock::new();
     *ALL.get_or_init(|| {
         std::env::var("HORIZON_SERIAL_TICK").is_ok_and(|v| v.eq_ignore_ascii_case("all"))
@@ -80,7 +96,11 @@ pub fn par_chunks_mut_with<T: Send>(
     std::thread::scope(|scope| {
         let helpers = worker_count().saturating_sub(1).clamp(1, count - 1);
         let threads: Vec<_> = (0..helpers)
-            .filter_map(|_| std::thread::Builder::new().spawn_scoped(scope, work).ok())
+            .filter_map(|_| {
+                horizon_guest_stack::builder()
+                    .spawn_scoped(scope, work)
+                    .ok()
+            })
             .collect();
         work();
         for t in threads {
@@ -349,6 +369,14 @@ pub fn behind_server() -> bool {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+fn idle_sched_param() -> libc::sched_param {
+    // SAFETY: `sched_param` is a plain C struct; zero-init also covers musl's extra fields.
+    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+    param.sched_priority = 0;
+    param
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn behind() -> bool {
     // SAFETY: these read and set the calling thread's own nice value or
     // policy (who 0, pid 0 is the calling thread on Linux and Android); `param` lives
@@ -358,7 +386,7 @@ fn behind() -> bool {
         if nice + BEHIND <= 19 {
             libc::setpriority(libc::PRIO_PROCESS as _, 0, nice + BEHIND) == 0
         } else {
-            let param = libc::sched_param { sched_priority: 0 };
+            let param = idle_sched_param();
             libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) == 0
         }
     }
@@ -443,7 +471,7 @@ pub fn idle_current() -> bool {
 
 #[cfg(target_os = "linux")]
 fn idle() -> bool {
-    let param = libc::sched_param { sched_priority: 0 };
+    let param = idle_sched_param();
     // SAFETY: sets the calling thread's own policy (pid 0); `param` lives
     // across the call.
     unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) == 0 }
@@ -505,13 +533,33 @@ pub fn catch_stop_signals() {
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 pub fn catch_stop_signals() {}
 
-/// The game's global allocator (`#[global_allocator]` in its `main.rs`).
+/// The game's global allocator (`#[global_allocator]` in `horizon-client`'s library).
 /// World generation, meshing and the tick allocate and free small blocks on
 /// every worker at once; the system heaps serialise them (Windows' heap was
 /// 16% of a chunk's generation time), mimalloc keeps a heap per thread.
+/// On Linux it samples allocations while a capture runs (`heap_sample`).
+#[cfg(all(target_os = "linux", not(feature = "test-allocation-count")))]
+pub type Allocator = heap_sample::SamplingAllocator;
+#[cfg(all(not(target_os = "linux"), not(feature = "test-allocation-count")))]
 pub type Allocator = mimalloc::MiMalloc;
 /// The game's mimalloc allocator.
-pub const ALLOCATOR: Allocator = mimalloc::MiMalloc;
+#[cfg(not(feature = "test-allocation-count"))]
+pub const ALLOCATOR: Allocator = Allocator {};
+
+/// The game's global allocator: the census, else counting mimalloc, else [`Allocator`].
+#[cfg(feature = "alloc-census")]
+pub type GameAllocator = heap_census::CensusAllocator;
+#[cfg(all(feature = "alloc-count", not(feature = "alloc-census")))]
+pub type GameAllocator = alloc_count::CountingAllocator;
+#[cfg(not(any(feature = "alloc-count", feature = "alloc-census")))]
+pub type GameAllocator = Allocator;
+/// The value of [`GameAllocator`].
+pub const GAME_ALLOCATOR: GameAllocator = GameAllocator {};
+
+#[cfg(feature = "test-allocation-count")]
+pub mod allocation_count;
+#[cfg(feature = "test-allocation-count")]
+pub use allocation_count::{ALLOCATOR, Allocator};
 
 /// The global allocator of a build with the `alloc-census` feature: live
 /// heap bytes by startup step and thread, for `horizon-ctl memory`.
@@ -528,15 +576,32 @@ pub fn heap_tag(name: &'static str) -> Option<heap_census::Tag> {
 /// `mi_option_purge_delay` in mimalloc.h (index 15 in v2 and v3); the bindings
 /// don't name it.
 const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+/// `mi_option_allow_thp` in mimalloc.h (index 43 in v3); unnamed in the bindings too.
+#[cfg(target_os = "linux")]
+const ALLOW_THP: libmimalloc_sys::mi_option_t = 43;
 
 /// Set the allocator up, first thing in `main`: free pages go back to the OS
 /// at once instead of a second later. With mimalloc's delay the game held a
 /// quarter more memory than with the system heap; without it a few percent,
 /// and generation keeps most of its speed-up.
+///
+/// On Linux it also turns transparent huge pages off for the process.
+/// mimalloc asks for them on its arenas (`MADV_HUGEPAGE`, so `madvise` systems
+/// give them too), and a 2 MiB huge page stays resident whole while one
+/// 64 KiB mimalloc page in it is used: in a world at render distance 12 the
+/// game held 200 MiB more that way, at the same load time and frame rate.
 pub fn configure_allocator() {
     // SAFETY: sets one integer option, which mimalloc reads at each purge.
     unsafe {
         libmimalloc_sys::mi_option_set(PURGE_DELAY, 0);
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: an integer option mimalloc reads at each new mapping, and a prctl
+    // that only sets this process's flag; the kernel reads it on each page fault,
+    // so the arenas mapped before `main` take small pages from now on too.
+    unsafe {
+        libmimalloc_sys::mi_option_set(ALLOW_THP, 0);
+        libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
     }
 }
 
@@ -869,6 +934,24 @@ mod tests {
         }
         super::configure_allocator();
         assert_eq!(get(), 0);
+    }
+
+    /// Configured, the process takes no transparent huge pages, whatever the
+    /// system's setting.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configuring_the_allocator_turns_transparent_huge_pages_off() {
+        super::configure_allocator();
+        // SAFETY: reads this process's flag.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_GET_THP_DISABLE, 0, 0, 0, 0) },
+            1
+        );
+        // SAFETY: reads one integer option.
+        assert_eq!(
+            unsafe { libmimalloc_sys::mi_option_get(super::ALLOW_THP) },
+            0
+        );
     }
 }
 
