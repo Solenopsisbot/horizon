@@ -409,6 +409,87 @@ pub mod aarch64 {
         0x4046C6CB, 0x40478FDB, 0x404858EB, 0x404921FB,
     ];
 
+    // The 396-hex-digit 2/pi table used by the large-argument stub.  The
+    // largest finite f64 needs only the first 66 24-bit chunks.
+    const TWO_OVER_PI: [f64; 66] = [
+        0xA2F983u32 as f64,
+        0x6E4E44u32 as f64,
+        0x1529FCu32 as f64,
+        0x2757D1u32 as f64,
+        0xF534DDu32 as f64,
+        0xC0DB62u32 as f64,
+        0x95993Cu32 as f64,
+        0x439041u32 as f64,
+        0xFE5163u32 as f64,
+        0xABDEBBu32 as f64,
+        0xC561B7u32 as f64,
+        0x246E3Au32 as f64,
+        0x424DD2u32 as f64,
+        0xE00649u32 as f64,
+        0x2EEA09u32 as f64,
+        0xD1921Cu32 as f64,
+        0xFE1DEBu32 as f64,
+        0x1CB129u32 as f64,
+        0xA73EE8u32 as f64,
+        0x8235F5u32 as f64,
+        0x2EBB44u32 as f64,
+        0x84E99Cu32 as f64,
+        0x7026B4u32 as f64,
+        0x5F7E41u32 as f64,
+        0x3991D6u32 as f64,
+        0x398353u32 as f64,
+        0x39F49Cu32 as f64,
+        0x845F8Bu32 as f64,
+        0xBDF928u32 as f64,
+        0x3B1FF8u32 as f64,
+        0x97FFDEu32 as f64,
+        0x05980Fu32 as f64,
+        0xEF2F11u32 as f64,
+        0x8B5A0Au32 as f64,
+        0x6D1F6Du32 as f64,
+        0x367ECFu32 as f64,
+        0x27CB09u32 as f64,
+        0xB74F46u32 as f64,
+        0x3F669Eu32 as f64,
+        0x5FEA2Du32 as f64,
+        0x7527BAu32 as f64,
+        0xC7EBE5u32 as f64,
+        0xF17B3Du32 as f64,
+        0x0739F7u32 as f64,
+        0x8A5292u32 as f64,
+        0xEA6BFBu32 as f64,
+        0x5FB11Fu32 as f64,
+        0x8D5D08u32 as f64,
+        0x560330u32 as f64,
+        0x46FC7Bu32 as f64,
+        0x6BABF0u32 as f64,
+        0xCFBC20u32 as f64,
+        0x9AF436u32 as f64,
+        0x1DA9E3u32 as f64,
+        0x91615Eu32 as f64,
+        0xE61B08u32 as f64,
+        0x659985u32 as f64,
+        0x5F14A0u32 as f64,
+        0x68408Du32 as f64,
+        0xFFD880u32 as f64,
+        0x4D7327u32 as f64,
+        0x310606u32 as f64,
+        0x1556CAu32 as f64,
+        0x73A8C9u32 as f64,
+        0x60E27Bu32 as f64,
+        0xC08C6Bu32 as f64,
+    ];
+    const PIO2_LARGE: [f64; 8] = [
+        1.57079625129699707031e+00,
+        7.54978941586159635335e-08,
+        5.39030252995776476554e-15,
+        3.28200341580791294123e-22,
+        1.27065575308067607349e-29,
+        1.22933308981111328932e-36,
+        2.73370053816464559624e-44,
+        2.16741683877804819444e-51,
+    ];
+
     /// `generate_kernel_sin`.
     fn kernel_sin(x: f64, y: f64, iy: bool) -> f64 {
         let z = x * x;
@@ -438,7 +519,7 @@ pub mod aarch64 {
         r = z.mul_add(r, C[1]);
         let zz = z * z;
         r = z.mul_add(r, C[0]);
-        if ix <= 0x3FD33333 {
+        if ix < 0x3FD33333 {
             let v = (-zz).mul_add(r, xy);
             1.0 - 0.5f64.mul_add(z, v)
         } else {
@@ -510,6 +591,187 @@ pub mod aarch64 {
         Some(if x > 0.0 { (n, y0, y1) } else { (-n, -y0, -y1) })
     }
 
+    #[inline]
+    fn scale_pow2(x: f64, n: i32) -> f64 {
+        libm::scalbn(x, n)
+    }
+
+    /// Payne–Hanek reduction used by the AArch64 stub for arguments beyond
+    /// the medium range. Products are accumulated with FMA, matching the
+    /// stub's `fmaddd`/`fmlav` sequence.
+    fn rem_pio2_large(x: f64, ix: i32) -> (i32, f64, f64) {
+        let x1p24 = 16_777_216.0;
+        let x1p_24 = 1.0 / x1p24;
+        let bits = x.to_bits();
+        let e0 = (ix >> 20) - (1023 + 23);
+        let mut z = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | (((1023 + 23) as u64) << 52));
+        let mut tx = [0.0; 3];
+        for t in &mut tx[..2] {
+            *t = z as i32 as f64;
+            z = (z - *t) * x1p24;
+        }
+        tx[2] = z;
+        let mut nx = 3;
+        while nx > 1 && tx[nx - 1] == 0.0 {
+            nx -= 1;
+        }
+
+        let jk = 4usize;
+        let jx = nx - 1;
+        let mut jv = (e0 - 3) / 24;
+        if jv < 0 {
+            jv = 0;
+        }
+        let mut q0 = e0 - 24 * (jv + 1);
+        let jv = jv as usize;
+        let m = jx + jk;
+        let mut f = [0.0; 20];
+        let mut q = [0.0; 20];
+        let mut iq = [0i32; 20];
+        let mut fq = [0.0; 20];
+        let mut j = jv as i32 - jx as i32;
+        for i in 0..=m {
+            f[i] = if j < 0 { 0.0 } else { TWO_OVER_PI[j as usize] };
+            j += 1;
+        }
+        for i in 0..=jk {
+            let mut fw = 0.0;
+            for k in (0..=jx).rev() {
+                fw = tx[k].mul_add(f[jx + i - k], fw);
+            }
+            q[i] = fw;
+        }
+        let mut jz = jk;
+        let (mut n, mut ih);
+        let mut zq;
+        loop {
+            zq = q[jz];
+            for i in 0..jz {
+                let fw = (x1p_24 * zq) as i32 as f64;
+                iq[i] = (zq - x1p24 * fw) as i32;
+                zq = q[jz - 1 - i] + fw;
+            }
+            zq = scale_pow2(zq, q0);
+            zq -= 8.0 * (zq * 0.125).floor();
+            n = zq as i32;
+            zq -= n as f64;
+            ih = if q0 > 0 {
+                let top = iq[jz - 1] >> (24 - q0);
+                n += top;
+                iq[jz - 1] -= top << (24 - q0);
+                iq[jz - 1] >> (23 - q0)
+            } else if q0 == 0 {
+                iq[jz - 1] >> 23
+            } else if zq >= 0.5 {
+                2
+            } else {
+                0
+            };
+            if ih > 0 {
+                n += 1;
+                let mut carry = 0;
+                for v in iq.iter_mut().take(jz) {
+                    let old = *v;
+                    if carry == 0 {
+                        if old != 0 {
+                            carry = 1;
+                            *v = 0x1000000 - old;
+                        }
+                    } else {
+                        *v = 0xffffff - old;
+                    }
+                }
+                if q0 > 0 {
+                    iq[jz - 1] &= if q0 == 1 {
+                        0x7fffff
+                    } else if q0 == 2 {
+                        0x3fffff
+                    } else {
+                        -1
+                    };
+                }
+                if ih == 2 {
+                    zq = 1.0 - zq;
+                    if carry != 0 {
+                        zq -= scale_pow2(1.0, q0);
+                    }
+                }
+            }
+            if zq == 0.0 {
+                let mut any = 0;
+                for &v in iq.iter().take(jz).skip(jk) {
+                    any |= v;
+                }
+                if any == 0 {
+                    let mut k = 1;
+                    while iq[jk - k] == 0 {
+                        k += 1;
+                    }
+                    for i in (jz + 1)..=(jz + k) {
+                        f[jx + i] = TWO_OVER_PI[jv + i];
+                        let mut fw = 0.0;
+                        for k in (0..=jx).rev() {
+                            fw = tx[k].mul_add(f[jx + i - k], fw);
+                        }
+                        q[i] = fw;
+                    }
+                    jz += k;
+                    continue;
+                }
+            }
+            break;
+        }
+        if zq == 0.0 {
+            jz -= 1;
+            q0 -= 24;
+            while iq[jz] == 0 {
+                jz -= 1;
+                q0 -= 24;
+            }
+        } else {
+            zq = scale_pow2(zq, -q0);
+            if zq >= x1p24 {
+                let fw = (x1p_24 * zq) as i32 as f64;
+                iq[jz] = (zq - x1p24 * fw) as i32;
+                jz += 1;
+                q0 += 24;
+                iq[jz] = fw as i32;
+            } else {
+                iq[jz] = zq as i32;
+            }
+        }
+        let mut fw = scale_pow2(1.0, q0);
+        for i in (0..=jz).rev() {
+            q[i] = fw * iq[i] as f64;
+            fw *= x1p_24;
+        }
+        for i in (0..=jz).rev() {
+            let mut sum = 0.0;
+            for k in 0..=jk.min(jz - i) {
+                sum = q[i + k].mul_add(PIO2_LARGE[k], sum);
+            }
+            fq[jz - i] = sum;
+        }
+        let mut y0 = 0.0;
+        for i in (0..=jz).rev() {
+            y0 += fq[i];
+        }
+        let mut y1 = fq[0] - y0;
+        for i in 1..=jz {
+            y1 += fq[i];
+        }
+        let (n, y0, y1) = if ih != 0 {
+            (n & 7, -y0, -y1)
+        } else {
+            (n & 7, y0, y1)
+        };
+        if x.is_sign_negative() {
+            (-n, -y0, -y1)
+        } else {
+            (n, y0, y1)
+        }
+    }
+
     fn sin_cos(x: f64, is_cos: bool) -> f64 {
         let ix = hi(x) & 0x7fff_ffff;
         if ix < 0x3e400000 {
@@ -525,11 +787,7 @@ pub mod aarch64 {
         if ix >= 0x7ff00000 {
             return f64::from_bits(0x7ff0_0000_0000_0001);
         }
-        // Beyond 2^19·π/2 the stub's Payne–Hanek reduction isn't ported:
-        // StrictMath's is used instead.
-        let Some((n, y0, y1)) = rem_pio2(x, ix) else {
-            return if is_cos { libm::cos(x) } else { libm::sin(x) };
-        };
+        let (n, y0, y1) = rem_pio2(x, ix).unwrap_or_else(|| rem_pio2_large(x, ix));
         let (value, negate) = if (n & 1 == 1) != is_cos {
             (
                 kernel_cos(y0, y1, ix),
@@ -898,6 +1156,17 @@ mod tests {
         check1(aarch64::cos, (0xc0496cc08a65245d, 0x3feab1a44a8022c4));
         check1(aarch64::cos, (0x40099262f89e73f8, 0xbfeff3aa148795ce));
         check1(aarch64::cos, (0x4001ce4e022387bc, 0xbfe37dd512be4d00));
+        // Large-argument Payne–Hanek rows captured from Temurin 25.0.5
+        // HotSpot on AArch64; these exercise the full 2/pi table path.
+        for (input, sin_bits, cos_bits) in [
+            (0x66c4110d7079a881, 0x3fef84e405049bb1, 0xbfc61b7e6695bf7e),
+            (0xe6c4110d7079a881, 0x3fef84e405049bb1, 0xbfc61b7e6695bf7e),
+            (0x7fe0000000000000, 0x3fe205248cbdb760, 0xbfea719f26c232be),
+            (0x7fefffffffffffff, 0x3f7452fc98b34e97, 0xbfefffe62ecfab76),
+        ] {
+            check1(aarch64::sin, (input, sin_bits));
+            check1(aarch64::cos, (input, cos_bits));
+        }
         // log
         check1(fdlibm::log, (0x40569150fe105e6f, 0x401202e102f27b78));
         check1(fdlibm::log, (0x3ff5dec70f518390, 0x3fd4009cda1f8856));
