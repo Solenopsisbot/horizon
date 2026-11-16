@@ -35,6 +35,86 @@
 
 mod strict_exp_pow;
 mod strict_trig;
+
+const FMA_TWO_OVER_PI: [f64; 66] = [
+    0xA2F983u32 as f64,
+    0x6E4E44u32 as f64,
+    0x1529FCu32 as f64,
+    0x2757D1u32 as f64,
+    0xF534DDu32 as f64,
+    0xC0DB62u32 as f64,
+    0x95993Cu32 as f64,
+    0x439041u32 as f64,
+    0xFE5163u32 as f64,
+    0xABDEBBu32 as f64,
+    0xC561B7u32 as f64,
+    0x246E3Au32 as f64,
+    0x424DD2u32 as f64,
+    0xE00649u32 as f64,
+    0x2EEA09u32 as f64,
+    0xD1921Cu32 as f64,
+    0xFE1DEBu32 as f64,
+    0x1CB129u32 as f64,
+    0xA73EE8u32 as f64,
+    0x8235F5u32 as f64,
+    0x2EBB44u32 as f64,
+    0x84E99Cu32 as f64,
+    0x7026B4u32 as f64,
+    0x5F7E41u32 as f64,
+    0x3991D6u32 as f64,
+    0x398353u32 as f64,
+    0x39F49Cu32 as f64,
+    0x845F8Bu32 as f64,
+    0xBDF928u32 as f64,
+    0x3B1FF8u32 as f64,
+    0x97FFDEu32 as f64,
+    0x05980Fu32 as f64,
+    0xEF2F11u32 as f64,
+    0x8B5A0Au32 as f64,
+    0x6D1F6Du32 as f64,
+    0x367ECFu32 as f64,
+    0x27CB09u32 as f64,
+    0xB74F46u32 as f64,
+    0x3F669Eu32 as f64,
+    0x5FEA2Du32 as f64,
+    0x7527BAu32 as f64,
+    0xC7EBE5u32 as f64,
+    0xF17B3Du32 as f64,
+    0x0739F7u32 as f64,
+    0x8A5292u32 as f64,
+    0xEA6BFBu32 as f64,
+    0x5FB11Fu32 as f64,
+    0x8D5D08u32 as f64,
+    0x560330u32 as f64,
+    0x46FC7Bu32 as f64,
+    0x6BABF0u32 as f64,
+    0xCFBC20u32 as f64,
+    0x9AF436u32 as f64,
+    0x1DA9E3u32 as f64,
+    0x91615Eu32 as f64,
+    0xE61B08u32 as f64,
+    0x659985u32 as f64,
+    0x5F14A0u32 as f64,
+    0x68408Du32 as f64,
+    0xFFD880u32 as f64,
+    0x4D7327u32 as f64,
+    0x310606u32 as f64,
+    0x1556CAu32 as f64,
+    0x73A8C9u32 as f64,
+    0x60E27Bu32 as f64,
+    0xC08C6Bu32 as f64,
+];
+const FMA_PIO2_LARGE: [f64; 8] = [
+    1.57079625129699707031e+00,
+    7.54978941586159635335e-08,
+    5.39030252995776476554e-15,
+    3.28200341580791294123e-22,
+    1.27065575308067607349e-29,
+    1.22933308981111328932e-36,
+    2.73370053816464559624e-44,
+    2.16741683877804819444e-51,
+];
+
 pub use strict_exp_pow::{exp, pow};
 pub use strict_trig::{cos, sin, tan};
 
@@ -489,6 +569,188 @@ fn rem_pio2_fma(x: f64) -> (i32, f64, f64) {
     if hx < 0 { (-n, -y0, -y1) } else { (n, y0, y1) }
 }
 
+#[inline]
+fn scale_pow2(x: f64, n: i32) -> f64 {
+    libm::scalbn(x, n)
+}
+
+pub(crate) fn rem_pio2_large_fma(x: f64, ix: i32) -> (i32, f64, f64) {
+    let x1p24 = 16_777_216.0;
+    let x1p_24 = 1.0 / x1p24;
+    let bits = x.to_bits();
+    let e0 = (ix >> 20) - (1023 + 23);
+    let mut z = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | (((1023 + 23) as u64) << 52));
+    let mut tx = [0.0; 3];
+    for t in &mut tx[..2] {
+        *t = z as i32 as f64;
+        z = (z - *t) * x1p24;
+    }
+    tx[2] = z;
+    let mut nx = 3;
+    while nx > 1 && tx[nx - 1] == 0.0 {
+        nx -= 1;
+    }
+
+    let jk = 4usize;
+    let jx = nx - 1;
+    let mut jv = (e0 - 3) / 24;
+    if jv < 0 {
+        jv = 0;
+    }
+    let mut q0 = e0 - 24 * (jv + 1);
+    let jv = jv as usize;
+    let m = jx + jk;
+    let mut f = [0.0; 20];
+    let mut q = [0.0; 20];
+    let mut iq = [0i32; 20];
+    let mut fq = [0.0; 20];
+    let mut j = jv as i32 - jx as i32;
+    for i in 0..=m {
+        f[i] = if j < 0 {
+            0.0
+        } else {
+            FMA_TWO_OVER_PI[j as usize]
+        };
+        j += 1;
+    }
+    for i in 0..=jk {
+        let mut fw = 0.0;
+        for k in (0..=jx).rev() {
+            fw = tx[k].mul_add(f[jx + i - k], fw);
+        }
+        q[i] = fw;
+    }
+    let mut jz = jk;
+    let (mut n, mut ih);
+    let mut zq;
+    loop {
+        zq = q[jz];
+        for i in 0..jz {
+            let fw = (x1p_24 * zq) as i32 as f64;
+            iq[i] = (zq - x1p24 * fw) as i32;
+            zq = q[jz - 1 - i] + fw;
+        }
+        zq = scale_pow2(zq, q0);
+        zq -= 8.0 * (zq * 0.125).floor();
+        n = zq as i32;
+        zq -= n as f64;
+        ih = if q0 > 0 {
+            let top = iq[jz - 1] >> (24 - q0);
+            n += top;
+            iq[jz - 1] -= top << (24 - q0);
+            iq[jz - 1] >> (23 - q0)
+        } else if q0 == 0 {
+            iq[jz - 1] >> 23
+        } else if zq >= 0.5 {
+            2
+        } else {
+            0
+        };
+        if ih > 0 {
+            n += 1;
+            let mut carry = 0;
+            for v in iq.iter_mut().take(jz) {
+                let old = *v;
+                if carry == 0 {
+                    if old != 0 {
+                        carry = 1;
+                        *v = 0x1000000 - old;
+                    }
+                } else {
+                    *v = 0xffffff - old;
+                }
+            }
+            if q0 > 0 {
+                iq[jz - 1] &= if q0 == 1 {
+                    0x7fffff
+                } else if q0 == 2 {
+                    0x3fffff
+                } else {
+                    -1
+                };
+            }
+            if ih == 2 {
+                zq = 1.0 - zq;
+                if carry != 0 {
+                    zq -= scale_pow2(1.0, q0);
+                }
+            }
+        }
+        if zq == 0.0 {
+            let mut any = 0;
+            for &v in iq.iter().take(jz).skip(jk) {
+                any |= v;
+            }
+            if any == 0 {
+                let mut k = 1;
+                while iq[jk - k] == 0 {
+                    k += 1;
+                }
+                for i in (jz + 1)..=(jz + k) {
+                    f[jx + i] = FMA_TWO_OVER_PI[jv + i];
+                    let mut fw = 0.0;
+                    for k in (0..=jx).rev() {
+                        fw = tx[k].mul_add(f[jx + i - k], fw);
+                    }
+                    q[i] = fw;
+                }
+                jz += k;
+                continue;
+            }
+        }
+        break;
+    }
+    if zq == 0.0 {
+        jz -= 1;
+        q0 -= 24;
+        while iq[jz] == 0 {
+            jz -= 1;
+            q0 -= 24;
+        }
+    } else {
+        zq = scale_pow2(zq, -q0);
+        if zq >= x1p24 {
+            let fw = (x1p_24 * zq) as i32 as f64;
+            iq[jz] = (zq - x1p24 * fw) as i32;
+            jz += 1;
+            q0 += 24;
+            iq[jz] = fw as i32;
+        } else {
+            iq[jz] = zq as i32;
+        }
+    }
+    let mut fw = scale_pow2(1.0, q0);
+    for i in (0..=jz).rev() {
+        q[i] = fw * iq[i] as f64;
+        fw *= x1p_24;
+    }
+    for i in (0..=jz).rev() {
+        let mut sum = 0.0;
+        for k in 0..=jk.min(jz - i) {
+            sum = q[i + k].mul_add(FMA_PIO2_LARGE[k], sum);
+        }
+        fq[jz - i] = sum;
+    }
+    let mut y0 = 0.0;
+    for i in (0..=jz).rev() {
+        y0 += fq[i];
+    }
+    let mut y1 = fq[0] - y0;
+    for i in 1..=jz {
+        y1 += fq[i];
+    }
+    let (n, y0, y1) = if ih != 0 {
+        (n & 7, -y0, -y1)
+    } else {
+        (n & 7, y0, y1)
+    };
+    if x.is_sign_negative() {
+        (-n, -y0, -y1)
+    } else {
+        (n, y0, y1)
+    }
+}
+
 /// `sin(x)`: fdlibm's `sin` (s_sin.c) with fused multiply-adds; see the
 /// module documentation for how it departs from the C.
 pub fn sin_fma(x: f64) -> f64 {
@@ -502,10 +764,11 @@ pub fn sin_fma(x: f64) -> f64 {
     if ix >= 0x7ff0_0000 {
         return f64::NAN;
     }
-    if ix > 0x4139_21fb {
-        return libm::sin(x);
-    }
-    let (n, y0, y1) = rem_pio2_fma(x);
+    let (n, y0, y1) = if ix > 0x4139_21fb {
+        rem_pio2_large_fma(x, ix)
+    } else {
+        rem_pio2_fma(x)
+    };
     match n & 3 {
         0 => sin_kernel_fma(y0, y1, true),
         1 => cos_kernel_fma(y0, y1, ix),
@@ -527,10 +790,11 @@ pub fn cos_fma(x: f64) -> f64 {
     if ix >= 0x7ff0_0000 {
         return f64::NAN;
     }
-    if ix > 0x4139_21fb {
-        return libm::cos(x);
-    }
-    let (n, y0, y1) = rem_pio2_fma(x);
+    let (n, y0, y1) = if ix > 0x4139_21fb {
+        rem_pio2_large_fma(x, ix)
+    } else {
+        rem_pio2_fma(x)
+    };
     match n & 3 {
         0 => cos_kernel_fma(y0, y1, ix),
         1 => -sin_kernel_fma(y0, y1, true),
@@ -592,5 +856,15 @@ mod tests {
         check1(sin_fma, &[(0xbfe1b3f7fec43873, 0xbfe0d04fc1a57b1d)]);
         check1(cos_fma, &[(0x401e6ba3a2f24963, 0x3fcf86e6398c69d5)]);
         check1(cos_fma, &[(0x400f271ce0981ec5, 0xbfe75bfc80508df7)]);
+        // Full Payne–Hanek reduction rows from Temurin 25.0.5 on AArch64.
+        for (input, sin_bits, cos_bits) in [
+            (0x66c4110d7079a881, 0xbfef84e405049bb1, 0xbfc61b7e6695bf7e),
+            (0xe6c4110d7079a881, 0x3fef84e405049bb1, 0xbfc61b7e6695bf7e),
+            (0x7fe0000000000000, 0x3fe205248cbdb760, 0xbfea719f26c232be),
+            (0x7fefffffffffffff, 0x3f7452fc98b34e97, 0xbfefffe62ecfab76),
+        ] {
+            check1(sin_fma, &[(input, sin_bits)]);
+            check1(cos_fma, &[(input, cos_bits)]);
+        }
     }
 }
