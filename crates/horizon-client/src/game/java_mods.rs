@@ -109,6 +109,12 @@ pub(super) struct JavaCompatibilityReport {
     pub(super) registrations: usize,
     pub(super) opaque: usize,
     pub(super) isolation_failure: Option<String>,
+    /// Calls outside the bounded host surface. They are retained even when
+    /// lenient host mode answered with a neutral value.
+    pub(super) unknown_host_calls: Vec<super::java_runtime_file::RuntimeUnknownHostCall>,
+    /// Resource and class metadata diagnostics that did not stop this jar.
+    pub(super) resource_errors: Vec<String>,
+    pub(super) resource_warnings: Vec<String>,
     pub(super) mixin: JavaMixinSummary,
 }
 
@@ -522,6 +528,9 @@ fn run_from_cache(path: &std::path::Path, entry: &java_cache::Entry) -> Result<J
         registrations: entry.registrations,
         opaque: entry.opaque,
         isolation_failure: entry.isolation_failure.clone(),
+        unknown_host_calls: entry.unknown_host_calls.clone(),
+        resource_errors: entry.resource_errors.clone(),
+        resource_warnings: entry.resource_warnings.clone(),
         mixin: JavaMixinSummary {
             woven: entry.woven,
             skipped: entry.skipped,
@@ -575,6 +584,9 @@ fn cache_entry(
         skip_plans: report.mixin.plans.clone(),
         skipped_by_reason: report.mixin.skipped_by_reason.clone(),
         isolation_failure: report.isolation_failure.clone(),
+        unknown_host_calls: report.unknown_host_calls.clone(),
+        resource_errors: report.resource_errors.clone(),
+        resource_warnings: report.resource_warnings.clone(),
         rows,
         metadata_rows,
     }
@@ -832,6 +844,17 @@ fn bootstrap_jar(
             .filter(|e| e.declaration.is_none())
             .count(),
         isolation_failure: None,
+        unknown_host_calls: super::java_runtime_file::unknown_host_rows(host.unknown_host_calls()),
+        resource_errors: super::java_runtime_file::diagnostic_rows(
+            jar.mixin_config_errors()
+                .into_iter()
+                .map(|(path, reason)| format!("{path}: {reason}")),
+        ),
+        resource_warnings: super::java_runtime_file::diagnostic_rows(
+            jar.mixin_config_warnings()
+                .into_iter()
+                .chain(jar.class_annotation_warnings().iter().cloned()),
+        ),
         mixin: JavaMixinSummary {
             woven: weave.woven.len()
                 + weave.woven_anchors.len()
@@ -1440,6 +1463,9 @@ fn runtime_report(batch: &JavaBatchOutcome) -> super::java_runtime_file::Runtime
                 registrations: r.registrations,
                 opaque: r.opaque,
                 isolation_failure: r.isolation_failure.clone(),
+                unknown_host_calls: r.unknown_host_calls.clone(),
+                resource_errors: r.resource_errors.clone(),
+                resource_warnings: r.resource_warnings.clone(),
                 refusal: None,
                 sha256: java_cache::known_sha256(&r.jar),
                 plans: r.mixin.plans.clone(),
@@ -1573,6 +1599,9 @@ mod tests {
                         registrations: 1,
                         opaque: 0,
                         isolation_failure: None,
+                        unknown_host_calls: Vec::new(),
+                        resource_errors: Vec::new(),
+                        resource_warnings: Vec::new(),
                         mixin: Default::default(),
                     },
                     declarations,
@@ -1636,6 +1665,9 @@ mod tests {
                     registrations: 1,
                     opaque: 0,
                     isolation_failure: None,
+                    unknown_host_calls: Vec::new(),
+                    resource_errors: Vec::new(),
+                    resource_warnings: Vec::new(),
                     mixin: Default::default(),
                 },
                 declarations,
@@ -1793,6 +1825,9 @@ mod tests {
             registrations: 1,
             opaque: 0,
             isolation_failure: None,
+            unknown_host_calls: Vec::new(),
+            resource_errors: Vec::new(),
+            resource_warnings: Vec::new(),
             mixin: Default::default(),
         }
     }
@@ -1922,6 +1957,9 @@ mod tests {
             skip_plans: Vec::new(),
             skipped_by_reason: BTreeMap::new(),
             isolation_failure: None,
+            unknown_host_calls: Vec::new(),
+            resource_errors: Vec::new(),
+            resource_warnings: Vec::new(),
             rows: Vec::new(),
             metadata_rows: Vec::new(),
         };

@@ -34,9 +34,15 @@ impl NativeJar {
     pub fn loader_kind(&self) -> &'static str {
         if self.has_fabric_metadata() {
             "fabric"
-        } else if self.resource_names().any(|name| name == "META-INF/neoforge.mods.toml") {
+        } else if self
+            .resource_names()
+            .any(|name| name == "META-INF/neoforge.mods.toml")
+        {
             "neoforge"
-        } else if self.resource_names().any(|name| name == "META-INF/mods.toml") {
+        } else if self
+            .resource_names()
+            .any(|name| name == "META-INF/mods.toml")
+        {
             "forge"
         } else {
             "unknown"

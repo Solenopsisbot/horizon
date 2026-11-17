@@ -29,6 +29,39 @@ pub(crate) const MAX_PLANS_PER_JAR: usize = 64;
 pub(crate) const MAX_CAUSE_CHARS: usize = 2048;
 /// The longest class, method or detail string one plan row carries.
 const MAX_NAME_CHARS: usize = 256;
+/// The most distinct host calls and resource diagnostics a jar reports. The
+/// counters stay whole while the detail rows are bounded for status clients.
+const MAX_DIAGNOSTICS_PER_JAR: usize = 64;
+
+/// One host method the bounded interpreter encountered without a native model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RuntimeUnknownHostCall {
+    pub(crate) method: String,
+    pub(crate) count: usize,
+}
+
+/// Keep diagnostics deterministic and hostile jar strings bounded.
+pub(crate) fn diagnostic_rows<I>(rows: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    rows.into_iter()
+        .take(MAX_DIAGNOSTICS_PER_JAR)
+        .map(|row| bounded(&row, MAX_NAME_CHARS))
+        .collect()
+}
+
+pub(crate) fn unknown_host_rows(
+    rows: impl IntoIterator<Item = (String, usize)>,
+) -> Vec<RuntimeUnknownHostCall> {
+    rows.into_iter()
+        .take(MAX_DIAGNOSTICS_PER_JAR)
+        .map(|(method, count)| RuntimeUnknownHostCall {
+            method: bounded(&method, MAX_NAME_CHARS),
+            count,
+        })
+        .collect()
+}
 
 /// One skipped mixin plan, as the launcher explains it: which mixin class wanted to change which target, with
 /// what injector, and why the bounded weave left it out.
@@ -146,6 +179,15 @@ pub(crate) struct RuntimeJar {
     /// Every skipped plan counted by its reason label.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) skipped_by_reason: BTreeMap<String, usize>,
+    /// Calls outside the native host model, retained even when lenient mode
+    /// supplied a neutral result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) unknown_host_calls: Vec<RuntimeUnknownHostCall>,
+    /// Resource and class metadata diagnostics that did not stop this jar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) resource_errors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) resource_warnings: Vec<String>,
 }
 
 impl RuntimeJar {
@@ -165,6 +207,9 @@ impl RuntimeJar {
             sha256: None,
             plans: Vec::new(),
             skipped_by_reason: BTreeMap::new(),
+            unknown_host_calls: Vec::new(),
+            resource_errors: Vec::new(),
+            resource_warnings: Vec::new(),
         }
     }
 }
@@ -348,6 +393,9 @@ mod tests {
             registrations: 2,
             opaque: 0,
             isolation_failure: None,
+            unknown_host_calls: Vec::new(),
+            resource_errors: Vec::new(),
+            resource_warnings: Vec::new(),
             refusal: None,
             sha256: Some("ab".repeat(32)),
             plans,

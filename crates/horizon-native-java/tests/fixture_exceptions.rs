@@ -173,3 +173,42 @@ public final class NestedCatchEntrypoint {
     let report = execute(&jar).expect("the caller's exception table must catch the nested throw");
     assert_eq!(report.class, "demo.NestedCatchEntrypoint");
 }
+
+#[test]
+fn arithmetic_exceptions_from_bytecode_and_host_calls_are_catchable() {
+    let jar = build_fixture(
+        "caught-arithmetic",
+        "fixture-caught-arithmetic",
+        "demo.CaughtArithmeticEntrypoint",
+        r#"
+package demo;
+public final class CaughtArithmeticEntrypoint {
+  private static int bytecodeDivide() {
+    int divisor = 0;
+    try {
+      return 12 / divisor;
+    } catch (ArithmeticException expected) {
+      return 7;
+    }
+  }
+
+  private static int hostExactMath() {
+    try {
+      return Math.addExact(Integer.MAX_VALUE, 1);
+    } catch (ArithmeticException expected) {
+      return 8;
+    }
+  }
+
+  public void onInitialize() {
+    if (bytecodeDivide() != 7 || hostExactMath() != 8) {
+      throw new IllegalStateException("arithmetic handler did not run");
+    }
+  }
+}
+"#,
+    );
+
+    let report = execute(&jar).expect("both ArithmeticException sources must reach their handlers");
+    assert_eq!(report.class, "demo.CaughtArithmeticEntrypoint");
+}

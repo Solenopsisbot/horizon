@@ -88,6 +88,20 @@ struct RuntimeJar {
     /// Every skipped plan counted by its reason label.
     #[serde(default)]
     skipped_by_reason: std::collections::BTreeMap<String, usize>,
+    /// Calls the native host did not model. The game may have supplied a
+    /// neutral value, so these remain visible in the compatibility panel.
+    #[serde(default)]
+    unknown_host_calls: Vec<RuntimeUnknownHostCall>,
+    #[serde(default)]
+    resource_errors: Vec<String>,
+    #[serde(default)]
+    resource_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimeUnknownHostCall {
+    method: String,
+    count: usize,
 }
 
 /// One skipped mixin plan in the runtime report: which mixin class wanted to change which
@@ -275,6 +289,33 @@ pub fn runtime_lines_in(
             language,
             "Runtime isolation: {error}",
             &[("error", &bounded(error))],
+        ));
+    }
+    if !jar.unknown_host_calls.is_empty() {
+        let calls = jar
+            .unknown_host_calls
+            .iter()
+            .map(|call| format!("{} {}", bounded(&call.method), call.count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(say(
+            language,
+            "Unknown native host calls: {calls}",
+            &[("calls", &bounded(&calls))],
+        ));
+    }
+    if !jar.resource_errors.is_empty() {
+        lines.push(say(
+            language,
+            "Native resource errors: {errors}",
+            &[("errors", &bounded(&jar.resource_errors.join(", ")))],
+        ));
+    }
+    if !jar.resource_warnings.is_empty() {
+        lines.push(say(
+            language,
+            "Native resource warnings: {warnings}",
+            &[("warnings", &bounded(&jar.resource_warnings.join(", ")))],
         ));
     }
     Some(RuntimeLines {

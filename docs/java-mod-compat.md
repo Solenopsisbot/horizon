@@ -20,6 +20,16 @@ Forge and NeoForge split at 1.20.2, so the 26.3 Forge-family loader is NeoForge;
 entrypoint diagnostics and its data is handled by the carry pipeline ([modpacks.md](modpacks.md)).
 Anything built for an older Minecraft version is a port, not a bridge.
 
+An external supervisor can opt into a durable lifecycle diagnostic with
+`horizon-jvm --sidecar-status PATH ...`. The runner atomically replaces `PATH`
+with JSON snapshots using protocol `horizon-jvm-sidecar/v1`. The initial
+snapshot has `state: "starting"`, and the terminal snapshot has either
+`state: "finished"` or `state: "failed"` with an `error` string. Each snapshot
+also carries the process id and a Unix-millisecond timestamp. Bounded launch
+and measurement children inherit the argument but do not overwrite the
+parent's record. This file is a supervisor handshake for the optional probe,
+and does not start or integrate a game on its own.
+
 That narrowing is worth its weight. Since 26.1 the game ships unobfuscated
 (`crates/horizon-port-pack/src/classes.rs`), so a 26.3 Fabric jar and a 26.3 NeoForge jar name classes
 the same way — one naming scheme for the façade, one name table for the census, and no intermediary/SRG
@@ -861,9 +871,11 @@ probed without requiring Fabric's full game provider. The metadata proxy exposes
 license collections and an empty icon-path optional, matching the no-host-files policy while allowing
 common display/bootstrap queries to complete. The native host also seeds Fabric's
 `EntrypointContainer` view from each loaded jar's declared lifecycle entries: bounded
-`FabricLoader.getEntrypoints`/`getEntrypointContainers` calls return deterministic containers whose
+`FabricLoader.getEntrypointContainers` calls return deterministic containers whose
 `getEntrypointClass`, `getEntrypoint`, and `getProvider` values remain markers tied to the jar id.
-This view never scans the process classpath; unsupported provider invocation still falls back to the JVM.
+`getEntrypoints` follows Fabric's API and returns the corresponding initialized-entrypoint markers,
+including its typed overload. This view never scans the process classpath; invoking a provider method
+still requires a supported entrypoint class in the loaded jar.
 Hollow Dawn's `CoreClient` now reaches and returns
 from `onInitializeClient`; Lithium's `onInitialize` now completes through the same path. Entrypoint
 classes exposing the Mixin config-plugin `onLoad(String)` callback receive their package before the
@@ -1486,6 +1498,12 @@ now records `Level.getCapability` and `BlockEntity.getCapability` requests with 
 side markers; a game adapter can seed a handler value for an exact request, while unseeded lookups remain
 empty. Actual block, side, and item transfer still belongs to the live native ABI rather than a fabricated
 Java result.
+`IEnergyStorage` is also available under both `net/neoforged/neoforge/energy` and
+`net/minecraftforge/energy`. A game adapter seeds an isolated marker with current energy, capacity,
+transfer limits and receive/extract flags. `getEnergyStored`, `getMaxEnergyStored`, `canReceive`,
+`canExtract`, `receiveEnergy` and `extractEnergy` preserve the simulation argument and bounded transfer
+semantics, and `StdHost::energy_storage` exposes the resulting snapshot for the adapter. These values
+remain a bootstrap façade and do not replace the live block capability table.
 The handler façade now keeps a bounded one-slot state per handler: reads return copies, inserts cap the
 stack at 64 and honor simulation, extraction decrements state, and the modifiable variant can replace the
 slot. The native `StdHost` also preserves capability markers and callback-local `LazyOptional` values

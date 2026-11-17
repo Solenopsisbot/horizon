@@ -13,6 +13,7 @@ use std::{
     sync::Arc,
 };
 
+mod annotation_proxy;
 mod annotation_values;
 mod block_item_id;
 pub mod brigadier;
@@ -40,6 +41,7 @@ mod map_compute;
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
+pub mod native_ir_cache;
 mod reflect_constructors;
 mod reflect_enum;
 mod reflect_generic;
@@ -1915,6 +1917,22 @@ pub struct CapabilityRequest {
     pub side: Option<String>,
 }
 
+/// A bounded Forge/NeoForge energy capability seeded by a game adapter.
+///
+/// The Java-side `IEnergyStorage` contract is intentionally value based. A
+/// host supplies the current amount and transfer limits, while callbacks can
+/// only mutate this isolated snapshot through `receiveEnergy` and
+/// `extractEnergy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnergyStorageState {
+    pub energy: i32,
+    pub capacity: i32,
+    pub max_receive: i32,
+    pub max_extract: i32,
+    pub can_receive: bool,
+    pub can_extract: bool,
+}
+
 impl CapabilityRequest {
     fn key(&self) -> String {
         format!(
@@ -2386,6 +2404,8 @@ pub struct StdHost {
     capability_values: BTreeMap<String, Value>,
     /// Seeded slot contents for bounded Forge/NeoForge IItemHandler markers.
     item_handlers: BTreeMap<String, Vec<Value>>,
+    /// Seeded state for bounded Forge/NeoForge IEnergyStorage markers.
+    energy_storages: BTreeMap<String, EnergyStorageState>,
     capability_requests: Vec<CapabilityRequest>,
     /// Messages and causes captured by bounded Throwable constructors. The
     /// interpreter keeps objects as markers, so this small side table is
@@ -2487,6 +2507,7 @@ impl StdHost {
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
             item_handlers: BTreeMap::new(),
+            energy_storages: BTreeMap::new(),
             capability_requests: Vec::new(),
             throwable_messages: BTreeMap::new(),
             throwable_causes: BTreeMap::new(),
@@ -3173,6 +3194,39 @@ impl StdHost {
     /// Inspect explicitly seeded item-handler slots after a native callback.
     pub fn item_handler_slots(&self, marker: &str) -> Option<&[Value]> {
         self.item_handlers.get(marker).map(Vec::as_slice)
+    }
+
+    /// Seed an isolated Forge/NeoForge energy capability marker. Transfer
+    /// limits are clamped to non-negative values and the initial amount is
+    /// clamped to the supplied capacity.
+    pub fn seed_energy_storage(
+        &mut self,
+        marker: impl Into<String>,
+        energy: i32,
+        capacity: i32,
+        max_receive: i32,
+        max_extract: i32,
+        can_receive: bool,
+        can_extract: bool,
+    ) {
+        let capacity = capacity.max(0);
+        self.energy_storages.insert(
+            marker.into(),
+            EnergyStorageState {
+                energy: energy.clamp(0, capacity),
+                capacity,
+                max_receive: max_receive.max(0),
+                max_extract: max_extract.max(0),
+                can_receive,
+                can_extract,
+            },
+        );
+    }
+
+    /// Inspect the isolated energy state after a callback has transferred
+    /// energy through the Java façade.
+    pub fn energy_storage(&self, marker: &str) -> Option<&EnergyStorageState> {
+        self.energy_storages.get(marker)
     }
 
     /// Capability lookups observed by the native runtime in invocation order.
@@ -5206,6 +5260,9 @@ impl Host for StdHost {
         if let Some(value) = self.block_item_id_instance(r, receiver) {
             return value;
         }
+        if let Some(value) = entity_facade_instance(r, receiver, args)? {
+            return Ok(value);
+        }
         // `Object.getClass` is the bridge from a value marker back to the
         // reflective class surface config code uses for field discovery.
         if r.owner == "java/lang/Object"
@@ -5591,6 +5648,57 @@ impl Host for StdHost {
                     r.name, r.descriptor
                 ))),
             };
+        }
+        if is_energy_storage_owner(&r.owner) {
+            let marker = expect_ref(receiver)
+                .ok_or_else(|| NativeError::Metadata("malformed energy-storage marker".into()))?;
+            let storage = self.energy_storages.get_mut(marker).ok_or_else(|| {
+                NativeError::Metadata(format!("unseeded energy-storage marker {marker}"))
+            })?;
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getEnergyStored", "()I") => return Ok(Value::Int(storage.energy)),
+                ("getMaxEnergyStored", "()I") => return Ok(Value::Int(storage.capacity)),
+                ("canReceive", "()Z") => {
+                    return Ok(Value::Int(i32::from(storage.can_receive)));
+                }
+                ("canExtract", "()Z") => {
+                    return Ok(Value::Int(i32::from(storage.can_extract)));
+                }
+                ("receiveEnergy", "(IZ)I") | ("extractEnergy", "(IZ)I") => {
+                    let requested = expect_int(r, Self::argument(r, args, 0)?)?.max(0);
+                    let simulate = expect_int(r, Self::argument(r, args, 1)?)? != 0;
+                    let receiving = r.name == "receiveEnergy";
+                    let enabled = if receiving {
+                        storage.can_receive
+                    } else {
+                        storage.can_extract
+                    };
+                    let limit = if receiving {
+                        storage.max_receive
+                    } else {
+                        storage.max_extract
+                    };
+                    let room = if receiving {
+                        storage.capacity.saturating_sub(storage.energy)
+                    } else {
+                        storage.energy
+                    };
+                    let transferred = if enabled {
+                        requested.min(limit).min(room)
+                    } else {
+                        0
+                    };
+                    if !simulate {
+                        if receiving {
+                            storage.energy = storage.energy.saturating_add(transferred);
+                        } else {
+                            storage.energy = storage.energy.saturating_sub(transferred);
+                        }
+                    }
+                    return Ok(Value::Int(transferred));
+                }
+                _ => {}
+            }
         }
         if is_item_handler_owner(&r.owner) {
             let marker = expect_ref(receiver)
@@ -8102,9 +8210,25 @@ impl Host for StdHost {
             }
             (
                 "net/fabricmc/loader/api/FabricLoader",
-                "getEntrypoints" | "getEntrypointContainers",
+                "getEntrypoints",
                 "(Ljava/lang/String;)Ljava/util/List;"
                 | "(Ljava/lang/String;Ljava/lang/Class;)Ljava/util/List;",
+            ) => {
+                let kind = expect_string(Self::argument(r, args, 0)?);
+                let values = self
+                    .fabric_entrypoint_containers
+                    .iter()
+                    .filter(|entry| entry.kind == kind)
+                    .map(|entry| {
+                        Value::Ref(Some(format!("fabric-entrypoint-instance/{}", entry.class)))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(collection_value("list", &values))
+            }
+            (
+                "net/fabricmc/loader/api/FabricLoader",
+                "getEntrypointContainers",
+                "(Ljava/lang/String;Ljava/lang/Class;)Ljava/util/List;",
             ) => {
                 let kind = expect_string(Self::argument(r, args, 0)?);
                 let values = self
@@ -9681,6 +9805,18 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "net/minecraft/world/entity/EquipmentSlot" => {
             &["MAINHAND", "OFFHAND", "FEET", "LEGS", "CHEST", "HEAD"]
         }
+        // Vanilla's 26.3 MobCategory declaration order.  These markers are
+        // also used by EntityType.Builder.of(..., category) below.
+        "net/minecraft/world/entity/MobCategory" => &[
+            "MONSTER",
+            "CREATURE",
+            "AMBIENT",
+            "AXOLOTLS",
+            "UNDERGROUND_WATER_CREATURE",
+            "WATER_CREATURE",
+            "WATER_AMBIENT",
+            "MISC",
+        ],
         "net/minecraft/world/level/block/Rotation" => &[
             "NONE",
             "CLOCKWISE_90",
@@ -9695,6 +9831,94 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "org/slf4j/event/Level" => &["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
         _ => return None,
     })
+}
+
+const ENTITY_BUILDER: &str = "entity-builder/";
+const ENTITY_TYPE: &str = "entity-type/";
+
+fn entity_facade_static(r: &MethodRef, args: &[Value]) -> Result<Option<Value>, NativeError> {
+    if r.owner != "net/minecraft/world/entity/EntityType$Builder"
+        || r.name != "of"
+        || !r
+            .descriptor
+            .ends_with(")Lnet/minecraft/world/entity/EntityType$Builder;")
+    {
+        return Ok(None);
+    }
+    let category = args
+        .get(1)
+        .and_then(expect_ref)
+        .ok_or_else(|| NativeError::Metadata("EntityType.Builder.of needs a MobCategory".into()))?;
+    Ok(Some(Value::Ref(Some(format!(
+        "{ENTITY_BUILDER}category={category}"
+    )))))
+}
+
+fn entity_facade_instance(
+    r: &MethodRef,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Option<Value>, NativeError> {
+    let Some(marker) = expect_ref(receiver) else {
+        return Ok(None);
+    };
+    if let Some(state) = marker.strip_prefix(ENTITY_BUILDER) {
+        if r.owner == "net/minecraft/world/entity/EntityType$Builder" {
+            if r.name == "build"
+                && r.descriptor
+                    .ends_with(")Lnet/minecraft/world/entity/EntityType;")
+            {
+                return Ok(Some(Value::Ref(Some(format!("{ENTITY_TYPE}{state}")))));
+            }
+            if r.descriptor
+                .ends_with(")Lnet/minecraft/world/entity/EntityType$Builder;")
+            {
+                let setting = match r.name.as_str() {
+                    "sized" if args.len() >= 2 => Some(format!(
+                        "|width={}|height={}",
+                        value_marker(&args[0]),
+                        value_marker(&args[1])
+                    )),
+                    "clientTrackingRange" => args
+                        .first()
+                        .map(|v| format!("|tracking={}", value_marker(v))),
+                    "updateInterval" => args
+                        .first()
+                        .map(|v| format!("|interval={}", value_marker(v))),
+                    "fireImmune" => Some("|fire=true".into()),
+                    "noSummon" => Some("|summon=false".into()),
+                    "canSpawnFarFromPlayer" => Some("|far=true".into()),
+                    _ => None,
+                };
+                if let Some(setting) = setting {
+                    return Ok(Some(Value::Ref(Some(format!(
+                        "{ENTITY_BUILDER}{state}{setting}"
+                    )))));
+                }
+            }
+        }
+    }
+    let Some(state) = marker.strip_prefix(ENTITY_TYPE) else {
+        return Ok(None);
+    };
+    if r.owner != "net/minecraft/world/entity/EntityType" {
+        return Ok(None);
+    }
+    let value = |key: &str| state.split('|').find_map(|part| part.strip_prefix(key));
+    let category = value("category=").map(|v| Value::Ref(Some(v.to_owned())));
+    let parsed = |key: &str| {
+        value(key)
+            .and_then(|v| v.strip_prefix('i'))
+            .and_then(|v| v.parse().ok())
+    };
+    let result = match (r.name.as_str(), r.descriptor.as_str()) {
+        ("getCategory", "()Lnet/minecraft/world/entity/MobCategory;") => category,
+        ("getClientTrackingRange", "()I") => parsed("tracking=").map(Value::Int),
+        ("getUpdateInterval", "()I") => parsed("interval=").map(Value::Int),
+        ("fireImmune", "()Z") => value("fire=").map(|v| Value::Int(i32::from(v == "true"))),
+        _ => None,
+    };
+    Ok(result)
 }
 
 fn is_throwable_owner(owner: &str) -> bool {
@@ -9851,6 +10075,13 @@ fn is_item_handler_owner(owner: &str) -> bool {
     matches!(
         owner,
         "net/neoforged/neoforge/items/IItemHandler" | "net/minecraftforge/items/IItemHandler"
+    )
+}
+
+fn is_energy_storage_owner(owner: &str) -> bool {
+    matches!(
+        owner,
+        "net/neoforged/neoforge/energy/IEnergyStorage" | "net/minecraftforge/energy/IEnergyStorage"
     )
 }
 
@@ -18422,9 +18653,21 @@ impl<H: Host> Runtime<'_, H> {
                 let cancelled = self.callback_infos.flag(owned)?;
                 Ok(Some(Value::Int(i32::from(cancelled))))
             }
-            ("setReturnValue", "(Ljava/lang/Object;)V") => {
-                self.callback_infos
-                    .set_return(owned, args.first().cloned().unwrap_or(Value::Ref(None)))?;
+            ("setReturnValue", descriptor)
+                if r.owner == CALLBACK_INFO_RETURNABLE_CLASS
+                    && callback_info_setter_descriptor(descriptor).is_some() =>
+            {
+                // CallbackInfoReturnable declares overloads for every Java
+                // primitive in addition to the erased Object setter. The
+                // interpreter's value carries the primitive width already,
+                // so retain it exactly as the callback supplied it and let
+                // take_override validate it against the target descriptor.
+                self.callback_infos.set_return(
+                    owned,
+                    args.first().cloned().unwrap_or_else(|| {
+                        Value::default_for(callback_info_setter_descriptor(descriptor).unwrap())
+                    }),
+                )?;
                 Ok(Some(Value::Void))
             }
             ("getReturnValue", "()Ljava/lang/Object;") => {
@@ -20575,6 +20818,9 @@ impl<H: Host> Runtime<'_, H> {
             && r.descriptor.ends_with(")Ljava/util/stream/Stream;")
         {
             return Ok(Some(self.new_stream(class, method, Vec::new())));
+        }
+        if let Some(value) = entity_facade_static(r, args)? {
+            return Ok(Some(value));
         }
         if r.owner != "net/minecraft/util/Util" {
             return Ok(None);
@@ -22886,6 +23132,28 @@ impl<H: Host> Runtime<'_, H> {
             ($at:expr, $call:expr) => {
                 match $call {
                     Ok(value) => value,
+                    Err(NativeError::Arithmetic { .. }) => {
+                        // Primitive division/remainder and the bounded
+                        // Math exact helpers use the internal Arithmetic
+                        // error because they do not have a Java object to
+                        // construct yet. At an invoke boundary it is still
+                        // a normal catchable ArithmeticException.
+                        let thrown = "java/lang/ArithmeticException";
+                        if let Some(handler) =
+                            self.exception_handler(file, method, desc, $at, thrown)?
+                        {
+                            let value = self.caught_throwable(thrown, Some("/ by zero".into()));
+                            stack.clear();
+                            stack.push(value);
+                            pc = handler;
+                            continue;
+                        }
+                        return Err(NativeError::UncaughtException {
+                            class: thrown.into(),
+                            message: Some("/ by zero".into()),
+                            frame: Some(format!("{class}#{method} +{}", $at)),
+                        });
+                    }
                     Err(NativeError::UncaughtException {
                         class: thrown,
                         message,
@@ -22973,35 +23241,45 @@ impl<H: Host> Runtime<'_, H> {
                 // iadd/isub/imul/idiv/irem. The long twins (odd opcodes) take
                 // the 64-bit path below so no long value is truncated.
                 0x60 | 0x64 | 0x68 | 0x6c | 0x70 => {
-                    let rhs = pop_int(&mut stack, class, method, at)?;
-                    let lhs = pop_int(&mut stack, class, method, at)?;
-                    let value = match op {
-                        0x60 => lhs.checked_add(rhs),
-                        0x64 => lhs.checked_sub(rhs),
-                        0x68 => lhs.checked_mul(rhs),
-                        0x6c => java_int_div(lhs, rhs),
-                        _ => java_int_rem(lhs, rhs),
-                    }
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: class.to_owned(),
-                        method: method.to_owned(),
-                    })?;
+                    let value = invoke_or_catch!(
+                        at,
+                        (|| {
+                            let rhs = pop_int(&mut stack, class, method, at)?;
+                            let lhs = pop_int(&mut stack, class, method, at)?;
+                            match op {
+                                0x60 => lhs.checked_add(rhs),
+                                0x64 => lhs.checked_sub(rhs),
+                                0x68 => lhs.checked_mul(rhs),
+                                0x6c => java_int_div(lhs, rhs),
+                                _ => java_int_rem(lhs, rhs),
+                            }
+                            .ok_or_else(|| NativeError::Arithmetic {
+                                class: class.to_owned(),
+                                method: method.to_owned(),
+                            })
+                        })()
+                    );
                     stack.push(Value::Int(value));
                 }
                 0x61 | 0x65 | 0x69 | 0x6d | 0x71 => {
-                    let rhs = pop_long(&mut stack, class, method, at)?;
-                    let lhs = pop_long(&mut stack, class, method, at)?;
-                    let value = match op {
-                        0x61 => lhs.checked_add(rhs),
-                        0x65 => lhs.checked_sub(rhs),
-                        0x69 => lhs.checked_mul(rhs),
-                        0x6d => java_long_div(lhs, rhs),
-                        _ => java_long_rem(lhs, rhs),
-                    }
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: class.to_owned(),
-                        method: method.to_owned(),
-                    })?;
+                    let value = invoke_or_catch!(
+                        at,
+                        (|| {
+                            let rhs = pop_long(&mut stack, class, method, at)?;
+                            let lhs = pop_long(&mut stack, class, method, at)?;
+                            match op {
+                                0x61 => lhs.checked_add(rhs),
+                                0x65 => lhs.checked_sub(rhs),
+                                0x69 => lhs.checked_mul(rhs),
+                                0x6d => java_long_div(lhs, rhs),
+                                _ => java_long_rem(lhs, rhs),
+                            }
+                            .ok_or_else(|| NativeError::Arithmetic {
+                                class: class.to_owned(),
+                                method: method.to_owned(),
+                            })
+                        })()
+                    );
                     stack.push(Value::Long(value));
                 }
                 // fadd/dadd, fsub/dsub, fmul/dmul, fdiv/ddiv, frem/drem. The
@@ -23899,6 +24177,22 @@ impl<H: Host> Runtime<'_, H> {
                                 == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
                     {
                         format_java_string_call(self, &r, &args)?
+                    } else if r.owner == "java/lang/String"
+                        && r.name == "formatted"
+                        && r.descriptor == "([Ljava/lang/Object;)Ljava/lang/String;"
+                    {
+                        let mut format_args = Vec::with_capacity(args.len() + 1);
+                        format_args.push(receiver.clone().ok_or_else(|| {
+                            NativeError::Metadata("String.formatted missing receiver".into())
+                        })?);
+                        format_args.extend(args);
+                        let format_ref = MethodRef {
+                            owner: "java/lang/String".into(),
+                            name: "format".into(),
+                            descriptor: "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
+                                .into(),
+                        };
+                        format_java_string_call(self, &format_ref, &format_args)?
                     } else if let Some(value) = self.invoke_string_join(&r, &args) {
                         value
                     } else if let Some(value) =
@@ -23969,7 +24263,7 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         value
                     } else if let Some(value) =
-                        self.invoke_jdk_runtime(&r, receiver.as_ref(), &args)?
+                        invoke_or_catch!(at, self.invoke_jdk_runtime(&r, receiver.as_ref(), &args))
                     {
                         value
                     } else if let Some(value) = invoke_or_catch!(
@@ -24709,6 +25003,24 @@ fn callback_takes_returnable(callback_descriptor: &str) -> bool {
 
 fn is_callback_info_class(owner: &str) -> bool {
     matches!(owner, CALLBACK_INFO_CLASS | CALLBACK_INFO_RETURNABLE_CLASS)
+}
+
+/// Parameter descriptors of CallbackInfoReturnable's setReturnValue overloads.
+/// The erased Object overload is what generic returnables compile against,
+/// while primitive targets call the corresponding primitive overload directly.
+fn callback_info_setter_descriptor(descriptor: &str) -> Option<&'static str> {
+    match descriptor {
+        "(Ljava/lang/Object;)V" => Some("Ljava/lang/Object;"),
+        "(Z)V" => Some("Z"),
+        "(B)V" => Some("B"),
+        "(C)V" => Some("C"),
+        "(S)V" => Some("S"),
+        "(I)V" => Some("I"),
+        "(J)V" => Some("J"),
+        "(F)V" => Some("F"),
+        "(D)V" => Some("D"),
+        _ => None,
+    }
 }
 
 /// The marker naming the `CallbackInfo` one injection point hands to its
@@ -36519,6 +36831,75 @@ mandatory = true
     }
 
     #[test]
+    fn standard_host_bridges_forge_and_neoforge_energy_storage() {
+        let mut host = StdHost::new();
+        let marker = "handler/energy";
+        host.seed_energy_storage(marker, 40, 100, 30, 25, true, true);
+        let receiver = Value::Ref(Some(marker.into()));
+        let method = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        for (index, owner) in [
+            "net/neoforged/neoforge/energy/IEnergyStorage",
+            "net/minecraftforge/energy/IEnergyStorage",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                host.invoke_instance(&method(owner, "getEnergyStored", "()I"), &receiver, &[])
+                    .unwrap(),
+                Value::Int(if index == 0 { 40 } else { 70 })
+            );
+            assert_eq!(
+                host.invoke_instance(
+                    &method(owner, "receiveEnergy", "(IZ)I"),
+                    &receiver,
+                    &[Value::Int(80), Value::Int(1)],
+                )
+                .unwrap(),
+                Value::Int(30),
+                "simulation reports the bounded receive amount"
+            );
+            assert_eq!(
+                host.invoke_instance(
+                    &method(owner, "receiveEnergy", "(IZ)I"),
+                    &receiver,
+                    &[Value::Int(80), Value::Int(0)],
+                )
+                .unwrap(),
+                Value::Int(30)
+            );
+        }
+        assert_eq!(
+            host.invoke_instance(
+                &method(
+                    "net/minecraftforge/energy/IEnergyStorage",
+                    "extractEnergy",
+                    "(IZ)I",
+                ),
+                &receiver,
+                &[Value::Int(100), Value::Int(0)],
+            )
+            .unwrap(),
+            Value::Int(25)
+        );
+        assert_eq!(
+            host.energy_storage(marker).unwrap(),
+            &EnergyStorageState {
+                energy: 75,
+                capacity: 100,
+                max_receive: 30,
+                max_extract: 25,
+                can_receive: true,
+                can_extract: true,
+            }
+        );
+    }
+
+    #[test]
     fn standard_host_bridges_seeded_block_capability_requests() {
         let mut host = StdHost::new();
         host.seed_capability(
@@ -37466,6 +37847,64 @@ mandatory = true
             Some(&["DOWN", "UP", "NORTH", "SOUTH", "WEST", "EAST"][..])
         );
         assert_eq!(game_enum_constants("demo/Unknown"), None);
+    }
+
+    #[test]
+    fn entity_type_builder_preserves_category_and_common_values() {
+        let category = Value::Ref(Some(
+            "enum/net/minecraft/world/entity/MobCategory/MONSTER".into(),
+        ));
+        let builder = entity_facade_static(
+            &MethodRef {
+                owner: "net/minecraft/world/entity/EntityType$Builder".into(),
+                name: "of".into(),
+                descriptor: "(Lnet/minecraft/world/entity/EntityType$EntityFactory;Lnet/minecraft/world/entity/MobCategory;)Lnet/minecraft/world/entity/EntityType$Builder;".into(),
+            },
+            &[Value::Ref(Some("factory".into())), category.clone()],
+        )
+        .unwrap()
+        .unwrap();
+        let builder = entity_facade_instance(
+            &MethodRef {
+                owner: "net/minecraft/world/entity/EntityType$Builder".into(),
+                name: "sized".into(),
+                descriptor: "(FF)Lnet/minecraft/world/entity/EntityType$Builder;".into(),
+            },
+            &builder,
+            &[Value::Float(0.6), Value::Float(1.95)],
+        )
+        .unwrap()
+        .unwrap();
+        let entity = entity_facade_instance(
+            &MethodRef {
+                owner: "net/minecraft/world/entity/EntityType$Builder".into(),
+                name: "build".into(),
+                descriptor: "(Ljava/lang/String;)Lnet/minecraft/world/entity/EntityType;".into(),
+            },
+            &builder,
+            &[Value::Ref(Some("demo:mob".into()))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            entity_facade_instance(
+                &MethodRef {
+                    owner: "net/minecraft/world/entity/EntityType".into(),
+                    name: "getCategory".into(),
+                    descriptor: "()Lnet/minecraft/world/entity/MobCategory;".into(),
+                },
+                &entity,
+                &[],
+            )
+            .unwrap(),
+            Some(category)
+        );
+        assert_eq!(
+            game_enum_constants("net/minecraft/world/entity/MobCategory")
+                .unwrap()
+                .len(),
+            8
+        );
     }
 
     /// A scratch tree for a test that has to run `javac`.
@@ -39101,6 +39540,19 @@ mandatory = true
 
     /// A non-void target returns 5; the callback's `setReturnValue` gets 3.
     fn return_override_fixture(override_result: bool) -> (NativeJar, MixinInjectionPlan) {
+        return_override_fixture_with_setter(override_result, "(Ljava/lang/Object;)V")
+    }
+
+    /// The primitive overload is what javac emits when the callback invokes
+    /// `setReturnValue` on a concrete `int` value.
+    fn primitive_return_override_fixture() -> (NativeJar, MixinInjectionPlan) {
+        return_override_fixture_with_setter(true, "(I)V")
+    }
+
+    fn return_override_fixture_with_setter(
+        override_result: bool,
+        setter_descriptor: &str,
+    ) -> (NativeJar, MixinInjectionPlan) {
         let target = ClassFile {
             name: "demo/Target".into(),
             super_name: "java/lang/Object".into(),
@@ -39120,7 +39572,7 @@ mandatory = true
             raw: Vec::new(),
         };
         let code = if override_result {
-            // aload_0; iconst_3; invokevirtual setReturnValue(Object); return
+            // aload_0; iconst_3; invokevirtual setReturnValue(...); return
             vec![0x2a, 0x06, 0xb6, 0x00, 0x06, 0xb1]
         } else {
             vec![0xb1]
@@ -39135,7 +39587,7 @@ mandatory = true
                 ),
                 Cp::Class(1),
                 Cp::Utf8("setReturnValue".into()),
-                Cp::Utf8("(Ljava/lang/Object;)V".into()),
+                Cp::Utf8(setter_descriptor.into()),
                 Cp::NameType {
                     name: 3,
                     descriptor: 4,
@@ -39189,6 +39641,16 @@ mandatory = true
         assert!(report.return_value_overridden);
         assert!(!report.cancelled, "cancel() cannot un-run the target");
         assert_eq!(report.callback_result, Value::Void);
+    }
+
+    #[test]
+    fn executes_primitive_returnable_setter_overload() {
+        let (jar, plan) = primitive_return_override_fixture();
+        let report = jar
+            .execute_mixin_at_return(&plan, None, &[], &mut NullHost)
+            .unwrap();
+        assert_eq!(report.target_result, Value::Int(3));
+        assert!(report.return_value_overridden);
     }
 
     #[test]
@@ -39434,6 +39896,50 @@ mandatory = true
             .unwrap(),
             Value::Int(1)
         );
+        let entrypoint = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "java/util/List".into(),
+                    name: "get".into(),
+                    descriptor: "(I)Ljava/lang/Object;".into(),
+                },
+                &main,
+                &[Value::Int(0)],
+            )
+            .unwrap();
+        assert_eq!(
+            entrypoint,
+            Value::Ref(Some("fabric-entrypoint-instance/demo.Main".into())),
+            "getEntrypoints returns initialized entrypoint objects, not containers"
+        );
+        let typed_objects = host
+            .invoke_instance(
+                &MethodRef {
+                    owner: "net/fabricmc/loader/api/FabricLoader".into(),
+                    name: "getEntrypoints".into(),
+                    descriptor: "(Ljava/lang/String;Ljava/lang/Class;)Ljava/util/List;".into(),
+                },
+                &loader,
+                &[
+                    Value::Ref(Some("main".into())),
+                    Value::Ref(Some("class/net.fabricmc.api.ModInitializer".into())),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/List".into(),
+                    name: "get".into(),
+                    descriptor: "(I)Ljava/lang/Object;".into(),
+                },
+                &typed_objects,
+                &[Value::Int(0)],
+            )
+            .unwrap(),
+            Value::Ref(Some("fabric-entrypoint-instance/demo.Main".into())),
+            "the typed getEntrypoints overload returns the same object view"
+        );
         let typed_entries = host
             .invoke_instance(
                 &MethodRef {
@@ -39455,7 +39961,7 @@ mandatory = true
                     name: "size".into(),
                     descriptor: "()I".into(),
                 },
-                &typed_entries,
+                &main,
                 &[],
             )
             .unwrap(),
@@ -39469,7 +39975,7 @@ mandatory = true
                     name: "get".into(),
                     descriptor: "(I)Ljava/lang/Object;".into(),
                 },
-                &main,
+                &typed_entries,
                 &[Value::Int(0)],
             )
             .unwrap();

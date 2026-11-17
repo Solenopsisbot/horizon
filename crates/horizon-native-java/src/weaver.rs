@@ -3996,6 +3996,9 @@ struct CallbackShape {
     /// The callback takes the target instance as an extra first parameter,
     /// which the inserted `aload_0` supplies.
     takes_receiver: bool,
+    /// The callback consumes the target's receiver and arguments. A simple
+    /// `(CallbackInfo)V` injector consumes only the runtime-owned info object.
+    takes_arguments: bool,
     /// The callback ends with a plain `CallbackInfo`, which the insert
     /// constructs before the call and passes as the last argument.
     callback_info: bool,
@@ -4073,6 +4076,18 @@ fn callback_arguments(
         ));
     }
     let target_arguments = crate::descriptor_arguments(target_descriptor);
+    // Mixin's simple callback form receives only CallbackInfo. It is valid for
+    // HEAD and INVOKE, including a callback that is itself an instance method
+    // (the bridge supplies that implicit receiver).
+    if injected != Injected::Returnable && callback_info && target_arguments.len() > 0 {
+        if callback_arguments.len() == 1 && callback_arguments[0] == CALLBACK_INFO_DESC {
+            return Ok(CallbackShape {
+                takes_receiver: false,
+                takes_arguments: false,
+                callback_info: true,
+            });
+        }
+    }
     let descriptor = |receiver: Option<&str>| {
         let mut shape = String::from("(");
         if let Some(receiver) = receiver {
@@ -4093,6 +4108,7 @@ fn callback_arguments(
     if callback_descriptor == plain {
         return Ok(CallbackShape {
             takes_receiver: false,
+            takes_arguments: true,
             callback_info,
         });
     }
@@ -4105,6 +4121,7 @@ fn callback_arguments(
     if callback_descriptor == with_receiver {
         return Ok(CallbackShape {
             takes_receiver: true,
+            takes_arguments: true,
             callback_info,
         });
     }
@@ -5280,16 +5297,19 @@ fn callback_call(
     target: &Target<'_>,
     callback: &MethodRef,
     takes_receiver: bool,
+    takes_arguments: bool,
     pool: &mut PoolBuilder<'_>,
 ) -> Result<CallbackCall, String> {
     let mut inserted = Vec::new();
     let mut slots = 0u16;
     let mut local_slots = if target.is_static { 0 } else { 1 };
-    for load in argument_loads(target, takes_receiver)? {
-        load.emit(&mut inserted);
-        let (slot, width) = load.span();
-        local_slots = local_slots.max(slot.checked_add(width).ok_or("local slot overflow")?);
-        slots = slots.checked_add(width).ok_or("argument slot overflow")?;
+    if takes_arguments {
+        for load in argument_loads(target, takes_receiver)? {
+            load.emit(&mut inserted);
+            let (slot, width) = load.span();
+            local_slots = local_slots.max(slot.checked_add(width).ok_or("local slot overflow")?);
+            slots = slots.checked_add(width).ok_or("argument slot overflow")?;
+        }
     }
     let callback_index = pool.method_ref(callback)?;
     inserted.push(0xb8); // invokestatic
@@ -5314,16 +5334,19 @@ fn plain_callback_info_call(
     target: &Target<'_>,
     callback: &MethodRef,
     takes_receiver: bool,
+    takes_arguments: bool,
     pool: &mut PoolBuilder<'_>,
 ) -> Result<CallbackCall, String> {
     let mut inserted = Vec::new();
     let mut slots = 0u16;
     let mut local_slots = if target.is_static { 0 } else { 1 };
-    for load in argument_loads(target, takes_receiver)? {
-        load.emit(&mut inserted);
-        let (slot, width) = load.span();
-        local_slots = local_slots.max(slot.checked_add(width).ok_or("local slot overflow")?);
-        slots = slots.checked_add(width).ok_or("argument slot overflow")?;
+    if takes_arguments {
+        for load in argument_loads(target, takes_receiver)? {
+            load.emit(&mut inserted);
+            let (slot, width) = load.span();
+            local_slots = local_slots.max(slot.checked_add(width).ok_or("local slot overflow")?);
+            slots = slots.checked_add(width).ok_or("argument slot overflow")?;
+        }
     }
     let info = pool.class(CALLBACK_INFO_CLASS)?;
     inserted.push(0xbb); // new CallbackInfo
@@ -6043,12 +6066,14 @@ fn callback_shape_for(
     if core == base {
         return Ok(CallbackShape {
             takes_receiver: false,
+            takes_arguments: true,
             callback_info,
         });
     }
     if core == with_receiver.as_slice() {
         return Ok(CallbackShape {
             takes_receiver: !target.is_static,
+            takes_arguments: true,
             callback_info,
         });
     }
@@ -7314,9 +7339,21 @@ fn weave_head_shape(
 
     let mut pool = PoolBuilder::new(&class.pool);
     let call = if shape.callback_info {
-        plain_callback_info_call(&target, callback, shape.takes_receiver, &mut pool)?
+        plain_callback_info_call(
+            &target,
+            callback,
+            shape.takes_receiver,
+            shape.takes_arguments,
+            &mut pool,
+        )?
     } else {
-        callback_call(&target, callback, shape.takes_receiver, &mut pool)?
+        callback_call(
+            &target,
+            callback,
+            shape.takes_receiver,
+            shape.takes_arguments,
+            &mut pool,
+        )?
     };
     let code = target.code()?;
     let scan = scan_code(&label, code.code)?;
@@ -7611,10 +7648,22 @@ fn weave_return_shape(
         let sites = FrameSites::InsertOnly;
         (call, sites)
     } else if shape.callback_info {
-        let call = plain_callback_info_call(&target, callback, shape.takes_receiver, &mut pool)?;
+        let call = plain_callback_info_call(
+            &target,
+            callback,
+            shape.takes_receiver,
+            shape.takes_arguments,
+            &mut pool,
+        )?;
         (call, FrameSites::Both)
     } else {
-        let call = callback_call(&target, callback, shape.takes_receiver, &mut pool)?;
+        let call = callback_call(
+            &target,
+            callback,
+            shape.takes_receiver,
+            shape.takes_arguments,
+            &mut pool,
+        )?;
         (call, FrameSites::Both)
     };
     if code.code.len() + call.bytes.len() * sites.len() > MAX_CODE_LENGTH {
@@ -7667,6 +7716,7 @@ fn callback_info_call(
     target: &Target<'_>,
     callback: &MethodRef,
     takes_receiver: bool,
+    takes_arguments: bool,
     slot: u16,
     pool: &mut PoolBuilder<'_>,
 ) -> Result<(Vec<u8>, u16, u16), String> {
@@ -7687,11 +7737,13 @@ fn callback_info_call(
     let mut local_slots = slot
         .checked_add(1)
         .ok_or("the fresh local does not fit the class-file local-slot limit")?;
-    for load in argument_loads(target, takes_receiver)? {
-        load.emit(&mut bytes);
-        let (index, width) = load.span();
-        local_slots = local_slots.max(index.saturating_add(width));
-        slots = slots.saturating_add(width);
+    if takes_arguments {
+        for load in argument_loads(target, takes_receiver)? {
+            load.emit(&mut bytes);
+            let (index, width) = load.span();
+            local_slots = local_slots.max(index.saturating_add(width));
+            slots = slots.saturating_add(width);
+        }
     }
     local_opcode(&mut bytes, 0x19, slot); // aload <slot>
     let callback_index = pool.method_ref(callback)?;
@@ -7711,11 +7763,18 @@ fn cancellable_head_call(
     target: &Target<'_>,
     callback: &MethodRef,
     takes_receiver: bool,
+    takes_arguments: bool,
     slot: u16,
     pool: &mut PoolBuilder<'_>,
 ) -> Result<CallbackCall, String> {
-    let (mut bytes, stack_slots, local_slots) =
-        callback_info_call(target, callback, takes_receiver, slot, pool)?;
+    let (mut bytes, stack_slots, local_slots) = callback_info_call(
+        target,
+        callback,
+        takes_receiver,
+        takes_arguments,
+        slot,
+        pool,
+    )?;
     let is_cancelled = pool.method_ref(&MethodRef {
         owner: CALLBACK_INFO_CLASS.to_owned(),
         name: "isCancelled".to_owned(),
@@ -7796,7 +7855,14 @@ pub fn weave_head_cancellable(
     let scan = scan_code(&label, code.code)?;
     let slot = code.max_locals.max(argument_slots(&target)?);
     let mut pool = PoolBuilder::new(&class.pool);
-    let call = cancellable_head_call(&target, callback, shape.takes_receiver, slot, &mut pool)?;
+    let call = cancellable_head_call(
+        &target,
+        callback,
+        shape.takes_receiver,
+        shape.takes_arguments,
+        slot,
+        &mut pool,
+    )?;
     if code.code.len() + call.bytes.len() > MAX_CODE_LENGTH {
         return Err(format!(
             "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"
@@ -8047,12 +8113,19 @@ fn cancellable_invoke_call(
     target: &Target<'_>,
     callback: &MethodRef,
     takes_receiver: bool,
+    takes_arguments: bool,
     site: &InvokeSite,
     slot: u16,
     pool: &mut PoolBuilder<'_>,
 ) -> Result<CancellableInvoke, String> {
-    let (mut bytes, stack_slots, local_slots) =
-        callback_info_call(target, callback, takes_receiver, slot, pool)?;
+    let (mut bytes, stack_slots, local_slots) = callback_info_call(
+        target,
+        callback,
+        takes_receiver,
+        takes_arguments,
+        slot,
+        pool,
+    )?;
     let is_cancelled = pool.method_ref(&MethodRef {
         owner: CALLBACK_INFO_CLASS.to_owned(),
         name: "isCancelled".to_owned(),
@@ -8294,6 +8367,7 @@ fn weave_invoke_shape(
             &target,
             callback,
             shape.takes_receiver,
+            shape.takes_arguments,
             site,
             code,
             &scan,
@@ -8319,9 +8393,21 @@ fn weave_invoke_shape(
 
     let mut pool = PoolBuilder::new(&class.pool);
     let call = if shape.callback_info {
-        plain_callback_info_call(&target, callback, shape.takes_receiver, &mut pool)?
+        plain_callback_info_call(
+            &target,
+            callback,
+            shape.takes_receiver,
+            shape.takes_arguments,
+            &mut pool,
+        )?
     } else {
-        callback_call(&target, callback, shape.takes_receiver, &mut pool)?
+        callback_call(
+            &target,
+            callback,
+            shape.takes_receiver,
+            shape.takes_arguments,
+            &mut pool,
+        )?
     };
     if code.code.len() + call.bytes.len() * offsets.len() > MAX_CODE_LENGTH {
         return Err(format!(
@@ -8367,6 +8453,7 @@ fn weave_cancellable_invoke(
     target: &Target<'_>,
     callback: &MethodRef,
     takes_receiver: bool,
+    takes_arguments: bool,
     site: &InvokeSite,
     code: &CodeLayout<'_>,
     scan: &CodeScan,
@@ -8386,8 +8473,15 @@ fn weave_cancellable_invoke(
     }
     let slot = code.max_locals.max(argument_slots(target)?);
     let mut pool = PoolBuilder::new(target.pool);
-    let mut call =
-        cancellable_invoke_call(target, callback, takes_receiver, site, slot, &mut pool)?;
+    let mut call = cancellable_invoke_call(
+        target,
+        callback,
+        takes_receiver,
+        takes_arguments,
+        site,
+        slot,
+        &mut pool,
+    )?;
     if code.code.len() + call.bytes.len() > MAX_CODE_LENGTH {
         return Err(format!(
             "{label}: woven code would exceed the class-file limit of {MAX_CODE_LENGTH} bytes"

@@ -1734,7 +1734,9 @@ dependencies = [
 name = "horizon-native-java"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
+ "sha2",
  "zip 2.6.1",
 ]
 

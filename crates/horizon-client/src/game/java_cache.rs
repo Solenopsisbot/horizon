@@ -32,7 +32,8 @@ use std::{
 /// Layout of an entry, and the engine identity that produced it. Bump it when
 /// the entry format changes; a differing schema is a miss, never a guess.
 /// 2: the report's skipped-plan list and counts by reason.
-pub(super) const SCHEMA: u32 = 2;
+/// 3: host-call and resource diagnostics in the replayed report.
+pub(super) const SCHEMA: u32 = 3;
 
 /// Total bytes the cache may keep before the next prune removes entries.
 const MAX_BYTES: u64 = 256 << 20;
@@ -93,6 +94,12 @@ pub(super) struct Entry {
     #[serde(default)]
     pub(super) skipped_by_reason: BTreeMap<String, usize>,
     pub(super) isolation_failure: Option<String>,
+    #[serde(default)]
+    pub(super) unknown_host_calls: Vec<crate::game::java_runtime_file::RuntimeUnknownHostCall>,
+    #[serde(default)]
+    pub(super) resource_errors: Vec<String>,
+    #[serde(default)]
+    pub(super) resource_warnings: Vec<String>,
     /// The typed rows the host recorded, in registration order.
     pub(super) rows: Vec<Row>,
     /// The jar's own `META-INF/horizon-native.json` rows.
@@ -509,6 +516,9 @@ mod tests {
             skip_plans: Vec::new(),
             skipped_by_reason: BTreeMap::new(),
             isolation_failure: None,
+            unknown_host_calls: Vec::new(),
+            resource_errors: Vec::new(),
+            resource_warnings: Vec::new(),
             rows: vec![Row {
                 registry: "minecraft:block".into(),
                 id: "fixture:ruby_block".into(),

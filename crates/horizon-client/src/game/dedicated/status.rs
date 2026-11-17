@@ -188,6 +188,9 @@ pub(super) fn java_section(
             "registrations": 0,
             "opaque": 0,
             "isolation_failure": null,
+            "unknown_host_calls": [],
+            "resource_errors": [],
+            "resource_warnings": [],
             "refusal": super::super::java_runtime_file::bounded_cause(&failure.reason),
         })
     });
@@ -202,6 +205,9 @@ pub(super) fn java_section(
             "registrations": report.registrations,
             "opaque": report.opaque,
             "isolation_failure": report.isolation_failure.as_deref().map(bounded_error),
+            "unknown_host_calls": report.unknown_host_calls,
+            "resource_errors": report.resource_errors,
+            "resource_warnings": report.resource_warnings,
             "refusal": null,
         })
     });
@@ -218,6 +224,12 @@ pub(super) fn java_section(
         "entrypoints": count(|r| r.entrypoints),
         "registrations": count(|r| r.registrations),
         "opaque": count(|r| r.opaque),
+        "unknown_host_calls": sorted
+            .iter()
+            .map(|r| r.unknown_host_calls.iter().map(|c| c.count).sum::<usize>())
+            .sum::<usize>(),
+        "resource_errors": count(|r| r.resource_errors.len()),
+        "resource_warnings": count(|r| r.resource_warnings.len()),
         "payload_channels": channel_ids,
         "payload_channels_total": total_channels,
         "entries": entries,

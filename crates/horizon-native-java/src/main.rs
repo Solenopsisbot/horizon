@@ -1,6 +1,5 @@
 use horizon_native_java::{
-    ClassFile, Entrypoint, EntrypointSkip, MethodRef, MixinInjectionPlan, NativeJar,
-    StdHost,
+    ClassFile, Entrypoint, EntrypointSkip, MethodRef, MixinInjectionPlan, NativeJar, StdHost,
     mixin_plans_in_weave_order, weave_class_with_extras, weave_classes_with_extras,
 };
 use std::{
@@ -656,15 +655,18 @@ fn main() -> ExitCode {
         Ok(jar) => jar,
         Err(error) => {
             if json {
-                println!("{}", serde_json::json!({
-                    "status": "error",
-                    "stage": "load",
-                    "loader": "unknown",
-                    "kind": requested_kind.as_deref().unwrap_or("main"),
-                    "entrypoint": serde_json::Value::Null,
-                    "error": error.to_string(),
-                    "refusal": serde_json::Value::Null,
-                }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "error",
+                        "stage": "load",
+                        "loader": "unknown",
+                        "kind": requested_kind.as_deref().unwrap_or("main"),
+                        "entrypoint": serde_json::Value::Null,
+                        "error": error.to_string(),
+                        "refusal": serde_json::Value::Null,
+                    })
+                );
             } else {
                 eprintln!("error loading jar: {error}");
             }
@@ -701,14 +703,10 @@ fn main() -> ExitCode {
     };
     if entrypoints.is_empty() {
         if json {
-            println!("{}", failure_json(
-                "discover",
-                &kind,
-                &jar,
-                None,
-                "no entrypoint",
-                None,
-            ));
+            println!(
+                "{}",
+                failure_json("discover", &kind, &jar, None, "no entrypoint", None,)
+            );
         } else {
             eprintln!("no {kind} entrypoint in metadata; pass its class as the third argument");
         }
@@ -725,9 +723,7 @@ fn main() -> ExitCode {
                 "{}: Fabric entrypoint adapter {adapter} is not supported by the native path",
                 entry.class
             );
-            error = Some(format!(
-                "{reason}"
-            ));
+            error = Some(format!("{reason}"));
             failed_entrypoint = Some(entry);
             refusal = Some(EntrypointSkip::UnsupportedAdapter);
             break;
@@ -766,14 +762,10 @@ fn main() -> ExitCode {
         }
         Some(error) => {
             if json {
-                println!("{}", failure_json(
-                    "execute",
-                    &kind,
-                    &jar,
-                    failed_entrypoint,
-                    &error,
-                    refusal,
-                ));
+                println!(
+                    "{}",
+                    failure_json("execute", &kind, &jar, failed_entrypoint, &error, refusal,)
+                );
             } else {
                 eprintln!("native execution stopped: {error}");
             }

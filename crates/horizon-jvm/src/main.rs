@@ -52,6 +52,56 @@ mod remap_tests {
     }
 }
 
+#[cfg(test)]
+mod sidecar_tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_flag_is_removed_and_path_is_preserved() {
+        let mut args = vec![
+            "--entry-kind".to_owned(),
+            "server".to_owned(),
+            "--sidecar-status".to_owned(),
+            "/tmp/horizon-jvm.status".to_owned(),
+            "mod.jar".to_owned(),
+        ];
+        assert_eq!(
+            take_sidecar_status(&mut args).unwrap(),
+            Some(PathBuf::from("/tmp/horizon-jvm.status"))
+        );
+        assert_eq!(args, ["--entry-kind", "server", "mod.jar"]);
+    }
+
+    #[test]
+    fn sidecar_snapshot_is_valid_json_and_replaces_the_previous_file() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-jvm-sidecar-{}-{}",
+            std::process::id(),
+            sidecar_now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.json");
+        write_sidecar_status(&path, "starting", sidecar_now_ms(), None).unwrap();
+        write_sidecar_status(&path, "failed", sidecar_now_ms(), Some("fixture failed")).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["protocol"], SIDECAR_PROTOCOL);
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["error"], "fixture failed");
+        assert!(value["pid"].as_u64().is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sidecar_requires_a_path() {
+        let mut args = vec!["--sidecar-status".to_owned()];
+        assert_eq!(
+            take_sidecar_status(&mut args).unwrap_err(),
+            "--sidecar-status requires a path"
+        );
+    }
+}
+
 impl NestedJars {
     fn new() -> Result<Self, String> {
         let stamp = SystemTime::now()
@@ -74,6 +124,13 @@ impl Drop for NestedJars {
 const HORIZON_REAL_LAUNCH_ENV: &str = "HORIZON_REAL_LAUNCH";
 /// What `--launch-game` reports when the second gate is missing.
 const LAUNCH_GAME_GATE_SKIPPED: &str = "skipped (HORIZON_REAL_LAUNCH is not 1)";
+/// The opt-in status file protocol for a supervisor around this one-shot
+/// probe. It is deliberately separate from game integration.
+const SIDECAR_PROTOCOL: &str = "horizon-jvm-sidecar/v1";
+const SIDECAR_STATUS_FLAG: &str = "--sidecar-status";
+/// Child probes inherit the status argument but must not race the parent for
+/// ownership of its lifecycle record.
+const SIDECAR_CHILD_ENV: &str = "HORIZON_JVM_SIDECAR_CHILD";
 /// Wall-clock bound for the gated launch child.
 const LAUNCH_GAME_TIMEOUT_SECS: u64 = 180;
 /// Override for [`LAUNCH_GAME_TIMEOUT_SECS`]; the gated test sets it so a run
@@ -1212,7 +1269,19 @@ impl NestedJars {
 }
 
 fn main() -> ExitCode {
-    match run() {
+    let sidecar = match sidecar_status_from_process_args() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = if sidecar.is_some() && std::env::var_os(SIDECAR_CHILD_ENV).is_none() {
+        run_with_sidecar(sidecar.as_deref().expect("sidecar path"))
+    } else {
+        run()
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -1221,8 +1290,106 @@ fn main() -> ExitCode {
     }
 }
 
+fn sidecar_status_from_process_args() -> Result<Option<PathBuf>, String> {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    take_sidecar_status(&mut args)
+}
+
+/// Remove the status option before normal argument parsing. Supporting the
+/// equals spelling makes the flag safe to forward through process supervisors.
+fn take_sidecar_status(args: &mut Vec<String>) -> Result<Option<PathBuf>, String> {
+    let mut found = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].clone();
+        if arg == SIDECAR_STATUS_FLAG {
+            if index + 1 >= args.len() {
+                return Err("--sidecar-status requires a path".to_owned());
+            }
+            let path = args.remove(index + 1);
+            args.remove(index);
+            if path.is_empty() {
+                return Err("--sidecar-status requires a path".to_owned());
+            }
+            if found.is_some() {
+                return Err("--sidecar-status may be supplied only once".to_owned());
+            }
+            found = Some(PathBuf::from(path));
+            continue;
+        }
+        if let Some(path) = arg.strip_prefix("--sidecar-status=") {
+            if path.is_empty() {
+                return Err("--sidecar-status requires a path".to_owned());
+            }
+            args.remove(index);
+            if found.is_some() {
+                return Err("--sidecar-status may be supplied only once".to_owned());
+            }
+            found = Some(PathBuf::from(path));
+            continue;
+        }
+        index += 1;
+    }
+    Ok(found)
+}
+
+fn sidecar_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+/// Write one complete snapshot with a sibling temp file and rename. A reader
+/// therefore sees either the old JSON or the new JSON, never a partial file.
+fn write_sidecar_status(
+    path: &Path,
+    state: &str,
+    timestamp_ms: u64,
+    error: Option<&str>,
+) -> Result<(), String> {
+    let snapshot = serde_json::json!({
+        "protocol": SIDECAR_PROTOCOL,
+        "pid": std::process::id(),
+        "state": state,
+        "timestampMs": timestamp_ms,
+        "error": error,
+    });
+    let text = snapshot.to_string() + "\n";
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|e| format!("create sidecar directory: {e}"))?;
+    }
+    let temp = path.with_extension(format!("tmp-{}-{}", std::process::id(), timestamp_ms));
+    fs::write(&temp, text).map_err(|e| format!("write sidecar status: {e}"))?;
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("install sidecar status: {error}"));
+    }
+    Ok(())
+}
+
+fn run_with_sidecar(path: &Path) -> Result<(), String> {
+    let started = sidecar_now_ms();
+    write_sidecar_status(path, "starting", started, None)?;
+    let result = run();
+    let (state, error) = match &result {
+        Ok(()) => ("finished", None),
+        Err(error) => ("failed", Some(error.as_str())),
+    };
+    let status_result = write_sidecar_status(path, state, sidecar_now_ms(), error);
+    match (result, status_result) {
+        (Err(error), Err(status_error)) => Err(format!("{error}; {status_error}")),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(status_error)) => Err(status_error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 /// The usage line, kept as data so a test can check the kinds it names.
-const USAGE: &str = "usage: horizon-jvm [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--real-launch] [--fabric-discovery] [--classpath-unlock] [--knot-launch] [--launch-game] [--accept-eula] [--mixin-apply-probe <class#method=value>] [--mixin-audit] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] [--measure [--measure-timeout <secs>] [--measure-sample-ms <ms>] [--measure-repeat <n>]] <jar>...";
+const USAGE: &str = "usage: horizon-jvm [--sidecar-status <path>] [--entry <class>] [--entry-kind <main|client|server|preLaunch|neoforge|datagen>] [--real-loader] [--real-launch] [--fabric-discovery] [--classpath-unlock] [--knot-launch] [--launch-game] [--accept-eula] [--mixin-apply-probe <class#method=value>] [--mixin-audit] [--game-jar <jar>]... [--game-version <v>] [--provider-report] [--datagen-output <dir>] [--list-entrypoints] [--list-mixin-configs] [--list-fml-mods] [--fml-report] [--json] [--mixin-config <path>]... [--fabric-development] [--stubs <jar>] [--loader <jar>] [--libs <dir>] [--measure [--measure-timeout <secs>] [--measure-sample-ms <ms>] [--measure-repeat <n>]] <jar>...";
 
 /// The FML listing/report flags, removed from the jar list before anything is
 /// resolved. `--fml-list` is the short spelling of `--list-fml-mods`.
@@ -1248,6 +1415,9 @@ fn take_flag(args: &mut Vec<String>, names: &[&str]) -> bool {
 
 fn run() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // The outer process owns the lifecycle record. Child probes inherit this
+    // option only so their argv remains a faithful replay of the invocation.
+    take_sidecar_status(&mut args)?;
     // A measured child is sent the recursive spelling instead of `--measure`.
     // Stripping it here makes the child take the normal path, exactly as the
     // measuring process would have.
@@ -2385,6 +2555,7 @@ fn run_launch_game_child(
     command.env("HORIZON_LAUNCHER_TRASH", &homes.trash);
     command.env("HORIZON_LAUNCHER_CLIPBOARD", &homes.clipboard);
     command.env("HORIZON_LAUNCHER_DESKTOP", &homes.desktop);
+    command.env(SIDECAR_CHILD_ENV, "1");
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
@@ -5579,7 +5750,8 @@ fn run_measured_child(
         // Replace, not append: a probe launched from a measuring probe (a
         // future nested run) must not inherit two copies of the marker.
         .env_remove(MEASURE_RECURSION_ENV)
-        .env(MEASURE_RECURSION_ENV, measurement_depth()?.to_string());
+        .env(MEASURE_RECURSION_ENV, measurement_depth()?.to_string())
+        .env(SIDECAR_CHILD_ENV, "1");
     // A killed JVM leaves children behind on Linux; a fresh process group lets
     // the kill reach all of them and keeps this process's signals out of it.
     #[cfg(unix)]
