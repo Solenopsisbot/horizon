@@ -34,6 +34,18 @@ const MAX_FML_IDS: usize = 16;
 /// The most characters of a failure the java and fml sections repeat.
 const MAX_STATUS_ERROR_CHARS: usize = 200;
 
+/// The dedicated engine identity carried by `server-status`.  Keeping this
+/// beside the status formatter makes it available even when the supervisor
+/// cannot inspect the executable that answered the request.
+pub(super) fn build_status() -> Value {
+    json!({
+        "horizon": horizon_core::release::VERSION,
+        "minecraft": horizon_core::version::VERSION_ID,
+        "protocol": horizon_core::version::PROTOCOL_VERSION,
+        "nightly": horizon_core::release::NIGHTLY,
+    })
+}
+
 /// The engine labels `engines` counts, in the order it prints them. The
 /// restored runner has no sidecar engine, so the old label stays at zero.
 const ENGINE_LABELS: [JavaEngine; 3] = [
@@ -408,6 +420,7 @@ impl Game<'_> {
             "paused": state.paused,
             // Additive: a reader written before this key existed reads the
             // fields above exactly as it did.
+            "build": build_status(),
             "java": java_status(),
             "fml": fml_section(fml::last_report().as_ref(), fml::strict_requested()),
         })
@@ -436,7 +449,7 @@ fn player_status(
 mod tests {
     use super::{
         MAX_FML_IDS, MAX_STATUS_ERROR_CHARS, MAX_STATUS_JARS, MAX_STATUS_REFUSED, MAX_STATUS_ROWS,
-        fml_section, java_section, java_status, player_status,
+        build_status, fml_section, java_section, java_status, player_status,
     };
     use crate::game::execution_role::ExecutionRole;
     use crate::game::java_mods::fml;
@@ -488,6 +501,19 @@ mod tests {
                 "ping_ms": 42,
                 "dimension": "minecraft:the_nether",
                 "position": [1.5, 64.0, -2.25],
+            })
+        );
+    }
+
+    #[test]
+    fn build_status_identifies_the_engine_and_protocol() {
+        assert_eq!(
+            build_status(),
+            json!({
+                "horizon": horizon_core::release::VERSION,
+                "minecraft": horizon_core::version::VERSION_ID,
+                "protocol": horizon_core::version::PROTOCOL_VERSION,
+                "nightly": horizon_core::release::NIGHTLY,
             })
         );
     }
