@@ -28,6 +28,21 @@ const FABRIC_SERVER_KINDS: &[&str] = &["server", "main"];
 const NEOFORGE_KINDS: &[&str] = &["neoforge"];
 
 impl NativeJar {
+    /// Loader family represented by this jar's metadata. This is kept as a
+    /// small diagnostic helper so callers can label refusals without guessing
+    /// from the selected entrypoint kind (`neoforge` covers Forge too).
+    pub fn loader_kind(&self) -> &'static str {
+        if self.has_fabric_metadata() {
+            "fabric"
+        } else if self.resource_names().any(|name| name == "META-INF/neoforge.mods.toml") {
+            "neoforge"
+        } else if self.resource_names().any(|name| name == "META-INF/mods.toml") {
+            "forge"
+        } else {
+            "unknown"
+        }
+    }
+
     /// Fabric's top-level environment limits the whole mod to one side.
     /// Metadata-only reads retain `fabric.mod.json` in `resource_bytes`, so
     /// role selection can apply the same gate before class discovery or
