@@ -1,7 +1,8 @@
 # Java mod compatibility: status
 
-Status: **ported onto the main tree** (branch `port/native-java-on-main`). Measured 6 November 2026 with
-binaries built from this branch at 19:02. The design, tier model and phase plan are
+Status: **ported onto the main tree** (branch `port/native-java-on-main`). This page was last updated 18 November
+2026. Corpus measurements retain the dates shown in each section and use the committed ledgers and proof reports.
+The design, tier model and phase plan are
 [java-mod-compat.md](java-mod-compat.md); this page is the maintained progress view: what runs today, what the
 corpus and the clock measured, and what is left.
 
@@ -162,6 +163,9 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   opt-in hook tier.
 - **Payloads.** Declared payload channels, codecs (`minecraft:raw`/`byte_array`, `minecraft:string`,
   `minecraft:empty`, opaque fallback), sender/receiver hosts and dispatch of a received frame to the jar's handler.
+  Fabric `PayloadTypeRegistry.playS2C()` and `playC2S()` registrations are modelled as typed channel rows, including
+  codec direction and identifier. Fixture coverage exercises both registry sides and keeps duplicate or conflicting
+  channel declarations visible in probe output.
 - **Game events** (`src/events.rs`). Each listener a jar registers gets a stable identity: the Fabric `Event` field
   (22 server-side fields: `ServerLifecycleEvents` start/started/stopping/stopped, `ServerTickEvents` server and
   level start/end, `ServerLevelEvents` load/unload, `ServerPlayConnectionEvents` and `ServerPlayerEvents`
@@ -328,7 +332,8 @@ table below), `tools/java_mod_loader_ledger.py` (real Fabric loader),
 `real-mod-corpus` workflow (fixtures and harness self-test only, never third-party jars), the fixture suites under
 `crates/horizon-native-java/tests/` and `crates/horizon-jvm/tests/` (the latter skipped unless a Minecraft jar,
 loader and libraries are supplied), `tools/native_java_smoke.py`, and the efficiency harness (`tools/efficiency/`,
-[efficiency.md](efficiency.md)) behind the numbers below.
+[efficiency.md](efficiency.md)) behind the numbers below. The native probe's JSON also reports the count and names
+of unknown host calls, so a qualified run can be triaged without scraping the human log.
 
 ## Measured corpus
 
