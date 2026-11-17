@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile and execute tiny Fabric and NeoForge native probe jars.
+"""Compile and execute tiny Fabric, NeoForge, and legacy Forge probe jars.
 
 This is intentionally independent of ``.local`` and a Minecraft installation.  It
 checks the complete native probe path with real classfiles: javac emits the

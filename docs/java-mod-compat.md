@@ -889,7 +889,7 @@ The compiled smoke regression exercises this path without a Minecraft installati
 python3 tools/native_java_smoke.py
 ```
 
-The script uses `javac` to compile two ordinary Java classes plus tiny Forge and NeoForge `@Mod`
+The script uses `javac` to compile two ordinary Java classes plus tiny legacy Forge and NeoForge `@Mod`
 fixtures, packages real Fabric metadata alongside `mods.toml` and `neoforge.mods.toml`, and checks that
 the native runner discovers and executes both Fabric `main` entrypoints plus the Forge-family
 constructors. The Forge fixture crosses the bounded `DeferredRegister` and `SimpleChannel` aliases;

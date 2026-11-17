@@ -1,4 +1,4 @@
-"""End-to-end regression for compiled Fabric and NeoForge native probe jars."""
+"""End-to-end regression for compiled Fabric, NeoForge, and Forge probe jars."""
 
 import json
 import shutil
@@ -23,9 +23,14 @@ class NativeJavaSmokeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn('"entrypoints": ["demo.First", "demo.Second"]', result.stdout)
         self.assertIn('"entrypoints": ["demo.Neo"]', result.stdout)
+        self.assertIn('"entrypoints": ["demo.Forge"]', result.stdout)
         report = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertGreaterEqual(report["fabric"]["host_calls"], 10)
         self.assertEqual(report["neoforge"]["payload_directions"], ["configurationToClient"])
+        self.assertEqual(report["neoforge"]["kind"], "neoforge")
+        self.assertEqual(report["forge"]["kind"], "neoforge")
+        self.assertEqual(report["forge"]["payload_directions"], ["playBidirectional"])
+        self.assertGreaterEqual(report["forge"]["host_calls"], 2)
 
 
 if __name__ == "__main__":
