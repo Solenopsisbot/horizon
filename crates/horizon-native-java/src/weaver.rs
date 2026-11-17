@@ -4079,14 +4079,17 @@ fn callback_arguments(
     // Mixin's simple callback form receives only CallbackInfo. It is valid for
     // HEAD and INVOKE, including a callback that is itself an instance method
     // (the bridge supplies that implicit receiver).
-    if injected != Injected::Returnable && callback_info && target_arguments.len() > 0 {
-        if callback_arguments.len() == 1 && callback_arguments[0] == CALLBACK_INFO_DESC {
-            return Ok(CallbackShape {
-                takes_receiver: false,
-                takes_arguments: false,
-                callback_info: true,
-            });
-        }
+    if injected != Injected::Returnable
+        && callback_info
+        && !target_arguments.is_empty()
+        && callback_arguments.len() == 1
+        && callback_arguments[0] == CALLBACK_INFO_DESC
+    {
+        return Ok(CallbackShape {
+            takes_receiver: false,
+            takes_arguments: false,
+            callback_info: true,
+        });
     }
     let descriptor = |receiver: Option<&str>| {
         let mut shape = String::from("(");

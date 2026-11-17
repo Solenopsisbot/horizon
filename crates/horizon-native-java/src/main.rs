@@ -723,7 +723,7 @@ fn main() -> ExitCode {
                 "{}: Fabric entrypoint adapter {adapter} is not supported by the native path",
                 entry.class
             );
-            error = Some(format!("{reason}"));
+            error = Some(reason.to_string());
             failed_entrypoint = Some(entry);
             refusal = Some(EntrypointSkip::UnsupportedAdapter);
             break;

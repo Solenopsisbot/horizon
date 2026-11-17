@@ -7,7 +7,7 @@
 
 use horizon_native_java::{NativeJar, StdHost};
 use std::{
-    env, fs,
+    env,
     path::PathBuf,
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
