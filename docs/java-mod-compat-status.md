@@ -221,7 +221,9 @@ python3 tools/hybrid_pack.py ~/horizon-corpus/corpus-helix \
   event loop ×3, one unremapped 1.21.1 jar, one missing a sibling jar, two interpreter markers). Before this
   change none reached Horizon's tree.
 - **Probe.** `horizon-native-java [--json] [--mixin-plans] [--weave <out.jar>] <jar> [kind] [class]` reports
-  entrypoints, host calls, registrations, plans and skips, and can write a woven jar.
+  entrypoints, host calls, registrations, plans and skips, and can write a woven jar. JSON refusal rows keep a
+  stable `stage`, `loader` (`fabric`, `forge`, or `neoforge`), `kind`, `entrypoint`, and `refusal` object. The
+  refusal carries a machine-readable `code`, the ledger label (`needs-loader` or `native-gap`), and its reason.
 
 ### `horizon-client` (the game)
 
