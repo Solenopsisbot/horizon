@@ -28,6 +28,24 @@ const FABRIC_SERVER_KINDS: &[&str] = &["server", "main"];
 const NEOFORGE_KINDS: &[&str] = &["neoforge"];
 
 impl NativeJar {
+    /// Fabric's top-level environment limits the whole mod to one side.
+    /// Metadata-only reads retain `fabric.mod.json` in `resource_bytes`, so
+    /// role selection can apply the same gate before class discovery or
+    /// entrypoint execution. Missing and wildcard environments are common.
+    fn fabric_environment_allows(&self, client: bool) -> bool {
+        let Some(bytes) = self.resource_bytes.get("fabric.mod.json") else {
+            return true;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return true;
+        };
+        match value.get("environment").and_then(serde_json::Value::as_str) {
+            Some("client") => client,
+            Some("server") => !client,
+            _ => true,
+        }
+    }
+
     /// Whether the jar carries Fabric metadata, which makes it a Fabric mod
     /// for native execution whatever other loader's metadata it also ships.
     pub fn has_fabric_metadata(&self) -> bool {
@@ -52,6 +70,9 @@ impl NativeJar {
     /// with every entrypoint of that kind, or `None` when the jar runs nothing
     /// in this role.
     pub fn role_entrypoints(&self, client: bool) -> Option<(&'static str, Vec<Entrypoint>)> {
+        if self.has_fabric_metadata() && !self.fabric_environment_allows(client) {
+            return None;
+        }
         self.role_entrypoint_kinds(client).iter().find_map(|kind| {
             let entries = self.discover_entrypoints(kind);
             (!entries.is_empty()).then_some((*kind, entries))
@@ -167,5 +188,16 @@ version = "1"
         )]);
         assert_eq!(main_only.role_entrypoints(false).unwrap().0, "main");
         assert_eq!(main_only.role_entrypoints(true).unwrap().0, "main");
+    }
+
+    #[test]
+    fn fabric_environment_server_stays_off_the_client() {
+        let jar = jar(&[(
+            "fabric.mod.json",
+            br#"{"schemaVersion":1,"id":"demo","version":"1",
+                "environment":"server","entrypoints":{"main":["demo.Main"]}}"#,
+        )]);
+        assert!(jar.role_entrypoints(false).is_some());
+        assert_eq!(jar.role_entrypoints(true), None);
     }
 }
