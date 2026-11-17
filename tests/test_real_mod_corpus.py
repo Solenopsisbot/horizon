@@ -132,6 +132,22 @@ class CorpusTest(unittest.TestCase):
         self.assertEqual(row["probes"][0]["status"], "ok")
         self.assertEqual(toolchain.calls, [("horizon-native-java", "main")])
 
+    def test_fabric_native_execution_error_is_kept_as_diagnostic(self):
+        self.fabric_jar("diagnostic.jar", {
+            "schemaVersion": 1, "id": "diagnostic", "version": "1.0",
+            "entrypoints": {"main": ["demo.Diagnostic"]},
+        })
+        toolchain = FakeToolchain({
+            ("horizon-native-java", "main"): response({
+                "status": "error", "stage": "execute", "error": "fixture native diagnostic",
+            }),
+        })
+        row = self.report(toolchain)["jars"][0]
+        self.assertEqual(row["verdict"], "fallback")
+        self.assertEqual(row["reason"],
+                         "native execution stopped: fixture native diagnostic; embedded JVM fallback")
+        self.assertEqual(row["probes"][0]["status"], "error")
+
     def test_fabric_client_only_entrypoint_is_fallback(self):
         self.fabric_jar("client.jar", {
             "schemaVersion": 1, "id": "demo-client", "version": "1.0",

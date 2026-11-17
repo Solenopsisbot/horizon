@@ -328,7 +328,8 @@ dedicated server per jar, verdict from its log, `java-runtime.json` and plan rep
 `native-ok`/`needs-loader`/`native-gap`; `--with-deps` runs a jar with its declared closure and labels an
 unresolvable one `missing-dependency`; `--docs` regenerates the
 table below), `tools/java_mod_loader_ledger.py` (real Fabric loader),
-`tools/real_mod_fixtures/build.py` (source-only Fabric/NeoForge/legacy-Forge fixtures), the
+`tools/real_mod_fixtures/build.py` (source-only Fabric/NeoForge/legacy-Forge fixtures, including a
+native-execution failure fixture that pins diagnostic propagation), the
 `real-mod-corpus` workflow (fixtures and harness self-test only, never third-party jars), the fixture suites under
 `crates/horizon-native-java/tests/` and `crates/horizon-jvm/tests/` (the latter skipped unless a Minecraft jar,
 loader and libraries are supplied), `tools/native_java_smoke.py`, and the efficiency harness (`tools/efficiency/`,

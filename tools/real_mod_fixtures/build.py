@@ -89,6 +89,11 @@ FABRIC_SOURCES = {
         "Payload.seen++; ServerPlayNetworking.<Object>registerGlobalReceiver(Identifier.fromNamespaceAndPath(\"fixture\", \"payload\"), this::receive); } "
         "private void receive(Object payload, Object context) { Payload.seen++; } }"
     ),
+    "demo/fabric/DiagnosticMod.java": (
+        "package demo.fabric; import net.fabricmc.api.ModInitializer; "
+        "public final class DiagnosticMod implements ModInitializer { "
+        "public void onInitialize() { throw new IllegalStateException(\"fixture native diagnostic\"); } }"
+    ),
     "org/spongepowered/asm/mixin/Mixin.java": (
         "package org.spongepowered.asm.mixin; import java.lang.annotation.*; "
         "@Retention(RetentionPolicy.CLASS) @Target(ElementType.TYPE) public @interface Mixin { Class<?>[] value() default {}; }"
@@ -164,6 +169,9 @@ def build(output: Path) -> dict[str, dict[str, str]]:
             "fabric.mod.json": '{"schemaVersion":1,"id":"native_fixture_fabric","version":"1.0.0","entrypoints":{"main":"demo.fabric.Mod"},"depends":{"minecraft":">=26.3","fabric-api":">=0.100"},"jars":[{"file":"META-INF/jars/nested.jar"}],"mixins":["native_fixture.mixins.json"]}',
             "native_fixture.mixins.json": '{"required":true,"package":"demo.fabric","compatibilityLevel":"JAVA_8","mixins":["FixtureMixin"]}',
             "META-INF/jars/nested.jar": nested.read_bytes(),
+        })
+        _jar(output / "fabric-diagnostic-fixture.jar", fabric_classes, {
+            "fabric.mod.json": '{"schemaVersion":1,"id":"native_diagnostic_fixture","version":"1.0.0","entrypoints":{"main":"demo.fabric.DiagnosticMod"}}',
         })
         neo_classes = _compile(NEO_COMMON, work / "neo")
         _jar(output / "neoforge-fixture.jar", neo_classes, {"META-INF/neoforge.mods.toml": 'modLoader="javafml"\nloaderVersion="[1,)"\nlicense="MIT"\n\n[[mods]]\nmodId="native_fixture_neo"\nversion="1.0.0"\n'} )

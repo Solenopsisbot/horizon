@@ -165,7 +165,9 @@ class RealModFixtureTest(unittest.TestCase):
 
     def test_manifest_is_deterministic_and_fabric_nested_probe_is_folded(self) -> None:
         self.require_probes()
-        self.assertEqual(set(self.manifest), {"fabric-fixture.jar", "forge-fixture.jar", "neoforge-fixture.jar"})
+        self.assertEqual(set(self.manifest), {
+            "fabric-diagnostic-fixture.jar", "fabric-fixture.jar", "forge-fixture.jar", "neoforge-fixture.jar",
+        })
         report = self.corpus("--fabric-jars")
         self.assertEqual(report["counts"]["total"], 1)
         row = next(item for item in report["jars"] if item["file"] == "fabric-fixture.jar")
@@ -174,6 +176,16 @@ class RealModFixtureTest(unittest.TestCase):
         self.assertEqual(len(row["nested"]), 1)
         self.assertEqual(row["nested"][0]["name"], "META-INF/jars/nested.jar")
         self.assertGreaterEqual(row["entrypoints"], 1)
+
+    def test_fabric_native_failure_keeps_execution_diagnostic(self) -> None:
+        self.require_probes()
+        shutil.copy2(self.output / "fabric-diagnostic-fixture.jar", self.fabric_root / "fabric-diagnostic-fixture.jar")
+        rows = {row["file"]: row for row in self.corpus("--fabric-jars")["jars"]}
+        row = rows["fabric-diagnostic-fixture.jar"]
+        self.assertEqual(row["verdict"], "fallback")
+        self.assertIn("native execution stopped", row["reason"])
+        self.assertIn("fixture native diagnostic", row["reason"])
+        self.assertEqual(row["probes"][0]["status"], "error")
 
     def test_neoforge_and_legacy_forge_metadata_only_without_server(self) -> None:
         report = self.corpus("--neoforge-jars")
