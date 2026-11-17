@@ -1,5 +1,6 @@
 use horizon_native_java::{
-    ClassFile, Entrypoint, MethodRef, MixinInjectionPlan, NativeJar, StdHost,
+    ClassFile, Entrypoint, EntrypointSkip, MethodRef, MixinInjectionPlan, NativeJar,
+    StdHost,
     mixin_plans_in_weave_order, weave_class_with_extras, weave_classes_with_extras,
 };
 use std::{
@@ -596,6 +597,39 @@ fn execution_json(
     })
 }
 
+/// Stable machine-readable shape shared by load, discovery and execution
+/// refusals. The human `error` remains for logs, while `refusal` lets ledgers
+/// group Fabric, Forge and NeoForge failures without parsing prose.
+fn failure_json(
+    stage: &str,
+    kind: &str,
+    jar: &NativeJar,
+    entrypoint: Option<&Entrypoint>,
+    error: &str,
+    skip: Option<EntrypointSkip>,
+) -> serde_json::Value {
+    let refusal = skip.map(|skip| {
+        serde_json::json!({
+            "code": match skip {
+                EntrypointSkip::MissingClass => "missing-class",
+                EntrypointSkip::KotlinRuntime => "kotlin-runtime",
+                EntrypointSkip::UnsupportedAdapter => "unsupported-adapter",
+            },
+            "label": skip.label(),
+            "reason": skip.reason(),
+        })
+    });
+    serde_json::json!({
+        "status": "error",
+        "stage": stage,
+        "loader": jar.loader_kind(),
+        "kind": kind,
+        "entrypoint": entrypoint.map(|entry| entry.class.as_str()),
+        "error": error,
+        "refusal": refusal,
+    })
+}
+
 fn main() -> ExitCode {
     let Some(cli) = Cli::parse(std::env::args().skip(1)) else {
         eprintln!(
@@ -622,10 +656,15 @@ fn main() -> ExitCode {
         Ok(jar) => jar,
         Err(error) => {
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"status": "error", "stage": "load", "error": error.to_string()})
-                );
+                println!("{}", serde_json::json!({
+                    "status": "error",
+                    "stage": "load",
+                    "loader": "unknown",
+                    "kind": requested_kind.as_deref().unwrap_or("main"),
+                    "entrypoint": serde_json::Value::Null,
+                    "error": error.to_string(),
+                    "refusal": serde_json::Value::Null,
+                }));
             } else {
                 eprintln!("error loading jar: {error}");
             }
@@ -662,10 +701,14 @@ fn main() -> ExitCode {
     };
     if entrypoints.is_empty() {
         if json {
-            println!(
-                "{}",
-                serde_json::json!({"status": "error", "stage": "discover", "kind": kind, "error": "no entrypoint"})
-            );
+            println!("{}", failure_json(
+                "discover",
+                &kind,
+                &jar,
+                None,
+                "no entrypoint",
+                None,
+            ));
         } else {
             eprintln!("no {kind} entrypoint in metadata; pass its class as the third argument");
         }
@@ -674,18 +717,27 @@ fn main() -> ExitCode {
     let mut host = jar.seed_host(StdHost::new());
     let mut calls = 0;
     let mut error = None;
+    let mut failed_entrypoint = None;
+    let mut refusal = None;
     for entry in &entrypoints {
         if let Some(adapter) = entry.adapter.as_deref() {
-            error = Some(format!(
+            let reason = format!(
                 "{}: Fabric entrypoint adapter {adapter} is not supported by the native path",
                 entry.class
+            );
+            error = Some(format!(
+                "{reason}"
             ));
+            failed_entrypoint = Some(entry);
+            refusal = Some(EntrypointSkip::UnsupportedAdapter);
             break;
         }
         match jar.execute(&entry.class, entry.method.as_deref(), &kind, &mut host) {
             Ok(report) => calls += report.calls,
             Err(entry_error) => {
                 error = Some(format!("{}: {entry_error}", entry.class));
+                failed_entrypoint = Some(entry);
+                refusal = entry_error.entrypoint_skip();
                 break;
             }
         }
@@ -714,10 +766,14 @@ fn main() -> ExitCode {
         }
         Some(error) => {
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"status": "error", "stage": "execute", "error": error.to_string()})
-                );
+                println!("{}", failure_json(
+                    "execute",
+                    &kind,
+                    &jar,
+                    failed_entrypoint,
+                    &error,
+                    refusal,
+                ));
             } else {
                 eprintln!("native execution stopped: {error}");
             }
@@ -1254,6 +1310,35 @@ mod tests {
             report["unknown_host_calls"],
             serde_json::json!([["demo/Unmodelled#test()V", 1]])
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refusal_report_has_loader_and_machine_readable_cause() {
+        let root = scratch("refusal_report");
+        let jar_path = root.join("report.jar");
+        write_zip(
+            &jar_path,
+            &[(
+                "fabric.mod.json",
+                br#"{"id":"demo","entrypoints":{"main":[{"value":"demo.Entry","adapter":"scala"}]}}"#,
+            )],
+        );
+        let jar = NativeJar::from_path(&jar_path).unwrap();
+        assert_eq!(jar.loader_kind(), "fabric");
+        let entrypoint = jar.discover_entrypoints("main")[0].clone();
+        let report = failure_json(
+            "execute",
+            "main",
+            &jar,
+            Some(&entrypoint),
+            "demo.Entry: unsupported adapter",
+            Some(EntrypointSkip::UnsupportedAdapter),
+        );
+        assert_eq!(report["loader"], "fabric");
+        assert_eq!(report["refusal"]["code"], "unsupported-adapter");
+        assert_eq!(report["refusal"]["label"], "native-gap");
+        assert_eq!(report["entrypoint"], "demo.Entry");
         let _ = std::fs::remove_dir_all(root);
     }
 }
