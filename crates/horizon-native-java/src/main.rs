@@ -910,8 +910,8 @@ fn game_listener_counts(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClassFile, Cli, MethodRef, MixinInjectionPlan, Path, PathBuf, WeaveReport, read_jar,
-        weave_jar, write_woven_jar,
+        ClassFile, Cli, EntrypointSkip, MethodRef, MixinInjectionPlan, NativeJar, Path, PathBuf,
+        WeaveReport, failure_json, read_jar, weave_jar, write_woven_jar,
     };
     use std::io::{Read, Write};
 
