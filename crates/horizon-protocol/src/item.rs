@@ -401,10 +401,10 @@ impl Component {
             ENCHANTMENT_GLINT_OVERRIDE => Self::Bool(r.bool()?),
             CUSTOM_NAME | ITEM_NAME => Self::Text(r.nbt()?),
             CUSTOM_DATA => Self::Nbt(r.nbt()?),
-            ITEM_MODEL => Self::Ident(r.string(32767)?),
-            // `tooltip_style`: an `Identifier` naming the style's
-            // `tooltip/<path>_background` and `_frame` sprites.
-            TOOLTIP_STYLE => Self::Ident(r.string(32767)?),
+            // `item_model` and `tooltip_style` (which names the style's
+            // `tooltip/<path>_background` and `_frame` sprites): an `Identifier`.
+            // One arm: each arm adds to this recursive function's debug frame.
+            ITEM_MODEL | TOOLTIP_STYLE => Self::Ident(r.string(32767)?),
             LORE => {
                 let n = r.count(256)?;
                 Self::Lore((0..n).map(|_| r.nbt()).collect::<Result<_>>()?)
