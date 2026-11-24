@@ -8,6 +8,8 @@
 pub mod banner_layer;
 pub mod blocks;
 pub mod bundle;
+#[cfg(test)]
+mod component_removal_tests;
 pub mod content_namespaces;
 pub mod cooldowns;
 pub mod durability;
@@ -30,5 +32,7 @@ pub mod properties;
 pub mod random_sequences;
 pub mod recipe_filters;
 pub mod recipe_sources;
+#[cfg(test)]
+mod tag_tests;
 pub mod use_animation;
 pub use horizon_client_core::Result;

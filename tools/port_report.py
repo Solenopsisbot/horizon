@@ -148,17 +148,53 @@ def blocking_items(diff, mapping, pinned_facts, root, regen=None):
         items.append(item(1, "report-format", f"blocks.json format: {', '.join(diff['blocks']['format'])}",
                           files=files_containing("blocks.json", root),
                           details={"fields": diff["blocks"]["format"]}))
-    if regen is None:
-        for output, command, stale in GENERATORS:
-            if stale(diff):
-                items.append(item(1, "regenerate", f"Regenerate {output}", files=[output], command=command))
-    else:
+    # Block state IDs are the chunk palette and the network protocol: a shift or state-count change
+    # is a blocking change even when no block was added, removed or given a different property.
+    blocks = diff["blocks"]
+    shifted = blocks.get("state_ids_shifted") or 0
+    count_change = blocks.get("state_count")
+    count_differs = isinstance(count_change, (list, tuple)) and len(count_change) == 2 and count_change[0] != count_change[1]
+    if shifted or count_differs:
+        first = blocks.get("first_shifted")
+        parts = []
+        if shifted:
+            parts.append(f"{shifted} blocks shifted" + (f" (first: {first})" if first else ""))
+        if count_differs:
+            parts.append(f"states {count_change[0]} -> {count_change[1]}")
+        items.append(item(1, "block-ids",
+                          f"Block state IDs: {', '.join(parts)}",
+                          files=files_containing("blocks.json", root),
+                          details={"shifted": shifted, "first": first,
+                                   "state_count": count_change}))
+    items_changed = diff["items"].get("changed", {})
+    if items_changed:
+        comp_summary = diff["items"].get("components", {})
+        comp_names = sorted(comp_summary) if comp_summary else sorted({
+            k for entry in items_changed.values()
+            for kind in ("added", "removed", "changed")
+            for k in (entry.get(kind, {}).keys() if isinstance(entry.get(kind), dict) else entry.get(kind, []))
+        })
+        item_names = sorted(items_changed)[:12]
+        suffix = f" (+{len(items_changed) - 12})" if len(items_changed) > 12 else ""
+        comp_text = f"; components: {', '.join(comp_names[:12])}" if comp_names else ""
+        items.append(item(1, "item-components",
+                          f"Item default components: {len(items_changed)} items changed ({', '.join(item_names)}{suffix}){comp_text}",
+                          files=files_naming(comp_names[:12], root),
+                          details={"items": items_changed, "components": comp_summary}))
+    covered = set()
+    if regen is not None:
         for name, entry in regen["generators"].items():
             if entry["status"] == "failed":
                 errors = entry.get("compile_errors", [])
                 what = "its vanilla exporter no longer compiles" if errors else "failed"
                 items.append(item(1, "regen-failed", f"Generator {name}: {what} on {regen['new']}",
                                   files=entry["outputs"], error=entry["error"], compile_errors=errors))
+                covered.update(entry.get("outputs", []))
+            elif entry["status"] in ("regenerated", "unchanged"):
+                covered.update(entry.get("outputs", []))
+    for output, command, stale in GENERATORS:
+        if output not in covered and stale(diff):
+            items.append(item(1, "regenerate", f"Regenerate {output}", files=[output], command=command))
     return items
 
 
@@ -281,8 +317,16 @@ def build(diff, mapping, old, new, pinned_facts, results=None, root=ROOT, regen=
     for number, entry in enumerate(items, 1):
         entry["id"] = number
     clean = [kind for kind in ("packets", "commands") if not diff[kind]]
-    clean += [kind for kind in ("blocks", "items") if not (diff[kind]["added"] or diff[kind]["removed"]
-                                                            or diff[kind]["changed"])]
+    blocks_changed = (diff["blocks"]["added"] or diff["blocks"]["removed"] or diff["blocks"]["changed"]
+                      or diff["blocks"].get("format") or diff["blocks"].get("state_ids_shifted")
+                      or (isinstance(diff["blocks"].get("state_count"), (list, tuple))
+                          and len(diff["blocks"]["state_count"]) == 2
+                          and diff["blocks"]["state_count"][0] != diff["blocks"]["state_count"][1]))
+    if not blocks_changed:
+        clean.append("blocks")
+    if not (diff["items"]["added"] or diff["items"]["removed"] or diff["items"]["changed"]
+            or diff["items"].get("format")):
+        clean.append("items")
     classes = diff["classes"]
     return {
         "old": old, "new": new,
@@ -291,8 +335,10 @@ def build(diff, mapping, old, new, pinned_facts, results=None, root=ROOT, regen=
             "classes": {"added": len(classes["added"]), "removed": len(classes["removed"]),
                         "moved": len(classes["moved"]), "changed": len(classes["changed"]),
                         "horizon": len(classes["horizon"])},
-            "generators": ({name: e["status"] for name, e in regen["generators"].items()} if regen
-                           else {i["files"][0]: "stale" for i in items if i["kind"] == "regenerate"}),
+            "generators": {
+                **({name: e["status"] for name, e in regen["generators"].items()} if regen else {}),
+                **{i["files"][0]: "stale" for i in items if i["kind"] == "regenerate"},
+            },
         },
         "harnesses": harnesses["summary"] if harnesses else None,
         "regen": {"candidate": regen["candidate"], "commit": regen["commit"],
@@ -320,9 +366,11 @@ def markdown(report, limit=12):
         lines.append(f"- unchanged: {', '.join(report['clean'])}")
     if report.get("regen"):
         generators = summary["generators"]
+        statuses = ("regenerated", "unchanged", "failed")
+        if any(v == "stale" for v in generators.values()):
+            statuses += ("stale",)
         lines.append(f"- generators in `{report['regen']['candidate']}` at {report['regen']['commit'][:10]}: "
-                     + ", ".join(f"{s} {sum(1 for v in generators.values() if v == s)}"
-                                 for s in ("regenerated", "unchanged", "failed")))
+                     + ", ".join(f"{s} {sum(1 for v in generators.values() if v == s)}" for s in statuses))
         for path, (added, removed) in report["regen"]["stat"].items():
             lines.append(f"  - regenerated `{path}` (+{added} -{removed})")
     if report.get("harnesses"):

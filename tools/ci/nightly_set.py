@@ -48,7 +48,11 @@ COUNCIL = ".github/council.txt"
 CODEOWNERS = ".github/CODEOWNERS"
 # What CODEOWNERS guards today, refused even if the file moved: what builds, signs and checks releases.
 ALWAYS_GUARDED = ["/.github/", "/tools/ci/", "/crates/horizon-release-sign/", "/crates/horizon-server/src/update.rs",
-                  "/launcher/src/backend.rs", "/launcher/links.json"]
+                  "/launcher/src/backend.rs", "/launcher/links.json", "/launcher/src/backend/release_selection.rs",
+                  "/launcher/src/update_handoff.rs", "/launcher/src/native_mods/sdk_cache.rs",
+                  "/crates/cargo-horizon-mod/src/sdk_fetch.rs", "/xtask/", "/.cargo/"]
+# `pulls/N/files` stops here however many files the pull request changes.
+LISTING_CAP = 3000
 STATE_BRANCH = "nightly-state"
 BUILD_PREFIX = "nightly/build-"
 MAX_PRS = 30
@@ -196,13 +200,61 @@ def authorize(actor: Actor, reviewers: Reviewers) -> None:
 
 def guarded_patterns(codeowners: str) -> list[str]:
     """The paths CODEOWNERS guards (the council reviews them), plus ALWAYS_GUARDED."""
-    found = [line.split()[0] for line in codeowners.splitlines() if line.strip().startswith("/")]
+    found = [words[0] for line in codeowners.splitlines()
+             if (words := line.split()) and not words[0].startswith("#")]
     return sorted(set(found + ALWAYS_GUARDED))
+
+
+def _pattern_regex(pattern: str, *, folder: bool = False) -> re.Pattern:
+    """CODEOWNERS' shell-style pattern: `*` and `?` stay inside one segment, `**/` spans zero or more.
+
+    `**/` must match zero folders too (`/packages/**/x.rs` guards `packages/x.rs`), and a folder
+    pattern must match any path under the named directory.
+    """
+    parts, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith('**/', i):
+            parts.append('(?:.*/)?')
+            i += 3
+        elif pattern.startswith('**', i):
+            parts.append('.*')
+            i += 2
+        elif pattern[i] == '*':
+            parts.append('[^/]*')
+            i += 1
+        elif pattern[i] == '?':
+            parts.append('[^/]')
+            i += 1
+        else:
+            parts.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile('^' + ''.join(parts) + ('/' if folder else r'\Z'), re.DOTALL)
 
 
 def guarded(path: str, patterns: list[str]) -> bool:
     p = "/" + path.lstrip("/")
-    return any(p.startswith(pat) if pat.endswith("/") else p == pat for pat in patterns)
+    for pat in patterns:
+        if not pat.startswith("/"):
+            # A single name (including a trailing directory slash) applies at
+            # any depth; a path containing an internal slash is root-relative.
+            pat = "/" + ("**/" if "/" not in pat.rstrip("/") else "") + pat
+        if pat.endswith("/"):
+            if "*" in pat or "?" in pat:
+                if _pattern_regex(pat.rstrip("/"), folder=True).match(p):
+                    return True  # a wildcard folder guards every file below it
+            elif p.startswith(pat):
+                return True
+        elif "*" in pat or "?" in pat:
+            pattern = _pattern_regex(pat)
+            # GitHub's `docs/*` example owns direct files, not their descendants.
+            # Explicit folders and literal terminal names such as **/logs still
+            # own descendants; a terminal * needs an explicit trailing slash.
+            if pattern.match(p) or (not pat.endswith("/*") and
+                                    any(pattern.match(p[:end]) for end, char in enumerate(p) if char == "/")):
+                return True  # a wildcard that names a directory guards everything under it
+        elif p == pat or p.startswith(pat + "/"):
+            return True  # CODEOWNERS also applies a directory path written without its trailing slash
+    return False
 
 
 @dataclass
@@ -214,6 +266,7 @@ class PullRequest:
     author: str
     base: str
     files: list[str]
+    complete: bool = True  # False when GitHub's file listing is cut short, so a guarded file may be missing
 
 
 def check(pr: PullRequest | None, number: int, patterns: list[str]) -> str | None:
@@ -226,6 +279,8 @@ def check(pr: PullRequest | None, number: int, patterns: list[str]) -> str | Non
         return f"#{number} is {pr.state}"
     if pr.base != "main":
         return f"#{number} targets `{safe(pr.base)}`, not main"
+    if not pr.complete:
+        return f"#{number}: GitHub listed only part of its changed files, so the guarded paths can't be checked"
     bad = [f for f in pr.files if guarded(f, patterns)]
     if bad:
         more = f" and {len(bad) - 1} more" if len(bad) > 1 else ""
@@ -399,8 +454,11 @@ class Conflict(Exception):
 def changed_files(base: str, head: str, cwd: str | None = None) -> list[str]:
     """What `head` changes since it left `base`, renames' old paths included."""
     since = out("merge-base", base, head, cwd=cwd)
-    names = out("diff", "--name-status", "--no-renames", since, head, cwd=cwd)
-    return [line.split("\t", 1)[1] for line in names.splitlines() if "\t" in line]
+    # NUL-delimited status/path pairs are repository bytes, not Git's quoted
+    # display names. Text decoding would also normalize newlines in a path.
+    names = subprocess.run(["git", *SAFE_GIT, "diff", "--name-status", "-z", "--no-renames", since, head],
+                           cwd=cwd, check=True, capture_output=True).stdout.split(b"\0")
+    return [os.fsdecode(path) for path in names[1::2]]
 
 
 def culprit(main: str, earlier: list[tuple[int, str]], head: str, date: str, cwd: str | None) -> int | None:
@@ -532,15 +590,28 @@ def lookup(repo: str) -> Callable[[int], PullRequest | None]:
         if not raw:
             return None
         p = json.loads(raw)
-        files = gh("api", "--paginate", f"repos/{repo}/pulls/{n}/files", "--jq",
-                   ".[] | .filename, (.previous_filename // empty)").splitlines()
+        pages = json.loads(gh("api", "--paginate", "--slurp", f"repos/{repo}/pulls/{n}/files"))
+        items = [item for page in pages for item in page]
+        files = [path for item in items for path in (item["filename"], item.get("previous_filename"))
+                 if path is not None]
+        # The listing is capped; a missing count counts as unknown, never as complete.
+        changed = p.get("changed_files")
+        complete = isinstance(changed, int) and changed <= len(items) < LISTING_CAP
         state = "merged" if p.get("merged_at") else p["state"]
-        return PullRequest(n, state, p["head"]["sha"], p["title"], p["user"]["login"], p["base"]["ref"], files)
+        return PullRequest(n, state, p["head"]["sha"], p["title"], p["user"]["login"], p["base"]["ref"], files,
+                           complete)
     return get
 
 
 def answer(repo: str, issue: str, text: str) -> None:
     gh("api", f"repos/{repo}/issues/{issue}/comments", "-f", f"body=🤖 Nightly: {text}")
+
+
+def title_request(title: str) -> str:
+    """The request id in a `nightly build` run's name, or ''. It sits right after the mode (nightly-build.yml's
+    run-name), before the free-form base, so a base that mentions another request's id is never taken for it."""
+    match = re.match(r"nightly build \((?:dry run|real)\) \(request ([^)\s]+)\)", title)
+    return match.group(1) if match else ""
 
 
 def dispatch(repo: str, issue: str, request: str, dry_run: list[dict] | None) -> str:
@@ -555,7 +626,7 @@ def dispatch(repo: str, issue: str, request: str, dry_run: list[dict] | None) ->
         runs = json.loads(gh("run", "list", "--repo", repo, "--workflow", "nightly-build.yml", "--event",
                              "workflow_dispatch", "--limit", "20", "--json", "displayTitle,url", check=False) or "[]")
         for r in runs:
-            if request in r["displayTitle"]:
+            if title_request(r["displayTitle"]) == request:
                 return r["url"]
     return f"https://github.com/{repo}/actions/workflows/nightly-build.yml"
 

@@ -6,7 +6,7 @@ use super::*;
 use build_mode::ModKind;
 use horizon_launcher::native_mods::{
     self as nm,
-    fit::{self, Verdict},
+    fit::{self, Age, Verdict},
     sdk_cache::Refusal as Sdk,
     Route, Step,
 };
@@ -54,14 +54,6 @@ fn misfits(count: usize) -> Vec<Misfit> {
         .collect()
 }
 
-fn unfit(name: &str, verdict: Verdict) -> Route {
-    Route::Unfit {
-        headline: fit::headline(name, &verdict),
-        line: fit::line(name, &verdict, BUILD),
-        actions: fit::actions(name),
-    }
-}
-
 fn row(name: &str, kind: ModKind, error: Option<&str>) -> ModRow {
     ModRow {
         file: format!("mods/{name}.hmod"),
@@ -71,6 +63,7 @@ fn row(name: &str, kind: ModKind, error: Option<&str>) -> ModRow {
         entry: None,
         icon: None,
         error: error.map(str::to_owned),
+        missing: false,
         native: None,
         internals: Vec::new(),
         kind: Some((kind, name.into())),
@@ -240,8 +233,7 @@ impl Launcher {
         // row before that.
         if matches!(kind, "step" | "error") && key != "no-consent" {
             self.settings.native_mods_allowed_at = Some(1);
-            *self.mods.native_state.borrow_mut() = Some((
-                String::new(),
+            *self.mods.native_state.borrow_mut() = Some(build_mode::NativeStateMemo::preview(
                 native_status::State::Outdated,
                 vec!["fast-ore".into(), "greeter".into()],
             ));
@@ -253,8 +245,10 @@ impl Launcher {
                 self.settings.native_mods_allowed_at = Some(1);
                 self.mod_preview.state = Some(native_status::State::UpToDate);
                 // Built: no mod waits for a build any more.
-                *self.mods.native_state.borrow_mut() =
-                    Some((String::new(), native_status::State::UpToDate, Vec::new()));
+                *self.mods.native_state.borrow_mut() = Some(build_mode::NativeStateMemo::preview(
+                    native_status::State::UpToDate,
+                    Vec::new(),
+                ));
                 self.native_done = step("done").map(|step| step.label());
             }
             ("step", "start") => {
@@ -290,10 +284,11 @@ impl Launcher {
             }
             ("update", key) => {
                 let to = "nightly-2026-11-13".to_owned();
-                let off = [(
-                    "hitbox-plus".to_owned(),
-                    "it changes the game's own code".to_owned(),
-                )];
+                let off = [nm::LeftOut {
+                    id: "hitbox-plus".into(),
+                    version: "1.2.0".into(),
+                    why: nm::Why::Unfit("it changes the game's own code".into()),
+                }];
                 let (summary, worlds) = match key {
                     "some" => (fit::update_summary(BUILD, 3, &off), Vec::new()),
                     "world" => (
@@ -325,6 +320,7 @@ impl Launcher {
                         "hitbox-plus",
                         Verdict::Exact {
                             made_for: MADE_FOR.into(),
+                            age: Age::Older,
                             why: "native",
                         },
                     ),
@@ -332,6 +328,7 @@ impl Launcher {
                         "deep-tools",
                         Verdict::Exact {
                             made_for: MADE_FOR.into(),
+                            age: Age::Older,
                             why: "internals",
                         },
                     ),
@@ -339,12 +336,14 @@ impl Launcher {
                         "old-greeter",
                         Verdict::NoList {
                             made_for: MADE_FOR.into(),
+                            age: Age::Older,
                         },
                     ),
                     (
                         "night-vision",
                         Verdict::DoesNotFit {
                             made_for: MADE_FOR.into(),
+                            age: Age::Older,
                             misfits: misfits(1),
                         },
                     ),
@@ -352,6 +351,7 @@ impl Launcher {
                         "big-update",
                         Verdict::DoesNotFit {
                             made_for: MADE_FOR.into(),
+                            age: Age::Older,
                             misfits: misfits(7),
                         },
                     ),
@@ -363,7 +363,7 @@ impl Launcher {
                         Verdict::Fits { .. } => Route::Fits {
                             line: fit::line(name, &verdict, BUILD),
                         },
-                        _ => unfit(name, verdict),
+                        _ => fit::unfit_route(name, &verdict, BUILD),
                     };
                     mods.push((name.to_owned(), route));
                     rows.push(row(name, ModKind::Native, None));
@@ -398,8 +398,10 @@ impl Launcher {
                 // A build counts the mods it left out as tried (`native_status::built`): the
                 // build is up to date, and only Switch off changes anything.
                 self.mod_preview.state = Some(native_status::State::UpToDate);
-                *self.mods.native_state.borrow_mut() =
-                    Some((String::new(), native_status::State::UpToDate, Vec::new()));
+                *self.mods.native_state.borrow_mut() = Some(build_mode::NativeStateMemo::preview(
+                    native_status::State::UpToDate,
+                    Vec::new(),
+                ));
             }
             ("trust", "registry") => {
                 let (reply, _answer) = std::sync::mpsc::channel();

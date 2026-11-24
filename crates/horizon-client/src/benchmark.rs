@@ -3,8 +3,8 @@
 //! same control commands `horizon-ctl` would, through the game's own command queue, and writes a
 //! report (docs/benchmark-report.md) to `benchmarks/` in the game folder.
 //!
-//! The scenes, the world (seed 1234, creative) and every step and figure match `tools/perf_bench.py`,
-//! so reports from the two can be compared.
+//! The standard and individual flight scenes match `tools/perf_bench.py`.
+//! The autotune scenarios drive their own fixed workloads and keep reports local.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
@@ -16,6 +16,11 @@ use horizon_bench::{App, Frames, Kind, Report};
 use serde_json::Value;
 
 use crate::control::Request;
+
+mod autotune;
+pub use autotune::{
+    AUTOTUNE_PACK_BLOCK, AUTOTUNE_PACK_ID, autotune_pack_loaded, prepare_autotune_pack,
+};
 
 pub const SEED: i64 = 1234;
 /// The world the benchmark creates under `saves/`, replaced on every run.
@@ -111,6 +116,8 @@ pub enum Scenario {
     Travel,
     /// The flight with the switch's B applied, then its two values interleaved B A A B.
     Ab(&'static Switch),
+    /// Seven fixed graphics workloads for a local settings trial.
+    Autotune { thorough: bool },
 }
 
 impl Scenario {
@@ -118,6 +125,8 @@ impl Scenario {
         match name {
             "standard" => Ok(Scenario::Scenes(SCENES.to_vec())),
             "travel" => Ok(Scenario::Travel),
+            "autotune-quick" => Ok(Scenario::Autotune { thorough: false }),
+            "autotune-thorough" => Ok(Scenario::Autotune { thorough: true }),
             name if name.starts_with("ab:") => SWITCHES
                 .iter()
                 .find(|s| s.name == &name[3..])
@@ -134,7 +143,7 @@ impl Scenario {
                 .find(|s| s.0 == name)
                 .map(|s| Scenario::Scenes(vec![*s]))
                 .ok_or_else(|| {
-                    format!("unknown benchmark {name}: standard, village, forest, ocean, mountain, travel or ab:SWITCH ({})", SWITCHES.map(|s| s.name).join(", "))
+                    format!("unknown benchmark {name}: standard, village, forest, ocean, mountain, travel, autotune-quick, autotune-thorough or ab:SWITCH ({})", SWITCHES.map(|s| s.name).join(", "))
                 }),
         }
     }
@@ -157,6 +166,7 @@ pub fn parse_set(value: &str) -> Result<(String, String), String> {
 /// What the game knows about the run before it starts.
 pub struct Setup {
     pub scenario: String,
+    /// The process's start: `startup.title_ms` and `startup.world_ms` count from it.
     pub started: Instant,
     pub app: App,
     pub simulation_distance: u32,
@@ -190,6 +200,14 @@ struct Control(Sender<Request>);
 
 impl Control {
     fn call(&self, line: &str) -> Result<Value, String> {
+        let response = self.send(line)?;
+        let text = response
+            .recv_timeout(LOAD_LIMIT)
+            .map_err(|_| format!("{line}: no reply"))?;
+        Self::decode(line, &text)
+    }
+
+    fn send(&self, line: &str) -> Result<mpsc::Receiver<String>, String> {
         let (reply, response) = mpsc::channel();
         self.0
             .send(Request {
@@ -197,11 +215,11 @@ impl Control {
                 reply,
             })
             .map_err(|_| "the game has exited".to_owned())?;
-        // Flights and loads reply when they finish.
-        let text = response
-            .recv_timeout(LOAD_LIMIT)
-            .map_err(|_| format!("{line}: no reply"))?;
-        let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        Ok(response)
+    }
+
+    fn decode(line: &str, text: &str) -> Result<Value, String> {
+        let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
         match value.get("error").and_then(Value::as_str) {
             Some(e) => Err(format!("{line}: {e}")),
             None => Ok(value),
@@ -212,9 +230,10 @@ impl Control {
     }
 }
 
-/// The wait before a scene's flight, spent timing Horizon's own render passes on the GPU:
-/// `gpu_pass.<scene>.<pass>_ms`, where a slow GPU spends its frame. The timing is off again for
-/// the flight, whose frames it would slow. False, having waited for nothing, on Metal: its passes
+/// The wait before a scene's flight, spent timing the render passes on the GPU, where a slow
+/// GPU spends its frame: Horizon's own as `gpu_pass.<scene>.<pass>_ms`, a shader pack's as
+/// `shader_pass.<scene>.<pass>_ms`. The timing is off again for the flight, whose frames it
+/// would slow. False, having waited for nothing, on Metal: its passes
 /// overlap on the GPU, so their times add up to more than the frame.
 fn time_passes(control: &Control, scene: &str, report: &mut Report) -> Result<bool, String> {
     if report
@@ -228,18 +247,21 @@ fn time_passes(control: &Control, scene: &str, report: &mut Report) -> Result<bo
     control.call("gpu-passes on")?;
     let held = control.call(&format!("bench {}", SETTLE.as_secs_f64()));
     control.call("gpu-passes off")?;
-    for (pass, ms) in held?["gpu_passes"].as_object().into_iter().flatten() {
-        let pass: String = pass
-            .trim()
-            .chars()
-            .map(|c| match c {
-                'a'..='z' | '0'..='9' => c,
-                'A'..='Z' => c.to_ascii_lowercase(),
-                _ => '_',
-            })
-            .collect();
-        if let Some(ms) = ms.as_f64() {
-            report.metric(&format!("gpu_pass.{scene}.{pass}_ms"), &[ms]);
+    let held = held?;
+    for (key, metric) in [("gpu_passes", "gpu_pass"), ("shader_passes", "shader_pass")] {
+        for (pass, ms) in held[key].as_object().into_iter().flatten() {
+            let pass: String = pass
+                .trim()
+                .chars()
+                .map(|c| match c {
+                    'a'..='z' | '0'..='9' => c,
+                    'A'..='Z' => c.to_ascii_lowercase(),
+                    _ => '_',
+                })
+                .collect();
+            if let Some(ms) = ms.as_f64() {
+                report.metric(&format!("{metric}.{scene}.{pass}_ms"), &[ms]);
+            }
         }
     }
     Ok(true)
@@ -258,6 +280,25 @@ fn run(control: &Control, setup: Setup) -> Result<PathBuf, String> {
     })?;
     report.metric("startup.title_ms", &[ms(setup.started.elapsed())]);
     let renderer = &title["renderer"];
+    if matches!(scenario, Scenario::Autotune { .. }) {
+        let graphics = crate::graphics::Graphics::load(&setup.game_dir);
+        if !setup.offscreen
+            && graphics.present_mode != crate::graphics::PresentMode::Auto
+            && !renderer["present_mode"]
+                .as_str()
+                .is_some_and(|active| active.eq_ignore_ascii_case(graphics.present_mode.name()))
+        {
+            return Err(format!(
+                "the requested {} present mode is not supported by this surface",
+                graphics.present_mode.name()
+            ));
+        }
+        if graphics.gpu_culling == crate::graphics::GpuCullingMode::On
+            && renderer["gpu_culling"].as_bool() != Some(true)
+        {
+            return Err("the requested GPU culling mode is not active on this adapter".into());
+        }
+    }
     report.hardware.gpu = Some(horizon_bench::Gpu {
         name: text(&renderer["gpu"]),
         vendor: match text(&renderer["vendor"]) {
@@ -313,6 +354,7 @@ fn run(control: &Control, setup: Setup) -> Result<PathBuf, String> {
         Scenario::Travel => (HOLD_BLOCKS, None),
         Scenario::Ab(_) => (2 * PAIRS, Some(WARMUP_SECONDS)),
         Scenario::Scenes(_) => (1, Some(SETTLE.as_secs_f64())),
+        Scenario::Autotune { thorough } => (autotune::repeats(thorough), None),
     };
     (c.repeats, c.warmup_s) = (Some(repeats), warmup);
     if let Some(bytes) = renderer["gpu_allocated_bytes"].as_f64() {
@@ -337,7 +379,9 @@ fn run(control: &Control, setup: Setup) -> Result<PathBuf, String> {
     if let Ok(meta) = std::env::current_exe().and_then(std::fs::metadata) {
         report.metric("game.binary_bytes", &[meta.len() as f64]);
     }
-    crate::telemetry::keep_benchmark(&crate::logging::game_home(), &report);
+    if !matches!(scenario, Scenario::Autotune { .. }) {
+        crate::telemetry::keep_benchmark(&crate::logging::game_home(), &report);
+    }
     let written = report
         .write_to(&setup.game_dir.join("benchmarks"))
         .map_err(|e| e.to_string())?;
@@ -366,6 +410,9 @@ fn measure(
     report: &mut Report,
     steady: &mut Vec<(Instant, Instant)>,
 ) -> Result<(), String> {
+    if matches!(scenario, Scenario::Autotune { .. }) {
+        autotune::check_pack(control)?;
+    }
     match (scenario, &setup.set) {
         (Scenario::Ab(switch), _) => apply_set(control, switch.name, switch.b)?,
         (_, Some((name, value))) => apply_set(control, name, value)?,
@@ -401,6 +448,7 @@ fn measure(
             }
         }
         Scenario::Travel => travel(control, report, steady)?,
+        Scenario::Autotune { thorough } => autotune::measure(control, *thorough, report, steady)?,
         Scenario::Ab(switch) => {
             trip(control, report, steady)?;
             let plan = Plan {
@@ -461,12 +509,7 @@ fn load_scene(
 ) -> Result<(), String> {
     let meshed = control.status()["meshed_sections"].as_f64().unwrap_or(0.0);
     let generated = control.status()["generated_chunks"].as_f64().unwrap_or(0.0);
-    let [x, y, z] = start;
-    control.call(&format!("tp {x} {y} {z}"))?;
-    let teleported = Instant::now();
-    // A zero-length flight holds the player at the start, flying.
-    control.call(&format!("fly {x} {y} {z} {x} {y} {z} 0.1 {pitch}"))?;
-    control.call(&format!("look {:.3} {pitch}", yaw(start, end)))?;
+    let teleported = hold_scene(control, start, end, pitch)?;
     let loaded = wait_loaded(control, near(start))?;
     let load = loaded - teleported;
     report.metric(&format!("chunks.{name}.load_ms"), &[ms(load)]);
@@ -482,6 +525,21 @@ fn load_scene(
         );
     }
     Ok(())
+}
+
+fn hold_scene(
+    control: &Control,
+    start: [f64; 3],
+    end: [f64; 3],
+    pitch: f64,
+) -> Result<Instant, String> {
+    let [x, y, z] = start;
+    control.call(&format!("tp {x} {y} {z}"))?;
+    let teleported = Instant::now();
+    // A zero-length flight holds the player at the start, flying.
+    control.call(&format!("fly {x} {y} {z} {x} {y} {z} 0.1 {pitch}"))?;
+    control.call(&format!("look {:.3} {pitch}", yaw(start, end)))?;
+    Ok(teleported)
 }
 
 /// Whether a status position is within 2 blocks of `target`.
@@ -783,8 +841,9 @@ fn wait_loaded(control: &Control, near: impl Fn(&Value) -> bool) -> Result<Insta
 }
 
 /// 80% of the view circle (pi x RD^2): the game keeps 637 columns at RD 12 and 3725 at RD 32
-/// (`tools/perf_bench.py`'s `view_chunks`).
-fn view_chunks(distance: u64) -> u64 {
+/// (`tools/perf_bench.py`'s `view_chunks`). The game and `horizon-ctl wait-ready` use it too:
+/// a world that has not reached it has not received its view yet.
+pub fn view_chunks(distance: u64) -> u64 {
     (0.8 * std::f64::consts::PI * (distance * distance) as f64) as u64
 }
 
@@ -857,6 +916,14 @@ mod tests {
         };
         assert_eq!(scenes("standard").len(), 4);
         assert_eq!(scenes("ocean")[0].0, "ocean");
+        assert!(matches!(
+            Scenario::parse("autotune-quick"),
+            Ok(Scenario::Autotune { thorough: false })
+        ));
+        assert!(matches!(
+            Scenario::parse("autotune-thorough"),
+            Ok(Scenario::Autotune { thorough: true })
+        ));
         assert!(matches!(Scenario::parse("travel"), Ok(Scenario::Travel)));
         assert!(matches!(
             Scenario::parse("ab:gpu-culling"),
@@ -949,7 +1016,8 @@ mod tests {
     }
 
     /// The wait before a flight times the passes and turns the timing off again before the
-    /// flight; the report gets one metric per pass. Not on Metal.
+    /// flight; the report gets one metric per pass, a shader pack's apart from Horizon's own.
+    /// Not on Metal.
     #[test]
     fn the_wait_times_the_passes_but_not_the_flight() {
         let time_on = |backend: &str| {
@@ -961,6 +1029,7 @@ mod tests {
                         serde_json::json!({
                             "frames": 120,
                             "gpu_passes": {"World": 1.5, "World after culling": 0.25, "HUD": 0.01},
+                            "shader_passes": {"Sky": 0.5, "World": 0.75},
                         })
                     } else {
                         serde_json::json!({ "ok": true })
@@ -991,7 +1060,9 @@ mod tests {
         assert_eq!(mean("gpu_pass.forest.world_ms"), Some(1.5));
         assert_eq!(mean("gpu_pass.forest.world_after_culling_ms"), Some(0.25));
         assert_eq!(mean("gpu_pass.forest.hud_ms"), Some(0.01));
-        assert_eq!(metrics.len(), 3);
+        assert_eq!(mean("shader_pass.forest.sky_ms"), Some(0.5));
+        assert_eq!(mean("shader_pass.forest.world_ms"), Some(0.75));
+        assert_eq!(metrics.len(), 5);
 
         let (timed, lines, metrics) = time_on("metal");
         assert!(!timed);

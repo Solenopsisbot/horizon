@@ -216,11 +216,11 @@ impl Game<'_> {
                 // Vec3.atBottomCenterOf(pos).relative(UP, 1.2), lowered by spawnItem.
                 VaultEvent::Eject(stack, v) => {
                     self.native_vault_loot(pos, &stack.item);
-                    self.spawn_item_thrown(
+                    let _ = self.spawn_item_thrown(
                         stack,
                         [center[0], center[1] + 0.7 - 0.125, center[2]],
                         v,
-                    )
+                    );
                 }
             }
         }
@@ -243,7 +243,11 @@ impl Game<'_> {
     /// `VaultRenderer`: the display item of every vault near the camera that
     /// shows one, turning above its floor.
     pub(super) fn vault_geometry(&self, camera: glam::DVec3, alpha: f64, out: &mut Vec<Vertex>) {
-        for (key, entity) in &self.world.block_entities {
+        for (key, entity) in self
+            .world
+            .block_entities
+            .listed(horizon_client::block_entities::Listed::Vault)
+        {
             let BlockEntity::Vault(vault) = entity else {
                 continue;
             };

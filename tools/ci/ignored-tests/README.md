@@ -40,7 +40,7 @@ daily run's list of what must run: an attribute without a row in a package no sh
 A launcher test is moved the same way (a new `daily-horizon-launcher-TOPIC.txt`): its own leg, `daily-rows-launcher`,
 runs it from `launcher/`, its own workspace, against its own lockfile. Windows-only process tests must be invoked
 on Windows; a manual row documents the command when no adopted workflow runs it.
-verify-static also checks both directions statically: a `#[ignore = "daily"]` function with no row, or a row with no
+verify-tree also checks both directions statically: a `#[ignore = "daily"]` function with no row, or a row with no
 such function, fails (`check_ignored_test_rows.py`). Daily selection matches the package, Cargo target and complete
 logical libtest path, including inline modules. Game area folders do not add path segments: the source-only
 `horizon-game-discovery` CLI calls the build script's canonical discovery and traverses Rust modules with `syn`.
@@ -80,9 +80,9 @@ skip it. Do not name an excluded fork workflow as an owner or substitute a workf
 
 A rowless `#[ignore]` in a target a package's shard builds (`horizon-client`'s targets, the other shard packages'
 libraries) still runs every day with `--include-ignored` and must pass, so it needs no row. Anywhere else it would run
-nowhere, so verify-static fails it until it has a row: `daily` to run it in the daily run, or `manual` to say who does.
+nowhere, so verify-tree fails it until it has a row: `daily` to run it in the daily run, or `manual` to say who does.
 
-verify-static fails an un-ignored test that starts a child process (`check_process_tests.py`): it runs a
+verify-tree fails an un-ignored test that starts a child process (`check_process_tests.py`): it runs a
 `Command`, directly or through a helper of its file or one listed in `tools/ci/process-spawns.txt`. Such a test is a
 `daily` row with reason `child-process`.
 
@@ -92,9 +92,6 @@ rerun also exceeds 5 s, fails, or has no passing timed record; both times are pr
 are, so a warned test stays until someone moves it. Initial times are wall time with three binaries and their test
 threads running at once, not isolated measurements. Documentation examples and `verify`'s Python steps are not timed.
 
-Tests that assert process-wide save admission isolate themselves, not the whole shard. For example,
-`game::visibility_unwind_tests::visibility_listener_unwind_does_not_block_an_outside_save` uses Game's
-`in_own_process` helper to run its callback, unwind and disk-save assertions in an exact-selected child
-process. It still runs through the normal parallel shard selection, without a failure-policy row or
-special runner selector. Other fixtures' outstanding leases must not be worked around by weakening
-the process-wide `passes_settled` save gate.
+Save admission is checked on the thread that opened the entities' passes. Independent fixtures
+can hold their own passes concurrently. The visibility-unwind fixtures still require prepared
+resources for their on-disk save checks.

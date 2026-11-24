@@ -52,6 +52,13 @@ fn register(r: &mut dyn Registrar) {
   (`PlayerRef::send_payload`), and `reply(cx, &value)` on either answers on the connection a
   handler received on. They return the raw sends' results: `Queued` means accepted locally.
   Sending the wrong direction does not compile.
+- **From a shared host.** Screen hooks are given `&dyn ClientHost`, which cannot call the
+  `&mut` `send_payload_to_server`. `ClientHost::queue_payload_to_server(&self, id, bytes)`
+  validates the bytes now and stages them in order; the game publishes them on a later client
+  tick through the same root commit. Staged inside a transaction, it goes with that
+  transaction: if the handler fails and rolls back, nothing is sent. `Queued` means staged, not delivered. A typed token's
+  `ToServer::send` still needs `&mut dyn ClientHost`, so stage the raw bytes from a screen hook
+  only for a declaration whose encoding you control.
 - **Schema negotiation.** The derive gives the value type a schema fingerprint (field types in
   order, variant positions; not names), and it is part of the negotiated version. A peer whose
   type has another shape is refused at join when the payload is required; when both sides
@@ -63,3 +70,7 @@ fn register(r: &mut dyn Registrar) {
   received body that is not one value of the type closes the session, naming the mod, and the
   handler does not run. A handler that panics is disabled: its transaction rolls back, nothing it
   staged is sent, the session closes, and it is not called again.
+
+## Raw play packets
+
+On the server, `host.player_send_packet(player, ClientboundPlayPacket::new(id, body))` sends one clientbound play packet to one player as it is: `body` is the vanilla packet body, without the packet id, length prefix or compression framing. The body must decode whole as the named packet, or the call returns `Result<(), SendPacketError>` with `InvalidBody` and nothing is sent. `UnknownPacket` names a packet that is not clientbound play, `PayloadTooLarge` a custom payload past vanilla's limit, and `NotConnected` a stale, offline or fake player and any call from a client. Nothing on the server changes; a custom payload on a `horizon:` channel is refused.

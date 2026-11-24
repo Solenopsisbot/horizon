@@ -98,7 +98,7 @@ MinecraftServer.findRespawnDimension	inline	crates/horizon-client/src/game/world
 MinecraftServer.setRespawnData	port	crates/horizon-client/src/game/administration/commands/mod.rs::Game::cmd_setworldspawn	gap: minor: the new spawn is not sent to guests here; they get it on join
 MinecraftServer.getCommandStorage	skip:java		getter for the command storage
 MinecraftServer.getStopwatches	skip:java		getter for the stopwatches
-MinecraftServer.setWeatherParameters	port	crates/horizon-client/src/game/administration/commands/mod.rs::Game::cmd_weather	sets the weather timers and state
+MinecraftServer.setWeatherParameters	port	crates/horizon-gameplay/src/commands/weather.rs::weather	sets the weather timers and state
 MinecraftServer.getAverageTickTimeNanos	port	crates/horizon-client/src/clock.rs::FixedStep::average_nanos	average of the recent tick times
 MinecraftServer.saveDebugReport	skip:debug		debug report output
 MinecraftServer.dumpMiscStats	skip:debug		debug report output
@@ -134,7 +134,7 @@ ReloadableServerRegistries.createAndValidateFullContext	skip:data		registry cont
 ReloadableServerRegistries.validateLootRegistries	skip:data		loot table validation at load
 ReloadableServerResources.loadResources	skip:data		server resource loading
 ServerAdvancementManager.validate	skip:data		advancement validation logging at load
-ServerFunctionLibrary.reload	port	crates/horizon-client/src/game/administration/functions.rs::Game::reload_datapacks	loads a candidate store, refreshes explicit-reload content, validates ordinary commands, then commits accepted functions
+ServerFunctionLibrary.reload	port	crates/horizon-client/src/game/administration/functions.rs::Game::load_datapacks	binds the content tables before compiling functions on world open and reload, then publishes the accepted library
 ServerFunctionLibrary.readLines	inline	crates/horizon-client-render/src/datapack.rs::parse_function	splits the function text into lines
 ServerFunctionManager.executeTagFunctions	port	crates/horizon-client/src/game/administration/functions.rs::Game::tick_functions	runs the functions of a tag
 ServerFunctionManager.execute	port	crates/horizon-client/src/game/administration/functions.rs::Game::run_function	runs one function as the sender

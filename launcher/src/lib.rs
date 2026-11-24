@@ -17,6 +17,7 @@ pub mod export;
 #[cfg(unix)]
 pub mod game_app;
 pub mod game_log;
+pub mod game_shader_api;
 pub mod github;
 pub mod github_mods;
 pub mod heads;
@@ -32,6 +33,7 @@ pub mod launch;
 pub mod loaders;
 #[cfg(target_os = "macos")]
 mod mac_update;
+pub mod min_launcher;
 pub mod minecraft_versions;
 pub mod modpacks;
 pub mod mojang;
@@ -46,6 +48,7 @@ pub mod pictures;
 pub mod private_window;
 pub mod process;
 pub mod proxy;
+pub mod refusals;
 pub mod relocation;
 mod run_leases;
 pub mod rust_toolchain;

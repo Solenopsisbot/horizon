@@ -119,6 +119,26 @@ fn contents_weight(items: &Items, inside: &[ItemStack]) -> Weight {
     })
 }
 
+/// `BundleContents.computeContentWeight` returns an error when its fraction
+/// arithmetic exceeds Java's integer bounds. The weight may exceed one.
+pub(crate) fn valid_contents_weight(items: &Items, inside: &[ItemStack]) -> bool {
+    fn checked(weight: Weight) -> Option<Weight> {
+        (i32::try_from(weight.n).is_ok() && i32::try_from(weight.d).is_ok()).then_some(weight)
+    }
+    fn weigh(items: &Items, inside: &[ItemStack]) -> Option<Weight> {
+        inside.iter().try_fold(Weight::ZERO, |total, stack| {
+            let weight = if let Some(nested) = contents_of(items, stack) {
+                checked(weigh(items, nested)?.add(Weight::new(1, 16)))?
+            } else {
+                item_weight(items, stack)
+            };
+            let weight = checked(weight.times(stack.count))?;
+            checked(total.add(weight))
+        })
+    }
+    weigh(items, inside).is_some()
+}
+
 /// `BundleItem.onDestroyed` (`ItemStack.onDestroyed` for a bundle): the stack
 /// is emptied and every stack it held comes back as its own item copy, which
 /// `ItemUtils.onContainerDestroyed` drops where the entity lay.
@@ -161,6 +181,15 @@ impl Contents {
     /// `getTooltipImage`) need the item **and** the component: a bundle with
     /// it removed, or another item carrying it, is a plain item.
     pub fn of(items: &Items, stack: &ItemStack) -> Option<Self> {
+        let mut contents = Self::from_stack(items, stack)?;
+        // `BundleContents.Mutable` materializes each saved `ItemStackTemplate`.
+        if crate::item_data::clean_stacks(&mut contents.items, &items.component_defaults) {
+            contents.weight = contents_weight(items, &contents.items);
+        }
+        Some(contents)
+    }
+
+    fn from_stack(items: &Items, stack: &ItemStack) -> Option<Self> {
         if !is_bundle_item(items, stack) {
             return None;
         }
@@ -376,7 +405,7 @@ pub fn tooltip_layout(
     box_width: f32,
     description_lines: usize,
 ) -> Option<TooltipLayout> {
-    let contents = Contents::of(items, stack)?;
+    let contents = Contents::from_stack(items, stack)?;
     let offset = ((box_width - 96.0) / 2.0).floor();
     if contents.items().is_empty() {
         // The description takes the top; the bar follows it. Its lines are
@@ -523,5 +552,80 @@ mod tooltip_tests {
         assert_eq!(layout.height, 3.0 * 9.0 + 13.0 + 8.0);
         assert_eq!(layout.bar, [4.0, 8.0 + 3.0 * 9.0 + 4.0]);
         assert_eq!(layout.empty_description, Some([4.0, 8.0]));
+    }
+
+    #[test]
+    fn bundle_removes_selected_item_or_defaults_to_last_inserted() {
+        let Some(items) = items() else { return };
+        let bundle = bundle_with(&[
+            ("minecraft:dirt", 5),
+            ("minecraft:stone", 10),
+            ("minecraft:apple", 2),
+        ]);
+        // Initially, selected is -1. remove_one takes index 0 (dirt, first stack).
+        let mut contents = Contents::of(&items, &bundle).unwrap();
+        assert_eq!(contents.selected(), -1);
+        let removed = contents.remove_one(&items).unwrap();
+        assert_eq!(&*removed.item, "minecraft:dirt");
+        assert_eq!(removed.count, 5);
+
+        // When an item is explicitly selected (e.g. index 2: apple):
+        let mut bundle = bundle_with(&[
+            ("minecraft:dirt", 5),
+            ("minecraft:stone", 10),
+            ("minecraft:apple", 2),
+        ]);
+        toggle_selected(&mut bundle, 2);
+        let mut contents = Contents::of(&items, &bundle).unwrap();
+        assert_eq!(contents.selected(), 2);
+        let removed = contents.remove_one(&items).unwrap();
+        assert_eq!(&*removed.item, "minecraft:apple");
+        assert_eq!(removed.count, 2);
+        assert_eq!(contents.selected(), -1);
+    }
+}
+
+#[cfg(test)]
+mod stack_size_tests {
+    use super::*;
+
+    /// Stone with its own `max_stack_size`, or with the component removed
+    /// (`!minecraft:max_stack_size`).
+    fn stone(size: Option<i32>, count: u32) -> ItemStack {
+        let mut stack = ItemStack::new("minecraft:stone", count);
+        let data = stack.data_mut();
+        match size {
+            Some(n) => data.set_other("minecraft:max_stack_size", Some(Tag::Int(n))),
+            None => data.set_other(
+                "!minecraft:max_stack_size",
+                Some(Tag::Compound(Default::default())),
+            ),
+        };
+        stack.tidy();
+        stack
+    }
+
+    /// `BundleContents.getWeight` weighs a stack by
+    /// `1 / ItemStack.getMaxStackSize()`: four stones with a `max_stack_size`
+    /// of 4 fill a bundle, and one whose component is removed is vanilla's
+    /// `getOrDefault` default of 1, which fills it on its own.
+    #[test]
+    fn a_bundle_weighs_a_stack_by_its_own_max_stack_size() {
+        let Some(items) = crate::items::prepared_items() else {
+            return;
+        };
+        let bundle = ItemStack::new("minecraft:bundle", 1);
+        let mut four = stone(Some(4), 8);
+        let mut contents = Contents::of(&items, &bundle).expect("a bundle");
+        assert_eq!(contents.room_for(&items, &four), 4);
+        assert_eq!(contents.try_insert(&items, &mut four, true), 4);
+        assert_eq!(four.count, 4);
+        assert!(contents.is_full());
+        let mut one = stone(None, 2);
+        let mut contents = Contents::of(&items, &bundle).expect("a bundle");
+        assert_eq!(contents.room_for(&items, &one), 1);
+        assert_eq!(contents.try_insert(&items, &mut one, true), 1);
+        assert_eq!(one.count, 1);
+        assert!(contents.is_full());
     }
 }

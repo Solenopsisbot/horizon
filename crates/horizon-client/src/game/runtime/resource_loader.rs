@@ -199,6 +199,9 @@ pub(super) enum PendingWorldEntry {
         seed: Option<i64>,
         creative: bool,
         create: Option<Box<horizon_client::title::WorldOptions>>,
+        /// The save must still exist when the entry opens (a title's Play or a request's Yes): nothing is
+        /// created for a folder that has gone.
+        existing_only: bool,
     },
     Server {
         address: String,
@@ -209,6 +212,11 @@ pub(super) enum PendingWorldEntry {
         cookies: Option<horizon_client::net::Cookies>,
     },
     StudioReplay(std::path::PathBuf),
+    /// A mod's replay, already read (`replay_open`): it is carried, never reopened by name.
+    PreparedReplay {
+        driver: Box<horizon_client::studio::ReplayDriver>,
+        origin: super::native_replay::ReplayOrigin,
+    },
 }
 
 pub(super) struct WorldRestLoader {

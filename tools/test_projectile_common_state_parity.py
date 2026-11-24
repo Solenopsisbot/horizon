@@ -135,12 +135,166 @@ def groups():
             cmd(f'/data get entity {target} PortalCooldown', expect_result=4),
             *setup(f'/kill {target}'),
         ])
+    # Rotation on falling blocks, shulkers and clouds: a summoned value is read back, after ticks, and across a chunk save and reload.
+    extra_kinds = ('falling_block', 'shulker', 'area_effect_cloud')
+    extra = []
+    for kind in extra_kinds:
+        target = f'@e[type={kind},tag=rot_row,limit=1]'
+        for saved in ('', ',Rotation:[90f,10f]', ',Rotation:[400f,100f]', ',Rotation:[0f,0f]',
+                      ',Rotation:[270f,370f]', ',Rotation:[-190f,-100f]', ',Rotation:[180f,45f]'):
+            extra.extend([
+                cmd(f'/summon {kind} 12.5 234 8.5 {{NoGravity:1b,Tags:["rot_row"]{saved}}}'),
+                cmd(f'/data get entity {target} Rotation'),
+                {'op': 'tick', 'n': 3},
+                cmd(f'/data get entity {target} Rotation'),
+                *setup(f'/kill {target}'),
+            ])
+    extra_reload = [*setup(f'/forceload add {chunk}'), wait]
+    for index, kind in enumerate(extra_kinds):
+        extra_reload.append(cmd(
+            f'/summon {kind} {4100 + 4 * index}.5 300 4104.5 {{NoGravity:1b,Tags:["rot_row"],Rotation:[90f,10f]}}'))
+    extra_reload.append({'op': 'tick', 'n': 3})
+    for kind in extra_kinds:
+        extra_reload.append(cmd(f'/data get entity @e[type={kind},tag=rot_row,limit=1] Rotation'))
+    extra_reload.extend([
+        *setup(f'/forceload remove {chunk}'),
+        {'op': 'tick', 'n': 60},
+        cmd('/execute unless loaded 4096 300 4096', expect_result=1),
+        *setup(f'/forceload add {chunk}'),
+        wait,
+    ])
+    for kind in extra_kinds:
+        target = f'@e[type={kind},tag=rot_row,limit=1]'
+        extra_reload.extend([
+            cmd(f'/execute if entity {target}', expect_result=1),
+            cmd(f'/data get entity {target} Rotation'),
+            *setup(f'/kill {target}'),
+        ])
+    extra_reload.extend(setup(f'/forceload remove {chunk}'))
+    # cloud fang and eye fire: a summoned value is read back, after ticks, and across a chunk save and reload.
+    fire_kinds = ('area_effect_cloud', 'evoker_fangs', 'eye_of_ender')
+    fire = []
+    for kind in fire_kinds:
+        target = f'@e[type={kind},limit=1]'
+        for saved in ('', ',Fire:100s', ',Fire:0s', ',Fire:-5s', ',Fire:"bad"'):
+            # Fangs and eyes of ender keep a non-numeric Fire as written; vanilla reads it as 0.
+            # That is how Horizon stores their loaded tags, not part of this change.
+            if saved.endswith('"bad"') and kind != 'area_effect_cloud':
+                continue
+            fire.extend([
+                cmd(f'/summon {kind} 12.5 234 8.5 {{NoGravity:1b{saved}}}'),
+                cmd(f'/data get entity {target} Fire'),
+                {'op': 'tick', 'n': 3},
+                cmd(f'/data get entity {target} Fire'),
+                *setup(f'/kill {target}'),
+            ])
+    fire_reload = [*setup(f'/forceload add {chunk}'), wait]
+    for index, kind in enumerate(fire_kinds):
+        fire_reload.append(cmd(
+            f'/summon {kind} {4100 + 4 * index}.5 300 4104.5 {{NoGravity:1b,Fire:170s}}'))
+    fire_reload.append({'op': 'tick', 'n': 3})
+    for kind in fire_kinds:
+        fire_reload.append(cmd(f'/data get entity @e[type={kind},limit=1] Fire'))
+    fire_reload.extend([
+        *setup(f'/forceload remove {chunk}'),
+        {'op': 'tick', 'n': 60},
+        cmd('/execute unless loaded 4096 300 4096', expect_result=1),
+        *setup(f'/forceload add {chunk}'),
+        wait,
+    ])
+    for kind in fire_kinds:
+        target = f'@e[type={kind},limit=1]'
+        fire_reload.extend([
+            cmd(f'/execute if entity {target}', expect_result=1),
+            cmd(f'/data get entity {target} Fire'),
+            *setup(f'/kill {target}'),
+        ])
+    fire_reload.extend(setup(f'/forceload remove {chunk}'))
+    # arrow and orb frozen ticks: a summoned value is read back, after ticks, and across a chunk save and reload.
+    frozen_kinds = ('arrow', 'spectral_arrow', 'experience_orb')
+    frozen = []
+    for kind in frozen_kinds:
+        target = f'@e[type={kind},limit=1]'
+        for saved in ('', ',TicksFrozen:100', ',TicksFrozen:0', ',TicksFrozen:-5', ',TicksFrozen:"bad"'):
+            frozen.extend([
+                cmd(f'/summon {kind} 12.5 234 8.5 {{NoGravity:1b{saved}}}'),
+                cmd(f'/data get entity {target} TicksFrozen'),
+                {'op': 'tick', 'n': 3},
+                cmd(f'/data get entity {target} TicksFrozen'),
+                *setup(f'/kill {target}'),
+            ])
+    frozen_reload = [*setup(f'/forceload add {chunk}'), wait]
+    for index, kind in enumerate(frozen_kinds):
+        frozen_reload.append(cmd(
+            f'/summon {kind} {4100 + 4 * index}.5 300 4104.5 {{NoGravity:1b,TicksFrozen:180}}'))
+    frozen_reload.append({'op': 'tick', 'n': 3})
+    for kind in frozen_kinds:
+        frozen_reload.append(cmd(f'/data get entity @e[type={kind},limit=1] TicksFrozen'))
+    frozen_reload.extend([
+        *setup(f'/forceload remove {chunk}'),
+        {'op': 'tick', 'n': 60},
+        cmd('/execute unless loaded 4096 300 4096', expect_result=1),
+        *setup(f'/forceload add {chunk}'),
+        wait,
+    ])
+    for kind in frozen_kinds:
+        target = f'@e[type={kind},limit=1]'
+        frozen_reload.extend([
+            cmd(f'/execute if entity {target}', expect_result=1),
+            cmd(f'/data get entity {target} TicksFrozen'),
+            *setup(f'/kill {target}'),
+        ])
+    frozen_reload.extend(setup(f'/forceload remove {chunk}'))
+    # read back, ticks down, and survives a chunk save and reload.
+    portal_kinds = ('arrow', 'spectral_arrow', 'experience_orb')
+    portal = []
+    for kind in portal_kinds:
+        target = f'@e[type={kind},limit=1]'
+        for saved in ('', ',PortalCooldown:100', ',PortalCooldown:9.75d',
+                      ',PortalCooldown:-3', ',PortalCooldown:"bad"'):
+            portal.extend([
+                cmd(f'/summon {kind} 12.5 234 8.5 {{NoGravity:1b{saved}}}'),
+                cmd(f'/data get entity {target} PortalCooldown'),
+                {'op': 'tick', 'n': 3},
+                cmd(f'/data get entity {target} PortalCooldown'),
+                *setup(f'/kill {target}'),
+            ])
+    portal_reload = [*setup(f'/forceload add {chunk}'), wait]
+    for index, kind in enumerate(portal_kinds):
+        portal_reload.append(cmd(
+            f'/summon {kind} {4100 + 4 * index}.5 300 4104.5 {{NoGravity:1b,PortalCooldown:180}}'))
+    portal_reload.append({'op': 'tick', 'n': 3})
+    for kind in portal_kinds:
+        portal_reload.append(cmd(f'/data get entity @e[type={kind},limit=1] PortalCooldown'))
+    portal_reload.extend([
+        *setup(f'/forceload remove {chunk}'),
+        {'op': 'tick', 'n': 60},
+        cmd('/execute unless loaded 4096 300 4096', expect_result=1),
+        *setup(f'/forceload add {chunk}'),
+        wait,
+    ])
+    for kind in portal_kinds:
+        target = f'@e[type={kind},limit=1]'
+        portal_reload.extend([
+            cmd(f'/execute if entity {target}', expect_result=1),
+            cmd(f'/data get entity {target} PortalCooldown'),
+            *setup(f'/kill {target}'),
+        ])
+    portal_reload.extend(setup(f'/forceload remove {chunk}'))
     return [
         ('projectile common state', summon),
         ('projectile common state reload', reloads),
         ('wither skull chunk reload', skull_reload),
         ('projectile fire and water', block_effects),
         ('other projectile codecs', controls),
+        ('Rotation on falling blocks, shulkers and clouds', extra),
+        ('Rotation on falling blocks, shulkers and clouds reload', extra_reload),
+        ('cloud fang and eye fire', fire),
+        ('cloud fang and eye fire reload', fire_reload),
+        ('arrow and orb frozen ticks', frozen),
+        ('arrow and orb frozen ticks reload', frozen_reload),
+        ('arrow and orb portal cooldown', portal),
+        ('arrow and orb portal cooldown reload', portal_reload),
     ]
 
 

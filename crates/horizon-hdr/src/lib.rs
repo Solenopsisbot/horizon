@@ -47,12 +47,32 @@ pub fn open_vulkan_device(
     Some(unsafe { adapter.create_device_from_hal(open, desc) })
 }
 
+/// The most draws one indirect multi-draw may hold on this Vulkan adapter and still be one
+/// command: `maxDrawIndirectCount` with the `multiDrawIndirect` feature, 0 without it. Past that,
+/// or without it, wgpu-hal issues one `vkCmdDrawIndexedIndirect` per draw
+/// (`third_party/wgpu-hal/src/vulkan/command.rs`), and wgpu reports neither. `None` off Vulkan.
+#[cfg(not(target_os = "macos"))]
+pub fn vulkan_multi_draw_limit(adapter: &wgpu::Adapter) -> Option<u32> {
+    use wgpu::hal::api::Vulkan;
+    // Safety: only read from here; dropped before wgpu takes the adapter back.
+    let hal = unsafe { adapter.as_hal::<Vulkan>() }?;
+    let instance = hal.shared_instance().raw_instance();
+    let device = hal.raw_physical_device();
+    // Safety: the adapter's own physical device on its own instance.
+    if unsafe { instance.get_physical_device_features(device) }.multi_draw_indirect == 0 {
+        return Some(0);
+    }
+    // Safety: as above.
+    let limits = unsafe { instance.get_physical_device_properties(device) }.limits;
+    Some(limits.max_draw_indirect_count)
+}
+
 /// wgpu's opt-in to its `EXPERIMENTAL_*` features, which the crates that forbid unsafe code
-/// can't give: hardware ray queries, asked for only when the player turns ray tracing on
-/// (`gfx/ray_query.rs` in horizon-client-render).
+/// can't give: hardware ray queries (`gfx/rt/query.rs`) and hardware mesh shaders
+/// (`gfx/mesh_shader.rs`), asked for only when the player turns them on.
 pub fn experimental_features() -> wgpu::ExperimentalFeatures {
     // Safety: wgpu warns that its experimental features may have bugs that reach undefined
-    // behaviour through safe calls. Horizon accepts that only on request, for ray queries.
+    // behaviour through safe calls. Horizon accepts that only on explicit request.
     unsafe { wgpu::ExperimentalFeatures::enabled() }
 }
 

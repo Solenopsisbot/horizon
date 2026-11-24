@@ -7,8 +7,9 @@ The component harnesses (tools/test_block_update_parity.py and the others) call 
 synthetic level. This runs whole machines: each is a list of /setblock commands (a random "soup" of
 redstone components from --seed, or a hand-built circuit) with commands that change it at set ticks,
 in a frozen world that steps one tick at a time (`tick freeze`, `tick step 1`). After the setup and
-after every tick both games report the machine's blocks (with their properties), and the first tick
-where the blocks differ is printed with the ones that differ. The entities near the machine are recorded
+after every tick both games report the machine's blocks (with their properties, and a comparator's output
+strength, `OutputSignal`, beside its state), and the first tick where the blocks differ is printed with the
+ones that differ. The entities near the machine are recorded
 too (see --keep) but not compared yet.
 
 Vanilla is the client of tools/perf_bench.py's driver (mods/horizon/src/bench: RedstoneDiff snapshots
@@ -27,8 +28,10 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'tools'))
-import lab  # noqa: E402
+try:
+    from . import lab
+except ImportError:  # running as a script
+    import lab
 
 ORIGIN = (200, 250, 200)
 SPACING = 24
@@ -275,11 +278,18 @@ def norm(state):
     return name + '[' + ','.join(sorted(props.split(','))) + ']'
 
 
-def clean_blocks(lines):
+def clean_blocks(lines, signals=()):
+    """{pos: state} from "x y z state" lines. signals ("x y z strength", one per comparator block entity) go
+    beside the comparator's state, as "state OutputSignal=N": a comparator that kept an old strength differs
+    from vanilla even where its block state (`powered`) still agrees."""
     out = {}
     for line in lines:
         x, y, z, state = line.split(' ', 3)
         out[(int(x), int(y), int(z))] = norm(state)
+    for line in signals:
+        x, y, z, strength = line.split()
+        pos = (int(x), int(y), int(z))
+        out[pos] = f"{out.get(pos, 'air')} OutputSignal={int(strength)}"
     return out
 
 
@@ -340,7 +350,7 @@ def run_vanilla(batch, args, work):
         e = json.loads(line)
         if e.get('event') == 'redstone':
             result[e['machine']] = [
-                {'tick': s['tick'], 'blocks': clean_blocks(s['blocks']), 'entities': s['entities']}
+                {'tick': s['tick'], 'blocks': clean_blocks(s['blocks'], s['signals']), 'entities': s['entities']}
                 for s in e['snapshots']]
         if e.get('event') == 'timeout':
             raise SystemExit('vanilla driver timed out in ' + e.get('phase', '?'))
@@ -408,7 +418,8 @@ def run_horizon(batch, args, work):
                 # in the next tick's broadcast, as vanilla's clients get them.
                 reply = ctl.json('simulation', 'blocks', *box)
                 near = ctl.json('entities', 16)
-                frames.append({'tick': tick, 'blocks': clean_blocks([' '.join(map(str, b[:3])) + ' ' + b[3] for b in reply['blocks']]),
+                frames.append({'tick': tick, 'blocks': clean_blocks([' '.join(map(str, b[:3])) + ' ' + b[3] for b in reply['blocks']],
+                                                                    [' '.join(map(str, s)) for s in reply['signals']]),
                                'entities': near})
 
             snapshot(0)
@@ -430,6 +441,11 @@ def run_horizon(batch, args, work):
 
 # ---- compare -----------------------------------------------------------------------------------
 
+# No state can be reported for a tick one of the timelines never produced; this marker keeps that
+# visible in the diff instead of treating the missing tail as a match.
+MISSING_TICK = '<no tick>'
+
+
 def diff_frames(a, b):
     """The first tick where two timelines differ: (tick, [(pos, a state, b state)]), or None."""
     for fa, fb in zip(a, b):
@@ -440,6 +456,16 @@ def diff_frames(a, b):
                 if ba.get(pos) != bb.get(pos):
                     rows.append((pos, ba.get(pos, 'air'), bb.get(pos, 'air')))
             return fa['tick'], rows
+    # zip() stops at the shorter timeline. A run that stops early is not identical to one that kept
+    # ticking: report the first tick the other timeline never reached as a difference.
+    if len(a) != len(b):
+        a_is_longer = len(a) > len(b)
+        extra = (a if a_is_longer else b)[min(len(a), len(b))]
+        if a_is_longer:
+            rows = [(pos, state, MISSING_TICK) for pos, state in sorted(extra['blocks'].items())]
+        else:
+            rows = [(pos, MISSING_TICK, state) for pos, state in sorted(extra['blocks'].items())]
+        return extra['tick'], rows
     return None
 
 
@@ -450,7 +476,7 @@ def main():
     p.add_argument('--ticks', type=int, default=40)
     p.add_argument('--only', nargs='*', help='machine names')
     p.add_argument('--profile', default='fast', help='the cargo profile of the built horizon-client and horizon-ctl')
-    p.add_argument('--resources', default=str(ROOT / '.local/horizon-client/26.3'))
+    p.add_argument('--resources', default=str(lab.RESOURCES))
     p.add_argument('--near', nargs=4, type=int, metavar=('DX', 'DY', 'DZ', 'R'),
                    help='keep only the setup commands within R blocks of this offset from the machine\'s origin')
     p.add_argument('--drop', nargs='*', type=int, default=[], help='with --near: leave out these setblock commands (by index)')

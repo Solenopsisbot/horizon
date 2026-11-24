@@ -3,6 +3,7 @@
 //! them, and the server thread then commits what they proposed in the pass's chunk order.
 use super::*;
 use crate::game::creatures::prep;
+use crate::game::structures::structures_reaching_in;
 use horizon_client::mobs::{
     finalize::{self, FinalizeLevel},
     spawn_selection::{self, Lane, Pack},
@@ -182,7 +183,7 @@ impl Level<'_, NoGame> {
         } else {
             self.group.borrow().clone()
         };
-        let difficulty = local_difficulty_in(self.w.world, r.position);
+        let difficulty = super::super::creatures::local_difficulty_in(self.w.world, r.position);
         let mut level = LaneFinalize {
             l: self,
             rides: Vec::new(),
@@ -206,10 +207,13 @@ impl Level<'_, NoGame> {
                 .push((m.kind.id.clone(), bounds));
         }
         let bounds = mob.bounds();
+        // `TropicalFish.isSchool`: finalizeSpawn clears it for a loner, which
+        // ends the pack (`isMaxGroupSizeReached`).
+        let school = !mob.extra.lone;
         Some((
             Spawned {
                 bounds,
-                school: true,
+                school,
                 cluster_size: None,
             },
             Made { mob, created, rides },

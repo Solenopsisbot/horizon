@@ -55,15 +55,22 @@ fn copy_resource_bytes(
     out.write_all(bytes)
 }
 
+/// Whatever a source must keep alive for as long as any reader holds it (a lock).
+/// Shared, so a subdirectory of a guarded folder keeps the same guard.
+type Guard = Option<Arc<dyn std::any::Any + Send + Sync>>;
+
 enum Storage {
-    Directory(PathBuf),
+    /// A folder, and what its owner keeps alive while it is read.
+    Directory(PathBuf, Guard),
     #[cfg(not(target_arch = "wasm32"))]
     Archive(Zip),
     Prefix {
         source: ResourceSource,
         prefix: String,
     },
-    Index(BTreeMap<String, Resource>),
+    /// Resolved files, and the layer they were resolved over: what a file the
+    /// index replaces shadows.
+    Index(BTreeMap<String, Resource>, Option<ResourceSource>),
 }
 
 /// A winning resource keeps its source alive; merged resources keep only their
@@ -112,11 +119,11 @@ impl Hash for ResourceSource {
 impl std::fmt::Debug for ResourceSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match self.0.as_ref() {
-            Storage::Directory(_) => "Directory",
+            Storage::Directory(..) => "Directory",
             #[cfg(not(target_arch = "wasm32"))]
             Storage::Archive(_) => "Archive",
             Storage::Prefix { .. } => "Prefix",
-            Storage::Index(_) => "Index",
+            Storage::Index(..) => "Index",
         };
         f.debug_tuple("ResourceSource").field(&kind).finish()
     }
@@ -178,8 +185,11 @@ impl ResourceRoot {
             .into_iter()
             .map(|name| (name.clone(), Resource::file(source.clone(), name)))
             .collect();
+        // The generated layer sits over the same resolved files, whose own
+        // underlay stays what a file they replace shadows.
+        let underlay = source.underlay().unwrap_or(source).clone();
         files.extend(textures);
-        root.source = ResourceSource::indexed(files);
+        root.source = ResourceSource::layered(files, underlay);
         root.runtime_block_sprites = block_sprites;
         self
     }
@@ -282,7 +292,7 @@ impl ResourceSource {
         if !stays_inside(top) {
             return Vec::new();
         }
-        if let Storage::Directory(root) = self.0.as_ref() {
+        if let Storage::Directory(root, _) = self.0.as_ref() {
             let mut names: Vec<_> = fs::read_dir(root.join(top))
                 .into_iter()
                 .flatten()
@@ -311,7 +321,7 @@ impl ResourceSource {
             Storage::Archive(archive) => {
                 collect(archive.names().filter(|name| stays_inside(name)), top)
             }
-            Storage::Index(files) => collect(files.keys().map(String::as_str), top),
+            Storage::Index(files, _) => collect(files.keys().map(String::as_str), top),
             _ => collect(
                 self.list(&format!("{top}/")).iter().map(String::as_str),
                 top,
@@ -319,10 +329,28 @@ impl ResourceSource {
         }
     }
     pub fn indexed(files: BTreeMap<String, Resource>) -> Self {
-        Self(Arc::new(Storage::Index(files)))
+        Self(Arc::new(Storage::Index(files, None)))
+    }
+    /// An index of the files `base` was resolved into layers above (`packs::
+    /// resources`): `underlay` names the layer a file the index replaces
+    /// shadows, for a reader that cannot decode the winning one.
+    pub fn layered(files: BTreeMap<String, Resource>, base: ResourceSource) -> Self {
+        Self(Arc::new(Storage::Index(files, Some(base))))
+    }
+    /// The layer this index was resolved over, when a caller said: the source
+    /// of every file the index replaces. None for an index of one layer.
+    pub fn underlay(&self) -> Option<&Self> {
+        match self.0.as_ref() {
+            Storage::Index(_, base) => base.as_ref(),
+            _ => None,
+        }
     }
     pub fn directory(root: PathBuf) -> Self {
-        Self(Arc::new(Storage::Directory(root)))
+        Self(Arc::new(Storage::Directory(root, None)))
+    }
+    /// A folder that keeps `guard` until its last reader is dropped.
+    pub fn directory_holding(root: PathBuf, guard: Box<dyn std::any::Any + Send + Sync>) -> Self {
+        Self(Arc::new(Storage::Directory(root, Some(Arc::from(guard)))))
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub fn archive(path: &Path) -> io::Result<Self> {
@@ -339,8 +367,11 @@ impl ResourceSource {
         if directory.is_empty() {
             return Ok(self.clone());
         }
-        if let Storage::Directory(root) = self.0.as_ref() {
-            return Ok(Self::directory(root.join(directory)));
+        if let Storage::Directory(root, guard) = self.0.as_ref() {
+            return Ok(Self(Arc::new(Storage::Directory(
+                root.join(directory),
+                guard.clone(),
+            ))));
         }
         if !stays_inside(directory) {
             return Err(io::Error::new(
@@ -361,11 +392,11 @@ impl ResourceSource {
             ));
         }
         match self.0.as_ref() {
-            Storage::Directory(root) => horizon_core::prepared_files::read(&root.join(name)),
+            Storage::Directory(root, _) => horizon_core::prepared_files::read(&root.join(name)),
             #[cfg(not(target_arch = "wasm32"))]
             Storage::Archive(archive) => archive.read(name),
             Storage::Prefix { source, prefix } => source.read(&format!("{prefix}{name}")),
-            Storage::Index(files) => files
+            Storage::Index(files, _) => files
                 .get(name)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, name.to_owned()))?
                 .read(),
@@ -378,11 +409,11 @@ impl ResourceSource {
             return None;
         }
         match self.0.as_ref() {
-            Storage::Directory(root) => root.join(name).is_file().then(|| root.clone()),
+            Storage::Directory(root, _) => root.join(name).is_file().then(|| root.clone()),
             #[cfg(not(target_arch = "wasm32"))]
             Storage::Archive(_) => None,
             Storage::Prefix { source, prefix } => source.folder_of(&format!("{prefix}{name}")),
-            Storage::Index(files) => match &files.get(name)?.0 {
+            Storage::Index(files, _) => match &files.get(name)?.0 {
                 ResourceStorage::File { source, name } => source.folder_of(name),
                 ResourceStorage::Bytes(_) => None,
             },
@@ -407,7 +438,7 @@ impl ResourceSource {
             Storage::Prefix { source, prefix } => {
                 source.copy_to(&format!("{prefix}{name}"), out, budget)
             }
-            Storage::Index(files) => match &files
+            Storage::Index(files, _) => match &files
                 .get(name)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, name.to_owned()))?
                 .0
@@ -415,7 +446,7 @@ impl ResourceSource {
                 ResourceStorage::File { source, name } => source.copy_to(name, out, budget),
                 ResourceStorage::Bytes(bytes) => copy_resource_bytes(bytes, out, budget),
             },
-            Storage::Directory(root) => copy_resource_bytes(
+            Storage::Directory(root, _) => copy_resource_bytes(
                 &horizon_core::prepared_files::read(&root.join(name))?,
                 out,
                 budget,
@@ -435,13 +466,13 @@ impl ResourceSource {
             ));
         }
         match self.0.as_ref() {
-            Storage::Directory(root) => {
+            Storage::Directory(root, _) => {
                 horizon_core::prepared_files::read_head(&root.join(name), max)
             }
             #[cfg(not(target_arch = "wasm32"))]
             Storage::Archive(archive) => archive.read_head(name, max),
             Storage::Prefix { source, prefix } => source.read_head(&format!("{prefix}{name}"), max),
-            Storage::Index(files) => match &files
+            Storage::Index(files, _) => match &files
                 .get(name)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, name.to_owned()))?
                 .0
@@ -459,7 +490,7 @@ impl ResourceSource {
             return false;
         }
         match self.0.as_ref() {
-            Storage::Directory(root) => {
+            Storage::Directory(root, _) => {
                 let path = root.join(name);
                 if horizon_core::prepared_files::find(&path).is_some() {
                     horizon_core::prepared_files::read_head(&path, 0).is_ok()
@@ -470,7 +501,7 @@ impl ResourceSource {
             #[cfg(not(target_arch = "wasm32"))]
             Storage::Archive(archive) => archive.contains(name),
             Storage::Prefix { source, prefix } => source.contains(&format!("{prefix}{name}")),
-            Storage::Index(files) => files.contains_key(name),
+            Storage::Index(files, _) => files.contains_key(name),
         }
     }
     /// Read only when the complete resource fits the limit. Bounds actual bytes
@@ -483,7 +514,7 @@ impl ResourceSource {
             ));
         }
         let bytes = match self.0.as_ref() {
-            Storage::Directory(root) => {
+            Storage::Directory(root, _) => {
                 horizon_core::prepared_files::read_head(&root.join(name), max.saturating_add(1))?
             }
             #[cfg(not(target_arch = "wasm32"))]
@@ -491,7 +522,7 @@ impl ResourceSource {
             Storage::Prefix { source, prefix } => {
                 return source.read_limited(&format!("{prefix}{name}"), max);
             }
-            Storage::Index(files) => match &files
+            Storage::Index(files, _) => match &files
                 .get(name)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, name.to_owned()))?
                 .0
@@ -521,7 +552,7 @@ impl ResourceSource {
             return Vec::new();
         }
         match self.0.as_ref() {
-            Storage::Directory(root) => {
+            Storage::Directory(root, _) => {
                 let mut out = Vec::new();
                 let directory = if prefix.ends_with('/') || prefix.is_empty() {
                     prefix
@@ -547,7 +578,7 @@ impl ResourceSource {
                 .into_iter()
                 .filter_map(|name| name.strip_prefix(base).map(str::to_owned))
                 .collect(),
-            Storage::Index(files) => files
+            Storage::Index(files, _) => files
                 .range(prefix.to_owned()..)
                 .map_while(|(name, _)| name.starts_with(prefix).then(|| name.clone()))
                 .collect(),
@@ -561,7 +592,7 @@ impl ResourceSource {
             return Vec::new();
         }
         match self.0.as_ref() {
-            Storage::Directory(root) => {
+            Storage::Directory(root, _) => {
                 let Ok(entries) = fs::read_dir(root.join(top)) else {
                     return Vec::new();
                 };
@@ -598,7 +629,7 @@ impl ResourceSource {
     /// local to one operation: a later reload observes folder edits even when
     /// a source is shared, while archive identities follow their open readers.
     pub fn fingerprint_under(&self, top: &str, kinds: &[&str]) -> Option<u64> {
-        if let Storage::Directory(root) = self.0.as_ref()
+        if let Storage::Directory(root, _) = self.0.as_ref()
             && !root.join(top).is_dir()
         {
             return None;
@@ -613,7 +644,7 @@ impl ResourceSource {
     }
     fn file_fingerprint(&self, name: &str, archives: &mut HashMap<usize, u64>) -> Option<u64> {
         match self.0.as_ref() {
-            Storage::Directory(root) => {
+            Storage::Directory(root, _) => {
                 metadata_fingerprint(&fs::metadata(root.join(name)).ok()?).ok()
             }
             #[cfg(not(target_arch = "wasm32"))]
@@ -635,7 +666,7 @@ impl ResourceSource {
             Storage::Prefix { source, prefix } => {
                 source.file_fingerprint(&format!("{prefix}{name}"), archives)
             }
-            Storage::Index(files) => match &files.get(name)?.0 {
+            Storage::Index(files, _) => match &files.get(name)?.0 {
                 ResourceStorage::File { source, name } => source.file_fingerprint(name, archives),
                 ResourceStorage::Bytes(bytes) => {
                     let mut hash = DefaultHasher::new();
@@ -718,6 +749,18 @@ mod tests {
         assert!(first.same_generation(&first.clone()));
         let reload = ResourceSource::directory(PathBuf::from("same-prepared-root"));
         assert!(!first.same_generation(&reload));
+    }
+
+    #[test]
+    fn a_subdirectory_keeps_its_parents_guard() {
+        let guard = Arc::new(());
+        let alive = Arc::downgrade(&guard);
+        let parent = ResourceSource::directory_holding(PathBuf::from("root"), Box::new(guard));
+        let child = parent.subdirectory("assets").unwrap();
+        drop(parent);
+        assert!(alive.upgrade().is_some());
+        drop(child);
+        assert!(alive.upgrade().is_none());
     }
 
     #[cfg(unix)]

@@ -2,7 +2,8 @@
 
 Every benchmark Horizon writes uses this one JSON format: `horizon-client --benchmark`, the launcher's own
 measurements, and `tools/perf_bench.py` (which also writes it for vanilla and vanilla with mods). The same
-file is the local log a player can attach to an issue by hand; nothing uploads it. The types, the statistics and the hardware
+format is used for the local file a player can attach to an issue and for opt-in uploads
+([telemetry.md](telemetry.md)). The types, the statistics and the hardware
 detection are in `crates/horizon-bench`; nothing else builds a report by hand.
 
 A report holds summaries and histogram counts, never raw frame streams: a 10-minute run is a few
@@ -81,6 +82,7 @@ confidence interval of the mean, Student's t, null when `n` is 1). The unit is t
 | --- | --- |
 | `startup.title_ms` | process start to the first frame of the title screen |
 | `startup.world_ms` | process start to in-world, every chunk around the spawn loaded and drawn |
+| `startup.first_chunk_ms` | Horizon `perf_bench.py` only: world open or server join to the first non-empty resident-chunk status; vanilla reports omit this diagnostic and it is not a comparison metric |
 | `chunks.<phase>.load_ms` | teleport to every chunk in view distance loaded and drawn |
 | `chunks.<phase>.generated_count`, `chunks.<phase>.meshed_count`, `chunks.<phase>.generated_per_s` | chunks generated and section meshes built while loading, and the rate |
 | `fps.<phase>.avg_fps`, `fps.<phase>.low_1pct_fps`, `fps.<phase>.low_01pct_fps` | per-phase figures across repeats |
@@ -92,6 +94,7 @@ confidence interval of the mean, Student's t, null when `n` is 1). The unit is t
 | `gpu.<phase>.p50_ms` | median GPU time of a frame (timestamp queries; not on every device). Over a phase's blocks, as `cpu.<phase>.p50_ms`: the `travel` flight and the `hold` blocks of `--benchmark travel`, and the `ab.a` and `ab.b` blocks of `--benchmark ab:SWITCH` (with `fps.` and `cpu.` of the same phases) |
 | `tick.<phase>.client_ms` | mean time of one client tick during the phase (vanilla: `Minecraft.tick`; Horizon: the frames' tick phase over the ticks run) |
 | `gpu_pass.<phase>.<pass>_ms` | GPU time of one of the game's render passes (`world`, `world_after_culling`, `occlusion_test`, `hud`...), the median of the last 15 timed frames in the 2 s before the flight, at its start; the flight itself is not timed per pass. In an A/B run the phases are `ab_a` and `ab_b`: each arm's passes, timed once after the blocks. Not on Metal, where passes overlap |
+| `shader_pass.<phase>.<pass>_ms` | the same for each pass of the shader pack that runs (its sky, shadow map, post passes and tone map, by the names F3 shows: a stage's `name`, else its file's, and `Tonemap` for the tone map with or without a `[tonemap]`; lowercased, other characters as `_`, as `gpu_pass`'s) |
 | `power.package_w`, `power.battery_drain_pct` | power draw, battery used per hour (laptops; planned) |
 | `thermal.cpu_c`, `thermal.throttled_pct` | temperature, share of the run spent throttled (planned) |
 | `launcher.start_ms` | launcher process start to its first frame (a session) |
@@ -132,11 +135,13 @@ The statistic, in `horizon_bench::compare`, exact and deterministic:
 4. `verdict`: `too_few_pairs`; `within_noise` when the interval holds 0; `negligible` when `|diff| < max(0.05 ms, 2% of a)`; else `slower` (interval above 0) or `faster` (below 0). Lower milliseconds are better.
 5. `noise` is the median distance between neighbouring blocks of the same arm (blocks 1-2, 3-4...), shown next to `diff`.
 
-## Local only
+## Privacy
 
-Nothing in a report identifies the player, the machine's name or the world: no host name, user name, path or
-address. `label` (a name the person running it chose) and `local` (paths of the logs the run wrote next to the
-report) are kept in the file. A report is never sent anywhere (docs/telemetry.md).
+Reports do not record user names, host names, addresses or world names. Saved reports may
+include a player-chosen `label` and `local` log paths. Automatic uploads require benchmark
+upload consent and send the report as it is after scrubbing, `label` and `local` included, with
+the user folder in paths replaced. See [telemetry](telemetry.md) for what is sent and how to
+preview it.
 
 ## Where reports go
 

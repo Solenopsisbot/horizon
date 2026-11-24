@@ -9,7 +9,7 @@ pub(super) enum MenuOpen {
 
 /// Per-guest state of the gameplay code that lives outside `Guest`.
 #[derive(Default)]
-pub(super) struct GuestPlay {
+pub(in crate::game) struct GuestPlay {
     mining: Option<Mining>,
     destroy_delay: u32,
     using: Option<(usize, u32)>,
@@ -25,6 +25,8 @@ pub(super) struct GuestPlay {
     pub(super) chat_spam: u32,
     /// `commandSpamThrottler`: 20 for each command, one less each tick.
     pub(super) command_spam: u32,
+    /// The log lines of the guest's quiet command batches (`lan_quiet.rs`).
+    pub(in crate::game) quiet_log: crate::game::lan_quiet::QuietLog,
     /// The recipe viewer's transfer checks (`horizon:recipe_check`): 20 for
     /// each, one less each tick; one from 200 goes unanswered.
     pub(super) recipe_checks: u32,
@@ -76,7 +78,7 @@ pub(super) struct GuestPlay {
     /// `Stats.LEAVE_GAME` is counted: a guest is saved more than once on the
     /// way out, the statistic is awarded once (`Game::award_leave_game`).
     pub(super) left_game: bool,
-    last_inventory: u64,
+    last_inventory: Option<u64>,
     /// `ServerPlayer.levitationStartPos` and `levitationStartTime`.
     levitation: Option<([f64; 3], u64)>,
     /// The fall, lava ride, Nether trip and blast the guest's advancements track.
@@ -195,7 +197,7 @@ pub(super) struct GuestSwap {
     message: Option<(String, std::time::Instant)>,
     host_ender: Option<(i32, i32, i32)>,
     adv_loaded: bool,
-    last_inventory: u64,
+    last_inventory: Option<u64>,
     levitation: Option<([f64; 3], u64)>,
     marks: super::advancements::TravelMarks,
     death_cause: Option<String>,
@@ -239,6 +241,15 @@ impl GuestPlay {
     /// The guest's `Player.attackStrengthTicker` outside its turn.
     pub(in crate::game) fn attack_ticks(&self) -> u32 {
         self.attack_ticks
+    }
+    /// Fresh play state for a scoped fake-player action: starts with a full attack charge
+    /// (100 ticks, matching a local player's initial `attack_ticks`) so weapon attacks deal
+    /// full damage.
+    pub(in crate::game) fn scoped() -> Self {
+        Self {
+            attack_ticks: 100,
+            ..Self::default()
+        }
     }
     /// The main-hand item of the guest's last tick (`Game.attack_item`).
     pub(in crate::game) fn attack_item(&self) -> Option<&str> {
@@ -328,57 +339,97 @@ fn building_player(g: &horizon_client::lan::guest::Guest) -> BuildingPlayer {
     }
 }
 
+use horizon_client::lan::guest_list::GuestList;
+
 thread_local! {
     /// The hub's bodies for the turns of one `tick_guests`, built once instead
-    /// of for every turn (players x turns a tick). A guest's entry is refreshed
-    /// when its turn ends ([`refresh_building_player`]), so the turns after it
-    /// see it where it went (a pearl, a death, spectator mode).
-    static BUILDING_CACHE: std::cell::RefCell<Option<HubBodies>> =
+    /// of for every turn (players x turns a tick), with the guest list's layout
+    /// they were built for. A guest's entry is refreshed when its turn ends
+    /// ([`refresh_building_player`]), so the turns after it see it where it went
+    /// (a pearl, a death, spectator mode).
+    static BUILDING_CACHE: std::cell::RefCell<Option<(u64, HubBodies)>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// The bodies of the simulation guests as they are now.
+pub(super) fn built_bodies(guests: &GuestList) -> (u64, HubBodies) {
+    guests.drain_written(|_, _| {});
+    (
+        guests.layout(),
+        shared(guests.simulation_iter().map(building_player)),
+    )
+}
+
+/// The cached bodies, if they were built for these guests as they are laid out, else bodies
+/// built afresh from the guests.
+pub(super) fn bodies_of(
+    guests: &GuestList,
+    cache: Option<&(u64, HubBodies)>,
+) -> HubBodies {
+    match cache {
+        Some((built_for, bodies)) if *built_for == guests.layout() => bodies.clone(),
+        _ => shared(guests.simulation_iter().map(building_player)),
+    }
+}
+
+/// Copies every guest written since the last time into the cached bodies (none when the guests
+/// were laid out differently since: [`bodies_of`] builds afresh then).
+pub(super) fn refresh_bodies(guests: &GuestList, (built_for, bodies): &(u64, HubBodies)) {
+    if *built_for == guests.layout() {
+        guests.drain_written(|place, g| bodies[place].set(building_player(g)));
+    }
 }
 
 /// The hub's current bodies, across dimensions. A borrowed ancestor's
 /// live body takes precedence over this saved state until its turn returns.
 fn building_players(host: &LanHost) -> HubBodies {
-    let guests: Vec<_> = host.hub.guests.simulation_iter().collect();
-    let kept = BUILDING_CACHE.with(|c| {
-        c.borrow()
-            .as_ref()
-            .filter(|list| {
-                list.len() == guests.len()
-                    && list
-                        .iter()
-                        .zip(&guests)
-                        .all(|(p, g)| p.get().conn == Some(g.conn))
-            })
-            .cloned()
-    });
-    kept.unwrap_or_else(|| shared(guests.into_iter().map(building_player)))
+    BUILDING_CACHE.with(|c| bodies_of(&host.hub.guests, c.borrow().as_ref()))
 }
 
 /// Builds the hub's bodies once for the turns to come (`Some`), or drops them.
 pub(super) fn building_cache(host: Option<&LanHost>) {
-    let bodies = host.map(|host| shared(host.hub.guests.simulation_iter().map(building_player)));
+    let bodies = host.map(|host| built_bodies(&host.hub.guests));
     BUILDING_CACHE.with(|c| *c.borrow_mut() = bodies);
 }
 
 /// The cached bodies as they are now in the hub, after `conn`'s turn (or its
-/// death step). Every entry, not only the actor's: a turn can move, kill or
-/// change another guest too (`/tp`, an attack, an explosion), and the turns
-/// after it must see that guest where it is now, as a list built afresh would.
-/// Copies into the shared cells, no allocation.
+/// death step): every guest written since the last refresh, not only the
+/// actor, as a turn can move, kill or change another guest too (`/tp`, an
+/// attack, an explosion), and the turns after it must see that guest where
+/// it is now, as a list built afresh would. The guest list notes each write
+/// (`drain_written`), so the work follows the guests that changed,
+/// not their number. Copies into the shared cells, no allocation.
 fn refresh_building_player(host: &LanHost, _conn: u32) {
     BUILDING_CACHE.with(|c| {
-        if let Some(list) = c.borrow().as_ref()
-            && list.len() == host.hub.guests.simulation_iter().count()
-        {
-            for (p, g) in list.iter().zip(host.hub.guests.simulation_iter()) {
-                if p.get().conn == Some(g.conn) {
-                    p.set(building_player(g));
-                }
+        if let Some(cache) = c.borrow().as_ref() {
+            #[cfg(test)]
+            if REFRESH_EVERY_GUEST.get() {
+                return refresh_every_guest(&host.hub.guests, cache);
             }
+            refresh_bodies(&host.hub.guests, cache);
         }
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test only: refresh every guest's body after each turn, as the code did before the guest
+    /// list noted its writes. The tests that compare the two run a scenario under each.
+    static REFRESH_EVERY_GUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test only: the refresh of every body, whatever was written.
+#[cfg(test)]
+fn refresh_every_guest(
+    guests: &GuestList,
+    (built_for, bodies): &(u64, HubBodies),
+) {
+    if *built_for == guests.layout() {
+        for (cell, g) in bodies.iter().zip(guests.simulation_iter()) {
+            cell.set(building_player(g));
+        }
+        guests.drain_written(|_, _| {});
+    }
 }
 
 /// Kept at LAN action scope to preserve its derived internals point identity.
@@ -2300,7 +2351,39 @@ mod pickup_xp_tests {
     use super::super::native_entity_refs::tests::with_game;
     use super::super::native_item_places::tests::{guest, open_to_lan};
     use horizon_client::entities::ExperienceOrb;
-    use horizon_core::geometry::Vec3;
+    use horizon_core::{geometry::Vec3, random::RandomSource};
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_guest_picks_an_orb_with_their_own_random() {
+        with_game(|game| {
+            open_to_lan(game);
+            let mut g = guest(1);
+            g.loaded = true;
+            g.position = [16.0, 70.0, 0.5];
+            game.lan.as_mut().unwrap().hub.guests.push(g);
+            game.as_guest(1, |game| game.player.as_mut().unwrap().random.set_seed(0))
+                .unwrap();
+
+            // Section 0 comes before section 1 even though its orb joined second.
+            let right = Vec3::new(16.5, 70.0, 0.5);
+            let left = Vec3::new(15.5, 70.0, 0.5);
+            game.orbs.push(ExperienceOrb::new(41, right, Vec3::ZERO, 7));
+            game.orbs.push(ExperienceOrb::new(40, left, Vec3::ZERO, 1));
+            game.guest_orbs(0);
+            game.guest_orbs(0);
+
+            let guest = &game.lan.as_ref().unwrap().hub.guests[0];
+            assert_eq!(guest.xp_total, 7);
+            assert_eq!(game.orbs.len(), 1);
+            assert_eq!(game.orbs[0].id, 40);
+            // Seed 0 after nextInt(2) and the cooldown tick's nextInt(1).
+            assert_eq!(
+                guest.motion.as_ref().unwrap().random.clone().next_int(),
+                1_033_096_058
+            );
+        });
+    }
 
     /// Listens to `pickup_xp`, canceling it when told to.
     struct Listen(bool);
@@ -2334,6 +2417,7 @@ mod pickup_xp_tests {
                 attachment_lifetime: Default::default(),
                 rotation: [0.0, 0.0],
                 join: Default::default(),
+                section_order: 0,
                 id: 40,
                 position: p,
                 previous: p,
@@ -3303,6 +3387,10 @@ mod bundle_slot_tests;
 #[cfg(test)]
 #[path = "tests/crack_feedback_tests.rs"]
 mod crack_feedback_tests;
+
+#[cfg(test)]
+#[path = "tests/interaction_target_box_tests.rs"]
+mod interaction_target_box_tests;
 
 #[cfg(test)]
 #[path = "tests/menu_still_valid_tests.rs"]

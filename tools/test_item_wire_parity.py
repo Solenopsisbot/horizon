@@ -110,8 +110,18 @@ ITEMS = {'profile name': 'player_head', 'profile full': 'player_head', 'trim reg
 
 def compare(vanilla, rust):
     """Failures, stacks checked, and the component ids covered."""
+    vanilla_labels = [v['label'] for v in vanilla]
+    rust_labels = [r['label'] for r in rust]
     results = {r['label']: r for r in rust}
     failures, covered = [], set()
+    # The vanilla-driven loop below never looks at a Rust row whose label has
+    # no vanilla fixture, so account for every label in both directions (and
+    # catch duplicates) instead: a broken probe can emit extra, even error,
+    # rows that would otherwise be silently accepted as a green pass.
+    for label in sorted(set(vanilla_labels) | set(rust_labels)):
+        expected, got = vanilla_labels.count(label), rust_labels.count(label)
+        if expected != got or got > 1:
+            failures.append(f'{label}: {expected} vanilla rows, {got} Rust rows')
     for v in vanilla:
         if 'error' in v:
             failures.append(f"oracle {v['label']}: {v['error']}")
@@ -158,8 +168,8 @@ def main():
     vanilla_path, rust_path = build / 'vanilla.jsonl', build / 'rust.jsonl'
     run(['java', '-Xmx1G', '-cp', os.pathsep.join([str(classes), str(jars['server']), dependency_path]),
          'dev.horizonlab.parity.VanillaItemWireOracle', fixtures, vanilla_path], 'oracle')
-    run(['cargo', 'build', '--release', '-p', 'horizon-protocol', '--example', 'item_wire_probe'], 'compile-rust')
-    binary = lab.cargo_target() / 'release/examples' / ('item_wire_probe.exe' if os.name == 'nt' else 'item_wire_probe')
+    run(['cargo', 'build', '--profile', 'fast', '-p', 'horizon-protocol', '--example', 'item_wire_probe'], 'compile-rust')
+    binary = lab.cargo_target() / 'fast/examples' / ('item_wire_probe.exe' if os.name == 'nt' else 'item_wire_probe')
     run([binary, vanilla_path, rust_path], 'rust')
     read = lambda path: [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
     failures, stacks, covered = compare(read(vanilla_path), read(rust_path))

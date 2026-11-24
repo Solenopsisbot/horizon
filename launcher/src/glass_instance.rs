@@ -7,6 +7,7 @@ use super::*;
 use crate::glass_ui::{self as ui, white};
 use horizon_launcher::instances::{self, Channel, Icon, Instance};
 use horizon_launcher::loaders::Kind as Loader;
+use horizon_launcher::nightly::{latest_for, stable_builds, StableBuild};
 use horizon_theme::glass::{fill, ink, radius};
 use new_instance::{NewKind, VersionList};
 use servers_page::Field;
@@ -271,23 +272,27 @@ impl Launcher {
         d.pin.clone().or_else(|| self.followed_version(d.channel))
     }
 
-    /// The version an instance that keeps none plays: on Stable the newest stable build (Create
-    /// installs it), on Nightly the launcher's, or with none installed yet, the newest Nightly.
+    /// The installed version an unpinned draft plays today.
     fn followed_version(&self, channel: Channel) -> Option<String> {
-        let nightly = || {
-            self.launcher_version()
-                .cloned()
-                .or_else(|| self.horizon_choices().into_iter().next())
-        };
-        match channel {
-            Channel::Stable => self
-                .stable_builds()
-                .into_iter()
-                .next()
-                .map(|b| b.tag)
-                .or_else(nightly),
-            Channel::Nightly => nightly(),
+        latest_for(channel, &self.installed, self.settings.selected.as_deref())
+    }
+
+    /// A saved pin may need a download. Saving on Stable can also fetch the offered build,
+    /// or when nothing is installed, saving on either channel can fetch its first build.
+    pub(super) fn draft_download(&self) -> Option<Release> {
+        let draft = self.instances.dialog.as_ref()?;
+        let tag = match (&draft.pin, draft.channel) {
+            (Some(tag), _) => Some(tag.clone()),
+            (None, Channel::Stable) => self.stable_builds().into_iter().next().map(|b| b.tag),
+            (None, Channel::Nightly) => None,
         }
+        .or_else(|| {
+            self.installed
+                .is_empty()
+                .then(|| self.horizon_choices().into_iter().next())
+                .flatten()
+        })?;
+        self.release_to_install(&tag)
     }
 
     /// The Stable channel's builds, newest first (none until the release list is here).
@@ -295,6 +300,36 @@ impl Launcher {
         match &self.releases {
             Load::Ready(r) => stable_builds(r),
             _ => Vec::new(),
+        }
+    }
+
+    /// Whether Home's Stable update has to wait: another download runs or is queued, and the
+    /// update never replaces it.
+    pub(super) fn stable_update_waits(&self) -> bool {
+        self.installing.is_some() || !self.install_queue.is_empty()
+    }
+
+    /// Home's Stable update is installed for the instance when no other download is pending.
+    pub(super) fn install_stable_update(&mut self, release: Release) {
+        if !self.stable_update_waits() {
+            self.stable_install = Some(release.clone());
+            self.install_for_instance(release);
+        }
+    }
+
+    /// The Stable build Home offers the selected instance (`tag`: what it plays, empty for a
+    /// Java instance): the newest one, when the instance is set to Latest on Stable and lacks it,
+    /// and it didn't fail since the list was last read from the network.
+    pub(super) fn stable_update(&self, tag: &str) -> Option<Release> {
+        self.selected_instance()
+            .filter(|i| i.channel == Channel::Stable && i.follows_horizon() && !tag.is_empty())?;
+        match &self.releases {
+            Load::Ready(list) => horizon_launcher::nightly::stable_offer(
+                list,
+                &self.installed,
+                self.stable_failed.as_ref(),
+            ),
+            _ => None,
         }
     }
 
@@ -585,64 +620,6 @@ impl Launcher {
     }
 }
 
-/// A build on the Stable channel; `week` is the Monday of its week when it stands for one.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct StableBuild {
-    pub(super) tag: String,
-    pub(super) week: Option<String>,
-}
-
-/// The Stable channel's builds, newest first: the real (non-Nightly, non-pre-release) releases
-/// when any exist; until then the newest Nightly of each Monday to Sunday week. `releases` is
-/// newest first, as GitHub lists them.
-pub(super) fn stable_builds(releases: &[Release]) -> Vec<StableBuild> {
-    let real: Vec<_> = releases
-        .iter()
-        .filter(|r| {
-            r.nightly.is_none()
-                && r.asset.is_some()
-                && !r.prerelease
-                && horizon_launcher::backend::launcher_version(&r.tag).is_none()
-        })
-        .map(|r| StableBuild {
-            tag: r.tag.clone(),
-            week: None,
-        })
-        .collect();
-    if !real.is_empty() {
-        return real;
-    }
-    use chrono::Datelike;
-    // (monday, date, tag): the newest date of a week wins; the first listed on a tie.
-    let mut weeks: Vec<(String, String, String)> = Vec::new();
-    for r in releases
-        .iter()
-        .filter(|r| r.nightly.is_some() && r.asset.is_some())
-    {
-        let Some(date) = horizon_launcher::nightly::date_of(&r.tag) else {
-            continue;
-        };
-        let Ok(day) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") else {
-            continue;
-        };
-        let monday =
-            (day - chrono::Duration::days(day.weekday().num_days_from_monday() as i64)).to_string();
-        match weeks.iter_mut().find(|w| w.0 == monday) {
-            Some(w) if w.1.as_str() < date => *w = (monday, date.into(), r.tag.clone()),
-            Some(_) => {}
-            None => weeks.push((monday, date.into(), r.tag.clone())),
-        }
-    }
-    weeks.sort_by(|a, b| b.0.cmp(&a.0));
-    weeks
-        .into_iter()
-        .map(|(monday, _, tag)| StableBuild {
-            tag,
-            week: Some(monday),
-        })
-        .collect()
-}
-
 /// Every Nightly published with a build for this platform, newest first, then the installed
 /// versions that list lacks (older Nightlies, imported builds). Picking one not installed installs
 /// it on Create.
@@ -814,12 +791,6 @@ fn native_base(tag: &str) -> Option<String> {
             .or_insert_with(|| native_mods::about(tag).map(|about| about.base))
             .clone()
     })
-}
-
-/// A build's commit, for the details under its name: `4baa571` of `nightly-2026-10-29-4baa571`.
-fn version_commit(tag: &str) -> Option<&str> {
-    horizon_launcher::nightly::date_of(tag)?;
-    tag.get(17..).filter(|c| !c.is_empty())
 }
 
 impl Launcher {
@@ -1117,30 +1088,13 @@ impl Launcher {
                 });
             },
         );
-        // Latest on Nightly plays the version picked on Versions: an older one Use picked is
-        // named, never called the latest.
-        let held = self
-            .held_version()
-            .filter(|_| channel == Channel::Nightly)
-            .map(|tag| self.version_name(tag));
-        // The way back through Versions is only for an instance following Latest, not one that
-        // keeps its own build.
-        let note =
-            ui::text(13., FontWeight::NORMAL, ink::QUIET)
-                .child(match (channel, held.as_ref().filter(|_| pin.is_none())) {
-                (Channel::Stable, _) => tr("One build a week, fewer surprises").to_string(),
-                (Channel::Nightly, None) => tr("Every day's build: newest, may break").to_string(),
-                (Channel::Nightly, Some(_)) => tr(
-                    "Every day's build. Another version was picked on Versions: press Use on the \
-                     newest there to follow new ones again.",
-                )
-                .to_string(),
-            });
-        let current = match (&pin, &held) {
-            (None, Some(held)) => trf("{version} (picked on Versions)", &[("version", held)]),
-            (None, None) => tr("Latest").to_string(),
-            (Some(p), _) => name(p),
-        };
+        let note = ui::text(13., FontWeight::NORMAL, ink::QUIET).child(match channel {
+            Channel::Stable => tr("One build a week, fewer surprises"),
+            Channel::Nightly => tr("Every day's build: newest, may break"),
+        });
+        let current = pin
+            .as_deref()
+            .map_or_else(|| tr("Latest").to_string(), name);
         let button = keyboard(
             div()
                 .id("horizon-version-menu")
@@ -1185,17 +1139,20 @@ impl Launcher {
                     cx.notify();
                 }))
         };
+        let details = self.followed_version(channel).map_or_else(
+            || tr("No version installed").to_string(),
+            |tag| {
+                trf(
+                    "Now {version}. Moves to each new one.",
+                    &[("version", &name(&tag))],
+                )
+            },
+        );
         let mut rows = vec![row(
             "horizon-version-latest".into(),
             pin.is_none(),
-            tr("Latest").into(),
-            match &held {
-                Some(held) => trf(
-                    "Playing {version}, picked on Versions",
-                    &[("version", held)],
-                ),
-                None => tr("Moves to each new one").into(),
-            },
+            tr("Latest").to_string(),
+            details,
             None,
         )];
         for tag in &builds {
@@ -1203,7 +1160,9 @@ impl Launcher {
                 format!("horizon-version-{tag}"),
                 pin.as_ref() == Some(tag),
                 name(tag),
-                version_commit(tag).unwrap_or_default().to_string(),
+                horizon_launcher::nightly::commit_of(tag)
+                    .unwrap_or_default()
+                    .to_string(),
                 Some(tag.clone()),
             ));
         }
@@ -1482,39 +1441,6 @@ mod tests {
             prerelease: false,
             nightly: nightly.then(|| "nightly".into()),
         }
-    }
-
-    #[test]
-    fn stable_is_a_build_a_week_until_real_releases_exist() {
-        // 2026-11-09 is a Monday, 2026-11-08 the Sunday before it.
-        let mut releases = vec![
-            release("nightly-2026-11-13-aaaaaaa", true, true),
-            release("nightly-2026-11-12-bbbbbbb", true, true),
-            release("nightly-2026-11-10-ccccccc", true, true),
-            release("nightly-2026-11-08-ddddddd", true, true),
-            release("nightly-2026-11-03-eeeeeee", true, true),
-            // No build for this platform: not a candidate.
-            release("nightly-2026-11-14-fffffff", true, false),
-        ];
-        let weekly = |tag: &str, week: &str| StableBuild {
-            tag: tag.into(),
-            week: Some(week.into()),
-        };
-        assert_eq!(
-            stable_builds(&releases),
-            [
-                weekly("nightly-2026-11-13-aaaaaaa", "2026-11-09"),
-                weekly("nightly-2026-11-08-ddddddd", "2026-11-02"),
-            ]
-        );
-        releases.insert(0, release("v0.3.0", false, true));
-        assert_eq!(
-            stable_builds(&releases),
-            [StableBuild {
-                tag: "v0.3.0".into(),
-                week: None
-            }]
-        );
     }
 
     #[test]

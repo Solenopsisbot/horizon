@@ -2,6 +2,7 @@
 //! entity selectors resolved against the game, vanilla feedback and errors.
 mod admin;
 mod clone_payload;
+mod command_host;
 pub(super) mod compute;
 mod data;
 mod difficulty;
@@ -12,6 +13,7 @@ pub(super) mod execute;
 pub(super) mod extra;
 mod give;
 mod item_count;
+mod item_predicate;
 pub(in crate::game) mod items;
 mod misc;
 mod modprofile;
@@ -46,6 +48,23 @@ use horizon_protocol::packets::play::{self, Clientbound as C};
 use horizon_world::registry::BlockStateId;
 
 pub(super) type R<T> = Result<T, CommandError>;
+
+/// One execution of a guest's `/save-all`, deferred to the end of their turn:
+/// the feedback decisions `CommandSourceStack.sendSuccess` and
+/// `broadcastToAdmins` make when the command runs, which is not when the save
+/// happens.
+pub(in crate::game) struct DeferredSaveAll {
+    /// `getDisplayName` of the source that ran it, for its admin line.
+    pub who: Text,
+    /// `withSuppressedOutput`: the source hears nothing and tells nobody.
+    pub silent: bool,
+    /// `CommandSource.acceptsSuccess()`: the source takes the success line.
+    pub to_source: bool,
+    /// `GameRules.SEND_COMMAND_FEEDBACK`: the other operators hear it.
+    pub to_operators: bool,
+    /// `GameRules.LOG_ADMIN_COMMANDS`: a dedicated server's console logs it.
+    pub to_console: bool,
+}
 
 /// An entity a selector found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -250,33 +269,33 @@ impl Game<'_> {
     /// Commands.performCommand for a line without its slash. A client mod's
     /// `command` hook is the caller's: this also runs on a server.
     pub(super) fn run_command(&mut self, command: &str) -> bool {
-        let d = self.ui.dispatcher.0.clone();
-        let parse = d.parse(command, &self.ui.registries);
-        let result = match parse.executable() {
-            Err(e) => {
-                self.syntax_failure(&e, command);
-                return false;
+        self.with_command_frame(|game| {
+            let d = game.ui.dispatcher.0.clone();
+            let parse = d.parse(command, &game.ui.registries);
+            let (ctx, id) = match parse.executable() {
+                Ok(executable) => executable,
+                Err(error) => {
+                    game.syntax_failure(&error, command);
+                    return false;
+                }
+            };
+            let ctx = ctx.clone();
+            game.exec.native_command_input = (id == "native_mod_command").then_some(parse.input);
+            let result = game.run_chain(&parse.context, &ctx);
+            let ok = result.is_ok();
+            if let Err(e) = result {
+                if e.input.is_some() {
+                    game.syntax_failure(&e, command);
+                } else {
+                    game.command_failure(e.message);
+                }
             }
-            Ok((ctx, _)) => {
-                let ctx = ctx.clone();
-                let root = parse.context.clone();
-                self.exec = Default::default();
-                self.run_chain(&root, &ctx)
+            // InventoryChangeTrigger fires as slots change, not on the next tick.
+            if game.player.is_some() {
+                game.check_inventory_trigger();
             }
-        };
-        let ok = result.is_ok();
-        if let Err(e) = result {
-            if e.input.is_some() {
-                self.syntax_failure(&e, command);
-            } else {
-                self.command_failure(e.message);
-            }
-        }
-        // InventoryChangeTrigger fires as slots change, not on the next tick.
-        if self.player.is_some() {
-            self.check_inventory_trigger();
-        }
-        ok
+            ok
+        })
     }
     /// `run_command` with its output suppressed
     /// (`CommandSourceStack.withSuppressedOutput`): the player's own source,
@@ -286,10 +305,7 @@ impl Game<'_> {
             silent: true,
             ..self.player_source()
         };
-        let outer = self.command_source.replace(quiet);
-        let ok = self.run_command(command);
-        self.command_source = outer;
-        ok
+        self.with_source(quiet, |game| game.run_command(command))
     }
     pub(in crate::game) fn syntax_failure(&mut self, e: &CommandError, command: &str) {
         self.command_failure(e.message.clone());
@@ -300,14 +316,10 @@ impl Game<'_> {
             ..Style::default()
         };
         let mut context = Text::empty();
-        if cursor > 10 {
+        if horizon_client::command::java_index(input, cursor) > 10 {
             context.push("...");
         }
-        let start = (0..=cursor.saturating_sub(10))
-            .rev()
-            .find(|&i| input.is_char_boundary(i))
-            .unwrap_or(0);
-        context.push(&input[start..cursor]);
+        context.push(&input[horizon_client::command::context_start(input, cursor)..cursor]);
         if cursor < input.len() {
             context.push(
                 Text::literal(&input[cursor..])
@@ -418,6 +430,38 @@ impl Game<'_> {
     /// server the console when `log_admin_commands`. Queued while the
     /// command runs; `send_admin_feedback` sends it.
     pub(super) fn broadcast_to_admins(&mut self, message: Text) {
+        let who = self.admin_who();
+        let (to_operators, to_console) = self.admin_broadcast_rules(self.lan_acting.is_some());
+        self.broadcast_to_admins_read(who, to_operators, to_console, message);
+    }
+    /// The two game rules `broadcastToAdmins` reads, and whether a player's
+    /// command logs to a dedicated server's console: `player` is
+    /// `this.source != this.server`.
+    fn admin_broadcast_rules(&self, player: bool) -> (bool, bool) {
+        let ops = self
+            .ui
+            .rules
+            .bool_at(horizon_client::gamerules::vanilla::SEND_COMMAND_FEEDBACK);
+        // MinecraftServer.sendSystemMessage, unless the server is the source.
+        let console = self.console_broadcast.is_none()
+            && player
+            && self.is_dedicated_server()
+            && self
+                .ui
+                .rules
+                .bool_at(horizon_client::gamerules::vanilla::LOG_ADMIN_COMMANDS);
+        (ops, console)
+    }
+    /// `broadcast_to_admins` with the two game rules read when the command ran:
+    /// a guest's `/save-all` reports with the rules of its command, not of the
+    /// end of the turn.
+    pub(super) fn broadcast_to_admins_read(
+        &mut self,
+        who: Text,
+        to_operators: bool,
+        to_console: bool,
+        message: Text,
+    ) {
         let informs = match self.console_broadcast {
             Some(broadcast) => broadcast,
             None => self.lan_acting.is_some() || self.lan.is_some(),
@@ -429,32 +473,27 @@ impl Game<'_> {
         {
             return;
         }
-        let ops = self
-            .ui
-            .rules
-            .bool_at(horizon_client::gamerules::vanilla::SEND_COMMAND_FEEDBACK);
-        // MinecraftServer.sendSystemMessage, unless the server is the source.
-        let console = self.console_broadcast.is_none()
-            && self.lan_acting.is_some()
-            && self.is_dedicated_server()
-            && self
-                .ui
-                .rules
-                .bool_at(horizon_client::gamerules::vanilla::LOG_ADMIN_COMMANDS);
-        if !ops && !console {
+        if !to_operators && !to_console {
             return;
         }
-        // getDisplayName: the entity the command runs as (`execute as`), or
-        // the server's own source, "Server".
-        let who = match self.command_source.and_then(|s| s.entity) {
-            Some(entity) => self.target_name(entity),
-            None if self.console_broadcast.is_some() => self.server_name(),
-            None => self.player_display_name(),
-        };
         let line = Text::translate("chat.type.admin", &[who, message])
             .with_color(text::GRAY)
             .italic();
-        self.admin_feedback.push((line, ops, console));
+        self.admin_feedback
+            .push((line, to_operators, to_console));
+    }
+    /// What a guest's `/save-all` reports once their turn ends, read while the
+    /// source that ran it is current: `CommandSourceStack.sendSuccess` and
+    /// `broadcastToAdmins` decide from these the moment the command runs.
+    pub(super) fn deferred_save_all(&self) -> DeferredSaveAll {
+        let (to_operators, to_console) = self.admin_broadcast_rules(self.lan_acting.is_some());
+        DeferredSaveAll {
+            who: self.admin_who(),
+            silent: self.command_source.is_some_and(|s| s.silent),
+            to_source: self.accepts_success(),
+            to_operators,
+            to_console,
+        }
     }
     /// Player.getDisplayName: the name (team-formatted), suggesting a
     /// `/tell`, showing the player on hover, inserting the name.
@@ -583,8 +622,16 @@ impl Game<'_> {
             Target::Mob(id) => self.mob_command_name(id),
             other => {
                 // Entity.getDisplayName: the CustomName component, else the type.
+                // An ominous item spawner keeps its compound in its own `raw`.
                 let custom = super::native_entities::target_id(other)
-                    .and_then(|id| self.persist_raw(id))
+                    .and_then(|id| {
+                        self.persist_raw(id).or_else(|| {
+                            self.ominous_spawners
+                                .iter()
+                                .find(|s| s.id == id)
+                                .and_then(|s| s.raw.as_deref())
+                        })
+                    })
                     .and_then(|r| r.get("CustomName"));
                 if let Some(c) = custom {
                     return horizon_client::scoreboard::comp_text(
@@ -602,7 +649,13 @@ impl Game<'_> {
             return self.player_named(name).into_iter().collect();
         }
         if let Some(uuid) = s.uuid {
-            return self.target_by_uuid(uuid).into_iter().collect();
+            // `Level.getEntity`: a dead player's removed body is in no level.
+            // (EntityArgument.parse refuses a UUID in a players-only argument.)
+            return self
+                .target_by_uuid(uuid)
+                .filter(|&t| !self.player_body_removed(t))
+                .into_iter()
+                .collect();
         }
         let origin = {
             let p = self.source_position();
@@ -642,7 +695,10 @@ impl Game<'_> {
             if dim == source_dim {
                 candidates.append(&mut source_candidates);
             }
-            if s.kind != 's' {
+            // EntitySelector.findEntities: a selector without entities (`@a`, `@p`, `@r`, a
+            // players-only token) reads the player list alone, which `player_candidates` gave;
+            // the level's entities would only be typed one by one and dropped.
+            if s.kind != 's' && s.include_entities {
                 if s.kind == 'e' && matches!(s.sort, Sort::Arbitrary) && !s.world_limited() {
                     candidates.extend(self.global_selector_candidates());
                 } else {
@@ -932,6 +988,34 @@ impl Game<'_> {
         self.enter_command_level(back);
         Some(result)
     }
+    /// [`Self::in_target_level`] for a command that reads the entity it was
+    /// given: a dead player whose body its level no longer holds
+    /// (`LivingEntity.tickDeath` removed it at its twentieth tick) is still
+    /// the `ServerPlayer` the selector returned (`@s`, a name, `@a`, `@p`,
+    /// `@r`), so it is read in its own level until it respawns.
+    pub(in crate::game) fn in_read_target_level<R>(
+        &mut self,
+        t: Target,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
+        if self.resident_target_dimension(t).is_some() {
+            return self.in_target_level(t, f);
+        }
+        let conn = match t {
+            Target::Player => self.lan_acting?,
+            Target::Guest(conn) => conn,
+            _ => return None,
+        };
+        let guest = self.command_guest(conn).filter(|g| !g.body_present())?;
+        let dim = Dim::from_id(&guest.dimension);
+        if dim == self.dim {
+            return Some(f(self));
+        }
+        let back = self.enter_command_level(dim)?;
+        let result = f(self);
+        self.enter_command_level(back);
+        Some(result)
+    }
     pub(in crate::game) fn entity_tag_matches(&self, tag: &str, ty: &str) -> bool {
         let path = self.options.resources.join(format!(
             "data/minecraft/tags/entity_type/{}.json",
@@ -1042,6 +1126,7 @@ impl Game<'_> {
             id if id.starts_with("whitelist.") => self.cmd_whitelist(id, ctx),
             "setidletimeout" => self.cmd_setidle_timeout(ctx),
             "stop" => self.cmd_stop(),
+            "restart" => self.cmd_restart(),
             "save-all" => self.cmd_save_all(),
             "save-off" | "save-on" => self.cmd_auto_save(id == "save-on"),
             "transfer" => self.cmd_transfer(ctx),
@@ -1115,35 +1200,7 @@ impl Game<'_> {
         }
     }
     fn cmd_help(&mut self, ctx: &Context) -> R<i32> {
-        let d = self.ui.dispatcher.0.clone();
-        let level = self.ui.registries.permission;
-        match ctx.get("command") {
-            None => {
-                let usage = d.smart_usage(0, level);
-                let n = usage.len() as i32;
-                for (_, line) in usage {
-                    self.feedback_unbroadcast(Text::literal(format!("/{line}")));
-                }
-                Ok(n)
-            }
-            Some(Arg::Str(command)) => {
-                let parse = d.parse(command, &self.ui.registries);
-                if parse.context.nodes.is_empty() {
-                    return Err(err("commands.help.failed", &[]));
-                }
-                let last = parse.context.nodes.last().map(|n| n.0).unwrap_or(0);
-                let usage = d.smart_usage(last, level);
-                let prefix = &command[..parse.context.range.1.min(command.len())];
-                for (_, line) in &usage {
-                    self.feedback_unbroadcast(Text::literal(format!("/{prefix} {line}")));
-                }
-                if usage.is_empty() {
-                    self.feedback_unbroadcast(Text::literal(format!("/{prefix}")));
-                }
-                Ok(usage.len().max(1) as i32)
-            }
-            _ => Ok(0),
-        }
+        horizon_gameplay::commands::help::help(self, ctx)
     }
     pub(super) fn set_game_mode(&mut self, mut mode: GameMode) -> bool {
         if self.mode == mode {
@@ -1239,16 +1296,17 @@ impl Game<'_> {
         {
             // `CompassItem.getName`: a lodestone tracker names it, over `item_name`.
             Text::translate("item.minecraft.lodestone_compass", &[])
-        } else if let Some(name) = s.data().and_then(|d| d.other("minecraft:item_name")) {
+        } else if let Some(name) = s.item_name_text() {
             // `ItemStack.getItemName`: the `item_name` component wins over the
             // item's own name (`Item.getName`), so a datapack's or a server's
-            // renaming shows here as it does on the tooltip's first line.
-            horizon_client::component::name_text(name)
+            // renaming shows here as it does on the tooltip's first line, and
+            // a content mod's default name for its item as well.
+            name
         } else if let Some(title) = s
             .data()
             .and_then(|d| d.written.as_ref())
             .map(|w| w.title.clone())
-            .filter(|t| !t.trim().is_empty())
+            .filter(|t| !horizon_core::java_character::is_blank(t))
         {
             Text::literal(title)
         } else if item == "minecraft:shield"
@@ -1302,17 +1360,12 @@ impl Game<'_> {
             .with_component_fields(vec![("hover_event".into(), shown)])
     }
     fn cmd_give(&mut self, ctx: &Context) -> R<i32> {
-        let Some(Arg::Item(ItemInput { id, components, .. })) = ctx.get("item").cloned() else {
+        let Some(Arg::Item(input)) = ctx.get("item").cloned() else {
             return Ok(0);
         };
-        let (damage, extra) = match components
-            .as_deref()
-            .map(horizon_client::item_data::command_components)
-        {
-            Some(Ok(tag)) => horizon_client::item_data::decode_components(Some(&tag)),
-            Some(Err(e)) => return Err(CommandError::new(Text::literal(e))),
-            None => (0, None),
-        };
+        // GiveCommand: `item.createItemStack(1, false)`, then copies of it.
+        let ItemStack { damage, extra, .. } = self.command_item_stack(&input, 1)?;
+        let id = input.id;
         let count = Self::int(ctx, "count").unwrap_or(1);
         let targets = self.entities(ctx, "targets", true)?;
         let max_stack = self.items().get(&id).map_or(64, |i| i.max_stack) as i32;
@@ -1432,6 +1485,23 @@ impl Game<'_> {
                 e.set_on_ground(true);
             });
         });
+    }
+    /// Writes `rotation` to the saved compound of an entity whose model has no slot for it (a cloud, a
+    /// cushion's pitch): where `/data get` and the save read it.
+    fn write_raw_rotation(&mut self, id: u32, rotation: [f32; 2]) {
+        use horizon_core::nbt::{Compound, JavaString, Tag};
+        let float = |v: f32| Tag::Float(if v == 0.0 { 0 } else { v.to_bits() });
+        if let Tag::Compound(raw) = self
+            .persist
+            .raw
+            .entry(id)
+            .or_insert_with(|| Tag::Compound(Compound::new()))
+        {
+            raw.insert(
+                JavaString::from("Rotation"),
+                Tag::List(vec![float(rotation[0]), float(rotation[1])]),
+            );
+        }
     }
     pub(in crate::game) fn teleport_to(
         &mut self,
@@ -1594,7 +1664,7 @@ impl Game<'_> {
             }
             Target::Orb(id) => {
                 if let Some(o) = self.orbs.iter_mut().find(|o| o.id == id) {
-                    o.position = v;
+                    o.set_position(v);
                     o.previous = v;
                     if let Some(r) = rotation {
                         Entity::set_rotation(o, r);
@@ -1700,6 +1770,8 @@ impl Game<'_> {
                     c.pos = [v.x.floor() as i32, v.y.floor() as i32, v.z.floor() as i32];
                     if let Some(r) = rotation {
                         c.yaw = r[0];
+                        // The cushion keeps its pitch in its saved compound, which a save writes back.
+                        self.write_raw_rotation(id, r);
                     }
                 }
             }
@@ -1744,6 +1816,11 @@ impl Game<'_> {
                     self.breath_clouds.update(i, |c| {
                         c.at = pos;
                     });
+                    // The cloud keeps its rotation in its saved compound: a teleport that sets one
+                    // writes it there, where `/data get` and the save read it.
+                    if let Some(r) = rotation {
+                        self.write_raw_rotation(id, r);
+                    }
                 }
             }
             // Wall-mounted entities do not move; a hook follows its own tick and a
@@ -2071,192 +2148,10 @@ impl Game<'_> {
     /// `TimeCommand.getDefaultClock`: explicit registered clocks and dimension defaults are
     /// separate; built-in timelines and markers belong only to Overworld.
     fn cmd_time(&mut self, id: &str, ctx: &Context) -> R<i32> {
-        if id == "time.query.gametime" {
-            let t = self.world.game_time;
-            self.feedback_unbroadcast(Text::tr("commands.time.query.gametime", &[&t]));
-            return Ok((t % i64::from(i32::MAX)) as i32);
-        }
-        // `time of <clock>` names the clock; otherwise the dimension's default clock.
-        let clock = match ctx.get("clock") {
-            Some(Arg::Resource(c)) => c.clone(),
-            _ => match self.dimension_type().default_clock.clone() {
-                Some(clock) => clock,
-                None => return Err(err("commands.time.no_default_clock", &[&self.dim.id()])),
-            },
-        };
-        let total = self.command_clock_time(&clock);
-        match id {
-            "time.set" => {
-                let t = i64::from(Self::int(ctx, "time").unwrap_or(0));
-                if total == t {
-                    return Err(err("commands.time.set.already_at_time", &[&clock, &t]));
-                }
-                let mut cancel = false;
-                self.native_time_skip(self.dim.id(), total, t, "command", &mut cancel);
-                if !cancel {
-                    self.set_command_clock_time(&clock, t);
-                    self.command_clock_state(&clock).partial = 0.0;
-                }
-                self.feedback(Text::tr("commands.time.set.absolute", &[&clock, &t]));
-                Ok(t as i32)
-            }
-            "time.set.marker" => {
-                let Some(Arg::Resource(marker)) = ctx.get("timemarker").cloned() else {
-                    return Ok(0);
-                };
-                let Some((m, target)) = (clock == "minecraft:overworld")
-                    .then(|| self.ui.markers.get(&marker).copied())
-                    .flatten()
-                    .and_then(|m| Some((m, m.resolve(total)?)))
-                else {
-                    return Err(err(
-                        "commands.time.no_time_marker_found",
-                        &[&marker, &clock],
-                    ));
-                };
-                if m.occurs_at(total) {
-                    return Err(err(
-                        "commands.time.set.already_at_time_marker",
-                        &[&clock, &marker],
-                    ));
-                }
-                let mut cancel = false;
-                self.native_time_skip(self.dim.id(), total, target, "command", &mut cancel);
-                if !cancel {
-                    self.set_command_clock_time(&clock, target);
-                    self.command_clock_state(&clock).partial = 0.0;
-                }
-                self.feedback(Text::tr(
-                    "commands.time.set.time_marker",
-                    &[&clock, &marker],
-                ));
-                Ok((self.command_clock_time(&clock) % i64::from(i32::MAX)) as i32)
-            }
-            "time.add" => {
-                let t = i64::from(Self::int(ctx, "time").unwrap_or(0));
-                let target = (total + t).max(0);
-                let mut cancel = false;
-                self.native_time_skip(self.dim.id(), total, target, "command", &mut cancel);
-                if !cancel {
-                    self.set_command_clock_time(&clock, target);
-                }
-                let now = self.command_clock_time(&clock);
-                self.feedback(Text::tr("commands.time.set.absolute", &[&clock, &now]));
-                Ok((now % i64::from(i32::MAX)) as i32)
-            }
-            "time.pause" | "time.resume" => {
-                let pause = id == "time.pause";
-                if self.command_clock_state(&clock).paused == pause {
-                    return Err(err(
-                        if pause {
-                            "commands.time.pause.already_paused"
-                        } else {
-                            "commands.time.pause.already_running"
-                        },
-                        &[&clock],
-                    ));
-                }
-                self.command_clock_state(&clock).paused = pause;
-                self.feedback(Text::tr(
-                    if pause {
-                        "commands.time.pause"
-                    } else {
-                        "commands.time.resume"
-                    },
-                    &[&clock],
-                ));
-                Ok(1)
-            }
-            "time.rate" => {
-                let rate = match ctx.get("rate") {
-                    Some(Arg::Float(r)) => *r,
-                    _ => 1.0,
-                };
-                if self.command_clock_state(&clock).rate == rate {
-                    return Err(err(
-                        "commands.time.rate.already_same",
-                        &[&clock, &float_to_string(rate)],
-                    ));
-                }
-                self.command_clock_state(&clock).rate = rate;
-                self.feedback(Text::tr(
-                    "commands.time.rate",
-                    &[&clock, &float_to_string(rate)],
-                ));
-                Ok(1)
-            }
-            "time.query.time" => {
-                self.feedback_unbroadcast(Text::tr(
-                    "commands.time.query.absolute",
-                    &[&clock, &total],
-                ));
-                Ok((total % i64::from(i32::MAX)) as i32)
-            }
-            "time.query.timeline" | "time.query.repetition" => {
-                let Some(Arg::Resource(timeline)) = ctx.get("timeline").cloned() else {
-                    return Ok(0);
-                };
-                let Some(period) = (clock == "minecraft:overworld")
-                    .then(|| self.ui.timelines.get(&timeline).copied())
-                    .flatten()
-                else {
-                    return Err(err(
-                        "commands.time.wrong_timeline_for_clock",
-                        &[&timeline, &clock],
-                    ));
-                };
-                if id == "time.query.timeline" {
-                    let ticks = period.map_or(total, |p| total.rem_euclid(p));
-                    self.feedback_unbroadcast(Text::tr(
-                        "commands.time.query.timeline",
-                        &[&timeline, &ticks],
-                    ));
-                    Ok(ticks as i32)
-                } else {
-                    let reps = period.map_or(0, |p| total / p);
-                    self.feedback_unbroadcast(Text::tr(
-                        "commands.time.query.timeline.repetitions",
-                        &[&timeline, &reps],
-                    ));
-                    Ok(reps as i32)
-                }
-            }
-            _ => Ok(0),
-        }
+        horizon_gameplay::commands::time::time(self, id, ctx)
     }
     fn cmd_weather(&mut self, ctx: &Context) -> R<i32> {
-        let duration = Self::int(ctx, "duration");
-        let sample = |min: i32, max: i32, r: &mut horizon_core::random::LegacyRandom| {
-            min + r.next_int_bound(max - min + 1).unwrap_or(0)
-        };
-        let (key, clear, time, raining, thundering) = if ctx.has("clear") {
-            (
-                "commands.weather.set.clear",
-                duration.unwrap_or_else(|| sample(12_000, 180_000, &mut self.world.random)),
-                0,
-                false,
-                false,
-            )
-        } else if ctx.has("rain") {
-            (
-                "commands.weather.set.rain",
-                0,
-                duration.unwrap_or_else(|| sample(12_000, 24_000, &mut self.world.random)),
-                true,
-                false,
-            )
-        } else {
-            (
-                "commands.weather.set.thunder",
-                0,
-                duration.unwrap_or_else(|| sample(3_600, 15_600, &mut self.world.random)),
-                true,
-                true,
-            )
-        };
-        self.set_weather_parameters(clear, time, raining, thundering);
-        self.feedback(Text::translate(key, &[]));
-        Ok(duration.unwrap_or(-1))
+        horizon_gameplay::commands::weather::weather(self, ctx)
     }
     pub(super) fn kill_target(&mut self, t: Target) {
         // An entity in another level is killed in the level that holds it.
@@ -2305,21 +2200,20 @@ impl Game<'_> {
                 self.ui.death_cause = Some("death.attack.genericKill".into());
             }
             Target::Mob(id) => {
-                let mut killed = None;
-                if let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) {
-                    // LivingEntity.kill: a generic_kill hit of Float.MAX_VALUE,
-                    // which its death message tells.
-                    let alive = m.alive();
-                    if alive {
-                        let source = horizon_client::mobs::Damage::of(
-                            horizon_client::mobs::DamageKind::GenericKill,
-                        );
-                        m.record_damage(source, f32::MAX);
-                        m.last_damage = Some((source, i64::from(m.age)));
-                    }
-                    m.health = 0.0;
-                    killed = alive.then(|| m.clone());
+                // LivingEntity.kill: `hurtServer` with a generic_kill hit of Float.MAX_VALUE, as
+                // /damage hurts (hurt time, death message); the type bypasses invulnerability and
+                // totems and deals no knockback. The death ticks start on the next tick.
+                let alive = self.mobs.iter().any(|m| m.id == id && m.alive());
+                if alive {
+                    let kill = horizon_client::mobs::DamageKind::GenericKill;
+                    self.command_damage_mob(id, f32::MAX, horizon_client::mobs::Damage::of(kill));
                 }
+                let killed = self
+                    .mobs
+                    .iter()
+                    .find(|m| m.id == id && !m.alive())
+                    .filter(|_| alive)
+                    .cloned();
                 // The hit runs LivingEntity.die before the command returns:
                 // its ENTITY_DIE, loot and experience come now, not in the
                 // next tick's deaths, which skip it (as a frog's bite does).
@@ -2410,6 +2304,27 @@ impl Game<'_> {
     /// `SummonCommand.createEntity`: Peaceful admission uses the entity-type
     /// policy for both forms, independently of the mob category.
     fn cmd_summon(&mut self, ctx: &Context) -> R<i32> {
+        /// The CustomName an NBT argument gives the entity (`Entity.load`
+        /// reads it with `ComponentSerialization.CODEC`: a string, a non-empty
+        /// list or a compound with one of the content types' fields; anything
+        /// else loads no name).
+        fn summon_custom_name(nbt: &str) -> Option<Text> {
+            use horizon_core::nbt::Tag;
+            const CONTENTS: [&str; 9] = [
+                "type", "text", "translate", "keybind", "score", "selector", "nbt", "sprite",
+                "player",
+            ];
+            let (tag, _) = horizon_core::nbt::parse_snbt(nbt).ok()?;
+            let name = horizon_client_core::block_entity_nbt::component(tag.get("CustomName")?)
+                .filter(|n| match n {
+                    Tag::List(l) => !l.is_empty(),
+                    Tag::Compound(c) => CONTENTS.iter().any(|k| c.contains_key(&(*k).into())),
+                    _ => true,
+                })?;
+            Some(horizon_client::scoreboard::comp_text(
+                &horizon_client::scoreboard::tag_to_json(&name),
+            ))
+        }
         let Some(Arg::Resource(kind)) = ctx.get("entity").cloned() else {
             return Ok(0);
         };
@@ -2424,9 +2339,12 @@ impl Game<'_> {
             let before = self.spawned_mark();
             let name = match self.summon_with_nbt(&kind, pos, &nbt)? {
                 Some(target) => self.target_name(target),
-                // Spawned as a kind no command target stands for (primed
-                // TNT, falling blocks, projectiles): its type's name.
-                None if self.spawned_mark() != before => data::summon_type_name(&kind),
+                // Spawned as a kind no command target stands for (evoker
+                // fangs, area effect clouds, experience orbs):
+                // `Entity.getDisplayName`, its loaded CustomName, else its type's name.
+                None if self.spawned_mark() != before => {
+                    summon_custom_name(&nbt).unwrap_or_else(|| data::summon_type_name(&kind))
+                }
                 None => return Err(err("commands.summon.failed", &[])),
             };
             self.feedback(Text::translate("commands.summon.success", &[name]));
@@ -3429,51 +3347,7 @@ impl Game<'_> {
         }
     }
     fn cmd_gamerule(&mut self, ctx: &Context) -> R<i32> {
-        let Some(name) = ctx.literals.get(1).cloned() else {
-            return Ok(0);
-        };
-        let Some(rule) = self.ui.rules.rule(&name).cloned() else {
-            return Ok(0);
-        };
-        // GameRule.id(): only the default namespace is omitted in messages.
-        let rule_id = rule.name.strip_prefix("minecraft:").unwrap_or(&rule.name);
-        let current = self.ui.rules.get(&rule.name).unwrap_or(rule.default);
-        let value = match ctx.get("value") {
-            Some(Arg::Bool(b)) => Value::Bool(*b),
-            Some(Arg::Int(i)) => Value::Int(*i),
-            _ => {
-                self.feedback_unbroadcast(Text::tr(
-                    "commands.gamerule.query",
-                    &[&rule_id, &current],
-                ));
-                return Ok(match current {
-                    Value::Bool(b) => i32::from(b),
-                    Value::Int(i) => i,
-                });
-            }
-        };
-        if current == value {
-            return Err(err("commands.gamerule.not_set", &[&rule_id, &value]));
-        }
-        let name = self.lan_acting_name.clone();
-        let actor = match (
-            self.lan_acting_uuid,
-            self.lan_acting_entity,
-            name.as_deref(),
-        ) {
-            (Some(uuid), Some(entity_id), Some(name)) => Some(mod_api::GameRuleActor {
-                uuid,
-                entity_id: entity_id as i32,
-                name,
-            }),
-            _ => None,
-        };
-        self.set_game_rule(&rule, value, actor.as_ref());
-        self.feedback(Text::tr("commands.gamerule.set", &[&rule_id, &value]));
-        Ok(match value {
-            Value::Bool(b) => i32::from(b),
-            Value::Int(i) => i,
-        })
+        horizon_gameplay::commands::gamerule::gamerule(self, ctx)
     }
     fn cmd_spawnpoint(&mut self, ctx: &Context) -> R<i32> {
         let targets = if ctx.get("targets").is_some() {
@@ -3543,10 +3417,16 @@ impl Game<'_> {
         let rot = [wrap_degrees(yaw), pitch.clamp(-90.0, 90.0)];
         let previous_point = self.world_spawn_position().map(|v| v.floor() as i32);
         let old_angle = self.level.world_spawn_angle;
+        let moved_level = self.level.spawn_dimension() != level.id();
         let old = self.level.world_spawn.replace(pos);
         self.level.world_spawn_angle = rot;
         self.level.world_spawn_dimension = Some(level.id().to_string());
-        if previous_point != pos || old_angle.map(f32::to_bits) != rot.map(f32::to_bits) {
+        // MinecraftServer.setRespawnData compares the whole RespawnData, its
+        // dimension too.
+        if previous_point != pos
+            || old_angle.map(f32::to_bits) != rot.map(f32::to_bits)
+            || moved_level
+        {
             self.lan_broadcast_world_spawn();
         }
         self.native_spawn_change(pos, rot);
@@ -3593,6 +3473,7 @@ impl Game<'_> {
         self.feedback(Text::translate("commands.setworldspawn.success", &args));
         Ok(1)
     }
+    #[allow(dead_code)]
     fn item_matches(&self, predicate: &ItemInput, item: &str) -> bool {
         if predicate.any {
             return true;
@@ -3612,135 +3493,15 @@ impl Game<'_> {
         predicate.id == item
     }
     /// `ItemPredicateArgument`: the item test and its `[...]` component
-    /// tests (presence, `=` equality, `!` negation, `|` alternatives).
+    /// tests (presence, `=` equality, `~` sub-predicates, `!` negation, `|` alternatives).
     pub(super) fn stack_matches(&self, predicate: &ItemInput, stack: &ItemStack) -> bool {
-        if !self.item_matches(predicate, &stack.item) {
-            return false;
-        }
-        let Some(tests) = predicate.components.as_deref() else {
-            return true;
-        };
-        let inner = tests
-            .trim()
-            .strip_prefix('[')
-            .and_then(|t| t.strip_suffix(']'))
-            .unwrap_or("");
-        let components = match horizon_client::item_data::encode_components(stack) {
-            Some(horizon_core::nbt::Tag::Compound(c)) => c,
-            _ => Default::default(),
-        };
-        let test = |term: &str| -> bool {
-            let term = term.trim();
-            let (negated, term) = match term.strip_prefix('!') {
-                Some(t) => (true, t.trim()),
-                None => (false, term),
-            };
-            let split = term.find(['=', '~']).unwrap_or(term.len());
-            let id = term[..split].trim();
-            let id = if id.contains(':') {
-                id.to_owned()
-            } else {
-                format!("minecraft:{id}")
-            };
-            let present = components.get(&id.as_str().into());
-            let result = match term[split..].chars().next() {
-                // Both count wrappers in `ItemPredicateArgument` use the live
-                // stack count and the same integer bounds matcher.
-                Some('=' | '~') if id == "minecraft:count" => {
-                    let value = horizon_core::nbt::parse_snbt(term[split + 1..].trim());
-                    value.is_ok_and(|(v, _)| item_count::matches(stack.count, &v))
-                }
-                Some('=') => {
-                    let value = horizon_core::nbt::parse_snbt(term[split + 1..].trim())
-                        .ok()
-                        .map(|(t, _)| t);
-                    match (present, value) {
-                        (Some(have), Some(want)) => {
-                            horizon_client::nbt_path::compare_nbt(&want, Some(have))
-                                && horizon_client::nbt_path::compare_nbt(have, Some(&want))
-                        }
-                        _ => false,
-                    }
-                }
-                Some('~') => {
-                    // Component sub-predicates.
-                    let value = horizon_core::nbt::parse_snbt(term[split + 1..].trim())
-                        .ok()
-                        .map(|(t, _)| t);
-                    match (id.as_str(), value) {
-                        // `MinMaxBounds.Ints.matches`: DamagePredicate's damage-only
-                        // Int bounds shape; effective DAMAGE presence is required.
-                        // Other fields keep the entire existing predicate path.
-                        ("minecraft:damage", Some(ref v))
-                            if matches!(v, horizon_core::nbt::Tag::Compound(c) if c.len() == 1)
-                                && match v.get("damage") {
-                                    Some(horizon_core::nbt::Tag::Int(_)) => true,
-                                    Some(horizon_core::nbt::Tag::Compound(bounds)) => {
-                                        bounds.iter().all(|(key, value)| {
-                                            matches!(key.to_string_lossy().as_str(), "min" | "max")
-                                                && matches!(value, horizon_core::nbt::Tag::Int(_))
-                                        })
-                                    }
-                                    _ => false,
-                                } =>
-                        {
-                            let removed = stack
-                                .data()
-                                .is_some_and(|data| data.other("!minecraft:damage").is_some());
-                            let has_damage = !removed
-                                && (present.is_some()
-                                    || self.items().get(&stack.item).is_some_and(|item| {
-                                        item.components.iter().any(|c| c == "minecraft:damage")
-                                    }));
-                            let n = i64::from(stack.damage);
-                            has_damage
-                                && match v.get("damage").unwrap() {
-                                    horizon_core::nbt::Tag::Int(exact) => n == i64::from(*exact),
-                                    bounds => {
-                                        let get = |key| match bounds.get(key) {
-                                            Some(horizon_core::nbt::Tag::Int(value)) => {
-                                                Some(i64::from(*value))
-                                            }
-                                            _ => None,
-                                        };
-                                        get("min").is_none_or(|min| n >= min)
-                                            && get("max").is_none_or(|max| n <= max)
-                                    }
-                                }
-                        }
-                        (_, Some(v)) => present.is_some_and(|have| {
-                            horizon_client::nbt_path::compare_nbt(&v, Some(have))
-                        }),
-                        _ => false,
-                    }
-                }
-                // Count is a pseudo-component, not a catalog component.
-                _ if id == "minecraft:count" => present.is_some(),
-                _ => self.stack_component_present(stack, &id),
-            };
-            result != negated
-        };
-        split_top_level(inner, ',')
-            .iter()
-            .filter(|t| !t.trim().is_empty())
-            .all(|term| split_top_level(term, '|').iter().any(|alt| test(alt)))
+        item_predicate::stack_matches(self, predicate, stack)
     }
     /// `ItemPredicateArgument.createComponentExistencePredicate`: the stack's
     /// effective component presence, with its patch ahead of its prototype.
+    #[allow(dead_code)]
     fn stack_component_present(&self, stack: &ItemStack, id: &str) -> bool {
-        // Read the modeled patch before saved-default elision. A removal wins
-        // even when the actual item prototype supplies the component.
-        if let Some(patch) = horizon_client::item_data::components_tag(stack.damage, stack.data()) {
-            if patch.get(&format!("!{id}")).is_some() {
-                return false;
-            }
-            if patch.get(id).is_some() {
-                return true;
-            }
-        }
-        self.items()
-            .get(&stack.item)
-            .is_some_and(|item| item.components.iter().any(|key| key == id))
+        item_predicate::stack_component_present(self, stack, id)
     }
     fn cmd_clear(&mut self, ctx: &Context) -> R<i32> {
         let targets = if ctx.get("targets").is_some() {
@@ -3977,6 +3738,12 @@ impl Game<'_> {
         let Some(Arg::Resource(s)) = ctx.get("structure").cloned() else {
             return Ok(0);
         };
+        if !self.structure_exists(&s) {
+            return Err(CommandError::new(Text::tr(
+                "commands.locate.structure.invalid",
+                &[&s],
+            )));
+        }
         let names = self.structure_names(&s);
         let from = origin.map(|v| v.floor() as i32);
         let found = self.end.locator().and_then(|t| t.locate(&names, from, 100));
@@ -4004,6 +3771,30 @@ impl Game<'_> {
         ));
         Ok(distance)
     }
+    /// `LocateCommand.getHolders`: an id the structure registry lacks, or a
+    /// tag no source defines, is no structure at all.
+    fn structure_exists(&self, structure: &str) -> bool {
+        match structure.strip_prefix('#') {
+            Some(tag) => self.tag_exists("worldgen/structure", tag),
+            None => self
+                .ui
+                .registries
+                .ids("minecraft:worldgen/structure")
+                .iter()
+                .any(|id| id == structure),
+        }
+    }
+    /// Whether the game's files or a world pack define the tag of `registry`.
+    fn tag_exists(&self, registry: &str, tag: &str) -> bool {
+        let (ns, path) = tag.split_once(':').unwrap_or(("minecraft", tag));
+        self.tag_file(registry, ns, path).is_some_and(|f| f.is_file())
+            || self
+                .fns
+                .store
+                .files
+                .get(&format!("tags/{ns}:{registry}/{path}"))
+                .is_some_and(|files| !files.is_empty())
+    }
     /// The structures `LocateCommand.locateStructure` searches for: an id, or
     /// a `#tag`'s members.
     pub(super) fn structure_names(&self, structure: &str) -> Vec<String> {
@@ -4016,6 +3807,24 @@ impl Game<'_> {
     pub(super) fn structure_tag(&self, tag: &str) -> Vec<String> {
         self.tag_entries("worldgen/structure", tag)
     }
+    /// The game's file of tag `ns:path` of `registry`, or `None` when a part of
+    /// the id is no path segment vanilla would read (`FileUtil.isValidPathSegment`),
+    /// so a tag such as `#../..` never reaches outside the game's files.
+    fn tag_file(&self, registry: &str, ns: &str, path: &str) -> Option<std::path::PathBuf> {
+        let segment = |s: &str| {
+            !s.is_empty()
+                && s != "."
+                && s != ".."
+                && s.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.' | b'_')
+                })
+        };
+        (segment(ns) && path.split('/').all(segment)).then(|| {
+            self.options
+                .resources
+                .join(format!("data/{ns}/tags/{registry}/{path}.json"))
+        })
+    }
     /// The entries of a data pack tag of `registry`, nested tags expanded.
     pub(super) fn tag_entries(&self, registry: &str, tag: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -4026,10 +3835,7 @@ impl Game<'_> {
                 continue;
             }
             let (ns, path) = t.split_once(':').unwrap_or(("minecraft", &t));
-            let file = self
-                .options
-                .resources
-                .join(format!("data/{ns}/tags/{registry}/{path}.json"));
+            let file = self.tag_file(registry, ns, path);
             // The game's file and the world's packs' both count, entries
             // joined in resource-stack order; a pack file with `replace`
             // drops what the lower sources put in (`TagLoader.load`).
@@ -4041,8 +3847,8 @@ impl Game<'_> {
                 .into_iter()
                 .flatten()
                 .filter_map(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
-            let parsed = std::fs::read(file)
-                .ok()
+            let parsed = file
+                .and_then(|f| std::fs::read(f).ok())
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                 .into_iter()
                 .chain(packed);
@@ -4135,9 +3941,33 @@ impl Game<'_> {
                 }
                 Text::translate("chat.type.announcement", &[name, message])
             }
+            "me" if self.lan.is_some() && self.command_source.is_some_and(|s| s.entity.is_none()) => {
+                // EmoteCommands from a source that is no player (the console, a command block):
+                // every player gets it, an unsigned announcement like `say`'s, and the log keeps it.
+                let line = Text::translate("chat.type.emote", &[name.clone(), message.clone()]);
+                if let Some(host) = &self.lan {
+                    use horizon_client::lan::data::component_nbt;
+                    host.hub.broadcast_source_chat(
+                        "emote_command",
+                        component_nbt(&name.component()),
+                        component_nbt(&message.component()),
+                        None,
+                    );
+                }
+                if self.is_dedicated_server() {
+                    self.lan_log_event(horizon_client::lan::hub::HostEvent::Chat {
+                        line: line.plain(),
+                        secure: false,
+                    });
+                }
+                return Ok(1);
+            }
             "me" => Text::translate("chat.type.emote", &[name, message]),
             _ => {
-                let _ = self.entities(ctx, "targets", true)?;
+                let targets = self.entities(ctx, "targets", true)?;
+                if self.command_source.is_some_and(|s| s.entity.is_none()) {
+                    return Ok(self.whisper_from_source(&targets, &name, &message));
+                }
                 // Whispering to yourself: the incoming and outgoing lines.
                 let out = Text::translate(
                     "commands.message.display.outgoing",
@@ -4189,8 +4019,45 @@ impl Game<'_> {
         );
         Ok(1)
     }
+    /// `MsgCommand.sendMessage` from a source that is no player (the console, a command block): the
+    /// source is told the outgoing line of each target, and each player of the server gets the incoming
+    /// one. The count of targets is the command's result.
+    fn whisper_from_source(&mut self, targets: &[Target], name: &Text, message: &Text) -> i32 {
+        for &t in targets {
+            let outgoing = Text::translate(
+                "commands.message.display.outgoing",
+                &[self.target_name(t), message.clone()],
+            )
+            .with_color(text::GRAY)
+            .italic();
+            self.feedback_unbroadcast(outgoing);
+        }
+        let connections: Vec<u32> = targets
+            .iter()
+            .filter_map(|t| match t {
+                Target::Guest(conn) => Some(*conn),
+                _ => None,
+            })
+            .collect();
+        if let Some(host) = &self.lan {
+            let guests: Vec<usize> = host
+                .hub
+                .guests
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| connections.contains(&g.conn))
+                .map(|(k, _)| k)
+                .collect();
+            host.hub.whisper_from_source(
+                &guests,
+                horizon_client::lan::data::component_nbt(&name.component()),
+                &message.plain(),
+            );
+        }
+        targets.len() as i32
+    }
     /// MessageArgument: `@p`-style selectors in a message become names.
-    pub(super) fn expand_selectors(&mut self, raw: &str) -> Text {
+    pub(in crate::game) fn expand_selectors(&mut self, raw: &str) -> Text {
         let mut out = Text::empty();
         let mut rest = raw;
         while let Some(at) = rest.find('@') {
@@ -4912,210 +4779,8 @@ mod selector_bounds_tests {
 }
 
 #[cfg(test)]
-mod local_coordinate_command_tests {
-    use super::*;
-    use crate::game::native_entity_refs::tests::with_game;
-    use horizon_core::nbt::Tag;
-    use horizon_core::position::BlockPos;
-
-    fn pos_bits(tag: &Tag) -> [u64; 3] {
-        let Some(Tag::List(pos)) = tag.get("Pos") else {
-            panic!("actual saved Double position missing")
-        };
-        assert_eq!(pos.len(), 3);
-        std::array::from_fn(|i| match &pos[i] {
-            Tag::Double(bits) => *bits,
-            other => panic!("actual Pos must be Double: {other:?}"),
-        })
-    }
-    #[test]
-    #[ignore = "daily"]
-    fn h149_actual_registered_local_commands_preserve_exact_saved_positions() {
-        with_game(|game| {
-            game.build_registries();
-            game.set_allow_commands(true);
-            game.world.chunks.insert(
-                (0, 0),
-                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
-            );
-            game.block_ticks
-                .add_empty_chunk(BlockPos::new(0, 0, 0).chunk())
-                .unwrap();
-            assert!(game.run_command("forceload add 0 0"));
-            assert!(game.run_command("fill 0 199 0 15 199 15 stone"));
-            assert!(game.run_command("scoreboard objectives add h149 dummy"));
-            let clock = game.world.game_time;
-            let mut failures = Vec::new();
-            let cases = [
-                (
-                    "south",
-                    "execute positioned 8.5 202.25 8.5 rotated 0.0 0.0 run tp 00000095-0000-0001-0000-000000000001 ^0.75 ^0.5 ^1.25",
-                    [
-                        0x4022800000000000u64,
-                        0x4069580000000000u64,
-                        0x4023800000000000u64,
-                    ],
-                    false,
-                ),
-                (
-                    "west",
-                    "execute positioned 8.5 202.25 8.5 rotated 90.0 0.0 run tp 00000095-0000-0001-0000-000000000002 ^0.75 ^0.5 ^1.25",
-                    [
-                        0x401d000000000000u64,
-                        0x4069580000000000u64,
-                        0x4022800000000000u64,
-                    ],
-                    false,
-                ),
-                (
-                    "north",
-                    "execute positioned 8.5 202.25 8.5 rotated 180.0 0.0 run tp 00000095-0000-0001-0000-000000000003 ^0.75 ^0.5 ^1.25",
-                    [
-                        0x401f000000000000u64,
-                        0x4069580000000000u64,
-                        0x401d000000000000u64,
-                    ],
-                    false,
-                ),
-                (
-                    "east",
-                    "execute positioned 8.5 202.25 8.5 rotated 270.0 0.0 run tp 00000095-0000-0001-0000-000000000004 ^0.75 ^0.5 ^1.25",
-                    [
-                        0x4023800000000000u64,
-                        0x4069580000000000u64,
-                        0x401f000000000000u64,
-                    ],
-                    false,
-                ),
-                (
-                    "oblique",
-                    "execute positioned 8.5 202.25 8.5 rotated 37.5 -22.25 run tp 00000095-0000-0001-0000-000000000005 ^0.1 ^0.1 ^0.1",
-                    [
-                        0x402117934a6314b9u64,
-                        0x40694c2c5ee98f58u64,
-                        0x40213562572e889au64,
-                    ],
-                    false,
-                ),
-                (
-                    "positioned_oblique",
-                    "execute positioned 8.5 202.25 8.5 rotated 123.75 47.125 positioned ^0.1 ^0.1 ^0.1 run tp 00000095-0000-0001-0000-000000000006 ~ ~ ~",
-                    [
-                        0x4020a7648c7aa86bu64,
-                        0x406947d514129374u64,
-                        0x4021025e8b180036u64,
-                    ],
-                    false,
-                ),
-                (
-                    "world",
-                    "execute positioned 8.5 202.25 8.5 rotated 37.5 -22.25 run tp 00000095-0000-0001-0000-000000000007 9.25 202.75 9.75",
-                    [
-                        0x4022800000000000u64,
-                        0x4069580000000000u64,
-                        0x4023800000000000u64,
-                    ],
-                    true,
-                ),
-                (
-                    "relative_eyes",
-                    "execute positioned 8.5 202.25 8.5 rotated 37.5 -22.25 anchored eyes run tp 00000095-0000-0001-0000-000000000008 ~0.75 ~0.5 ~1.25",
-                    [
-                        0x4022800000000000u64,
-                        0x4069580000000000u64,
-                        0x4023800000000000u64,
-                    ],
-                    true,
-                ),
-                (
-                    "feet",
-                    "execute as 00000095-0000-0001-0000-000000000009 at @s anchored feet rotated 37.5 -22.25 run tp @s ^ ^ ^",
-                    [
-                        0x4012000000000000u64,
-                        0x4069000000000000u64,
-                        0x4012000000000000u64,
-                    ],
-                    true,
-                ),
-                (
-                    "eyes",
-                    "execute as 00000095-0000-0001-0000-00000000000a at @s anchored eyes rotated 37.5 -22.25 run tp @s ^ ^ ^",
-                    [
-                        0x4012000000000000u64,
-                        0x4069187ae1400000u64,
-                        0x4012000000000000u64,
-                    ],
-                    true,
-                ),
-            ];
-            for (i, (name, command, want, control)) in cases.into_iter().enumerate() {
-                let number = i as i32 + 1;
-                let actor = format!("00000095-0000-0001-0000-{number:012x}");
-                let uuid = [149, 1, 0, number];
-                assert!(game.run_command(&format!(r#"summon pig 4.5 200 4.5 {{UUID:[I;149,1,0,{number}],Tags:["h149"],Health:10f,NoAI:1b,NoGravity:1b,Silent:1b,PersistenceRequired:1b,Motion:[0d,0d,0d],Rotation:[11f,7f]}}"#)));
-                let id = *game
-                    .persist
-                    .uuids
-                    .iter()
-                    .find(|(_, u)| **u == uuid)
-                    .unwrap()
-                    .0;
-                assert!(game.mobs.iter().any(|m| m.id == id));
-                assert!(game.run_command(&format!("execute if entity @e[type=pig,nbt={{UUID:[I;149,1,0,{number}],Health:10f,NoAI:1b,NoGravity:1b,Pos:[4.5d,200d,4.5d],Motion:[0d,0d,0d],Rotation:[11f,7f]}}]")));
-                assert!(game.world.loaded(4, 4));
-                let before = game.command_target_nbt(Target::Mob(id)).unwrap();
-                assert_eq!(pos_bits(&before), [4.5f64, 200.0, 4.5].map(f64::to_bits));
-                assert_eq!(before.get("UUID"), Some(&Tag::IntArray(uuid.to_vec())));
-                assert_eq!(before.get("Health"), Some(&Tag::Float(10f32.to_bits())));
-                // Discard retained raw input: only actual modeled position may prove this.
-                game.persist.raw.remove(&id);
-                assert!(game.run_command("scoreboard players set #r h149 91"));
-                assert!(game.run_command("scoreboard players set #s h149 17"));
-                assert!(
-                game.run_command(&format!(
-                    "execute store result score #r h149 store success score #s h149 run {command}"
-                )),
-                "actual command accepted: {name}"
-            );
-                assert_eq!(game.score.board.score("#r", "h149").unwrap().value, 1);
-                assert_eq!(game.score.board.score("#s", "h149").unwrap().value, 1);
-                let model = game.mobs.iter().find(|m| m.id == id).unwrap();
-                let model_bits =
-                    [model.position.x, model.position.y, model.position.z].map(f64::to_bits);
-                let saved = game.command_target_nbt(Target::Mob(id)).unwrap();
-                let got = pos_bits(&saved);
-                assert_eq!(
-                    model_bits, got,
-                    "actual model and typed canonical save agree: {name}"
-                );
-                assert_eq!(saved.get("UUID"), before.get("UUID"));
-                for key in ["Health", "NoAI", "NoGravity", "Rotation", "Motion"] {
-                    assert_eq!(saved.get(key), before.get(key), "unchanged {key}: {name}");
-                }
-                assert!(
-                    game.run_command(&format!("execute as {actor} at @s if block ~ 199 ~ stone"))
-                );
-                assert!(game.world.loaded(
-                    f64::from_bits(got[0]).floor() as i32,
-                    f64::from_bits(got[2]).floor() as i32,
-                ));
-                if control {
-                    assert_eq!(
-                        got, want,
-                        "independent world/relative/anchor control {name}"
-                    );
-                } else if got != want {
-                    failures.push((name, got, want));
-                }
-                assert_eq!(game.world.game_time, clock, "zero observation ticks");
-            }
-            assert!(
-                failures.is_empty(),
-                "actual registered local-coordinate bit mismatches: {failures:#?}"
-            );
-        });
-    }
-}
+#[path = "local_coordinate_command_tests.rs"]
+mod local_coordinate_command_tests;
 
 #[cfg(test)]
 mod query_feedback_tests {
@@ -5309,20 +4974,25 @@ mod forced_respawn_tests {
         with_game(|game| {
             game.build_registries();
             game.set_allow_commands(true);
-            for pos in [[1_000_000, 1024, -1_000_000], [-29_999_999, -1024, 29_999_999]] {
+            for pos in [
+                [1_000_000, 1024, -1_000_000],
+                [-29_999_999, -1024, 29_999_999],
+            ] {
                 assert!(!game.world.chunks.contains_key(&(pos[0] >> 4, pos[2] >> 4)));
-                assert!(game.run_command(&format!(
-                    "setworldspawn {} {} {}",
-                    pos[0], pos[1], pos[2]
-                )));
+                assert!(
+                    game.run_command(&format!("setworldspawn {} {} {}", pos[0], pos[1], pos[2]))
+                );
                 assert_eq!(game.level.world_spawn, Some(pos));
             }
             let previous = game.level.world_spawn;
-            for pos in [[30_000_000, 64, 0], [0, 20_000_000, 0], [0, 64, -30_000_001]] {
-                assert!(!game.run_command(&format!(
-                    "setworldspawn {} {} {}",
-                    pos[0], pos[1], pos[2]
-                )));
+            for pos in [
+                [30_000_000, 64, 0],
+                [0, 20_000_000, 0],
+                [0, 64, -30_000_001],
+            ] {
+                assert!(
+                    !game.run_command(&format!("setworldspawn {} {} {}", pos[0], pos[1], pos[2]))
+                );
                 assert_eq!(game.level.world_spawn, previous);
             }
         });

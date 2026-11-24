@@ -208,11 +208,14 @@ pub(super) fn potion_cloud_to_nbt(c: &Breath, uuid: [i32; 4], raw: Option<&Tag>)
     };
     let at = Vec3::new(c.at[0], c.at[1], c.at[2]);
     let motion = Vec3::new(c.motion[0], c.motion[1], c.motion[2]);
+    // A loaded cloud keeps the Rotation it was saved with (`Entity.load`);
+    // the model has no slot for it, so the saved compound supplies it.
+    let rotation = raw.map_or([0.0; 2], horizon_client::entity_nbt::loaded_rotation);
     let mut tag = horizon_client::entity_nbt::entity_base_tag(
         "minecraft:area_effect_cloud",
         at,
         motion,
-        [0.0, 0.0],
+        rotation,
         uuid,
         raw,
     );
@@ -888,7 +891,7 @@ impl Game<'_> {
             self.particles.add(&options, at, [0.0; 3]);
             self.lan_send_particles(super::lan_particles::QueuedParticle {
                 dimension: self.dim.id(),
-                options,
+                options: options.into(),
                 state: None,
                 at,
                 spread: [0.0; 3],
@@ -1114,6 +1117,12 @@ impl Game<'_> {
                     if cancel {
                         return;
                     }
+                    horizon_client::hunger::native_living_heal_cause(
+                        &self.loop_context,
+                        player.entity_id as u32,
+                        "magic",
+                        amount,
+                    );
                 }
                 EffectAction::Heal(amount)
             }
@@ -1252,6 +1261,11 @@ impl Game<'_> {
         } else {
             Vec::new()
         };
+        let active_effects: Vec<mod_api::EffectKey> = effects
+            .list
+            .iter()
+            .filter_map(|e| e.registry_index.and_then(mod_api::__private::effect_key_by_index))
+            .collect();
         let (actions, raid_omen_added) = effects.tick_with(
             &mut |e, t, actions, dispatch| {
                 for action in actions.drain(..) {
@@ -1291,6 +1305,7 @@ impl Game<'_> {
                         health,
                         max_health,
                         food,
+                        &active_effects,
                     );
                     let registry = &self.motion.health.damage;
                     actions.extend(changes.into_iter().filter_map(|change| {
@@ -1520,12 +1535,20 @@ impl Game<'_> {
         health: f32,
         max_health: f32,
         food: Option<PlayerFood>,
+        active_effects: &[mod_api::EffectKey],
     ) -> (bool, Vec<EffectTickChange>) {
         let mut apply = false;
         self.native_should_apply_effect_tick_this_tick(effect, tick_count, amplifier, &mut apply);
         let mut keep = true;
         let mut changes = Vec::new();
         if apply {
+            if let Some(owner) = mod_api::__private::effect_index(effect)
+                .and_then(horizon_client_core::potions::effect_by_index)
+                .and_then(|def| def.owner)
+            {
+                mod_api::__private::set_effect_owner(effect, owner);
+            }
+            let _active = mod_api::__private::scope_active_tick_effects(active_effects);
             self.native_apply_effect_tick(mod_api::__private::ApplyEffectTickCall {
                 effect,
                 dimension: self.dim.id(),
@@ -1907,6 +1930,26 @@ impl Game<'_> {
     /// five-tick doses, with each victim's configured reapplication delay.
     /// False once the cloud is gone.
     fn tick_potion_cloud(&mut self, c: &mut Breath, players: &[FightPlayer]) -> bool {
+        // `Entity.baseTick`: an `AreaEffectCloud` is fire-immune, so a positive
+        // loaded `Fire` is cleared on its first tick (a load keeps it as given).
+        if let Some(raw) = self.persist.raw.get_mut(&c.id) {
+            horizon_client::entity_nbt::clear_positive_fire(raw);
+        }
+        // `Entity.baseTick` -> `updateFluidInteraction`: a cloud whose box (`radius * 2`
+        // wide, 0.5 high) is in water resets the fall distance it was loaded with.
+        if c.potion.is_some() {
+            let r = f64::from(c.radius);
+            let bounds = Aabb::new(
+                Vec3::new(c.at[0] - r, c.at[1], c.at[2] - r),
+                Vec3::new(c.at[0] + r, c.at[1] + 0.5, c.at[2] + r),
+            );
+            if self.bounds_in_water(bounds)
+                && let Some(Tag::Compound(raw)) = self.persist.raw.get_mut(&c.id)
+                && raw.contains_key(&"fall_distance".into())
+            {
+                raw.insert("fall_distance".into(), Tag::Double(0.0_f64.to_bits()));
+            }
+        }
         c.age = c.age.wrapping_add(1);
         let Some(potion) = c.potion.as_mut() else {
             return true;
@@ -2711,6 +2754,16 @@ impl horizon_client::mobs::ModEffectTicks for Game<'_> {
         let Some(effect) = mod_api::__private::effect_key_by_index(effect) else {
             return true;
         };
+        let active_effects: Vec<mod_api::EffectKey> = mob
+            .extra
+            .effects
+            .iter()
+            .filter_map(|e| {
+                e.registry_index
+                    .and_then(mod_api::__private::effect_key_by_index)
+                    .or_else(|| mod_api::__private::effect_key(e.id))
+            })
+            .collect();
         let (keep, changes) = self.mod_effect_tick(
             effect,
             Some(mob.id as i32),
@@ -2720,6 +2773,7 @@ impl horizon_client::mobs::ModEffectTicks for Game<'_> {
             mob.health,
             mob.attrs.max_health,
             None,
+            &active_effects,
         );
         for change in changes {
             match change {
@@ -2839,6 +2893,32 @@ mod tests {
         });
     }
 
+    /// A loaded cloud keeps `Fire` as given until its first tick, which clears
+    /// a positive value only (`Entity.baseTick` of a fire-immune entity).
+    #[test]
+    #[ignore = "daily"]
+    fn a_cloud_clears_a_positive_fire_on_its_tick_and_keeps_a_negative_one() {
+        crate::game::native_entity_refs::tests::with_game(|game| {
+            game.breath_clouds.clear();
+            for _ in 0..2 {
+                game.spawn_creeper_cloud([0.0, 80.0, 0.0], Vec::new(), Vec::new(), Vec::new(), 0);
+            }
+            let burning = game.breath_clouds[0].id;
+            let frozen_fire = game.breath_clouds[1].id;
+            for (id, snbt) in [(burning, "{Fire:300s}"), (frozen_fire, "{Fire:-5s}")] {
+                let (tag, _) = horizon_core::nbt::parse_snbt(snbt).unwrap();
+                game.persist.raw.insert(id, tag);
+            }
+            let fire = |game: &crate::game::Game<'_>, id| {
+                horizon_client::save::number(game.persist.raw[&id].get("Fire"))
+            };
+            assert_eq!(fire(game, burning), Some(300));
+            game.tick_potion_clouds();
+            assert_eq!(fire(game, burning), Some(0));
+            assert_eq!(fire(game, frozen_fire), Some(-5));
+        });
+    }
+
     #[test]
     #[ignore = "daily"]
     fn residency_cloud_load_expiry_bottling_and_late_ids() {
@@ -2927,7 +3007,8 @@ mod tests {
             "test-potions",
             Box::new(TestMod),
         )]));
-        assert!(brewing::register_mod_effects([(
+        assert!(brewing::register_mod_effects_owned([(
+            "test-potions".into(),
             "test:effect".into(),
             0,
             brewing::Category::Neutral,

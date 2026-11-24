@@ -4,7 +4,7 @@
 //! A wasm mod is a member of its dependency group, linked at load by the game
 //! (`horizon-mod-wasm`): one memory, one copy of std and of each library mod. So every member is
 //! a position-independent shared module built by one pinned toolchain, with std built from
-//! source (`-Zbuild-std`) so its symbols are the same in every member. This tool is also the
+//! source (`-Zbuild-std`) so its symbols are the same in every member, whichever host built it (the\n//! wrapper gives std crates a host-free disambiguator). This tool is also the
 //! link step (cargo calls it as the linker, with `HORIZON_MOD_LINK` set): the std member links
 //! std whole and exports it; a mod leaves std and its library mods out, to resolve to theirs.
 use horizon_mod_package::manifest::{MANIFEST, WASM, sha512_of};
@@ -24,7 +24,7 @@ const LLD_ENV: &str = "HORIZON_MOD_LLD";
 /// The library mods' crate names, comma-separated, that a member leaves out.
 const PROVIDED_ENV: &str = "HORIZON_MOD_PROVIDED";
 const PROFILE: &str = "horizon-wasm";
-const FLAGS: &str = "-Crelocation-model=pic -Zshare-generics=n -Zdefault-visibility=hidden --cfg=horizon_shared_artifacts_v2";
+const FLAGS: &str = "-Crelocation-model=pic -Zshare-generics=n -Zdefault-visibility=hidden --cfg=horizon_shared_artifacts_v3";
 
 /// Guest boundary exports, kept even though they originate in an rlib dependency.
 const GUEST_EXPORTS: &[&str] = &["horizon_layout", "horizon_in", "horizon_hook"];
@@ -199,9 +199,14 @@ fn std_member(target_dir: &Path, toolchain: &Toolchain) -> Result<Vec<u8>, Strin
         "[package]\nname = \"horizon-wasm-std\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n",
     )
     .map_err(|e| e.to_string())?;
+    // The array's length is the transport's own value, which the game checks
+    // (`horizon_group_words`) when it links a group.
+    let words = mod_vocab::wire::GROUP_WORDS;
     std::fs::write(
         dir.join("src/lib.rs"),
-        "// The group's one std: linked whole and exported. The array is the group's shared state: word 0\n// points at its handler table, word 1 counts its cache budget, word 2 guards eviction, words 3.. are eviction callbacks\n// (`horizon_mod_api::wire::guest`).\n#[unsafe(no_mangle)]\npub static horizon_group_state: [core::sync::atomic::AtomicUsize; 32] =\n    [const { core::sync::atomic::AtomicUsize::new(0) }; 32];\n",
+        format!(
+            "// The group's one std: linked whole and exported. The array is the group's shared state (`horizon_mod_api::wire::guest`).\n#[unsafe(no_mangle)]\npub static horizon_group_state: [core::sync::atomic::AtomicUsize; {words}] =\n    [const {{ core::sync::atomic::AtomicUsize::new(0) }}; {words}];\n/// The array's length, which the game checks.\n#[unsafe(no_mangle)]\npub extern \"C\" fn horizon_group_words() -> u32 {{\n    {words}\n}}\n"
+        ),
     )
     .map_err(|e| e.to_string())?;
     let mut command = cargo_command("rustc", "std", &dir, target_dir, toolchain)?;
@@ -232,22 +237,12 @@ pub fn wasm_std(args: &[String]) -> Result<(), String> {
     let target = std::env::current_dir()
         .map_err(|e| e.to_string())?
         .join("target/horizon-mod");
-    std::fs::write(out, std_member(&target, &toolchain)?).map_err(|e| format!("{out}: {e}"))?;
-    if let Some(input) = super::flag(&args[1..], "--catalog") {
-        let path = Path::new(out)
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("points.json");
-        let bytes = std::fs::read(input).map_err(|e| format!("{input}: {e}"))?;
-        std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    }
-    Ok(())
+    std::fs::write(out, std_member(&target, &toolchain)?).map_err(|e| format!("{out}: {e}"))
 }
 
-fn registrations(
-    manifest: &toml_edit::DocumentMut,
-    catalog: Option<&Path>,
-) -> Result<(String, String), String> {
+/// Parse the member's manifest as the package will, so a refused one (`[[inject]]` among them)
+/// fails before the build.
+fn validate(manifest: &toml_edit::DocumentMut) -> Result<(), String> {
     let mut parsed = manifest.clone();
     if !parsed.contains_key("wasm") {
         let mut wasm = toml_edit::Table::new();
@@ -255,49 +250,11 @@ fn registrations(
         wasm["toolchain"] = toml_edit::value("pending");
         parsed["wasm"] = toml_edit::Item::Table(wasm);
     }
-    let parsed = horizon_mod_package::Manifest::parse(&parsed.to_string())?;
-    let (registrations, point_names) = if parsed.inject.is_empty() {
-        (String::new(), "[]".to_owned())
-    } else {
-        let std_member = std::env::var_os("HORIZON_WASM_STD")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::current_exe()
-                    .ok()
-                    .map(|p| p.with_file_name("horizon-wasm-std.wasm"))
-            });
-        let default_catalog = std_member.and_then(|p| p.parent().map(|p| p.join("points.json")));
-        let path = catalog.map(Path::to_path_buf).or(default_catalog).ok_or(
-            "[[inject]] requires --catalog <points.json> or HORIZON_WASM_STD beside points.json",
-        )?;
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("{}: {e}; supply --catalog <points.json>", path.display()))?;
-        let (_, json): (_, Value) =
-            horizon_mod_package::build_data::read(horizon_mod_package::build_data::POINTS, &text)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-        let points: Vec<horizon_mod_point_emit::Point> =
-            serde_json::from_value(json["points"].clone())
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-        let expressions = horizon_mod_point_emit::api(&parsed, &points, "crate::")
-            .map_err(|e| format!("{}:{e}", parsed.id))?;
-        let names = horizon_mod_point_emit::places(&parsed, &points)
-            .map_err(|e| format!("{}:{e}", parsed.id))?;
-        let registrations = expressions
-            .iter()
-            .map(|e| {
-                format!("mod_points::register(&{e}).expect(\"validated guest API listener\");\n")
-            })
-            .collect();
-        (
-            registrations,
-            serde_json::to_string(&names).map_err(|e| e.to_string())?,
-        )
-    };
-    Ok((registrations, point_names))
+    horizon_mod_package::Manifest::parse(&parsed.to_string()).map(drop)
 }
 
-pub fn build(root: &Path, catalog: Option<&Path>, additional: &[PathBuf]) -> Result<(), String> {
-    group::build(root, catalog, additional)
+pub fn build(root: &Path, additional: &[PathBuf]) -> Result<(), String> {
+    group::build(root, additional)
 }
 
 fn member_export(name: &str) -> bool {
@@ -307,12 +264,7 @@ fn member_export(name: &str) -> bool {
 }
 
 fn group_export(name: &str, krate: &str) -> bool {
-    if GUEST_EXPORTS.contains(&name)
-        || name == "horizon_layout_ext"
-        || name == "horizon_mod_points_register"
-        || name == "horizon_mod_points_seal"
-        || name.starts_with("__wasm_")
-    {
+    if GUEST_EXPORTS.contains(&name) || name.starts_with("__wasm_") {
         return true;
     }
     let Ok(symbol) = rustc_demangle::try_demangle(name) else {
@@ -450,9 +402,6 @@ pub fn link(role: &str, args: Vec<String>) -> Result<(), String> {
         out.push("-Bsymbolic".to_owned());
         for name in GUEST_EXPORTS {
             out.push(format!("--export={name}"));
-        }
-        if std::env::var("HORIZON_GUEST_REGISTRATIONS").is_ok_and(|s| !s.is_empty()) {
-            out.push("--export=horizon_layout_ext".to_owned());
         }
     }
     let status = Command::new(&lld)
@@ -630,15 +579,9 @@ mod export_tests {
 #[cfg(test)]
 mod refusal_tests {
     #[test]
-    fn wasm_registration_refusal_names_mod_target_and_type() {
-        let dir = std::env::temp_dir().join(format!("horizon-wire-refusal-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let catalog = dir.join("points.json");
-        std::fs::write(&catalog, r#"{"schema":1,"build":{"commit":"c"},"points":[{"target":"game::tick","name":"tick","at_return":true,"api_refusal":"argument 1 `value` (`&RegistrationData`) has no API type yet"}]}"#).unwrap();
-        let manifest = "id = 'addon'\nname = 'Addon'\nversion = '1.0.0'\napi = '0.2'\ncapabilities = ['registries']\n[[inject]]\nid = 'before'\nat = 'game::tick'\nkind = 'head'\nwith = 'before'\nhash = 'pin'\n".parse().unwrap();
-        assert_eq!(
-            super::registrations(&manifest, Some(&catalog)).unwrap_err(),
-            "addon:before: no API listener at game::tick: argument 1 `value` (`&RegistrationData`) has no API type yet"
-        );
+    fn a_member_declaring_inject_is_refused_as_removed() {
+        let manifest = "id = 'addon'\nname = 'Addon'\nversion = '1.0.0'\napi = '0.2'\ncapabilities = ['registries']\n[[inject]]\nid = 'before'\nat = 'game::tick'\nkind = 'head'\nwith = 'before'\n".parse().unwrap();
+        let error = super::validate(&manifest).unwrap_err();
+        assert!(error.contains("[[inject]] was removed"), "{error}");
     }
 }

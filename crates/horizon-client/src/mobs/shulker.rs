@@ -49,9 +49,23 @@ pub fn peek_height_scale(m: &Mob) -> Option<f32> {
     (m.extra.variant3 == DOWN && peek > 0.0).then_some(1.0 + peek)
 }
 
+/// `Shulker.finalizeSpawn`: a new shulker faces yaw 0 (`setYRot(0.0F)`), its body follows (`yBodyRot`), and
+/// `setOldPosAndRot` brings the previous rotations (and the head's, which a creation path drew at random) to
+/// it. Only the spawn path calls it: a shulker loaded from NBT keeps its saved `Rotation`.
+pub fn finalize_spawn(m: &mut Mob) {
+    if m.species() == crate::mobs::Species::Shulker {
+        m.yaw = 0.0;
+        m.previous_yaw = 0.0;
+        m.body_yaw = 0.0;
+        m.previous_body_yaw = 0.0;
+        m.head_yaw = 0.0;
+        m.previous_head_yaw = 0.0;
+        m.previous_head_pitch = m.head_pitch;
+    }
+}
+
 pub fn register(m: &mut Mob) {
     m.no_gravity = true;
-    m.yaw = 0.0;
     m.body_yaw = 0.0;
     m.previous_body_yaw = 0.0;
     if m.extra.color == 0 && m.extra.variant == 0 {
@@ -525,9 +539,10 @@ pub fn keep_eased_peek(slot: &mut Mob, old: &Mob) {
 /// [`shell_tick`].
 pub fn tick(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
     m.velocity = Vec3::ZERO;
+    // `LivingEntity.travel` still moves it by that zero motion: the move meets
+    // nothing below, so `setOnGroundWithMovement` clears a loaded `OnGround`.
+    m.on_ground = false;
     m.body_yaw = 0.0;
-    m.yaw = 0.0;
-    m.head_pitch = 0.0;
     shell_tick(m, w, events);
 }
 /// `Shulker.tick`'s own part, which runs with or without AI: a shell that
@@ -900,30 +915,30 @@ impl Goal for Peek {
     }
 }
 /// The shell's texture: plain or dyed.
-pub fn texture(m: &Mob) -> String {
+pub fn texture(m: &Mob) -> &'static str {
     const COLORS: [&str; 16] = [
-        "white",
-        "orange",
-        "magenta",
-        "light_blue",
-        "yellow",
-        "lime",
-        "pink",
-        "gray",
-        "light_gray",
-        "cyan",
-        "purple",
-        "blue",
-        "brown",
-        "green",
-        "red",
-        "black",
+        "entity/shulker/shulker_white",
+        "entity/shulker/shulker_orange",
+        "entity/shulker/shulker_magenta",
+        "entity/shulker/shulker_light_blue",
+        "entity/shulker/shulker_yellow",
+        "entity/shulker/shulker_lime",
+        "entity/shulker/shulker_pink",
+        "entity/shulker/shulker_gray",
+        "entity/shulker/shulker_light_gray",
+        "entity/shulker/shulker_cyan",
+        "entity/shulker/shulker_purple",
+        "entity/shulker/shulker_blue",
+        "entity/shulker/shulker_brown",
+        "entity/shulker/shulker_green",
+        "entity/shulker/shulker_red",
+        "entity/shulker/shulker_black",
     ];
     // Shulker.getColor: the saved byte is signed; 16 and above are undyed, and
     // DyeColor.byId sends a negative id to white (OutOfBoundsStrategy.ZERO).
     match m.extra.color as i8 {
-        16.. => "entity/shulker/shulker".into(),
-        c => format!("entity/shulker/shulker_{}", COLORS[c.max(0) as usize]),
+        16.. => "entity/shulker/shulker",
+        c => COLORS[c.max(0) as usize],
     }
 }
 /// `attachFace.getOpposite().getRotation()` by attach face: the open
@@ -1224,6 +1239,22 @@ mod tests {
         assert_eq!(posted(&events), ["minecraft:container_close"]);
     }
 
+    /// `Shulker.setDeltaMovement` is empty: a hit's knockback leaves the shell where it is.
+    #[test]
+    fn a_hit_does_not_move_a_shulker() {
+        let mut m = shulker();
+        m.on_ground = true;
+        m.knockback(
+            &mut crate::health::TestLevel::new(0).level(),
+            0.4,
+            3.0,
+            -4.0,
+            &Damage::of(crate::mobs::DamageKind::Thrown),
+            1.0,
+        );
+        assert_eq!(m.velocity, Vec3::ZERO);
+    }
+
     /// A shulker fixed to a block face.
     pub(super) fn shulker() -> Mob {
         let mut kind = kind();
@@ -1341,6 +1372,19 @@ mod tests {
         assert_eq!(m.extra.counter, 0);
         assert_eq!(m.extra.scratch[0], 0);
         assert_eq!(render_offset(&m, 0.0), glam::DVec3::ZERO);
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn loaded_rotation_survives_a_shulker_tick() {
+        assert!(crate::mobs::world::with_test_world(&[], |world, _| {
+            let mut m = shulker();
+            m.yaw = 73.0;
+            m.head_pitch = -24.0;
+            register(&mut m);
+            tick(&mut m, world, &mut Vec::new());
+            assert_eq!([m.yaw, m.head_pitch], [73.0, -24.0]);
+        }));
     }
 
     #[test]

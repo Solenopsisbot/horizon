@@ -20,6 +20,7 @@ mod management_tls;
 mod mcp;
 mod panel;
 mod process;
+mod proxy;
 mod prune;
 mod query;
 mod rcon;
@@ -49,8 +50,8 @@ horizon-server: host a Horizon (Minecraft Java Edition 26.3) server
 Usage: horizon-server [--dir DIR] <command>
 
   init        Set up a server here: the EULA, the world, the port, who may join (asks, or takes flags:
-              --eula --world NAME --seed SEED --port N --whitelist/--no-whitelist --player NAME... --op NAME
-              --offline --yes)
+              --eula --world NAME --seed SEED --level-type ID --generator-settings JSON|@FILE --port N
+              --whitelist/--no-whitelist --player NAME... --op NAME --offline --yes)
   run         Run the server in the foreground; type console commands, Ctrl-C stops it cleanly. It
               restarts the game if it crashes.
   start       Run the server in the background, or resume a stopped supervisor (output goes to logs/supervisor.log)
@@ -90,8 +91,8 @@ Usage: horizon-server [--dir DIR] <command>
               The settings in server.toml
   config set KEY=VALUE... [--json]
               Change settings (for example world.difficulty=hard server.max_players=10), checked first;
-              a running server takes the difficulty, default game mode and whitelist at once, the rest
-              at its next start
+              a running server takes the difficulty, default game mode, whitelist, message of the day,
+              player limit and the backup and update settings at once, the rest at its next start
   import FILE Write server.toml from a vanilla server.properties
   import-resources DIR
               Copy game files prepared elsewhere (by the launcher or horizon-prepare) into place, after
@@ -222,6 +223,17 @@ fn init_answers(args: &[String]) -> Result<init::Answers, String> {
             "--yes" | "-y" => answers.yes = true,
             "--world" => answers.world = Some(value(arg)?),
             "--seed" => answers.seed = Some(value(arg)?),
+            "--level-type" => answers.level_type = Some(value(arg)?),
+            // Inline JSON, or `@FILE` for the JSON in a file.
+            "--generator-settings" => {
+                let given = value(arg)?;
+                answers.generator_settings = Some(match given.strip_prefix('@') {
+                    Some(file) => std::fs::read_to_string(file)
+                        .map(|json| json.trim().to_owned())
+                        .map_err(|e| format!("--generator-settings {given}: {e}"))?,
+                    None => given,
+                });
+            }
             "--port" => {
                 answers.port = Some(
                     value(arg)?

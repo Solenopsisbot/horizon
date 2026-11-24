@@ -5,14 +5,18 @@
 //! sense to load when that mod's data is in the root.
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-/// Enabled package IDs captured by the engine for one owning data load.
-/// Readers share this immutable view; they never recover IDs from namespaces.
+const VANILLA_FEATURE: &str = "minecraft:vanilla";
+
+/// Package IDs and feature flags captured by the engine for one owning data load.
+/// Readers share this immutable view instead of inferring it from resource namespaces.
 /// Resource selection happens before evaluating ordinary JSON files. Stacked
 /// tags and data maps instead evaluate each layer before merge or replace.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LoadConditions {
     mods: Vec<String>,
+    features: Option<Arc<[String]>>,
     registered: Option<RegisteredLookup>,
     diagnostics: Diagnostics,
 }
@@ -22,6 +26,7 @@ impl LoadConditions {
     pub const fn vanilla() -> Self {
         Self {
             mods: Vec::new(),
+            features: None,
             registered: None,
             diagnostics: Diagnostics::new(),
         }
@@ -39,9 +44,26 @@ impl LoadConditions {
         mods.dedup();
         Self {
             mods,
+            features: None,
             registered: None,
             diagnostics: Diagnostics::default(),
         }
+    }
+
+    /// Capture an owning world's feature flags before registration and resource evaluation.
+    /// World-less loads use the built-in vanilla flag through [`Self::new`].
+    pub fn for_features<'a>(ids: impl IntoIterator<Item = &'a str>, features: &[String]) -> Self {
+        Self {
+            // An empty list is a save's default: vanilla's flag alone.
+            features: (!features.is_empty() && features != [VANILLA_FEATURE])
+                .then(|| features.into()),
+            ..Self::new(ids)
+        }
+    }
+
+    /// Explicit flags when the data load differs from vanilla's default feature set.
+    pub fn feature_flags(&self) -> Option<&Arc<[String]>> {
+        self.features.as_ref()
     }
 
     /// Use the recipe source's inventory while retaining this candidate's
@@ -134,7 +156,19 @@ impl LoadConditions {
 
     /// Evaluate a resource, constructing its path only for registered handlers or diagnostics.
     pub fn allows_id(&self, file: &Value, kind: &str, id: &str) -> bool {
-        self.allows_context(file, || {
+        self.allows_id_with_items(file, kind, id, None)
+    }
+
+    /// [`Self::allows_id`] for a load that knows its items and item tags, so
+    /// `neoforge:item_exists` and `neoforge:tag_empty` are answered.
+    pub fn allows_id_with_items(
+        &self,
+        file: &Value,
+        kind: &str,
+        id: &str,
+        items: Option<&dyn ItemFacts>,
+    ) -> bool {
+        self.allows_context(file, items, || {
             let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
             format!("data/{namespace}/{kind}/{path}.json")
         })
@@ -142,22 +176,29 @@ impl LoadConditions {
 
     /// Evaluate a resource whose namespace and path are stored separately.
     pub fn allows_parts(&self, file: &Value, kind: &str, namespace: &str, path: &str) -> bool {
-        self.allows_context(file, || format!("data/{namespace}/{kind}/{path}.json"))
+        self.allows_context(file, None, || {
+            format!("data/{namespace}/{kind}/{path}.json")
+        })
     }
 
     /// Evaluate a folder resource without joining paths in the no-mod fast path.
     pub fn allows_path(&self, file: &Value, directory: &std::path::Path, name: &str) -> bool {
-        self.allows_context(file, || {
+        self.allows_context(file, None, || {
             directory.join(format!("{name}.json")).display().to_string()
         })
     }
 
     /// Evaluate once per entry and payload, outside the diagnostics mutex.
     pub fn allows_file(&self, file: &Value, path: &str) -> bool {
-        self.allows_context(file, || path.to_owned())
+        self.allows_context(file, None, || path.to_owned())
     }
 
-    fn allows_context(&self, file: &Value, context: impl FnOnce() -> String) -> bool {
+    fn allows_context(
+        &self,
+        file: &Value,
+        items: Option<&dyn ItemFacts>,
+        context: impl FnOnce() -> String,
+    ) -> bool {
         let Some(payload) = file.get("neoforge:conditions") else {
             return true;
         };
@@ -166,17 +207,31 @@ impl LoadConditions {
             // The ordinary path uses only borrowed nodes and a boolean. No path,
             // argument copy, name set, cache key or diagnostics lock is needed.
             let mut unknown = false;
-            let answer = evaluate(file, &loaded, &|_, _| None, &BTreeMap::new(), &mut |_| {
-                unknown = true
-            })
+            let answer = evaluate(
+                file,
+                &loaded,
+                self.features.as_deref(),
+                items,
+                &|_, _| None,
+                &BTreeMap::new(),
+                &mut |_| unknown = true,
+            )
             .expect("empty lookup cannot fail");
             if !unknown {
                 return answer;
             }
             let mut names = BTreeSet::new();
-            let _ = evaluate(file, &loaded, &|_, _| None, &BTreeMap::new(), &mut |name| {
-                names.insert(name.to_owned());
-            });
+            let _ = evaluate(
+                file,
+                &loaded,
+                self.features.as_deref(),
+                items,
+                &|_, _| None,
+                &BTreeMap::new(),
+                &mut |name| {
+                    names.insert(name.to_owned());
+                },
+            );
             self.report_unknown(&context(), names);
             return answer;
         };
@@ -192,18 +247,13 @@ impl LoadConditions {
             .0
             .as_ref()
             .expect("owning candidate diagnostics");
-        let cell = state
-            .lock()
-            .unwrap()
-            .cache
-            .entry((path.to_owned(), payload.to_string()))
-            .or_default()
-            .clone();
-        *cell.get_or_init(|| {
+        let answer = || {
             let mut unknown = BTreeSet::new();
             let result = evaluate(
                 file,
                 &loaded,
+                self.features.as_deref(),
+                items,
                 &*registered.0.lookup,
                 &registered.0.owned,
                 &mut |name| {
@@ -216,15 +266,28 @@ impl LoadConditions {
             match result {
                 Ok(answer) => answer,
                 Err(error) => {
-                    state
-                        .lock()
-                        .unwrap()
-                        .errors
-                        .push(format!("{path}: {error}"));
+                    let error = format!("{path}: {error}");
+                    let mut state = state.lock().unwrap();
+                    if !state.errors.contains(&error) {
+                        state.errors.push(error);
+                    }
                     false
                 }
             }
-        })
+        };
+        // Every load that reaches this candidate shares its cache. An answer that
+        // asked a load's items holds for those items only, so it isn't kept.
+        if items.is_some() {
+            return answer();
+        }
+        let cell = state
+            .lock()
+            .unwrap()
+            .cache
+            .entry((path.to_owned(), payload.to_string()))
+            .or_default()
+            .clone();
+        *cell.get_or_init(answer)
     }
 
     fn report_unknown(&self, path: &str, names: BTreeSet<String>) {
@@ -336,6 +399,50 @@ impl std::hash::Hash for RegisteredLookup {
 /// Whether a package is enabled for the owning data load.
 pub type ModLoaded<'a> = dyn Fn(&str) -> bool + 'a;
 
+/// The items and item tags of the owning data load, which NeoForge's
+/// `neoforge:item_exists` (`item`) and `neoforge:tag_empty` (`tag`, an item
+/// tag) ask about. `None` means the load can't tell; the condition then stays
+/// unknown, as in a load that has no item facts at all.
+pub trait ItemFacts {
+    fn item_exists(&self, id: &str) -> Option<bool>;
+    fn item_tag_empty(&self, tag: &str) -> Option<bool>;
+}
+
+/// A condition's item or tag id with vanilla's default namespace.
+fn resource_id(id: &str) -> std::borrow::Cow<'_, str> {
+    if id.contains(':') {
+        id.into()
+    } else {
+        format!("minecraft:{id}").into()
+    }
+}
+
+fn feature_enabled(flags: Option<&[String]>, namespace: &str, path: &str) -> bool {
+    flags.map_or_else(
+        || namespace == "minecraft" && path == "vanilla",
+        |flags| {
+            flags
+                .iter()
+                .any(|flag| flag.split_once(':') == Some((namespace, path)))
+        },
+    )
+}
+
+fn feature_id(id: &str) -> Option<(&str, &str)> {
+    let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
+    let namespace = if namespace.is_empty() {
+        "minecraft"
+    } else {
+        namespace
+    };
+    let valid = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_.-".contains(&c);
+    (!path.is_empty()
+        && namespace != ".."
+        && namespace.bytes().all(valid)
+        && path.bytes().all(|c| valid(c) || c == b'/'))
+    .then_some((namespace, path))
+}
+
 /// Evaluate built-in conditions with an empty registration lookup.
 pub fn conditions_hold(v: &Value, loaded: &ModLoaded) -> bool {
     conditions_hold_with_lookup(v, loaded, &|_, _| None, &BTreeMap::new())
@@ -350,12 +457,14 @@ pub fn conditions_hold_with_lookup(
     lookup: &ConditionLookup,
     owned: &BTreeMap<String, String>,
 ) -> Result<bool, String> {
-    evaluate(v, loaded, lookup, owned, &mut |_| {})
+    evaluate(v, loaded, None, None, lookup, owned, &mut |_| {})
 }
 
 fn evaluate(
     v: &Value,
     loaded: &ModLoaded,
+    features: Option<&[String]>,
+    items: Option<&dyn ItemFacts>,
     lookup: &ConditionLookup,
     owned: &BTreeMap<String, String>,
     unknown: &mut dyn FnMut(&str),
@@ -363,21 +472,45 @@ fn evaluate(
     fn hold(
         c: &Value,
         loaded: &ModLoaded,
+        features: Option<&[String]>,
+        items: Option<&dyn ItemFacts>,
         lookup: &ConditionLookup,
         owned: &BTreeMap<String, String>,
         unknown: &mut dyn FnMut(&str),
     ) -> Result<Option<bool>, String> {
+        // The item conditions are answered where the load knows its items; elsewhere
+        // they fall through to the lookup and stay unknown.
+        let fact = items.and_then(|facts| match c["type"].as_str()? {
+            "neoforge:item_exists" => facts.item_exists(&resource_id(c["item"].as_str()?)),
+            "neoforge:tag_empty" => facts.item_tag_empty(&resource_id(c["tag"].as_str()?)),
+            _ => None,
+        });
+        if let Some(answer) = fact {
+            return Ok(Some(answer));
+        }
         Ok(match c["type"].as_str() {
             Some("neoforge:mod_loaded") => Some(c["modid"].as_str().is_some_and(loaded)),
             Some("neoforge:true") => Some(true),
-            Some("neoforge:not") => hold(&c["value"], loaded, lookup, owned, unknown)?.map(|v| !v),
+            Some("neoforge:false") => Some(false),
+            Some("neoforge:feature_flags_enabled") => c["flags"]
+                .as_array()
+                .filter(|flags| !flags.is_empty())
+                .and_then(|flags| {
+                    flags.iter().try_fold(true, |all, flag| {
+                        let (namespace, path) = feature_id(flag.as_str()?)?;
+                        Some(all & feature_enabled(features, namespace, path))
+                    })
+                }),
+            Some("neoforge:not") => {
+                hold(&c["value"], loaded, features, items, lookup, owned, unknown)?.map(|v| !v)
+            }
             Some(kind @ ("neoforge:and" | "neoforge:or")) => {
                 // Visit every child: an unknown node invalidates the whole file,
                 // including after a sibling already determines its boolean result.
                 let mut answer = kind == "neoforge:and";
                 let mut known = true;
                 for child in c["values"].as_array().into_iter().flatten() {
-                    match hold(child, loaded, lookup, owned, unknown)? {
+                    match hold(child, loaded, features, items, lookup, owned, unknown)? {
                         Some(value) => {
                             if kind == "neoforge:and" {
                                 answer &= value;
@@ -410,7 +543,8 @@ fn evaluate(
     }
     let mut allowed = true;
     for condition in v["neoforge:conditions"].as_array().into_iter().flatten() {
-        allowed &= hold(condition, loaded, lookup, owned, unknown)?.unwrap_or(false);
+        allowed &=
+            hold(condition, loaded, features, items, lookup, owned, unknown)?.unwrap_or(false);
     }
     Ok(allowed)
 }
@@ -457,6 +591,80 @@ mod tests {
             LoadConditions::new(["minecraft"]),
             LoadConditions::vanilla()
         );
+    }
+
+    /// A save with no enabled_features list runs vanilla's default set.
+    #[test]
+    fn an_empty_feature_list_is_vanilla() {
+        let conditions = LoadConditions::for_features(["gem"], &[]);
+        assert!(conditions.feature_flags().is_none());
+        assert!(conditions.allows(&json!({"neoforge:conditions":[{
+            "type":"neoforge:feature_flags_enabled", "flags":["minecraft:vanilla"]
+        }]})));
+    }
+
+    struct GemItems;
+    impl ItemFacts for GemItems {
+        fn item_exists(&self, id: &str) -> Option<bool> {
+            Some(matches!(id, "gem:ruby" | "minecraft:stick"))
+        }
+        fn item_tag_empty(&self, tag: &str) -> Option<bool> {
+            Some(tag != "c:ingots/copper")
+        }
+    }
+
+    /// NeoForge's item conditions are answered where the load knows its items,
+    /// and stay unknown, leaving the file out, where it doesn't.
+    #[test]
+    fn item_conditions_ask_the_loads_items() {
+        let conditions = LoadConditions::new(["gem"]);
+        let file = |c: Value| json!({"neoforge:conditions": [c]});
+        let allows = |c: Value| {
+            conditions.allows_id_with_items(&file(c), "recipe", "gem:x", Some(&GemItems))
+        };
+        assert!(allows(
+            json!({"type": "neoforge:item_exists", "item": "gem:ruby"})
+        ));
+        assert!(allows(
+            json!({"type": "neoforge:item_exists", "item": "stick"})
+        ));
+        assert!(!allows(
+            json!({"type": "neoforge:item_exists", "item": "gem:topaz"})
+        ));
+        assert!(!allows(
+            json!({"type": "neoforge:tag_empty", "tag": "c:ingots/copper"})
+        ));
+        assert!(allows(
+            json!({"type": "neoforge:tag_empty", "tag": "c:ingots/tin"})
+        ));
+        assert!(allows(json!({"type": "neoforge:not",
+            "value": {"type": "neoforge:tag_empty", "tag": "c:ingots/copper"}})));
+        assert!(!allows(json!({"type": "neoforge:false"})));
+        let without_items = file(json!({"type": "neoforge:item_exists", "item": "gem:ruby"}));
+        assert!(!conditions.allows(&without_items));
+    }
+
+    struct Present(&'static [&'static str]);
+    impl ItemFacts for Present {
+        fn item_exists(&self, id: &str) -> Option<bool> {
+            Some(self.0.contains(&id))
+        }
+        fn item_tag_empty(&self, _: &str) -> Option<bool> {
+            Some(true)
+        }
+    }
+
+    /// A candidate with registered handlers caches its answers, and every load that
+    /// reaches it shares them: an answer about items holds for the load that asked.
+    #[test]
+    fn item_answers_hold_for_the_items_that_gave_them() {
+        let conditions = LoadConditions::new(["gem"]).with_lookup(BTreeMap::new(), |_, _| None);
+        let file = json!({"neoforge:conditions": [
+            {"type": "neoforge:item_exists", "item": "gem:ruby"}]});
+        let with = Present(&["gem:ruby"]);
+        let without = Present(&[]);
+        assert!(conditions.allows_id_with_items(&file, "recipe", "gem:x", Some(&with)));
+        assert!(!conditions.allows_id_with_items(&file, "recipe", "gem:x", Some(&without)));
     }
 
     fn loaded(id: &str) -> bool {

@@ -11,15 +11,6 @@
    "jobs": 14,
    "exclude": {}
   },
-  "desktop": {
-   "ssh": "desktop",
-   "root": ".actions-runners/horizon/parity-host",
-   "shell": "systemd-run --user --scope --quiet --slice=horizon-ci.slice --unit=horizon-parity-worker-$$ bash -c",
-   "setup": "test ! -e ~/.actions-runners/horizon/paused && set -a && . ~/.actions-runners/horizon/.env && set +a && export PATH=$(cat ~/.actions-runners/horizon/.path) && eval \"$(vscreen env)\"",
-   "jobs": 8,
-   "nice": 19,
-   "note": "ludodesktop, the maintainer's own machine: only while nobody uses it (tools/ci/runner_pause.py: screen locked or untouched for 15 min, no game; a paused desktop refuses workers and stops the running ones, whose harnesses then run here); 8 jobs at most, in the CI runner's environment and slice"
-  },
   "playhorizon": {
    "ssh": "ludovic@playhorizon",
    "root": ".actions-runners/horizon/parity-host",
@@ -36,6 +27,23 @@
     "remote_fireworks": "fails here even alone, at bare main 3b19c386c (2 of 2 runs and the retry), and passes on the Mac mini: the guest's sparks are gone by its trail screenshot (same CPU starvation as remote_fireball; a private Xvfb on CPUs 0-3 did not help) - 2026-10-27"
    },
    "note": "a partner's server (Ubuntu, 8 EPYC threads, 30 GB, Detroit; tailnet only), its CI runner has CPUs 4-7, so workers get 0-3 (as tools/remote.sh runs do) and 3 jobs, in the CI runner's environment, slice and Xvfb screen (tools/ci/linux-runner.sh); the always-on Linux host since the ThinkPad stopped running harnesses (2026-10-26)"
+  },
+  "hosted": {
+   "note": "Not a worker: the hosted runners without a GPU that .github/workflows/parity-hosted.yml uses. tools/parity_plan.py --hosted leaves these out, and local_only, named_only and (but with --known-failing, as main's full runs) known_failing too, and lists them as not run there.",
+   "exclude": {
+    "ambient_sound": "needs the vanilla sounds, which the hosted runners' data leaves out (tools/ci/fetch-vanilla-data.sh)",
+    "audio_attributes": "needs the vanilla sounds, which the hosted runners' data leaves out (tools/ci/fetch-vanilla-data.sh)",
+    "music": "needs the vanilla sounds, which the hosted runners' data leaves out (tools/ci/fetch-vanilla-data.sh)",
+    "situational_music": "needs the vanilla sounds, which the hosted runners' data leaves out (tools/ci/fetch-vanilla-data.sh)",
+    "sound_engine": "needs the vanilla sounds, which the hosted runners' data leaves out (tools/ci/fetch-vanilla-data.sh)",
+    "sound_event": "needs the vanilla sounds, which the hosted runners' data leaves out (tools/ci/fetch-vanilla-data.sh)",
+    "subtitle": "needs the vanilla sounds, which the hosted runners' data leaves out (tools/ci/fetch-vanilla-data.sh)",
+    "pack_screen": "needs the vanilla languages besides en_us, which the hosted runners' data leaves out",
+    "creative": "its oracle loads fr_fr beside en_us (localized tooltip search), which the hosted runners' data leaves out: EmptyTranslationsException on 2026-11-23",
+    "entity_model": "reads the decompiled client sources, which the hosted runners' data leaves out",
+    "datafix": "upgrades worlds made with the official server jars of 1.18.2 to 26.2, which the hosted runners' data leaves out",
+    "redstone_catalog": "downloads its schematics from the network while it runs"
+   }
   }
  },
  "local_only": {
@@ -56,10 +64,6 @@
   "lan_integration": "the whole lan_e2e suite: ~40 min a run on a loaded runner, and single checks flake under load; run it by name, or tools/lan_e2e.py",
   "wire_stream": "a real vanilla 26.3 client on a virtual screen beside a vanilla server and a headless Horizon client, ~15 min a run; run it by name (before a pull request that changes what the client sends) or nightly",
   "command_exec": "1 or 2 of its 19,566 commands differ in every run on main since #15161, other ones each time, on all three runners (#15158, #15316): most gameplay changes select it, so every such pull request and parity-main fail; back in automatic runs with the fix",
-  "use_item_on": "fails on main whatever a pull request changes since #14900 (#15320): placing a jukebox that holds a record posts a block_change event vanilla doesn't; back in automatic runs with the fix",
-  "recipe_book_view": "fails on main whatever a pull request changes since #14910 (#15321): a recipe search also matches item ids, so 4 of 1200 cases show recipes vanilla doesn't; back in automatic runs with the fix",
-  "block_entity_render": "fails on main whatever a pull request changes since #11899 (#15322): the decorated pot's base has no face normals, 16 of 455 cases; back in automatic runs with the fix",
-  "fishing_hook_entities": "fails on main in most runs since 2026-11-10 (#15323): a summoned boat moves away and the hook doesn't catch it; back in automatic runs with the fix",
   "arrow_mob_permission": "capture-preserving harness: needs --work-dir (a fresh capture folder) and --reference-dir, which an automatic run doesn't pass, so it fails at startup whatever changed",
   "boat_passenger_tree": "capture-preserving harness: needs --work-dir (a fresh capture folder) and --reference-dir, which an automatic run doesn't pass, so it fails at startup whatever changed",
   "command_damage_range": "capture-preserving harness: needs --work-dir (a fresh capture folder) and --reference-dir, which an automatic run doesn't pass, so it fails at startup whatever changed",
@@ -77,13 +81,24 @@
   "shulker_lock_drop": "capture-preserving harness: needs --work-dir (a fresh capture folder) and --reference-dir, which an automatic run doesn't pass, so it fails at startup whatever changed",
   "pot_hopper": "capture-preserving harness: needs --work-dir (a fresh capture folder) and --reference-dir, which an automatic run doesn't pass, so it fails at startup whatever changed",
   "stand_lodestone": "capture-preserving harness: needs --work-dir (a new capture folder), --reference-dir and --binary, which an automatic run doesn't pass, so it fails at startup whatever changed",
-  "hoglin_repeat_attack": "has never passed on CI since #12823 added it, and fails whatever a pull request changes (#15158): the pig's HurtTime and health after repeated hits differ; take it off this list with the fix",
-  "last_hurt_by_mob": "has never passed on CI since #12843 added it, and fails whatever a pull request changes (#15158): a pig summoned with last_hurt_by_mob loses it, and the saved key order differs; take it off this list with the fix",
   "mob_command_damage_vibration": "has never passed on CI since #11179 added it, and fails whatever a pull request changes (#15158): 25 of 184 records differ, mostly sensor messages; take it off this list with the fix"
  },
  "known_flaky": {
   "world_reopen": "counted 4 minecarts instead of 3 once on a loaded Mac mini runner, then passed at the same head (10-26)",
   "lunge_motion": "a loaded Mac mini runner: the server catches up with two ticks for one of the jump's moves (Alice falls a tick of gravity more, -0.3015 vs -0.2277; the harness now names it), and vanilla's own run once sent an extra motion while sprinting; the same trees pass alone (#5656, 11-01)",
-  "server_wool_vibration": "real-time dedicated servers: the player cases send one client position per 50 ms sleep, so on a loaded machine the sensor's phase check sometimes runs before or after the landing (shrieker-jump-stone, Horizon's side, 1 of 4 runs on playhorizon at load 15-25, 11-07); the drop and corpse leaks between cow and item cases are cleared in the harness"
+  "server_wool_vibration": "real-time dedicated servers: walk-stone missed Horizon's active sensor in 29 of 35 parity-main tries from 11-19 (#18133). Suspected cause: the phase was read 1 to 3 ticks before the sensor's 30 active ticks ended (hosted, 11-20: active 10-39 on vanilla and 12-41 on Horizon, read at 38-39). The hosted reads landed inside both windows, so the failure did not reproduce there. The walks are stepped a tick at a time since, compared tick by tick (the same on both servers); the other cases still run in real time. Off the list once parity-main passes it with no retry"
+ },
+ "known_failing": {
+  "block_removal": "#18133: keeps banner_patterns:[] on dropped banners; no `set` record when a block-entity block is replaced",
+  "command_parse": "#18133: SNBT error text and empty-suggestion ranges differ from Brigadier",
+  "crafter": "#18133: hopper minecart slot0 record missing",
+  "datafix": "#18133: runner's .local resolves into shared-local, so every shard refuses its default root",
+  "dispenser": "#18133: container-entity slot0 and sapling-growth `set` records missing",
+  "dragon_render": "#18133: dragon tests exit 101; Rust log not in the artifact",
+  "portal_cooldown": "#18133: cooldown test fails; Rust log not in the artifact",
+  "save_roundtrip": "#18133: level.dat gains fml and horizon keys",
+  "sculk_saved_fields": "#18133: placed sensor/shrieker vibration fields read back as 0",
+  "seed_sync": "#18133: summoned armor stand gets a different UUID",
+  "server_resource_pack": "#18133: extra config custom_payload horizon:payloads"
  }
 }

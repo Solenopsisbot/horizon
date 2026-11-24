@@ -216,8 +216,8 @@ impl Game<'_> {
         let keys: Vec<_> = self
             .world
             .block_entities
-            .iter()
-            .filter_map(|(k, e)| matches!(e, BlockEntity::Beacon(_)).then_some(*k))
+            .listed(horizon_client::block_entities::Listed::Beacon)
+            .map(|(k, _)| *k)
             .collect();
         for key in keys {
             let Some((lease, BlockEntity::Beacon(mut b))) = self.world.block_entities.take(&key)
@@ -551,12 +551,14 @@ impl Game<'_> {
         });
         self.render_transparent_background("beacon", batch);
         let atlas = &self.gui.atlas;
-        if let Some(mut r) = atlas.sprites.get("gui/container/beacon").copied() {
-            let (du, dv) = ((r.u1 - r.u0) / r.w as f32, (r.v1 - r.v0) / r.h as f32);
-            r.u1 = r.u0 + 230.0 * du;
-            r.v1 = r.v0 + HEIGHT * dv;
-            batch.rect_uv(bx, by, 230.0, HEIGHT, r, u32::MAX);
-        }
+        // `BeaconScreen.extractBackground`.
+        batch.texture_blit_baked(
+            atlas,
+            "gui/container/beacon",
+            [bx, by, 230.0, HEIGHT],
+            [0.0; 2],
+            [256.0; 2],
+        );
         self.draw_screen_phase(batch, horizon_client::screen_draw::RenderPhase::Background);
         let label = 0xFFE0_E0E0;
         for (key, fallback, cx) in [
@@ -712,12 +714,24 @@ impl Game<'_> {
         }
         let test_beams: Vec<_> = world
             .block_entities
-            .iter()
+            .boxes()
             .filter_map(|(k, e)| Some((*k, self.test_instance_beam(e)?)))
             .collect();
-        for (k, e) in &world.block_entities {
+        for (k, e) in world
+            .block_entities
+            .listed(horizon_client::block_entities::Listed::Beacon)
+        {
             if let Some(sections) = beam(e) {
-                self.far_beacons.insert(*k, sections.to_vec());
+                match self.far_beacons.get_mut(k) {
+                    Some(kept) if kept.as_slice() == sections => {}
+                    Some(kept) => {
+                        kept.clear();
+                        kept.extend_from_slice(sections);
+                    }
+                    None => {
+                        self.far_beacons.insert(*k, sections.to_vec());
+                    }
+                }
             }
         }
         for (k, sections) in test_beams {

@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fast_bins  # noqa: E402
 import lab  # noqa: E402
 from integration_env import run_game  # noqa: E402
 from test_dedicated_server_parity import Server  # noqa: E402
@@ -71,11 +72,11 @@ def main():
     shutil.rmtree(out, ignore_errors=True)
     out.mkdir(parents=True)
     if args.bin_dir:
-        binary = Path(args.bin_dir) / 'horizon-client'
+        binary = lab.binary(Path(args.bin_dir), 'horizon-client')
     else:
-        subprocess.run(['cargo', 'build', '--profile', 'fast', '-p', 'horizon-game', '--bin', 'horizon-client'],
+        subprocess.run(fast_bins.command('horizon-client'),
                        cwd=ROOT, check=True)
-        binary = Path(lab.cargo_target()) / 'fast' / 'horizon-client'
+        binary = lab.binary(Path(lab.cargo_target()) / 'fast', 'horizon-client')
     port = lab.free_port()
     directory = out / 'server'
     directory.mkdir()

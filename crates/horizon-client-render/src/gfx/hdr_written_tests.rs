@@ -25,7 +25,6 @@ override TEST_OVERLAY: u32 = 0u;
     let own = globals.colored_lights[0];
     o.color = vec4(select(vec3(0.8, 1.0, 0.7), own.rgb, own.a > 0.0) * shade,
         select(1.0, 0.5, globals.misc.z > 0.5));
-    o.scene = vec2(15.0);
     o.spherical = globals.misc.x;
     o.cylindrical = globals.misc.x;
     o.visibility = globals.misc.y;
@@ -837,6 +836,38 @@ fn float_plain_fragments_keep_rgb_and_write_only_coverage() {
         }
     }
     eprintln!("plain float GPU ran {cases} colour/coverage comparisons");
+}
+
+#[test]
+fn native_model_and_fluid_store_linear_light_and_keep_coverage() {
+    let _gpu = crate::gfx::test_gpu::lock();
+    let Some(adapter) = crate::gfx::test_gpu::adapter() else {
+        return;
+    };
+    let (device, queue) = crate::gfx::test_gpu::device(&adapter);
+    let globals = super::super::Globals {
+        fog_color: [0.2, 0.3, 0.4, 1.0],
+        fog: [0.0, 100.0, 0.0, 100.0],
+        filtering: [0.0, 1.0, 0.0, 0.0],
+        ..bytemuck::Zeroable::zeroed()
+    };
+    let mut draw = Draw::new(&device, &queue, true, &globals, 180);
+    draw.raw = true;
+    for (entry, coverage) in [("fs_native_model", 1.0), ("fs_native_fluid", 180.0 / 255.0)] {
+        draw.constants.clear();
+        let gamma = draw.render(true, entry, 0, 0, [0.0; 4]);
+        draw.constants.push(("FRAME_LINEAR", 1.0));
+        let linear = draw.render(true, entry, 0, 0, [0.0; 4]);
+        for channel in 0..3 {
+            let expected = gamma[channel].powf(2.2);
+            assert!(
+                (linear[channel] - expected).abs() < 0.001,
+                "{entry}: gamma {gamma:?}, linear {linear:?}"
+            );
+        }
+        assert!((gamma[3] - coverage).abs() < 0.001, "{entry}: {gamma:?}");
+        assert!((linear[3] - coverage).abs() < 0.001, "{entry}: {linear:?}");
+    }
 }
 
 #[test]

@@ -5,9 +5,10 @@ use horizon_client::{
     items::ItemStack,
     scoreboard_cmd::{Holder, Tracker},
     text::Text,
-    worldborder::{MAX_CENTER, MAX_SIZE},
 };
-use horizon_core::{position::ChunkPos, random::RandomSource};
+#[cfg(test)]
+use horizon_core::position::ChunkPos;
+use horizon_core::random::RandomSource;
 
 /// `LocationCheck.test` / `BlockPredicate`: the measured loaded block-state subset.
 fn loot_location_block(
@@ -64,24 +65,12 @@ fn loot_location_block(
 fn num(n: impl std::fmt::Display) -> Text {
     Text::literal(n.to_string())
 }
-fn chunk_text(x: i32, z: i32) -> Text {
-    Text::literal(format!("[{x}, {z}]"))
-}
 fn holder(text: Text) -> Holder {
     Holder {
         name: String::new(),
         text,
         display: None,
     }
-}
-fn ticks_to_seconds(ticks: i64) -> String {
-    super::percent_f(ticks as f64 / 20.0, 2)
-}
-/// `WorldBorderCommand.ERROR_TOO_BIG`'s argument: vanilla hands the message the
-/// double `5.9999968E7` (the value `setSize` compares against too), and a `%s`
-/// substitution prints a double with `Double.toString`.
-fn size_limit_text() -> String {
-    horizon_core::java_number::double_to_string(MAX_SIZE)
 }
 
 /// Whose hand `LootCommand.getSourceHandItem` reads a `mainhand` or `offhand` tool from.
@@ -137,215 +126,13 @@ impl Game<'_> {
     }
     /// `ForceLoadCommand.changeForceLoad`: update and load each newly forced column in order.
     pub(super) fn cmd_forceload(&mut self, id: &str, ctx: &Context) -> R<i32> {
-        let dim = Text::literal(self.dim.id());
-        match id {
-            "forceload.query" if ctx.get("pos").is_none() => {
-                let mut forced: Vec<(i32, i32)> =
-                    self.streaming.commanded().iter().copied().collect();
-                // ForceLoadCommand sorts its LongStream before formatting chunks.
-                forced.sort_unstable_by_key(|&(x, z)| ChunkPos::new(x, z).pack());
-                if forced.is_empty() {
-                    self.command_failure(Text::translate("commands.forceload.added.none", &[dim]));
-                    return Ok(0);
-                }
-                let list = forced
-                    .iter()
-                    .map(|(x, z)| format!("[{x}, {z}]"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let message = if forced.len() == 1 {
-                    Text::translate(
-                        "commands.forceload.list.single",
-                        &[dim, Text::literal(list)],
-                    )
-                } else {
-                    Text::translate(
-                        "commands.forceload.list.multiple",
-                        &[num(forced.len()), dim, Text::literal(list)],
-                    )
-                };
-                self.feedback(message);
-                Ok(forced.len() as i32)
-            }
-            "forceload.query" => {
-                let [x, z] = self.column_arg(ctx, "pos")?;
-                let key = (x >> 4, z >> 4);
-                if self.streaming.commanded().contains(&key) {
-                    self.feedback(Text::translate(
-                        "commands.forceload.query.success",
-                        &[chunk_text(key.0, key.1), dim],
-                    ));
-                    Ok(1)
-                } else {
-                    Err(err(
-                        "commands.forceload.query.failure",
-                        &[&chunk_text(key.0, key.1).plain(), &dim.plain()],
-                    ))
-                }
-            }
-            "forceload.remove.all" => {
-                self.streaming.clear_forced();
-                self.feedback(Text::translate("commands.forceload.removed.all", &[dim]));
-                Ok(0)
-            }
-            _ => {
-                let add = id == "forceload.add";
-                let from = self.column_arg(ctx, "from")?;
-                let to = if ctx.get("to").is_some() {
-                    self.column_arg(ctx, "to")?
-                } else {
-                    from
-                };
-                let (min_x, max_x) = (from[0].min(to[0]), from[0].max(to[0]));
-                let (min_z, max_z) = (from[1].min(to[1]), from[1].max(to[1]));
-                if min_x < -30_000_000
-                    || min_z < -30_000_000
-                    || max_x >= 30_000_000
-                    || max_z >= 30_000_000
-                {
-                    return Err(err("argument.pos.outofworld", &[]));
-                }
-                let (cx0, cx1, cz0, cz1) = (min_x >> 4, max_x >> 4, min_z >> 4, max_z >> 4);
-                let count = i64::from(cx1 - cx0 + 1) * i64::from(cz1 - cz0 + 1);
-                if count > 256 {
-                    return Err(err("commands.forceload.toobig", &[&256, &count]));
-                }
-                let mut tracker = Tracker::default();
-                for x in cx0..=cx1 {
-                    for z in cz0..=cz1 {
-                        let changed = self.streaming.set_forced_loaded(&mut self.world, x, z, add);
-                        tracker.track(&holder(chunk_text(x, z)), i32::from(changed));
-                    }
-                }
-                let (lo, hi) = (chunk_text(cx0, cz0), chunk_text(cx1, cz1));
-                let verb = if add { "added" } else { "removed" };
-                let (message, total) = tracker.message(
-                    false,
-                    Some(err(&format!("commands.forceload.{verb}.failure"), &[])),
-                    |h, _| {
-                        Text::translate(
-                            &format!("commands.forceload.{verb}.single"),
-                            &[h.text.clone(), dim.clone()],
-                        )
-                    },
-                    |c, _| {
-                        Text::translate(
-                            &format!("commands.forceload.{verb}.multiple"),
-                            &[num(c), dim.clone(), lo.clone(), hi.clone()],
-                        )
-                    },
-                )?;
-                self.feedback(message);
-                Ok(total)
-            }
-        }
+        horizon_gameplay::commands::forceload::forceload(self, id, ctx)
     }
 
     // ---- /fillbiome ----------------------------------------------------------------
 
     pub(super) fn cmd_fillbiome(&mut self, ctx: &Context) -> R<i32> {
-        let Some(Arg::Resource(biome)) = ctx.get("biome").cloned() else {
-            return Ok(0);
-        };
-        // BlockPosArgument.getLoadedBlockPos on both corners first.
-        let (a, b) = (
-            self.block_pos_arg(ctx, "from")?,
-            self.block_pos_arg(ctx, "to")?,
-        );
-        // Quantize to biome cells (`QuartPos`), then work with the box.
-        let q = |v: i32| (v >> 2) << 2;
-        let lo = [
-            q(a[0]).min(q(b[0])),
-            q(a[1]).min(q(b[1])),
-            q(a[2]).min(q(b[2])),
-        ];
-        let hi = [
-            q(a[0]).max(q(b[0])),
-            q(a[1]).max(q(b[1])),
-            q(a[2]).max(q(b[2])),
-        ];
-        let volume = i64::from(hi[0] - lo[0] + 1)
-            * i64::from(hi[1] - lo[1] + 1)
-            * i64::from(hi[2] - lo[2] + 1);
-        let limit = self
-            .ui
-            .rules
-            .int_at(horizon_client::gamerules::vanilla::MAX_BLOCK_MODIFICATIONS);
-        if volume > i64::from(limit) {
-            return Err(err("commands.fillbiome.toobig", &[&limit, &volume]));
-        }
-        let Some(target) = world_biomes!(self)
-            .list
-            .iter()
-            .position(|b| b.name == biome)
-        else {
-            return Err(err(
-                "argument.resource.not_found",
-                &[&biome, &"minecraft:worldgen/biome"],
-            ));
-        };
-        let filter = match ctx.get("filter") {
-            Some(Arg::Resource(f)) => Some(f.clone()),
-            _ => None,
-        };
-        for cz in (lo[2] >> 4)..=(hi[2] >> 4) {
-            for cx in (lo[0] >> 4)..=(hi[0] >> 4) {
-                if !self.world.chunks.contains_key(&(cx, cz)) {
-                    return Err(err("argument.pos.unloaded", &[]));
-                }
-            }
-        }
-        let mut changed = 0;
-        let mut touched = std::collections::HashSet::new();
-        for z in (lo[2]..=hi[2]).step_by(4) {
-            for y in (lo[1]..=hi[1]).step_by(4) {
-                for x in (lo[0]..=hi[0]).step_by(4) {
-                    let key = (x >> 4, z >> 4);
-                    let Some(chunk) = self.world.chunks.get(&key) else {
-                        continue;
-                    };
-                    let current = chunk.biome(x, y, z);
-                    let current_name = world_biomes!(self).name(current);
-                    if let Some(f) = &filter
-                        && !self.biome_matches(f, current_name)
-                    {
-                        continue;
-                    }
-                    if usize::from(current) == target {
-                        continue;
-                    }
-                    let qy = ((y - self.world.bottom_y()) >> 2)
-                        .clamp(0, self.world.layout().height() / 4 - 1);
-                    if let Some(chunk) = self.world.chunks.get_mut(&key) {
-                        let chunk = std::sync::Arc::make_mut(chunk);
-                        chunk.set_biome_cell((x & 15) >> 2, qy, (z & 15) >> 2, target as u16);
-                    }
-                    touched.insert(key);
-                    changed += 1;
-                }
-            }
-        }
-        if changed == 0 {
-            return Err(err("commands.fillbiome.no_changes", &[]));
-        }
-        let columns: Vec<(i32, i32)> = ((lo[2] >> 4)..=(hi[2] >> 4))
-            .flat_map(|cz| ((lo[0] >> 4)..=(hi[0] >> 4)).map(move |cx| (cx, cz)))
-            .filter(|key| touched.contains(key))
-            .collect();
-        self.commit_biome_columns(&touched, &columns);
-        self.feedback(Text::translate(
-            "commands.fillbiome.success.count",
-            &[
-                num(changed),
-                num(lo[0]),
-                num(lo[1]),
-                num(lo[2]),
-                num(hi[0]),
-                num(hi[1]),
-                num(hi[2]),
-            ],
-        ));
-        Ok(changed)
+        horizon_gameplay::commands::fillbiome::fillbiome(self, ctx)
     }
 
     /// The tail of a biome change: the columns in `touched` are saved and re-meshed, and the
@@ -375,32 +162,40 @@ impl Game<'_> {
     /// without publishing. Saving, remeshing and resending wait for the outermost commit,
     /// once per column. Outside a transaction they run immediately.
     pub(in crate::game) fn set_biome_at(&mut self, pos: [i32; 3], biome: &str) -> bool {
-        let Some(target) = world_biomes!(self)
+        match self.write_biome_at(pos, biome) {
+            Some(key) => {
+                self.after_commit(super::super::transactions::After::Biome(key));
+                true
+            }
+            None => false,
+        }
+    }
+    /// `set_biome_at` without the column resend: the changed cell's column, None when nothing changed.
+    pub(in crate::game) fn write_biome_at(
+        &mut self,
+        pos: [i32; 3],
+        biome: &str,
+    ) -> Option<(i32, i32)> {
+        let target = world_biomes!(self)
             .list
             .iter()
-            .position(|b| b.name == biome)
-        else {
-            return false;
-        };
+            .position(|b| b.name == biome)?;
         let key = (pos[0] >> 4, pos[2] >> 4);
-        let Some(chunk) = self.world.chunks.get(&key) else {
-            return false;
-        };
+        let chunk = self.world.chunks.get(&key)?;
         if !self.world.shape.contains_y(pos[1])
             || usize::from(chunk.biome(pos[0], pos[1], pos[2])) == target
         {
-            return false;
+            return None;
         }
         let old = chunk.biome(pos[0], pos[1], pos[2]);
         self.journal_biome(pos, old);
         let qy =
             ((pos[1] - self.world.bottom_y()) >> 2).clamp(0, self.world.layout().height() / 4 - 1);
-        if let Some(chunk) = self.world.chunks.get_mut(&key) {
+        self.world.chunks.mutate_chunk(key, |chunk| {
             let chunk = std::sync::Arc::make_mut(chunk);
             chunk.set_biome_cell((pos[0] & 15) >> 2, qy, (pos[2] & 15) >> 2, target as u16);
-        }
-        self.after_commit(super::super::transactions::After::Biome(key));
-        true
+        });
+        Some(key)
     }
 
     // ---- /worldborder -----------------------------------------------------------------------
@@ -465,155 +260,7 @@ impl Game<'_> {
         }
     }
     pub(super) fn cmd_worldborder(&mut self, id: &str, ctx: &Context) -> R<i32> {
-        let float2 = |v: f64| super::percent_f(v, 2);
-        let double = match ctx.get("distance") {
-            Some(Arg::Double(d)) => *d,
-            _ => 0.0,
-        };
-        let time = match ctx.get("time") {
-            Some(Arg::Int(t)) => Some(i64::from(*t)),
-            _ => None,
-        };
-        match id {
-            "worldborder.get" => {
-                let size = self.border.size();
-                self.feedback(Text::translate(
-                    "commands.worldborder.get",
-                    &[Text::literal(super::percent_f(size, 0))],
-                ));
-                Ok((size + 0.5).floor() as i32)
-            }
-            "worldborder.set" | "worldborder.add" => {
-                let current = self.border.size();
-                // `add` measures from the size the border has now and, given a
-                // time, keeps a change in flight going for its remaining ticks
-                // plus the argument (`getLerpTime() + time`); `set` replaces it.
-                let (distance, ticks) = match (id, time) {
-                    ("worldborder.add", Some(t)) => {
-                        (current + double, self.border.remaining_ticks() + t)
-                    }
-                    ("worldborder.add", None) => (current + double, 0),
-                    (_, t) => (double, t.unwrap_or(0)),
-                };
-                if current == distance {
-                    return Err(err("commands.worldborder.set.failed.nochange", &[]));
-                }
-                if distance < 1.0 {
-                    return Err(err("commands.worldborder.set.failed.small", &[]));
-                }
-                if distance > MAX_SIZE {
-                    return Err(err(
-                        "commands.worldborder.set.failed.big",
-                        &[&size_limit_text()],
-                    ));
-                }
-                let shown = Text::literal(super::percent_f(distance, 1));
-                if ticks > 0 {
-                    self.border.lerp_to(distance, ticks);
-                    let key = if distance > current {
-                        "commands.worldborder.set.grow"
-                    } else {
-                        "commands.worldborder.set.shrink"
-                    };
-                    self.feedback(Text::translate(
-                        key,
-                        &[shown, Text::literal(ticks_to_seconds(ticks))],
-                    ));
-                } else {
-                    self.border.set_size(distance);
-                    self.feedback(Text::translate(
-                        "commands.worldborder.set.immediate",
-                        &[shown],
-                    ));
-                }
-                self.native_world_border_bounds_changed();
-                Ok((distance - current) as i32)
-            }
-            "worldborder.center" => {
-                let p = self
-                    .position_arg(ctx, "pos")
-                    .unwrap_or_else(|| self.source_position());
-                let (x, z) = (p[0], p[2]);
-                if self.border.center() == [x, z] {
-                    return Err(err("commands.worldborder.center.failed", &[]));
-                }
-                if x.abs() > MAX_CENTER || z.abs() > MAX_CENTER {
-                    return Err(err(
-                        "commands.worldborder.set.failed.far",
-                        &[&"2.9999984E7"],
-                    ));
-                }
-                self.border.set_center([x, z]);
-                self.native_world_border_center_changed();
-                self.feedback(Text::translate(
-                    "commands.worldborder.center.success",
-                    &[Text::literal(float2(x)), Text::literal(float2(z))],
-                ));
-                Ok(0)
-            }
-            "worldborder.damage.amount" | "worldborder.damage.buffer" => {
-                let amount = id.ends_with("amount");
-                let value = match ctx.get(if amount { "damagePerBlock" } else { "distance" }) {
-                    Some(Arg::Float(v)) => f64::from(*v),
-                    _ => 0.0,
-                };
-                let slot = if amount {
-                    &mut self.border.damage_per_block
-                } else {
-                    &mut self.border.safe_zone
-                };
-                if *slot == value {
-                    return Err(err(
-                        if amount {
-                            "commands.worldborder.damage.amount.failed"
-                        } else {
-                            "commands.worldborder.damage.buffer.failed"
-                        },
-                        &[],
-                    ));
-                }
-                *slot = value;
-                self.feedback(Text::translate(
-                    if amount {
-                        "commands.worldborder.damage.amount.success"
-                    } else {
-                        "commands.worldborder.damage.buffer.success"
-                    },
-                    &[Text::literal(float2(value))],
-                ));
-                Ok(value as i32)
-            }
-            "worldborder.warning.distance" => {
-                let d = match ctx.get("distance") {
-                    Some(Arg::Int(v)) => *v,
-                    _ => 0,
-                };
-                if self.border.warning_distance == d {
-                    return Err(err("commands.worldborder.warning.distance.failed", &[]));
-                }
-                self.border.warning_distance = d;
-                self.feedback(Text::translate(
-                    "commands.worldborder.warning.distance.success",
-                    &[num(d)],
-                ));
-                Ok(d)
-            }
-            _ => {
-                let ticks = match ctx.get("time") {
-                    Some(Arg::Int(v)) => *v,
-                    _ => 0,
-                };
-                if self.border.warning_time == ticks {
-                    return Err(err("commands.worldborder.warning.time.failed", &[]));
-                }
-                self.border.warning_time = ticks;
-                self.feedback(Text::translate(
-                    "commands.worldborder.warning.time.success",
-                    &[Text::literal(ticks_to_seconds(i64::from(ticks)))],
-                ));
-                Ok(ticks)
-            }
-        }
+        horizon_gameplay::commands::worldborder::worldborder(self, id, ctx)
     }
 
     // ---- /loot ---------------------------------------------------------------------------------
@@ -663,19 +310,19 @@ impl Game<'_> {
             .first()
             .and_then(|s| self.slot_get(s)))
     }
-    /// `LootCommand.dropBlockLoot`: copy the actual block entity's components
-    /// into the mine result without removing the source block or its contents.
+    /// `LootCommand.dropChestLoot`: resolve a named table from the world's
+    /// reloadable loot registry. `dropBlockLoot` keeps the mined block's components.
     pub(super) fn cmd_loot(&mut self, id: &str, ctx: &Context) -> R<i32> {
         let keep_empty = ctx.literals.iter().any(|literal| literal == "replace");
         // The drops.
         let (drops, table): (Vec<ItemStack>, Option<String>) = match id {
             "loot.loot" | "loot.fish" => {
-                let Some(Arg::Resource(table)) = ctx.get("loot_table").cloned() else {
+                let Some(Arg::Resource(table)) = ctx.get("loot_table") else {
                     return Ok(0);
                 };
                 // An inline table (ResourceOrIdArgument) keeps its random sequence.
                 if table.starts_with('{') {
-                    let (tag, _) = horizon_core::nbt::parse_snbt(&table)
+                    let (tag, _) = horizon_core::nbt::parse_snbt(table)
                         .map_err(|e| err("argument.nbt.invalid", &[&e]))?;
                     let json = horizon_client::scoreboard::tag_to_json(&tag);
                     // LootCommand's omitted fishing tool is EMPTY, not mainhand.
@@ -705,27 +352,28 @@ impl Game<'_> {
                     };
                     (drops, None)
                 } else {
-                    if !self.items().has_loot_table(&table) {
-                        return Err(err("argument.resource_or_id.failed_to_parse", &[&table]));
+                    if !world_items!(self).has_loot_table(table) {
+                        return Err(err("argument.resource_or_id.failed_to_parse", &[table]));
                     }
                     let held = if id == "loot.fish" {
                         self.tool_stack(ctx)?
                     } else {
                         None
                     };
-                    let drops = match world_items!(self).loot_sequence(&table) {
+                    let items = world_items!(self);
+                    let drops = match items.loot_sequence(table) {
                         Some(seq) => {
                             let random = self.rand_sequences.get(&seq, self.level.seed);
-                            world_items!(self).loot_table_for_command(
-                                &table,
+                            items.loot_table_for_command(
+                                table,
                                 false,
                                 held.as_ref(),
                                 random,
                                 keep_empty,
                             )
                         }
-                        None => world_items!(self).loot_table_for_command(
-                            &table,
+                        None => items.loot_table_for_command(
+                            table,
                             false,
                             held.as_ref(),
                             &mut self.world.random,
@@ -848,12 +496,12 @@ impl Game<'_> {
                         pending.attach(p, drop);
                     }
                 }
-                (drops, Some(table))
+                (items.split_stacks(drops), Some(table))
             }
         };
         let drops: Vec<ItemStack> = drops
             .into_iter()
-            .filter(|d| keep_empty || d.count > 0)
+            .filter(|d| keep_empty || (d.count > 0 && &*d.item != "minecraft:air"))
             .collect();
         // Where they go.
         let mut used: Vec<ItemStack> = Vec::new();
@@ -863,15 +511,11 @@ impl Game<'_> {
                 for &t in &self.entities(ctx, "players", true)? {
                     // LootCommand.playerGive gives to every target player: a
                     // guest gets it with their state in place, as with /give.
+                    // `Inventory.add` keeps what fits and throws nothing out. It is true
+                    // only when all of it went in, or always for a player with infinite
+                    // materials (creative).
                     let added = self.for_player(t, |g| {
-                        let complete = g.creative;
-                        if let Some(rest) = g.add_stack_to_inventory(d.clone()) {
-                            let p = g.source_position();
-                            g.spawn_item(rest, [p[0], p[1] + 1.32, p[2]], [0.0; 3], 0);
-                            complete
-                        } else {
-                            true
-                        }
+                        g.add_stack_to_inventory(d.clone()).is_none() || g.creative
                     });
                     if added == Some(true) {
                         used.push(d.clone());
@@ -985,7 +629,7 @@ impl Game<'_> {
                         None => first.first().cloned().filter(|_| i == 0),
                     };
                     let Some(slot) = slot else { continue };
-                    let item = drops.get(i).filter(|drop| drop.count > 0).cloned();
+                    let item = loot_replace_slot_item(&drops, i);
                     if self.slot_accepts(&slot, item.as_ref())
                         && self.slot_set_by_command(&slot, item.clone())
                     {
@@ -1036,19 +680,30 @@ impl Game<'_> {
     }
 }
 
+fn loot_replace_slot_item(drops: &[ItemStack], index: usize) -> Option<ItemStack> {
+    drops
+        .get(index)
+        .filter(|drop| drop.count > 0 && &*drop.item != "minecraft:air")
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
-    /// `WorldBorderCommand.ERROR_TOO_BIG` is built with the double
-    /// `5.9999968E7`, the same value `setSize` compares `distance` against, and
-    /// the `%s` substitution of a translatable renders a double with
-    /// `Double.toString`: the message names `5.9999968E7`, not a rounded
-    /// `5.999997E7`.
     #[test]
-    fn the_too_big_message_names_the_limit_as_vanilla_prints_it() {
-        assert_eq!(super::MAX_SIZE, 5.9999968E7);
-        assert_eq!(super::size_limit_text(), "5.9999968E7");
+    fn loot_replace_normalises_air_and_zero_positions_while_preserving_later_items() {
+        let drops = [
+            super::ItemStack::new("minecraft:air", 1),
+            super::ItemStack::new("minecraft:iron_ingot", 0),
+            super::ItemStack::new("minecraft:diamond", 2),
+        ];
+        assert_eq!(super::loot_replace_slot_item(&drops, 0), None);
+        assert_eq!(super::loot_replace_slot_item(&drops, 1), None);
+        assert_eq!(
+            super::loot_replace_slot_item(&drops, 2),
+            Some(super::ItemStack::new("minecraft:diamond", 2))
+        );
+        assert_eq!(super::loot_replace_slot_item(&drops, 3), None);
     }
-
     /// `LootCommand.getSourceHandItem`: a living source's hand; `permissions.requires.entity` for a source
     /// without an entity; `commands.drop.no_held_items` for any other entity. The player in place's own command
     /// (no source) reads its own hand.

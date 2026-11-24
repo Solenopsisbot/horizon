@@ -9,7 +9,7 @@ use crate::{
     graphics::{
         EntityCullingMode, FarDetail, FrameGeneration, GpuCullingMode, GraphicsApi, HdrLook,
         HdrMode, HdrSetup as Setup, LeafCullingMode, Overlay, Pacing, ParallelTickMode,
-        ParticleCullingMode, PresentMode, Preset, Upscaling,
+        ParticleCullingMode, PresentMode, Preset, RayTracingMode, Upscaling,
     },
     graphics_style::Cost,
     lang,
@@ -19,8 +19,38 @@ use crate::{
     text::Text,
 };
 
+mod benchmark;
+pub use benchmark::{
+    BenchmarkAction, BenchmarkChange, BenchmarkOutcome, BenchmarkResult, BenchmarkRow,
+    BenchmarkView,
+};
+
 /// The language key of the screen's name.
 const TITLE: &str = "Graphics";
+
+/// The language key of the Performance page's warning while the OS's energy saver is on: the
+/// system's own switch, which these settings don't set. The page says that and nothing more;
+/// whether and how much it costs frames is the system's business, not this screen's.
+const OS_ENERGY_SAVER: &str = "horizon.graphics.os_energy_saver";
+
+/// The language key of the page's warning while the OS holds the CPU below full speed for heat:
+/// that one does slow the game, and the page says so in the warning colour above its description.
+const OS_THERMAL_LIMIT: &str = "horizon.graphics.os_thermal_limit";
+
+/// What the OS reports about this machine right now, as the key of the warning the Performance page
+/// shows, or `None` while it reports nothing (`horizon_system::power`). The thermal limit wins when
+/// both are on: it is the one that costs frames.
+fn os_limit() -> Option<&'static str> {
+    let sample = horizon_system::power::sample();
+    if !sample.limited() {
+        return None;
+    }
+    Some(if sample.thermal.limited() {
+        OS_THERMAL_LIMIT
+    } else {
+        OS_ENERGY_SAVER
+    })
+}
 
 /// The screen's pages, in its order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,15 +63,17 @@ pub enum Page {
     Advanced,
     /// HDR output's own settings.
     Hdr,
+    Benchmark,
 }
 impl Page {
-    pub const ALL: [Page; 6] = [
+    pub const ALL: [Page; 7] = [
         Page::General,
         Page::Quality,
         Page::Performance,
         Page::Shaders,
         Page::Advanced,
         Page::Hdr,
+        Page::Benchmark,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -51,6 +83,7 @@ impl Page {
             Page::Shaders => "Shaders",
             Page::Advanced => "Advanced",
             Page::Hdr => "HDR",
+            Page::Benchmark => benchmark::NAME,
         }
     }
     /// What the page holds, in the strip while no setting is pointed at.
@@ -62,6 +95,7 @@ impl Page {
             Page::Shaders => "Shader packs, Horizon's and shaders/ folder ones, and their options.",
             Page::Advanced => "How frames reach the screen, and the performance overlay.",
             Page::Hdr => "Brighter-than-white output on an HDR display.",
+            Page::Benchmark => benchmark::ABOUT,
         }
     }
 }
@@ -72,8 +106,6 @@ pub enum H {
     Preset,
     LodDistance,
     FarDetail,
-    BlueMapAutoDetect,
-    BlueMapRadius,
     CaveCulling,
     GpuCulling,
     EntityCulling,
@@ -115,9 +147,12 @@ pub enum H {
     HdrPeak,
     HdrPaperWhite,
     HdrUiBrightness,
+    HdrColorBoost,
     HdrLook,
     BatteryMode,
     ShadowCache,
+    /// Hardware ray tracing for packs that declare it (`Graphics::ray_tracing`): Auto, On or Off.
+    RayTracing,
     /// Opens the shader pack list (`options_ui::Page::ShaderPacks`).
     ShaderPacks,
     GraphicsApi,
@@ -130,6 +165,7 @@ pub enum Item {
     Horizon(H),
     /// A Horizon extra that changes the picture (`extras::Item`, kept in `horizon-extras.txt`).
     Extra(crate::extras::Item),
+    Benchmark(BenchmarkRow),
 }
 
 #[derive(Clone, Copy)]
@@ -164,12 +200,6 @@ fn e(item: crate::extras::Item, cost: Cost) -> Setting {
 /// Every page's settings, in named groups of related rows.
 pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
     use Cost::*;
-    // Suggested, never switched on, where far terrain costs the GPU most.
-    let far = if crate::graphics::reduced_far_detail_suggested() {
-        "Reduced draws far terrain coarser: faster on this integrated GPU."
-    } else {
-        "Reduced draws far terrain coarser, for GPUs it slows down."
-    };
     let mut pages = vec![
         (
             Page::General,
@@ -200,18 +230,12 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         h(
                             H::LodDistance,
                             Medium,
-                            "Coarse distant terrain in local worlds. Integrated GPUs stop at 128 chunks.",
-                        ),
-                        h(H::FarDetail, Medium, far),
-                        h(
-                            H::BlueMapAutoDetect,
-                            None,
-                            "On servers, finds their BlueMap web map for far terrain. Next join.",
+                            "Coarse distant terrain in local worlds.",
                         ),
                         h(
-                            H::BlueMapRadius,
-                            None,
-                            "How far around you BlueMap tiles are downloaded. Next join.",
+                            H::FarDetail,
+                            Medium,
+                            "Reduced draws far terrain coarser, for GPUs it slows down.",
                         ),
                         v(
                             Opt::SimulationDistance,
@@ -349,6 +373,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             "Leaves with see-through gaps. Off draws them solid.",
                         ),
                         v(
+                            Opt::BetterGrass,
+                            Low,
+                            "horizon.options.better_grass.tooltip",
+                        ),
+                        v(
                             Opt::ImprovedTransparency,
                             Medium,
                             "Sorts water and glass more exactly behind each other.",
@@ -386,7 +415,7 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         h(
                             H::Antialiasing,
                             Medium,
-                            "Smooths jagged edges. FXAA: softer. TAA: smoothest, moving things may trail.",
+                            "FXAA: softer. TAA: may trail. 4x MSAA: terrain and foliage, more GPU memory.",
                         ),
                         h(
                             H::Upscaling,
@@ -550,6 +579,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         Saves,
                         "Reuses the pack shadow map when sun, view and world match. Off by default.",
                     ),
+                    h(
+                        H::RayTracing,
+                        High,
+                        "Ray tracing for packs that use it: Auto as the pack asks, On always, Off never.",
+                    ),
                 ],
             )],
         ),
@@ -633,6 +667,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             "How bright the HUD and menus are. Auto: at paper white.",
                         ),
                         h(
+                            H::HdrColorBoost,
+                            None,
+                            "0%: exact colours. More: stretched to your display's range, as SDR often is.",
+                        ),
+                        h(
                             H::HdrLook,
                             None,
                             "Horizon: light sources and the sun shine past white. Vanilla: just as SDR.",
@@ -665,8 +704,6 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
     pages
 }
 
-/// BlueMap download radii, in chunks.
-const BLUE_MAP_RADII: [u32; 5] = [16, 32, 64, 128, 256];
 const UPLOAD_STEPS: [u32; 8] = [0, 256, 512, 1024, 2048, 4096, 8192, 16384];
 /// What the LOD Distance slider stops at, in chunks: off, fine steps up to 256
 /// for a short ring of far terrain past a small render distance (a phone or an
@@ -706,6 +743,15 @@ fn setup(s: &Settings, out: &EffectiveOutput) -> Setup {
 /// What the HDR page says while HDR output is held back on this window's graphics driver
 /// (`EffectiveOutput::held`): picking a mode tries again (`H::cycle`).
 const HDR_HELD: &str = "HDR output stopped the game the last time it started with this graphics driver. Choose a mode to try again.";
+/// The same, held by a graphics device loss (`gfx::safe_start`).
+fn hdr_held(s: &Settings) -> &'static str {
+    match s.horizon.safe_start {
+        Some(_) => {
+            "An earlier start lost the graphics device, so HDR stays off. Choose a mode to try again."
+        }
+        None => HDR_HELD,
+    }
+}
 
 /// The description beside `item` where it depends on [`setup`]; `text` otherwise.
 fn description(
@@ -715,7 +761,7 @@ fn description(
     text: &'static str,
 ) -> &'static str {
     match (item, setup(s, out)) {
-        (Item::Horizon(H::Hdr), _) if out.held => HDR_HELD,
+        (Item::Horizon(H::Hdr), _) if out.held => hdr_held(s),
         (Item::Horizon(H::HdrCalibrate), Setup::Unknown) => {
             "Your display didn't say how bright it gets: calibrate to set it up."
         }
@@ -829,6 +875,7 @@ impl H {
                 n => (1.0 + crate::graphics::peak_step_of(n as f32)) / PEAK_POSITIONS as f32,
             }),
             H::HdrBlackLevel => Some(g.hdr_black_level as f32 / 100.0),
+            H::HdrColorBoost => Some(g.hdr_color_boost as f32 / 100.0),
             _ => None,
         }
     }
@@ -844,6 +891,8 @@ impl H {
             H::HdrPaperWhite | H::HdrUiBrightness => Some(crate::graphics::NITS_STEPS),
             H::HdrPeak => Some(PEAK_POSITIONS),
             H::HdrBlackLevel => Some(100),
+            // 0..100% by 5.
+            H::HdrColorBoost => Some(20),
             _ => None,
         }
     }
@@ -870,11 +919,6 @@ impl H {
                 n => labelled("LOD Distance", lang::tr("%s chunks", &[&n])),
             },
             H::FarDetail => labelled("Far Detail", g.far_detail.label()),
-            H::BlueMapAutoDetect => labelled("Find BlueMap", on_off(g.blue_map.auto_detect)),
-            H::BlueMapRadius => labelled(
-                "BlueMap Radius",
-                lang::tr("%s chunks", &[&g.blue_map.radius_chunks()]),
-            ),
             H::CaveCulling => labelled("Cave Culling", on_off(g.cave_culling)),
             // Greyed out where it isn't offered (`Item::blocked`): Off, as it is there, while
             // the saved value waits.
@@ -944,10 +988,11 @@ impl H {
             H::TargetFps => labelled("Target FPS", g.target_fps),
             H::Antialiasing => labelled(
                 "Anti-aliasing",
-                match (g.fxaa, g.taa) {
-                    (_, true) => "TAA",
-                    (true, false) => "FXAA",
-                    (false, false) => "Off",
+                match (g.msaa4x && out.msaa, g.fxaa, g.taa) {
+                    (true, _, _) => "4x MSAA",
+                    (_, _, true) => "TAA",
+                    (_, true, false) => "FXAA",
+                    (_, false, false) => "Off",
                 },
             ),
             H::Upscaling => labelled("Upscaling", g.upscaling.label()),
@@ -972,6 +1017,7 @@ impl H {
                 "Black Level",
                 lang::tr("%s nits", &[&format!("{:.2}", g.black_level_nits())]),
             ),
+            H::HdrColorBoost => labelled_percent("Color Boost", g.hdr_color_boost),
             // Under a shader pack the look is the pack's: its name, greyed (`Item::blocked`).
             H::HdrLook => Text::option_name_value(
                 Text::literal(lang::get_or("horizon.hdr.look", "Look")),
@@ -985,6 +1031,7 @@ impl H {
             ),
             H::BatteryMode => labelled("Battery Mode", on_off(g.battery)),
             H::ShadowCache => labelled("Shadow Cache", on_off(g.shadow_cache)),
+            H::RayTracing => labelled("Ray Tracing", g.ray_tracing.label()),
             // A press across the row, as Calibrate...: the list it opens shows the pick.
             H::ShaderPacks => Text::literal(lang::get("Shader Packs...")),
             H::GraphicsApi => labelled("Graphics API", g.api.label()),
@@ -1029,6 +1076,7 @@ impl H {
                 }
             }
             H::HdrBlackLevel => g.hdr_black_level = (v * 100.0).round() as u32,
+            H::HdrColorBoost => g.hdr_color_boost = (v * 20.0).round() as u32 * 5,
             _ => {}
         }
     }
@@ -1048,10 +1096,6 @@ impl H {
         match self {
             H::FarDetail => {
                 g.far_detail = step(&[FarDetail::Full, FarDetail::Reduced], g.far_detail, back)
-            }
-            H::BlueMapAutoDetect => g.blue_map.auto_detect = !g.blue_map.auto_detect,
-            H::BlueMapRadius => {
-                g.blue_map.radius = step(&BLUE_MAP_RADII, g.blue_map.radius_chunks(), back)
             }
             H::CaveCulling => g.cave_culling = !g.cave_culling,
             H::GpuCulling => g.gpu_culling = step(&GpuCullingMode::ALL, g.gpu_culling, back),
@@ -1084,11 +1128,18 @@ impl H {
             H::DynamicResolution => g.dynamic_resolution = !g.dynamic_resolution,
             H::DitherCutoutMips => g.dither_cutout_mips = !g.dither_cutout_mips,
             H::PresentMode => g.present_mode = step(&PresentMode::ALL, g.present_mode, back),
-            // Off, FXAA, TAA.
+            // Off, FXAA, TAA, and 4x MSAA where the renderer can draw it.
             H::Antialiasing => {
-                let i = if g.taa { 2 } else { usize::from(g.fxaa) };
-                let i = (i + if back { 2 } else { 1 }) % 3;
-                (g.fxaa, g.taa) = (i == 1, i == 2);
+                let modes = if out.msaa { 4 } else { 3 };
+                let i = if g.msaa4x {
+                    3
+                } else if g.taa {
+                    2
+                } else {
+                    usize::from(g.fxaa)
+                };
+                let i = (i + if back { modes - 1 } else { 1 }) % modes;
+                (g.fxaa, g.taa, g.msaa4x) = (i == 1, i == 2, i == 3);
                 if !g.taa {
                     g.upscaling = Upscaling::Native;
                 }
@@ -1098,6 +1149,7 @@ impl H {
                 g.upscaling = step(&Upscaling::ALL, g.upscaling, back);
                 if g.upscaling != Upscaling::Native {
                     (g.fxaa, g.taa) = (false, true);
+                    g.msaa4x = false;
                 }
             }
             H::ScreenshotQuality => {
@@ -1113,6 +1165,7 @@ impl H {
             // Any choice tries HDR output again on a driver a start failed on.
             H::Hdr => {
                 g.hdr_failed_start = None;
+                g.safe_start = None;
                 g.hdr = step(&HdrMode::ALL, g.hdr, back);
                 if g.hdr == HdrMode::On && !out.hdr_offered() {
                     g.hdr = step(&HdrMode::ALL, g.hdr, back);
@@ -1121,7 +1174,12 @@ impl H {
             H::HdrLook => g.hdr_look = step(&HdrLook::ALL, g.hdr_look, back),
             H::BatteryMode => g.battery = !g.battery,
             H::ShadowCache => g.shadow_cache = !g.shadow_cache,
-            H::GraphicsApi => g.api = step(GraphicsApi::choices(), g.api, back),
+            H::RayTracing => g.ray_tracing = step(&RayTracingMode::ALL, g.ray_tracing, back),
+            H::GraphicsApi => {
+                g.api = step(GraphicsApi::choices(), g.api, back);
+                g.watchdog_api = None;
+                g.watchdog_driver = None;
+            }
             H::TranslucentBatching => g.translucent_batching = !g.translucent_batching,
             H::Pacing => {
                 g.pacing = match g.pacing {
@@ -1141,7 +1199,7 @@ impl H {
     }
 }
 fn max_workers() -> u32 {
-    std::thread::available_parallelism().map_or(8, |n| n.get() as u32)
+    horizon_threads::available_parallelism().map_or(8, |n| n.get() as u32)
 }
 
 impl Item {
@@ -1170,6 +1228,7 @@ impl Item {
                 | H::HdrPeak
                 | H::HdrPaperWhite
                 | H::HdrUiBrightness
+                | H::HdrColorBoost
                 | H::HdrLook,
             ) if !out.hdr_frame_supported => Some("Your GPU or graphics API doesn't support it."),
             Item::Horizon(
@@ -1178,6 +1237,7 @@ impl Item {
                 | H::HdrPeak
                 | H::HdrPaperWhite
                 | H::HdrUiBrightness
+                | H::HdrColorBoost
                 | H::HdrLook,
             ) if !out.hdr_offered() => Some("Your display or system doesn't offer HDR output."),
             Item::Horizon(
@@ -1186,15 +1246,19 @@ impl Item {
                 | H::HdrPeak
                 | H::HdrPaperWhite
                 | H::HdrUiBrightness
+                | H::HdrColorBoost
                 | H::HdrLook,
             ) if !out.requests_hdr(s.horizon.hdr) => Some(if out.held {
-                HDR_HELD
+                hdr_held(s)
             } else {
                 "Turn HDR on to use it."
             }),
             // HDR output without the HUD's layer: a `shaders/` pack's frame (`FrameRequest`).
             Item::Horizon(H::HdrUiBrightness) if out.hdr_on() && !out.frame.hud_layer => {
                 Some("The shader pack's picture is shown at Paper White.")
+            }
+            Item::Horizon(H::HdrColorBoost) if out.compositor_stretches() => {
+                Some("In scRGB, your desktop's own color setting applies.")
             }
             Item::Horizon(H::HdrLook) if out.pack_lights => {
                 Some(if out.hdr_on() && !out.frame.hud_layer {
@@ -1218,6 +1282,9 @@ impl Item {
             Item::Vanilla(Opt::MaxAnisotropy) if s.file.int("textureFiltering") != 2 => {
                 Some("Only with Anisotropic texture filtering.")
             }
+            Item::Horizon(H::LeafCulling) if !s.horizon.vanilla_models(&s.resource_packs) => {
+                Some("Only with the default resource pack.")
+            }
             _ => None,
         }
     }
@@ -1225,13 +1292,15 @@ impl Item {
     fn steps(self, s: &Settings) -> bool {
         self.switch(s).is_none()
             && self.slider(s).is_none()
-            && !matches!(self, Item::Horizon(H::HdrCalibrate | H::ShaderPacks))
+            && !matches!(
+                self,
+                Item::Horizon(H::HdrCalibrate | H::ShaderPacks) | Item::Benchmark(_)
+            )
     }
     /// On/off settings and their value.
     pub fn switch(self, s: &Settings) -> Option<bool> {
         let g = &s.horizon;
         Some(match self {
-            Item::Horizon(H::BlueMapAutoDetect) => g.blue_map.auto_detect,
             Item::Horizon(H::CaveCulling) => g.cave_culling,
             Item::Horizon(H::OpaqueIce) => g.opaque_ice,
             Item::Horizon(H::CacheShulkerBoxes) => g.cache_shulker_boxes,
@@ -1269,7 +1338,7 @@ impl Item {
         match self {
             Item::Vanilla(o) => o.slider_position(s),
             Item::Horizon(h) => h.slider(s),
-            Item::Extra(_) => None,
+            Item::Extra(_) | Item::Benchmark(_) => None,
         }
     }
     pub fn label(self, s: &Settings, out: &EffectiveOutput) -> Text {
@@ -1287,6 +1356,7 @@ impl Item {
                 Text::literal(e.caption_text()),
                 Text::literal(e.value(&s.extras)),
             ),
+            Item::Benchmark(_) => Text::literal(lang::get(benchmark::NAME)),
         }
     }
     pub fn set_slider(self, s: &mut Settings, v: f32, out: &EffectiveOutput) {
@@ -1297,18 +1367,19 @@ impl Item {
             // Options.applyGraphicsPreset, as Video Settings' slider does it.
             Item::Vanilla(o) => crate::options_ui::set_slider(o, s, v),
             Item::Horizon(h) => h.set_slider(s, v),
-            Item::Extra(_) => {}
+            Item::Extra(_) | Item::Benchmark(_) => return,
         }
         self.touched(s);
     }
     pub fn cycle(self, s: &mut Settings, back: bool, framebuffer: [i32; 2], out: &EffectiveOutput) {
-        if !self.available() {
+        if !self.available() || self.blocked(s, out).is_some() {
             return;
         }
         match self {
             Item::Vanilla(o) => o.cycle(s, back, framebuffer),
             Item::Horizon(h) => h.cycle(s, back, out),
             Item::Extra(e) => e.cycle(&mut s.extras, back),
+            Item::Benchmark(_) => return,
         }
         self.touched(s);
     }
@@ -1319,8 +1390,6 @@ impl Item {
             Item::Extra(_)
                 | Item::Horizon(
                     H::Preset
-                        | H::BlueMapAutoDetect
-                        | H::BlueMapRadius
                         | H::Overlay
                         | H::ScreenshotQuality
                         | H::Pacing
@@ -1330,6 +1399,7 @@ impl Item {
                         | H::FrameGeneration
                         | H::BatteryMode
                         | H::ShadowCache
+                        | H::RayTracing
                         | H::GraphicsApi
                         | H::TranslucentBatching
                 )
@@ -1347,6 +1417,7 @@ impl Item {
                         | Opt::Vignette
                         | Opt::Autosave
                         | Opt::AttackIndicator
+                        | Opt::BetterGrass
                         | Opt::FovEffects
                 )
         );
@@ -1358,7 +1429,7 @@ impl Item {
         match self {
             Item::Vanilla(o) => o.slider_steps(),
             Item::Horizon(h) => h.slider_steps(),
-            Item::Extra(_) => None,
+            Item::Extra(_) | Item::Benchmark(_) => None,
         }
     }
     pub fn step_slider(self, s: &mut Settings, forward: bool, width: f32, out: &EffectiveOutput) {
@@ -1404,6 +1475,10 @@ fn row(setting: Setting, s: &Settings, out: &EffectiveOutput) -> Row<Item> {
     let about = lang::get(setting.text);
     let chosen = lang::get(description(item, s, out, setting.text));
     Row {
+        agent_id: match item {
+            Item::Vanilla(opt) => opt.agent_id(),
+            _ => None,
+        },
         chosen: (chosen != about).then_some(chosen),
         ..Row::new(item, name, value)
             .about(about)
@@ -1454,6 +1529,7 @@ fn read(s: &Settings) -> impl std::fmt::Debug + '_ {
         s.cutout_leaves,
         s.improved_transparency,
         &s.graphics_preset,
+        s.better_grass_mode(),
     );
     let window = (
         s.fullscreen,
@@ -1476,6 +1552,7 @@ pub struct GraphicsScreen {
     /// The output of the renderer the settings are drawn for (`OptionsUi::draw_background`), handed in
     /// each time the screen is reached.
     pub(crate) output: EffectiveOutput,
+    pub(crate) benchmark: Option<std::sync::Arc<BenchmarkView>>,
 }
 
 impl Screen for GraphicsScreen {
@@ -1491,15 +1568,30 @@ impl Screen for GraphicsScreen {
             self.output,
             g::translucent_batching_offered(),
             g::gpu_culling_offer(),
-            g::reduced_far_detail_suggested(),
+            // What the OS reports, not whether it reports something: a reason that changes without a
+            // moment of nothing (the saver, then the CPU's heat) has to rebuild the sheets too.
+            os_limit(),
         );
-        shell::stamp_of(&(read(s), s.fullbright_held, &s.running_pack, offers))
+        shell::stamp_of(&(
+            read(s),
+            s.fullbright_held,
+            &s.running_pack,
+            offers,
+            self.benchmark.as_ref().map(std::sync::Arc::as_ptr),
+        ))
     }
     fn sheets(&self, s: &Settings) -> Vec<Sheet<Page, Item>> {
         let sheet = |(page, groups): (Page, Vec<(&'static str, Vec<Setting>)>)| Sheet {
             id: page,
             name: lang::get(page.name()),
             about: lang::get(page.about()),
+            // What the machine is doing is no setting of this screen: when the OS itself limits
+            // the machine, the page that sells power use says what, before the player blames a
+            // switch for it.
+            warning: (page == Page::Performance)
+                .then(os_limit)
+                .flatten()
+                .map(lang::get),
             groups: groups
                 .into_iter()
                 .map(|(name, settings)| Group {
@@ -1514,10 +1606,18 @@ impl Screen for GraphicsScreen {
             listed: true,
             heading: None,
         };
-        rows().into_iter().map(sheet).collect()
+        rows()
+            .into_iter()
+            .map(sheet)
+            .chain(self.benchmark.iter().map(benchmark::sheet))
+            .collect()
     }
     fn press(&mut self, s: &mut Settings, item: Item, back: bool) -> Vec<Output> {
         match item {
+            Item::Benchmark(BenchmarkRow::Action(action)) => {
+                vec![Output::Event(Event::GraphicsBenchmark(action))]
+            }
+            Item::Benchmark(_) => Vec::new(),
             Item::Horizon(H::HdrCalibrate) if setup(s, &self.output) == Setup::Changed => {
                 s.horizon.hdr_peak = 0;
                 s.horizon.hdr_paper_white = 0;
@@ -1587,6 +1687,7 @@ impl Screen for GraphicsScreen {
         s.chunk_fade = b.chunk_fade;
         s.mipmap_levels = b.mipmap_levels;
         s.cutout_leaves = b.cutout_leaves;
+        s.better_grass = b.better_grass_mode();
         s.improved_transparency = b.improved_transparency;
         s.prioritize_chunk_updates = b.prioritize_chunk_updates;
         // Presets set it beside the options above.
@@ -1688,7 +1789,11 @@ mod tests {
         ] {
             assert!(all.iter().any(|(_, i)| *i == Item::Vanilla(opt)), "{opt:?}");
         }
-        for page in Page::ALL {
+        // The benchmark is an optional live sheet, not a collection of settings.
+        for page in Page::ALL
+            .into_iter()
+            .filter(|page| *page != Page::Benchmark)
+        {
             assert!(all.iter().any(|(p, _)| *p == page), "{page:?} is empty");
         }
         for (_, groups) in rows() {
@@ -1748,6 +1853,13 @@ mod tests {
         let size = (427.0, 240.0);
         let mut s = Settings::default();
         let mut ui = ui();
+        ui.screen.benchmark = Some(
+            BenchmarkView {
+                can_start: true,
+                ..BenchmarkView::default()
+            }
+            .into(),
+        );
         let cols = Columns::of(size.0, size.1);
         assert!((cols.bottom - cols.top) / style::ROW >= 5.0);
         let [x, y, w, h] = cols.page(Page::ALL.len() - 1);
@@ -1762,7 +1874,11 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(ui.current_page(&s, size), Some(Page::Hdr));
+        assert_eq!(ui.current_page(&s, size), Some(Page::Benchmark));
+        assert!(ui.listed(&s, size).contains(&(
+            Page::Benchmark,
+            Item::Benchmark(BenchmarkRow::Action(BenchmarkAction::Quick)),
+        )));
     }
 
     #[test]
@@ -1804,7 +1920,11 @@ mod tests {
             [general(Item::Vanilla(Opt::FovEffects))]
         );
         ui.set_search("hdr");
-        let [x, y, w, h] = cols.page(Page::ALL.len() - 1);
+        let hdr = Page::ALL
+            .iter()
+            .position(|page| *page == Page::Hdr)
+            .unwrap();
+        let [x, y, w, h] = cols.page(hdr);
         press(&mut ui, &mut s, (x + w / 2.0, y + h / 2.0));
         assert_eq!(ui.current_page(&s, SIZE), Some(Page::Hdr));
         let [x, y, ..] = cols.clear();
@@ -2126,6 +2246,7 @@ mod tests {
         let mut screen = GraphicsScreen {
             framebuffer: FB,
             output: NONE,
+            benchmark: None,
         };
         let default = Settings::default();
         for (_, item) in items() {
@@ -2244,34 +2365,6 @@ mod tests {
     }
 
     #[test]
-    fn blue_map_settings_sit_with_far_terrain() {
-        let mut s = Settings::default();
-        let find = Item::Horizon(H::BlueMapAutoDetect);
-        let radius = Item::Horizon(H::BlueMapRadius);
-        let distance: Vec<Item> = rows()
-            .into_iter()
-            .flat_map(|(_, groups)| groups)
-            .find(|(name, _)| *name == "Distance")
-            .unwrap()
-            .1
-            .iter()
-            .map(|r| r.item)
-            .collect();
-        assert!(distance.contains(&find) && distance.contains(&radius));
-        assert!(distance.contains(&Item::Horizon(H::FarDetail)));
-        assert_eq!(find.switch(&s), Some(false), "off by default");
-        assert_eq!(radius.label(&s, &NONE).plain(), "BlueMap Radius: 64 chunks");
-        find.cycle(&mut s, false, FB, &NONE);
-        assert!(s.horizon.blue_map.auto_detect);
-        radius.cycle(&mut s, false, FB, &NONE);
-        assert_eq!(s.horizon.blue_map.radius, 128);
-        radius.cycle(&mut s, true, FB, &NONE);
-        radius.cycle(&mut s, true, FB, &NONE);
-        assert_eq!(radius.label(&s, &NONE).plain(), "BlueMap Radius: 32 chunks");
-        assert_eq!(s.horizon.preset, Preset::Custom);
-    }
-
-    #[test]
     fn presets_set_vanilla_and_horizon_options() {
         let mut s = Settings::default();
         Item::Horizon(H::Preset).cycle(&mut s, false, [854, 480], &NONE);
@@ -2330,27 +2423,34 @@ mod tests {
     }
 
     #[test]
-    fn antialiasing_cycles_off_fxaa_taa() {
+    fn antialiasing_cycles_spatial_temporal_and_multisampled_modes() {
         let mut s = Settings::default();
         let item = Item::Horizon(H::Antialiasing);
-        for label in ["FXAA", "TAA", "Off"] {
-            item.cycle(&mut s, false, [854, 480], &NONE);
+        let msaa = EffectiveOutput { msaa: true, ..NONE };
+        for label in ["FXAA", "TAA", "4x MSAA", "Off"] {
+            item.cycle(&mut s, false, [854, 480], &msaa);
             assert_eq!(
-                item.label(&s, &NONE).plain(),
+                item.label(&s, &msaa).plain(),
                 format!("Anti-aliasing: {label}")
             );
         }
-        item.cycle(&mut s, true, [854, 480], &NONE);
-        assert_eq!((s.horizon.fxaa, s.horizon.taa), (false, true));
+        item.cycle(&mut s, true, [854, 480], &msaa);
+        assert_eq!(
+            (s.horizon.fxaa, s.horizon.taa, s.horizon.msaa4x),
+            (false, false, true)
+        );
 
         // Upscaling needs TAA: a ratio turns it on, leaving TAA goes back to Native.
         s.horizon.taa = false;
+        s.horizon.msaa4x = false;
         let upscaling = Item::Horizon(H::Upscaling);
         upscaling.cycle(&mut s, false, [854, 480], &NONE);
         assert_eq!(upscaling.label(&s, &NONE).plain(), "Upscaling: Quality");
         assert!(s.horizon.taa);
+        // A renderer that can't draw 4x MSAA goes from TAA to Off.
         item.cycle(&mut s, false, [854, 480], &NONE);
         assert_eq!(s.horizon.upscaling, Upscaling::Native);
+        assert_eq!(item.label(&s, &NONE).plain(), "Anti-aliasing: Off");
 
         // The Upscaling row is only on the screen while TAA is on.
         assert!(!shown(upscaling, &s));
@@ -2759,6 +2859,31 @@ mod tests {
         );
         assert_eq!(s.horizon.leaf_culling, LeafCullingMode::Hidden);
         assert_eq!(s.horizon.preset, Preset::Custom);
+
+        // A custom resource pack blocks leaf culling and explains why.
+        s.resource_packs = vec!["vanilla".into(), "faithful.zip".into()];
+        assert_eq!(
+            item.blocked(&s, &NONE),
+            Some("Only with the default resource pack.")
+        );
+        let before_mode = s.horizon.leaf_culling;
+        item.cycle(&mut s, false, FB, &NONE);
+        assert_eq!(s.horizon.leaf_culling, before_mode);
+        let screen_row = GraphicsScreen::default()
+            .sheets(&s)
+            .into_iter()
+            .flat_map(|sh| sh.groups)
+            .flat_map(|g| g.rows)
+            .find(|row| row.id == item)
+            .unwrap();
+        assert!(!screen_row.live);
+        assert_eq!(
+            screen_row.why.as_deref(),
+            Some("Only with the default resource pack.")
+        );
+
+        s.resource_packs = vec!["vanilla".into()];
+        assert_eq!(item.blocked(&s, &NONE), None);
     }
 
     #[test]
@@ -2776,6 +2901,7 @@ mod tests {
             H::HdrPeak,
             H::HdrBlackLevel,
             H::HdrUiBrightness,
+            H::HdrColorBoost,
         ];
         for h in options {
             let item = Item::Horizon(h);
@@ -2925,6 +3051,7 @@ mod tests {
                 "No settings match.",
                 "Undo",
                 "Done",
+                "Only with the default resource pack.",
             ] {
                 lang::get(text);
             }

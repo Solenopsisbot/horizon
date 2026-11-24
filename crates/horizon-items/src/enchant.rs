@@ -7,8 +7,10 @@ mod holder_sets;
 use crate::item_data::Levels;
 use crate::items::{ItemStack, Items};
 pub use holder_sets::HolderSetBinding;
+use horizon_client_core::{lang, text::Text};
 use horizon_core::nbt::Tag;
 use horizon_core::random::{LegacyRandom, RandomSource};
+use horizon_world::tag_layers::TagLayers;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -211,7 +213,7 @@ fn string_list(v: &Value) -> Vec<String> {
         _ => vec![],
     }
 }
-fn read_tag_dir(dir: &Path) -> HashMap<String, horizon_world::tag_layers::TagLayers> {
+fn read_tag_dir(dir: &Path) -> HashMap<String, TagLayers> {
     read_tag_dir_in(dir, "minecraft")
 }
 /// The resource root's `data/` namespaces other than `minecraft`, in name
@@ -222,10 +224,7 @@ fn other_namespaces(root: &Path) -> Vec<String> {
     out.retain(|ns| ns != "minecraft");
     out
 }
-fn read_tag_dir_in(
-    dir: &Path,
-    namespace: &str,
-) -> HashMap<String, horizon_world::tag_layers::TagLayers> {
+fn read_tag_dir_in(dir: &Path, namespace: &str) -> HashMap<String, TagLayers> {
     let Ok(folder) = horizon_world::json_folder::read(dir) else {
         return HashMap::new();
     };
@@ -236,33 +235,10 @@ fn read_tag_dir_in(
             let v = serde_json::from_slice::<Value>(file.bytes().ok()?).ok()?;
             Some((
                 format!("{namespace}:{}", file.name),
-                horizon_world::tag_layers::TagLayers::from_file(&v),
+                TagLayers::from_file(&v),
             ))
         })
         .collect()
-}
-/// Expand a tag keeping first-seen order and applying removals before its parent uses it.
-fn expand_ordered(
-    name: &str,
-    raw: &HashMap<String, horizon_world::tag_layers::TagLayers>,
-    out: &mut Vec<String>,
-    depth: u32,
-) {
-    if depth > 16 {
-        return;
-    }
-    if let Some(layers) = raw.get(name) {
-        let members = layers.build(|tag| {
-            let mut child = Vec::new();
-            expand_ordered(tag, raw, &mut child, depth + 1);
-            child
-        });
-        for member in members {
-            if !out.contains(&member) {
-                out.push(member);
-            }
-        }
-    }
 }
 /// Roman numerals as in `enchantment.level.N` (falls back to the number).
 pub fn level_name(level: u32) -> String {
@@ -385,25 +361,17 @@ impl Enchantments {
                 raw_tags.entry(id.clone()).or_default().push(&v);
             }
         }
-        let tags: HashMap<String, Vec<Arc<str>>> = raw_tags
-            .keys()
-            .map(|k| {
-                let mut v = Vec::new();
-                expand_ordered(k, &raw_tags, &mut v, 0);
-                (
-                    k.clone(),
-                    v.into_iter().map(|s| Arc::from(s.as_str())).collect(),
-                )
-            })
+        // The enchantments are a data-driven registry: only the `#tag`
+        // references are checked, not the elements.
+        let tags: HashMap<String, Vec<Arc<str>>> = TagLayers::resolve_all(raw_tags, |_| true)
+            .into_iter()
+            .map(|(id, members)| (id, members.into_iter().map(Arc::from).collect()))
             .collect();
-        let unordered = |raw: HashMap<String, horizon_world::tag_layers::TagLayers>| -> HashMap<String, HashSet<String>> {
-            raw.keys()
-                .map(|k| {
-                    let mut v = Vec::new();
-                    expand_ordered(k, &raw, &mut v, 0);
-                    (k.clone(), v.into_iter().collect())
-                })
-                .collect()
+        let unordered = |raw| {
+            TagLayers::resolve_all(raw, |_| true)
+                .into_iter()
+                .map(|(id, members)| (id, members.into_iter().collect()))
+                .collect::<HashMap<String, HashSet<String>>>()
         };
         let entity_tags = unordered(read_tag_dir(&data.join("tags/entity_type")));
         let damage_tags = match horizon_world::damage_source::Catalog::load(root, overlay) {
@@ -694,42 +662,90 @@ impl Enchantments {
         level: u32,
         numeric: bool,
     ) -> (String, bool) {
-        let tr = |key: &str| language.and_then(|l| l.get(key).map(str::to_owned));
         let Some(e) = self.get(id) else {
             return (format!("{id} {}", level_name(level)), false);
         };
-        let mut name = tr(&e.description_key).unwrap_or_else(|| e.description.clone());
-        if (level != 1 || e.max_level != 1) && numeric {
+        let mut name = language
+            .and_then(|language| language.get(&e.description_key))
+            .unwrap_or(&e.description)
+            .to_owned();
+        if let Some(suffix) = self.level_suffix(e, language, level, numeric) {
             name.push(' ');
-            name.push_str(&level.to_string());
-        } else if level != 1 || e.max_level != 1 {
-            name.push(' ');
-            let key = format!("enchantment.level.{level}");
-            let suffix = tr(&key)
-                .or_else(|| self.lang.get(&key).cloned())
-                .unwrap_or_else(|| {
-                    if (1..=10).contains(&level) {
-                        level_name(level)
-                    } else {
-                        key
-                    }
-                });
             name.push_str(&suffix);
         }
         (name, self.is_curse(id))
     }
+
+    fn level_suffix(
+        &self,
+        enchantment: &Enchantment,
+        language: Option<&lang::Language>,
+        level: u32,
+        numeric: bool,
+    ) -> Option<String> {
+        if level == 1 && enchantment.max_level == 1 {
+            return None;
+        }
+        if numeric {
+            return Some(level.to_string());
+        }
+        let key = format!("enchantment.level.{level}");
+        if let Some(name) = language
+            .and_then(|language| language.get(&key))
+            .or_else(|| self.translate(&key))
+        {
+            Some(name.to_owned())
+        } else if (1..=10).contains(&level) {
+            Some(level_name(level))
+        } else {
+            Some(key)
+        }
+    }
     /// Tooltip lines for a level list, in `#tooltip_order` then remaining order.
     pub fn tooltip(&self, levels: &[(Arc<str>, u32)]) -> Vec<(String, bool)> {
+        let language = lang::current();
+        let numeric = NUMERIC_LEVELS.load(Ordering::Relaxed);
+        self.ordered_tooltip(levels, |id, level| {
+            self.full_name_with(language.as_deref(), id, level, numeric)
+        })
+    }
+
+    /// The visible enchantment tooltip, with the description's translation key
+    /// still on the root component so a mod can identify the line after localization.
+    pub fn tooltip_text(&self, levels: &[(Arc<str>, u32)]) -> Vec<(Text, bool)> {
+        let language = lang::current();
+        let numeric = NUMERIC_LEVELS.load(Ordering::Relaxed);
+        self.ordered_tooltip(levels, |id, level| {
+            let Some(e) = self.get(id) else {
+                return (Text::literal(format!("{id} {}", level_name(level))), false);
+            };
+            let mut name = if e.description_key.is_empty() {
+                Text::literal(&e.description)
+            } else {
+                Text::translate_with_fallback(&e.description_key, &e.description, &[])
+            };
+            if let Some(suffix) = self.level_suffix(e, language.as_deref(), level, numeric) {
+                name.push(format!(" {suffix}"));
+            }
+            (name, self.is_curse(id))
+        })
+    }
+
+    fn ordered_tooltip<T>(
+        &self,
+        levels: &[(Arc<str>, u32)],
+        mut line: impl FnMut(&str, u32) -> T,
+    ) -> Vec<T> {
         let order = self.tag("minecraft:tooltip_order");
         let mut out = Vec::new();
         for id in order {
             if let Some((_, l)) = levels.iter().find(|(e, _)| e == id) {
-                out.push(self.full_name(id, *l));
+                out.push(line(id, *l));
             }
         }
         for (id, l) in levels {
             if !order.contains(id) {
-                out.push(self.full_name(id, *l));
+                out.push(line(id, *l));
             }
         }
         out
@@ -923,12 +939,53 @@ impl Enchantments {
         component: &str,
         ctx: &EffectContext<'_>,
         random: &mut LegacyRandom,
-        mut value: f32,
+        value: f32,
     ) -> f32 {
         let Some(e) = self.get(id) else { return value };
-        for effect in e.effects[component].as_array().into_iter().flatten() {
+        self.apply_filtered_value(&e.effects[component], level, ctx, (random, None), value)
+    }
+
+    /// `Enchantment.modifyEntityFilteredValue`: requirements use the loot
+    /// context's level random and the value effect uses the entity's random.
+    pub fn modify_entity_value(
+        &self,
+        stack: &ItemStack,
+        component: &str,
+        ctx: &EffectContext<'_>,
+        level_random: &mut horizon_core::random::LevelRandom,
+        entity_random: &mut horizon_core::random::EntityRandom,
+        mut value: f32,
+    ) -> f32 {
+        for (id, level) in stack.all_enchantments().iter() {
+            if let Some(e) = self.get(id) {
+                value = self.apply_filtered_value(
+                    &e.effects[component],
+                    *level,
+                    ctx,
+                    (entity_random, Some(level_random)),
+                    value,
+                );
+            }
+        }
+        value
+    }
+
+    fn apply_filtered_value(
+        &self,
+        effects: &Value,
+        level: u32,
+        ctx: &EffectContext<'_>,
+        (random, mut requirement_random): (&mut LegacyRandom, Option<&mut LegacyRandom>),
+        mut value: f32,
+    ) -> f32 {
+        for effect in effects.as_array().into_iter().flatten() {
             if let Some(req) = effect.get("requirements")
-                && !self.condition(req, level, ctx, random)
+                && !self.condition(
+                    req,
+                    level,
+                    ctx,
+                    requirement_random.as_deref_mut().unwrap_or(&mut *random),
+                )
             {
                 continue;
             }
@@ -1273,6 +1330,56 @@ pub fn apply_value_effect(
 pub mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn entity_filtered_values_draw_requirements_and_effects_from_their_owners() {
+        use horizon_core::random::{EntityRandom, LevelRandom};
+
+        let component = "minecraft:projectile_count";
+        // Seed 42 draws about 0.728 and 0.055. Both requirements pass in this
+        // order, but the removal requirement would fail if checked first.
+        let add = json!({"effects":{component:[{
+            "requirements":{"condition":"minecraft:random_chance","chance":0.8},
+            "effect":{"type":"minecraft:add","value":2}
+        }]}});
+        let remove = json!({"effects":{component:[{
+            "requirements":{"condition":"minecraft:random_chance","chance":0.1},
+            "effect":{"type":"minecraft:remove_binomial","chance":1.0}
+        }]}});
+        let enchantments = Enchantments::default()
+            .with_entries([("test:add", &add), ("test:remove", &remove)])
+            .unwrap()
+            .unwrap();
+        let mut stack = ItemStack::new("minecraft:crossbow", 1);
+        stack.data_mut().enchantments.extend([
+            ("test:add".into(), 1),
+            ("test:unresolved".into(), 1),
+            ("test:remove".into(), 1),
+        ]);
+        let mut level = LevelRandom::for_level(LegacyRandom::new(42));
+        let mut entity = EntityRandom::own(LegacyRandom::new(17));
+        assert_eq!(
+            enchantments.modify_entity_value(
+                &stack,
+                component,
+                &EffectContext::default(),
+                &mut level,
+                &mut entity,
+                3.0,
+            ),
+            0.0
+        );
+        let mut expected_level = LegacyRandom::new(42);
+        for _ in 0..2 {
+            expected_level.next_float();
+        }
+        let mut expected_entity = LegacyRandom::new(17);
+        for _ in 0..5 {
+            expected_entity.next_float();
+        }
+        assert_eq!(level.state(), expected_level.state());
+        assert_eq!(entity.state(), expected_entity.state());
+    }
 
     #[test]
     fn custom_damage_output_is_bounded_before_builtin_nodes() {

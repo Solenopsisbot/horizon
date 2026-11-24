@@ -164,6 +164,12 @@ impl Game<'_> {
         let (input, output) = spec
             .split_once(',')
             .ok_or("HORIZON_SCULK_FIXTURE=SCENARIOS,OUTPUT")?;
+        // The synthetic world skips normal world adoption, which loads the
+        // loot snapshot required by the mob death path, including XP drops.
+        self.load_server_loot();
+        if self.server_loot.get().is_none() {
+            return Err("sculk fixture requires server loot data".into());
+        }
         let text = std::fs::read_to_string(input)?;
         let mut out = std::io::BufWriter::new(std::fs::File::create(output)?);
         for s in parse(&text) {
@@ -671,9 +677,14 @@ impl Game<'_> {
         seeded: &mut HashSet<u32>,
     ) -> Result<()> {
         self.world.game_time += 1;
-        // Scheduled block and fluid ticks, then block events.
-        self.tick_scheduled()?;
+        // Scheduled block and fluid ticks, then block events, inside the
+        // level tick's `handlingTick` (ServerLevel.java:360-412), as
+        // `tick_blocks` runs them.
+        self.block_ticks.begin_handling_tick();
+        let stepped = self.tick_scheduled();
         self.with_level(|b, level, ticks| b.run_block_events(level, ticks));
+        self.block_ticks.end_handling_tick();
+        stepped?;
         self.process_level_events()?;
         // The scenario's actions happen among the entities.
         for (tick, words) in &s.actions {

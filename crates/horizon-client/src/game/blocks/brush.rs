@@ -208,10 +208,15 @@ impl Game<'_> {
             &mut self.rand_sequences,
             self.level.seed,
         );
+        // The roll comes back as the saved tag's item: taken in against this world's prototypes.
+        let mut item = tag.get("item").and_then(save::item_from_nbt);
+        if let Some(stack) = item.as_mut() {
+            self.clean_stack(stack);
+        }
         if let Some(BlockEntity::Brushable(b)) = self.world.block_entities.get_mut(&key) {
             b.loot_table = tag.get("LootTable").cloned();
             b.table_seed_tag = tag.get("LootTableSeed").cloned();
-            b.item = tag.get("item").and_then(save::item_from_nbt);
+            b.item = item;
         }
         self.world.modified.insert((pos[0] >> 4, pos[2] >> 4));
     }
@@ -311,7 +316,11 @@ impl Game<'_> {
     /// `BrushableBlockRenderer`: reveal the item from the first brushed face.
     pub(super) fn brushable_geometry(&self, camera: glam::DVec3, out: &mut Vec<Vertex>) {
         use horizon_assets::item_model::DisplayContext;
-        for (key, entity) in &self.world.block_entities {
+        for (key, entity) in self
+            .world
+            .block_entities
+            .listed(horizon_client::block_entities::Listed::Brushable)
+        {
             let BlockEntity::Brushable(b) = entity else {
                 continue;
             };

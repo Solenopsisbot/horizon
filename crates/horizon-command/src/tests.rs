@@ -228,6 +228,30 @@ fn reader_matches_brigadier() {
     assert_eq!(e.context().unwrap(), "<--[HERE]");
 }
 
+/// Brigadier reports an error's position, and cuts its ten-character context, in Java `String`
+/// indices (UTF-16 units), not UTF-8 bytes; a character outside the BMP is two units.
+#[test]
+fn error_position_and_context_count_utf16_units() {
+    let error_at = |input: &'static str| {
+        let mut r = Reader::new(input);
+        r.cursor = input.find("1.5").unwrap();
+        r.read_int().unwrap_err()
+    };
+    // Eleven two-byte characters and a space before the number: 12 units, 23 bytes.
+    let e = error_at("ééééééééééé 1.5");
+    assert_eq!(e.java_cursor(), 12);
+    assert_eq!(e.context().unwrap(), "...ééééééééé <--[HERE]");
+    // 'é' (1 unit), '😀' (2 units, 4 bytes), then 9 units: the window of ten
+    // starts inside the emoji's surrogate pair, so the half character is left out.
+    let e = error_at("é😀 abcdefg 1.5");
+    assert_eq!(e.java_cursor(), 12);
+    assert_eq!(e.context().unwrap(), "... abcdefg <--[HERE]");
+    // Exactly ten units before the cursor: no ellipsis, nothing cut.
+    let e = error_at("😀😀abcdef1.5");
+    assert_eq!(e.java_cursor(), 10);
+    assert_eq!(e.context().unwrap(), "😀😀abcdef<--[HERE]");
+}
+
 #[test]
 fn resource_selector_wildcards_preserve_unicode_and_backtracking() {
     let cases = [
@@ -1091,6 +1115,46 @@ fn the_dedicated_commands_complete_from_the_servers_lists() {
     assert!(suggest("ban ").contains(&"@a".to_owned()));
 }
 #[test]
+fn restart_is_only_on_a_supervised_dedicated_server_and_asks_for_stop_permission() {
+    // A vanilla-like server's tree stays vanilla: /restart needs the supervisor.
+    for dev in [false, true] {
+        for horizon in [false, true] {
+            assert!(
+                vanilla::game_tree_with(dev, horizon, true, false)
+                    .find("restart")
+                    .is_none()
+            );
+            // An integrated server never has it, supervised or not.
+            assert!(
+                vanilla::game_tree_with(dev, horizon, false, true)
+                    .find("restart")
+                    .is_none()
+            );
+            let registry = horizon_client_core::gamerules::RuleRegistry::vanilla();
+            let d = vanilla::session_tree(&registry, &[], dev, horizon, true, true);
+            assert!(
+                vanilla::session_tree(&registry, &[], dev, horizon, true, false)
+                    .find("restart")
+                    .is_none()
+            );
+            assert!(
+                vanilla::session_tree(&registry, &[], dev, horizon, false, true)
+                    .find("restart")
+                    .is_none()
+            );
+            let restart = d
+                .find("restart")
+                .expect("supervised dedicated tree has /restart");
+            let stop = d.find("stop").unwrap();
+            assert_eq!(d.nodes[restart].permission, d.nodes[stop].permission);
+            assert_eq!(
+                d.parse("restart", &reg()).executable().unwrap().1,
+                "restart"
+            );
+        }
+    }
+}
+#[test]
 fn only_a_dedicated_server_has_the_dedicated_commands() {
     // Commands.CommandSelection: an integrated server (single player, a LAN
     // world) registers no /op, /ban, /ban-ip, /banlist, /pardon, /pardon-ip,
@@ -1561,6 +1625,64 @@ fn a_greedy_custom_argument_takes_the_rest_of_the_line() {
             value: "hello there".into(),
         })
     );
+}
+
+#[test]
+fn a_token_custom_argument_takes_one_space_free_token_and_the_arguments_after_it_still_parse() {
+    let argument = ArgType::Custom(CustomArgument::new(
+        "example:account",
+        CustomArgumentKind::Token,
+        |input| Ok(input.to_owned()),
+        |_, _| Vec::new(),
+    ));
+    let mut dispatcher = Dispatcher::new();
+    let eco = dispatcher.literal(0, "eco");
+    let give = dispatcher.literal(eco, "give");
+    let who = dispatcher.argument(give, "who", argument);
+    let amount = dispatcher.argument(
+        who,
+        "amount",
+        ArgType::Integer {
+            min: 0,
+            max: i32::MAX,
+        },
+    );
+    dispatcher.executes(amount, "test");
+
+    let registries = reg();
+    for (line, token) in [
+        ("eco give * 5", "*"),
+        ("eco give ** 5", "**"),
+        ("eco give mod:acct/1 5", "mod:acct/1"),
+    ] {
+        let parsed = dispatcher.parse(line, &registries);
+        let (context, _) = parsed.executable().unwrap_or_else(|_| panic!("{line}"));
+        assert_eq!(
+            context.get("who"),
+            Some(&Arg::Custom {
+                kind: "example:account".into(),
+                value: token.into(),
+            }),
+            "{line}"
+        );
+        assert_eq!(context.get("amount"), Some(&Arg::Int(5)), "{line}");
+    }
+    // A missing token is not a command.
+    assert!(
+        dispatcher
+            .parse("eco give ", &registries)
+            .executable()
+            .is_err()
+    );
+}
+
+#[test]
+fn read_token_stops_at_a_space_and_is_empty_at_one() {
+    let mut reader = Reader::new("a*:/b rest");
+    assert_eq!(reader.read_token(), "a*:/b");
+    assert_eq!(reader.cursor, 5);
+    assert_eq!(reader.read_token(), "");
+    assert_eq!(reader.cursor, 5);
 }
 
 #[test]

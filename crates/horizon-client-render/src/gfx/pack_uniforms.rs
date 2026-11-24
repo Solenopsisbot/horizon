@@ -266,6 +266,9 @@ pub const NAMES: &[&str] = &[
     "viewWidth",
     "viewHeight",
     "aspectRatio",
+    "screenSize",
+    "fsrScreenSize",
+    "fsrRenderScale",
     "near",
     "far",
     "rainStrength",
@@ -519,6 +522,34 @@ pub fn light_angle(frame: &Frame) -> f32 {
 /// / 360` in floats to the last bit, by day and by night.
 fn day_fraction(degrees: f32) -> f32 {
     (degrees + 90.0) % 360.0 / 360.0
+}
+
+/// The frame's [`WorldLook`](crate::render_slots::WorldLook) for `world_drawn`:
+/// `sun_path_rotation` is the shader pack's, a `shaders/` or a native one (`None`: no pack drew the frame).
+pub fn world_look(frame: &Frame, sun_path_rotation: Option<f32>) -> crate::render_slots::WorldLook {
+    let tilt = sun_path_rotation.unwrap_or(0.0);
+    let sky = &frame.sky;
+    let (fog_color, fog) = super::fog_uniform(frame);
+    let rgb1 = |c: [f32; 3]| [c[0], c[1], c[2], 1.0];
+    crate::render_slots::WorldLook {
+        sky_color: rgb1(sky.sky_color),
+        fog_color,
+        fog,
+        sun_direction: body(sky.sun_angle, tilt).normalize(),
+        moon_direction: body(sky.moon_angle, tilt).normalize(),
+        light_direction: body(light_angle(frame), tilt).normalize(),
+        sun_angle: day_fraction(sky.sun_angle),
+        sky_light_factor: sky.sky_light_factor,
+        sky_light_color: sky.sky_light_color,
+        ambient_light_color: sky.ambient_light_color,
+        block_light_tint: sky.block_light_tint,
+        sunrise_color: sky.sunrise_color,
+        star_brightness: sky.star_brightness,
+        underwater: frame.underwater,
+        water_fog_color: frame.water_fog,
+        night_vision: frame.night_vision,
+        shader_pack: sun_path_rotation.is_some(),
+    }
 }
 
 /// `shadowAngle`: the day fraction of the body that casts the shadows, the sun by day and the
@@ -956,6 +987,14 @@ impl FrameUniforms {
                 "viewWidth" => Value::f(&[size[0] as f32]),
                 "viewHeight" => Value::f(&[size[1] as f32]),
                 "aspectRatio" => Value::f(&[aspect]),
+                // The upscaler a pack runs needs its own view of the frame (#16757): the size
+                // it draws at (`screenSize`, `fsrScreenSize`) is the pack's render size, and
+                // the scale it renders at is 1 — Horizon already divides the world by the
+                // Upscaling ratio, so a pack's FSR pass needs to scale nothing itself. Like
+                // every other name in `NAMES`, these are built-ins: a `uniform.*` of the same
+                // name that a pack declares reads ours (`pack_post::index_in`).
+                "screenSize" | "fsrScreenSize" => Value::f(&[size[0] as f32, size[1] as f32]),
+                "fsrRenderScale" => Value::f(&[1.0]),
                 "near" => Value::f(&[0.05]),
                 // The chunk render distance, not the distant terrain's reach.
                 "far" => Value::f(&[frame.detail_distance]),
@@ -1140,7 +1179,7 @@ fn components(name: &str) -> usize {
         | "fogColor"
         | "skyColor"
         | "endFlashPosition" => 3,
-        "eyeBrightness" | "eyeBrightnessSmooth" | "atlasSize" => 2,
+        "eyeBrightness" | "eyeBrightnessSmooth" | "atlasSize" | "screenSize" | "fsrScreenSize" => 2,
         "entityColor" => 4,
         // Horizon's own vec4s, a dynamic light and half a boat's water patch box; their counts
         // are ints.
@@ -2265,6 +2304,25 @@ pub(super) mod initial_history_tests {
         }
     }
 
+    /// The upscaler's uniforms (#16757): a window 1280×720 at Performance upscaling (ratio 2)
+    /// leaves the world 640×360, and a pack that reads it is given that size to draw at
+    /// (`screenSize`, `fsrScreenSize`), with `fsrRenderScale` 1 — the world is already
+    /// scaled, so the pack's own FSR pass scales nothing.
+    #[test]
+    fn the_upscaler_s_uniforms_tell_the_pack_the_size_it_draws_at() {
+        let hud = HudBatch::scratch([1280, 720]);
+        let mut u = FrameUniforms::default();
+        u.update(&frame(&hud), &PackInputs::default(), [640, 360]);
+        assert_eq!(float(&u, "screenSize")[..2], [640.0, 360.0]);
+        assert_eq!(float(&u, "fsrScreenSize")[..2], [640.0, 360.0]);
+        assert_eq!(float(&u, "fsrRenderScale")[0], 1.0);
+        // A custom uniform checks their shapes before the first frame, at their sizes (#9086).
+        let shape = |name| zero(name).map(|v| v.n);
+        assert_eq!(shape("screenSize"), Some(2));
+        assert_eq!(shape("fsrScreenSize"), Some(2));
+        assert_eq!(shape("fsrRenderScale"), Some(1));
+    }
+
     /// Iris 1.11.7, read back exactly with a probe pack on a clear day (render distance 12,
     /// cloud range 64): fogStart 0 and fogEnd 1024 (the environmental fog, not the render
     /// distance's 172.8 to 192), fogDensity 0; composite and final programs read alphaTestRef
@@ -2684,6 +2742,35 @@ pub(super) mod initial_history_tests {
         assert_eq!(float(&u, "constantMood")[0], 0.0235);
     }
 
+    #[test]
+    fn world_look_gives_the_frames_sun_fog_and_water() {
+        let hud = HudBatch::scratch([1280, 720]);
+        let mut f = frame(&hud);
+        f.sky.sun_angle = 0.0;
+        f.sky.moon_angle = 180.0;
+        f.underwater = true;
+        f.water_fog = [0.1, 0.2, 0.6];
+        let look = world_look(&f, None);
+        // Noon: the sun straight up, the moon straight down, the sun lights the frame.
+        assert!(
+            look.sun_direction.abs_diff_eq(Vec3::Y, 1e-5),
+            "{:?}",
+            look.sun_direction
+        );
+        assert!(look.moon_direction.abs_diff_eq(-Vec3::Y, 1e-5));
+        assert_eq!(look.light_direction, look.sun_direction);
+        assert_eq!(look.sun_angle, 0.25);
+        let (color, fog) = super::super::fog_uniform(&f);
+        assert_eq!((look.fog_color, look.fog), (color, fog));
+        assert!(look.underwater && !look.shader_pack);
+        assert_eq!(look.water_fog_color, [0.1, 0.2, 0.6]);
+        // A pack's sunPathRotation turns the noon sun toward -Z (north), and says a pack drew.
+        let tilted = world_look(&f, Some(30.0));
+        assert!(tilted.shader_pack);
+        assert!(tilted.sun_direction.z < -0.4 && tilted.sun_direction.y > 0.8);
+        assert!((tilted.sun_direction.length() - 1.0).abs() < 1e-5);
+    }
+
     pub(in crate::gfx) fn frame(hud: &HudBatch) -> Frame<'_> {
         Frame {
             eye: glam::DVec3::ZERO,
@@ -2707,6 +2794,7 @@ pub(super) mod initial_history_tests {
             underwater: false,
             cave_culling: false,
             title: true,
+            gui_only: false,
             sky_blocked: false,
             skybox: false,
             end_sky: false,

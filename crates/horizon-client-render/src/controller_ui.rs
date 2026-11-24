@@ -68,10 +68,8 @@ pub enum Item {
 /// (docs/layers.md#file-size).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Switch {
-    /// A broken block ticks the pad, as in Bedrock.
+    /// A broken block ticks the pad and a split buzzes, as in Bedrock.
     BlockVibration,
-    /// Splitting a stack buzzes briefly, as in Bedrock.
-    SplitVibration,
     /// An Xbox One pad's impulse triggers buzz with its handles.
     ImpulseTriggers,
 }
@@ -80,21 +78,18 @@ impl Switch {
     fn caption(self) -> &'static str {
         match self {
             Switch::BlockVibration => "horizon.options.block_vibration",
-            Switch::SplitVibration => "horizon.options.split_vibration",
             Switch::ImpulseTriggers => "horizon.options.impulse_triggers",
         }
     }
     fn on(self, s: &Settings) -> bool {
         match self {
             Switch::BlockVibration => s.controller.block_vibration,
-            Switch::SplitVibration => s.controller.split_vibration,
             Switch::ImpulseTriggers => s.controller.impulse_triggers,
         }
     }
     fn toggle(self, s: &mut Settings) {
         match self {
             Switch::BlockVibration => s.controller.block_vibration = !s.controller.block_vibration,
-            Switch::SplitVibration => s.controller.split_vibration = !s.controller.split_vibration,
             Switch::ImpulseTriggers => {
                 s.controller.impulse_triggers = !s.controller.impulse_triggers
             }
@@ -141,12 +136,12 @@ fn choice_description(opt: Opt, pad: &PadSettings) -> Option<&'static str> {
         },
         Opt::PadLightbar => match pad.lightbar {
             gamepad::Lightbar::Health => {
-                "A DualSense's light shows your health, from green through amber to red."
+                "The light on a DualSense or a DualShock 4 shows your health, from green through amber to red."
             }
             gamepad::Lightbar::Dimension => {
-                "A DualSense's light changes with the dimension you're in."
+                "The light on a DualSense or a DualShock 4 changes with the dimension you're in."
             }
-            gamepad::Lightbar::Off => "A DualSense keeps its own light.",
+            gamepad::Lightbar::Off => "A DualSense or a DualShock 4 keeps its own light.",
         },
         Opt::PadRadialMode => match pad.radial_mode {
             gamepad::RadialMode::Hold => "horizon.options.radial_mode.hold.about",
@@ -359,17 +354,21 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                     "Feedback",
                     vec![
                         option(Opt::PadVibration, "Rumble when something happens to you."),
-                        switch(
-                            Switch::BlockVibration,
-                            "A tick when you break a block, as in Bedrock.",
-                        ),
-                        switch(
-                            Switch::SplitVibration,
-                            "A short buzz when you split a stack, as in Bedrock.",
+                        option(
+                            Opt::PadVibrationStrength,
+                            "How hard the handles buzz. Lower it if the pad rattles on a desk.",
                         ),
                         switch(
                             Switch::ImpulseTriggers,
                             "An Xbox One controller's triggers buzz with its handles.",
+                        ),
+                        option(
+                            Opt::PadImpulseStrength,
+                            "How hard an Xbox pad's triggers buzz. Lower it if its triggers rattle.",
+                        ),
+                        switch(
+                            Switch::BlockVibration,
+                            "A tick when you break a block and a short buzz when you split a stack, as in Bedrock.",
                         ),
                         option(
                             Opt::PadAdaptiveTriggers,
@@ -377,7 +376,7 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         ),
                         option(
                             Opt::PadLightbar,
-                            "What a DualSense's light shows, over USB or Bluetooth.",
+                            "What the light on a DualSense or a DualShock 4 shows, over USB or Bluetooth.",
                         ),
                     ],
                 ),
@@ -422,7 +421,6 @@ impl Item {
             Item::Option(Opt::PadEnabled) => Some(c.enabled),
             Item::Option(Opt::PadVibration) => Some(c.vibration),
             Item::Switch(Switch::BlockVibration) => Some(c.block_vibration),
-            Item::Switch(Switch::SplitVibration) => Some(c.split_vibration),
             Item::Switch(Switch::ImpulseTriggers) => Some(c.impulse_triggers),
             Item::Option(Opt::PadPlayInBackground) => Some(c.play_in_background),
             Item::Option(Opt::PadAdaptiveTriggers) => Some(c.adaptive_triggers),
@@ -567,6 +565,7 @@ impl Screen for ControllerScreen {
             id: page,
             name: lang::get(page.name()),
             about: lang::get(page.about()),
+            warning: None,
             groups: groups
                 .into_iter()
                 .map(|(name, settings)| Group {
@@ -625,7 +624,7 @@ impl Screen for ControllerScreen {
         let Item::Bind(action) = item else {
             return Vec::new();
         };
-        s.controller.bind(action, PadSettings::default_of(action));
+        s.controller.reset_binding(action);
         vec![Output::Event(Event::Changed)]
     }
     /// Whose profile these settings are, and the controller the game sees.
@@ -766,6 +765,8 @@ mod tests {
             Opt::PadGameplayGuide,
             Opt::PadCraftOnServers,
             Opt::PadVibration,
+            Opt::PadVibrationStrength,
+            Opt::PadImpulseStrength,
             Opt::PadPlayInBackground,
             Opt::PadAdaptiveTriggers,
             Opt::PadLightbar,
@@ -786,11 +787,7 @@ mod tests {
         ] {
             assert!(items.contains(&Item::Option(opt)), "{opt:?}");
         }
-        for setting in [
-            Switch::BlockVibration,
-            Switch::SplitVibration,
-            Switch::ImpulseTriggers,
-        ] {
+        for setting in [Switch::BlockVibration, Switch::ImpulseTriggers] {
             assert!(items.contains(&Item::Switch(setting)), "{setting:?}");
         }
     }
@@ -806,8 +803,8 @@ mod tests {
                 Item::Switch(Switch::BlockVibration),
                 (|s: &Settings| s.controller.block_vibration) as fn(&Settings) -> bool,
             ),
-            (Item::Switch(Switch::SplitVibration), |s: &Settings| {
-                s.controller.split_vibration
+            (Item::Switch(Switch::ImpulseTriggers), |s: &Settings| {
+                s.controller.impulse_triggers
             }),
         ] {
             let at = ui.point_at(&s, SIZE, item);
@@ -1036,6 +1033,44 @@ mod tests {
         let outputs = ui.click(&mut s, on_reset, SIZE, false, false, false);
         assert_eq!(outputs, [CLICK, CHANGED]);
         assert!(s.controller.is_default(JUMP));
+    }
+
+    #[test]
+    fn the_radial_reset_restores_the_current_sticks_valid_default() {
+        use gamepad::{RADIAL, RadialMode, RadialStick};
+        for stick in RadialStick::ALL {
+            let mut s = Settings::default();
+            s.controller.set_radial_stick(stick);
+            s.controller.radial_mode = RadialMode::Toggle;
+            s.controller.bind(RADIAL, Some(Button::LeftBumper));
+            s.controller.bind(JUMP, Some(Button::North));
+            let before = s.controller.clone();
+            let mut ui = ui(Page::Bindings);
+            let item = Item::Bind(RADIAL);
+            let (_, y) = ui.point_at(&s, SIZE, item);
+            let cols = Columns::of(SIZE.0, SIZE.1);
+            let on_reset = (cols.list_x + cols.list_w - 10.0, y);
+            assert_eq!(
+                ui.click(&mut s, on_reset, SIZE, false, false, false),
+                [CLICK, CHANGED]
+            );
+            let expected = (stick == RadialStick::Right).then_some(Button::DPadRight);
+            assert_eq!(s.controller.binding(RADIAL), expected, "{stick:?}");
+            assert!(matches!(
+                binding(RADIAL, &s.controller, ui.screen.context.glyphs).reset,
+                Reset::Default
+            ));
+            assert_eq!(s.controller.binding(JUMP), Some(Button::North));
+            assert_eq!(s.controller.radial_stick, stick);
+            assert_eq!(s.controller.radial_mode, before.radial_mode);
+            assert_eq!(s.controller.radial, before.radial);
+            assert_eq!(PadSettings::parse(&s.controller.serialize()), s.controller);
+            // Once reset, the same location is a binding row, not a working reset.
+            assert_eq!(
+                ui.click(&mut s, on_reset, SIZE, false, false, false),
+                [CLICK, Output::Bind(Capture::Pad(RADIAL))]
+            );
+        }
     }
 
     #[test]

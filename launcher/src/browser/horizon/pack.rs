@@ -38,21 +38,29 @@ pub fn list() -> Vec<Installed> {
 }
 
 pub(crate) fn list_in(dir: &Path) -> Vec<Installed> {
-    let mut packs: Vec<Installed> = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| read(&e.path()))
-        .collect();
+    let mut packs: Vec<_> = list_results(dir).into_iter().flatten().flatten().collect();
     packs.sort_by_key(|p| p.name.to_lowercase());
     packs
 }
 
+pub(crate) fn list_checked_in(dir: &Path) -> Result<Vec<Installed>, String> {
+    list_results(dir)?.collect()
+}
+
+fn list_results(
+    dir: &Path,
+) -> Result<impl Iterator<Item = Result<Installed, String>> + '_, String> {
+    Ok(crate::modpacks::pack_folders(dir)?.map(|work| read_record(&work?)))
+}
+
 fn read(work: &Path) -> Option<Installed> {
-    let text = fs::read_to_string(work.join(RECORD)).ok()?;
-    let mut pack: Installed = serde_json::from_str(&text).ok()?;
+    read_record(work).ok()
+}
+
+pub(crate) fn read_record(work: &Path) -> Result<Installed, String> {
+    let mut pack: Installed = horizon_port_pack::pipeline::read_json(&work.join(RECORD))?;
     pack.work = work.to_path_buf();
-    Some(pack)
+    Ok(pack)
 }
 
 /// Whether `work` is a registry pack's folder.
@@ -85,8 +93,9 @@ fn install_in(
     if p.kind != idx::Kind::Modpack {
         return Err(format!("{} is a {}, not a modpack.", p.name, p.kind.name()));
     }
-    let v = newest(index, p)?;
     let work = dir.join(&p.id);
+    let _game = crate::game_shader_api::for_home(&home(&work));
+    let v = newest(index, p)?;
     let fresh = !work.exists();
     let result = install_version_in(index, local, p, v, &work, progress);
     if result.is_err() && fresh {
@@ -168,9 +177,7 @@ fn install_version_in(
 /// Turns the game's command into the pack's profile: its own game folder (the player's
 /// options.txt copied in when the pack brings none), its taken-down mods turned off first.
 pub fn apply(cmd: &mut Command, work: &Path) -> Result<(), String> {
-    if !is_pack(work) {
-        return Err(format!("{} is not an installed modpack.", work.display()));
-    }
+    read_record(work)?;
     let home = home(work);
     fs::create_dir_all(&home).map_err(|e| format!("{}: {e}", home.display()))?;
     let options = home.join("options.txt");
@@ -344,6 +351,43 @@ mod tests {
         let packs = dir.join("horizon-packs");
         let e = install_in(&index, true, "cozy", &packs, &|_, _| {}).unwrap_err();
         assert!(e.contains("taken down: Test."), "{e}");
+        assert!(!packs.join("cozy").exists(), "nothing left behind");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A pack that pins a shader pack made for another shader API fails as a whole, and the
+    /// pinned pack isn't downloaded (#17245).
+    #[test]
+    fn a_pack_pinning_a_shader_pack_for_another_shader_api_installs_nothing() {
+        let dir = scratch("shader-api");
+        let mut index = registry(&dir, true, "");
+        let pinned = index
+            .projects
+            .iter_mut()
+            .find(|p| p.id == "coords_hud")
+            .unwrap();
+        pinned.kind = idx::Kind::Shader;
+        pinned.versions[0].api = "0.1".into();
+        let packs = dir.join("horizon-packs");
+        let fetched = std::sync::Mutex::new(Vec::new());
+        let install = || {
+            install_in(&index, true, "cozy", &packs, &|line, _| {
+                fetched.lock().unwrap().push(line.to_owned())
+            })
+        };
+        let e = crate::game_shader_api::tests::with_game(&["0.2"], install).unwrap_err();
+        assert_eq!(
+            e,
+            "Coordinates HUD needs shader API 0.1; this Horizon serves 0.2."
+        );
+        assert!(
+            fetched
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|l| l.starts_with("Cozy ")),
+            "only the pack's own file was downloaded"
+        );
         assert!(!packs.join("cozy").exists(), "nothing left behind");
         fs::remove_dir_all(&dir).unwrap();
     }

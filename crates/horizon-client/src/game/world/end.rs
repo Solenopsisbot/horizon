@@ -128,7 +128,7 @@ fn fallback_spawn(own: Option<Vec3>, world: Option<[i32; 3]>) -> Vec3 {
 pub(super) struct EndState {
     /// Ticks until the player can use a gateway again (TheEndGatewayBlockEntity cooldown).
     gateway_cooldown: u32,
-    gateways: HashMap<u32, horizon_client::end_gateway::Traveller>,
+    pub(in crate::game) gateways: HashMap<u32, horizon_client::end_gateway::Traveller>,
     /// The entities that went through a gateway, waiting for its exit.
     arrivals: Vec<GatewayArrival>,
     /// The chunks kept loaded for those arrivals.
@@ -147,6 +147,8 @@ pub(super) struct EndState {
     /// Thrown eyes of ender in flight.
     eyes: Vec<EyeOfEnder>,
     flash: EndFlash,
+    /// Gateways waiting for their 3x3 footprint chunks to load before placing.
+    pub(super) pending_gateways: Vec<[i32; 3]>,
 }
 
 /// EndFlashState: a purple flash in the End sky every 600 ticks that also
@@ -331,6 +333,10 @@ impl Game<'_> {
             // ServerLevel.tick: only entities in entity-ticking chunks tick.
             if !ticking(o.position.x.floor() as i32, o.position.z.floor() as i32) {
                 return true;
+            }
+            // Entity.baseTick: a burning eye's loaded Fire counts down.
+            if let Some(raw) = self.persist.raw.get_mut(&o.id) {
+                horizon_client::entity_nbt::count_down_fire(raw);
             }
             let m = eye.motion;
             o.position = Vec3::new(o.position.x + m.x, o.position.y + m.y, o.position.z + m.z);
@@ -655,6 +661,7 @@ impl Game<'_> {
         self.tick_crystals();
         self.clear_crystal_fire();
         self.tick_eyes();
+        self.tick_pending_gateways()?;
         if self.dimension_type().has_ender_dragon_fight {
             self.ensure_exit_portal()?;
         }
@@ -807,7 +814,7 @@ impl Game<'_> {
         if self.exit_portal().is_some() {
             // The gateway may have been out of range when it was placed.
             if won
-                && self.world.loaded(gateway[0], gateway[2])
+                && self.gateway_footprint_loaded(gateway)
                 && &*self.block_name(gateway) != "minecraft:end_gateway"
                 && &*self.block_name([gateway[0], gateway[1] + 2, gateway[2]])
                     != "minecraft:bedrock"
@@ -831,7 +838,7 @@ impl Game<'_> {
         let origin = [0, y.max(1), 0];
         self.set_exit_portal(origin);
         self.place_podium(origin, won)?;
-        if won && self.world.loaded(gateway[0], gateway[2]) {
+        if won && self.gateway_footprint_loaded(gateway) {
             self.place_gateway(gateway)?;
         }
         Ok(())
@@ -875,7 +882,44 @@ impl Game<'_> {
         self.place_podium(origin, true)
     }
     pub(super) fn place_gateway_at(&mut self, pos: [i32; 3]) -> Result<()> {
+        if !self.gateway_footprint_loaded(pos) {
+            if !self.end.pending_gateways.contains(&pos) {
+                self.end.pending_gateways.push(pos);
+                self.fight.dirty = true;
+            }
+            return Ok(());
+        }
         self.place_gateway(pos)
+    }
+
+    /// Whether every chunk holding a block in the gateway's 3x3 footprint is loaded.
+    pub(super) fn gateway_footprint_loaded(&self, origin: [i32; 3]) -> bool {
+        Self::is_gateway_footprint_loaded(&self.world, origin)
+    }
+
+    pub(super) fn is_gateway_footprint_loaded(
+        world: &horizon_client::world::World,
+        origin: [i32; 3],
+    ) -> bool {
+        (-1..=1).all(|dx| (-1..=1).all(|dz| world.loaded(origin[0] + dx, origin[2] + dz)))
+    }
+
+    /// Places the queued gateways whose footprint has loaded. The queue belongs
+    /// to the End's fight, so only the level with that fight drains it.
+    pub(super) fn tick_pending_gateways(&mut self) -> Result<()> {
+        if self.end.pending_gateways.is_empty() || !self.dimension_type().has_ender_dragon_fight {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.end.pending_gateways);
+        for pos in pending {
+            if self.gateway_footprint_loaded(pos) {
+                self.place_gateway(pos)?;
+                self.fight.dirty = true;
+            } else {
+                self.end.pending_gateways.push(pos);
+            }
+        }
+        Ok(())
     }
 
     /// The first gateway of the shuffled ring (EnderDragonFight constructor
@@ -954,6 +998,9 @@ impl Game<'_> {
 
     /// EndGatewayFeature.place: the gateway block in a bedrock cross.
     fn place_gateway(&mut self, origin: [i32; 3]) -> Result<()> {
+        if !self.gateway_footprint_loaded(origin) {
+            return Err("gateway footprint chunk is not loaded".into());
+        }
         for y in -2i32..=2 {
             for z in -1..=1 {
                 for x in -1..=1 {
@@ -1834,9 +1881,14 @@ impl Game<'_> {
         match arrival.traveller {
             Arriving::Live(id) => {
                 if let Some(target) = self.level_entity(id as i32) {
-                    // Entity.teleportSameDimension keeps the live entity and
-                    // its motion, and moves every passenger in the same operation.
+                    // Entity.teleportSameDimension keeps the live entity and moves every
+                    // passenger in the same operation. The gateway's transition has
+                    // `Relative.DELTA`: the motion `/tp`'s rule in there stops is put back.
+                    let motion = self.transition_motion(target);
                     self.teleport_to_in_level(target, [at.x, at.y, at.z], None, [false; 3], false);
+                    if let Some(motion) = motion {
+                        self.restore_transition_motion(target, motion);
+                    }
                     self.set_portal_cooldown(id);
                     self.place_portal_ticket(key);
                 }
@@ -2015,6 +2067,50 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
+    fn an_entity_keeps_its_motion_through_a_gateway() {
+        use super::super::native_entity_refs::tests::with_game;
+
+        with_game(|game| {
+            // The exit's chunk is loaded, so the arrival does not wait.
+            game.world.chunks.insert(
+                (0, 0),
+                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+            );
+            game.spawn_item_own(
+                horizon_client::items::ItemStack::new("minecraft:stick", 1),
+                [2.5, 100.0, 2.5],
+                0,
+            );
+            let id = game.dropped.last().unwrap().id;
+            let target = Vec3::new(12.5, 100.0, 12.5);
+            let motion = Vec3::new(0.117, 0.25, -0.05);
+            game.dropped
+                .iter_mut()
+                .find(|d| d.id == id)
+                .unwrap()
+                .velocity = motion;
+            let arrival = GatewayArrival {
+                traveller: Arriving::Live(id),
+                job: GatewayJob::Known {
+                    exit: [12, 100, 12],
+                    exact: true,
+                },
+                target,
+            };
+            assert!(game.arrive_through_gateway(arrival).is_none());
+            // Entity.teleportSameDimension with the gateway's Relative.DELTA: the
+            // entity is at the exit and its motion is kept.
+            let item = game.dropped.iter().find(|d| d.id == id).unwrap();
+            let (at, to) = (item.position, target);
+            for (a, t) in [(at.x, to.x), (at.y, to.y), (at.z, to.z)] {
+                assert!((a - t).abs() < 1e-3, "{at:?}");
+            }
+            assert_eq!(item.velocity, motion);
+        });
+    }
+
+    #[test]
     fn leaving_the_end_without_a_point_of_its_own_goes_to_the_world_spawn() {
         let world = Some([220, 63, -41]);
         assert_eq!(fallback_spawn(None, world), Vec3::new(220.5, 63.0, -40.5));
@@ -2128,8 +2224,28 @@ mod tests {
             assert!((at(x, y).length() - 100.0).abs() < 1e-3);
         }
     }
+
+    #[test]
+    fn gateway_footprint_loaded_requires_all_boundary_chunks() {
+        use horizon_client::chunk::Chunk;
+        use horizon_world::registry::BlockStateId;
+
+        let mut world = horizon_client::world::World::new(BlockStateId(0), 0);
+        world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+
+        let origin = [15, 75, 8];
+        assert!(world.loaded(origin[0], origin[2]));
+        assert!(!Game::is_gateway_footprint_loaded(&world, origin));
+
+        world.chunks.insert((1, 0), Arc::new(Chunk::empty(1, 0)));
+        assert!(Game::is_gateway_footprint_loaded(&world, origin));
+    }
 }
 
 #[cfg(test)]
 #[path = "end/gateway_cooldown_tests.rs"]
 mod cooldown_tests;
+
+#[cfg(test)]
+#[path = "end/pending_gateway_tests.rs"]
+mod pending_gateway_tests;

@@ -6,10 +6,11 @@ use super::native_hooks::PhantomSpawnResult;
 use super::{Dim, Game};
 use horizon_core::geometry::Vec3;
 use horizon_core::random::RandomSource;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+pub(super) use horizon_gameplay::stats::{
+    Stats, locate_player_json, player_json, write_player_json,
 };
+use horizon_gameplay::stats::{namespaced, phantom_group_size};
+use std::path::PathBuf;
 
 #[cfg(test)]
 #[path = "tests/phantom_spawn_tests.rs"]
@@ -27,217 +28,6 @@ struct PhantomTarget {
     position: Vec3,
     since_rest: i32,
     identity: Option<(u128, String)>,
-}
-
-/// `stats[type][key]`, with `type` and `key` namespaced ids.
-#[derive(Default)]
-pub(super) struct Stats {
-    pub(super) values: BTreeMap<String, BTreeMap<String, i32>>,
-    pub(super) loaded: bool,
-    /// Ticks until the phantom spawner runs again.
-    phantom_tick: i32,
-    /// Statistic changes (type, key, amount; `None` = reset) for the
-    /// scoreboard criteria to follow.
-    pub(super) events: Vec<(String, String, Option<i32>)>,
-    /// Changed since the client was last sent them (`StatsCounter`'s dirty
-    /// set), by type.
-    dirty: BTreeMap<String, BTreeSet<String>>,
-}
-
-/// `minecraft:` and `name`, given to `f` from the stack when short: some
-/// counters go up every tick for every player, and they are found without
-/// a string made for each.
-fn namespaced<T>(name: &str, f: impl FnOnce(&str) -> T) -> T {
-    const NAMESPACE: &str = "minecraft:";
-    let mut buf = [0u8; 96];
-    let len = NAMESPACE.len() + name.len();
-    if len > buf.len() {
-        return f(&format!("{NAMESPACE}{name}"));
-    }
-    buf[..NAMESPACE.len()].copy_from_slice(NAMESPACE.as_bytes());
-    buf[NAMESPACE.len()..len].copy_from_slice(name.as_bytes());
-    // Two strings one after the other are one.
-    f(std::str::from_utf8(&buf[..len]).unwrap_or_default())
-}
-
-/// The map under `key`, made when missing, found without an owned key
-/// when there.
-fn entry<'a, V: Default>(map: &'a mut BTreeMap<String, V>, key: &str) -> &'a mut V {
-    if !map.contains_key(key) {
-        map.insert(key.to_owned(), V::default());
-    }
-    map.get_mut(key).expect("just inserted")
-}
-
-impl Stats {
-    pub(super) fn add(&mut self, ty: &str, key: &str, n: i32) {
-        namespaced(ty, |ty| {
-            let v = entry(entry(&mut self.values, ty), key);
-            *v = v.saturating_add(n);
-            self.events.push((ty.to_owned(), key.to_owned(), Some(n)));
-            self.mark_dirty(ty, key);
-        });
-    }
-    fn mark_dirty(&mut self, ty: &str, key: &str) {
-        let keys = entry(&mut self.dirty, ty);
-        if !keys.contains(key) {
-            keys.insert(key.to_owned());
-        }
-    }
-    pub(super) fn get(&self, ty: &str, key: &str) -> i32 {
-        self.values
-            .get(&format!("minecraft:{ty}"))
-            .and_then(|m| m.get(key))
-            .copied()
-            .unwrap_or(0)
-    }
-    pub(super) fn reset(&mut self, ty: &str, key: &str) {
-        if let Some(m) = self.values.get_mut(&format!("minecraft:{ty}")) {
-            m.insert(key.to_owned(), 0);
-        }
-        self.mark_dirty(&format!("minecraft:{ty}"), key);
-        self.events
-            .push((format!("minecraft:{ty}"), key.to_owned(), None));
-    }
-    /// `ServerPlayer.die`'s `resetStat` of `TIME_SINCE_DEATH` and `TIME_SINCE_REST`.
-    pub(super) fn reset_death_timers(&mut self) {
-        self.reset("custom", "minecraft:time_since_death");
-        self.reset("custom", "minecraft:time_since_rest");
-    }
-    pub(super) fn custom(&mut self, key: &str, n: i32) {
-        namespaced(key, |key| self.add("custom", key, n));
-    }
-    /// `ServerStatsCounter.markAllDirty`: everything goes out on the next request.
-    pub(super) fn mark_all_dirty(&mut self) {
-        self.dirty = self
-            .values
-            .iter()
-            .map(|(ty, m)| (ty.clone(), m.keys().cloned().collect()))
-            .collect();
-    }
-    /// `ServerStatsCounter.sendStats`' entries: the dirty statistics and
-    /// their values, the set cleared.
-    pub(super) fn take_dirty(&mut self) -> Vec<(String, String, i32)> {
-        std::mem::take(&mut self.dirty)
-            .into_iter()
-            .flat_map(|(ty, keys)| keys.into_iter().map(move |key| (ty.clone(), key)))
-            .map(|(ty, key)| {
-                let v = self.values.get(&ty).and_then(|m| m.get(&key)).copied();
-                (ty, key, v.unwrap_or(0))
-            })
-            .collect()
-    }
-    /// `ServerStatsCounter.parseLocal`: the counters of a stats file.
-    pub(super) fn read(path: &Path) -> Self {
-        let json = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .unwrap_or_default();
-        Self::from_json(&json)
-    }
-    /// The counters of a stats file's JSON, or of a hand-over's record (`player-import`).
-    pub(super) fn from_json(json: &serde_json::Value) -> Self {
-        let mut stats = Self {
-            loaded: true,
-            ..Self::default()
-        };
-        if let Some(all) = json.get("stats").and_then(|s| s.as_object()) {
-            for (ty, entries) in all {
-                let Some(entries) = entries.as_object() else {
-                    continue;
-                };
-                let map = stats.values.entry(ty.clone()).or_default();
-                for (key, v) in entries {
-                    if let Some(n) = v.as_i64() {
-                        map.insert(key.clone(), n as i32);
-                    }
-                }
-            }
-        }
-        stats
-    }
-    /// `ServerStatsCounter.toJson`: what `write` puts in the file, and what a
-    /// hand-over's record carries (`player-export`).
-    pub(super) fn to_json(&self) -> serde_json::Value {
-        let stats: serde_json::Map<String, serde_json::Value> = self
-            .values
-            .iter()
-            .filter(|(_, m)| !m.is_empty())
-            .map(|(ty, m)| {
-                let entries: serde_json::Map<String, serde_json::Value> =
-                    m.iter().map(|(k, v)| (k.clone(), (*v).into())).collect();
-                (ty.clone(), serde_json::Value::Object(entries))
-            })
-            .collect();
-        serde_json::json!({
-            "stats": stats,
-            "DataVersion": horizon_world::DATA_VERSION,
-        })
-    }
-    /// `ServerStatsCounter.save`.
-    pub(super) fn write(&self, path: &Path) {
-        let json = self.to_json();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(text) = serde_json::to_string_pretty(&json) {
-            let _ = std::fs::write(path, text);
-        }
-    }
-}
-/// `players/<dir>/<uuid>.json` of a world (advancements, stats).
-pub(super) fn player_json(world: &Path, dir: &str, uuid: [i32; 4]) -> PathBuf {
-    let hex: String = uuid.iter().map(|v| format!("{:08x}", *v as u32)).collect();
-    let text = format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    );
-    world.join("players").join(dir).join(format!("{text}.json"))
-}
-/// `FileUtil.isValidPathSegment`: not `.` or `..`, and only the characters
-/// `[-._a-z0-9]`. A player name with a capital letter in it is refused like any
-/// other segment vanilla would not write to disk.
-fn valid_path_segment(segment: &str) -> bool {
-    segment != "."
-        && segment != ".."
-        && segment.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.' | b'_')
-        })
-}
-
-/// `PlayerList.locateStatsFile`: the player's stats file, with the one an older
-/// version named after the player (`stats/<name>.json`) moved to the uuid file the
-/// first time it is asked for. A uuid file that is already there wins, and a move
-/// that fails leaves the old one in place.
-pub(super) fn locate_player_json(world: &Path, dir: &str, uuid: [i32; 4], name: &str) -> PathBuf {
-    let uuid_file = player_json(world, dir, uuid);
-    if uuid_file.exists() {
-        return uuid_file;
-    }
-    let file = format!("{name}.json");
-    if !valid_path_segment(&file) {
-        return uuid_file;
-    }
-    let named = uuid_file.with_file_name(&file);
-    if !named.is_file() {
-        return uuid_file;
-    }
-    match std::fs::rename(&named, &uuid_file) {
-        Ok(()) => uuid_file,
-        Err(e) => {
-            log::warn!(
-                "Horizon: failed to move the {} file {} to {}: {e}",
-                dir,
-                named.display(),
-                uuid_file.display()
-            );
-            named
-        }
-    }
 }
 
 /// The value registry owned by each vanilla statistic type.
@@ -332,7 +122,7 @@ impl Game<'_> {
         }
         self.stats.loaded = true;
         if let Some(path) = self.stats_path() {
-            self.stats.values = Stats::read(&path).values;
+            self.stats.load_from(Stats::read(&path));
         }
     }
     /// `ServerStatsCounter.save`.
@@ -385,6 +175,22 @@ impl Game<'_> {
         };
         let alive = !p.health.dead_or_dying();
         let crouching = p.pose == horizon_client::pose::Pose::Crouching;
+        if !self.lan_acting_fake && !mod_api::__private::listened(mod_api::HookId::PlayerStatAward)
+        {
+            let mut mask = (1 << 0) | (1 << 1);
+            if alive {
+                mask |= 1 << 2;
+            }
+            if crouching {
+                mask |= 1 << 3;
+            }
+            if !sleeping {
+                mask |= 1 << 4;
+            }
+            let record_events = !self.score.board.objectives.is_empty();
+            self.stats.add_tick_mask(mask, record_events);
+            return;
+        }
         self.award_custom_stat("play_time", 1);
         self.award_custom_stat("total_world_time", 1);
         if alive {
@@ -439,7 +245,7 @@ impl Game<'_> {
             p.fall_flying,
             p.pose == horizon_client::pose::Pose::Swimming,
         );
-        let climbing = p.last_climbable.is_some() && d.y > 0.0;
+        let on_climbable = self.player_on_climbable();
         let riding = self.riding.map(|id| {
             self.mobs
                 .iter()
@@ -481,8 +287,10 @@ impl Game<'_> {
                     self.award_custom_stat("walk_on_water_one_cm", horizontal)
                 }
             }
-            None if climbing => {
-                self.award_custom_stat("climb_one_cm", (d.y * 100.0).round() as i32)
+            None if on_climbable => {
+                if d.y > 0.0 {
+                    self.award_custom_stat("climb_one_cm", (d.y * 100.0).round() as i32);
+                }
             }
             None if on_ground => {
                 if horizontal > 0 {
@@ -518,12 +326,12 @@ impl Game<'_> {
         {
             return;
         }
-        self.stats.phantom_tick -= 1;
-        if self.stats.phantom_tick > 0 {
+        if !self.stats.phantom_due() {
             return;
         }
         let r = &mut self.world.random;
-        self.stats.phantom_tick += (60 + r.next_int_bound(60).unwrap_or(0)) * 20;
+        self.stats
+            .phantom_delay((60 + r.next_int_bound(60).unwrap_or(0)) * 20);
         if self.sky_darken() < 5 {
             return;
         }
@@ -632,15 +440,8 @@ impl Game<'_> {
     }
 }
 
-/// `1 + random.nextInt(difficulty.getId() + 1)` of `PhantomSpawner.tick`: Peaceful still draws.
-fn phantom_group_size(random: &mut impl RandomSource, difficulty_id: i32) -> i32 {
-    1 + random.next_int_bound(difficulty_id + 1).unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     #[ignore = "daily"]
     fn fake_players_do_not_advance_phantom_rng() {
@@ -671,7 +472,7 @@ mod tests {
             game.world.random = horizon_core::random::LevelRandom::for_level(
                 horizon_core::random::LegacyRandom::new(12345),
             );
-            game.stats.phantom_tick = 0;
+            game.stats.set_phantom_tick(0);
             game.lan
                 .as_mut()
                 .unwrap()
@@ -683,124 +484,182 @@ mod tests {
         });
     }
 
-    /// `PlayerList.locateStatsFile`: a stats file an older version named after the player is moved
-    /// to the uuid file the first time it is asked for; a uuid file that is already there wins, and
-    /// a name vanilla would not write as a path segment is not looked for at all.
     #[test]
-    fn an_old_stats_file_named_after_the_player_moves_to_its_uuid() {
-        let world = std::env::temp_dir().join(format!(
-            "horizon-stats-file-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let stats = world.join("players").join("stats");
-        std::fs::create_dir_all(&stats).unwrap();
-        let uuid = [1, 2, 3, 4];
-        let located = player_json(&world, "stats", uuid);
-        // Nothing to move: the uuid name is the answer, and looking writes nothing.
-        assert_eq!(locate_player_json(&world, "stats", uuid, "notch"), located);
-        assert!(!located.exists(), "looking for the file writes none");
-        // The old name-based file is moved onto the uuid name, and not left behind.
-        let old = stats.join("notch.json");
-        std::fs::write(&old, "{}").unwrap();
-        assert_eq!(locate_player_json(&world, "stats", uuid, "notch"), located);
-        assert!(located.is_file(), "the old file landed on the uuid name");
-        assert!(!old.exists(), "and is not left behind");
-        // A uuid file that exists is the answer, whether or not an old one does.
-        std::fs::write(&old, "{}").unwrap();
-        assert_eq!(locate_player_json(&world, "stats", uuid, "notch"), located);
-        assert!(old.is_file(), "the old file is left alone");
-        // FileUtil.isValidPathSegment on the file name: capitals and separators are not a segment,
-        // while a lowercase name with dashes, dots or digits is.
-        for name in ["Notch", "no/tch", "no tch"] {
-            assert!(
-                !valid_path_segment(&format!("{name}.json")),
-                "{name:?} is not a path segment"
-            );
-        }
-        for name in ["notch", "a-b_c.1", "jeb_"] {
-            assert!(
-                valid_path_segment(&format!("{name}.json")),
-                "{name:?} is a path segment"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&world);
-    }
+    fn tick_mask_stats_roundtrip_snapshots_and_player_predicate() {
+        use super::Stats;
+        use horizon_client::advancements::{self as adv, EntityView, PlayerFacts, World};
+        use std::collections::BTreeMap;
 
-    /// ServerPlayer.die zeroes the two timers (and only them) and sends the new zero.
-    #[test]
-    fn death_resets_the_timers_since_death_and_rest() {
-        let mut s = Stats::default();
-        s.custom("time_since_death", 700);
-        s.custom("time_since_rest", 900);
-        s.custom("deaths", 2);
-        s.events.clear();
-        s.reset_death_timers();
-        assert_eq!(s.get("custom", "minecraft:time_since_death"), 0);
-        assert_eq!(s.get("custom", "minecraft:time_since_rest"), 0);
-        assert_eq!(s.get("custom", "minecraft:deaths"), 2);
-        assert_eq!(s.events.len(), 2);
-    }
-
-    #[test]
-    fn phantom_group_size_follows_difficulty() {
-        // Expected from java.util.Random(12345): 1 + nextInt(id + 1), six draws each.
-        let expected: [(i32, [i32; 6]); 4] = [
-            (0, [1, 1, 1, 1, 1, 1]),
-            (1, [1, 2, 2, 2, 2, 1]),
-            (2, [2, 2, 1, 1, 2, 2]),
-            (3, [2, 3, 4, 4, 4, 1]),
-        ];
-        for (id, sizes) in expected {
-            let mut r = horizon_core::random::LegacyRandom::new(12345);
-            let got: Vec<i32> = (0..6).map(|_| phantom_group_size(&mut r, id)).collect();
-            assert_eq!(got, sizes, "difficulty {id}");
+        struct TestWorld;
+        impl World for TestWorld {
+            fn dimension(&self) -> &str {
+                "minecraft:overworld"
+            }
+            fn weather(&self) -> (bool, bool) {
+                (false, false)
+            }
+            fn biome(&self, _: [i32; 3]) -> String {
+                "minecraft:plains".into()
+            }
+            fn structures(&self, _: [i32; 3]) -> Vec<String> {
+                Vec::new()
+            }
+            fn block(&self, _: [i32; 3]) -> (String, BTreeMap<String, String>) {
+                ("minecraft:air".into(), BTreeMap::new())
+            }
+            fn fluid(&self, _: [i32; 3]) -> Option<String> {
+                None
+            }
+            fn can_see_sky(&self, _: [i32; 3]) -> bool {
+                true
+            }
+            fn light(&self, _: [i32; 3]) -> i32 {
+                15
+            }
+            fn smokey(&self, _: [i32; 3]) -> bool {
+                false
+            }
+            fn in_tag(&self, _: &str, _: &str, _: &str) -> bool {
+                false
+            }
         }
-    }
 
-    #[test]
-    fn counters_events_and_dirty_entries() {
-        let mut s = Stats::default();
-        s.custom("play_time", 1);
-        s.custom("play_time", 1);
-        s.add("mined", "minecraft:stone", 2);
-        s.custom(&"x".repeat(100), 3);
-        assert_eq!(s.get("custom", "minecraft:play_time"), 2);
-        assert_eq!(s.get("mined", "minecraft:stone"), 2);
-        assert_eq!(
-            s.get("custom", &format!("minecraft:{}", "x".repeat(100))),
-            3
-        );
-        assert_eq!(s.events.len(), 4);
-        assert_eq!(
-            s.events[1],
-            (
-                "minecraft:custom".into(),
-                "minecraft:play_time".into(),
-                Some(1)
-            )
-        );
-        let long = format!("minecraft:{}", "x".repeat(100));
-        let sent = |v: &[(&str, &str, i32)]| -> Vec<(String, String, i32)> {
-            v.iter()
-                .map(|&(t, k, n)| (t.to_owned(), k.to_owned(), n))
-                .collect()
+        let predicate = serde_json::json!({
+            "type_specific/player": {
+                "stats": [{
+                    "type": "minecraft:custom",
+                    "stat": "minecraft:play_time",
+                    "value": { "min": 2 }
+                }]
+            }
+        });
+        let matches = |stats: &Stats| {
+            let view = EntityView {
+                kind: "minecraft:player".into(),
+                player_facts: PlayerFacts {
+                    stats: Some(stats.merged_values()),
+                    ..PlayerFacts::default()
+                },
+                ..EntityView::default()
+            };
+            adv::entity(&predicate, &view, &TestWorld, [0.0; 3])
         };
+
+        let mut stats = Stats::default();
+        // Bits: play_time (0), sneak_time (3), time_since_rest (4).
+        let mask = (1 << 0) | (1 << 3) | (1 << 4);
+        stats.add_tick_mask(mask, false);
+        stats.add_tick_mask(mask, false);
+
+        assert_eq!(stats.get("custom", "minecraft:play_time"), 2);
+        assert_eq!(stats.get("custom", "minecraft:sneak_time"), 2);
+        assert_eq!(stats.get("custom", "minecraft:time_since_rest"), 2);
+        assert_eq!(stats.get("custom", "minecraft:total_world_time"), 0);
+
+        let json = stats.to_json();
+        assert_eq!(json["stats"]["minecraft:custom"]["minecraft:play_time"], 2);
+        assert_eq!(json["stats"]["minecraft:custom"]["minecraft:sneak_time"], 2);
         assert_eq!(
-            s.take_dirty(),
-            sent(&[
-                ("minecraft:custom", "minecraft:play_time", 2),
-                ("minecraft:custom", &long, 3),
-                ("minecraft:mined", "minecraft:stone", 2),
-            ])
+            json["stats"]["minecraft:custom"]["minecraft:time_since_rest"],
+            2
         );
-        assert!(s.take_dirty().is_empty());
-        s.reset("mined", "minecraft:stone");
+
+        let dirty = stats.take_dirty();
         assert_eq!(
-            s.take_dirty(),
-            sent(&[("minecraft:mined", "minecraft:stone", 0)])
+            dirty,
+            vec![
+                ("minecraft:custom".into(), "minecraft:play_time".into(), 2),
+                ("minecraft:custom".into(), "minecraft:sneak_time".into(), 2),
+                (
+                    "minecraft:custom".into(),
+                    "minecraft:time_since_rest".into(),
+                    2
+                ),
+            ]
         );
-        s.mark_all_dirty();
-        assert_eq!(s.take_dirty().len(), 3);
+        assert!(matches(&stats));
+
+        let next = Stats::from_snapshot(&serde_json::json!({
+            "stats": {
+                "minecraft:custom": {
+                    "minecraft:play_time": 42
+                }
+            }
+        }))
+        .unwrap();
+        stats.replace(next);
+        assert_eq!(stats.get("custom", "minecraft:play_time"), 42);
+        assert_eq!(stats.get("custom", "minecraft:sneak_time"), 0);
+        assert!(matches(&stats));
+        let replace_dirty = stats.take_dirty();
+        assert_eq!(
+            replace_dirty,
+            vec![
+                ("minecraft:custom".into(), "minecraft:play_time".into(), 42),
+                ("minecraft:custom".into(), "minecraft:sneak_time".into(), 0),
+                (
+                    "minecraft:custom".into(),
+                    "minecraft:time_since_rest".into(),
+                    0
+                ),
+            ]
+        );
+
+        let cleared = Stats::from_snapshot(&serde_json::json!({ "stats": {} })).unwrap();
+        stats.replace(cleared);
+        assert!(stats.is_empty());
+        assert_eq!(stats.get("custom", "minecraft:play_time"), 0);
+        assert!(!matches(&stats));
+        assert_eq!(
+            stats.take_dirty(),
+            vec![("minecraft:custom".into(), "minecraft:play_time".into(), 0)]
+        );
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn movement_stats_uses_current_on_climbable_branch() {
+        crate::game::native_entity_refs::tests::with_game(|game| {
+            game.world.chunks.insert(
+                (0, 0),
+                std::sync::Arc::new(horizon_client::chunk::Chunk::empty(0, 0)),
+            );
+            let scaffolding = game
+                .pack
+                .assets
+                .registry
+                .resolve(&horizon_world::chunk::BlockState {
+                    name: "minecraft:scaffolding".into(),
+                    properties: Default::default(),
+                })
+                .unwrap();
+            let air = game.res.facts().air;
+            game.world.set(0, 65, 0, scaffolding).unwrap();
+            {
+                let p = game.player.as_mut().unwrap();
+                p.position = horizon_core::geometry::Vec3::new(0.5, 65.0, 0.5);
+                p.ground.on_ground = true;
+                p.flying = false;
+                p.last_climbable = None;
+            }
+            // Walking horizontally inside scaffolding awards neither walk nor climb.
+            game.movement_stats(horizon_core::geometry::Vec3::new(1.0, 0.0, 0.0));
+            assert_eq!(game.stats.get("custom", "minecraft:walk_one_cm"), 0);
+            assert_eq!(game.stats.get("custom", "minecraft:climb_one_cm"), 0);
+
+            // Moving upward inside scaffolding awards climb_one_cm.
+            game.movement_stats(horizon_core::geometry::Vec3::new(0.0, 1.0, 0.0));
+            assert_eq!(game.stats.get("custom", "minecraft:climb_one_cm"), 100);
+
+            // Leaving the climbable block while last_climbable is still set does not award climb.
+            game.world.set(0, 65, 0, air).unwrap();
+            {
+                let p = game.player.as_mut().unwrap();
+                p.ground.on_ground = false;
+                p.last_climbable = Some(horizon_core::position::BlockPos::new(0, 65, 0));
+            }
+            game.movement_stats(horizon_core::geometry::Vec3::new(0.0, 1.0, 0.0));
+            assert_eq!(game.stats.get("custom", "minecraft:climb_one_cm"), 100);
+        });
     }
 }

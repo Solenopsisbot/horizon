@@ -14,9 +14,10 @@ from pathlib import Path
 import subprocess
 import tempfile
 try:
-    from . import lab
+    from . import fast_bins, lab
     from .integration_env import run_game
 except ImportError:
+    import fast_bins
     import lab
     from integration_env import run_game
 
@@ -24,6 +25,7 @@ SOURCES = [
     'crates/horizon-client/src/game.rs',
     'crates/horizon-client/src/game/modding/native_client_particles.rs',
     'crates/horizon-client/src/game/modding/native_client_particles_fixture.rs',
+    'crates/horizon-client/src/game/runtime/loading_window.rs',  # Starts the fixture in the World phase.
     'crates/horizon-client-render/src/particles.rs',
     'tools/test_native_client_particles_parity.py',
 ]
@@ -42,9 +44,9 @@ def main():
     binary = args.binary
     if binary is None:
         with (work / 'build.log').open('w', encoding='utf-8') as log:
-            subprocess.run(['cargo', 'build', '-p', 'horizon-game', '--bin', 'horizon-client'],
-                           cwd=lab.ROOT, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=1800)
-        binary = lab.cargo_target() / 'debug' / ('horizon-client.exe' if os.name == 'nt' else 'horizon-client')
+            subprocess.run(fast_bins.command('horizon-client'), cwd=lab.ROOT, stdout=log, stderr=subprocess.STDOUT,
+                           check=True, timeout=1800)
+        binary = lab.cargo_target() / 'fast' / ('horizon-client.exe' if os.name == 'nt' else 'horizon-client')
     with tempfile.TemporaryDirectory(prefix='hz-native-particles-') as scratch:
         # Declare fixture providers before the load-owned particle registry freezes.
         import zipfile

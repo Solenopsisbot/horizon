@@ -46,6 +46,7 @@ mod glass_storage;
 mod glass_toast;
 mod glass_ui;
 mod glass_versions;
+mod glide;
 mod home;
 mod home_tabs;
 mod import_page;
@@ -66,6 +67,7 @@ mod modpacks_page;
 mod mods_page;
 mod mods_project;
 mod motion;
+mod move_window;
 mod multiplayer_page;
 mod native_consent;
 mod native_log_page;
@@ -79,6 +81,7 @@ mod partner;
 mod perf;
 mod picture_cache;
 mod plate;
+mod play_step;
 mod profile_heads;
 mod screenshots_page;
 mod scrollbar;
@@ -209,6 +212,17 @@ struct Crash {
     /// One line on what went wrong: the report's error, else how the process ended.
     summary: String,
     copied: bool,
+    /// The game refused its folder leases before it started (exit 78): no game log exists.
+    leases_refused: bool,
+}
+
+/// What the Prepare error's notice offers to do about it.
+#[derive(Clone, Debug, PartialEq)]
+enum PrepareFix {
+    /// The version was deleted while the window was open: install it again.
+    Reinstall(String),
+    /// The Minecraft folders lack a library of the game: download the version's from Mojang.
+    Mojang(String),
 }
 
 /// The opening: the wordmark holds at least `OPENING_HOLD` (until the release
@@ -236,6 +250,19 @@ enum Load<T> {
 }
 
 const LOG_LINES: usize = 2000;
+/// A game folder and the graphics API notice it is due.
+type ApiNoticeOf = (std::path::PathBuf, Option<backend::api_fallback::Notice>);
+
+enum InstallSource {
+    Instance,
+    Manual(instances::ManualInstallTarget),
+    Update,
+}
+
+struct QueuedInstall {
+    release: Release,
+    source: InstallSource,
+}
 
 struct Launcher {
     theme: Theme,
@@ -257,11 +284,8 @@ struct Launcher {
     whats_new_open: Option<std::collections::HashSet<String>>,
     /// The section the glass Settings list marked when last drawn (`glass_settings`).
     settings_marked: usize,
-    /// About's credit picture was asked for, and what came back.
-    credit_asked: bool,
     /// The Game version dropdown of the instance dialog and sheet is open.
     version_menu: bool,
-    credit_picture: Option<std::sync::Arc<gpui::Image>>,
     /// The instance sheet's Storage: which instance was measured, and its size once known.
     sheet_size: Option<(String, Option<u64>)>,
     /// The Mods page's project card, kept in view beside its list.
@@ -274,14 +298,24 @@ struct Launcher {
     update_error: Option<String>,
     self_update: SelfUpdate,
     self_update_hidden: bool,
+    /// The restart for links.json's `min_launcher` was tried this start, or this launcher is
+    /// what one started: it isn't tried (again) before the next start.
+    min_restart_tried: bool,
     /// The Horizon version being installed as an update: whether it becomes the selected one is
     /// judged when it finishes.
     update_install: Option<String>,
     /// The Horizon version being installed because an instance was made or saved to play it: it
     /// becomes the launcher's version only when the launcher has none.
     instance_install: Option<String>,
-    /// One for an instance waiting for the install running now to end.
-    install_next: Option<Release>,
+    /// The displayed instance when a manual install started.
+    manual_install_for: Option<instances::ManualInstallTarget>,
+    /// Pending downloads retain the reason and instance that requested them.
+    install_queue: VecDeque<QueuedInstall>,
+    /// The Stable build Home's Update is installing (`nightly::install_stable`).
+    stable_install: Option<Release>,
+    /// A Stable build whose download failed: not offered again until the release list is read
+    /// from the network (`Msg::ReleasesFromNetwork`).
+    stable_failed: Option<Release>,
     /// The install bar's previous and current fraction, so it moves rather than jumps.
     bar: (f32, f32),
     releases: Load<Vec<Release>>,
@@ -296,6 +330,14 @@ struct Launcher {
     disk: Vec<(String, u64)>,
     storage_report: Option<storage::Report>,
     storage_pending: bool,
+    /// The Settings visit (`storage_visit`) the last count or cleanup started in: a count that
+    /// failed is tried again on the next visit, not on every frame of this one.
+    storage_tried: u64,
+    /// The cleanups lowered cache limits asked for and those that ran: one still owed (a count
+    /// was running, the build lock was busy, a newer limit came) runs before the next count.
+    storage_trims: crate::glass_storage::Trims,
+    /// The running storage work is such a cleanup, settling the requests up to this generation.
+    storage_trimming: Option<u64>,
     /// A Clear the player still has to confirm: `Some(None)` is Clear all.
     storage_confirm: Option<Option<storage::Category>>,
     storage_error: Option<String>,
@@ -320,6 +362,12 @@ struct Launcher {
     /// Native mods (`native_mods`, on the Mods page): the build's step while it runs, why it
     /// failed, and the warning before a build while it is open, with the mods it names.
     native_step: Option<String>,
+    /// The player pressed Stop on the build under way: the card says it is stopping, and its
+    /// Stop buttons wait, until the build ends (#19300).
+    native_stopping: bool,
+    /// A build waiting for its base version's preparation, or for an install of it, kept as it
+    /// was started (#18659).
+    native_prepare_first: Option<native_mods::prepare_first::Waiting>,
     /// Where the build under way is, for the card's stages and bar.
     native_progress: Option<native_mods::Progress>,
     /// The first build's one-time download (the compiler), in bytes; `None` once it is there.
@@ -403,6 +451,8 @@ struct Launcher {
     background_error: Option<String>,
     /// Settings' data relocation confirmation and the worker's last result.
     location_target: Option<std::path::PathBuf>,
+    /// A linked data target discovered at startup, reused while the Settings page redraws.
+    location_real_target: Option<std::path::PathBuf>,
     location_error: Option<String>,
     location_note: Option<String>,
     settings: Settings,
@@ -416,12 +466,20 @@ struct Launcher {
     /// so it moves when a line arrives even while `prepare_log` is full and its length stays.
     log_revision: u64,
     prepare_error: Option<String>,
+    /// What `prepare_error`'s notice offers, when something can be done about it.
+    prepare_fix: Option<PrepareFix>,
     client: Option<Running>,
     client_error: Option<String>,
     /// When the running client started, to tell its crash report from older ones.
     client_started: Option<std::time::SystemTime>,
     /// The folder the running game keeps its settings in: the game home, or a modpack's.
     client_home: Option<std::path::PathBuf>,
+    /// The Horizon version the last game was started as, for the record of a graphics API
+    /// switched after its start crash (`backend::api_fallback`).
+    client_build: Option<String>,
+    /// A game folder's graphics API notice, read once (`Self::api_notice`); emptied when a game
+    /// ends or the player answers.
+    api_notice: std::cell::RefCell<Option<ApiNoticeOf>>,
     crash: Option<Crash>,
     /// The Servers page (`servers_page.rs`).
     servers: servers_page::Servers,
@@ -455,7 +513,11 @@ struct Launcher {
     /// The game is waiting for its session (a token renewal), or a Java instance for its files
     /// and Java (`start_java`), before it starts.
     starting_client: Option<String>,
+    /// The instance that start is for, whatever is selected by the time it ends.
     starting_instance: Option<String>,
+    /// The Stop of the start under way while it may run its instance's pre-launch command
+    /// (Windows runs it before the game): kept until the start's result is handled.
+    pre_launch_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Play was pressed on a version not prepared yet: it starts once this preparation ends well.
     play_when_prepared: Option<(String, String)>,
     /// Join a friend: the code typed on the Play page, and the one the game
@@ -501,6 +563,8 @@ struct Launcher {
     perf: perf::Perf,
     install_started: Option<Instant>,
     prepare_started: Option<Instant>,
+    /// The version the preparation under way is for: its end checks that one is ready.
+    prepare_tag: Option<String>,
     /// The download under way as first seen (when, files done), for the time left.
     download_seen: Option<(Instant, usize)>,
     /// The tab open under Home's hero (`home_tabs.rs`).
@@ -517,8 +581,6 @@ struct Launcher {
     /// The size of Home's tab strip, measured as it is laid out: the glass panel's plate cuts
     /// its corner around it.
     home_strip: std::rc::Rc<std::cell::Cell<Option<gpui::Size<Pixels>>>>,
-    /// When the running game was first seen running, for Home's "Playing for…".
-    client_since: Option<Instant>,
     /// The selected instance's mods, for Home's Mods tab (`instance_mods.rs`).
     instance_mods: instance_mods::InstanceMods,
     /// Debug-build previews of the native mod states (`glass_mod_states.rs`).
@@ -526,6 +588,8 @@ struct Launcher {
     /// Modrinth projects' icon URLs (`instance_mods.rs`).
     project_icons: instance_mods::ProjectIcons,
     play_pressed: Option<Instant>,
+    /// The step the start in progress said last (`play_step`).
+    play_step: play_step::PlayStep,
     /// `horizon-launcher benchmark` started this window to measure it.
     bench: Option<perf::Bench>,
     /// The Modpacks page: the imported packs (read when the page first opens), the one shown,
@@ -534,6 +598,8 @@ struct Launcher {
     /// Modpacks installed from Horizon's registry, each its own profile.
     registry_packs: Vec<horizon_launcher::browser::horizon::pack::Installed>,
     packs_loaded: Option<Instant>,
+    /// The imported packs' read on a thread, and whether it may still apply (`load_packs`).
+    packs_reading: modpacks_page::PackReads,
     pack_open: Option<String>,
     pack_filter: Option<horizon_port_pack::report::Status>,
     pack_busy: bool,
@@ -545,6 +611,10 @@ struct Launcher {
     found_scanning: bool,
     /// The game starting now plays this pack's profile (its work folder).
     starting_pack: Option<std::path::PathBuf>,
+    /// The folder of the instance a start is preparing, while `starting_client` is set.
+    starting_work: Option<std::path::PathBuf>,
+    /// The pack folder a Port step is rebuilding now.
+    porting: Option<std::path::PathBuf>,
     /// The Mods page: the browser's search, installs and updates (`mods_page.rs`).
     mods: mods_page::Mods,
     github: github_mods_page::Github,
@@ -558,6 +628,8 @@ struct Launcher {
     /// Pictures from disk made at their drawn size (`picture_cache`).
     pictures: picture_cache::Pictures,
     game_packs: packs_page::Packs,
+    /// The games' answers about their shader API seen so far (`game_shader_api::answers`).
+    shader_answers: u64,
     world_packs: datapacks_page::WorldPacks,
     export: Option<export_page::ExportPanel>,
     launch: Option<launch_page::LaunchPanel>,
@@ -593,8 +665,8 @@ actions!(horizon_launcher, [Quit, CloseWindow]);
 fn shut_down(cx: &mut App) {
     servers_page::stop_on_quit();
     telemetry::send_before_exit();
-    // A downloaded launcher update goes in only when the player presses Update: closing drops it.
-    horizon_launcher::update_handoff::forget();
+    // A downloaded launcher update goes in once this process has exited; the game keeps running.
+    horizon_launcher::update_handoff::on_close();
     cx.quit()
 }
 
@@ -762,20 +834,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_selection_survives_a_removal_or_moves_to_the_newest_left() {
-        let left = ["v0.2.49".to_string(), "v0.2.48".to_string()];
-        let pick =
-            |saved: Option<&str>| super::selection_after_removal(&left, saved.map(String::from));
-        assert_eq!(pick(Some("v0.2.48")).as_deref(), Some("v0.2.48"));
-        assert_eq!(pick(Some("v0.2.47")).as_deref(), Some("v0.2.49"));
-        assert_eq!(pick(None).as_deref(), Some("v0.2.49"));
-        assert_eq!(
-            super::selection_after_removal(&[], Some("v0.2.47".into())),
-            None
-        );
-    }
-
     /// An owner's Play works on a version not prepared yet: it prepares it (downloading
     /// Minecraft from Mojang when this computer has no install), then plays. Without an owner
     /// it stays off: signing in comes first.
@@ -818,6 +876,159 @@ mod tests {
         assert!(!starts_now(true, true, false), "prepared again under way");
         assert!(!starts_now(false, false, false), "not prepared");
         assert!(!starts_now(true, false, true), "already running");
+    }
+
+    /// A sidebar row says Running or Starting for the instance that was started, not for
+    /// whichever one is selected (#16186).
+    #[test]
+    fn a_row_shows_the_game_of_its_own_instance_only() {
+        use super::frame::{row_phase, running_ids, RowPhase};
+        assert_eq!(row_phase("a", &["a"], None), Some(RowPhase::Running));
+        assert_eq!(row_phase("b", &["a"], None), None, "B is only selected");
+        assert_eq!(row_phase("a", &[], Some("a")), Some(RowPhase::Starting));
+        assert_eq!(row_phase("b", &[], Some("a")), None);
+        assert_eq!(row_phase("a", &[], None), None, "nothing runs");
+        // Several games: one runs while another starts.
+        assert_eq!(row_phase("a", &["a"], Some("b")), Some(RowPhase::Running));
+        assert_eq!(row_phase("b", &["a"], Some("b")), Some(RowPhase::Starting));
+        assert_eq!(row_phase("b", &["a", "b"], None), Some(RowPhase::Running));
+        // The started instance deleted (ids don't change on a rename): no row has its game.
+        assert_eq!(row_phase("c", &["a"], Some("b")), None);
+        // The ids come from the run's own instance, and only while its game runs.
+        let run = ("a".to_string(), std::time::Instant::now());
+        assert_eq!(running_ids(true, Some(&run)), ["a"]);
+        assert!(running_ids(false, Some(&run)).is_empty());
+        assert!(
+            running_ids(true, None).is_empty(),
+            "a pack with no instance"
+        );
+    }
+
+    /// Home's play-time line and Play/Stop controls scope running and starting state to the
+    /// started instance, never claiming another selected instance is being played (#20630).
+    #[test]
+    fn home_shows_running_and_starting_for_the_started_instance_only() {
+        use super::frame::RowPhase;
+        use super::{other_game_info, other_game_label, selected_game_state, SelectedGameState};
+        use horizon_launcher::instances::{Channel, Instance, Kind};
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let run = ("inst-1".to_string(), started);
+
+        // Idle when neither running nor starting (even with stale metadata).
+        assert_eq!(
+            selected_game_state(Some("inst-1"), false, Some(&run), false, Some("inst-1")),
+            SelectedGameState::Idle
+        );
+
+        // Running: only the started instance sees SelectedRunning (preserving spawn Instant).
+        assert_eq!(
+            selected_game_state(Some("inst-1"), true, Some(&run), false, None),
+            SelectedGameState::SelectedRunning { since: started }
+        );
+        assert_eq!(
+            selected_game_state(Some("inst-2"), true, Some(&run), false, None),
+            SelectedGameState::OtherRunning { id: Some("inst-1") }
+        );
+        assert_eq!(
+            selected_game_state(None, true, Some(&run), false, None),
+            SelectedGameState::OtherRunning { id: Some("inst-1") }
+        );
+        assert_eq!(
+            selected_game_state(Some("inst-1"), true, None, false, None),
+            SelectedGameState::OtherRunning { id: None }
+        );
+        // Running takes precedence over starting if both flags are set.
+        assert_eq!(
+            selected_game_state(Some("inst-2"), true, Some(&run), true, Some("inst-2")),
+            SelectedGameState::OtherRunning { id: Some("inst-1") }
+        );
+
+        // Starting: only the starting instance sees SelectedStarting.
+        assert_eq!(
+            selected_game_state(Some("inst-1"), false, None, true, Some("inst-1")),
+            SelectedGameState::SelectedStarting
+        );
+        assert_eq!(
+            selected_game_state(Some("inst-2"), false, None, true, Some("inst-1")),
+            SelectedGameState::OtherStarting { id: Some("inst-1") }
+        );
+        assert_eq!(
+            selected_game_state(Some("inst-1"), false, None, true, None),
+            SelectedGameState::OtherStarting { id: None }
+        );
+
+        let make = |id: &str, name: &str, kind: Kind| Instance {
+            id: id.into(),
+            name: name.into(),
+            kind,
+            work: PathBuf::new(),
+            home: PathBuf::new(),
+            icon: None,
+            group: None,
+            version: None,
+            channel: Channel::Nightly,
+            native_profile: Default::default(),
+            played: Duration::ZERO,
+            last_played: None,
+            launch: Default::default(),
+            java: None,
+        };
+        let instances = [
+            make("inst-1", "Horizon", Kind::Default),
+            make("inst-2", "Latest", Kind::Own),
+            make("blank", "   ", Kind::Own),
+            make("port:cool-pack", "Cool Pack", Kind::Port),
+            make("pack:reg-pack", "Registry Pack", Kind::Pack),
+        ];
+
+        assert_eq!(
+            other_game_info(&instances, Some("inst-1")),
+            (Some("Horizon"), true)
+        );
+        assert_eq!(
+            other_game_info(&instances, Some("inst-2")),
+            (Some("Latest"), true)
+        );
+        assert_eq!(
+            other_game_info(&instances, Some("blank")),
+            (None, true),
+            "blank names fall back to generic copy"
+        );
+        assert_eq!(
+            other_game_info(&instances, Some("port:cool-pack")),
+            (Some("Cool Pack"), false),
+            "ported modpacks have no Home page so Stop stays reachable"
+        );
+        assert_eq!(
+            other_game_info(&instances, Some("pack:reg-pack")),
+            (Some("Registry Pack"), false)
+        );
+        assert_eq!(other_game_info(&instances, Some("deleted")), (None, false));
+        assert_eq!(other_game_info(&instances, None), (None, false));
+
+        assert_eq!(
+            other_game_label(RowPhase::Running, Some("Horizon")),
+            "Horizon is running"
+        );
+        assert_eq!(
+            other_game_label(RowPhase::Running, Some("   ")),
+            "Another instance is running"
+        );
+        assert_eq!(
+            other_game_label(RowPhase::Running, None),
+            "Another instance is running"
+        );
+        assert_eq!(
+            other_game_label(RowPhase::Starting, Some("Horizon")),
+            "Horizon is starting"
+        );
+        assert_eq!(
+            other_game_label(RowPhase::Starting, None),
+            "Another instance is starting"
+        );
     }
 
     #[test]

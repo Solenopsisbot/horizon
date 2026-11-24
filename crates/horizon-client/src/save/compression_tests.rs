@@ -8,7 +8,9 @@ use horizon_world::region::RegionFile;
 
 use super::{
     Record,
-    compression_pool::{CompressionPool, compress_records, compress_records_with_pool},
+    compression_pool::{
+        CompressionPool, compress_records, compress_records_with_pool, holding_selected_codec,
+    },
 };
 
 fn sample_tag(i: i32) -> NamedTag {
@@ -53,6 +55,7 @@ fn parallel_compression_matches_single_threaded_fidelity() {
         })
         .collect();
     let refs: Vec<_> = records.iter().map(|(k, r)| (*k, r)).collect();
+    let _codec = holding_selected_codec();
     let pool_compressed = compress_records(&refs, 9999);
     assert_eq!(pool_compressed.len(), records.len());
 
@@ -88,6 +91,7 @@ fn custom_worker_pool_sizes_all_produce_identical_output() {
         .collect();
     let refs: Vec<_> = records.iter().map(|(k, r)| (*k, r)).collect();
 
+    let _codec = holding_selected_codec();
     let pool_1 = CompressionPool::new(1);
     let pool_2 = CompressionPool::new(2);
     let pool_4 = CompressionPool::new(4);
@@ -144,5 +148,43 @@ fn compressed_chunks_written_to_region_file_reload_with_full_integrity() {
         assert_eq!(read_tag, *original_tag);
     }
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compression_workers_run_on_the_guest_stack() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pool = CompressionPool::new(2);
+    let sink = Arc::clone(&seen);
+    pool.run(16, move |_| {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or_default().to_owned();
+        sink.lock()
+            .unwrap()
+            .push((name, horizon_guest_stack::check_current()));
+    });
+    let seen = seen.lock().unwrap();
+    let workers: Vec<_> = seen
+        .iter()
+        .filter(|(name, _)| name.starts_with("horizon-save-compression-"))
+        .collect();
+    assert!(!workers.is_empty(), "no job ran on a pool worker");
+    assert!(
+        workers.iter().all(|(_, check)| check.is_ok()),
+        "{workers:?}"
+    );
+}
+
+#[test]
+fn region_writer_starts_on_the_guest_stack() {
+    let dir = std::env::temp_dir().join(format!("horizon-writer-stack-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let save = super::SaveDir::new(dir.clone(), super::LevelShape::OVERWORLD);
+    // The writer thread debug-asserts its stack at start; a failed assert stops it and the write errors.
+    save.write_records("region", vec![((0, 0), Some(sample_tag(0)))], true)
+        .unwrap();
+    drop(save);
     let _ = std::fs::remove_dir_all(&dir);
 }

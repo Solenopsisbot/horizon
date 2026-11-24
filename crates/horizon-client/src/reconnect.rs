@@ -69,7 +69,7 @@ fn classified_key(key: &str) -> Option<bool> {
     // whitelists, version refusals, the account's session refusals and
     // Horizon's own refusals: never. Shutdowns, timeouts, a full server, a
     // slow login and the session servers being down: retry.
-    const NEVER: [&str; 14] = [
+    const NEVER: [&str; 16] = [
         "multiplayer.disconnect.banned",
         "multiplayer.disconnect.ip_banned",
         "multiplayer.disconnect.kicked",
@@ -84,6 +84,8 @@ fn classified_key(key: &str) -> Option<bool> {
         "disconnect.loginFailedInfo.userBanned",
         "horizon.multiplayer.not_signed_in",
         "horizon.multiplayer.invalid_address",
+        "horizon.multiplayer.incoming_too_large",
+        crate::build_mismatch::KEY,
     ];
     const RETRY: [&str; 6] = [
         "multiplayer.disconnect.server_shutdown",
@@ -93,9 +95,7 @@ fn classified_key(key: &str) -> Option<bool> {
         "disconnect.loginFailedInfo.serversUnavailable",
         "disconnect.timeout",
     ];
-    NEVER
-        .iter()
-        .any(|k| key.starts_with(k))
+    (key == "disconnect.loginFailedInfo" || NEVER.iter().any(|k| key.starts_with(k)))
         .then_some(false)
         .or_else(|| RETRY.iter().any(|k| key.starts_with(k)).then_some(true))
 }

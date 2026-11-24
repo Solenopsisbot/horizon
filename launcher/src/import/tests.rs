@@ -227,6 +227,22 @@ fn a_dropped_zip_reports_the_central_directory_limit() {
     }
 }
 
+/// A retired `.hnmod` dropped on the window says what it is and where its current version is,
+/// not the generic list of what can be dropped. Any letter case, without reading the file.
+#[test]
+fn a_dropped_hnmod_is_named_as_the_retired_format() {
+    let scratch = tempfile::tempdir().unwrap();
+    for name in ["zoom-2.0.0.hnmod", "Zoom.HNMOD"] {
+        let path = scratch.path().join(name);
+        fs::write(&path, b"not even a zip").unwrap();
+        let error = what(&path).unwrap_err();
+        assert!(error.starts_with(name), "{error}");
+        assert!(error.contains("old .hnmod format"), "{error}");
+        assert!(error.contains("Mods page"), "{error}");
+        assert!(!error.contains("can't be imported"), "{error}");
+    }
+}
+
 #[test]
 fn an_export_comes_back_as_an_instance_and_nothing_escapes_its_folder() {
     let dir = scratch("roundtrip");
@@ -296,6 +312,36 @@ fn an_export_comes_back_as_an_instance_and_nothing_escapes_its_folder() {
         )],
     );
     assert!(import_into(&java, NONE, &maker(&made)).is_err());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Modrinth's layers: `client-overrides/` wins over `overrides/`, in whichever order the archive
+/// keeps them. A zip tool that sorts its entries puts `client-overrides/` first.
+#[test]
+fn client_overrides_win_over_overrides_in_any_archive_order() {
+    let dir = scratch("client-overrides");
+    let made = dir.join("instances");
+    let client: (&str, &[u8]) = ("client-overrides/options.txt", b"client");
+    let shared: (&str, &[u8]) = ("overrides/options.txt", b"shared");
+    for (name, first, second) in [
+        ("Client first", client, shared),
+        ("Shared first", shared, client),
+    ] {
+        let index = format!(
+            r#"{{"formatVersion":1,"name":"{name}","files":[],"dependencies":{{"minecraft":"26.3"}}}}"#
+        );
+        let pack = dir.join(format!("{name}.mrpack"));
+        zip_file(
+            &pack,
+            &[("modrinth.index.json", index.as_bytes()), first, second],
+        );
+        let i = import_into(&pack, NONE, &maker(&made)).unwrap();
+        assert_eq!(
+            fs::read(i.home.join("options.txt")).unwrap(),
+            b"client",
+            "{name}"
+        );
+    }
     fs::remove_dir_all(&dir).unwrap();
 }
 

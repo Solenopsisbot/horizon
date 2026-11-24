@@ -18,8 +18,9 @@ import random
 import subprocess
 
 try:
-    from . import lab, oracle_harness, test_rust_parity as base, test_model_baking_parity as baking
+    from . import fast_bins, lab, oracle_harness, test_rust_parity as base, test_model_baking_parity as baking
 except ImportError:
+    import fast_bins
     import lab
     import oracle_harness
     import test_rust_parity as base
@@ -333,6 +334,10 @@ def compare(vanilla, rust):
         if bad is None:
             clean += 1
             report.append(f'{name}: all {len(v)} ticks match')
+    # The comparison is symmetric: a scenario that only Horizon recorded is a
+    # difference too, not a silently accepted extra that passes as parity.
+    for name in sorted(set(rust) - set(vanilla)):
+        report.append(f'{name}: missing from vanilla')
     return report, clean
 
 
@@ -359,7 +364,7 @@ def main():
                                    'dev.horizonlab.parity.VanillaSculkOracle', inputs, build / 'vanilla.txt'],
                                   build, 'vanilla', timeout=3600)
     if not args.java_only:
-        oracle_harness.run_logged(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-game', '--bin', 'horizon-client'],
+        oracle_harness.run_logged(fast_bins.command('horizon-client'),
                                   build, 'compile-rust')
         oracle_harness.run_logged([lab.cargo_target() / 'fast/horizon-client', '--resources', resources], build, 'horizon',
                                   env=lab.game_env(HORIZON_SCULK_FIXTURE=f'{inputs},{build / "horizon.txt"}'))
@@ -367,11 +372,13 @@ def main():
         return
     names = {s[0] for _, s in chosen}
     vanilla = {k: v for k, v in parse(build / 'vanilla.txt').items() if k in names}
-    report, clean = compare(vanilla, parse(build / 'horizon.txt'))
+    horizon = parse(build / 'horizon.txt')
+    report, clean = compare(vanilla, horizon)
     (build / 'report.txt').write_text('\n'.join(report) + '\n')
     print('\n'.join(line for line in report if not line.endswith('ticks match')))
-    print(f'{clean}/{len(vanilla)} scenarios match on every tick')
-    if not args.report_only and clean != len(vanilla):
+    total = len(set(vanilla) | set(horizon))
+    print(f'{clean}/{total} scenarios match on every tick')
+    if not args.report_only and clean != total:
         raise SystemExit(1)
 
 

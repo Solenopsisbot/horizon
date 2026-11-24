@@ -1,6 +1,5 @@
 //! Cargo-facing generation: the mod API's and the game's generated files.
 use super::{Catalog, Target, free_function_source, host, sources};
-use quote::ToTokens;
 use std::{fs, path::Path};
 mod vocab_boundary;
 
@@ -32,6 +31,20 @@ pub fn write_if_changed(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std:
 /// Generate only this crate's files, tracking every source read by the generator.
 /// `root` is supplied at run time by the consuming crate's build script.
 pub fn generate(root: &Path, out_dir: &Path, target: Target) -> Result<(), String> {
+    generate_output(root, out_dir, target, false)
+}
+
+/// Generate the API guest and its snapshot-only native hook record provenance.
+pub fn generate_api_snapshot(root: &Path, out_dir: &Path) -> Result<(), String> {
+    generate_output(root, out_dir, Target::Api, true)
+}
+
+fn generate_output(
+    root: &Path,
+    out_dir: &Path,
+    target: Target,
+    snapshot_records: bool,
+) -> Result<(), String> {
     track(root, !matches!(&target, Target::Vocab))?;
     let inventory = if matches!(target, Target::Vocab) {
         let path = root.join("tools/layering/mod_vocab_state.json");
@@ -96,14 +109,25 @@ pub fn generate(root: &Path, out_dir: &Path, target: Target) -> Result<(), Strin
             ];
             let (providers, sources) = super::capability_providers::generate(root, &included)?;
             // The resolver recurses through the API's types: give it a deep stack.
+            let mut native_records = super::wire::NativeHookRecords::new();
+            let records = snapshot_records.then_some(&mut native_records);
             let generated_wire = std::thread::scope(|scope| {
                 std::thread::Builder::new()
                     .stack_size(64 << 20)
-                    .spawn_scoped(scope, || super::wire::generate(root, &included))
+                    .spawn_scoped(scope, || {
+                        super::wire::generate_with_records(root, &included, records)
+                    })
                     .map_err(|e| e.to_string())?
                     .join()
                     .map_err(|_| "generating the wire impls panicked".to_string())?
             })?;
+            if snapshot_records {
+                write_if_changed(
+                    out_dir.join("native-hook-records.json"),
+                    serde_json::to_vec(&native_records).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+            }
             for path in sources.iter().chain(&generated_wire.sources) {
                 crate::rerun_if_changed(&path.display());
             }
@@ -259,137 +283,22 @@ fn render_records_need_no_game_sources() {
     generate_render(&root, &root).unwrap();
     let generated = fs::read_to_string(root.join("native_render_generated.rs")).unwrap();
     let file = syn::parse_file(&generated).unwrap();
-    assert_eq!(
-        file.items
-            .iter()
-            .filter(|item| matches!(item, syn::Item::Struct(_)))
-            .count(),
-        5
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-#[ignore = "daily"]
-fn listed_render_slots_have_eligible_points() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    super::points::game_points(&root).unwrap();
-}
-
-/// The `mod_api` types with a `Wire` layout ([`super::wire`]), for point records.
-/// A source tree without the mod API (a generator fixture's) has none.
-pub(crate) fn wire_types(root: &Path) -> Result<std::collections::BTreeSet<String>, String> {
-    if !root.join("crates/horizon-mod-vocab/src/hooks").is_dir() {
-        return Ok(Default::default());
-    }
-    let generated = sources(root, super::FillMode::Require)?;
-    wire_types_from_sources(root, &generated)
-}
-
-/// Resolve Wire layouts from already validated, immutable API sources.
-/// The caller has established that the mod API directory exists.
-pub(super) fn wire_types_from_sources(
-    root: &Path,
-    generated: &super::Sources,
-) -> Result<std::collections::BTreeSet<String>, String> {
-    let included = [
-        (host::AREAS_OUTPUT, generated.areas.as_str()),
-        ("mod_api_generated.rs", generated.hooks.as_str()),
-        ("mod_api_generated_host.rs", generated.host.as_str()),
-    ];
-    // The resolver recurses through the API's types: give it a deep stack.
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(64 << 20)
-            .spawn_scoped(scope, || super::wire::owned_types(root, &included))
-            .map_err(|e| e.to_string())?
-            .join()
-            .map_err(|_| "reading the wire types panicked".to_string())?
-    })
-}
-
-/// `horizon-mod-points`' generated file: each point's record, `PointId` and typed function constructors,
-/// from the game's source, tracking the game module's files.
-pub fn generate_points(root: &Path, out_dir: &Path) -> Result<(), String> {
-    crate::interface_cache::with_cache(out_dir, || {
-        crate::source::with_walk_cache(|| generate_points_inner(root, out_dir))
-    })
-}
-
-/// Generate the engine-owned point vocabulary and typed dispatch.
-pub fn generate_engine_points(root: &Path, out_dir: &Path) -> Result<(), String> {
-    crate::interface_cache::with_cache(out_dir, || {
-        crate::source::with_walk_cache(|| {
-            for path in super::points::tracked(root)? {
-                crate::rerun_if_changed(&path.display());
-            }
-            crate::rerun_if_staged(root);
-            let points = super::points::game_points(root)?;
-            println!("cargo:rerun-if-env-changed=HORIZON_POINT_NAMES");
-            let selected = std::env::var("HORIZON_POINT_NAMES")
-                .ok()
-                .map(|json| {
-                    serde_json::from_str::<std::collections::BTreeSet<String>>(&json)
-                        .map_err(|error| format!("HORIZON_POINT_NAMES: {error}"))
-                })
-                .transpose()?;
-            let code = super::points::engine_records(&points, selected.as_ref());
-            let generated = syn::parse_file(&code).map_err(|e| format!("engine points: {e}"))?;
-            let mut code = String::new();
-            for item in generated.items {
-                code.push_str(&item.to_token_stream().to_string());
-                code.push('\n');
-            }
-            write_if_changed(out_dir.join("engine_points.rs"), code).map_err(|e| e.to_string())
-        })
-    })
-}
-
-pub(super) fn generate_points_inner(root: &Path, out_dir: &Path) -> Result<(), String> {
-    // Phase durations for CI's build report (points-timing.txt beside the output); never read back.
-    let started = std::time::Instant::now();
-    let mut timing = String::new();
-    let mut phase = |name: &str| {
-        timing.push_str(&format!("{name} {:.2}s\n", started.elapsed().as_secs_f64()));
-    };
-    let src = root.join("crates/horizon-client/src");
-    crate::rerun_if_changed(&src.join("game.rs").display());
-    crate::rerun_if_changed(&src.join("game").display());
-    for path in super::points::tracked(root)? {
-        crate::rerun_if_changed(&path.display());
-    }
-    phase("tracked");
-    println!("cargo:rerun-if-env-changed=HORIZON_POINT_NAMES");
-    let selected = std::env::var("HORIZON_POINT_NAMES")
-        .ok()
-        .map(|json| {
-            serde_json::from_str::<std::collections::BTreeSet<String>>(&json)
-                .map_err(|error| format!("HORIZON_POINT_NAMES: {error}"))
-        })
-        .transpose()?;
-    // Only a staged copy compiles the points' sites into the game; the wasm host's listener
-    // fixture brings its own.
-    crate::rerun_if_staged(root);
-    let staged =
-        root.join(".horizon-source-staged").is_file() || cfg!(feature = "listener-fixture");
-    let points = super::points::game_points(root)?;
-    phase("game_points");
-    let code = super::points::records_selected(&points, selected.as_ref())
-        + &format!(
-            "/// Whether this build compiled the points' sites into the game: only the prebuilt game, built from a staged copy of the source, has them. A build without them refuses every listener at load.\npub const STAGED: bool = {staged};\n"
+    for name in [
+        "CelestialSkyEvent",
+        "HandDrawnEvent",
+        "RenderNeedsEvent",
+        "WorldDrawnEvent",
+        "WorldViewDrawnEvent",
+        "WorldViewsEvent",
+    ] {
+        assert!(
+            file.items
+                .iter()
+                .any(|item| matches!(item, syn::Item::Struct(record) if record.ident == name)),
+            "missing standalone render record {name}"
         );
-    phase("records");
-    let generated = syn::parse_file(&code).map_err(|e| format!("generated Rust: points: {e}"))?;
-    // A single multi-megabyte line makes Clippy's source lookups prohibitively slow.
-    let mut code = String::new();
-    for item in generated.items {
-        code.push_str(&item.to_token_stream().to_string());
-        code.push('\n');
     }
-    phase("format");
-    write_if_changed(out_dir.join("points_generated.rs"), code).map_err(|e| e.to_string())?;
-    phase("written");
-    fs::write(out_dir.join("points-timing.txt"), timing).map_err(|e| e.to_string())
+    fs::remove_dir_all(root).unwrap();
 }
 
 pub(super) fn track(root: &Path, all_game: bool) -> Result<(), String> {

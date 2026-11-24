@@ -15,7 +15,7 @@ const WATER_OVERLAY: u16 = 13;
 /// Fluid indexes per table row: vanilla's five fluids.
 const FLUIDS: usize = 5;
 
-fn air() -> Info {
+pub(super) fn air() -> Info {
     Info {
         solid: false,
         full: false,
@@ -47,7 +47,7 @@ fn air() -> Info {
 
 /// The tables, with the block beside the water selecting the overlay as vanilla's test does when
 /// `overlay` is true (glass, leaves).
-fn tables(overlay: bool) -> MeshTables {
+pub(super) fn tables(overlay: bool) -> MeshTables {
     let water = Info {
         fluid: FluidState::new(FluidKind::Water, 8, false),
         ..air()
@@ -56,6 +56,7 @@ fn tables(overlay: bool) -> MeshTables {
         info: vec![air(), water, Info { overlay, ..air() }],
         solid: vec![],
         full_faces: vec![],
+        ao_info: vec![],
         visibility: horizon_world::block_render::FaceVisibility::empty(),
         water_still: 11,
         water_flow: WATER_FLOW,
@@ -84,9 +85,9 @@ fn faces(tables: &MeshTables, parts: &PartTables) -> [Vec<u16>; 6] {
     tesselate(
         tables,
         parts,
-        (false, false, true, false),
+        (false, false, true, false, false),
         &pad,
-        0x3F76E4,
+        || 0x3F76E4,
         &mut mesh,
         [0, 0, 0],
     );

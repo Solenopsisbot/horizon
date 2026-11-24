@@ -19,14 +19,15 @@ The opening, then Play ([clip](docs/opening.webm)):
   built on your fork's Actions, or the zip holding it) and installs it as `imported-<date>-<sha>`:
   a copy of the selected release or Nightly's folder, game files included, with that program as the
   game. Imported builds are listed apart as unsigned, and no update replaces them.
-- **Move data to another drive**: Settings → Data folder → Move… copies the launcher's
+- **Move data to another drive**: Settings → About → Data folder → Move… copies the launcher's
   installations, downloads and account files, the game's worlds and instances, and managed native
   build data to an empty folder. Close games and servers and wait for active jobs first. The launcher
   exits while the copy is verified, switches its location only after success, then reopens. Old folders
   remain as recovery copies and still use disk space; verify your worlds and instances before removing
   them yourself. External Minecraft/server folders and paths embedded in custom launch commands stay
-  unchanged. Links/junctions and overlapping roots are refused; Windows build destinations need ASCII
-  characters without spaces. Copy or commit failure leaves the original location selected.
+  unchanged. Links/junctions and overlapping roots are refused; on Windows, destinations may contain
+  spaces or non-English characters and build tools automatically use a compatible ASCII directory when
+  needed ([docs/launcher-data-location.md](../docs/launcher-data-location.md)). Copy or commit failure leaves the original location selected.
   The location pointer is independent of the moved folders, at the platform config directory's
   `horizon-launcher-location/location.json`. `HORIZON_LAUNCHER_LOCATION_FILE` selects an alternative
   absolute pointer file for portable installations. Nonempty `HORIZON_LAUNCHER_HOME` and `HORIZON_HOME`
@@ -143,7 +144,11 @@ The opening, then Play ([clip](docs/opening.webm)):
   (`nice -n 5`), and environment variables (`NAME=value OTHER="two words"`), kept in
   `instances.json` (`horizon_launcher::launch`). The game stays one process the launcher follows:
   on Unix `/bin/sh` runs the command and then `exec`s the wrapper and the game, whose words pass
-  through `"$@"` untouched; on Windows `cmd /C` runs `<command> && <game>`. Both the window's Play
+  through `"$@"` untouched; on Windows `cmd /C` runs the command to its end, then the wrapper and
+  the game start with their words as they are, never through cmd. While that command runs, Play's
+  Stop (Cancel in the classic layout) ends it with what it started, and so does closing the
+  launcher. On Windows a wrapper that is a shell (`cmd` or PowerShell) can't join
+  a server or open a world: it would read their names as commands. Both the window's Play
   and `play` use them. `horizon-launcher instance launch <instance> [--pre-launch …]
   [--wrapper …] [--env …]` (an MCP agent needs `confirm: true`: it sets commands Play runs).
   On Linux the panel also has switches for what the computer has: **GameMode** (`gamemoderun`
@@ -175,12 +180,12 @@ The opening, then Play ([clip](docs/opening.webm)):
   every background (a test holds every accent in both looks to it). The picture is copied into the
   data folder. `horizon-launcher settings accent NAME|#rrggbb|DEGREES`,
   `settings background PATH|default`.
-- **Language**: English, French, Russian, German, Simplified Chinese, Spanish, Ukrainian and Polish.
-  The window follows the system's language unless the player picks one in Settings > Launcher
-  (each named in itself); a string a table lacks shows in English. The tables are
-  `launcher/lang/<code>.json`, English text to its translation, Horizon's own; a test fails when
+- **Language**: 87 languages (English plus 86 translation tables in `launcher/lang/<code>.json`).
+  The window follows the system's language unless the player picks one in Settings → Launcher
+  (each named in itself); a string a table lacks shows in English. Translations are Horizon's own
+  ([docs/translations.md](../docs/translations.md)); a test fails when
   the code asks `tr("…")` for a string a table lacks, or a table keeps one the code dropped.
-  `horizon-launcher settings language system|en|fr|ru|de|zh|es|uk|pl`.
+  `horizon-launcher settings language system|<code>` (for example `en`, `fr`, `de`, `zh`, `pt-br`).
 - **Console**: Home's Console shows the game's output of this run as it comes: a search (every
   word, any case), Follow to keep the newest line in view, Copy, and Open logs folder. Warnings
   and errors stand out. **Share log…** uploads the log to [mclo.gs](https://mclo.gs), a paste
@@ -224,7 +229,7 @@ The opening, then Play ([clip](docs/opening.webm)):
   keeping every field the launcher doesn't show and the servers joined with Direct Connection. The
   same from the command line: `horizon-launcher multiplayer [list|add|remove] [--instance <name>]`
   and `horizon-launcher play --server <address or name>`.
-- **Patch notes**: each release's notes, newest first, with a link to GitHub Sponsors. Quiet "Sponsor", "Discord" and "Website" links sit in the sidebar footer.
+- **Patch notes**: each release's notes, newest first, with a link to Horizon's Open Collective. Quiet "Sponsor", "Discord" and "Website" links sit in the sidebar footer.
 
 Data lives in the platform's data directory (`~/.local/share/horizon-launcher` on Linux,
 `~/Library/Application Support/horizon-launcher` on macOS, `%APPDATA%\horizon-launcher` on
@@ -243,7 +248,7 @@ page `servers.json` (the list), `servers/<name>/` (the servers created there) an
   A changed choice reinstalls the selected version when automatic updates are on, and the game
   won't launch an installed build that conflicts with a manual choice. `horizon-launcher settings
   game-architecture auto|x64|arm64`.
-- **Updates**: Horizon ships only the Nightly (since 2026-10-28, docs/release-flow.md). The
+- **Updates**: Horizon ships only the Nightly (since 2026-10-28, [docs/release-flow.md](../docs/release-flow.md)). The
   launcher installs the current one (the `nightly` pre-release, checksums signed for the Nightly
   channel) as `nightly-<date>-<commit>` and selects it when the player was on a Nightly, on the
   newest release or on nothing; a version picked by hand or pinned by an instance stays, and so
@@ -255,7 +260,7 @@ page `servers.json` (the list), `servers/<name>/` (the servers created there) an
   its "Nightly" instance stays and keeps following the Nightly. The `update_channel` and
   `beta_builds` keys older launchers wrote are ignored and dropped on the next save.
 - **Game arguments**: extra arguments added to the game's command line (for example
-  `--server-thread`), one line where quotes group a word with spaces. They are appended after the
+  `--render-distance 16`), one line where quotes group a word with spaces. They are appended after the
   launcher's own arguments, kept as `game_args` in `settings.json`, and apply the next time the
   game starts. `horizon-launcher game-args "<line>"` sets them too, and `play --arg <ARG>` passes
   one for a single run.
@@ -280,9 +285,12 @@ page `servers.json` (the list), `servers/<name>/` (the servers created there) an
   Without one, `HTTPS_PROXY` and `HTTP_PROXY` are used when the launcher is started with them, and
   `NO_PROXY` names the hosts to reach directly, a modpack import's jars included. A server on this
   computer never goes through it.
-- **Links**: the Discord invite, the Sponsors page and the website come from `launcher/links.json` on main
+- **Links**: the Discord invite, the Open Collective page and the website come from `launcher/links.json` on main
   (`{"discord": "...", "sponsor": "...", "website": "..."}`), so they change without a launcher release. Offline,
-  the launcher uses the same values built in; an empty address hides its button.
+  the launcher uses the same values built in; an empty address hides its button. An optional `"min_launcher":
+  "0.2.80"` names the oldest launcher that may stay in use, for a release known to be broken: an older one that
+  updates itself installs the update it downloads and restarts at once, or when its window closes while a game
+  it started runs. A failed update says why and the launcher goes on. Unset, nothing changes.
 
 Long pages, dialogs, the server console and data previews have a visible scrollbar when
 their content overflows. Drag the thumb or click the track to navigate without a mouse wheel.
@@ -290,6 +298,9 @@ When the top bar's page tabs overflow, an arrow on a fading edge shows each side
 (`src/nav_strip.rs`); the arrows go at the ends and when all tabs fit. They fade in and out over
 150 ms, and a click scrolls three quarters of the strip over 240 ms; another click goes on from where
 that one is headed, and the wheel stops it. Performance mode and reduced motion make both instant.
+
+A mouse wheel's notch glides over 240 ms instead of jumping (`src/glide.rs`); trackpads scroll as
+they are. Performance mode and reduced motion (`HORIZON_LAUNCHER_MOTION=off`) turn the glide off.
 
 Pages and Home's landscape fill the window as it resizes. The title bar is transparent over the
 launcher on every platform: Windows keeps native dragging, resizing, Snap, minimize,
@@ -312,13 +323,15 @@ themselves come from their download links, which that limit doesn't cover.
 
 It also updates itself from GitHub releases tagged `launcher@X.Y.Z` (the game's are `nightly`, and
 `vX.Y.Z` before 2026-10-28; neither is ever taken for the other). Before 0.2 they were `launcher-vX.Y.Z` and `vYYYY.MM.DD`:
-every 0.2 tag counts as newer than all of those (docs/versioning.md). It downloads the new build, checks it
+every 0.2 tag counts as newer than all of those ([docs/versioning.md](../docs/versioning.md)). It downloads the new build, checks it
 against the release's signed `SHA256SUMS`, and says "A new version is available" in the sidebar with
 **Update**: the window closes, the launcher's own file runs again as the installer (`apply-update`,
 `src/update_handoff.rs`), which waits for the window's process to exit, puts the new launcher in place (the
-binary, the `.app` bundle or the AppImage) and starts it. Nothing goes in without **Update**: closing the window
-drops a downloaded update, and the next start checks again. When the installer can't put it in place, the old
-launcher starts again and says why. Each process stages in its own folder, and the installer checks the signed
+binary, the `.app` bundle or the AppImage) and starts it. Until then the sidebar says it installs when the
+launcher closes: closing the window installs it the same way without the restart, so the next start is the new
+launcher, and a game started from the window keeps running. Quitting for a data move drops it, and the next start
+checks again. When the installer can't put it in place, the old launcher stays (after **Update** it starts again)
+and says why at its next start. Each process stages in its own folder, and the installer checks the signed
 SHA-256 again before anything goes in; when the launcher in place is already that version or newer, it changes
 nothing. Servers keep running through **Update**. A copy that can't replace itself says so at once and offers
 **Download again** (the website's install page): one in a read-only folder (the disk image, or the read-only copy
@@ -345,10 +358,10 @@ Linux packagers can set `HORIZON_LAUNCHER_DESKTOP_EXEC` to a wrapper's absolute 
 Menu entries the launcher writes then start that wrapper, which can
 set `HORIZON_LAUNCHER_NO_SELF_UPDATE=1` to keep launcher updates with the package manager.
 
-Launcher releases are automatic (docs/release-flow.md in the repository): when main changes the
+Launcher releases are automatic ([docs/release-flow.md](../docs/release-flow.md)): when main changes the
 launcher, `horizon-prepare` or `horizon-theme`, the `launcher` workflow builds Linux, macOS, Windows x64 and
-Windows ARM64 and publishes `launcher-vX.Y.Z` (the next patch, or the next minor after a pull request
-labelled `feature`) with `horizon-launcher-linux-x86_64.tar.gz`,
+Windows ARM64 and publishes `launcher@X.Y.Z` (the next patch on the release line in `.github/release-line.txt`;
+a `feature` label lists the change under "New" rather than bumping the minor version) with `horizon-launcher-linux-x86_64.tar.gz`,
 `horizon-launcher-linux-x86_64.AppImage`, `horizon-launcher-macos-arm64.zip`,
 `horizon-launcher-macos-x64.zip` (Intel Macs), `horizon-launcher-windows-x64.zip` and
 `horizon-launcher-windows-arm64.zip`, never marked latest. The version is built in from the tag
@@ -453,6 +466,14 @@ scripts and tests). Test runs also set `HORIZON_LAUNCHER_TRASH=<folder>` and
 system's trash goes into that folder, and what Copy would put on the clipboard is written to that
 file, so a test never touches the real trash or clipboard.
 
+Game-cache inventory, cleanup and direct game entry resolve aliases above configured roots
+(including macOS's `/var` and `/tmp`) before entering the lease protocol. Direct entry checks
+the discovered data root before resolving its ancestors and only opens an existing registry.
+The data folder itself and managed descendants may not be symbolic links. A deleted selected
+home remains a managed lease requirement, so a late game cannot start after cleanup. Unknown
+game builds still block shared-cache deletion, and a running game's leases prevent deletion
+until its final owner exits.
+
 ## AI agents (MCP)
 
 `horizon-launcher mcp` is a Model Context Protocol server over stdio. `horizon-launcher
@@ -520,6 +541,13 @@ launcher started crashes, the Play page says so, with buttons to open or copy th
 logs folder and report it on Discord; Settings has the logs folder too. A crash report leaves the
 machine only if you turn on crash reports (below).
 
+On Linux and macOS, `untrusted control socket directory` is a launch refusal
+before the game starts, not a game crash. The error names the directory it
+could not trust. Check that path and have the system administrator restore its
+expected ownership or permissions. Do not make it writable to get past the
+error. A normal Linux `/` is owned by root and is not group- or world-writable;
+the sticky-bit `/tmp` directory is allowed.
+
 ## Data collection
 
 The first time it opens, the launcher asks whether you want to send performance statistics,
@@ -581,6 +609,14 @@ client starts (`--help`) and that the binaries import only system libraries (Win
 
     cargo test --lib    # tag separation, version order, update selection, notes as text,
                         # the auto-install default, the links fallback
+
+Run the complete launcher checks through `python3 tools/pr_ready.py` from the repository root.
+It and the launcher workflow give every Cargo test target fresh launcher/game homes, a private
+location pointer, XDG data/config folders, trash, clipboard and desktop paths, and remove the
+scratch home on exit. On Windows the scratch path must also be ASCII and contain no spaces,
+or build tools can fall back outside it. Direct Cargo runs of binary or integration tests need
+the same overrides: they link the library without `cfg(test)`, so its library-test fallback
+alone does not keep them out of the player's profile.
 
 Geist and Geist Mono (SIL Open Font License, `crates/horizon-theme/fonts/OFL-*.txt`, shared with the game's on-screen keyboard) are
 bundled so the type is the same on every platform.

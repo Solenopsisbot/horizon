@@ -234,6 +234,16 @@ pub fn max_damage(items: &Items, stack: &ItemStack) -> i32 {
 fn damage_value(items: &Items, stack: &ItemStack) -> i32 {
     (stack.damage.min(i32::MAX as u32) as i32).clamp(0, max_damage(items, stack).max(0))
 }
+/// The `item.durability` line of an advanced tooltip (`ItemStack.addDetailsToTooltip`):
+/// `getMaxDamage - getDamageValue` and `getMaxDamage` of a damaged stack, from
+/// the stack's own `max_damage` rather than its item's.
+pub fn durability(items: &Items, stack: &ItemStack) -> Option<(i32, i32)> {
+    let damage = damage_value(items, stack);
+    (is_damageable(items, stack) && damage > 0).then(|| {
+        let max = max_damage(items, stack);
+        (max - damage, max)
+    })
+}
 /// `ItemStack.setDamageValue`: stored clamped to `[0, max_damage]`.
 fn set_damage_value(items: &Items, stack: &mut ItemStack, damage: i32) {
     stack.damage = damage.clamp(0, max_damage(items, stack).max(0)) as u32;
@@ -301,7 +311,7 @@ pub fn hover_name(names: &crate::creative::Names, stack: &ItemStack) -> String {
         .data()
         .and_then(|d| d.written.as_ref())
         .map(|w| w.title.as_str())
-        .filter(|t| !t.trim().is_empty())
+        .filter(|t| !horizon_core::java_character::is_blank(t))
     {
         return title.to_owned();
     }
@@ -430,7 +440,7 @@ pub fn anvil_result(
         }
     }
     match name {
-        Some(n) if !n.trim().is_empty() => {
+        Some(n) if !horizon_core::java_character::is_blank(n) => {
             if n != hover_name {
                 naming_cost = 1;
                 price += 1;
@@ -770,6 +780,8 @@ pub struct StationRecipes {
     /// addition).
     smithing_additions: [HashSet<String>; 3],
     item_limits: std::collections::HashMap<Arc<str>, (u32, u32)>,
+    /// `Items::component_defaults`, which an assembled result's patch leaves out.
+    prototypes: Arc<std::collections::HashMap<String, horizon_core::nbt::Compound>>,
 }
 impl StationRecipes {
     pub fn load(
@@ -839,6 +851,7 @@ impl StationRecipes {
                 .iter()
                 .map(|(id, info)| (id.clone(), (info.max_stack, info.max_damage)))
                 .collect(),
+            prototypes: items.component_defaults.clone(),
             smithing_additions: [
                 added("smithing_template"),
                 added("smithing_base"),
@@ -941,7 +954,11 @@ impl StationRecipes {
                         && b.test_in(context, base)
                         && optional_matches(a, addition)
                     {
-                        let output = result.over(base, 0);
+                        // `applyComponents` keeps no value equal to the prototype.
+                        let mut output = result.over(base, 0);
+                        if let Some(prototype) = self.prototypes.get(&*output.item) {
+                            item_data::drop_prototype_values(&mut output, prototype);
+                        }
                         let (mut max_stack, mut max_damage) = self
                             .item_limits
                             .get(&output.item)
@@ -2008,6 +2025,38 @@ mod tests {
             grindstone_result(context(), &e, &items, Some(&zero), Some(&zero.clone())).unwrap();
         assert_eq!(out.count, 2);
         assert!(!out.has_any_enchantments());
+    }
+
+    /// `/give @s minecraft:diamond_sword[max_damage=800,damage=300]` lists
+    /// 500 / 800, not the sword's own 1261 / 1561.
+    #[test]
+    fn the_durability_line_uses_the_stacks_max_damage() {
+        let root = std::env::temp_dir().join(format!("horizon-durability-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("items.json"),
+            r#"{"minecraft:diamond_sword":{"minecraft:max_stack_size":1,"minecraft:max_damage":1561,"minecraft:damage":0}}"#,
+        )
+        .unwrap();
+        let items = Items::catalog(
+            &root,
+            &PackOverlay::NONE,
+            &horizon_world::item_defaults::read(&root).unwrap(),
+        )
+        .unwrap();
+        let give = |components: &str| {
+            let snbt =
+                format!(r#"{{id:"minecraft:diamond_sword",count:1,components:{components}}}"#);
+            item_data::parse_stack(&snbt).unwrap().unwrap()
+        };
+        let patched = give(r#"{"minecraft:max_damage":800,"minecraft:damage":300}"#);
+        assert_eq!(durability(&items, &patched), Some((500, 800)));
+        let plain = give(r#"{"minecraft:damage":300}"#);
+        assert_eq!(durability(&items, &plain), Some((1261, 1561)));
+        // Not damaged, or unbreakable: no line.
+        assert_eq!(durability(&items, &give("{}")), None);
+        let unbreakable = give(r#"{"minecraft:damage":300,"minecraft:unbreakable":{}}"#);
+        assert_eq!(durability(&items, &unbreakable), None);
     }
 
     /// `ItemStack.isDamageableItem` asks for the DAMAGE component too, so a

@@ -1,3 +1,5 @@
+import errno
+import json
 import os
 import subprocess
 import tempfile
@@ -223,6 +225,119 @@ class RefusalTests(unittest.TestCase):
             self.assertFalse(ns.guarded(path, PATTERNS), path)
         self.assertTrue(ns.guarded("tools/ci/x.py", ns.guarded_patterns("")))  # even without CODEOWNERS
 
+    def test_the_sdk_and_self_update_code_and_the_build_setup_are_guarded(self):
+        # Siblings of the single files CODEOWNERS named first: they verify SDKs, install the launcher's own
+        # update, resolve what is downloaded, or set how the release archives are built.
+        for path in ("launcher/src/backend/release_selection.rs", "launcher/src/update_handoff.rs",
+                     "launcher/src/native_mods/sdk_cache.rs", "crates/cargo-horizon-mod/src/sdk_fetch.rs",
+                     "xtask/src/main.rs", ".cargo/config.toml"):
+            self.assertTrue(ns.guarded(path, ns.guarded_patterns("")), path)  # even if CODEOWNERS lost it
+            # The real CODEOWNERS names the council for it: read here, apart from the fallback list.
+            owned = [line.split() for line in (ROOT / ".github/CODEOWNERS").read_text().splitlines()
+                     if line.strip() and not line.lstrip().startswith("#")]
+            self.assertTrue(any(owners[1:] == ["@horizon-rust/council"] and (
+                path == owners[0].lstrip("/") or (owners[0].endswith("/") and path.startswith(owners[0].lstrip("/"))))
+                for owners in owned), f"CODEOWNERS gives {path} no council rule")
+        for path in ("launcher/src/backend/settings.rs", "launcher/src/nightly.rs"):
+            self.assertFalse(ns.guarded(path, PATTERNS), path)
+
+    def test_wildcard_and_slashless_directory_patterns_guard_descendants(self):
+        patterns = ns.guarded_patterns('/packages/** @council\n/council-only @council\n/scripts/*.py @council\n')
+        self.assertTrue(ns.guarded('packages/x/y.rs', patterns))
+        self.assertTrue(ns.guarded('council-only/notes/x.md', patterns))
+        self.assertTrue(ns.guarded('scripts/task.py', patterns))
+        self.assertFalse(ns.guarded('scripts/task.txt', patterns))
+        self.assertFalse(ns.guarded('scripts/task.py\n', patterns))
+        self.assertFalse(ns.guarded('packages-dev/x.rs', patterns))
+        self.assertFalse(ns.guarded('council-only-other/x.md', patterns))
+
+    def test_wildcard_folder_patterns_guard_every_file_under_them(self):
+        patterns = ns.guarded_patterns('/packages/*/ @council\n/packages/**/x.rs @council\n')
+        self.assertTrue(ns.guarded('packages/x/a.rs', patterns))
+        self.assertTrue(ns.guarded('packages/x.rs', patterns))  # **/ matches zero folders
+        self.assertTrue(ns.guarded('packages/a/b/x.rs', patterns))
+        self.assertTrue(ns.guarded('packages/line\nname/x.rs', patterns))
+        self.assertFalse(ns.guarded('other/x/a.rs', patterns))  # negative control
+        self.assertFalse(ns.guarded('other/x/y/a.rs', patterns))  # the folder must be under packages/
+
+    def test_terminal_star_differs_from_an_explicit_directory_rule(self):
+        patterns = ns.guarded_patterns('docs/* @council\n')
+        self.assertTrue(ns.guarded('docs/getting-started.md', patterns))
+        self.assertFalse(ns.guarded('docs/build-app/troubleshooting.md', patterns))
+        self.assertTrue(ns.guarded('docs/build-app/troubleshooting.md',
+                                   ns.guarded_patterns('docs/*/ @council\n')))
+        self.assertTrue(ns.guarded('nested/logs/today.txt',
+                                   ns.guarded_patterns('**/logs @council\n')))
+        self.assertTrue(ns.guarded('nested/line\nname/logs/today.txt',
+                                   ns.guarded_patterns('**/logs @council\n')))
+
+    def test_unrooted_codeowners_rules_guard_at_their_path_scope(self):
+        cases = (
+            ('owned', ('owned', 'owned/a.txt', 'nested/owned/a.txt'),
+             ('owned-other/a.txt', 'nested/owned-other/a.txt')),
+            ('owned/', ('owned/a.txt', 'nested/owned/a.txt'),
+             ('owned', 'owned-other/a.txt')),
+            ('*.rs', ('a.rs', 'nested/a.rs', 'nested/a.rs/notes.txt'),
+             ('a.rs.bak', 'nested/a.txt')),
+            ('packages/*/', ('packages/a/x.txt', 'packages/a/nested/x.txt'),
+             ('nested/packages/a/x.txt', 'packages-other/a/x.txt')),
+            ('shared/owned', ('shared/owned', 'shared/owned/a.txt'),
+             ('nested/shared/owned/a.txt', 'shared/owned-other/a.txt')),
+            ('/owned', ('owned', 'owned/a.txt'),
+             ('nested/owned/a.txt', 'owned-other/a.txt')),
+        )
+        for rule, guarded, unguarded in cases:
+            with self.subTest(rule=rule):
+                patterns = ns.guarded_patterns(f'# ignored @council\n\n  {rule} @council\n')
+                for path in guarded:
+                    self.assertTrue(ns.guarded(path, patterns), path)
+                for path in unguarded:
+                    self.assertFalse(ns.guarded(path, patterns), path)
+                self.assertFalse(ns.guarded('#/notes.txt', patterns))
+
+    def test_lookup_preserves_paginated_and_renamed_paths_for_the_guard(self):
+        pages = [[{"filename": "unowned/readme.txt", "previous_filename": "packages/line\nname.rs"}],
+                 [{"filename": "packages/café.rs"}, {"filename": "unowned/café.rs"}]]
+        paths = ["unowned/readme.txt", "packages/line\nname.rs", "packages/café.rs", "unowned/café.rs"]
+
+        def gh(*args, **kwargs):
+            if args[1] == "repos/owner/repo/pulls/123":
+                return json.dumps({"state": "open", "head": {"sha": "a" * 40}, "title": "paths",
+                                   "user": {"login": "dev"}, "base": {"ref": "main"}, "changed_files": 3})
+            return "\n".join(paths) if "--jq" in args else json.dumps(pages)
+
+        with mock.patch.object(ns, "gh", gh):
+            candidate = ns.lookup("owner/repo")(123)
+        self.assertEqual(candidate.files, paths)
+        patterns = ns.guarded_patterns("/packages/*.rs @council\n")
+        self.assertIn("only the council merges", ns.check(candidate, 123, patterns))
+        self.assertIsNone(ns.check(pr(124, files=["unowned/café.rs"]), 124, patterns))
+
+
+    def test_a_listing_cut_at_the_cap_is_refused(self):
+        # GitHub lists at most 3000 files; a guarded file past that would be unseen, so the pick fails closed.
+        items = [{"filename": f"unowned/f{i}.txt"} for i in range(ns.LISTING_CAP)]
+
+        def gh_for(changed):
+            def gh(*args, **kwargs):
+                if args[1] == "repos/owner/repo/pulls/123":
+                    return json.dumps({"state": "open", "head": {"sha": "a" * 40}, "title": "big",
+                                       "user": {"login": "dev"}, "base": {"ref": "main"},
+                                       "changed_files": changed})
+                return json.dumps([items])
+            return gh
+
+        for changed in (ns.LISTING_CAP + 40, ns.LISTING_CAP):
+            with mock.patch.object(ns, "gh", gh_for(changed)):
+                candidate = ns.lookup("owner/repo")(123)
+            self.assertIn("can't be checked", ns.check(candidate, 123, PATTERNS), changed)
+        items[:] = items[:5]
+        # Below the cap too: five listed of six changed is an incomplete listing, whatever the cap.
+        with mock.patch.object(ns, "gh", gh_for(6)):
+            self.assertIn("can't be checked", ns.check(ns.lookup("owner/repo")(123), 123, PATTERNS))
+        with mock.patch.object(ns, "gh", gh_for(5)):
+            self.assertIsNone(ns.check(ns.lookup("owner/repo")(123), 123, PATTERNS))
+
     def test_a_set_with_a_refused_pull_request_changes_nothing(self):
         state = {"prs": []}
         bad = [pr(2, files=["tools/ci/nightly.py"]), pr(3, state="closed"), pr(4, state="merged"), pr(5, base="x")]
@@ -354,6 +469,29 @@ class AssemblyTests(unittest.TestCase):
 
     def test_changed_files_finds_guarded_paths(self):
         self.assertEqual(sorted(ns.changed_files(self.main, self.p2, cwd=self.repo)), [".gitattributes", "b.txt"])
+
+    def test_changed_files_preserves_repository_paths_for_the_guard(self):
+        # Git's display quoting and text/newline decoding must not change the paths
+        # the guard sees. Include an unrelated file to control the guard's scope.
+        paths = ("packages/café.rs", "packages/ space .rs", "unowned/café.rs")
+        if os.name != "nt":
+            paths += ("packages/tab\tname.rs", "packages/line\nname.rs", "packages/carriage\rname.rs",
+                      os.fsdecode(b"packages/invalid-\xff.rs"))
+        for path in paths:
+            target = Path(self.repo, path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                target.write_text("new\n")
+            except OSError as error:
+                if error.errno != errno.EILSEQ:
+                    raise
+                self.skipTest("this file system refuses a file name that isn't UTF-8 (macOS's APFS)")
+        head = self.commit("paths Git would quote")
+        changed = ns.changed_files(self.main, head, cwd=self.repo)
+        self.assertCountEqual(changed, paths)
+        patterns = ns.guarded_patterns("/packages/*.rs @council\n")
+        for path in changed:
+            self.assertEqual(ns.guarded(path, patterns), path.startswith("packages/"), path)
 
 
 class StateTests(unittest.TestCase):

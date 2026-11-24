@@ -53,6 +53,20 @@ back with its parent transaction instead of splitting one item off.
 elision and `without_component` preserve the normal prototype-plus-patch semantics. The latter
 records real NBT removal entries for default components; it is not an unknown-value fallback.
 
+The display name and lore are the `minecraft:custom_name` and `minecraft:lore` components.
+`ItemStack::set_display(host, Some(&name), &lore)` writes them from `Text` values, converted
+to component NBT by `host.text_to_nbt(&text)`; `None` removes the name and an empty lore slice
+removes the lore. A refused text returns `TextFormError` and changes nothing. Vanilla draws a
+custom name in italics unless its style sets `italic: false`.
+
+They read back with `stack.display_name(host)` (an `Option<Text>`, `None` for a stack with no name of its
+own) and `stack.lore(host)` (the lines, top first; a line that is not one text component is left out), through
+`host.text_from_nbt(&tag)`, which turns what `text_to_nbt` writes back into a `Text` with its colours and
+styles. A prototype's default name is not the stack's own: ask `host.item_default_component`. The model
+data of `minecraft:custom_model_data` reads with `stack.custom_model_data_floats()` (the first is Bukkit's
+`getCustomModelData`) and `stack.custom_model_data_strings()`; a stack with none gives empty lists, and
+`stack.components().is_none()` says a stack has no component overrides besides its damage (Bukkit's `hasItemMeta` false once `damage_component()` is none too).
+
 ## Game boundaries
 
 A consume or death-protection override whose opaque native effect payload cannot be decoded

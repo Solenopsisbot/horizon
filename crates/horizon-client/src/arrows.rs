@@ -190,6 +190,10 @@ pub struct ArrowState {
     /// `piercingIgnoreEntityIds`: the entities a piercing arrow has gone
     /// through (cleared when it sticks in a block).
     pub pierced: Vec<Who>,
+    /// `piercedAndKilledEntities`: what a piercing arrow has killed so far, as
+    /// `KILLED_BY_ARROW` sees it. Made on its first piercing hit, emptied (not
+    /// dropped) when it sticks in a block.
+    pub pierced_and_killed: Option<Vec<crate::advancements::EntityView>>,
     /// `Entity.remainingFireTicks`.
     pub fire_ticks: i32,
     /// The server's shared fire flag, independent of the client-local fire timer.
@@ -289,6 +293,7 @@ impl ArrowState {
             effect_color: -1,
             pierce: 0,
             pierced: Vec::new(),
+            pierced_and_killed: None,
             fire_ticks: 0,
             synced_fire: false,
             fall_distance: 0.0,
@@ -410,6 +415,18 @@ impl ArrowScene<'_, '_> {
     }
     fn is_air(&self, state: BlockStateId) -> bool {
         self.facts.is_air(state)
+    }
+    /// The check that opens `AbstractArrow.tick`: `at` lies inside one of the
+    /// collision boxes of the block it is in.
+    pub fn inside_collision(&self, at: Vec3) -> bool {
+        let p = BlockPos::containing(at);
+        let state = self.block(p);
+        let origin = Vec3::new(f64::from(p.x), f64::from(p.y), f64::from(p.z));
+        !self.is_air(state)
+            && self
+                .collision_boxes(state, p)
+                .iter()
+                .any(|b| b.move_by(origin).contains(at))
     }
     /// `BlockState.getCollisionShape(level, pos)` (an empty collision context).
     fn collision_boxes(&self, state: BlockStateId, p: BlockPos) -> Vec<Aabb> {
@@ -770,19 +787,13 @@ impl Ticker<'_, '_, '_, '_> {
         let block_pos = self.block_position();
         let state = self.scene.block(block_pos);
         if !self.scene.is_air(state) && physics {
-            let origin = Vec3::new(
-                f64::from(block_pos.x),
-                f64::from(block_pos.y),
-                f64::from(block_pos.z),
-            );
-            let at = self.position();
-            let inside = self
-                .scene
-                .collision_boxes(state, block_pos)
-                .iter()
-                .any(|b| b.move_by(origin).contains(at));
+            let inside = self.scene.inside_collision(self.position());
             if inside && !self.st.canceled_impact_inside {
                 self.p.velocity = Vec3::ZERO;
+                // `setInGround(true)`: `onSyncedDataUpdated` starts the shake.
+                if !self.st.in_ground && !self.st.first_tick && self.st.shake <= 0 {
+                    self.st.shake = 7;
+                }
                 self.st.in_ground = true;
             }
             self.st.canceled_impact_inside &= inside;
@@ -1018,6 +1029,7 @@ impl Ticker<'_, '_, '_, '_> {
             // AbstractArrow.onHitEntity: past pierce level + 1 entities the
             // arrow is discarded before it hurts the next one.
             if (self.st.pierce as i8) > 0 {
+                self.st.pierced_and_killed.get_or_insert_with(Vec::new);
                 if self.st.pierced.len() > usize::from(self.st.pierce) {
                     self.st.removed = true;
                     return Hit::None;
@@ -1144,6 +1156,9 @@ impl Ticker<'_, '_, '_, '_> {
         self.p.set_critical(false);
         self.st.pierce = 0;
         self.st.pierced.clear();
+        if let Some(killed) = &mut self.st.pierced_and_killed {
+            killed.clear();
+        }
     }
     /// `Projectile.mayInteract`: a mob's arrows need `mob_griefing`, or a
     /// mod's yes for the owner (NeoForge's `canEntityGrief(level, owner)`).

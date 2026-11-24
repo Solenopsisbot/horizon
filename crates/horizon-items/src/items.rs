@@ -101,7 +101,7 @@ pub fn parse_consumable(
             .or_else(|| cons["sound"]["sound_id"].as_str())
             .unwrap_or("minecraft:entity.generic.eat")
             .to_owned(),
-        particles: cons["has_consume_particles"].as_bool().unwrap_or(true),
+        particles: json_flag(&cons["has_consume_particles"]).unwrap_or(true),
         effects: cons["on_consume_effects"]
             .as_array()
             .into_iter()
@@ -178,7 +178,7 @@ pub fn parse_consume_effect(effect: &serde_json::Value) -> Option<ConsumeEffect>
                     .map_or(16.0, |d| d as f32),
                 directional_particles: effect
                     .get("directional_particles")
-                    .and_then(serde_json::Value::as_bool)
+                    .and_then(json_flag)
                     .unwrap_or(true),
             },
         )),
@@ -365,11 +365,16 @@ fn sound_event(v: &Value) -> Option<String> {
 impl BlocksAttacks {
     /// The `blocks_attacks` `stack` has (`ItemStack.get(DataComponents.BLOCKS_ATTACKS)`):
     /// its own component when it carries one (`/give @s diamond_sword[blocks_attacks={}]`,
-    /// or a server's item), else its item's (`item`, a shield's).
+    /// or a server's item), else its item's (`item`, a shield's). A
+    /// `!minecraft:blocks_attacks` removal patch leaves the lookup empty, so
+    /// the item's component does not come back.
     pub fn of_stack<'a>(
         stack: &ItemStack,
         item: Option<&'a ItemInfo>,
     ) -> Option<std::borrow::Cow<'a, Self>> {
+        if !stack.carries_component(item, "minecraft:blocks_attacks") {
+            return None;
+        }
         if let Some(own) = stack
             .data()
             .and_then(|d| d.other("minecraft:blocks_attacks"))
@@ -441,6 +446,12 @@ pub struct ItemStack {
     /// Components beyond count and damage (see `item_data`); None when default.
     pub extra: Option<Box<crate::item_data::StackData>>,
 }
+impl std::hash::Hash for ItemStack {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.count, state);
+        self.hash_item_and_components(state);
+    }
+}
 /// `order`'s items in the registry's order (`command-registries.json`'s
 /// `items`, exported from the game); `order` itself when that is missing.
 fn registry_order(root: &Path, order: &[Arc<str>]) -> Vec<Arc<str>> {
@@ -464,11 +475,34 @@ const DYNAMIC: &str = "#dynamic:";
 /// The item id standing for a chosen `minecraft:loot_table` entry, whose
 /// table then rolls in full (`NestedLootTable`).
 const NESTED: &str = "#loot_table";
+/// The item id standing for an unexpanded `minecraft:tag` entry, which emits
+/// a stack of every item in the tag when chosen (`TagEntry`).
+const TAG: &str = "#tag";
 thread_local! {
     /// The nested tables rolling now, outermost first: a table never rolls
     /// inside itself (`LootContext.pushVisitedElement`).
     static NESTED_ROLLS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
+/// The tags a `minecraft:custom_data` component matcher may decode to. A
+/// data pack may write the component as SNBT text (`CustomData.CODEC` reads
+/// NBT) or as JSON; vanilla's JSON-to-NBT decode turns a whole number into the
+/// smallest NBT integer, so `{"k":1}` matches saved `1b` as `"{k:1b}"` does.
+/// This engine has always decoded a whole JSON number to `Int`, so that tag
+/// stays a candidate too: a JSON `{"k":5}` keeps matching saved `Int(5)`.
+/// Either tag matches exactly; the SNBT path is parsed as written.
+fn custom_data_tags(value: &Value) -> Option<Vec<horizon_core::nbt::Tag>> {
+    if value.is_string() {
+        return horizon_world::loot::nbt_predicate_tag(value).map(|tag| vec![tag]);
+    }
+    let minimal = horizon_world::loot::nbt_predicate_tag(value)?;
+    let int = horizon_client_core::scoreboard::json_to_tag(value);
+    Some(if minimal == int {
+        vec![minimal]
+    } else {
+        vec![minimal, int]
+    })
+}
+
 #[derive(Clone)]
 pub struct Items {
     pub items: HashMap<Arc<str>, ItemInfo>,
@@ -576,6 +610,12 @@ pub fn instrument_use_ticks(seconds: f32) -> i32 {
 /// None for an inline instrument (see `inline_instrument`).
 pub fn instrument_id(stack: &ItemStack) -> Option<String> {
     if &*stack.item != "minecraft:goat_horn" {
+        return None;
+    }
+    if stack
+        .data()
+        .is_some_and(|d| d.other("!minecraft:instrument").is_some())
+    {
         return None;
     }
     match stack.data().and_then(|d| d.other("minecraft:instrument")) {
@@ -702,16 +742,52 @@ pub(crate) fn load_tag_lists(
             raw.entry(id.to_owned()).or_default().push(&v);
         }
     }
-    fn resolve(name: &str, raw: &HashMap<String, TagLayers>, depth: u32) -> Vec<String> {
-        match raw.get(name) {
-            Some(layers) if depth <= 32 => layers.build(|tag| resolve(tag, raw, depth + 1)),
-            _ => Vec::new(),
+    let known = frozen_registry_ids(root, kind);
+    Ok(TagLayers::resolve_all(raw, |id| {
+        known.as_ref().is_none_or(|ids| ids.contains(id))
+    }))
+}
+/// The ids of the built-in registry `kind`'s tags name, which a tag's
+/// elements are checked against (`ElementLookup.fromFrozenRegistry`): the
+/// blocks, items and fluids of `command-registries.json`, which content mods'
+/// join, and the entity types of `entity-types.json`, which holds the mods'
+/// too. None for a data-driven registry, or a root without the export: then
+/// every element is taken.
+fn frozen_registry_ids(root: &Path, kind: &str) -> Option<HashSet<String>> {
+    let qualify = |id: &str| {
+        if id.contains(':') {
+            id.to_owned()
+        } else {
+            format!("minecraft:{id}")
         }
+    };
+    if kind == "entity_type"
+        && let Ok(bytes) = fs::read(root.join("entity-types.json"))
+    {
+        let rows: HashMap<String, serde::de::IgnoredAny> = serde_json::from_slice(&bytes)
+            .inspect_err(|e| log::warn!("Horizon: entity-types.json is unreadable: {e}"))
+            .ok()?;
+        return Some(rows.keys().map(|id| qualify(id)).collect());
     }
-    Ok(raw
-        .keys()
-        .map(|k| (k.clone(), resolve(k, &raw, 0)))
-        .collect())
+    if !matches!(kind, "block" | "item" | "fluid" | "entity_type") {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct Export<'a> {
+        #[serde(borrow, default)]
+        by_registry: HashMap<String, &'a serde_json::value::RawValue>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Ids {
+        ids: Vec<String>,
+    }
+    let bytes = fs::read(root.join("command-registries.json")).ok()?;
+    let export: Export = serde_json::from_slice(&bytes)
+        .inspect_err(|e| log::warn!("Horizon: command-registries.json is unreadable: {e}"))
+        .ok()?;
+    let ids: Ids =
+        serde_json::from_str(export.by_registry.get(&format!("minecraft:{kind}"))?.get()).ok()?;
+    Some(ids.ids.iter().map(|id| qualify(id)).collect())
 }
 /// An entity type id or `#tag` as the set of entity type ids it names.
 fn entity_spec(tags: &HashMap<String, HashSet<String>>, spec: &str) -> HashSet<String> {
@@ -1267,6 +1343,34 @@ impl Items {
             None => spec == block,
         }
     }
+    /// A published HolderSet (`#tag`, an id or a list of ids) resolved from
+    /// the tags this engine holds: blocks, items and fluids. No biome or
+    /// structure tags are loaded here, so those resolve to nothing and a
+    /// location check that asks for one fails.
+    fn holder_set(&self, registry: &str, v: &Value) -> Vec<String> {
+        match v {
+            Value::String(s) => match s.strip_prefix('#') {
+                Some(tag) => {
+                    let registry = match registry {
+                        "block" => TagRegistry::Block,
+                        "item" => TagRegistry::Item,
+                        "fluid" => TagRegistry::Fluid,
+                        _ => return Vec::new(),
+                    };
+                    self.tag_members(registry, tag)
+                        .map(<[String]>::to_vec)
+                        .unwrap_or_default()
+                }
+                None => vec![s.clone()],
+            },
+            Value::Array(a) => a
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
     /// `Item.canDestroyBlock`: a tool may forbid block destruction with instabuild.
     pub fn can_destroy_block(&self, held: Option<&ItemStack>, creative: bool) -> bool {
         if !creative {
@@ -1545,7 +1649,42 @@ impl Items {
             Some(spec) => self.block_matches(spec, block),
             None => true,
         };
+        // `BlockPredicate.components`: each listed component must equal the
+        // block entity's collected value exactly (not a subset pattern), as
+        // the item side compares a stack's saved components.
+        let components_ok = c["components"].as_object().is_none_or(|components| {
+            // `BlockPredicate.matchesBlockEntity` skips an empty matcher.
+            if components.is_empty() {
+                return true;
+            }
+            let Some(place) = horizon_world::loot::current_native_loot_place() else {
+                return false;
+            };
+            let Some(horizon_core::nbt::Tag::Compound(have)) =
+                place.block_entity_components.as_ref()
+            else {
+                return false;
+            };
+            components.iter().all(|(id, expected)| {
+                let expected = if id == "minecraft:custom_data" {
+                    custom_data_tags(expected)
+                } else {
+                    Some(vec![horizon_client_core::scoreboard::json_to_tag(expected)])
+                };
+                // A matcher that does not decode matches nothing, not an
+                // absent component.
+                let Some(expected) = expected else {
+                    return false;
+                };
+                let Some(actual) = have.get(&horizon_core::nbt::JavaString::from(id.as_str()))
+                else {
+                    return false;
+                };
+                expected.iter().any(|tag| tag == actual)
+            })
+        });
         blocks_ok
+            && components_ok
             && c["state"]
                 .as_object()
                 .into_iter()
@@ -1570,7 +1709,10 @@ impl Items {
     }
     /// `Block.getDrops`: the block's loot table rolled with `roll`, drawing
     /// from the table's random sequence when it has one (`sequences`: the
-    /// world's sequences and seed), else from `random`.
+    /// world's sequences and seed), else from `random`. The results come
+    /// before `LootTable.createStackSplitter`, one per result, so a caller can
+    /// copy the block entity's components onto each first; then it splits
+    /// them with [`Self::split_stacks`].
     pub fn block_drops(
         &self,
         registry: &BlockRegistry,
@@ -1593,6 +1735,14 @@ impl Items {
                 }
             })
             .collect()
+    }
+    /// `LootTable.createStackSplitter` over [`Self::block_drops`]' results, in order.
+    pub fn split_stacks(&self, stacks: Vec<ItemStack>) -> Vec<ItemStack> {
+        let mut out = Vec::with_capacity(stacks.len());
+        for stack in stacks {
+            split_stack(self, stack, &mut out);
+        }
+        out
     }
 
     fn roll_block_table<R: RandomSource>(
@@ -1667,23 +1817,9 @@ impl Items {
         this_entity: bool,
         random: &mut R,
     ) -> Option<Vec<ItemStack>> {
-        let raw = self.table_raw(id, false, held, this_entity, random, false)?;
-        // LootTable.createStackSplitter.
-        let mut out = Vec::with_capacity(raw.len());
-        for stack in raw {
-            let max = crate::bundle::max_stack(self, &stack);
-            let mut count = stack.count;
-            while count > max {
-                let mut part = stack.clone();
-                part.count = max;
-                out.push(part);
-                count -= max;
-            }
-            out.push(ItemStack { count, ..stack });
-        }
-        Some(out)
+        self.table_raw(id, false, held, this_entity, random, false)
     }
-    /// `LootTable.getRandomItemsRaw` of table `id` with no block.
+    /// `LootTable.getRandomItems` of table `id` with no block (split stacks).
     fn table_raw<R: RandomSource>(
         &self,
         id: &str,
@@ -1712,7 +1848,7 @@ impl Items {
         };
         // LootTable.getRandomItemsRaw visits the table itself first.
         NESTED_ROLLS.with(|v| v.borrow_mut().push(id.to_owned()));
-        let out = ctx.evaluate(table, random);
+        let out = ctx.roll(table, random);
         ctx.query.finish(Some(id));
         NESTED_ROLLS.with(|v| v.borrow_mut().pop());
         Some(out)
@@ -1746,7 +1882,7 @@ impl Items {
             location: None,
             keep_empty: false,
         };
-        ctx.evaluate(table, random)
+        ctx.roll(table, random)
     }
     /// `loot_table` drawing from any random (a random sequence).
     pub fn loot_table_from(
@@ -1918,6 +2054,24 @@ impl Items {
 /// `DataComponents.BLOCK_STATE`.
 const BLOCK_STATE: &str = "minecraft:block_state";
 impl<R: RandomSource> LootContext<'_, R> {
+    /// `LootTable.getRandomItems`: the table's stacks through
+    /// `LootTable.createStackSplitter`, so none is larger than its stack size.
+    /// The splitter draws nothing from `random`. A nested table entry rolls
+    /// `getRandomItemsRaw` ([`Self::evaluate`]), unsplit.
+    fn roll(&self, table: &Value, random: &mut R) -> Vec<ItemStack> {
+        let raw = self.evaluate(table, random);
+        let mut out = Vec::with_capacity(raw.len());
+        for stack in raw {
+            // A `minecraft:dynamic` marker becomes the dynamic drops later, whatever its count.
+            if stack.item.starts_with(DYNAMIC) {
+                out.push(stack);
+            } else {
+                split_stack(self.items, stack, &mut out);
+            }
+        }
+        out
+    }
+    /// `LootTable.getRandomItemsRaw`.
     fn evaluate(&self, table: &Value, random: &mut R) -> Vec<ItemStack> {
         let ctx = self;
         let mut out = Vec::new();
@@ -1937,6 +2091,9 @@ impl<R: RandomSource> LootContext<'_, R> {
                 for (mut stack, emitted) in produced {
                     ctx.modifiers(&pool["modifier"], &mut stack, random);
                     ctx.modifiers(&table["modifier"], &mut stack, random);
+                    if &*stack.item == "minecraft:air" {
+                        stack.count = 0;
+                    }
                     if stack.count > 0 || (ctx.keep_empty && emitted) {
                         out.push(stack);
                     }
@@ -1944,6 +2101,33 @@ impl<R: RandomSource> LootContext<'_, R> {
             }
         }
         out
+    }
+}
+/// `LootTable.createStackSplitter` (every item is enabled): a stack below its
+/// stack size as it is, else copies of at most the stack size, in order. The
+/// size is the stack's own `max_stack_size` (1 when it removes it), else its
+/// item's (64 when the item has no facts, `Item.Properties`' default, as
+/// `Items::load` and the world's loot facts give it).
+fn split_stack(items: &Items, stack: ItemStack, out: &mut Vec<ItemStack>) {
+    let info = items.get(&stack.item);
+    let removed = stack
+        .data()
+        .is_some_and(|data| data.other("!minecraft:max_stack_size").is_some());
+    let max = if removed || stack.carries_component(None, "minecraft:max_stack_size") {
+        crate::bundle::max_stack(items, &stack)
+    } else {
+        info.map_or(64, |info| info.max_stack.max(1))
+    };
+    if stack.count < max {
+        out.push(stack);
+        return;
+    }
+    let mut count = stack.count;
+    while count > 0 {
+        let mut copy = stack.clone();
+        copy.count = max.min(count);
+        count -= copy.count;
+        out.push(copy);
     }
 }
 /// What a roll asks when its table reads an enchantment level: given the
@@ -2077,6 +2261,25 @@ impl<R: RandomSource> LootContext<'_, R> {
                 min + random.next_int_bound(max - min + 1).unwrap_or(0)
             };
         }
+        // An int provider's constant goes through Codec.INT, which takes
+        // `Number.intValue`: 2.5 is 2 and -2.5 is -2, not rounded.
+        let constant = match v {
+            Value::Object(o)
+                if o.get("type").and_then(Value::as_str) == Some("minecraft:constant") =>
+            {
+                o.get("value").unwrap_or(&Value::Null)
+            }
+            _ => v,
+        };
+        if let Value::Number(n) = constant {
+            // `intValue` keeps the low 32 bits of the integer (a decimal is
+            // cut toward zero first); f64 holds that integer exactly up to 2^53.
+            return match (n.as_i64(), n.as_u64()) {
+                (Some(i), _) => i as i32,
+                (_, Some(u)) => u as i32,
+                _ => (n.as_f64().unwrap_or(0.0).trunc() as i128) as i32,
+            };
+        }
         Self::number(v, random).round() as i32
     }
     fn condition(&self, c: &Value, random: &mut R) -> bool {
@@ -2186,13 +2389,33 @@ impl<R: RandomSource> LootContext<'_, R> {
             // Entity flags, equipment and damage-source predicates: none hold
             // for an unenchanted player kill without fire or lightning.
             "minecraft:entity_properties" | "minecraft:damage_source_properties" => false,
-            // LocationCheck reads the world at its offset, which this engine
-            // does not have: held true (a double plant's other half is taken
-            // as there). Unknown types fail, as in loot.rs.
-            "minecraft:location_check" => self
-                .location
-                .and_then(|location| location(c))
-                .unwrap_or(true),
+            // A command's block-loot roll binds its own reader. Every other
+            // roll reads the place the game captured around it (a broken
+            // block's drops, an explosion's): the fields it holds answer, and
+            // the ones it cannot answer fail, as `loot.rs` requires. A roll
+            // with no captured place keeps this engine's historical answer of
+            // true (a double plant's other half is taken as there). The place
+            // holds the origin's facts only, so a check at an offset has
+            // nothing to read and keeps that answer too: `tall_grass` and
+            // `large_fern` gate each pool on the other half one block up or
+            // down (`BlockLootSubProvider.createDoublePlantWithSeedDrops`).
+            // Unknown types fail, as in loot.rs.
+            "minecraft:location_check" => match self.location {
+                Some(location) => location(c).unwrap_or(true),
+                None => horizon_world::loot::current_native_loot_place()
+                    .as_deref()
+                    .is_none_or(|place| {
+                        ["offsetX", "offsetY", "offsetZ"]
+                            .iter()
+                            .any(|axis| c[*axis].as_i64().is_some_and(|n| n != 0))
+                            || horizon_world::loot::evaluate_location_check(
+                                c,
+                                Some(place),
+                                None,
+                                &|registry, value| self.items.holder_set(registry, value),
+                            )
+                    }),
+            },
             // A mod's own kind: the condition hook answers.
             k if !c.is_null() && k.contains(':') && !k.starts_with("minecraft:") => {
                 let ctx = self.native_loot_context(random);
@@ -2219,10 +2442,13 @@ impl<R: RandomSource> LootContext<'_, R> {
         }
         match e["type"].as_str().unwrap_or("") {
             "minecraft:item" => {
+                let Some(name) = e["name"].as_str().filter(|s| !s.is_empty()) else {
+                    return false;
+                };
                 out.push((
                     e["weight"].as_i64().unwrap_or(1) as i32,
                     ItemStack {
-                        item: Arc::from(e["name"].as_str().unwrap_or("minecraft:air")),
+                        item: Arc::from(name),
                         count: 1,
                         damage: 0,
                         extra: None,
@@ -2300,7 +2526,69 @@ impl<R: RandomSource> LootContext<'_, R> {
                 ));
                 true
             }
+            // TagEntry: expanded, one candidate per item in the tag; not
+            // expanded, one candidate that emits every item when chosen.
+            "minecraft:tag" => {
+                if e["expand"].as_bool().unwrap_or(false) {
+                    for item in self.tag_items(&e["items"]) {
+                        out.push((
+                            e["weight"].as_i64().unwrap_or(1) as i32,
+                            ItemStack {
+                                item: Arc::from(item),
+                                count: 1,
+                                damage: 0,
+                                extra: None,
+                            },
+                            e["modifier"].clone(),
+                            true,
+                        ));
+                    }
+                } else {
+                    out.push((
+                        e["weight"].as_i64().unwrap_or(1) as i32,
+                        ItemStack {
+                            item: Arc::from(TAG),
+                            count: 1,
+                            damage: 0,
+                            extra: None,
+                        },
+                        e.clone(),
+                        true,
+                    ));
+                }
+                true
+            }
             _ => false,
+        }
+    }
+    /// A tag entry's `items` (`HolderSet`): a tag's members in `TagLoader`
+    /// order, one item id, or a list of ids.
+    fn tag_items(&self, v: &Value) -> Vec<String> {
+        match v {
+            Value::String(s) => match s.strip_prefix('#') {
+                Some(tag) => {
+                    // `ResourceLocation`: an unqualified tag name defaults to
+                    // the `minecraft` namespace (as in `Items::item_in_tag`).
+                    let normalized;
+                    let tag = if !tag.contains(':') || tag.starts_with(':') {
+                        normalized = format!("minecraft:{}", tag.strip_prefix(':').unwrap_or(tag));
+                        normalized.as_str()
+                    } else {
+                        tag
+                    };
+                    self.items
+                        .tag_members(TagRegistry::Item, tag)
+                        .map(<[String]>::to_vec)
+                        .unwrap_or_default()
+                }
+                None => vec![s.clone()],
+            },
+            Value::Array(a) => a
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
         }
     }
     fn choose(&self, entries: &[Value], random: &mut R, produced: &mut Vec<(ItemStack, bool)>) {
@@ -2329,6 +2617,19 @@ impl<R: RandomSource> LootContext<'_, R> {
         let (_, mut stack, modifiers, emitted) = candidates.swap_remove(pick);
         if &*stack.item == NESTED {
             self.nested(&modifiers, random, produced);
+            return;
+        }
+        if &*stack.item == TAG {
+            for item in self.tag_items(&modifiers["items"]) {
+                let mut stack = ItemStack {
+                    item: Arc::from(item),
+                    count: 1,
+                    damage: 0,
+                    extra: None,
+                };
+                self.modifiers(&modifiers["modifier"], &mut stack, random);
+                produced.push((stack, true));
+            }
             return;
         }
         self.modifiers(&modifiers, &mut stack, random);
@@ -2463,7 +2764,9 @@ impl<R: RandomSource> LootContext<'_, R> {
                     if level > 0 {
                         let add = level as f32 * Self::number(&f["count"], random);
                         // ItemStack.grow: an int sum, which wraps as in Java.
-                        let count = (stack.count as i32).wrapping_add(add.round() as i32);
+                        // Math.round(float): ties go up, so -1.5 adds -1.
+                        let add = horizon_core::jmath::round_f32(add);
+                        let count = (stack.count as i32).wrapping_add(add);
                         stack.count = count.max(0) as u32;
                         if let Some(limit) = f["limit"].as_i64().filter(|l| *l > 0) {
                             stack.count = stack.count.min(limit as u32);
@@ -2883,10 +3186,35 @@ mod death_effects_tests {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn effect_flags_read_as_bytes_too() {
+        let spec = consume_effect_spec(&serde_json::json!({
+            "id": "minecraft:nausea",
+            "duration": 40,
+            "show_particles": 0,
+            "show_icon": 0
+        }))
+        .unwrap();
+        assert!(!spec.show_particles && !spec.show_icon);
+        let spec = consume_effect_spec(
+            &serde_json::json!({"id": "minecraft:nausea", "show_particles": 1}),
+        )
+        .unwrap();
+        assert!(spec.show_particles && spec.show_icon);
+        assert_eq!(json_flag(&serde_json::json!(true)), Some(true));
+        assert_eq!(json_flag(&serde_json::json!("x")), None);
+    }
+}
+
+/// A flag as `Codec.BOOL` reads it: a boolean, or a number (a component's
+/// `0b`/`1b` arrives as a number through NBT), non-zero being true.
+fn json_flag(v: &Value) -> Option<bool> {
+    v.as_bool().or_else(|| v.as_f64().map(|n| n != 0.0))
 }
 
 fn consume_effect_spec(e: &Value) -> Option<ConsumeEffectSpec> {
-    let flag = |key: &str, default: bool| e.get(key).and_then(|v| v.as_bool()).unwrap_or(default);
+    let flag = |key: &str, default: bool| e.get(key).and_then(json_flag).unwrap_or(default);
     Some(ConsumeEffectSpec {
         id: e.get("id")?.as_str()?.to_string(),
         duration: e.get("duration").and_then(|d| d.as_i64()).unwrap_or(0) as i32,
@@ -2951,6 +3279,26 @@ pub(crate) fn prepared_items() -> Option<Items> {
 #[cfg(test)]
 mod consume_effect_tests {
     use super::*;
+
+    #[test]
+    fn teleport_effect_keeps_numeric_particle_flags() {
+        let mut effect = serde_json::json!({"type": "minecraft:teleport_randomly"});
+        let particles = |effect: &Value| {
+            let Some(ConsumeEffect::TeleportRandomly(teleport)) = parse_consume_effect(effect)
+            else {
+                panic!("expected a teleport consume effect");
+            };
+            teleport.directional_particles
+        };
+
+        assert!(particles(&effect));
+        effect["directional_particles"] = serde_json::json!(0);
+        assert!(!particles(&effect));
+        effect["directional_particles"] = serde_json::json!(1);
+        assert!(particles(&effect));
+        effect["directional_particles"] = serde_json::json!(false);
+        assert!(!particles(&effect));
+    }
 
     #[test]
     fn effects_keep_their_ambient_and_particle_flags() {
@@ -3608,6 +3956,71 @@ mod tests {
         assert!(!items.item_in_tag("test:missing", "test:apple"));
     }
 
+    /// `LootTable.createStackSplitter`: a block's or a mob's drop above its
+    /// item's stack size comes out as stacks of at most that size, in order,
+    /// an unstackable item one by one; splitting draws nothing from the random.
+    #[test]
+    fn oversized_drops_split_into_full_stacks() {
+        let mut items = Items::for_tests(HashMap::new());
+        for (id, max) in [
+            ("minecraft:ender_pearl", 16),
+            ("minecraft:diamond_sword", 1),
+        ] {
+            items.items.insert(
+                Arc::from(id),
+                ItemInfo {
+                    id: Arc::from(id),
+                    max_stack: max,
+                    components: vec!["minecraft:max_stack_size".into()],
+                    ..ItemInfo::default()
+                },
+            );
+        }
+        let table = json!({"pools":[
+            {"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:ender_pearl",
+                "modifier":[{"type":"minecraft:set_count","count":40}]}]},
+            {"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond_sword",
+                "modifier":[{"type":"minecraft:set_count","count":3}]}]},
+            {"rolls":1,"condition":{"type":"minecraft:random_chance","chance":0.0},"entries":[
+                {"type":"minecraft:item","name":"minecraft:stick"}]}]});
+        items.loot = Arc::new(
+            [("minecraft:entities/test".to_owned(), table.clone())]
+                .into_iter()
+                .collect(),
+        );
+        let summary = |drops: Vec<ItemStack>| {
+            drops
+                .into_iter()
+                .map(|s| format!("{} {}", s.item, s.count))
+                .collect::<Vec<_>>()
+        };
+        let expected = [
+            "minecraft:ender_pearl 16",
+            "minecraft:ender_pearl 16",
+            "minecraft:ender_pearl 8",
+            "minecraft:diamond_sword 1",
+            "minecraft:diamond_sword 1",
+            "minecraft:diamond_sword 1",
+        ];
+        let props = horizon_world::chunk::BlockProperties::new();
+        let mut random = LegacyRandom::new(5);
+        let block = items.roll_block_table(
+            &table,
+            "minecraft:stone",
+            &props,
+            BlockLootRoll::default(),
+            &mut random,
+        );
+        assert_eq!(summary(items.split_stacks(block)), expected);
+        let mut unsplit = LegacyRandom::new(5);
+        let _ = ctx(&items, None, &props, "minecraft:stone").evaluate(&table, &mut unsplit);
+        // The last pool's chance draws: the random has moved on, as far as unsplit.
+        assert_ne!(random.clone().next_long(), LegacyRandom::new(5).next_long());
+        assert_eq!(random.next_long(), unsplit.next_long());
+        let mob = items.entity_drops("minecraft:test", false, None, &mut LegacyRandom::new(5));
+        assert_eq!(summary(mob), expected);
+    }
+
     /// `NestedLootTable`: a `loot_table` entry, by id or inline, rolls that
     /// table in full and applies its own functions to each stack; a table
     /// never rolls inside itself.
@@ -3640,6 +4053,102 @@ mod tests {
         assert_eq!(roll("test:inline"), ["minecraft:diamond 1"]);
         // `test:loop` is already rolling: its own entry adds nothing.
         assert_eq!(roll("test:loop"), ["minecraft:stick 1"]);
+    }
+
+    /// `TagEntry`: with `expand` the tag entry is one choice per item in the
+    /// tag; without it, choosing the entry emits a stack of every item.
+    #[test]
+    fn loot_tag_entries_expand_per_item_or_emit_the_whole_tag() {
+        let mut items = Items::for_tests(HashMap::new());
+        items.set_tags(
+            TagRegistry::Item,
+            HashMap::from([(
+                "minecraft:wool".to_owned(),
+                vec![
+                    "minecraft:white_wool".to_owned(),
+                    "minecraft:orange_wool".to_owned(),
+                    "minecraft:red_wool".to_owned(),
+                ],
+            )]),
+        );
+        let table = |expand: bool| {
+            json!({"pools":[{"rolls":1,"entries":[{"type":"minecraft:tag",
+                "items":"#minecraft:wool","expand":expand}]}]})
+        };
+        let summary = |stacks: Vec<ItemStack>| {
+            stacks
+                .into_iter()
+                .map(|s| s.item.to_string())
+                .collect::<Vec<_>>()
+        };
+        // Expanded, a roll takes exactly one of the tag's items, and every
+        // item is a candidate of its own.
+        let mut seen = HashSet::new();
+        for seed in 0..32 {
+            let rolled =
+                summary(items.inline_loot_table(&table(true), &mut LegacyRandom::new(seed)));
+            assert_eq!(
+                rolled.len(),
+                1,
+                "one expanded candidate and one roll is one stack: {rolled:?}"
+            );
+            seen.extend(rolled);
+        }
+        assert_eq!(
+            seen,
+            HashSet::from([
+                "minecraft:white_wool".to_owned(),
+                "minecraft:orange_wool".to_owned(),
+                "minecraft:red_wool".to_owned(),
+            ])
+        );
+        // Unexpanded, the chosen entry emits the whole tag, in tag order.
+        assert_eq!(
+            summary(items.inline_loot_table(&table(false), &mut LegacyRandom::new(1))),
+            [
+                "minecraft:white_wool",
+                "minecraft:orange_wool",
+                "minecraft:red_wool"
+            ]
+        );
+    }
+
+    /// An unqualified tag name (`#wool`) resolves in the `minecraft`
+    /// namespace, exactly like `#minecraft:wool` (`ResourceLocation`).
+    #[test]
+    fn loot_tag_entry_without_namespace_uses_the_minecraft_default() {
+        let mut items = Items::for_tests(HashMap::new());
+        items.set_tags(
+            TagRegistry::Item,
+            HashMap::from([(
+                "minecraft:wool".to_owned(),
+                vec![
+                    "minecraft:white_wool".to_owned(),
+                    "minecraft:orange_wool".to_owned(),
+                    "minecraft:red_wool".to_owned(),
+                ],
+            )]),
+        );
+        let table = |expand: bool| {
+            json!({"pools":[{"rolls":1,"entries":[{"type":"minecraft:tag",
+                "items":"#wool","expand":expand}]}]})
+        };
+        // Unexpanded, `#wool` emits every member of `minecraft:wool`.
+        let rolled = items.inline_loot_table(&table(false), &mut LegacyRandom::new(1));
+        assert_eq!(
+            rolled
+                .iter()
+                .map(|s| s.item.to_string())
+                .collect::<Vec<_>>(),
+            [
+                "minecraft:white_wool",
+                "minecraft:orange_wool",
+                "minecraft:red_wool"
+            ]
+        );
+        // Expanded, it yields one candidate per member, so one roll is one stack.
+        let expanded = items.inline_loot_table(&table(true), &mut LegacyRandom::new(1));
+        assert_eq!(expanded.len(), 1, "one expanded candidate: {expanded:?}");
     }
 
     /// `Blocks.wallVariant`: a wall block without a table of its own drops
@@ -3877,6 +4386,237 @@ mod tests {
                 usize::from(value.unwrap_or(true))
             );
         }
+    }
+
+    /// `BlockPredicate.matchesBlockEntity`: an empty component matcher never
+    /// requires a block entity, but a nonempty matcher does.
+    #[test]
+    fn match_block_empty_components_need_no_block_entity() {
+        let items = Items::for_tests(HashMap::new());
+        let props = horizon_world::chunk::BlockProperties::new();
+        assert!(items.matches_block_state(
+            &json!({"blocks":"minecraft:stone","components":{}}),
+            "minecraft:stone",
+            &props,
+        ));
+        assert!(!items.matches_block_state(
+            &json!({"blocks":"minecraft:chest","components":{}}),
+            "minecraft:stone",
+            &props,
+        ));
+        assert!(!items.matches_block_state(
+            &json!({"blocks":"minecraft:stone","components":{"minecraft:custom_name":"Loot"}}),
+            "minecraft:stone",
+            &props,
+        ));
+    }
+
+    /// `BlockPredicate.components`: every listed component must equal the
+    /// block entity's collected value exactly; a different value, or one the
+    /// entity does not carry, does not match.
+    #[test]
+    fn match_block_reads_the_block_entity_components() {
+        use horizon_world::loot::{LootPlace, with_native_loot_place};
+        let items = Items::for_tests(HashMap::new());
+        let props = horizon_world::chunk::BlockProperties::new();
+        let collected = || {
+            horizon_core::nbt::parse_snbt(
+                r#"{"minecraft:container":[{slot:4,item:{id:"minecraft:stone",count:5}}],"minecraft:custom_name":"Loot"}"#,
+            )
+            .unwrap()
+            .0
+        };
+        let matched = |predicate: Value| {
+            let place = LootPlace {
+                block_entity_components: Some(collected()),
+                ..LootPlace::default()
+            };
+            with_native_loot_place(place, || {
+                items.matches_block_state(&predicate, "minecraft:chest", &props)
+            })
+        };
+        assert!(
+            matched(json!({"blocks":"minecraft:chest","components":{
+                "minecraft:container":[{"slot":4,"item":{"id":"minecraft:stone","count":5}}],
+                "minecraft:custom_name":"Loot"}})),
+            "the collected component values match"
+        );
+        assert!(
+            !matched(json!({"blocks":"minecraft:chest","components":{
+                "minecraft:container":[{"slot":4,"item":{"id":"minecraft:stone","count":6}}]}})),
+            "a different component value does not"
+        );
+        assert!(
+            !matched(json!({"blocks":"minecraft:chest","components":{
+                "minecraft:custom_data":{"k":1}}})),
+            "a component the entity does not carry does not"
+        );
+        assert!(
+            !matched(json!({"blocks":"minecraft:chest","components":{
+                "minecraft:custom_data":"{} trailing"}})),
+            "invalid SNBT does not match a missing component"
+        );
+    }
+
+    /// `BlockPredicate.components`: a JSON `custom_data` value and the same
+    /// value as SNBT decode compatibly, so a whole JSON number matches saved
+    /// `1b`; the JSON whole number also keeps its old `Int` match. Every
+    /// other value stays exact.
+    #[test]
+    fn match_block_custom_data_json_and_snbt_decode_alike() {
+        use horizon_world::loot::{LootPlace, with_native_loot_place};
+        let items = Items::for_tests(HashMap::new());
+        let props = horizon_world::chunk::BlockProperties::new();
+        let matched = |collected: &str, custom_data: Value| {
+            let place = LootPlace {
+                block_entity_components: Some(horizon_core::nbt::parse_snbt(collected).unwrap().0),
+                ..LootPlace::default()
+            };
+            with_native_loot_place(place, || {
+                items.matches_block_state(
+                    &json!({"blocks":"minecraft:chest","components":{
+                        "minecraft:custom_data":custom_data}}),
+                    "minecraft:chest",
+                    &props,
+                )
+            })
+        };
+        let byte = r#"{"minecraft:custom_data":{k:1b}}"#;
+        let int = r#"{"minecraft:custom_data":{k:5}}"#;
+        assert!(
+            matched(byte, json!({"k":1})),
+            "JSON 1 matches saved Byte(1)"
+        );
+        assert!(matched(byte, json!("{k:1b}")), "SNBT 1b still matches");
+        assert!(
+            matched(int, json!({"k":5})),
+            "JSON 5 keeps matching saved Int(5)"
+        );
+        assert!(matched(int, json!("{k:5}")), "SNBT 5 matches saved Int(5)");
+        assert!(
+            !matched(byte, json!({"k":2})),
+            "a different JSON value does not"
+        );
+        assert!(
+            !matched(byte, json!("{k:2b}")),
+            "a different SNBT value does not"
+        );
+    }
+
+    /// A block's drops read the `LootPlace` the game captured around the roll
+    /// (`block_loot_at`'s `with_native_loot_place`): a `location_check` the
+    /// place answers holds, one it cannot answer fails, and a roll with no
+    /// captured place keeps the engine's historical answer of true.
+    #[test]
+    fn block_drops_read_the_captured_place_for_location_check() {
+        use horizon_world::loot::{LootBlockState, LootPlace, with_native_loot_place};
+        let registry = BlockRegistry::from_facts_json(
+            &br#"{"defaults":{"minecraft:stone":0,"minecraft:dirt":1},"states":[["stone",false,false,"","minecraft:stone"],["dirt",false,false,"","minecraft:dirt"]]}"#[..],
+        )
+        .unwrap();
+        let mut items = Items::for_tests(HashMap::new());
+        items.loot = Arc::new(
+            [(
+                "minecraft:blocks/stone".into(),
+                json!({"pools":[{"rolls":1,
+                    "condition":{"type":"minecraft:location_check","predicate":{"block":{"blocks":"minecraft:stone"}}},
+                    "entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let place = |name: &str| LootPlace {
+            origin: Some([0.5, 64.0, 0.5]),
+            block: Some(LootBlockState {
+                name: name.to_owned(),
+                properties: horizon_world::chunk::BlockProperties::new(),
+            }),
+            ..LootPlace::default()
+        };
+        let drops = |place: Option<LootPlace>| {
+            let mut random = LegacyRandom::new(1);
+            match place {
+                Some(place) => with_native_loot_place(place, || {
+                    items.block_drops(
+                        &registry,
+                        BlockStateId(0),
+                        BlockLootRoll::default(),
+                        &mut random,
+                        None,
+                    )
+                }),
+                None => items.block_drops(
+                    &registry,
+                    BlockStateId(0),
+                    BlockLootRoll::default(),
+                    &mut random,
+                    None,
+                ),
+            }
+        };
+        assert_eq!(drops(Some(place("minecraft:stone"))).len(), 1);
+        assert!(
+            drops(Some(place("minecraft:dirt"))).is_empty(),
+            "a mismatched block fails"
+        );
+        assert_eq!(
+            drops(None).len(),
+            1,
+            "an unbound roll keeps the legacy answer"
+        );
+    }
+
+    /// `BlockLootSubProvider.createDoublePlantWithSeedDrops`: each pool of
+    /// `tall_grass` is gated by a `location_check` for the other half, one
+    /// block up or down. The captured place holds the broken half's origin
+    /// only, so those checks keep the engine's answer of true: the plant
+    /// still drops when it is broken, with the origin's facts captured.
+    #[test]
+    fn a_double_plants_offset_location_checks_still_hold_with_a_captured_place() {
+        use horizon_world::loot::{LootBlockState, LootPlace, with_native_loot_place};
+        let registry = BlockRegistry::from_facts_json(
+            &br#"{"defaults":{"minecraft:tall_grass":0},"states":[["tall_grass",false,false,"","minecraft:tall_grass"]]}"#[..],
+        )
+        .unwrap();
+        let other_half = |half: &str, offset_y: i64| {
+            json!({"type":"minecraft:location_check","offsetY":offset_y,
+                "predicate":{"block":{"blocks":"minecraft:tall_grass","state":{"half":half}}}})
+        };
+        let mut items = Items::for_tests(HashMap::new());
+        items.loot = Arc::new(
+            [(
+                "minecraft:blocks/tall_grass".into(),
+                json!({"pools":[
+                    {"rolls":1,"conditions":[other_half("upper", 1)],
+                     "entries":[{"type":"minecraft:item","name":"minecraft:wheat_seeds"}]},
+                    {"rolls":1,"conditions":[other_half("lower", -1)],
+                     "entries":[{"type":"minecraft:item","name":"minecraft:wheat_seeds"}]},
+                ]}),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let mut properties = horizon_world::chunk::BlockProperties::new();
+        properties.insert("half".to_owned(), "lower".to_owned());
+        let place = LootPlace {
+            origin: Some([0.5, 64.0, 0.5]),
+            block: Some(LootBlockState {
+                name: "minecraft:tall_grass".to_owned(),
+                properties,
+            }),
+            ..LootPlace::default()
+        };
+        let mut random = LegacyRandom::new(1);
+        let drops = with_native_loot_place(place, || {
+            items.block_drops(
+                &registry,
+                BlockStateId(0),
+                BlockLootRoll::default(),
+                &mut random,
+                None,
+            )
+        });
+        assert_eq!(drops.len(), 2, "both pools hold, one per half");
     }
 
     fn ctx<'a>(
@@ -4534,6 +5274,100 @@ mod tests {
         );
         // 46 is vanilla's count for this seed; an extra level draw gives 28.
         assert_eq!(drops[0].count, 46);
+    }
+
+    #[test]
+    fn loot_evaluation_never_emits_positive_air_stacks() {
+        let items = Items::for_tests(HashMap::new());
+        let empty_with_pool_count = json!({
+            "pools": [{
+                "rolls": 1,
+                "modifier": {"type": "minecraft:set_count", "count": 1},
+                "entries": [{
+                    "type": "minecraft:empty"
+                }]
+            }]
+        });
+        let air_item = json!({
+            "pools": [{
+                "rolls": 1,
+                "entries": [{
+                    "type": "minecraft:item",
+                    "name": "minecraft:air"
+                }]
+            }]
+        });
+        let missing_name = json!({
+            "pools": [{
+                "rolls": 1,
+                "entries": [{
+                    "type": "minecraft:item"
+                }]
+            }]
+        });
+        let empty_name = json!({
+            "pools": [{
+                "rolls": 1,
+                "entries": [{
+                    "type": "minecraft:item",
+                    "name": ""
+                }]
+            }]
+        });
+        for table in [
+            &empty_with_pool_count,
+            &air_item,
+            &missing_name,
+            &empty_name,
+        ] {
+            let drops =
+                items.inline_loot_table_for_command(table, None, &mut LegacyRandom::new(1), false);
+            assert!(drops.is_empty(), "expected no air drops, got {drops:?}");
+        }
+        for table in [&empty_with_pool_count, &missing_name, &empty_name] {
+            let drops =
+                items.inline_loot_table_for_command(table, None, &mut LegacyRandom::new(1), true);
+            assert!(
+                drops.is_empty(),
+                "expected no emitted entries with keep_empty, got {drops:?}"
+            );
+        }
+        // Explicit air entry with keep_empty=true normalises to count 0 so slots stay empty.
+        let air_kept =
+            items.inline_loot_table_for_command(&air_item, None, &mut LegacyRandom::new(1), true);
+        assert_eq!(air_kept.len(), 1);
+        assert_eq!(&*air_kept[0].item, "minecraft:air");
+        assert_eq!(air_kept[0].count, 0);
+
+        // Real item reduced to zero preserves its empty position before a later real item.
+        let zero_then_diamond = json!({
+            "pools": [
+                {
+                    "rolls": 1,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "minecraft:iron_ingot",
+                        "modifier": {"type": "minecraft:set_count", "count": 0}
+                    }]
+                },
+                {
+                    "rolls": 1,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "minecraft:diamond"
+                    }]
+                }
+            ]
+        });
+        let kept = items.inline_loot_table_for_command(
+            &zero_then_diamond,
+            None,
+            &mut LegacyRandom::new(1),
+            true,
+        );
+        assert_eq!(kept.len(), 2);
+        assert_eq!((&*kept[0].item, kept[0].count), ("minecraft:iron_ingot", 0));
+        assert_eq!((&*kept[1].item, kept[1].count), ("minecraft:diamond", 1));
     }
 
     /// A content root's remainders reach the mods' items; vanilla's stay its own.

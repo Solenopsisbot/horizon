@@ -36,7 +36,8 @@ single-player paths, a LAN guest, a screenshot for anything visible. The list is
 A pull request that touches a CODEOWNERS path needs a code owner's approving review: GitHub keeps its merge button
 locked until then. Leave it open and say in the thread that it waits for a code owner.
 
-Pull requests opened by the maintainer's agents (author `ludovic111`, body starting "Opened by Ludovic's AI agent")
+Pull requests opened by the maintainer's agents (author `ludovic111`, body starting "Opened by Ludovic's AI agent"
+or ending with a "🤖 Agent:" line)
 are ordinary pull requests: review and merge them like any other, or close them if they went stale. Closing keeps
 the branch.
 
@@ -69,7 +70,7 @@ is waiting, and closes it once the runners are back.
 | Runner label | What waits | What to do |
 | --- | --- | --- |
 | `horizon-light` (bots) | Triage and claim commands, labels, overlap notes, the Mojang check | An organisation owner sets `SELF_HOSTED_CI` to `off` (Settings → Secrets and variables → Actions → Variables). Then everything runs on GitHub |
-| `horizon-checks` | `verify` of this repository's own pull requests ending in 0 or 1 | Same switch (`off` or `light`), then re-run the waiting checks. Forks' pull requests never use these runners |
+| `horizon-checks` | `verify` of pull requests ending in 0, approved forks' included | Same switch (`off` or `light`), then re-run the waiting checks. Forks' pull requests see no repository variable, so they wait for these runners |
 | `horizon-game` | A pull request's own parity job | It isn't required: merge on `verify`, and label pull requests that touch gameplay `needs-proof` |
 | `horizon-parity-main` | parity-main on main | Nothing can be done on GitHub. Nightlies wait for the last commit it passed on |
 | `horizon-nightly`, `horizon-release` | The Nightly's and the launcher's macOS builds | Nothing can be done on GitHub. No Nightly or launcher release until the Mac is back |
@@ -101,14 +102,14 @@ is out, so label that pull request `release-now` (or ask the council to) once it
 
 ## Kira
 
-Kira runs on Railway and needs nobody's machine.
+Kira runs on Ludovic's home server (ludothinkpad, behind a Cloudflare Tunnel) and needs no contributor's machine.
 
 - **Questions Kira can't answer** ("passed to the team") are listed in #kira-handoffs. Answer the member in their
   thread.
 - **Switches anyone on staff can use:** `/kira-ai off|on` (AI answers), the triage pause.
 - **Polls:** `/vote question:` (council members) starts a 24-hour poll; `/poll start` for the other kinds. The
-  results are in #polls-and-decisions and in `https://kira-production-500e.up.railway.app/decisions.json`.
-- **If Kira is down:** only the account holder can reach Railway today. Post in #council so someone tells him.
+  results are in #polls-and-decisions and in `https://mcp.playhorizon.dev/decisions.json`.
+- **If Kira is down:** only the account holder can reach the host today. Post in #council so someone tells him.
 
 ## The official server
 
@@ -129,5 +130,5 @@ council member tells the panel holders and the host.
 
 - Code and merges: the Horizon Team, in #horizon-team.
 - Decisions: the council, by poll.
-- Accounts (GitHub organisation, Discord ownership, Railway, the server panel, domains): the account holders; the
+- Accounts (GitHub organisation, Discord ownership, the home server, the server panel, domains): the account holders; the
   list is in GOVERNANCE.md section 11.

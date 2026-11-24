@@ -56,6 +56,22 @@ fn target_refusal(
     )
 }
 
+/// Removes what a previous run staged at `path`: `horizon-mixins apply` refuses an `--out` that
+/// already exists, and a stale directory must not pass for this run's output. A symlink is removed
+/// as the link itself, never followed into the directory it names.
+fn clear_output_dir(path: &Path) -> Result<(), String> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    if meta.is_dir() {
+        fs::remove_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))
+    } else {
+        fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
 /// The support modules and bridges `bundles` add to the patch crate.
 fn extras(bundles: &[&Bundle]) -> Result<api_gen::patch::Extras, String> {
     let mut extras = api_gen::patch::Extras::default();
@@ -383,6 +399,54 @@ fn function_index(game: &Path, commit: &str) -> Result<api_gen::functions::Funct
     index.checked().map_err(|e| format!("E_MIXIN_INDEX: {e}"))
 }
 
+/// Refuses any `OVERWRITE` mixin row whose target function fingerprint is missing or does not
+/// match the current function span's SHA-256 in `index`, printing the current fingerprint so the
+/// mod author can re-verify the overwritten body after a game update.
+fn check_overwrite_fingerprints(
+    bundles: &[&Bundle],
+    index: &api_gen::functions::FunctionIndex,
+) -> Result<(), String> {
+    use horizon_platform::mod_package::manifest::mixin::Kind;
+    let mut refusals = Vec::new();
+    for bundle in bundles {
+        for mixin in &bundle.native().mixin {
+            if mixin.kind != Kind::Overwrite {
+                continue;
+            }
+            let key = api_gen::functions::key(&mixin.target);
+            let Some(function) = index.functions.get(&key) else {
+                continue;
+            };
+            let owner = format!("{}:{}", bundle.manifest.id, mixin.id);
+            match mixin.fingerprint.as_deref() {
+                Some(pinned) if pinned == function.sha256 => {}
+                Some(pinned) => refusals.push(trf(
+                    "E_MIXIN_OVERWRITE_FINGERPRINT: {owner}: {target}: pinned fingerprint `{pinned}` does not match current `{current}`",
+                    &[
+                        ("owner", &owner),
+                        ("target", &mixin.target),
+                        ("pinned", pinned),
+                        ("current", &function.sha256),
+                    ],
+                )),
+                None => refusals.push(trf(
+                    "E_MIXIN_OVERWRITE_FINGERPRINT: {owner}: {target}: OVERWRITE mixin must pin fingerprint = \"{current}\"",
+                    &[
+                        ("owner", &owner),
+                        ("target", &mixin.target),
+                        ("current", &function.sha256),
+                    ],
+                )),
+            }
+        }
+    }
+    if refusals.is_empty() {
+        Ok(())
+    } else {
+        Err(refusals.join("\n"))
+    }
+}
+
 /// Copies, generates and transforms the patch crates for `projects` into `out`, without
 /// compiling them; `None` when no mod has a mixin, module, bridge or loop.
 pub(super) fn prepare<'a>(
@@ -431,9 +495,10 @@ pub(super) fn prepare<'a>(
     } else {
         Some(super::mixins_patch::tool(rust, &|_| {})?)
     };
-    let source = super::source(sdk.commit())?;
+    let source = super::source_until(sdk.commit(), &super::check_cancelled)?;
     let started = std::time::Instant::now();
     let index = function_index(game, sdk.commit())?;
+    check_overwrite_fingerprints(&bundles, &index)?;
     // A filled loop's entry, or one whose loop function has rows, is copied like a mixin's target,
     // with the loop's body.
     let targets: Vec<String> = rows
@@ -465,7 +530,7 @@ pub(super) fn prepare<'a>(
         .collect();
     // The workspace horizon-mixins plans against: one patch crate per game crate with copies.
     let workspace = out.join("patch-workspace");
-    let _ = fs::remove_dir_all(&workspace);
+    clear_output_dir(&workspace)?;
     let write = |path: PathBuf, text: &str| {
         fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
     };
@@ -508,7 +573,7 @@ pub(super) fn prepare<'a>(
     }
     // Each mod's rows, retargeted at the copies, as the tool's bundles.
     let mods = out.join("patch-mods");
-    let _ = fs::remove_dir_all(&mods);
+    clear_output_dir(&mods)?;
     for bundle in bundles
         .iter()
         .filter(|bundle| !bundle.native().mixin.is_empty())
@@ -518,6 +583,8 @@ pub(super) fn prepare<'a>(
         let mut rows = bundle.native().mixin.clone();
         for row in &mut rows {
             row.target = ids[row.target.as_str()].to_owned();
+            // Launcher-checked pin; horizon-mixins does not accept a `fingerprint` key.
+            row.fingerprint = None;
         }
         let mut manifest = toml::Table::new();
         manifest.insert(
@@ -544,9 +611,12 @@ pub(super) fn prepare<'a>(
         )?;
     }
     let copied = started.elapsed();
+    // A repeated build in one folder finds the last run's output: clear it unconditionally, so apply
+    // never stages into an existing `--out` and no stale copy survives a run with no tool.
+    let patched = out.join("patch-applied");
+    clear_output_dir(&patched)?;
     // With no rows (only modules or bridges), the crate compiles as generated.
     let patched = if let Some(tool) = &tool {
-        let patched = out.join("patch-applied");
         super::run(
             super::apply(rust, tool, &workspace, &mods, &patched),
             "Applying the mixins to their functions",
@@ -600,6 +670,36 @@ pub(super) fn prepare<'a>(
 
 #[cfg(test)]
 mod refusal_tests {
+    #[test]
+    fn a_stale_patch_applied_directory_is_cleared_before_apply() {
+        let out = tempfile::tempdir().unwrap();
+        let patched = out.path().join("patch-applied");
+        std::fs::create_dir_all(patched.join("nested")).unwrap();
+        std::fs::write(patched.join("stale.rs"), "fn stale() {}").unwrap();
+        std::fs::write(patched.join("nested").join("also-stale.rs"), "").unwrap();
+        super::clear_output_dir(&patched).unwrap();
+        assert!(
+            !patched.exists(),
+            "a stale patch-applied directory must not survive: apply refuses an existing --out"
+        );
+        // A fresh or already-cleared path is not an error, so every run can clear unconditionally.
+        super::clear_output_dir(&patched).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_patch_applied_symlink_is_removed_not_followed() {
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.rs"), "keep").unwrap();
+        let patched = out.path().join("patch-applied");
+        std::os::unix::fs::symlink(&target, &patched).unwrap();
+        super::clear_output_dir(&patched).unwrap();
+        assert!(patched.symlink_metadata().is_err());
+        assert!(target.join("keep.rs").is_file(), "the link's target stays");
+    }
+
     #[test]
     fn a_missing_or_foreign_function_index_is_refused_by_name() {
         let game = tempfile::tempdir().unwrap();
@@ -673,6 +773,64 @@ mod refusal_tests {
         assert_eq!(
             super::target_refusal(&refused, &requests),
             "E_MIXIN_NOT_REPLACEABLE: first:before, second:after: game::tick: no slot"
+        );
+    }
+
+    #[test]
+    fn overwrite_fingerprint_pin_matches_or_prints_current_fingerprint() {
+        use horizon_platform::mod_package::manifest::{mixin, Manifest};
+        let current = "b".repeat(64);
+        let stale = "a".repeat(64);
+        let mut index = super::api_gen::functions::FunctionIndex::default();
+        index.functions.insert(
+            "horizon_client::game::Game::tick".into(),
+            super::api_gen::functions::Function {
+                module: "horizon_client::game".into(),
+                file: "crates/horizon-client/src/game.rs".into(),
+                span: [0, 10],
+                signature_hash: "sig".into(),
+                sha256: current.clone(),
+            },
+        );
+        let bundle_with = |fingerprint: Option<String>| {
+            let text = format!(
+                "id='sample'\nname='Sample'\nversion='1.0.0'\napi='0.2'\ncapabilities=['registries']\n[native]\ngame='26.3'\nhorizon='{0}'\nmixins='{0}'\n",
+                "c".repeat(40)
+            );
+            let mut manifest = Manifest::parse(&text).unwrap();
+            manifest.native.as_mut().unwrap().mixin.push(mixin::Mixin {
+                id: "replace_tick".into(),
+                target: "horizon_client::game::Game::tick".into(),
+                kind: mixin::Kind::Overwrite,
+                helper: "src/tick.rs".into(),
+                fingerprint,
+                options: toml::Table::new(),
+            });
+            super::Bundle {
+                dir: std::path::PathBuf::new(),
+                manifest,
+            }
+        };
+
+        let matched = bundle_with(Some(current.clone()));
+        super::check_overwrite_fingerprints(&[&matched], &index).unwrap();
+
+        let unpinned = bundle_with(None);
+        let err = super::check_overwrite_fingerprints(&[&unpinned], &index).unwrap_err();
+        assert!(
+            err.contains("E_MIXIN_OVERWRITE_FINGERPRINT")
+                && err.contains("sample:replace_tick")
+                && err.contains(&current),
+            "{err}"
+        );
+
+        let mismatched = bundle_with(Some(stale.clone()));
+        let err = super::check_overwrite_fingerprints(&[&mismatched], &index).unwrap_err();
+        assert!(
+            err.contains("E_MIXIN_OVERWRITE_FINGERPRINT")
+                && err.contains(&stale)
+                && err.contains(&current),
+            "{err}"
         );
     }
 }

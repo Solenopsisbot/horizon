@@ -32,17 +32,19 @@ mod step_1_21_8;
 mod step_26_1;
 mod sync_registries;
 mod synced;
+mod text_down;
 mod world;
 
 use super::{
     ServerVersion,
     ids::{self, Ids, Way, down_or_substitute},
     layout_26_2,
+    pinned_ids::entity_type::EXPERIENCE_ORB,
     translate::{packet_ids_entity::FALLING_BLOCK, swing_id},
 };
 use crate::{
     Result, State,
-    buf::{Reader, Writer},
+    buf::{Codec, Reader, Writer},
     entity_data::{ParticleData, Value, serializer},
     ids as packet_ids,
     packets::{configuration, play},
@@ -92,6 +94,10 @@ pub struct ClientSession {
     /// (it carries the place) made redundant, and which counts as the tick's move on the server. Other
     /// packets (a keep-alive answer, a swing) may come between them.
     accepted: Mutex<Option<Place>>,
+    /// A client through 1.21.4 is told an experience orb's value by its own packet (`add_experience_orb`): the
+    /// orb's add waits here for the entity data that carries the value (the one state a packet leaves for the
+    /// next).
+    orb: Mutex<Option<play::AddEntity>>,
     /// A packet to pass on after the one just translated ([`Self::next_serverbound`]).
     pending: Mutex<Option<(i32, Vec<u8>)>>,
 }
@@ -188,6 +194,7 @@ impl ClientSession {
             held: AtomicU8::new(0),
             synced: Mutex::new(Arc::default()),
             accepted: Mutex::new(None),
+            orb: Mutex::new(None),
             pending: Mutex::new(None),
         }
     }
@@ -356,6 +363,7 @@ impl ClientSession {
                 self.tick_ended(pinned);
                 payload
             }
+            (State::Play, sb::SIGN_UPDATE) => sign_update_up(&payload)?,
             _ => payload,
         };
         let Some(ids) = self.version.ids() else {
@@ -376,16 +384,123 @@ impl ClientSession {
     }
 
     /// A packet body (VarInt id + payload) the server sends, as the client numbers it. `None`: the client
-    /// has no such packet, or nothing it could show for what the packet names, so nothing is sent.
+    /// has no such packet, or nothing it could show for what the packet names, so nothing is sent. A packet
+    /// that becomes several (a wooden boat, 1.21.1 and older) gives only the first here: the connection uses
+    /// [`Self::clientbound_all`].
     pub fn clientbound(&self, body: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.translate(body)?.0)
+    }
+
+    /// Every body a packet becomes for the client, in the order to send them: empty when [`Self::clientbound`]
+    /// would give `None` and nothing came with it, the one body for most packets, and for a packet that brings
+    /// another (a boat's wood in entity data) the other after it.
+    pub fn clientbound_all(&self, body: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let (first, rest) = self.translate(body)?;
+        Ok(first.into_iter().chain(rest).collect())
+    }
+
+    fn translate(&self, body: &[u8]) -> Result<(Option<Vec<u8>>, Vec<Vec<u8>>)> {
         let state = self.writing();
-        self.clientbound_in(state, body).map_err(|e| {
+        self.clientbound_with_extras(state, body).map_err(|e| {
             let id = Reader::new(body).varint().unwrap_or(-1);
             crate::Error::new(format!(
                 "{e} (packet {id} in {state:?} for a {} client)",
                 self.version.name()
             ))
         })
+    }
+
+    /// [`Self::clientbound_in`], for the packets that become several or wait for another: a wooden boat (1.21.1
+    /// and older) and an experience orb (1.21.4 and older). The second part is what goes after the first.
+    fn clientbound_with_extras(
+        &self,
+        state: State,
+        body: &[u8],
+    ) -> Result<(Option<Vec<u8>>, Vec<Vec<u8>>)> {
+        use packet_ids::play::clientbound as cb;
+        if state != State::Play {
+            return Ok((self.clientbound_in(state, body)?, Vec::new()));
+        }
+        let mut r = Reader::new(body);
+        let id = r.varint()?;
+        let payload = r.rest();
+        if self.version.at_most(ServerVersion::V1_21_4) {
+            let waiting = self.orb.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let orb = |add: &play::AddEntity, value: i32| {
+                self.entities
+                    .lock()
+                    .unwrap()
+                    .insert(add.id, (add.kind, add.uuid));
+                let mut w = Writer::new();
+                // add_experience_orb has been id 2 in every release through 1.21.4 (the id tables name no such
+                // packet)
+                w.varint(2);
+                w.varint(add.id);
+                add.position.iter().for_each(|v| w.f64(*v));
+                w.i16(value.clamp(0, i32::from(i16::MAX)) as i16);
+                w.data
+            };
+            if let Some(add) = waiting {
+                if id == cb::SET_ENTITY_DATA {
+                    let mut d = play::SetEntityData::read(&mut Reader::new(payload))?;
+                    if d.id == add.id {
+                        let value = d.values.iter().find_map(|(index, _, v)| match v {
+                            Value::Int(v) if *index == 8 => Some(*v),
+                            _ => None,
+                        });
+                        d.values.retain(|(index, _, _)| *index != 8);
+                        let mut after = Vec::new();
+                        if !d.values.is_empty()
+                            && let Some(rest) = self.clientbound_in(
+                                state,
+                                &play::Clientbound::SetEntityData(d).encode(),
+                            )?
+                        {
+                            after.push(rest);
+                        }
+                        return Ok((Some(orb(&add, value.unwrap_or(0))), after));
+                    }
+                }
+                // Anything else shows the orb with no value first.
+                let first = orb(&add, 0);
+                let (next, rest) = self.clientbound_with_extras(state, body)?;
+                return Ok((Some(first), next.into_iter().chain(rest).collect()));
+            }
+            if id == cb::ADD_ENTITY {
+                let e = play::AddEntity::read(&mut Reader::new(payload))?;
+                if e.kind == EXPERIENCE_ORB {
+                    *self.orb.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                    return Ok((None, Vec::new()));
+                }
+            }
+        }
+        // 1.21.2 gave every wood its own boat type; 1.21.1 has the plain one and the wood in entity data.
+        if id == cb::ADD_ENTITY && self.version.at_most(ServerVersion::V1_21_1) {
+            let e = play::AddEntity::read(&mut Reader::new(payload))?;
+            if let Some((plain, wood)) = step_1_21_1::boat(e.kind) {
+                let entity = e.id;
+                let sent = self.clientbound_in(
+                    state,
+                    &play::Clientbound::AddEntity(play::AddEntity { kind: plain, ..e }).encode(),
+                )?;
+                let mut extra = Vec::new();
+                if let Some(ids) = self.version.ids()
+                    && let Some(mapped) =
+                        self.version.clientbound_id_down(state, cb::SET_ENTITY_DATA)
+                {
+                    let data = play::Clientbound::SetEntityData(play::SetEntityData {
+                        id: entity,
+                        values: vec![(11, serializer::INT, Value::Int(wood))],
+                    });
+                    let mut w = Writer::new();
+                    w.varint(mapped);
+                    w.bytes(&encode_down(ids, &data));
+                    extra.push(w.data);
+                }
+                return Ok((sent, extra));
+            }
+        }
+        Ok((self.clientbound_in(state, body)?, Vec::new()))
     }
 
     fn clientbound_in(&self, state: State, body: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -495,7 +610,7 @@ impl ClientSession {
         if state != State::Play
             || !matches!(
                 id,
-                cb::ADD_ENTITY | cb::REMOVE_ENTITIES | cb::SET_ENTITY_DATA
+                cb::ADD_ENTITY | cb::REMOVE_ENTITIES | cb::SET_ENTITY_DATA | cb::LOGIN
             )
         {
             return Ok(None);
@@ -510,6 +625,13 @@ impl ClientSession {
                 for id in &r.ids {
                     entities.remove(id);
                 }
+            }
+            // The local player is never sent an add_entity: its entity data still needs the player's step.
+            play::Clientbound::Login(l) => {
+                entities.insert(
+                    l.player_id,
+                    (crate::adapter::pinned_ids::entity_type::PLAYER, 0),
+                );
             }
             play::Clientbound::SetEntityData(d)
                 if self.version.at_most(ServerVersion::V1_21_11) =>
@@ -528,6 +650,9 @@ impl ClientSession {
                 // 1.21.5's indexes go back to 1.21.4's last.
                 if self.version.at_most(ServerVersion::V1_21_4) {
                     step_1_21_4::entity_data(kind, d);
+                }
+                if self.version.at_most(ServerVersion::V1_21_1) {
+                    step_1_21_1::boat_data(kind, d);
                 }
                 return Ok(Some(strip_id(p.encode())));
             }
@@ -592,7 +717,9 @@ impl ClientSession {
         }
         // 1.21.8 is newer than 1.21.6: its packets are brought down after the steps above.
         if v.at_most(ServerVersion::V1_21_6) {
-            match step_1_21_6::clientbound(state, id, &payload)? {
+            // 1.21.5 and 1.21.6 have the saddle slot; 1.21.4 doesn't.
+            match step_1_21_6::clientbound(state, id, &payload, !v.at_most(ServerVersion::V1_21_4))?
+            {
                 step_1_21_6::Out::Untouched => {}
                 step_1_21_6::Out::Rewritten(p) => payload = p,
                 step_1_21_6::Out::Dropped => return Ok(None),
@@ -647,6 +774,15 @@ impl ClientSession {
     ) -> Result<Option<(i32, Vec<u8>)>> {
         use packet_ids::play::serverbound as sb;
         let v = self.version;
+        // 1.21.2 named recipes by a display id; a 1.21.1 client sends the recipe's key (a string) in place_recipe
+        // and recipe_book_seen_recipe, which the pinned readers take for a VarInt. It gets no recipe book (see
+        // `older_layout_down`), so these are not passed on.
+        if v.at_most(ServerVersion::V1_21_1)
+            && state == State::Play
+            && matches!(pinned, sb::PLACE_RECIPE | sb::RECIPE_BOOK_SEEN_RECIPE)
+        {
+            return Ok(None);
+        }
         // 1.20.6 is the oldest release: its use_item is read first, with the client's last rotation.
         if v.at_most(ServerVersion::V1_20_6) {
             let (yaw, pitch) = {
@@ -715,6 +851,27 @@ impl ClientSession {
         }
         Ok(Some((pinned, payload)))
     }
+}
+
+/// An older client's serverbound `sign_update` (position, the side as a boolean, the four lines) in
+/// 26.3's order (position, the four lines, the side as a VarInt): the mirror of translate's `sign_update`.
+fn sign_update_up(payload: &[u8]) -> Result<Vec<u8>> {
+    let mut r = Reader::new(payload);
+    let pos = r.i64()?;
+    let front = r.bool()?;
+    let mut w = Writer::new();
+    w.i64(pos);
+    for _ in 0..4 {
+        w.string(&r.string(384)?);
+    }
+    // 26.3's decoder refuses trailing bytes, so an older client's packet must not reach it with any.
+    if r.remaining() != 0 {
+        return Err(crate::Error::new(
+            "sign_update with bytes after its four lines",
+        ));
+    }
+    w.varint(i32::from(front));
+    Ok(w.data)
 }
 
 /// A 26.2 client's packets whose layout changed are written in its layout ([`layout_26_2`], when enabled),
@@ -1039,6 +1196,7 @@ fn renumber(ids: &Ids, p: &mut play::Clientbound) -> Option<()> {
             Some(())
         }
         play::Clientbound::BlockEntityData(b) => {
+            world::pot_sherds_down(ids, &mut b.tag);
             b.kind = ids.block_entity_type.down(b.kind)?;
             Some(())
         }
@@ -1095,6 +1253,9 @@ fn renumber(ids: &Ids, p: &mut play::Clientbound) -> Option<()> {
 /// One entity data value renumbered for the older client: false drops it (a particle it lacks).
 fn entity_value(ids: &Ids, kind: i32, value: &mut Value) -> bool {
     let particle = |p: &mut crate::entity_data::Particle| {
+        if ids.quirks.simple_spell_particles {
+            p.without_plain_options();
+        }
         if let Some(ParticleData::State(s)) = &mut p.data {
             *s = state_down(ids, *s);
         }
@@ -1127,6 +1288,11 @@ fn entity_value(ids: &Ids, kind: i32, value: &mut Value) -> bool {
             };
             true
         }
+        // 1.21 to 1.21.4 read a wolf variant as a holder (the id plus one, 0 for an inline one); 1.21.5 made it the id.
+        Value::Id(id) if kind == serializer::WOLF_VARIANT && ids.quirks.wolf_variant_holder => {
+            *id += 1;
+            true
+        }
         Value::Particle(p) => particle(p),
         Value::Particles(list) => {
             list.retain_mut(particle);
@@ -1140,6 +1306,52 @@ fn entity_value(ids: &Ids, kind: i32, value: &mut Value) -> bool {
 mod tests {
     use super::*;
     use crate::buf::Codec;
+
+    #[test]
+    fn an_older_clients_sign_update_reaches_26_3_with_the_side_after_the_lines() {
+        let mut w = Writer::new();
+        w.i64(0x1234);
+        w.bool(false); // back side
+        for line in ["a", "bb", "", "dddd"] {
+            w.string(line);
+        }
+        let up = sign_update_up(&w.data).unwrap();
+        let mut r = Reader::new(&up);
+        assert_eq!(r.i64().unwrap(), 0x1234);
+        for line in ["a", "bb", "", "dddd"] {
+            assert_eq!(r.string(384).unwrap(), line);
+        }
+        assert_eq!(r.varint().unwrap(), 0);
+        assert!(r.rest().is_empty());
+        let packet = play::Serverbound::decode(packet_ids::play::serverbound::SIGN_UPDATE, &up);
+        assert!(packet.is_ok(), "{packet:?}");
+    }
+
+    #[test]
+    fn a_1_21_4_clients_sign_update_goes_through_the_session_into_26_3s_layout() {
+        let s = ClientSession::new(ServerVersion::V1_21_4);
+        s.reading.store(to_u8(State::Play), Ordering::Release);
+        let old_id = ServerVersion::V1_21_4
+            .serverbound_id(State::Play, packet_ids::play::serverbound::SIGN_UPDATE)
+            .unwrap();
+        let mut w = Writer::new();
+        w.i64(0x1234);
+        w.bool(false); // back side
+        for line in ["a", "bb", "", "dddd"] {
+            w.string(line);
+        }
+        let (id, payload) = s.serverbound(old_id, w.data.clone()).unwrap().unwrap();
+        assert_eq!(id, packet_ids::play::serverbound::SIGN_UPDATE);
+        let play::Serverbound::SignUpdate(sign) = play::Serverbound::decode(id, &payload).unwrap()
+        else {
+            panic!("not a sign_update");
+        };
+        assert_eq!(sign.lines, ["a", "bb", "", "dddd"].map(String::from));
+        assert!(!sign.front);
+        // 26.3 refuses bytes after the lines, so the session refuses them too.
+        w.data.push(0);
+        assert!(s.serverbound(old_id, w.data).is_err());
+    }
 
     fn body(id: i32, payload: &[u8]) -> Vec<u8> {
         let mut w = Writer::new();
@@ -1379,6 +1591,35 @@ mod tests {
             Some((packet_ids::play::serverbound::PUNCH, Vec::new()))
         );
         assert_eq!(s.serverbound(63, vec![1]).unwrap(), None);
+    }
+
+    #[test]
+    fn the_recipe_packets_of_a_1_21_1_client_are_not_passed_on() {
+        let s = ClientSession::new(ServerVersion::V1_21_1);
+        s.reading.store(to_u8(State::Play), Ordering::Release);
+        s.writing.store(to_u8(State::Play), Ordering::Release);
+        let key = |id: i32| {
+            let mut w = Writer::new();
+            if id == 34 {
+                w.varint(2);
+            }
+            w.string("minecraft:oak_planks");
+            if id == 34 {
+                w.bool(false);
+            }
+            w.data
+        };
+        // place_recipe is 34 and recipe_book_seen_recipe 41 in 1.21.1 (packets report); both name the recipe by key.
+        assert_eq!(s.serverbound(34, key(34)).unwrap(), None);
+        assert_eq!(s.serverbound(41, key(41)).unwrap(), None);
+        // The settings packet is laid out alike and goes on (40 in 1.21.1, 47 pinned).
+        assert_eq!(
+            s.serverbound(40, vec![0, 1, 0]).unwrap(),
+            Some((
+                packet_ids::play::serverbound::RECIPE_BOOK_CHANGE_SETTINGS,
+                vec![0, 1, 0]
+            ))
+        );
     }
 
     #[test]
@@ -1928,5 +2169,590 @@ mod tests {
             let sent = s.clientbound(&data.encode()).unwrap().unwrap();
             assert!(sent.ends_with(tail), "{version:?}: {sent:?}");
         }
+    }
+
+    /// 26.1's `spectate_entity` is its id 62 (the packets report: sign_update 61, spectate_entity 62, swing 63);
+    /// 26.3 has it as `spectator_action` at 63 (by network id, sign_update at 62).
+    #[test]
+    fn a_26_1_client_spectating_an_entity_reaches_the_server_by_network_id() {
+        let s = ClientSession::new(ServerVersion::V26_1);
+        s.reading.store(to_u8(State::Play), Ordering::Release);
+        s.writing.store(to_u8(State::Play), Ordering::Release);
+        s.entities.lock().unwrap().insert(7, (0, 0x42));
+        let mut w = Writer::new();
+        w.uuid(0x42);
+        let (id, payload) = s.serverbound(62, w.data).unwrap().unwrap();
+        assert_eq!(id, 63);
+        // OptVarInt: the network id plus one.
+        assert_eq!(payload, [8]);
+        // An entity the client was never told of is dropped.
+        let mut w = Writer::new();
+        w.uuid(0x43);
+        assert_eq!(s.serverbound(62, w.data).unwrap(), None);
+        // The ids around it keep their numbers: 26.1's sign_update (61) is the pinned 62.
+        assert_eq!(
+            ServerVersion::V26_1.serverbound_id_up(State::Play, 61),
+            Some(62)
+        );
+    }
+
+    /// A real 1.20.6, 1.21.4 or 1.21.8 client given an absorption effect left with "Invalid entity data item type
+    /// for field 17 ... old=0(Byte), new=4.0(Float)": 26.3's Avatar has the main hand (15) and the skin parts (16),
+    /// its Player the absorption (17), the score (18) and the shoulders (19, 20); through 1.21.8 the Player has the
+    /// absorption (15), the score (16), the skin parts (17), the main hand (18) and the shoulders (19, 20, NBTs).
+    /// The local player is never sent an add_entity, so it is told apart by the login's entity id.
+    #[test]
+    fn a_player_s_own_fields_move_back_for_clients_through_1_21_8() {
+        use crate::adapter::pinned_ids::entity_type as entity;
+        let login = play::Clientbound::Login(play::Login {
+            player_id: 7,
+            hardcore: false,
+            levels: vec!["minecraft:overworld".into()],
+            max_players: 20,
+            chunk_radius: 10,
+            simulation_distance: 8,
+            reduced_debug_info: false,
+            show_death_screen: true,
+            limited_crafting: false,
+            spawn: play::SpawnInfo {
+                dimension_type: 0,
+                dimension: "minecraft:overworld".into(),
+                seed: 42,
+                game_type: 1,
+                previous_game_type: None,
+                debug: false,
+                flat: true,
+                last_death: None,
+                portal_cooldown: 0,
+                sea_level: 63,
+            },
+            online_mode: true,
+            enforces_secure_chat: false,
+        });
+        let add = play::Clientbound::AddEntity(play::AddEntity {
+            id: 9,
+            uuid: 1,
+            kind: entity::PLAYER,
+            position: [0.0; 3],
+            velocity: [0.0; 3],
+            pitch: 0,
+            yaw: 0,
+            head_yaw: 0,
+            data: 0,
+        });
+        let data = |id| {
+            play::Clientbound::SetEntityData(play::SetEntityData {
+                id,
+                values: vec![
+                    (15, serializer::HUMANOID_ARM, Value::Id(1)),
+                    (16, serializer::BYTE, Value::Byte(0x7f)),
+                    (17, serializer::FLOAT, Value::Float(4.0)),
+                    (18, serializer::INT, Value::Int(5)),
+                    (19, serializer::OPTIONAL_UNSIGNED_INT, Value::Id(0)),
+                    (20, serializer::OPTIONAL_UNSIGNED_INT, Value::Id(0)),
+                ],
+            })
+        };
+        for version in [
+            ServerVersion::V1_21_8,
+            ServerVersion::V1_21_4,
+            ServerVersion::V1_20_6,
+        ] {
+            let s = ClientSession::new(version);
+            s.reading.store(to_u8(State::Play), Ordering::Release);
+            s.writing.store(to_u8(State::Play), Ordering::Release);
+            s.clientbound(&login.encode()).unwrap();
+            s.clientbound(&add.encode()).unwrap();
+            // main hand 18 (byte), skin parts 17 (byte), absorption 15 (float 4.0), score 16 (VarInt); the
+            // shoulders (19, 20) are dropped.
+            let tail = [
+                18, 0, 1, 17, 0, 0x7f, 15, 3, 0x40, 0x80, 0, 0, 16, 1, 5, 0xff,
+            ];
+            for id in [7u8, 9] {
+                let sent = s
+                    .clientbound(&data(i32::from(id)).encode())
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    sent.ends_with(&[&[id][..], &tail[..]].concat()),
+                    "{version:?} {id}: {sent:?}"
+                );
+            }
+        }
+    }
+
+    /// A wolf variant is a registry-or-inline holder (the id plus one) for 1.21 to 1.21.4 and the id for the
+    /// rest: variant 2 ends the entity data as 3 or as 2.
+    #[test]
+    fn a_wolf_variant_is_a_holder_for_a_client_through_1_21_4() {
+        let data = play::Clientbound::SetEntityData(play::SetEntityData {
+            id: 9,
+            values: vec![(22, serializer::WOLF_VARIANT, Value::Id(2))],
+        })
+        .encode();
+        for (version, tail) in [
+            (ServerVersion::V1_21_4, &[3, 0xff][..]),
+            (ServerVersion::V1_21_3, &[3, 0xff][..]),
+            (ServerVersion::V1_21_1, &[3, 0xff][..]),
+            (ServerVersion::V1_21_5, &[2, 0xff][..]),
+            (ServerVersion::V1_20_6, &[2, 0xff][..]),
+        ] {
+            let s = ClientSession::new(version);
+            s.reading.store(to_u8(State::Play), Ordering::Release);
+            s.writing.store(to_u8(State::Play), Ordering::Release);
+            let sent = s.clientbound(&data).unwrap().unwrap();
+            assert!(sent.ends_with(tail), "{version:?}: {sent:?}");
+        }
+    }
+
+    /// An explosion's particle goes through the explode step, which reads it back in the client's layout and writes
+    /// it again: for a client through 1.21.8 `dragon_breath`, `effect`, `instant_effect` and `flash` carry no options
+    /// there either, so the sound after the particle stays where the client reads it.
+    #[test]
+    fn an_explosion_particle_keeps_no_options_for_a_client_through_1_21_8() {
+        use crate::adapter::pinned_ids::particle_type;
+        use crate::entity_data::{Particle, ParticleData as D};
+        let send = |version, particle| {
+            let packet = play::Clientbound::Explode(play::Explode {
+                center: [1.0, 2.0, 3.0],
+                radius: 3.0,
+                block_count: 0,
+                knockback: None,
+                particle,
+                sound: (-1, Some(("minecraft:entity.generic.explode".into(), None))),
+                block_particles: Vec::new(),
+                play_sound: true,
+            })
+            .encode();
+            let s = ClientSession::new(version);
+            s.reading.store(to_u8(State::Play), Ordering::Release);
+            s.writing.store(to_u8(State::Play), Ordering::Release);
+            s.clientbound(&packet).unwrap().unwrap()
+        };
+        for version in [ServerVersion::V1_21_5, ServerVersion::V1_21_8] {
+            // A particle without options, as the reference: a one-byte id between the knockback flag and the sound.
+            let reference = send(
+                version,
+                Particle {
+                    id: particle_type::EXPLOSION,
+                    data: None,
+                },
+            );
+            for (id, data) in [
+                (particle_type::DRAGON_BREATH, D::Scalar(1.0)),
+                (particle_type::EFFECT, D::ColorPower(0x1122_3344, 1.0)),
+                (
+                    particle_type::INSTANT_EFFECT,
+                    D::ColorPower(0x1122_3344, 1.0),
+                ),
+                (particle_type::FLASH, D::Color(0x1122_3344)),
+            ] {
+                let sent = send(
+                    version,
+                    Particle {
+                        id,
+                        data: Some(data),
+                    },
+                );
+                assert_eq!(sent.len(), reference.len(), "{version:?} {id}: {sent:?}");
+                // everything after the particle id is the sound, which must come out whole
+                let sound = &reference[27..];
+                assert!(sent.ends_with(sound), "{version:?} {id}: {sent:?}");
+            }
+        }
+    }
+
+    /// Every particle with options, written for the clients before 1.21.2 (1.20.5 to 1.21.1 read the same bytes)
+    /// as their `ParticleTypes` read them, checked against the 1.20.6 and 1.21.1 client jars: the particle follows the
+    /// count, dust colours are three floats, `entity_effect` is one ARGB int, and `effect`, `instant_effect`,
+    /// `dragon_breath` and `flash` carry nothing. A particle they lack (`block_crumble`, `tinted_leaves`, `trail`)
+    /// is not sent. Each tail is the count (1), the particle's id and its options.
+    #[test]
+    fn particles_with_options_are_written_as_1_20_6_and_1_21_1_read_them() {
+        use crate::entity_data::{Particle, ParticleData as D};
+        let cases: [(i32, D, Option<&str>); 16] = [
+            (1, D::State(1), Some(concat!("00000001", "01", "01"))),
+            (2, D::State(1), Some(concat!("00000001", "02", "01"))),
+            (36, D::State(1), Some(concat!("00000001", "1c", "01"))),
+            (121, D::State(1), Some(concat!("00000001", "69", "01"))),
+            (125, D::State(1), None),
+            (
+                28,
+                D::Color(0x1122_3344),
+                Some(concat!("00000001", "14", "11223344")),
+            ),
+            (46, D::Color(0x1122_3344), None),
+            (52, D::Color(0x1122_3344), Some(concat!("00000001", "27"))),
+            (
+                21,
+                D::ColorScale(0x0011_2233, 1.0),
+                Some(concat!(
+                    "00000001", "0d", "3d888889", "3e088889", "3e4ccccd", "3f800000"
+                )),
+            ),
+            (
+                22,
+                D::ColorScale2(0x0011_2233, 0x0044_5566, 1.0),
+                Some(concat!(
+                    "00000001", "0e", "3d888889", "3e088889", "3e4ccccd", "3e888889", "3eaaaaab",
+                    "3ecccccd", "3f800000"
+                )),
+            ),
+            (
+                23,
+                D::ColorPower(0x1122_3344, 1.0),
+                Some(concat!("00000001", "0f")),
+            ),
+            (
+                56,
+                D::ColorPower(0x1122_3344, 1.0),
+                Some(concat!("00000001", "2b")),
+            ),
+            (15, D::Scalar(1.0), Some(concat!("00000001", "07"))),
+            (
+                48,
+                D::Scalar(0.5),
+                Some(concat!("00000001", "23", "3f000000")),
+            ),
+            (115, D::Delay(3), Some(concat!("00000001", "63", "03"))),
+            (59, D::Trail([1.0, 2.0, 3.0], 0x1122_3344, 20), None),
+        ];
+        for version in [ServerVersion::V1_20_6, ServerVersion::V1_21_1] {
+            for (id, data, tail) in &cases {
+                let packet = play::Clientbound::LevelParticles(play::LevelParticles {
+                    particle: Particle {
+                        id: *id,
+                        data: Some(data.clone()),
+                    },
+                    override_limiter: false,
+                    always_show: false,
+                    pos: [0.0; 3],
+                    dist: [0.0; 3],
+                    max_speed: [0.0; 3],
+                    count: 1,
+                    randomization: 0,
+                })
+                .encode();
+                let s = ClientSession::new(version);
+                s.reading.store(to_u8(State::Play), Ordering::Release);
+                s.writing.store(to_u8(State::Play), Ordering::Release);
+                let sent = s.clientbound(&packet).unwrap();
+                let hex = sent.map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>());
+                match (tail, hex) {
+                    (Some(tail), Some(hex)) => {
+                        // packet id, long distance flag, 3 doubles, 4 floats: 1 + 1 + 24 + 16 bytes of 2 digits
+                        assert!(hex.starts_with("2900"), "{version:?} {id}: {hex}");
+                        assert_eq!(&hex[(1 + 1 + 24 + 16) * 2..], *tail, "{version:?} {id}");
+                    }
+                    (None, None) => {}
+                    (tail, hex) => panic!("{version:?} {id}: {hex:?}, expected {tail:?}"),
+                }
+            }
+        }
+    }
+
+    /// 1.21.9 gave `effect`, `instant_effect` and `dragon_breath` their options and `flash` its colour; 1.21.8 and
+    /// older read none (1.21.5 and 1.21.8 shown, as numbered there).
+    #[test]
+    fn effect_and_flash_options_start_with_1_21_9() {
+        use crate::entity_data::{Particle, ParticleData as D};
+        let send = |version, id, data| {
+            let packet = play::Clientbound::LevelParticles(play::LevelParticles {
+                particle: Particle {
+                    id,
+                    data: Some(data),
+                },
+                override_limiter: false,
+                always_show: false,
+                pos: [0.0; 3],
+                dist: [0.0; 3],
+                max_speed: [0.0; 3],
+                count: 1,
+                randomization: 0,
+            })
+            .encode();
+            let s = ClientSession::new(version);
+            s.reading.store(to_u8(State::Play), Ordering::Release);
+            s.writing.store(to_u8(State::Play), Ordering::Release);
+            let sent = s.clientbound(&packet).unwrap().unwrap();
+            sent[sent.len() - 4..].to_vec()
+        };
+        let power = D::ColorPower(0x1122_3344, 1.0);
+        let tail = |version, id, data| {
+            let t = send(version, id, data);
+            t.iter().map(|x| format!("{x:02x}")).collect::<String>()
+        };
+        // plain: the count and the particle id are the last bytes; with options the colour and power follow
+        assert_eq!(tail(ServerVersion::V1_21_5, 23, power.clone()), "0000010f");
+        assert_eq!(tail(ServerVersion::V1_21_8, 15, D::Scalar(1.0)), "00000107");
+        assert_eq!(tail(ServerVersion::V1_21_8, 52, D::Color(7)), "00000129");
+        assert_eq!(tail(ServerVersion::V1_21_10, 23, power), "3f800000");
+        assert_eq!(tail(ServerVersion::V1_21_10, 52, D::Color(7)), "00000007");
+    }
+
+    /// 26.2 and older read a decorated pot's `sherds` as a list of the four item ids (26.3: a compound of
+    /// stack templates).
+    #[test]
+    fn a_decorated_pot_update_has_its_sherds_as_a_list_for_26_2_and_older() {
+        use horizon_core::nbt::{Compound, JavaString, Tag};
+        let text = |s: &str| Tag::String(JavaString::from(s));
+        let mut front = Compound::new();
+        front.insert(
+            JavaString::from("id"),
+            text("minecraft:angler_pottery_sherd"),
+        );
+        let mut sides = Compound::new();
+        sides.insert(JavaString::from("front"), Tag::Compound(front));
+        let mut root = Compound::new();
+        root.insert(JavaString::from("sherds"), Tag::Compound(sides));
+        let update = play::Clientbound::BlockEntityData(play::BlockEntityData {
+            pos: [1, 64, 2],
+            kind: 41,
+            tag: Tag::Compound(root),
+        })
+        .encode();
+        let list = Tag::List(vec![
+            text("minecraft:brick"),
+            text("minecraft:brick"),
+            text("minecraft:brick"),
+            text("minecraft:angler_pottery_sherd"),
+        ]);
+        for version in [
+            ServerVersion::V26_2,
+            ServerVersion::V26_1,
+            ServerVersion::V1_21_11,
+            ServerVersion::V1_21_5,
+            ServerVersion::V1_20_6,
+        ] {
+            let s = ClientSession::new(version);
+            s.reading.store(to_u8(State::Play), Ordering::Release);
+            s.writing.store(to_u8(State::Play), Ordering::Release);
+            let sent = s.clientbound(&update).unwrap().unwrap();
+            let mut r = Reader::new(&sent);
+            r.varint().unwrap();
+            let tag = play::BlockEntityData::read(&mut r).unwrap().tag;
+            let Tag::Compound(root) = tag else {
+                panic!("{version:?}")
+            };
+            assert_eq!(
+                root.get(&JavaString::from("sherds")),
+                Some(&list),
+                "{version:?}"
+            );
+        }
+        // a 26.3 client reads the compound
+        let s = ClientSession::new(ServerVersion::Current);
+        s.reading.store(to_u8(State::Play), Ordering::Release);
+        s.writing.store(to_u8(State::Play), Ordering::Release);
+        assert_eq!(s.clientbound(&update).unwrap().unwrap(), update);
+    }
+
+    /// 1.21.10, 1.21.11 and 26.1 clients lack what 26.3 added: a new item or entity shows as its nearest older
+    /// equivalent (the way 26.2's and 1.21.8's tables do), not as nothing.
+    #[test]
+    fn a_1_21_10_to_26_1_client_is_shown_stand_ins_for_what_26_3_added() {
+        use crate::item::Stack;
+        for (version, planks, map) in [
+            (ServerVersion::V1_21_10, 38, 1104),
+            (ServerVersion::V1_21_11, 38, 1104),
+            (ServerVersion::V26_1, 38, 1105),
+        ] {
+            let s = ClientSession::new(version);
+            s.reading.store(to_u8(State::Play), Ordering::Release);
+            s.writing.store(to_u8(State::Play), Ordering::Release);
+            let slot = |item: i32| {
+                let p = play::Clientbound::SetCursorItem(play::SetCursorItem {
+                    item: Some(Stack::new(item, 1)),
+                });
+                let sent = s.clientbound(&p.encode()).unwrap().unwrap();
+                let mut r = Reader::new(&sent);
+                r.varint().unwrap();
+                let mut payload = Reader::new(r.rest());
+                crate::item::Slot::read(&mut payload).unwrap().unwrap().item
+            };
+            // poplar_planks (72) is birch_planks, ocean_monument_map (1239) a filled_map
+            assert_eq!(slot(72), planks, "{version:?}");
+            assert_eq!(slot(1239), map, "{version:?}");
+            let add = |kind: i32| {
+                play::Clientbound::AddEntity(play::AddEntity {
+                    id: 5,
+                    uuid: 1,
+                    kind,
+                    position: [0.0; 3],
+                    velocity: [0.0; 3],
+                    pitch: 0,
+                    yaw: 0,
+                    head_yaw: 0,
+                    data: 0,
+                })
+                .encode()
+            };
+            // poplar_boat (106) sails as birch_boat (12); cushion (33) has no stand-in.
+            let sent = s.clientbound(&add(106)).unwrap().unwrap();
+            let mut r = Reader::new(&sent);
+            r.varint().unwrap();
+            assert_eq!(play::AddEntity::read(&mut r).unwrap().kind, 12);
+            assert_eq!(s.clientbound(&add(33)).unwrap(), None);
+        }
+    }
+
+    /// 1.21.4 added the duration to the trail particle's options (TargetColorParticleOption, 1.21.2 and
+    /// 1.21.3: a target and a colour only).
+    #[test]
+    fn a_trail_particle_has_no_duration_for_a_1_21_3_client() {
+        use crate::entity_data::{Particle, ParticleData};
+        let trail = play::Clientbound::LevelParticles(play::LevelParticles {
+            particle: Particle {
+                id: 59,
+                data: Some(ParticleData::Trail([1.5, 2.0, 3.0], 9, 40)),
+            },
+            override_limiter: false,
+            always_show: false,
+            pos: [0.0; 3],
+            dist: [0.0; 3],
+            max_speed: [0.0; 3],
+            count: 1,
+            randomization: 0,
+        })
+        .encode();
+        for (version, tail) in [
+            (ServerVersion::V1_21_3, &[0, 0, 0, 9][..]),
+            (ServerVersion::V1_21_4, &[0, 0, 0, 9, 40][..]),
+        ] {
+            let s = ClientSession::new(version);
+            s.reading.store(to_u8(State::Play), Ordering::Release);
+            s.writing.store(to_u8(State::Play), Ordering::Release);
+            let sent = s.clientbound(&trail).unwrap().unwrap();
+            assert!(sent.ends_with(tail), "{version:?}: {sent:?}");
+        }
+    }
+
+    /// 1.21.2 split `boat` and `chest_boat` into one type per wood; a client through 1.21.1 knows the two
+    /// types (10 and 17) and takes the wood from entity data index 11 (Boat.Type's ordinal), where the
+    /// paddles and the bubble time move up by one.
+    #[test]
+    fn a_boat_of_any_wood_is_the_plain_boat_with_its_wood_for_a_client_through_1_21_1() {
+        use crate::adapter::pinned_ids::entity_type as entity;
+        use packet_ids::play::clientbound as cb;
+        let add = |kind: i32| {
+            play::Clientbound::AddEntity(play::AddEntity {
+                id: 5,
+                uuid: 1,
+                kind,
+                position: [0.0; 3],
+                velocity: [0.0; 3],
+                pitch: 0,
+                yaw: 0,
+                head_yaw: 0,
+                data: 0,
+            })
+            .encode()
+        };
+        // (pinned type, the client's type, the wood)
+        let cases = [
+            (entity::ACACIA_BOAT, 10, 4),
+            (entity::BAMBOO_RAFT, 10, 8),
+            (entity::OAK_BOAT, 10, 0),
+            (95, 10, 2),  // pale_oak_boat, a birch to this client
+            (96, 17, 2),  // pale_oak_chest_boat
+            (106, 10, 2), // poplar_boat
+            (107, 17, 2), // poplar_chest_boat
+            (entity::ACACIA_CHEST_BOAT, 17, 4),
+            (entity::BAMBOO_CHEST_RAFT, 17, 8),
+            (entity::OAK_CHEST_BOAT, 17, 0),
+        ];
+        for version in [ServerVersion::V1_21_1, ServerVersion::V1_20_6] {
+            let data_id = version
+                .clientbound_id_down(State::Play, cb::SET_ENTITY_DATA)
+                .unwrap() as u8;
+            for (pinned, old, wood) in cases {
+                let s = ClientSession::new(version);
+                s.reading.store(to_u8(State::Play), Ordering::Release);
+                s.writing.store(to_u8(State::Play), Ordering::Release);
+                let all = s.clientbound_all(&add(pinned)).unwrap();
+                assert_eq!(all.len(), 2, "{version:?} {pinned}");
+                let (main, extra) = (&all[0], &all[1]);
+                let mut r = Reader::new(main);
+                r.varint().unwrap();
+                let spawned = play::AddEntity::read(&mut r).unwrap();
+                assert_eq!(spawned.kind, old, "{version:?} {pinned}");
+                // entity 5; index 11, serializer 1 (int), the wood, the end marker
+                assert_eq!(*extra, [data_id, 5, 11, 1, wood as u8, 0xff]);
+                // the paddles (11, 12) and the bubble time (13) take 1.21.1's indexes 12 to 14
+                let paddles = play::Clientbound::SetEntityData(play::SetEntityData {
+                    id: 5,
+                    values: vec![
+                        (11, serializer::BOOLEAN, Value::Bool(true)),
+                        (13, serializer::INT, Value::Int(7)),
+                    ],
+                })
+                .encode();
+                let sent = s.clientbound_all(&paddles).unwrap();
+                assert_eq!(sent, [[data_id, 5, 12, 8, 1, 14, 1, 7, 0xff]]);
+            }
+        }
+        // a 1.21.2 client has every wood as it is
+        let s = ClientSession::new(ServerVersion::V1_21_3);
+        s.reading.store(to_u8(State::Play), Ordering::Release);
+        s.writing.store(to_u8(State::Play), Ordering::Release);
+        assert_eq!(
+            s.clientbound_all(&add(entity::ACACIA_BOAT)).unwrap().len(),
+            1
+        );
+    }
+
+    /// A client through 1.21.4 takes an orb's value from `add_experience_orb` (id 2), not from entity data:
+    /// the add waits for the data that follows it.
+    #[test]
+    fn an_experience_orb_is_added_with_its_value_for_a_client_through_1_21_4() {
+        let add = play::Clientbound::AddEntity(play::AddEntity {
+            id: 41,
+            uuid: 7,
+            kind: EXPERIENCE_ORB,
+            position: [1.0, 2.0, -3.0],
+            velocity: [0.0; 3],
+            pitch: 0,
+            yaw: 0,
+            head_yaw: 0,
+            data: 0,
+        })
+        .encode();
+        let data = play::Clientbound::SetEntityData(play::SetEntityData {
+            id: 41,
+            values: vec![(8, serializer::INT, Value::Int(7))],
+        })
+        .encode();
+        let orb = |value: u8| {
+            let mut w = Writer::new();
+            w.varint(2);
+            w.varint(41);
+            for v in [1.0, 2.0, -3.0] {
+                w.f64(v);
+            }
+            w.bytes(&[0, value]);
+            w.data
+        };
+        for version in [
+            ServerVersion::V1_21_4,
+            ServerVersion::V1_21_1,
+            ServerVersion::V1_20_6,
+        ] {
+            let s = ClientSession::new(version);
+            s.reading.store(to_u8(State::Play), Ordering::Release);
+            s.writing.store(to_u8(State::Play), Ordering::Release);
+            assert!(s.clientbound_all(&add).unwrap().is_empty());
+            assert_eq!(s.clientbound_all(&data).unwrap(), [orb(7)], "{version:?}");
+            // with no data after it, another packet shows it with the value 0 first
+            assert!(s.clientbound_all(&add).unwrap().is_empty());
+            let gone = play::Clientbound::RemoveEntities(play::RemoveEntities { ids: vec![41] });
+            let sent = s.clientbound_all(&gone.encode()).unwrap();
+            assert_eq!(sent.len(), 2, "{version:?}");
+            assert_eq!(sent[0], orb(0));
+        }
+        // 1.21.5 and later have it as entity data: nothing waits
+        let s = ClientSession::new(ServerVersion::V1_21_5);
+        s.reading.store(to_u8(State::Play), Ordering::Release);
+        s.writing.store(to_u8(State::Play), Ordering::Release);
+        assert!(s.clientbound(&add).unwrap().is_some());
     }
 }

@@ -155,6 +155,9 @@ impl Game<'_> {
                 game.native_player_clone(cloned, &name, true, original);
             });
         }
+        // sendLevelInfo reads the level's respawn data when it sends, after the
+        // Clone hook, which may have moved it.
+        let world_spawn = self.world_spawn_position();
         let clock_rate = self.network_clock_rate();
         let ctx = TickCtx {
             world: &mut self.world,
@@ -162,8 +165,9 @@ impl Game<'_> {
             next_entity: &mut self.next_entity,
             // PlayerList.respawn / sendLevelInfo send level respawn data,
             // independently of the personal destination passed to Hub::respawn.
-            spawn: world,
+            spawn: world_spawn,
             spawn_angle: self.level.world_spawn_angle,
+            spawn_dimension: self.level.spawn_dimension(),
             sea_level: self.end.locator().map_or(63, |terrain| terrain.sea_level()),
             difficulty: i32::from(self.ui.difficulty),
             difficulty_locked: self.level.difficulty_locked,
@@ -314,6 +318,10 @@ impl Game<'_> {
         // The killing blow, for the death hooks.
         let blow = (dying && !mod_api::__private::mods().is_empty())
             .then(|| self.guest_damage_source(conn));
+        // The hit `living_death` hears with it, for the drops too.
+        let hit = blow
+            .as_ref()
+            .and_then(|(damage_type, _)| self.guest_death_hit(gi, damage_type));
         if dying && self.guest_death_canceled(gi, conn) {
             return;
         }
@@ -326,6 +334,10 @@ impl Game<'_> {
             if let Some(play) = self.lan.as_mut().and_then(|host| host.play.get_mut(&conn)) {
                 play.hook.discard();
             }
+            // ServerPlayer.die: shoulder parrots are dropped at the death
+            // spot before the loot and the death message. `host`'s borrow
+            // ends with the condition, so as_guest may take `&mut self`.
+            self.as_guest(conn, |game| game.remove_entities_on_shoulder());
         }
         let Some(host) = self.lan.as_mut() else {
             return;
@@ -447,9 +459,24 @@ impl Game<'_> {
                 entity: id as u32,
                 kind: "minecraft:player",
                 player: Some(uuid),
-                source: killing.as_ref().map(|(damage_type, attacker)| {
-                    crate::game::creatures::death_hurt_source(damage_type, attacker.unwrap_or(0))
-                }),
+                // `dropAllDeathLoot(level, source)`: every death has a source, so
+                // with mods loaded the drops hear the blow `living_death` heard,
+                // `/kill`'s generic_kill and an unrecorded death's generic
+                // included. Without mods `blow` is `None` and the combat record's
+                // blow stays, so `drop_death_items` keeps today's draw order.
+                source: blow
+                    .as_ref()
+                    .map(|(damage_type, causing)| {
+                        super::death_state::death_source(hit.as_deref(), damage_type, *causing)
+                    })
+                    .or_else(|| {
+                        killing.as_ref().map(|(damage_type, attacker)| {
+                            crate::game::creatures::death_hurt_source(
+                                damage_type,
+                                attacker.unwrap_or(0),
+                            )
+                        })
+                    }),
                 recently_hit,
             };
             // LivingEntity.die: the death is heard, and a sculk catalyst

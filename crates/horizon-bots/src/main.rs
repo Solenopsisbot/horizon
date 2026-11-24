@@ -21,6 +21,9 @@
 //! Each bot also keeps the chunks it holds, as a client's chunk cache does, so the report tells chunks that
 //! entered the view apart from chunks sent again while the bot still held them (`resent`), and counts the
 //! times the server pulled a bot back (`pulled_back`: a teleport after the first, as for "moved too quickly").
+//! A teleport that lands more than 64 blocks from both the bot and the spot its walk centres on isn't a pull-back:
+//! the server moved the bot (a /tp, as `tools/server_bench.py --spread` sends), and it walks around where it
+//! landed from then on.
 
 //! The report also has wire bytes in and out (`bytes_in`, `bytes_out`, per bot and in total, after
 //! compression) and join-time percentiles (`join_time`: p50, p99 and max in milliseconds).
@@ -40,8 +43,10 @@ use horizon_protocol::{
     },
 };
 use serde_json::json;
+mod far;
 use std::{
     collections::{BTreeMap, HashSet},
+    path::PathBuf,
     sync::{
         Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -98,6 +103,13 @@ horizon-bots: load-test bots for a Minecraft Java Edition 26.3 server (offline m
                          ground (give them swords); for PvP benches (crit and sweep particles)
   --name PREFIX          bot names: PREFIX0, PREFIX1...; default Bot
   --brand B              the client brand sent in configuration (minecraft:brand); default none
+  --far D                ask the server for far terrain out to D chunks, 1024 at most (horizon:lod, needs
+                         --brand horizon and a server with horizon-lod-distance), as a Horizon client with
+                         LOD Distance D does: one pass of its plan, nearest first; the report gives each
+                         bot's tiles, bytes and seconds (src/far.rs), and each second's line how many bots
+                         finished their pass (far_done)
+  --far-after S          start asking S seconds after joining (after a /tp to spread the bots); default 3
+  --far-dump DIR         keep every tile each bot got in DIR/<name>.tiles, to compare servers byte for byte
   --height H             blocks above spawn the bots fly at (walk, explore, idle); default 24
   --ground               claim the ground in every move (with --height 0 on a flat world: walking
                          on it; higher, or over water: a no-fall or jesus cheat, to test an anticheat)
@@ -197,6 +209,10 @@ struct Options {
     capture: Option<String>,
     /// How many times as fast as vanilla's 20 Hz the bots tick (a timer cheat above 1).
     timer: f64,
+    /// --far: far terrain out to this many chunks (0: none), from this long after joining.
+    far: u32,
+    far_after: f64,
+    far_dump: Option<String>,
 }
 
 fn options() -> Result<Options, String> {
@@ -231,6 +247,9 @@ fn options() -> Result<Options, String> {
         capture: None,
         brand: None,
         timer: 1.0,
+        far: 0,
+        far_after: 3.0,
+        far_dump: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -297,6 +316,16 @@ fn options() -> Result<Options, String> {
             "--report" => o.report = Some(value),
             "--capture" => o.capture = Some(value),
             "--brand" => o.brand = Some(value),
+            "--far" => {
+                o.far = value.parse().map_err(|_| number("chunks"))?;
+                // A server offers at most this far (`lod_net::MAX_DISTANCE`), and the plan's
+                // coverage loop stays far inside an i32 there.
+                if o.far > FAR_MAX {
+                    return Err(format!("--far {value}: at most {FAR_MAX} chunks"));
+                }
+            }
+            "--far-after" => o.far_after = value.parse().map_err(|_| number("seconds"))?,
+            "--far-dump" => o.far_dump = Some(value),
             "--give" => {
                 for part in value.split(',') {
                     let n: Vec<&str> = part.split(':').collect();
@@ -394,7 +423,7 @@ struct Bot {
     /// Different chunks received over the run.
     unique: AtomicU64,
     forgotten: AtomicU64,
-    /// Teleports after the spawn one: the server refused a move.
+    /// Teleports after the spawn one that land near the bot or its anchor: the server refused a move.
     pulled_back: AtomicU64,
     /// Ticks the bot couldn't move because it didn't hold its chunk yet.
     waited: AtomicU64,
@@ -406,6 +435,10 @@ struct Bot {
     held: Mutex<HashSet<(i32, i32)>>,
     /// Where the server last put the bot (a teleport), to start from.
     teleport: Mutex<Option<[f64; 3]>>,
+    /// Where a teleport that moved the bot far put it (`re_anchor`): its walk's new anchor. Set with `teleport`.
+    moved: Mutex<Option<[f64; 3]>>,
+    /// Where the bot last told the server it is (its last move).
+    sent: Mutex<Option<[f64; 3]>>,
     error: Mutex<Option<String>>,
     joined_after_ms: AtomicU64,
     /// The connection's byte counters (wire bytes, after compression and encryption), set once it is open.
@@ -416,6 +449,8 @@ struct Bot {
     target: Mutex<Vec<(u128, Option<i32>)>>,
     /// The last SetHealth.
     health: Mutex<Option<f32>>,
+    /// --far: the far terrain it asks for.
+    far: far::Far,
 }
 
 impl Bot {
@@ -477,6 +512,9 @@ impl Random {
 }
 
 /// Vanilla's bare-hand attack speed is 4 a second: a full-strength swing every 20 / 4 ticks.
+/// The farthest `--far`: what a server offers at most (`horizon-lod-distance`, 1024 chunks).
+const FAR_MAX: u32 = 1024;
+
 const ATTACK_COOLDOWN_TICKS: u32 = 5;
 /// How far, in blocks, a fight bot strikes (the survival entity interaction range is 3).
 const ATTACK_REACH: f64 = 2.5;
@@ -678,6 +716,19 @@ fn walk_step(
         pos[0] += dx / distance * step;
         pos[2] += dz / distance * step;
     }
+}
+
+/// How far a teleport lands from the bot for vanilla's client to take it as a jump rather than a correction
+/// (`ClientPacketListener.setValuesFromPositionPacket`: a distance squared over 4096). It is also past the
+/// farthest a walking bot gets from its anchor (`walk_step`: 8 + 40 blocks).
+const FAR_TELEPORT: f64 = 64.0;
+
+/// The anchor a teleport to `to` gives the bot when it lands more than FAR_TELEPORT from both where the bot is
+/// (`at`) and its `anchor`: the server moved it (a /tp), so its walk centres there and it wasn't pulled back.
+/// A pull-back lands where the server last accepted the bot: near where it is, or at its anchor when the
+/// server refused every move (flood-move, whose moves are each 64 to 256 blocks).
+fn re_anchor(anchor: [f64; 3], at: [f64; 3], to: [f64; 3]) -> Option<[f64; 3]> {
+    (distance(at, to) > FAR_TELEPORT && distance(anchor, to) > FAR_TELEPORT).then_some(to)
 }
 
 /// One bot thread that panics poisons the locks it held; the others and the report go on.
@@ -1009,7 +1060,8 @@ fn read(
     let send = |body: Vec<u8>| lock(&writer).send(&body);
     let mut seen = HashSet::new();
     let mut batch = BatchSize::new();
-    let mut teleports = 0u64;
+    // The spot the bot's walk centres on, as the teleports tell it: the spawn (the first), then the last far one.
+    let mut anchor: Option<[f64; 3]> = None;
     loop {
         if bot.deaf.load(Ordering::Relaxed) {
             while bot.online.load(Ordering::SeqCst) {
@@ -1033,6 +1085,12 @@ fn read(
         let sent = match id {
             cb::SET_TIME => {
                 *lock(&bot.server_time) = r.i64().ok();
+                Ok(())
+            }
+            cb::CUSTOM_PAYLOAD => {
+                if r.string(32767).is_ok_and(|channel| channel == far::CHANNEL) {
+                    bot.far.reply(&body[body.len() - r.remaining()..]);
+                }
                 Ok(())
             }
             cb::KEEP_ALIVE => match r.i64() {
@@ -1110,9 +1168,18 @@ fn read(
                         }
                     });
                     *at = Some(pos);
-                    teleports += 1;
-                    if teleports > 1 {
-                        bot.pulled_back.fetch_add(1, Ordering::Relaxed);
+                    match anchor {
+                        None => anchor = Some(pos),
+                        Some(old) => {
+                            let last = lock(&bot.sent).unwrap_or(old);
+                            if let Some(new) = re_anchor(old, last, pos) {
+                                // Under the `teleport` lock, so the bot takes both together.
+                                anchor = Some(new);
+                                *lock(&bot.moved) = Some(new);
+                            } else {
+                                bot.pulled_back.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                     send(
                         play::Serverbound::AcceptTeleportation(play::AcceptTeleportation {
@@ -1200,8 +1267,8 @@ fn run_bot(
         thread::spawn(move || read(reader, writer, bot, track, ack_rate, capture));
     }
     use ids::play::serverbound as sb;
-    // Wait for the spawn position.
-    let spawn = loop {
+    // Wait for the spawn position. The walk centres on it, until a teleport moves the bot far (`re_anchor`).
+    let mut spawn = loop {
         if let Some(at) = *lock(&bot.teleport) {
             break at;
         }
@@ -1271,9 +1338,14 @@ fn run_bot(
         if lock(&until).is_some_and(|u| Instant::now() >= u) || !bot.online.load(Ordering::SeqCst) {
             break;
         }
-        // A teleport from the server wins over where the bot thought it was.
+        // A teleport from the server wins over where the bot thought it was. One that moved it far makes where
+        // it landed the walk's centre, and its target, so the bot walks around there.
         if let Some(at) = lock(&bot.teleport).take() {
             pos = at;
+            if let Some(moved) = lock(&bot.moved).take() {
+                spawn = moved;
+                target = moved;
+            }
         }
         let here = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
         // The abusive client doesn't wait for its chunk, as a real client must.
@@ -1457,6 +1529,21 @@ fn run_bot(
             }
         }
         tick += 1;
+        if o.far > 0 && joined.elapsed().as_secs_f64() >= o.far_after {
+            let dump =
+                (o.far_dump.as_ref()).map(|dir| PathBuf::from(dir).join(format!("{name}.tiles")));
+            bot.far.start(pos, i32::from(o.view_distance), o.far, dump);
+            for data in bot.far.requests() {
+                send(
+                    play::Serverbound::CustomPayload(configuration::CustomPayload {
+                        channel: far::CHANNEL.into(),
+                        data,
+                    })
+                    .encode(),
+                );
+            }
+        }
+        *lock(&bot.sent) = Some(pos);
         let ok = send(
             play::Serverbound::MovePlayerPos(play::MovePlayerPos {
                 x: pos[0],
@@ -1579,6 +1666,8 @@ fn main() {
                 "pulled_back": total(|b| &b.pulled_back),
                 "waited_ticks": total(|b| &b.waited),
                 "attacks": total(|b| &b.attacks),
+                // Bots whose far plan is done: every tile asked for and answered.
+                "far_done": bots.iter().filter(|b| b.far.is_finished()).count(),
             })
         );
         previous_chunks = chunks;
@@ -1632,6 +1721,7 @@ fn main() {
             "error": *lock(&b.error),
             "attacks": b.attacks.load(Ordering::Relaxed),
             "health": *lock(&b.health),
+            "far": (o.far > 0).then(|| b.far.report()),
         })).collect::<Vec<_>>(),
     });
     if o.report.as_deref() == Some("-") {
@@ -1901,6 +1991,34 @@ mod tests {
         assert!(first.is_some_and(|t| t > 30));
         assert!((target.1[0] - pos[0]).abs() <= ATTACK_REACH);
         assert!(pos[0] < 10.0 - CLOSE_IN + 1e-9);
+    }
+
+    #[test]
+    fn a_far_teleport_moves_the_anchor_and_a_pull_back_keeps_it() {
+        // The spawn, on the ground; the bots fly 24 blocks above it.
+        let spawn = [0.5, 64.0, 0.5];
+        // A walking bot pulled back a couple of blocks.
+        assert_eq!(
+            re_anchor(spawn, [20.0, 88.0, 30.0], [18.5, 88.0, 29.0]),
+            None
+        );
+        // An explore bot 2000 blocks out, pulled back 5: far from its anchor, not from where it is.
+        assert_eq!(
+            re_anchor(spawn, [2000.0, 88.0, 0.5], [1995.0, 88.0, 0.5]),
+            None
+        );
+        // flood-move claims a spot 200 blocks away; the server, which took none of its moves, sends it back to
+        // the spawn.
+        assert_eq!(re_anchor(spawn, [200.5, 88.0, 0.5], spawn), None);
+        // A /tp 700 blocks away moves it: its walk centres there from now on.
+        let to = [-600.5, 88.0, 380.5];
+        assert_eq!(re_anchor(spawn, [10.0, 88.0, 5.0], to), Some(to));
+        // Vanilla's cutoff: 64 blocks is still a correction, 64.5 a jump.
+        assert_eq!(re_anchor(spawn, spawn, [64.5, 64.0, 0.5]), None);
+        assert_eq!(
+            re_anchor(spawn, spawn, [65.0, 64.0, 0.5]),
+            Some([65.0, 64.0, 0.5])
+        );
     }
 
     #[test]

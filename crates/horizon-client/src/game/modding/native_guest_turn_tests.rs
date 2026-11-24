@@ -80,7 +80,7 @@ pub(in crate::game) fn with_guests_at(
 #[ignore = "daily"]
 fn player_dimensions_validate_identity_on_both_server_roles() {
     use super::execution_role::ExecutionRole;
-    let previous_extra = super::EXTRA_DIMS.read().unwrap().clone();
+    let previous_extra = super::Dim::snapshot_extras();
     with_guests(|game| {
         super::Dim::add_extra("test:pocket");
         for role in [
@@ -164,7 +164,7 @@ fn player_dimensions_validate_identity_on_both_server_roles() {
             );
         }
     });
-    *super::EXTRA_DIMS.write().unwrap() = previous_extra;
+    super::Dim::restore_extras(previous_extra);
 }
 
 #[test]
@@ -395,16 +395,52 @@ fn another_guests_menu_and_push_work_during_a_turn() {
     });
 }
 
+/// `player_set_velocity` replaces a guest's velocity (where `entity_push`
+/// adds), for the acting guest and another one, and refuses what it can't set.
+#[test]
+#[ignore = "daily"]
+fn player_set_velocity_replaces_a_guests_motion() {
+    with_guests(|game| {
+        for conn in [12, 13] {
+            game.as_guest(conn, |game| {
+                game.player.as_mut().unwrap().velocity = Vec3::ZERO;
+            })
+            .unwrap();
+        }
+        let a = game.player(12).unwrap();
+        let b = game.player(13).unwrap();
+        let velocity = |game: &super::Game<'_>, conn| {
+            let guest = game.lan.as_ref().unwrap().hub.guest(conn).unwrap();
+            guest.motion.as_ref().unwrap().velocity
+        };
+        assert!(game.entity_push(b.entity(), [1.0, 1.0, 1.0]));
+        assert!(game.player_set_velocity(b, [0.5, 0.25, -1.5]));
+        assert_eq!(velocity(game, 13), Vec3::new(0.5, 0.25, -1.5));
+        assert!(!game.player_set_velocity(b, [f64::NAN, 0.0, 0.0]));
+        assert!(!game.player_set_velocity(b, [0.0, f64::INFINITY, 0.0]));
+        assert_eq!(velocity(game, 13), Vec3::new(0.5, 0.25, -1.5));
+        game.as_guest(12, |game| {
+            assert!(game.player_set_velocity(a, [0.0, 0.42, 2.0]));
+            assert_eq!(
+                game.player.as_ref().unwrap().velocity,
+                Vec3::new(0.0, 0.42, 2.0)
+            );
+            assert!(game.player_set_velocity(b, [-1.0, 0.0, 0.0]));
+        })
+        .unwrap();
+        assert_eq!(velocity(game, 12), Vec3::new(0.0, 0.42, 2.0));
+        assert_eq!(velocity(game, 13), Vec3::new(-1.0, 0.0, 0.0));
+    });
+}
+
 /// Native services can reach B during A's turn without exposing displaced
 /// inventories or changing ordinary command resolution during nested turns.
 #[test]
 #[ignore = "daily"]
 fn another_guests_services_work_during_a_turn() {
-    use super::{
-        commands::Target,
-        native_inventories::NativeInventoryKind::{Ender, Player},
-    };
+    use super::{api_values::TryIntoApi, commands::Target};
     use horizon_client::{advancements as adv, command::args::Selector, items::ItemStack};
+    use mod_api::PlayerInventoryKind::{Ender, Player};
     use mod_api::{CriterionContext, CriterionTest, CriterionTestError, TriggerCriterionError};
 
     struct Accept;
@@ -457,16 +493,24 @@ fn another_guests_services_work_during_a_turn() {
                 }),
                 [Target::Player]
             );
-            assert!(game.native_inventory(12, Player).is_err());
+            assert!(game.server_player_inventory(12, Player).is_err());
+            let stone = stone.clone().try_into_api().unwrap();
             assert_eq!(
-                game.native_inventory(13, Player).unwrap().slots[0],
+                game.server_player_inventory(13, Player).unwrap().slots[0],
                 Some(stone.clone())
             );
-            game.native_move_stack((13, Player, 0), &stone, (13, Ender))
-                .unwrap();
-            assert_eq!(game.native_inventory(13, Player).unwrap().slots[0], None);
+            game.server_move_inventory_stack(&mod_api::PlayerInventoryMove::new(
+                (13, Player, 0),
+                stone.clone(),
+                (13, Ender),
+            ))
+            .unwrap();
             assert_eq!(
-                game.native_inventory(13, Ender).unwrap().slots[0],
+                game.server_player_inventory(13, Player).unwrap().slots[0],
+                None
+            );
+            assert_eq!(
+                game.server_player_inventory(13, Ender).unwrap().slots[0],
                 Some(stone.clone())
             );
             assert_eq!(
@@ -492,8 +536,8 @@ fn another_guests_services_work_during_a_turn() {
                 Some(ItemStack::new("minecraft:apple", 1))
             );
             game.as_guest(13, |game| {
-                assert!(game.native_inventory(12, Player).is_err());
-                assert!(game.native_inventory(13, Player).is_err());
+                assert!(game.server_player_inventory(12, Player).is_err());
+                assert!(game.server_player_inventory(13, Player).is_err());
                 assert_eq!(
                     a.trigger_criterion(game, &trigger, Arc::new(Accept)),
                     Err(TriggerCriterionError::PlayerUnavailable)
@@ -1491,17 +1535,18 @@ fn run_command_checks_the_line_at_the_level_given() {
 #[test]
 #[ignore = "daily"]
 fn run_command_runs_as_the_entity_from_where_it_is() {
-    use super::native_inventories::NativeInventoryKind::Player;
+    use super::api_values::TryIntoApi;
     use horizon_client::items::ItemStack;
     use mod_api::PermissionLevel::Gamemasters;
+    use mod_api::PlayerInventoryKind::Player;
 
     with_guests(|game| {
         game.build_registries();
         let a = game.player(12).unwrap().entity();
         let b = game.player(13).unwrap().entity();
-        let holds = |game: &super::Game<'_>, uuid: u128, item: &str| {
-            let stack = ItemStack::new(item, 1);
-            let slots = game.native_inventory(uuid, Player).unwrap().slots;
+        let holds = |game: &mut super::Game<'_>, uuid: u128, item: &str| {
+            let stack = ItemStack::new(item, 1).try_into_api().unwrap();
+            let slots = game.server_player_inventory(uuid, Player).unwrap().slots;
             slots.iter().flatten().any(|s| *s == stack)
         };
         let stand = summon_stand(game);
@@ -1591,9 +1636,10 @@ fn run_command_answers_false_for_a_bad_line_or_a_stale_handle() {
 #[test]
 #[ignore = "daily"]
 fn run_command_refuses_a_player_whose_level_is_parked() {
-    use super::native_inventories::NativeInventoryKind::Player;
+    use super::api_values::TryIntoApi;
     use horizon_client::{gamerules::vanilla::SEND_COMMAND_FEEDBACK, items::ItemStack};
     use mod_api::PermissionLevel::Owners;
+    use mod_api::PlayerInventoryKind::Player;
 
     with_guests(|game| {
         game.build_registries();
@@ -1606,9 +1652,9 @@ fn run_command_refuses_a_player_whose_level_is_parked() {
                 .update_guest(13, |guest| guest.dimension = dimension.to_owned())
                 .unwrap();
         };
-        let has_stick = |game: &super::Game<'_>| {
-            let stick = ItemStack::new("minecraft:stick", 1);
-            let slots = game.native_inventory(13, Player).unwrap().slots;
+        let has_stick = |game: &mut super::Game<'_>| {
+            let stick = ItemStack::new("minecraft:stick", 1).try_into_api().unwrap();
+            let slots = game.server_player_inventory(13, Player).unwrap().slots;
             slots.iter().flatten().any(|s| *s == stick)
         };
         assert!(game.ui.rules.bool_at(SEND_COMMAND_FEEDBACK));
@@ -1665,5 +1711,157 @@ fn run_command_runs_from_the_players_own_place_inside_an_outer_command() {
                 "guest {conn}"
             );
         }
+    });
+}
+
+/// Issue #17416: Multiple players cannot ride the same single-seat mount (horse).
+/// A guest interacting with a mount that the host is riding is refused,
+/// while a camel with 1 rider still allows a second player to board.
+#[test]
+#[ignore = "daily"]
+fn multiple_players_cannot_ride_same_mount() {
+    with_guests(|game| {
+        let horse = game.res.mob_types().get("minecraft:horse").unwrap().clone();
+        let mut m = Mob::new(42, horse, Vec3::new(3.0, 64.0, 5.0), 0.0);
+        m.extra.tame = true;
+        game.mobs.push(m);
+        let horse_index = game.mobs.iter().position(|m| m.id == 42).unwrap();
+
+        // Host is riding the horse.
+        game.riding = Some(42);
+
+        // Guest 13 attempts to interact with the horse while host is riding:
+        // boarding and feeding are both refused (AbstractHorse isVehicle).
+        game.as_guest(13, |game| {
+            assert!(!game.interact_mount(horse_index, "minecraft:air"), "guest cannot board horse host is riding");
+            assert!(!game.interact_mount(horse_index, "minecraft:golden_apple"), "guest cannot feed horse host is riding");
+        })
+        .unwrap();
+
+        // Guest boarded check also enforces capacity and reverts if over capacity.
+        game.lan
+            .as_mut()
+            .unwrap()
+            .hub
+            .update_guest(13, |guest| guest.vehicle = Some(42))
+            .unwrap();
+        game.guest_boarded(13, None);
+        assert_eq!(
+            game.lan.as_ref().unwrap().hub.guest(13).unwrap().vehicle,
+            None,
+            "guest vehicle reverted because horse is full"
+        );
+
+        // A camel seats two: host + guest can both ride.
+        let camel = game.res.mob_types().get("minecraft:camel").unwrap().clone();
+        let mut c = Mob::new(43, camel, Vec3::new(5.0, 64.0, 5.0), 0.0);
+        c.extra.tame = true;
+        game.mobs.push(c);
+        let camel_index = game.mobs.iter().position(|m| m.id == 43).unwrap();
+
+        // Host rides the camel.
+        game.riding = Some(43);
+
+        // Guest 13 can board the camel as second rider.
+        game.as_guest(13, |game| {
+            assert!(game.interact_mount(camel_index, "minecraft:air"), "guest can board camel as second rider");
+        })
+        .unwrap();
+        assert_eq!(
+            game.lan.as_ref().unwrap().hub.guest(13).unwrap().vehicle,
+            Some(43),
+            "camel accommodates second rider"
+        );
+        game.guest_boarded(13, None);
+        assert_eq!(
+            game.lan.as_ref().unwrap().hub.guest(13).unwrap().vehicle,
+            Some(43),
+            "guest_boarded confirms second rider"
+        );
+
+        // Third rider (guest 12) is refused because camel is full (2 riders).
+        game.as_guest(12, |game| {
+            assert!(!game.interact_mount(camel_index, "minecraft:air"), "third rider cannot board camel");
+        })
+        .unwrap();
+
+        // Nautilus seats 1: host riding refuses guest boarding.
+        let nautilus = game.res.mob_types().get("minecraft:nautilus").unwrap().clone();
+        let mut n = Mob::new(44, nautilus, Vec3::new(3.0, 64.0, 5.0), 0.0);
+        n.extra.tame = true;
+        game.mobs.push(n);
+        let nautilus_index = game.mobs.iter().position(|m| m.id == 44).unwrap();
+        game.riding = Some(44);
+        game.as_guest(13, |game| {
+            assert!(!game.interact_nautilus(nautilus_index, "minecraft:air"), "guest cannot board nautilus host is riding");
+        })
+        .unwrap();
+
+        // Llama seats 1: host riding refuses guest boarding and feeding.
+        let llama = game.res.mob_types().get("minecraft:llama").unwrap().clone();
+        let mut l = Mob::new(45, llama, Vec3::new(3.0, 64.0, 5.0), 0.0);
+        l.extra.tame = true;
+        game.mobs.push(l);
+        let llama_index = game.mobs.iter().position(|m| m.id == 45).unwrap();
+        game.riding = Some(45);
+        game.as_guest(13, |game| {
+            assert!(!game.interact_mount(llama_index, "minecraft:air"), "guest cannot board llama host is riding");
+            assert!(!game.interact_mount(llama_index, "minecraft:wheat"), "guest cannot feed llama host is riding");
+            assert!(!game.interact_llama(llama_index, "minecraft:air"), "guest direct interact_llama cannot board llama host is riding");
+            assert!(!game.interact_llama(llama_index, "minecraft:wheat"), "guest direct interact_llama cannot feed llama host is riding");
+        })
+        .unwrap();
+
+        // Boat capacities: normal boat = 2, chest boat = 1.
+        game.boats.push(crate::game::boats::Boat::new(50, "oak".into(), Vec3::ZERO, 0.0));
+        game.boats.push(crate::game::boats::Boat::new(51, "oak".into(), Vec3::ZERO, 0.0).with_chest());
+        assert_eq!(game.vehicle_capacity(50), 2, "normal boat capacity is 2");
+        assert_eq!(game.vehicle_capacity(51), 1, "chest boat capacity is 1");
+    });
+}
+
+/// A panic that leaves a guest's turn writes the half-done turn back into their record and
+/// restores the outer player, so `lan_acting` no longer names them. Crash teardown still keeps
+/// that player's last saved file (#18117), and only theirs.
+#[test]
+#[ignore = "daily"]
+fn crash_teardown_keeps_the_last_file_of_a_guest_whose_turn_panicked() {
+    with_guests(|game| {
+        let outer = game.lan_acting;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            game.as_guest(13, |_| std::panic::panic_any(18117_u32))
+        }))
+        .unwrap_err();
+        assert_eq!(panic.downcast_ref::<u32>(), Some(&18117));
+        assert_eq!(game.lan_acting, outer);
+        assert!(game.keep_interrupted_players().is_some());
+        let placed = |game: &super::Game<'_>, conn| {
+            game.lan.as_ref().unwrap().hub.guest(conn).unwrap().placed
+        };
+        assert!(!placed(game, 13), "the interrupted guest would be saved");
+        assert!(
+            placed(game, 12),
+            "a guest the panic did not interrupt is saved"
+        );
+    });
+}
+
+/// A panic inside nested turns that never reach `leave_guest` (a guest's command giving another
+/// guest an effect opens both swaps directly) leaves only the inner one in `lan_acting`. Crash
+/// teardown keeps both players' last saved files: the outer one's record holds another state.
+#[test]
+#[ignore = "daily"]
+fn crash_teardown_keeps_every_player_a_swap_still_displaces() {
+    with_guests(|game| {
+        let outer = game.enter_guest(13).unwrap();
+        let inner = game.enter_guest(12).unwrap();
+        assert!(game.keep_interrupted_players().is_some());
+        let placed = |game: &super::Game<'_>, conn| {
+            game.lan.as_ref().unwrap().hub.guest(conn).unwrap().placed
+        };
+        assert!(!placed(game, 12), "the inner turn's player would be saved");
+        assert!(!placed(game, 13), "the outer turn's player would be saved");
+        game.leave_guest(inner);
+        game.leave_guest(outer);
     });
 }

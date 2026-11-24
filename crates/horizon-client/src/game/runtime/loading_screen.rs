@@ -164,8 +164,9 @@ impl Loading {
             Some(&self.boot),
             None,
             None,
-            self.settings.horizon.api,
+            self.settings.horizon.effective_api(),
             shader_packs::picked_pack_shape(&self.settings).ray_tracing,
+            self.settings.horizon.ray_tracing,
         ) {
             Ok(r) => self.renderer = Some(r),
             Err(e) => {
@@ -235,11 +236,17 @@ impl Loading {
             Some(&bundle.atlas),
             Some(&bundle.panorama),
             self.renderer.as_ref(),
-            self.settings.horizon.api,
+            self.settings.horizon.effective_api(),
             shader_packs::picked_pack_shape(&self.settings).ray_tracing,
+            self.settings.horizon.ray_tracing,
         ) {
             Ok(r) => {
                 self.renderer = Some(r);
+                // The GPU holds the atlas now: keep its copy compressed until the world
+                // renderer reads it at the handoff, as the game does after its first frame.
+                if let Some(gui) = &mut self.gui {
+                    gui.atlas.pack_pixels();
+                }
             }
             Err(e) => self.error = Some(e),
         }
@@ -264,6 +271,21 @@ impl Loading {
             return;
         }
         self.poll_menu_realms(event_loop);
+        if self.title_drawn
+            && self
+                .options
+                .as_ref()
+                .is_some_and(|o| o.benchmark.is_none() && !o.offscreen)
+        {
+            super::graphics_tuning::ready_at_title(&self.vanilla_root, &self.settings);
+        }
+        if let Some((redraw, next)) = super::graphics_tuning::title_redraw() {
+            if redraw && let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+            return;
+        }
         if let Some(w) = &self.window {
             if self.options.as_ref().is_some_and(|o| o.offscreen) {
                 self.draw();
@@ -316,9 +338,15 @@ impl Loading {
         options.server = None;
         let gui = self.gui.take().ok_or("missing menu bundle")?;
         let window = self.window.clone().ok_or("window closed")?;
-        // Keep the loader's device and swap in the real textures in one step.
-        if let Some(renderer) = &mut self.renderer {
+        // Keep the loader's device and swap in the real textures in one step. The loading
+        // screen draws no frame after this: its atlas texture is freed before the world
+        // renderer uploads its own, so a phone never holds both (#15608).
+        let mut previous = self.renderer.take();
+        if let Some(renderer) = &mut previous {
             renderer.release_surface();
+            if let Some(atlas) = &renderer.hud.atlas_texture {
+                atlas.destroy();
+            }
         }
         let renderer_at = Instant::now();
         let renderer = startup::time("renderer.world", || {
@@ -327,14 +355,14 @@ impl Loading {
                 options.offscreen,
                 &loaded.pack,
                 &gui,
-                self.renderer.as_ref(),
+                previous.as_ref(),
                 loaded.renderer_cpu,
-                self.settings.horizon.api,
+                self.settings.horizon.effective_api(),
                 self.settings.horizon.translucent_batching,
                 self.settings.vsync,
                 &self.settings.horizon,
                 shader_packs::picked_pack_shape(&self.settings),
-                self.renderer
+                previous
                     .as_ref()
                     .map(|r| r.display_reading())
                     .unwrap_or_default(),
@@ -395,6 +423,9 @@ impl Loading {
         game.fullscreen = self.fullscreen;
         game.panorama_rotation = self.panorama_rotation;
         self.menu.handoff(&mut game);
+        if game.title.is_some() && game.options.benchmark.is_none() && !game.options.offscreen {
+            super::graphics_tuning::ready_at_title(&self.vanilla_root, &game.settings);
+        }
         game.apply_settings();
         game.previous = Instant::now();
         // Minecraft.onGameLoadFinished: a start that made it this far is clean.

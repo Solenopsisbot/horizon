@@ -5,10 +5,11 @@ use super::*;
 use crate::glass_ui::{self as ui, white};
 use gpui::deferred;
 use horizon_theme::glass::{fill, ink, radius};
-use std::time::Instant;
 
 /// Play, the version and the big icons are this tall (`h-14`).
 const TALL: f32 = 56.;
+
+const MOD_SCAN_BUSY_LABEL: &str = "Reading the mods";
 /// The window width from which Home's head is laid out as the mockup's `xl` (1280 px); under it
 /// Play and the version are narrower and the invite code takes what is left of their row. The
 /// account page and the theme editor also put their two columns side by side from it.
@@ -45,12 +46,6 @@ impl Launcher {
         cx: &mut Context<Self>,
     ) -> Div {
         let java = self.selected_instance().and_then(|i| i.java.clone());
-        // How long this game has run, for "Playing for 5 min now".
-        match (&self.client, self.client_since) {
-            (Some(_), None) => self.client_since = Some(Instant::now()),
-            (None, Some(_)) => self.client_since = None,
-            _ => {}
-        }
         // The invite code stays on the actions' row at every width (unlike the mockup's
         // `xl:flex-row`, which moves it under them): on the right, 340 wide from 1280 px; under
         // that it takes what is left, and the puzzle (the Mods tab below does the same) gives
@@ -297,7 +292,11 @@ impl Launcher {
     /// "You've played for 41 h 06 min! Last played today.", or how long it has run now; then
     /// the players counts the launcher knows (not in the mockup).
     fn played_text(&self, cx: &mut Context<Self>) -> Div {
-        let line = match (self.client_since, self.selected_instance()) {
+        let running_since = match self.selected_game_state() {
+            SelectedGameState::SelectedRunning { since } => Some(since),
+            _ => None,
+        };
+        let line = match (running_since, self.selected_instance()) {
             (Some(since), _) => trf(
                 "Playing for {time} now. Have fun!",
                 &[("time", &instances::play_time(since.elapsed()))],
@@ -385,20 +384,43 @@ impl Launcher {
     fn play_group(&mut self, tag: &str, ready: bool, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
         let accent = ui::color(self.look.accent);
-        let running = self.client.is_some();
+        let state = self.selected_game_state();
+        let any_game_active = !matches!(state, SelectedGameState::Idle);
+        let is_selected_running = matches!(state, SelectedGameState::SelectedRunning { .. });
+        let is_selected_starting = matches!(state, SelectedGameState::SelectedStarting);
+        let other_game = match state {
+            SelectedGameState::OtherRunning { id } => {
+                let (name, has_home) = other_game_info(&self.instances.list, id);
+                Some((
+                    frame::RowPhase::Running,
+                    other_game_label(frame::RowPhase::Running, name),
+                    !has_home,
+                ))
+            }
+            SelectedGameState::OtherStarting { id } => {
+                let (name, has_home) = other_game_info(&self.instances.list, id);
+                Some((
+                    frame::RowPhase::Starting,
+                    other_game_label(frame::RowPhase::Starting, name),
+                    !has_home,
+                ))
+            }
+            _ => None,
+        };
+        let is_quiet_game = is_selected_running || other_game.is_some();
+        let other_without_home = other_game.as_ref().is_some_and(|(_, _, no_home)| *no_home);
+        let other_is_running = matches!(state, SelectedGameState::OtherRunning { .. });
+        let other_is_starting = matches!(state, SelectedGameState::OtherStarting { .. });
         let follows = self
             .selected_instance()
-            .is_some_and(|i| i.version.is_none());
+            .is_some_and(|i| i.follows_horizon());
         let stable = self
             .selected_instance()
             .is_some_and(|i| i.channel == horizon_launcher::instances::Channel::Stable);
-        // A Stable instance follows the newest stable build, not each Nightly: its update is
-        // that build when it isn't installed yet.
+        // A Stable instance follows the newest stable build, not each Nightly.
+        let stable_update = self.stable_update(tag);
         let update = if stable {
-            self.stable_builds()
-                .first()
-                .map(|b| b.tag.clone())
-                .filter(|next| follows && !tag.is_empty() && !self.installed.contains(next))
+            stable_update.as_ref().map(|r| r.tag.clone())
         } else {
             self.updates
                 .horizon
@@ -415,7 +437,10 @@ impl Launcher {
             .selected_instance()
             .and_then(|i| i.version.as_ref())
             .and_then(|v| {
-                let queued = self.install_next.as_ref().is_some_and(|r| r.tag == *v);
+                let queued = self
+                    .install_queue
+                    .iter()
+                    .any(|request| request.release.tag == *v);
                 let running = self.installing.as_ref().filter(|(t, _)| t == v);
                 running.map(|(_, p)| Some(*p)).or(queued.then_some(None))
             });
@@ -424,32 +449,50 @@ impl Launcher {
             .is_some_and(|i| self.native_for.as_deref() == Some(i.id.as_str()));
         let building = mine && self.native_step.is_some();
         // Native mods that changed since the last build: Play builds them first, one button.
-        let needs_build = !building
-            && self
-                .selected_instance()
-                .filter(|i| i.java.is_none())
-                .is_some_and(|i| {
-                    matches!(
-                        self.native_state_of(i),
-                        native_status::State::NotBuilt | native_status::State::Outdated
-                    )
-                });
+        let mods = self
+            .selected_instance()
+            .filter(|i| i.java.is_none() && !building);
+        let mod_state = mods.and_then(|i| self.native_state_of(i, cx));
+        let needs_build = matches!(
+            mod_state,
+            Some(native_status::State::NotBuilt | native_status::State::Outdated)
+        );
         let busy: Option<(SharedString, Option<f32>)> =
-            match (installing, self.preparing, &self.starting_client) {
+            match (installing, self.preparing, is_selected_starting) {
                 (Some(p), _, _) => Some((tr("Updating").into(), Some(p))),
                 (_, _, _) if own.is_some() => Some((tr("Installing").into(), own.flatten())),
+                // A Stable update never replaces another download: it waits, and says so.
+                _ if stable && update.is_some() && self.stable_update_waits() => {
+                    Some((tr("Waiting for another download").into(), None))
+                }
                 (_, true, _) => Some((
                     tr("Preparing").into(),
                     horizon_launcher::mojang::progress().map(|(d, n)| d as f32 / n.max(1) as f32),
                 )),
-                (_, _, Some(_)) => Some((tr("Starting").into(), None)),
+                (_, _, true) => Some((
+                    self.play_step
+                        .now()
+                        .unwrap_or(tr("Starting"))
+                        .to_owned()
+                        .into(),
+                    None,
+                )),
                 // This instance's mods building (Build and play): the build's overall progress,
                 // the same figure as its card.
                 _ if building => Some((
-                    tr("Building mods").into(),
+                    match self.native_stopping {
+                        true => tr("Stopping the build…").into(),
+                        false => tr("Building mods").into(),
+                    },
                     self.native_progress
                         .map(|p| build_mode::percent(Some(p)) as f32 / 100.),
                 )),
+                _ if wait_for_mod_scan(any_game_active, mods.is_some() && mod_state.is_none())
+                    && ready
+                    && update.is_none() =>
+                {
+                    Some((tr(MOD_SCAN_BUSY_LABEL).into(), None))
+                }
                 // One build at a time: another instance's build first, and this one says whose.
                 _ if needs_build && self.native_step.is_some() => Some((
                     trf(
@@ -469,9 +512,10 @@ impl Launcher {
             };
         let open = self.home_menu == HomeMenu::Play;
         // What is drawn on the accent takes its own ink (white on the default violet), in the
-        // light look too, where `white` is the page's dark ink; Stop sits on a quiet fill.
+        // light look too, where `white` is the page's dark ink; Stop and the other-instance
+        // status pill sit on a quiet fill.
         let on_accent = ui::color(self.look.on_accent);
-        let glyph = if running && busy.is_none() {
+        let glyph = if is_quiet_game && busy.is_none() {
             white(ink::FULL)
         } else {
             on_accent
@@ -502,8 +546,13 @@ impl Launcher {
                 }
                 cx.notify();
             }));
-        // A build under way is cancelled from the button it was started from.
-        let more = if building {
+        // A build under way, a start's pre-launch command (for this instance, or for a starting
+        // game with no Home view of its own), or a running game with no Home view of its own (a
+        // ported/registry modpack) can be stopped here.
+        let stop_pre_launch = (is_selected_starting || (other_is_starting && other_without_home))
+            && self.pre_launch_stoppable();
+        let stop_other = other_is_running && other_without_home && busy.is_none();
+        let more = if building || stop_pre_launch || stop_other {
             div()
                 .id("play-cancel")
                 .occlude()
@@ -517,11 +566,23 @@ impl Launcher {
                 .cursor_pointer()
                 .hover(|s| s.bg(gpui::black().opacity(0.2)))
                 .child(ui::icon("stop", 18., glyph))
-                .tooltip(ui::tip(tr("Stop the build")))
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                .tooltip(ui::tip(if building {
+                    tr("Stop the build")
+                } else {
+                    tr("Stop")
+                }))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
-                    this.play_after_build = None;
-                    native_mods::cancel();
+                    if building {
+                        // A second press while it stops would only stop it again.
+                        if !this.native_stopping {
+                            this.stop_native_build();
+                        }
+                    } else if stop_pre_launch {
+                        this.stop_pre_launch();
+                    } else if let Some(client) = &this.client {
+                        client.kill();
+                    }
                     cx.notify();
                 }))
         } else {
@@ -565,6 +626,7 @@ impl Launcher {
                 .child(label)
         };
         let busy_none = busy.is_none();
+        let passive_other = busy_none && other_game.is_some();
         let group = match busy {
             Some((label, progress)) => base
                 .bg(accent.opacity(0.35))
@@ -591,12 +653,9 @@ impl Launcher {
                         .font_family(horizon_theme::glass::FONT)
                         .text_size(px(16.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(match progress {
-                            Some(p) => format!("{label} {:.0}%", p * 100.),
-                            None => format!("{label}…"),
-                        }),
+                        .child(play_busy_caption(&label, progress)),
                 ),
-            None if running => base
+            None if is_selected_running => base
                 .bg(white(0.14))
                 .border_color(white(ui::edge::HOVER))
                 .child(
@@ -610,6 +669,41 @@ impl Launcher {
                             cx.notify();
                         })),
                 ),
+            None if other_game.is_some() => {
+                let (phase, label, _) = other_game.unwrap();
+                let dot_tone = match phase {
+                    frame::RowPhase::Running => ui::Tone::Live,
+                    frame::RowPhase::Starting => ui::Tone::Busy,
+                };
+                base.max_w(px(if self.window_width >= WIDE {
+                    280.
+                } else {
+                    260.
+                }))
+                .bg(white(0.14))
+                .border_color(white(ui::edge::HOVER))
+                .text_color(white(ink::FULL))
+                .child(
+                    div()
+                        .id("play")
+                        .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(10.))
+                        .pl(px(18.))
+                        .pr(px(52.))
+                        .font_family(horizon_theme::glass::FONT)
+                        .text_size(px(15.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .cursor_default()
+                        .tooltip(ui::tip(label.clone()))
+                        .child(ui::dot(dot_tone))
+                        .child(div().min_w_0().truncate().child(label)),
+                )
+            }
             None => {
                 let owner = if horizon_launcher::developer_offline::selected() {
                     Some(true)
@@ -649,15 +743,11 @@ impl Launcher {
                             cx.notify();
                         }))
                     }
-                    (Some(next), _) if stable => {
-                        let next = next.clone();
+                    (Some(_), _) if stable => {
+                        let release = stable_update.clone();
                         main.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            let release = match &this.releases {
-                                Load::Ready(list) => list.iter().find(|r| r.tag == next).cloned(),
-                                _ => None,
-                            };
-                            if let Some(release) = release {
-                                this.install(&release);
+                            if let Some(release) = release.clone() {
+                                this.install_stable_update(release);
                             }
                             cx.notify();
                         }))
@@ -731,7 +821,7 @@ impl Launcher {
             }
         };
         // Ready to play: the accent's glow comes up under the pointer, a press dims it.
-        let primary = !running && busy_none;
+        let primary = !any_game_active && busy_none;
         let soft = ui::color(self.look.accent_soft);
         let group = group
             .id("play-group")
@@ -764,9 +854,14 @@ impl Launcher {
                 })
                 .active(|s| s.opacity(0.92).shadow(Vec::new()))
             });
-        let mut wrap = div().relative().child(keyboard(group, &t).child(more));
+        let (group, more) = if passive_other {
+            (group, keyboard(more, &t))
+        } else {
+            (keyboard(group, &t), more)
+        };
+        let mut wrap = div().relative().child(group.child(more));
         if open {
-            let locked = running || !busy_none;
+            let locked = any_game_active || !busy_none;
             let mut items: Vec<(&'static str, SharedString, String, bool, PlayItem)> = Vec::new();
             if !tag.is_empty() {
                 let version = backend::game_version(tag);
@@ -1259,9 +1354,40 @@ fn launch_command(id: &str) -> String {
     format!("horizon-launcher play --instance {id}")
 }
 
+fn play_busy_caption(label: &str, progress: Option<f32>) -> String {
+    match progress {
+        Some(p) => format!("{label} {:.0}%", p * 100.),
+        None => format!("{label}…"),
+    }
+}
+
+fn wait_for_mod_scan(running: bool, pending: bool) -> bool {
+    !running && pending
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pending_scan_delays_play_but_keeps_stop_available() {
+        assert!(wait_for_mod_scan(false, true));
+        assert!(!wait_for_mod_scan(true, true));
+        assert!(!wait_for_mod_scan(false, false));
+    }
+
+    #[test]
+    fn play_shows_one_ellipsis_while_reading_mods() {
+        use crate::i18n::{tr_in, Language};
+
+        for (language, expected) in [
+            (Language::English, "Reading the mods…"),
+            (Language::Russian, "Чтение модов…"),
+        ] {
+            let label = tr_in(language, MOD_SCAN_BUSY_LABEL);
+            assert_eq!(play_busy_caption(label, None), expected);
+        }
+    }
 
     #[test]
     fn an_edition_tab_goes_to_that_editions_instance_played_last() {

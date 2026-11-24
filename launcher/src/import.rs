@@ -97,6 +97,15 @@ pub fn what(file: &Path) -> Result<Dropped, String> {
         // A build for Linux or macOS is named `horizon-client` with no
         // extension, so a file nothing else claims is read before giving up.
         _ if is_build(file) => return Ok(Dropped::Build),
+        // Native mods in the retired format (#17934), e.g. Zoom 2.0.0 downloaded by hand. Without
+        // this, players read the generic list below as "the launcher can't take mods at all".
+        // After the build check, which still takes a game build whatever its name.
+        Some("hnmod") => {
+            return Err(crate::i18n::trf(
+                "{name} is a native mod in the old .hnmod format, which this Horizon no longer loads. Install its current version from the Mods page, or ask its author to republish it as .hmod.",
+                &[("name", &name)],
+            ));
+        }
         _ => {
             let kinds = "a .mrpack, a .zip, a .hshader or a Horizon game build";
             return Err(format!("{name} can't be imported: drop {kinds}."));
@@ -261,8 +270,18 @@ fn fill(
     limit: u64,
 ) -> Result<(), String> {
     let count = zip.len();
+    // Modrinth's layers: `client-overrides/` is copied over `overrides/`, whatever order the
+    // archive keeps them in (a zip tool that sorts its entries puts `client-overrides/` first).
+    let mut order: Vec<usize> = (0..count).collect();
+    if index.is_some() {
+        order.sort_by_key(|&i| {
+            zip.name_for_index(i)
+                .and_then(Result::ok)
+                .is_some_and(|name| name.starts_with(OVERRIDES[1]))
+        });
+    }
     let mut total = 0u64;
-    for i in 0..count {
+    for (done, i) in order.into_iter().enumerate() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
         let name = entry.name().map_err(|e| e.to_string())?.into_owned();
         let relative = match index {
@@ -290,7 +309,7 @@ fn fill(
         }
         progress(
             &format!("Copying {relative}"),
-            (i + 1) as f32 / count as f32,
+            (done + 1) as f32 / count as f32,
         );
     }
     let files = index

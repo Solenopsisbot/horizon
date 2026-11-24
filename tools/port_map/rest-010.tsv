@@ -96,8 +96,8 @@ FriendlyByteBuf.readWithCount	skip:java		count loop; the List codec does it
 FriendlyByteBuf.writeEnumSet	port	crates/horizon-protocol/src/packets/play/player_info.rs::PlayerInfoUpdate::write	action flags as one byte (8 actions fit)
 FriendlyByteBuf.readEnumSet	port	crates/horizon-protocol/src/packets/play/player_info.rs::PlayerInfoUpdate::read	action flags as one byte (8 actions fit)
 FriendlyByteBuf.writeOptional	port	crates/horizon-protocol/src/buf.rs::Opt::write	boolean flag, then the value
-FriendlyByteBuf.writeEither	port	crates/horizon-protocol/src/packets/play.rs::TrackedWaypoint::write	gap: minor: only the waypoint identifier; no generic Either codec
-FriendlyByteBuf.readEither	port	crates/horizon-protocol/src/packets/play.rs::TrackedWaypoint::read	gap: minor: only the waypoint identifier; no generic Either codec
+FriendlyByteBuf.writeEither	port	crates/horizon-protocol/src/packets/play/waypoints.rs::TrackedWaypoint::write	gap: minor: only the waypoint identifier; no generic Either codec
+FriendlyByteBuf.readEither	port	crates/horizon-protocol/src/packets/play/waypoints.rs::TrackedWaypoint::read	gap: minor: only the waypoint identifier; no generic Either codec
 FriendlyByteBuf.readNullable	port	crates/horizon-protocol/src/buf.rs::Opt::read	boolean flag, then the value
 FriendlyByteBuf.writeNullable	port	crates/horizon-protocol/src/buf.rs::Opt::write	boolean flag, then the value
 FriendlyByteBuf.readByteArray	port	crates/horizon-protocol/src/buf.rs::Reader::byte_array	VarInt length, then bytes
@@ -143,7 +143,7 @@ HiddenByteBuf.unpack	skip:java		Netty in-memory channel wrapper
 HiddenByteBuf.retain	skip:java		Netty reference counting
 HiddenByteBuf.touch	skip:java		Netty leak detection
 MonitoredLocalFrameDecoder.channelRead	port	crates/horizon-protocol/src/connection.rs::ConnReader::recv	bytes_in counter for the bandwidth chart
-PacketBundlePacker.decode	inline	crates/horizon-client/src/net.rs::receive_play	gap: minor: BundleDelimiter is dropped; bundled packets are dispatched one by one
+PacketBundlePacker.decode	inline	crates/horizon-client/src/net.rs::receive_play	receive_play opens a bundle on a delimiter and hands its packets on together at the closing one; 4096 sub-packets are the cap
 PacketBundleUnpacker.encode	port	crates/horizon-client/src/lan/entity.rs::ServerEntity::send_changes	gap: minor: delimiters only around the projectile motion and power pair
 PacketDecoder.decode	port	crates/horizon-protocol/src/packets/mod.rs::decode	rejects leftover bytes (larger than expected)
 PacketEncoder.encode	port	crates/horizon-protocol/src/packets/mod.rs::encode	gap: minor: no error log and no skippable-packet path

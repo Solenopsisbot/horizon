@@ -83,7 +83,24 @@ impl Game<'_> {
     }
     /// What the entity rides (`Entity.getVehicle`): `None` when it rides
     /// nothing, its actual vehicle is off-level, or the input handle is stale.
+    /// Client-side reads use passenger packets and the local player's predicted ride.
     pub(super) fn entity_vehicle(&self, entity: EntityRef) -> Option<EntityRef> {
+        if !self.is_logical_server() {
+            // A remembered passenger relationship must not resurrect an entity
+            // that left this client level, or an old level's entity handle.
+            if self.native_client_entity_target(entity).is_none()
+                && self.native_client_tracked(entity).is_none()
+            {
+                return None;
+            }
+            let remote = self.remote.as_ref().filter(|remote| remote.logged_in)?;
+            let vehicle_id = if i32::try_from(entity.id()).ok()? == remote.entity_id {
+                self.riding
+            } else {
+                remote.passenger_vehicles.get(&entity.id()).copied()
+            }?;
+            return self.entity(vehicle_id);
+        }
         self.native_vehicle(entity).flatten()
     }
     /// Whether the entity rides another object, including a retained off-level vehicle.
@@ -1043,6 +1060,46 @@ mod tests {
                 location: [0.0; 3]
             })));
             assert_eq!(game.riding, Some(61));
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_rider_boards_another_cart_or_boat_straight_from_its_vehicle() {
+        use super::super::{
+            InteractTarget,
+            boats::Boat,
+            minecarts::{CartKind, Minecart},
+        };
+        use horizon_client::motion::PlayerMotion;
+        super::super::native_entity_refs::tests::with_game(|game| {
+            game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
+            game.carts
+                .push(Minecart::new(61, CartKind::Rideable, Vec3::ZERO));
+            game.carts
+                .push(Minecart::new(62, CartKind::Rideable, Vec3::ZERO));
+            let mut chest_boat = Boat::new(63, "oak".into(), Vec3::ZERO, 0.0);
+            chest_boat.chest = true;
+            game.boats.push(chest_boat);
+            let at = |id| {
+                Some(InteractTarget {
+                    id,
+                    location: [0.0; 3],
+                })
+            };
+            assert!(game.interact_cart(at(61)));
+            assert_eq!(game.riding, Some(61));
+            // Minecart.interact -> Entity.startRiding, which leaves the old
+            // vehicle first: the rider changes carts in one click.
+            assert!(game.interact_cart(at(62)));
+            assert_eq!(game.riding, Some(62));
+            // AbstractChestBoat.interact tries AbstractBoat.interact's
+            // boarding first; the chest only opens when that passes.
+            assert!(game.interact_boat(at(63)));
+            assert_eq!(game.riding, Some(63));
+            assert_eq!(game.container, None, "the chest stays closed");
+            assert!(game.interact_cart(at(61)));
+            assert_eq!(game.riding, Some(61), "and from a boat into a cart");
         });
     }
 

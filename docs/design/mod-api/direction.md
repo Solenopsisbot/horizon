@@ -85,7 +85,7 @@ and [Parts](../../modding/src/concepts/parts.md).
 | Biome regions | `declare_biome_region` | Startup declarations on the sides that load the mod | Sorted by mod id, then region id. A new world records them; from then on its saved layout, not the mods, decides the Overworld's and Nether's regions ([the design](mod-biome-regions.md)). |
 | New attribute types | `declare_attribute` | Startup declarations on the sides that load the mod | When the attribute catalog grows, before entity attribute rows resolve. The mod attributes append after the vanilla ones, sorted by mod id then attribute id — the network id order on every side running the same mods. |
 | Game rules and categories | `game_rule_bool`, `game_rule_category` | Startup, before the game validates and installs the rule schema | When the game uses the installed schema to load rule values and build the rule UI. |
-| Dimension, chunk generation and biome source code, structure types, ticket controllers | `register_dimension`, `register_chunk_generator`, `register_biome_source`, `register_structure_type`, `register_ticket_controller` | Startup declarations, consumed by world setup and generation | When the world resolves its dimension, structure or ticket registrations. |
+| Dimension, chunk generation, biome source and density function code, structure types, ticket controllers | `register_dimension`, `register_chunk_generator`, `register_biome_source`, `register_density_function_type`, `register_structure_type`, `register_ticket_controller` | Startup declarations, consumed by world setup and generation | When the world resolves its dimension, structure or ticket registrations; a density function type when density JSON naming it loads. |
 | Controls bindings | `Registrar::register_key_mapping` | Startup registration, client consumer | When the client installs the bindings in Controls and restores saved bindings. |
 | Component tooltips | `Registrar::register_tooltip_appender` | Startup registration, client consumer | The item tooltip builder uses the callback for the registered component and placement. |
 | Server commands | `Hooks::register_commands` collects `Command` usages | Server, when opening a world and on explicit command refresh | After the server rebuilds the command tree. The server owns permission checks and sends the tree to players. |
@@ -216,12 +216,11 @@ A wasm mod keeps running on a newer game while the hooks it imports are unchange
 always builds for `wasm32-unknown-unknown`: a hook that needs an engine type takes a plain-data type of the
 API's own, converted on the game side.
 
-## Injections stay, and the API comes first
+## The API comes first
 
-`[[inject]]` is the shared native/wasm escape hatch for what the API does not yet reach. The rule is
-API first: a mod needing something the API lacks asks for the hook that replaces the injection, and the
-injection is the stopgap until it exists. The [injections chapter](../../modding/src/concepts/injections.md) holds the current forms,
-the decision ladder and the hook-request format.
+A mod needing something the API lacks asks for the hook. `[[inject]]`, the native/wasm escape hatch at
+generated injection points, was removed unused (#19547, #19576); a native mod that cannot wait takes the
+native route.
 
 ## The order of the build route
 
@@ -230,15 +229,12 @@ rests on the one before:
 
 1. **The prebuilt game.** The game as a dylib with its metadata, built daily and published as prerelease
    builds, so a native mod compiles against it instead of rebuilding the game.
-2. **Slots.** `[[inject]]` listeners fill compiled points without compiling game code.
-   A missing slot is refused, including on native.
-3. **The internals tier.** A per-mod declared list of game internals the prebuilt game exposes. It is native
+2. **The internals tier.** A per-mod declared list of game internals the prebuilt game exposes. It is native
    only and logged, and each internal a mod needs is a request for an API.
-4. **Wasm points.** API `[[inject]]` listeners use the same records on native and wasm.
    Engine internals and listed call sites are native only.
 
 A native mod that needs a supported source edit uses [mixins](../../modding/src/concepts/native-route/2-mixins.md),
-which compile game code. An inject never falls back to one.
+which compile game code.
 
 ## No telemetry
 

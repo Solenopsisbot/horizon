@@ -12,6 +12,7 @@ fn with_input_context<T>(run: impl FnOnce(&mut TickCtx<'_>) -> T) -> T {
         next_entity: &mut next_entity,
         spawn: [0.5, 64.0, 0.5],
         spawn_angle: [0.0; 2],
+        spawn_dimension: "minecraft:overworld",
         difficulty: 2,
         difficulty_locked: false,
         clock_rate: 1.0,
@@ -62,12 +63,14 @@ fn leaving_physical_guest_keeps_then_discards_its_queued_input_credit() {
     let provider = hub.lan.shared.events.clone();
     publish_packet(&hub, S::Punch(horizon_protocol::packets::Empty));
     let conn = hub.guests[0].conn;
+    let uuid = hub.guests[0].uuid;
     provider
         .send(NetEvent::Left(conn, "test departure".into()))
         .unwrap();
     with_input_context(|ctx| {
         let events = hub.poll(ctx);
         assert!(hub.guests.is_empty());
+        assert!(hub.player_logout_pending(uuid));
         assert!(provider.stats().reserved_bytes > 0);
         assert!(
             events
@@ -75,6 +78,7 @@ fn leaving_physical_guest_keeps_then_discards_its_queued_input_credit() {
                 .any(|e| matches!(e, HostEvent::Left(g) if g.conn == conn && g.inbox.len() == 1))
         );
         drop(events);
+        assert!(!hub.player_logout_pending(uuid));
         assert_eq!(provider.stats().reserved_bytes, 0);
     });
 }

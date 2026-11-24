@@ -261,7 +261,12 @@ pub fn apply(
 pub fn changeable_remotely(key: &str) -> bool {
     // Checked as written, but applied trimmed (parse_change): a key with any space in it,
     // " engine.path" for one, would pass here as another section and be written as itself.
-    if key.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    // A `=` is refused too: "{key}={value}" is split at the first one, so "anticheat.strikes="
+    // would be judged as the field `strikes=` and applied as the refused `anticheat.strikes`.
+    if key
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '=')
+    {
         return false;
     }
     let (section, field) = key.split_once('.').unwrap_or((key, ""));
@@ -308,6 +313,9 @@ mod tests {
             "chat_filter.words_file",
             "anticheat.log",
             "anticheat.strikes",
+            "anticheat.strikes=",
+            "engine.path=x",
+            "properties.rcon.password=",
         ] {
             assert!(!changeable_remotely(key), "{key:?}");
         }
@@ -605,5 +613,43 @@ mod tests {
         assert!(set(&dir, &["world.name=a/b", "server.port=1"]).is_err());
         assert_eq!(config::Config::load(&dir).unwrap(), cfg);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `horizon-server help` says which settings `config set` gives a running server at once; every setting it
+    /// names has a way to apply it (`live_line`), and `view_distance`, which has none, is not named.
+    #[test]
+    fn the_help_names_what_config_set_applies_at_once() {
+        let help = crate::HELP;
+        let paragraph = &help[help.find("  config set").unwrap()..];
+        let paragraph = &paragraph[..paragraph.find("  import FILE").unwrap()];
+        let (text, number) = (
+            |s: &str| toml::Value::String(s.into()),
+            |n| toml::Value::Integer(n),
+        );
+        for (named, section, field, value) in [
+            ("difficulty", "world", "difficulty", text("hard")),
+            ("default game mode", "world", "game_mode", text("creative")),
+            (
+                "whitelist",
+                "server",
+                "whitelist",
+                toml::Value::Boolean(true),
+            ),
+            ("message of the day", "server", "motd", text("Hi")),
+            ("player limit", "server", "max_players", number(8)),
+            ("backup", "backups", "keep", number(3)),
+            ("update", "updates", "keep", number(2)),
+        ] {
+            assert!(
+                live_line(section, field, &value).is_some(),
+                "{section}.{field} is applied at once"
+            );
+            assert!(
+                paragraph.contains(named),
+                "the help names {named:?}: {paragraph}"
+            );
+        }
+        assert!(live_line("server", "view_distance", &number(8)).is_none());
+        assert!(!paragraph.contains("view distance"));
     }
 }

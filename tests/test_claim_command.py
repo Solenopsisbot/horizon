@@ -1,6 +1,8 @@
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from tools.ci import claim_command as cc
 from tools.ci import nightly_set as ns
@@ -131,6 +133,34 @@ class ClaimTests(unittest.TestCase):
         self.assertEqual(api.calls, [])
         do("/claim", Fake(claims=cc.MAX_CLAIMS - 1))
 
+    def test_only_the_claimants_own_pull_request_lifts_an_issue_off_the_limit(self):
+        def closing(*authors, more=False):
+            return {"pageInfo": {"hasNextPage": more, "endCursor": "k" if more else None},
+                    "nodes": [{"author": {"login": a} if a else None} for a in authors]}
+
+        def node(number, *authors, more=False):
+            return {"number": number, "closedByPullRequestsReferences": closing(*authors, more=more)}
+
+        # The claimant's pull request is the eleventh on issue 5: it is on the connection's second page.
+        nodes = [node(1), node(2, "someone-else"), node(3, "Newcomer"), node(4, "someone-else", "newcomer"),
+                 node(5, *["someone-else"] * 10, more=True), node(6, None)]
+        pages = [{"pageInfo": {"hasNextPage": True, "endCursor": "c"}, "nodes": nodes[:2]},
+                 {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes[2:]}]
+        asked = []
+
+        def gh(*args, **kwargs):
+            asked.append(args)
+            if any(a == "number=5" for a in args):
+                return json.dumps({"data": {"repository": {"issue": {
+                    "closedByPullRequestsReferences": closing("newcomer")}}}})
+            return json.dumps({"data": {"repository": {"issues": pages[sum("login=newcomer" in a for a in asked) - 1]}}})
+
+        with mock.patch.object(cc, "gh", gh):
+            # Not linked, linked by another account, a deleted account: counted. Linked by the claimant, on the
+            # first page or a later one: not.
+            self.assertEqual(cc.Api("o/r").open_claims("newcomer"), 3)
+        self.assertEqual(len(asked), 3)
+
     def test_team_has_no_limit_unless_paused(self):
         do("/claim", Fake(claims=50), login="ludovic111")
         do("/claim", Fake(claims=50), login="RdbtCVS")
@@ -229,6 +259,12 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(cc.stale_claims(node(events=[assigned("dev", 9), mentioned("CLOSED")]), NOW), ["dev"])
         self.assertEqual(cc.stale_claims(node(events=[assigned("dev", 9), {"__typename": "CrossReferencedEvent",
                                                                           "source": {}}]), NOW), ["dev"])
+
+    def test_a_saturated_timeline_window_keeps_the_claim(self):
+        # With `last: 100`, an open PR link older than the newest 100 events is invisible. Keep the claim
+        # rather than unassigning a contributor whose protection we cannot see.
+        full = [assigned("other", 1) for _ in range(cc.TIMELINE_WINDOW)]
+        self.assertEqual(cc.stale_claims(node(events=[assigned("dev", 6), *full]), NOW), [])
 
     def test_release_unassigns_and_says_why(self):
         class Api(Fake):

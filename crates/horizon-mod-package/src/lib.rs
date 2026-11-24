@@ -15,6 +15,8 @@ pub mod icon;
 pub mod index;
 pub mod install_lock;
 pub mod internals;
+#[cfg(all(windows, feature = "junction"))]
+pub mod junction;
 pub mod layouts;
 #[cfg(all(
     feature = "runtime-process",
@@ -44,4 +46,4 @@ pub use manifest::{Capability, Manifest, Package, find};
 #[cfg(feature = "prebuilt")]
 pub use mod_surface;
 /// The SDK's build-pinned data files and their common header.
-pub use point_shape::build_data;
+pub use mod_surface::build_data;

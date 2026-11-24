@@ -12,7 +12,7 @@ numeric ID, never by login), on the first line:
     /label bug, good first issue       existing labels only; never creates one
     /unlabel bug
 
-Refused with a one-line answer: a label with `release` in it or `full-parity`; anything by a council member (their
+Refused with a one-line answer: a label with `release` in it, `full-parity`, `run-parity`, or removing `needs-proof`; anything by a council member (their
 issues and pull requests); a merged pull request; a locked thread; more than 60 actions per reviewer in 24 hours. No
 code of any pull request is read or run: only the comment's text, its author and the API's answers, which reach this
 script as env vars.
@@ -61,6 +61,8 @@ def safe(text: str) -> str:
 def parse(body: str) -> Command | None:
     """The command on a comment's first line; None when it isn't one. Raises Refused when it is one, but wrong."""
     line = next((line.strip() for line in body.splitlines() if line.strip()), "")
+    # Agents start every comment with "🤖 Agent:" (AGENTS.md), so their `/close` follows it, as in claim_command.
+    line = re.sub(r"^🤖\s*Agent:\s*", "", line)
     m = re.match(r"^/(\w+)(?:\s+(.*))?$", line)
     if not m or m.group(1).lower() not in COMMANDS:
         return None
@@ -89,10 +91,14 @@ def parse(body: str) -> Command | None:
     return Command(verb, labels=names)
 
 
-def label_refusal(name: str) -> str | None:
+def label_refusal(name: str, verb: str = "label") -> str | None:
     low = name.lower()
     if "release" in low or low == "full-parity":
         return f"`{safe(name)}` is a release or parity label: only the council touches those."
+    # run-parity runs a fork's code on the Mac mini once a maintainer has read it; needs-proof holds a risky pull
+    # request back until its proof is in, so a reviewer may add it but not lift it.
+    if low == "run-parity" or (low == "needs-proof" and verb == "unlabel"):
+        return f"`{safe(name)}` is a gate on what runs or merges: only the council touches it this way."
     return None
 
 
@@ -138,6 +144,11 @@ def gh(*args: str, check: bool = True) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def encode_label(name: str) -> str:
+    """One URL path segment: `/` would otherwise become a path segment of its own."""
+    return name.replace("/", "%2F").replace(" ", "%20")
+
+
 class Api:
     """The few GitHub calls this needs; tests replace it."""
 
@@ -150,7 +161,7 @@ class Api:
 
     def label(self, name: str) -> str | None:
         """The label's real name, or None when the repository has no such label."""
-        raw = gh("api", f"repos/{self.repo}/labels/{name.replace('/', '%2F').replace(' ', '%20')}", check=False)
+        raw = gh("api", f"repos/{self.repo}/labels/{encode_label(name)}", check=False)
         return json.loads(raw)["name"] if raw else None
 
     def add_labels(self, n: int, names: list[str]) -> None:
@@ -160,7 +171,7 @@ class Api:
         gh(*args)
 
     def remove_label(self, n: int, name: str) -> None:
-        gh("api", "-X", "DELETE", f"repos/{self.repo}/issues/{n}/labels/{name.replace(' ', '%20')}")
+        gh("api", "-X", "DELETE", f"repos/{self.repo}/issues/{n}/labels/{encode_label(name)}")
 
     def close(self, n: int, reason: str | None) -> None:
         args = ["api", "-X", "PATCH", f"repos/{self.repo}/issues/{n}", "-f", "state=closed"]
@@ -184,10 +195,10 @@ class Api:
 def actions_by(api, login: str, now: datetime) -> int:
     """Actions this workflow answered for `login` in the last 24 h, counted from its own comments."""
     since = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    tag = f"on behalf of @{login.lower()}"
+    tag = re.compile(rf"on behalf of @{re.escape(login.lower())}(?![a-z0-9-])")
     return sum(1 for c in api.recent_comments(since)
                if c["user"] == "github-actions[bot]" and c["body"].startswith(PREFIX)
-               and c["body"].split("\n", 1)[0].lower().count(tag))
+               and tag.search(c["body"].split("\n", 1)[0].lower()))
 
 
 def say(action: str, login: str, url: str) -> str:
@@ -199,7 +210,7 @@ def run(api, cmd: Command, actor: ns.Actor, number: int, url: str, reviewers: ns
     authorize(actor, reviewers)
     login = actor.login
     for name in cmd.labels:
-        if (why := label_refusal(name)):
+        if (why := label_refusal(name, cmd.verb)):
             raise Refused(why)
     issue = api.issue(number)
     if issue is None:
@@ -231,7 +242,7 @@ def run(api, cmd: Command, actor: ns.Actor, number: int, url: str, reviewers: ns
         found = api.label(name)
         if found is None:
             raise Refused(f"There is no label `{safe(name)}` in Horizon: triage doesn't create new ones.")
-        if (why := label_refusal(found)):
+        if (why := label_refusal(found, cmd.verb)):
             raise Refused(why)
         real.append(found)
     if cmd.verb == "label":

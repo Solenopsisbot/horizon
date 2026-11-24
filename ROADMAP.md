@@ -78,8 +78,6 @@ Owner: [levzzz5154](https://github.com/levzzz5154) · Tracking: [#3911](https://
 
 One item for all modding work ([#3911](https://github.com/horizon-rust/horizon/issues/3911)), led by levzzz5154; the order between the parts is theirs. Native mods on stable hook points (game/native_hooks.rs, [#3345](https://github.com/horizon-rust/horizon/issues/3345), [#3346](https://github.com/horizon-rust/horizon/issues/3346), [#3434](https://github.com/horizon-rust/horizon/issues/3434), [#3435](https://github.com/horizon-rust/horizon/issues/3435)) built by the launcher ([#3388](https://github.com/horizon-rust/horizon/issues/3388), [#3855](https://github.com/horizon-rust/horizon/issues/3855)); server-side hooks ([#3878](https://github.com/horizon-rust/horizon/issues/3878), [#3706](https://github.com/horizon-rust/horizon/issues/3706)); mod-owned screens, input and drawing; tools for mod makers (templates, `native.py check`); the registry ([#1634](https://github.com/horizon-rust/horizon/issues/1634), [#1642](https://github.com/horizon-rust/horizon/issues/1642), [#1659](https://github.com/horizon-rust/horizon/issues/1659)); machines with inventories and menus ([#1189](https://github.com/horizon-rust/horizon/issues/1189)); mods that read and change the world through the server. [docs/modding/src/how-to/native-mods.md](docs/modding/src/how-to/native-mods.md).
 
-More: [https://github.com/arismoko/horizon/issues/3855](https://github.com/arismoko/horizon/issues/3855) · [https://github.com/arismoko/horizon/issues/3351](https://github.com/arismoko/horizon/issues/3351) · [https://github.com/arismoko/horizon/issues/3353](https://github.com/arismoko/horizon/issues/3353) · [https://github.com/arismoko/horizon/issues/3360](https://github.com/arismoko/horizon/issues/3360) · [https://github.com/arismoko/horizon/issues/3706](https://github.com/arismoko/horizon/issues/3706) · [https://github.com/arismoko/horizon/issues/3878](https://github.com/arismoko/horizon/issues/3878) · [https://github.com/arismoko/horizon/issues/3345](https://github.com/arismoko/horizon/issues/3345) · [https://github.com/arismoko/horizon/issues/3346](https://github.com/arismoko/horizon/issues/3346) · [https://github.com/arismoko/horizon/issues/3388](https://github.com/arismoko/horizon/issues/3388) · [https://github.com/arismoko/horizon/issues/3434](https://github.com/arismoko/horizon/issues/3434) · [https://github.com/arismoko/horizon/issues/3435](https://github.com/arismoko/horizon/issues/3435) · [https://github.com/arismoko/horizon/issues/1634](https://github.com/arismoko/horizon/issues/1634) · [https://github.com/arismoko/horizon/issues/1642](https://github.com/arismoko/horizon/issues/1642) · [https://github.com/arismoko/horizon/issues/1659](https://github.com/arismoko/horizon/issues/1659) · [https://github.com/arismoko/horizon/issues/1596](https://github.com/arismoko/horizon/issues/1596) · [https://github.com/arismoko/horizon/issues/1635](https://github.com/arismoko/horizon/issues/1635)
-
 </details>
 
 ### Gameplay parity
@@ -150,7 +148,7 @@ New public numbers comparing Horizon with vanilla on many kinds of computers, me
 
 <details><summary>Technical</summary>
 
-Redo the comparison after the current performance work ([#1073](https://github.com/horizon-rust/horizon/issues/1073)); reliability, coverage and presentation ([#1346](https://github.com/horizon-rust/horizon/issues/1346)); a scene must count as loaded only once its first chunk arrives ([#1749](https://github.com/horizon-rust/horizon/issues/1749)). Next: a performance history across releases (an automatic comparison of each release with the last, on a timeline), more report fields (server TPS and MSPT, power, battery drain, temperature, throttling) and more hardware (a MacBook on battery, low-end laptops, community reports). Players' reports come in through `--benchmark` and `horizon-launcher data benchmark` ([docs/benchmark.md](docs/benchmark.md)).
+Redo the comparison after the current performance work ([#1073](https://github.com/horizon-rust/horizon/issues/1073)); reliability, coverage and presentation ([#1346](https://github.com/horizon-rust/horizon/issues/1346)); a scene must count as loaded only once its first chunk arrives ([#1749](https://github.com/horizon-rust/horizon/issues/1749)). Next: a performance history across releases (an automatic comparison of each release with the last, on a timeline), more report fields (server TPS and MSPT, power, battery drain, temperature, throttling) and more hardware (a MacBook on battery, low-end laptops, community reports). Server scale is published in [#12930](https://github.com/horizon-rust/horizon/issues/12930) and [docs/performance/server-vs-vanilla.md](docs/performance/server-vs-vanilla.md). Players' reports come in through `--benchmark` and `horizon-launcher data benchmark` ([docs/benchmark.md](docs/benchmark.md)).
 
 </details>
 
@@ -386,8 +384,6 @@ Making mods that add machines, magic and mobs work in Horizon, in steps, startin
 
 333 of the 496 mods in a big pack (ATM10) contain code. Issue [#1854](https://github.com/horizon-rust/horizon/issues/1854) ranks the gaps (ticking block entities, networking, rendering, menus, inventories) that unlock them in tiers, with machines first as the recommended path. Code mods are native mods now ([docs/modding/src/how-to/native-mods.md](docs/modding/src/how-to/native-mods.md)): each port is a horizon-mixins bundle. The path isn't started yet ([docs/modpacks.md](docs/modpacks.md)).
 
-More: [https://github.com/arismoko/horizon/issues/1854](https://github.com/arismoko/horizon/issues/1854)
-
 </details>
 
 #### Data packs in the mod browser
@@ -474,7 +470,7 @@ Install and run a Horizon dedicated server from a terminal with a single command
 
 <details><summary>Technical</summary>
 
-A player's idea (#horizon-ideas). `horizon-server` already runs headless; left: an install script (Linux/macOS shell, Windows PowerShell) that fetches the signed release, checks it, asks for or points at the player's own game files and starts the server, documented in [docs/hosting.md](docs/hosting.md).
+A player's idea (#suggestions). `horizon-server` already runs headless; left: an install script (Linux/macOS shell, Windows PowerShell) that fetches the signed release, checks it, asks for or points at the player's own game files and starts the server, documented in [docs/hosting.md](docs/hosting.md).
 
 </details>
 
@@ -764,7 +760,7 @@ Install Horizon on NixOS through a Nix flake.
 
 <details><summary>Technical</summary>
 
-A player's idea (#horizon-ideas). The launcher's AppImage ships with each launcher release ([packaging/linux/appimage.sh](packaging/linux/appimage.sh)): one file with the libraries GPUI needs, which replaces itself when it updates. A flake.nix packaging the release binaries with their runtime libraries (Vulkan loader, X11/Wayland, ALSA) is still missing, the way horizon-parity's NixOS setup runs them today.
+A player's idea (#suggestions). The launcher's AppImage ships with each launcher release ([packaging/linux/appimage.sh](packaging/linux/appimage.sh)): one file with the libraries GPUI needs, which replaces itself when it updates. A flake.nix packaging the release binaries with their runtime libraries (Vulkan loader, X11/Wayland, ALSA) is still missing, the way horizon-parity's NixOS setup runs them today.
 
 </details>
 
@@ -788,7 +784,7 @@ An optional look for the game's own menus and options that matches the Horizon l
 
 <details><summary>Technical</summary>
 
-A player's idea (#horizon-ideas). A built-in resource pack or a Horizon setting that restyles the title, pause and options screens with the launcher's design tokens (crates/horizon-theme), following [docs/design-system.md](docs/design-system.md); off by default because it changes the vanilla look.
+A player's idea (#suggestions). A built-in resource pack or a Horizon setting that restyles the title, pause and options screens with the launcher's design tokens (crates/horizon-theme), following [docs/design-system.md](docs/design-system.md); off by default because it changes the vanilla look.
 
 </details>
 

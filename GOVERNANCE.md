@@ -108,7 +108,7 @@ council matter.
 | **🧭 Server & SMP lead** | The server's settings, by the written rules (backup first, warning in game) | As every lead | A panel sub-user once a council accounts poll gives one | As every lead |
 | **🧭 Group lead** | The group's free actions; gives and removes its helper role | In the group's channels: delete messages, manage and pin threads, ping the group; the helper role through Kira | — | Triage on the group's labels through Kira (no repository role) |
 | **🌌 Horizon Team** | Merges; elects Team members | #horizon-team and the staff channels. The role still carries timeout and delete; whether it keeps them is a mod matter | — | `horizon-team`: write on horizon, horizon-mods, horizon-mixins, horizon-native-mod-template and horizon-server; also kira and horizon-site if P37 passes |
-| **🔧 Server Manager** | — | Manage Channels and Manage Roles (the server's layout); given by council poll | — | — |
+| **🔧 Server Manager** | — | Manage Channels and Manage Roles for the server layout. Manage Server for Community Onboarding and the Server Guide. Given by council poll | — | — |
 | **🏛️ Council** | Council polls, vetoes, emergencies (any 2) | A moderator's permissions plus Ban, mention @everyone and pin; #council | Panel sub-users for two members if P38 passes | The `council` team: code-owner reviews and the release tools' owner powers if P35 passes, security managers if P36 passes; a second organisation owner if P28 passes |
 | **Account holder** (the founder) | Carries out decisions on his accounts (section 11) | Server owner | The panel's owner account | Organisation owner |
 
@@ -278,7 +278,7 @@ measures the work, and only people above a floor can be nominated. Their body th
 
 | Signal | What counts | Source |
 | --- | --- | --- |
-| **Merged pull requests** | Pull requests merged in a public horizon-rust repo. For Modding, also in the mod API's fork (arismoko/horizon). Counted overall, and per group by label or by files touched | GitHub search, as the ranks are counted today |
+| **Merged pull requests** | Pull requests merged in a public horizon-rust repo. Counted overall, and per group by label or by files touched | GitHub search, as the ranks are counted today |
 | **Reviews** | Others' pull requests you reviewed: approved, asked for changes, or left a review with comments. One per pull request | GitHub search `reviewed-by:` and Kira's GitHub webhook |
 | **Triage** | Triage commands run (`/label`, `/close`, duplicates), issues labelled or closed, bug posts routed on Discord | The triage workflow's comments and Kira's webhook |
 | **Support answers** | #horizon-support posts you answered that ended solved | Kira's support feature |
@@ -400,7 +400,7 @@ holder or an org owner removes GitHub access when the Team role ends.
 
 | Group | Covers | GitHub | Discord |
 | --- | --- | --- | --- |
-| **Modding** | The mod API, native and content mods, mixins, the mod registry, `cargo horizon-mod` | The mod API lives in Ari's fork **arismoko/horizon**. Its owner runs that repo by their own rules; the council governs only what is Horizon's: horizon-rust/horizon-mods, horizon-mixins, horizon-native-mod-template, the registry. Label `mods` | The 🧩 MODDING category (#modding, #horizon-modding-team); roles 🧩 Modder (picked) and 🧩 Horizon Modding Team (the lead gives it) |
+| **Modding** | The mod API, native and content mods, mixins, the mod registry, `cargo horizon-mod` | The mod API lives in horizon-rust/horizon, beside horizon-rust/horizon-mods, horizon-mixins, horizon-native-mod-template and the registry. Label `mods` | The 🧩 MODDING category (#modding, #horizon-modding-team); roles 🧩 Modder (picked) and 🧩 Horizon Modding Team (the lead gives it) |
 | **Shaders and rendering** | The renderer, shaders, shader packs, OptiFine and Polytone pack formats | Label `rendering`; `crates/horizon-client-render` (gfx), `*.wgsl`, `horizon-shaders`, `horizon-shader-api`, `horizon-optifine`, `horizon-polytone` | #shaders-rendering |
 | **Performance** | Frame rate, memory, server tick, benchmarks | Label `perf`; `horizon-bench`, the benchmark tools | #performance |
 | **Launcher** | The launcher: installs, updates, instances, its pages | Label `launcher`; `launcher/` | #launcher |

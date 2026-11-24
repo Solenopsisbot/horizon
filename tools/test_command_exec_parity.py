@@ -12,6 +12,9 @@ command reported to the player's CommandResultCallback. World, entity and item
 changes are observed through probe commands whose feedback reports them
 (execute if, clear with a zero count, data get, scoreboard queries...).
 Messages that depend on time or a random UUID are compared after masking.
+The explicitly scoped vanilla_help comparison projects declared Horizon-only
+native root usage after checking its complete raw callback count; both raw
+captures and the projection boundary are retained in the report.
 Direct falling-block probes also compare the physical entities in each level,
 independently of the command selector's support for those entity types.
 """
@@ -27,11 +30,12 @@ import sys
 import zipfile
 
 try:
-    from . import lab, test_rust_parity as base
+    from . import fast_bins, lab, test_rust_parity as base
     from .integration_env import run_game
     from . import command_exec_corpus as corpus_module
     from . import seed_agent
 except ImportError:
+    import fast_bins
     import lab
     import seed_agent
     from integration_env import run_game
@@ -39,6 +43,11 @@ except ImportError:
     import command_exec_corpus as corpus_module
 
 SEED = 1
+
+# vanilla::session_dispatcher adds this documented platform command outside the
+# reference vanilla dispatcher. Do not infer exclusions from unexpected output:
+# any new extension must be declared here explicitly.
+HORIZON_ONLY_COMMAND_ROOTS = frozenset({'modprofile'})
 
 
 def install_datapack_fixtures(world, predicates, functions, jar, advancements=None, loot_tables=None, recipes=None):
@@ -135,6 +144,7 @@ def main():
     parser.add_argument('--item-contents-fixture', action='store_true')
     parser.add_argument('--item-contents-provider-empty-control', action='store_true')
     parser.add_argument("--boat-item-hit-fixture", action="store_true")
+    parser.add_argument("--boat-void-fixture", action="store_true")
     parser.add_argument("--stand-entity-collision-fixture", action="store_true")
     parser.add_argument("--reference-only", action="store_true")
     parser.add_argument("--boat-leash-view-fixture", action="store_true")
@@ -187,6 +197,7 @@ def main():
     parser.add_argument('--mob-absorption-infinite-fixture', action='store_true', help='infinite Absorption used up, kept, and beside another infinite effect')
     parser.add_argument('--mob-absorption-raw-diagnostic', action='store_true', help='add each mob\'s whole entity data')
     parser.add_argument("--mob-pickup-save-fixture", action="store_true")
+    parser.add_argument('--merchant-restock-fixture', action='store_true')
     parser.add_argument('--merchant-crafted-fixture', action='store_true')
     parser.add_argument('--mob-name-presentation-diagnostic', action='store_true',
                         help='retain all 312 mob-name records, including ten separate name/saved-text presentation observations')
@@ -453,6 +464,9 @@ def main():
     if args.selector_bounds_fixture:
         from selector_bounds_corpus import selector_bounds
         groups = [("setup", corpus_module.group_setup()), ("selector entity bounds", selector_bounds())]
+    if args.merchant_restock_fixture:
+        from merchant_restock_corpus import cases
+        groups = [('merchant live restock', cases())]
     if args.baby_modifier_fixture:
         from baby_modifier_corpus import baby_modifier
         groups = [('setup', corpus_module.group_setup()), ('baby modifier mutation', baby_modifier(args.baby_modifier_raw_diagnostic))]
@@ -507,6 +521,9 @@ def main():
     if args.merchant_gate_fixture:
         from merchant_gate_corpus import cases
         groups = [('setup', [corpus_module.cmd('/tick freeze', False), *corpus_module.group_setup()]), ('merchant reputation AI gate', cases())]
+    if args.boat_void_fixture:
+        from test_boat_void_parity import program as boat_void_program
+        groups = [('Boat load and void removal', boat_void_program())]
     if args.groups_file:
         # Generated scripts (tools/parity_fuzz.py): the common setup, then the file's [name, ops] groups only.
         groups = [('setup', corpus_module.group_setup()),
@@ -556,6 +573,8 @@ def main():
         direct_input = build / 'orb-water-inputs.json'
         direct_input.write_text(json.dumps(arithmetic_inputs()), encoding='utf-8')
         java_options = ['-Dhorizon.orbWaterArithmetic=' + str(direct_input)]
+    if args.merchant_restock_fixture:
+        java_options += ['-Dhorizon.merchantFixture=true']
     if args.function_admission_fixture:
         java_options.append('-Dhorizon.functionAdmissionFixture=true')
     if synced:
@@ -598,7 +617,7 @@ def main():
     if args.binary:
         binary = args.binary.resolve(strict=True)
     else:
-        run(['cargo', 'build', '--profile', 'fast', '-p', 'horizon-game', '--bin', 'horizon-client'], 'compile-rust', cwd=lab.ROOT)
+        run(fast_bins.command('horizon-client'), 'compile-rust', cwd=lab.ROOT)
         metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'], cwd=lab.ROOT, text=True))
         binary = Path(metadata['target_directory']) / 'fast' / ('horizon-client.exe' if os.name == 'nt' else 'horizon-client')
     rust_dir = build / 'rust'
@@ -623,7 +642,7 @@ def main():
     if args.loaded_fixture:
         env['HORIZON_HARNESS_LOADED_FIXTURE'] = '1'
         env['HORIZON_HARNESS_CLIENT_CONFIG'] = str(build / 'rust-client-config.json')
-    run([binary, '--resources', lab.RESOURCES, '--world', 'harness', '--seed', SEED, '--radius', 2 if args.loaded_fixture else 4], 'rust', game=True, cwd=rust_dir, env=env)
+    run([binary, '--resources', Path(os.environ.get('HORIZON_TEST_RESOURCES', lab.RESOURCES)), '--world', 'harness', '--seed', SEED, '--radius', 2 if args.loaded_fixture else 4], 'rust', game=True, cwd=rust_dir, env=env)
 
     if any(op['op'] == 'raid_state' for op in script):
         from raid_village_corpus import validate_native_inputs
@@ -640,7 +659,7 @@ def main():
         java = json.loads((build / 'client_config.json').read_text())
         if java.get('server_view') != 2 or java.get('server_simulation') != 2 or not java.get('client_loaded'):
             sys.exit(f'Java server/client-loaded prerequisite failed: {java}')
-        if not args.merchant_gate_fixture:
+        if any(name == 'loaded ticket removal' for name, _ in groups):
             for name in ['java.log', 'rust.log']:
                 waits = re.findall(r'harness paced wait: (\d+) ticks, (\d+) ms', (build / name).read_text())
                 if len(waits) != 2 or any(int(n) != ticks or not ticks * 50 <= int(ms) <= upper
@@ -688,7 +707,7 @@ def main():
     failed_positions = set()
     for position, (v, r) in enumerate(zip(vanilla, rust)):
         assert v['cmd'] == r['cmd'], (v['cmd'], r['cmd'])
-        kind = ('strict_record' if v != r else None) if args.merchant_gate_fixture or args.merchant_crafted_fixture else compare(v, r, recorded_ops[position].get('comparison'))
+        kind = ('strict_record' if v != r else None) if args.merchant_gate_fixture or args.merchant_crafted_fixture or args.merchant_restock_fixture else compare(v, r, recorded_ops[position].get('comparison'))
         if kind:
             failed_positions.add(position)
             mismatches.append({'kind': kind, 'cmd': v['cmd'], 'vanilla': v, 'rust': r})
@@ -712,7 +731,11 @@ def main():
                   {'cmd': op['cmd'], 'comparison': op['comparison'],
                    'vanilla_results': v['results'], 'rust_results': r['results']}
                   for op, v, r in zip(recorded_ops, vanilla, rust) if op.get('comparison')],
-              'scope': 'Feedback and failure messages (text and resolved style), chat lines, and CommandResultCallback results of commands run by the single-player owner of an integrated server; world, entity and item effects through probe commands. Explicit positive_result operations compare presence only; their unmodified raw counts remain in the records and comparison_overrides.'}
+              'vanilla_help_projection': {
+                  'excluded_native_roots': sorted(HORIZON_ONLY_COMMAND_ROOTS),
+                  'native_count_guard': 'One successful integer callback must equal the complete raw usage-line count before subtracting excluded lines.',
+                  'raw_records': ['vanilla.jsonl', 'rust.jsonl']},
+              'scope': 'Feedback and failure messages (text and resolved style), chat lines, and CommandResultCallback results of commands run by the single-player owner of an integrated server; world, entity and item effects through probe commands. Explicit positive_result operations compare presence only; vanilla_help projects only declared Horizon-only native root usage after validating the complete raw callback count. Vanilla expected records are unchanged; unmodified raw counts remain in the records and comparison_overrides.'}
     for override in report['comparison_overrides']:
         print(f'{override["comparison"]}: {override["cmd"]}: '
               f'Java {override["vanilla_results"]}, Horizon {override["rust_results"]}', flush=True)
@@ -860,10 +883,26 @@ def unordered_attributes(record):
 
 
 def masked(record):
-    text = json.dumps(record['messages'], ensure_ascii=False)
-    # GameRuleCommand registers the rules in identity-hash order, different
-    # in every JVM: compare /help's gamerule alternatives as a set.
-    text = GAMERULES.sub(lambda m: '/gamerule (' + '|'.join(sorted(m.group(1).split('|'))) + ')', text)
+    messages = record['messages']
+    if record.get('cmd') == '/help':
+        messages = json.loads(json.dumps(messages))
+        for line in messages:
+            if len(line) != 1:
+                continue
+            match = GAMERULES.fullmatch(line[0][0])
+            if match is None:
+                continue
+            alternatives = match.group(1).split('|')
+            pairs = list(zip(alternatives[::2], alternatives[1::2]))
+            # GameRules.visitGameRuleTypes visits GameRuleMap's identity-hash
+            # keySet, not the built-in registry's insertion order. Only rule
+            # identities are unordered: GameRuleCommand.register always adds
+            # each short name immediately before its minecraft-qualified alias.
+            if len(alternatives) % 2 == 0 and all(
+                    re.fullmatch(r'[a-z0-9_./-]+', short) and qualified == 'minecraft:' + short
+                    for short, qualified in pairs):
+                line[0][0] = '/gamerule (' + '|'.join(name for pair in sorted(pairs) for name in pair) + ')'
+    text = json.dumps(messages, ensure_ascii=False)
     for pattern, replacement in MASKS:
         text = pattern.sub(replacement, text)
     return text
@@ -880,14 +919,46 @@ def positive_result(record):
     return count > 0
 
 
+def vanilla_help(record):
+    """Project native root usage, never repairing an incorrect raw callback."""
+    messages, results = record.get('messages'), record.get('results')
+    if record.get('cmd') != '/help' or not isinstance(messages, list):
+        return None
+    if (not isinstance(results, list) or len(results) != 1 or
+            not isinstance(results[0], list) or len(results[0]) != 2 or
+            results[0][0] is not True or type(results[0][1]) is not int or
+            results[0][1] != len(messages)):
+        return None
+    kept, excluded = [], set()
+    for line in messages:
+        # HelpCommand sends one literal component per root's smart usage.
+        if (not isinstance(line, list) or len(line) != 1 or
+                not isinstance(line[0], list) or len(line[0]) != 2 or
+                not isinstance(line[0][0], str) or not line[0][0].startswith('/')):
+            return None
+        root = line[0][0][1:].split(' ', 1)[0]
+        if root in HORIZON_ONLY_COMMAND_ROOTS:
+            if root in excluded:
+                return None
+            excluded.add(root)
+        else:
+            kept.append(line)
+    return {**record, 'messages': kept, 'results': [[True, results[0][1] - len(excluded)]]}
+
+
 def compare(v, r, comparison=None):
-    # Explicit per-operation scope for random counts (for example explosion
-    # fire). All raw feedback/results remain in the JSON and report; every
-    # other command still compares exact feedback, styles and results.
+    # Explicit per-operation scope retains all raw feedback/results in the JSON
+    # and report. The default still compares exact feedback, styles and results.
     if comparison == 'positive_result':
         left, right = positive_result(v), positive_result(r)
         return None if left is not None and right is not None and left == right else 'positive_result'
-    if comparison is not None:
+    if comparison == 'vanilla_help':
+        if v.get('cmd') != '/help':
+            return 'vanilla_help'
+        r = vanilla_help(r)
+        if r is None:
+            return 'vanilla_help'
+    elif comparison is not None:
         raise ValueError(f'unknown command comparison: {comparison}')
     if v.get("state") != r.get("state"):
         return "state"

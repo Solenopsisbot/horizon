@@ -7,9 +7,9 @@
 //! Also `/stop`, `/save-all`, `/save-off` and `/save-on` (StopCommand,
 //! SaveAllCommand, SaveOffCommand, SaveOnCommand), on the switches the lists
 //! share.
-use super::{Arg, Context, Game, R, Target, err};
+use super::{Arg, Context, DeferredSaveAll, Game, R, Target, command_host::profiles::ListsTarget, err};
 use horizon_client::{
-    server::user_lists::{BanEntry, NameAndId, OpEntry, WhiteEntry},
+    server::user_lists::{BanEntry, NameAndId, OpEntry},
     text::Text,
 };
 use horizon_protocol::text::translatable;
@@ -17,7 +17,7 @@ use horizon_protocol::text::translatable;
 impl Game<'_> {
     /// Commands.CommandSelection.DEDICATED: on an integrated server these do
     /// not exist.
-    fn dedicated_lists(
+    pub(super) fn dedicated_lists(
         &self,
     ) -> R<std::sync::Arc<std::sync::Mutex<super::super::dedicated::Lists>>> {
         match (&self.server_lists, self.is_dedicated_server()) {
@@ -29,30 +29,26 @@ impl Game<'_> {
     /// StopCommand: the server loop (game/interface/dedicated/mod.rs) ends after this tick.
     pub(super) fn cmd_stop(&mut self) -> R<i32> {
         let lists = self.dedicated_lists()?;
-        self.feedback(Text::translate("commands.stop.stopping", &[]));
-        lists.lock().unwrap().stop = true;
+        horizon_gameplay::commands::profiles::stop(&mut ListsTarget { game: self, lists })
+    }
+
+    pub(super) fn cmd_restart(&mut self) -> R<i32> {
+        let lists = self.dedicated_lists()?;
+        let reply = super::super::dedicated::request_restart(
+            super::super::dedicated::supervised(),
+            &mut lists.lock().unwrap().stop,
+        );
+        self.feedback(reply);
         Ok(1)
     }
 
-    /// SaveAllCommand. Every save waits for the chunks to be written, so
-    /// `flush` changes nothing.
+    /// SaveAllCommand.saveAll: `commands.save.saving` to the source, then
+    /// `commands.save.success` to it and the other operators, or the
+    /// `ERROR_FAILED` it throws (result 0) when the save did not go through.
+    /// `flush` changes nothing: every save waits for the chunks to be written.
     pub(super) fn cmd_save_all(&mut self) -> R<i32> {
-        self.dedicated_lists()?;
-        self.feedback(Text::translate("commands.save.saving", &[]));
-        Self::admit_entity_save().map_err(|_| err("commands.save.failed", &[]))?;
-        if self.lan_acting.is_some() {
-            // The acting guest's record holds the game's state until their
-            // turn ends: saving now would write it to their file.
-            // shortcut: the other operators aren't told of a guest's save, add it if anyone asks.
-            self.save_after_guest_turn = true;
-            return Ok(1);
-        }
-        self.save_game().map_err(|e| {
-            log::error!("Horizon: /save-all: {e}");
-            err("commands.save.failed", &[])
-        })?;
-        self.feedback(Text::translate("commands.save.success", &[]));
-        Ok(1)
+        let lists = self.dedicated_lists()?;
+        horizon_gameplay::commands::profiles::save_all(&mut ListsTarget { game: self, lists })
     }
 
     /// Save everything; `commands.save.success`, or `commands.save.failed` in red.
@@ -66,24 +62,52 @@ impl Game<'_> {
         }
     }
 
+    /// `cmd_save_all` for a guest, once their turn ended and their own state
+    /// is back in their record (`run_guest_command`): the success line to each
+    /// source and to the other operators, or the `ERROR_FAILED` only to them.
+    /// The turn's one save answers every `/save-all` that ran in it, each with
+    /// the feedback it decided when it ran. Returns the command's result.
+    pub(in crate::game) fn finish_deferred_save_all(
+        &mut self,
+        deferred: Vec<DeferredSaveAll>,
+        lines: &mut Vec<Text>,
+    ) -> bool {
+        let reply = self.save_all_reply();
+        let saved = reply.translation_key() == Some("commands.save.success");
+        for run in deferred {
+            // sendSuccess(line, true): a silent source sends nothing; else the
+            // source hears it when it takes success feedback
+            // (`send_command_feedback`), the operators always, and a dedicated
+            // server's console logs it (`log_admin_commands`).
+            if run.silent {
+                continue;
+            }
+            if saved {
+                if run.to_source {
+                    lines.push(reply.clone());
+                }
+                // The guest's source is a player's, not the server's.
+                self.broadcast_to_admins_read(
+                    run.who,
+                    run.to_operators,
+                    run.to_console,
+                    reply.clone(),
+                );
+            } else {
+                // sendFailure: the source alone, always (`acceptsFailure`).
+                lines.push(reply.clone());
+            }
+        }
+        saved
+    }
+
     /// SaveOffCommand and SaveOnCommand.
     pub(super) fn cmd_auto_save(&mut self, enabled: bool) -> R<i32> {
         let lists = self.dedicated_lists()?;
-        if !super::super::dedicated::set_auto_save(&lists, enabled) {
-            let already = if enabled {
-                "commands.save.alreadyOn"
-            } else {
-                "commands.save.alreadyOff"
-            };
-            return Err(err(already, &[]));
-        }
-        let done = if enabled {
-            "commands.save.enabled"
-        } else {
-            "commands.save.disabled"
-        };
-        self.feedback(Text::translate(done, &[]));
-        Ok(1)
+        horizon_gameplay::commands::profiles::auto_save(
+            &mut ListsTarget { game: self, lists },
+            enabled,
+        )
     }
 
     /// `NameAndId` of a player target.
@@ -104,7 +128,7 @@ impl Game<'_> {
     /// `GameProfileArgument.getGameProfiles`: a selector's players
     /// (`SelectorResult.getNames`, no players is an error), else the name in
     /// the user cache.
-    fn game_profiles(&mut self, ctx: &Context, name: &str) -> R<Vec<NameAndId>> {
+    pub(super) fn game_profiles(&mut self, ctx: &Context, name: &str) -> R<Vec<NameAndId>> {
         match ctx.get(name).cloned() {
             Some(Arg::Entity(s)) => {
                 let players: Vec<Target> = self
@@ -275,7 +299,9 @@ impl Game<'_> {
             }
             let removed = {
                 let mut l = lists.lock().unwrap();
-                l.ip_bans.get(&target).is_some() && l.ip_bans.remove(&target)
+                // `IpBanList.isBanned` is `StoredUserList.contains`: an entry that has
+                // expired still counts until it is removed here.
+                l.ip_bans.contains(&target) && l.ip_bans.remove(&target)
             };
             if !removed {
                 return Err(err("commands.pardonip.failed", &[]));
@@ -301,7 +327,7 @@ impl Game<'_> {
         let Some(ip) = ip else {
             return Err(err("commands.banip.invalid", &[]));
         };
-        if lists.lock().unwrap().ip_bans.get(&ip).is_some() {
+        if lists.lock().unwrap().ip_bans.contains(&ip) {
             return Err(err("commands.banip.failed", &[]));
         }
         let players: Vec<(u128, String)> = self
@@ -334,10 +360,18 @@ impl Game<'_> {
             &[lit(&ip), Self::reason_message(reason.as_deref())],
         ));
         if !players.is_empty() {
-            let names: Vec<&str> = players.iter().map(|(_, n)| n.as_str()).collect();
+            // `EntitySelector.joinNames`: `ComponentUtils.formatList(players,
+            // Entity::getDisplayName)`, the gray ", " between them.
+            let names = players
+                .iter()
+                .map(|(uuid, name)| self.player_text(name, *uuid))
+                .collect();
             self.feedback(Text::translate(
                 "commands.banip.info",
-                &[lit(&players.len().to_string()), lit(&names.join(", "))],
+                &[
+                    lit(&players.len().to_string()),
+                    horizon_client::scoreboard_cmd::format_list(names),
+                ],
             ));
         }
         for (uuid, _) in &players {
@@ -352,15 +386,10 @@ impl Game<'_> {
     /// command's result is the number of minutes.
     pub(super) fn cmd_setidle_timeout(&mut self, ctx: &Context) -> R<i32> {
         let lists = self.dedicated_lists()?;
-        let Some(Arg::Int(minutes)) = ctx.get("minutes") else {
-            return Ok(0);
-        };
-        let minutes = *minutes;
-        // DedicatedServer.setPlayerIdleTimeout: the live sweep reads it, and
-        // server.properties keeps it.
-        self.set_player_idle_timeout(&lists, minutes);
-        self.feedback(idle_timeout_reply(minutes));
-        Ok(minutes)
+        horizon_gameplay::commands::profiles::setidle_timeout(
+            &mut ListsTarget { game: self, lists },
+            ctx,
+        )
     }
 
     /// `TransferCommand.register` and `TransferCommand.transfer`: each target's
@@ -423,48 +452,11 @@ impl Game<'_> {
     /// (`banlist`), or one of them; told to the source only.
     pub(super) fn cmd_banlist(&mut self, id: &str) -> R<i32> {
         let lists = self.dedicated_lists()?;
-        let lit = |s: &str| Text::literal(s.to_owned());
-        let entries: Vec<(String, String, Option<String>)> = {
-            let l = lists.lock().unwrap();
-            let players = l
-                .bans
-                .entries()
-                .into_iter()
-                .map(|b| (b.user.name.clone(), b.source.clone(), b.reason.clone()));
-            let ips = l
-                .ip_bans
-                .entries()
-                .into_iter()
-                .map(|b| (b.user.clone(), b.source.clone(), b.reason.clone()));
-            match id {
-                "banlist.ips" => ips.collect(),
-                "banlist.players" => players.collect(),
-                _ => players.chain(ips).collect(),
-            }
-        };
-        if entries.is_empty() {
-            self.feedback_unbroadcast(Text::translate("commands.banlist.none", &[]));
-            return Ok(0);
-        }
-        self.feedback_unbroadcast(Text::translate(
-            "commands.banlist.list",
-            &[lit(&entries.len().to_string())],
-        ));
-        for (name, source, reason) in &entries {
-            self.feedback_unbroadcast(Text::translate(
-                "commands.banlist.entry",
-                &[
-                    lit(name),
-                    lit(source),
-                    Self::reason_message(reason.as_deref()),
-                ],
-            ));
-        }
-        Ok(entries.len() as i32)
+        horizon_gameplay::commands::profiles::banlist(&mut ListsTarget { game: self, lists }, id)
     }
 
     /// `BanListEntry.getReasonMessage`.
-    fn reason_message(reason: Option<&str>) -> Text {
+    pub(super) fn reason_message(reason: Option<&str>) -> Text {
         reason.map_or_else(
             || Text::translate("multiplayer.disconnect.banned.reason.default", &[]),
             |r| Text::literal(r.to_owned()),
@@ -474,131 +466,18 @@ impl Game<'_> {
     /// `WhitelistCommand`: `on`, `off`, `list`, `reload`, `add` and `remove`.
     pub(super) fn cmd_whitelist(&mut self, id: &str, ctx: &Context) -> R<i32> {
         let lists = self.dedicated_lists()?;
-        let lit = |s: &str| Text::literal(s.to_owned());
-        match id {
-            "whitelist.reload" => {
-                // PlayerList.reloadWhiteList.
-                let _ = lists.lock().unwrap().white.load();
-                self.feedback(Text::translate("commands.whitelist.reloaded", &[]));
-                self.kick_unlisted_players(&lists);
-                Ok(1)
-            }
-            "whitelist.on" => {
-                if lists.lock().unwrap().use_whitelist {
-                    return Err(err("commands.whitelist.alreadyOn", &[]));
-                }
-                self.set_using_whitelist(&lists, true);
-                self.feedback(Text::translate("commands.whitelist.enabled", &[]));
-                self.kick_unlisted_players(&lists);
-                Ok(1)
-            }
-            "whitelist.off" => {
-                if !lists.lock().unwrap().use_whitelist {
-                    return Err(err("commands.whitelist.alreadyOff", &[]));
-                }
-                self.set_using_whitelist(&lists, false);
-                self.feedback(Text::translate("commands.whitelist.disabled", &[]));
-                Ok(1)
-            }
-            "whitelist.list" => {
-                let names: Vec<String> = lists
-                    .lock()
-                    .unwrap()
-                    .white
-                    .entries()
-                    .iter()
-                    .map(|e| e.user.name.clone())
-                    .collect();
-                if names.is_empty() {
-                    self.feedback_unbroadcast(Text::translate("commands.whitelist.none", &[]));
-                } else {
-                    self.feedback_unbroadcast(Text::translate(
-                        "commands.whitelist.list",
-                        &[lit(&names.len().to_string()), lit(&names.join(", "))],
-                    ));
-                }
-                Ok(names.len() as i32)
-            }
-            _ => {
-                let add = id == "whitelist.add";
-                let targets = self.game_profiles(ctx, "targets")?;
-                let mut count = 0;
-                for target in &targets {
-                    let done = {
-                        let mut l = lists.lock().unwrap();
-                        if add {
-                            !l.white.contains(target)
-                                && l.white.add(WhiteEntry {
-                                    user: target.clone(),
-                                })
-                        } else {
-                            l.white.contains(target) && l.white.remove(target)
-                        }
-                    };
-                    if done {
-                        count += 1;
-                        let key = if add {
-                            "commands.whitelist.add.success"
-                        } else {
-                            "commands.whitelist.remove.success"
-                        };
-                        self.feedback(Text::translate(key, &[lit(&target.name)]));
-                    }
-                }
-                if count == 0 {
-                    return Err(err(
-                        if add {
-                            "commands.whitelist.add.failed"
-                        } else {
-                            "commands.whitelist.remove.failed"
-                        },
-                        &[],
-                    ));
-                }
-                if !add {
-                    self.kick_unlisted_players(&lists);
-                }
-                Ok(count)
-            }
-        }
-    }
-}
-
-/// `SetPlayerIdleTimeoutCommand.setIdleTimeout`'s reply: the minutes, or
-/// `commands.setidletimeout.success.disabled` when the timeout is off.
-fn idle_timeout_reply(minutes: i32) -> Text {
-    if minutes > 0 {
-        Text::translate(
-            "commands.setidletimeout.success",
-            &[Text::literal(minutes.to_string())],
+        horizon_gameplay::commands::profiles::whitelist(
+            &mut ListsTarget { game: self, lists },
+            id,
+            ctx,
         )
-    } else {
-        Text::translate("commands.setidletimeout.success.disabled", &[])
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::idle_timeout_reply;
+#[path = "kick_ban_names_tests.rs"]
+mod kick_ban_names_tests;
 
-    /// `SetPlayerIdleTimeoutCommand.setIdleTimeout`: minutes above zero are
-    /// named in `commands.setidletimeout.success`, and zero turns the timeout
-    /// off with `commands.setidletimeout.success.disabled`.
-    #[test]
-    fn the_idle_timeout_reply_names_the_minutes_or_says_it_is_off() {
-        let reply = idle_timeout_reply(5);
-        assert_eq!(
-            reply.translation_key(),
-            Some("commands.setidletimeout.success"),
-            "{reply:?}"
-        );
-        assert_eq!(reply.component()["with"], serde_json::json!([5]));
-        let off = idle_timeout_reply(0);
-        assert_eq!(
-            off.translation_key(),
-            Some("commands.setidletimeout.success.disabled")
-        );
-        // The disabled message takes no argument.
-        assert!(off.component().get("with").is_none(), "{off:?}");
-    }
-}
+#[cfg(test)]
+#[path = "save_all_command_tests.rs"]
+mod save_all_command_tests;

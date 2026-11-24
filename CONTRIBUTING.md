@@ -14,25 +14,21 @@ else (videos, Discord and other community material) lives elsewhere.
 suggest something. A pull request for a roadmap item carries its `roadmap:<id>` label; ideas go to the suggestion
 queue (the hub, or `/suggest` on Discord) rather than to issues, which are for bugs.
 
-**Mod-related pull requests go to [arismoko/horizon](https://github.com/arismoko/horizon)**, the fork that carries the
-mod API and reviews and merges that work. That covers the mod API, native hooks and events for mods, native mods,
-content mods (`.hmod`), mixins, wasm mods, `cargo horizon-mod`, `horizon-mods`, mod builds and the registry, and
-their docs ([mods](docs/mods.md), [native mods](docs/native-mods.md)). Open the pull request there from your usual
-branch. Mod-related pull requests opened here are closed with a pointer to it. Engine extension points that Horizon's
-own crates register (the [layer split](docs/layers.md)), resource and shader pack formats, and gameplay fixes stay
-here.
+**Mod-related pull requests are opened here, like every other.** That covers the mod API, native hooks and events
+for mods, native mods, content mods (`.hmod`), mixins, wasm mods, `cargo horizon-mod`, `horizon-mods`, mod builds and
+the registry, and their docs ([mods](docs/mods.md), [native mods](docs/native-mods.md)).
 
 ## Build it
 
 - **Prerequisites:** Rust (stable), Python 3.11+, JDK 25, git 2.38 or newer, and on Linux the ALSA and udev headers
-  (`libasound2-dev libudev-dev`).
+  (`libasound2-dev libudev-dev`; Void Linux: `base-devel pkg-config alsa-lib-devel eudev-libudev-devel`).
 - **Resources:** Horizon never downloads the game; it prepares its resources from your own copy of Minecraft 26.3, as
   described in [Build from source](docs/native-client.md#run-from-a-checkout).
 - **Commands:**
 
   ```sh
   cargo run --release -p horizon-prepare -- --prepare --server-jar ~/Downloads/server.jar
-  cargo run --release -p horizon-client
+  cargo run --release -p horizon-game
   ```
 
 - **Launcher:** its own Cargo workspace in `launcher/` (`cd launcher && cargo run`; on NixOS, `nix-shell` first).
@@ -164,8 +160,17 @@ it (edited on every push, never repeated): talk to its author in the thread befo
   (`#[cfg(test)]` modules) don't count, and neither do lines moved unchanged (same text, whitespace ignored, runs of
   3 or more lines), so a refactor that moves code can be far bigger than 3000 lines.
   pr_ready counts it the same way and warns when a pull request is over.
+- **Small fixes of one kind are one change.** The same defect in several tools, or several small fixes to one tool
+  or harness, go in one pull request that lists each issue it fixes (`Fixes #1, Fixes #2`).
 - **Fill in the template**: what and why, the vanilla reference, the pr_ready block, screenshots for anything you
   can see.
+- **Prove an in-game change before you open the pull request.** If players would see or feel the change in the
+  game (gameplay, mobs, blocks, items, rendering, UI, multiplayer, saves), the description shows it working on the
+  pull request's own head commit: what was wrong, what you did in the game to check it, and what happened. Attach
+  before and after screenshots or a short video, or the `lan_e2e`, harness or `horizon-ctl` commands you ran with
+  their output. A unit test alone doesn't count, and neither does a proof from an older commit. Without it the pull
+  request gets `needs-proof` and waits for review until the proof is there. Tooling, docs, tests and refactors that
+  change nothing in the game don't need it.
 - **Tick "Allow edits by maintainers".** When something small is left (a lint, a rebase, a nit) we push the fixup
   ourselves instead of sending it back to you; only design questions come back.
 - **Once we've pushed to your branch, merge main into it; don't rebase or force-push.** A rebase or force-push
@@ -178,15 +183,26 @@ it (edited on every push, never repeated): talk to its author in the thread befo
   (`perf(chunks,rendering): ...`), or leave it out (`docs: ...`). Release notes drop the prefix.
 - **Tick its kind** in the template: `parity` (Horizon now does what vanilla does), `bug` (a crash or breakage),
   `perf`, `feature` (new for players), `extra` (Horizon-only, off by default), `tooling` or `docs`. A workflow sets
-  that label from the box, else from the title, and area labels (`launcher`, `mobs`, `worldgen`, `rendering`...)
-  from the title and the paths you change.
+  that label from the box, else from the title, and area labels (`launcher`, `mobs`, `worldgen`, `rendering`, `translations`...)
+  from the title and the paths you change. A size label (`size: XS` up to 50 lines, `S` 150, `M` 500, `L` 3000,
+  `XL` over) counts the lines GitHub shows as added and removed outside Markdown and test files: what counts above,
+  but with moved lines and inline tests, which the label can't tell apart.
   `label:parity` is the list of real progress toward vanilla.
 - **Release labels** (we set them if you can't): `feature` also puts it under "New" in the release notes,
   `skip-release` when players see no change (tooling, docs, tests), nothing for a fix. `release-now` is for crash
   fixes that shouldn't wait. pr_ready suggests one.
 
-Who reviews and merges: the Horizon Team, on CI for ordinary pull requests; risky ones (saves, network, world
-generation, the launcher's updates) wait for a local proof first ([merging](docs/release-flow.md#merging)).
+Who reviews and merges: the Horizon Team, on CI for ordinary pull requests; an in-game change waits for the proof
+above, and risky ones (saves, network, world generation, the launcher's updates) also for a local proof from us
+([merging](docs/release-flow.md#merging)).
+Prefer `COMMENT` reviews for routine suggestions so fixed PRs are not stuck waiting on one person; reserve
+`REQUEST_CHANGES` for hard blockers. If a `CHANGES_REQUESTED` review predates the fixing commits and every point
+is verified fixed on the current head, another `@horizon-rust/horizon-team` reviewer may dismiss that stale review
+(citing the fixing commit SHA) after approving. When registering new `#[ignore = "daily"]` tests, prefer a focused
+`tools/ci/ignored-tests/<area>.txt` file over appending to a shared `daily-horizon-client*.txt` list so concurrent
+PRs do not collide.
+A bot, CodeRabbit, also comments when a pull request opens. Treat it like any reviewer: fix what's right, say why
+when it isn't, and resolve the thread. It can't block a merge; `@coderabbitai review` asks it to look again.
 
 Every merge to main is released automatically ([release flow](docs/release-flow.md)), so main always stays playable.
 How agents, checks, releases and signed updates keep this safe: [security](docs/security.md).

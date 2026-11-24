@@ -50,13 +50,18 @@ impl Game<'_> {
         if !self.passenger_object_present(id) {
             return None;
         }
-        self.persist.passenger_slots.iter().find_map(|(&vehicle, slots)| {
-            (self.passenger_object_present(vehicle)
-                && slots
+        // The slot test first: presence walks the level's mobs, boats and carts, so asking it of
+        // every vehicle with riders made each lookup cost all vehicles times all entities.
+        self.persist
+            .passenger_slots
+            .iter()
+            .find_map(|(&vehicle, slots)| {
+                (slots
                     .iter()
-                    .any(|slot| matches!(slot, PassengerSlot::Live(rider) if *rider == id)))
-            .then_some(vehicle)
-        })
+                    .any(|slot| matches!(slot, PassengerSlot::Live(rider) if *rider == id))
+                    && self.passenger_object_present(vehicle))
+                .then_some(vehicle)
+            })
     }
 
     /// Public riding queries still exclude objects refused level residency.
@@ -246,18 +251,27 @@ impl Game<'_> {
             .collect();
         riders.sort_unstable();
         riders.dedup();
-        riders.sort_by_key(|id| {
+        let mut depths = std::collections::HashMap::new();
+        riders.retain(|id| {
             let mut path = vec![*id];
             let mut next = self.passenger_vehicle(*id);
             while let Some(parent) = next {
                 if path.contains(&parent) {
                     break;
                 }
+                // ServerLevel.tickPassenger: only a ticked vehicle's riders
+                // ride-tick, and a retained off-level root never ticks, so
+                // nothing below it is seated again.
+                if self.persist.off_level.contains_key(&parent) {
+                    return false;
+                }
                 path.push(parent);
                 next = self.passenger_vehicle(parent);
             }
-            path.len()
+            depths.insert(*id, path.len());
+            true
         });
+        riders.sort_by_key(|id| depths[id]);
         let index: std::collections::HashMap<u32, usize> = self
             .mobs
             .iter()
@@ -300,7 +314,7 @@ impl Game<'_> {
         for handle in self.entity_handles() {
             with_entity_mut!(self, handle, entity => {
                 if entity.id() == id {
-                    *entity.position_mut() = at;
+                    entity.set_position(at);
                     *entity.velocity_mut() = horizon_core::geometry::Vec3::ZERO;
                 }
             });
@@ -448,6 +462,9 @@ impl Game<'_> {
         let id = entity_nbt::uuid(tag)
             .and_then(|u| self.target_with_uuid(u))
             .and_then(target_id);
-        id.is_none_or(|id| self.passenger_vehicle(id).is_none())
+        // An entity a mod kept out of the saves (`entity_set_saved`) is not written.
+        id.is_none_or(|id| {
+            !self.persist.unsaved.contains(&id) && self.passenger_vehicle(id).is_none()
+        })
     }
 }

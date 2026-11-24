@@ -83,6 +83,21 @@ class GameBootCheck(unittest.TestCase):
             fn other_new() { Vec::new(); without_game(); }
             """), [("direct", "with_game"), ("through_helpers", "silent_game -> server_game -> Game::new")])
 
+    def test_a_turbofish_on_the_type_does_not_hide_the_fixture_call(self):
+        pattern = check.call("Game::new")
+        for snippet in ("Game::new()", "Game :: new ()", "Game::<T>::new()",
+                        "Game::<'a, T>::new()", "Game::<T>::new::<U>()"):
+            with self.subTest(snippet=snippet):
+                self.assertIsNotNone(pattern.search(snippet), snippet)
+        self.assertIsNone(pattern.search("Game::<T>::new"), "a bare path is not a call")
+        self.assertEqual(self.offenders("""\
+            #[test]
+            fn boots() { Game::<T>::new(1); }
+            #[test]
+            #[ignore = "daily"]
+            fn moved() { Game::<'a, T>::new(1); }
+            """), [("boots", "Game::new")])
+
     def test_a_file_without_a_fixture_call_is_not_read_further(self):
         with patch.object(check.rust_tests, "functions") as functions:
             self.assertEqual(check.offenders("#[test]\nfn plain() { Game::default(); }\n", self.NAMES), [])
@@ -100,7 +115,7 @@ class GameBootCheck(unittest.TestCase):
     def test_the_committed_list_names_fixtures_that_exist(self):
         for name in check.fixtures():
             function = name.rsplit("::", 1)[-1]
-            found = subprocess.run(["git", "grep", "-q", "-E", rf"fn {function}\b", "--", "crates/*.rs"],
+            found = subprocess.run(["git", "grep", "-q", "-w", "-E", f"fn {function}", "--", "crates/*.rs"],
                                    cwd=check.ROOT)
             self.assertEqual(found.returncode, 0, f"{name} is not defined anywhere under crates/")
 

@@ -178,7 +178,7 @@ mod tests {
             )
             .unwrap();
             let mut child = Command::new(std::env::current_exe().unwrap());
-            child.args(["--exact", "developer_offline::tests::account_gate_is_preserved_without_opt_in_and_for_signed_lineage", "--nocapture"])
+            child.args(["--include-ignored", "--exact", "developer_offline::tests::account_gate_is_preserved_without_opt_in_and_for_signed_lineage", "--nocapture"])
                 .env("OFFLINE_GATE_TEST_TAG", tag)
                 .env("HORIZON_LAUNCHER_HOME", root.path())
                 .env("HORIZON_HOME", root.path().join("game"))
@@ -260,7 +260,7 @@ mod tests {
                 env: [(key.to_string(), "reintroduced".to_string())].into(),
                 ..Default::default()
             };
-            let wrapped = crate::launch::wrap(command, &launch);
+            let wrapped = crate::launch::wrap(command, &launch).unwrap();
             assert!(validate(&wrapped).is_err(), "{key}");
         }
     }

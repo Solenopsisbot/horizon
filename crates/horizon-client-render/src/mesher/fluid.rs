@@ -3,7 +3,7 @@
 //! beside glass and leaves, back faces, cardinal shading and max(self, above)
 //! light.
 use super::{
-    Info, MeshTables, Padded, SectionMesh, TerrainVertex, fluid_face, lighting, pack_coords,
+    Info, MeshTables, Padded, SectionMesh, TerrainVertex, as_fluid, lighting, pack_coords,
     pack_rgb, part_tables::PartTables, pi,
 };
 use horizon_core::{
@@ -213,13 +213,14 @@ pub(super) fn splits_north_east(nw: f32, ne: f32, sw: f32, se: f32) -> bool {
 /// `(nether, shader_pack_lighting, separate_ao, shader_pack)`: the Nether's face shading, only the
 /// up-face value when a shader pack lights the faces (`Mesher::shader_pack_lighting`), whether to
 /// keep pure alpha for separate AO, and whether a `shaders/` pack draws the terrain
-/// (`Mesher::shader_pack`: tops split as Iris splits them, [`splits_north_east`]).
+/// (`Mesher::shader_pack`: tops split as Iris splits them, [`splits_north_east`], and the alpha
+/// as that path reads it, `mesher::for_shaders_format`).
 pub(super) fn tesselate(
     tables: &MeshTables,
     parts: &PartTables,
-    (nether, shader_pack_lighting, separate_ao, shader_pack): (bool, bool, bool, bool),
+    (nether, shader_pack_lighting, separate_ao, shader_pack, looks): (bool, bool, bool, bool, bool),
     pad: &Padded,
-    water_color: u32,
+    water_color: impl FnOnce() -> u32,
     out: &mut SectionMesh,
     [x, y, z]: [i32; 3],
 ) {
@@ -245,17 +246,23 @@ pub(super) fn tesselate(
     // Empty with no part answering: vanilla's tests alone.
     let hides = !parts.hidden_fluid_faces.is_empty();
     let hidden = |d: Direction| hides && parts.hides_fluid_face(neighbor_id(d), kind, d);
-    let should_render = |d: Direction| !same(neighbor(d)) && !occluded_by_self(me, d) && !hidden(d);
+    let should_render_side = |d: Direction| {
+        let n = neighbor(d);
+        !same(n) && n.face[d.opposite() as usize] != 1 && !occluded_by_self(me, d) && !hidden(d)
+    };
     let render_up = !same(up) && !hidden(Direction::Up);
-    let render_down =
-        should_render(Direction::Down) && !occluded_by(Direction::Down, MAX_HEIGHT, down);
+    let render_down = !same(down)
+        && !occluded_by_self(me, Direction::Down)
+        && !hidden(Direction::Down)
+        && !occluded_by(Direction::Down, MAX_HEIGHT, down);
     let sides = [
-        should_render(Direction::North),
-        should_render(Direction::South),
-        should_render(Direction::West),
-        should_render(Direction::East),
+        should_render_side(Direction::North),
+        should_render_side(Direction::South),
+        should_render_side(Direction::West),
+        should_render_side(Direction::East),
     ];
-    if !render_up && !render_down && !sides.iter().any(|&s| s) {
+    let any_side = sides[0] || sides[1] || sides[2] || sides[3];
+    if !render_up && !render_down && !any_side {
         return;
     }
     // A mod's fluid draws as water does, with the sprites and tint of its own model.
@@ -268,7 +275,7 @@ pub(super) fn tesselate(
     );
     let tint = match model.and_then(|model| model.tint) {
         Some(tint) => tint,
-        None if water => water_color & 0xFF_FFFF,
+        None if water => water_color() & 0xFF_FFFF,
         None => 0xFF_FFFF,
     };
     let emission = if water {
@@ -276,12 +283,20 @@ pub(super) fn tesselate(
     } else {
         crate::mesher::hdr_tier("lava", 15)
     };
+    // What the fluid itself gives off, on every face and not the block holding it: lava's block
+    // 15 at every level, water none, also around a waterlogged light; a mod fluid its own
+    // block's (a mod fluid waterlogging another block reads that block's).
+    let level = match kind {
+        FluidKind::Lava | FluidKind::FlowingLava => 15,
+        FluidKind::Mod(_) | FluidKind::ModFlowing(_) => me.emission,
+        _ => 0,
+    };
     let color = |by: f32| {
         let rgb = [16, 8, 0].map(|shift| lighting::scale((tint >> shift & 255) as i32, by) as u32);
         if separate_ao {
             pack_rgb(rgb)
         } else {
-            crate::mesher::emitting(pack_rgb(rgb), emission)
+            crate::mesher::giving_off(crate::mesher::emitting(pack_rgb(rgb), emission), level)
         }
     };
     let height = |step: isize| -> f32 {
@@ -298,44 +313,46 @@ pub(super) fn tesselate(
             -1.0
         }
     };
-    let own = height(0);
     let (mut ne, mut nw, mut se, mut sw) = (1.0f32, 1.0f32, 1.0f32, 1.0f32);
-    if own < 1.0 {
-        let n = height(-P_STEP);
-        let s = height(P_STEP);
-        let e = height(X_STEP);
-        let w = height(-X_STEP);
-        // calculateAverageHeight(self, height2, height1, corner)
-        let average = |h2: f32, h1: f32, corner: isize| -> f32 {
-            if h1 >= 1.0 || h2 >= 1.0 {
-                return 1.0;
-            }
-            let mut sum = [0f32; 2];
-            let mut add = |h: f32| {
-                if h >= 0.8 {
-                    sum[0] += h * 10.0;
-                    sum[1] += 10.0;
-                } else if h >= 0.0 {
-                    sum[0] += h;
-                    sum[1] += 1.0;
-                }
-            };
-            if h1 > 0.0 || h2 > 0.0 {
-                let hc = height(corner);
-                if hc >= 1.0 {
+    if render_up || any_side {
+        let own = height(0);
+        if own < 1.0 {
+            let n = height(-P_STEP);
+            let s = height(P_STEP);
+            let e = height(X_STEP);
+            let w = height(-X_STEP);
+            // calculateAverageHeight(self, height2, height1, corner)
+            let average = |h2: f32, h1: f32, corner: isize| -> f32 {
+                if h1 >= 1.0 || h2 >= 1.0 {
                     return 1.0;
                 }
-                add(hc);
-            }
-            add(own);
-            add(h1);
-            add(h2);
-            sum[0] / sum[1]
-        };
-        ne = average(n, e, X_STEP - P_STEP);
-        nw = average(n, w, -X_STEP - P_STEP);
-        se = average(s, e, X_STEP + P_STEP);
-        sw = average(s, w, -X_STEP + P_STEP);
+                let mut sum = [0f32; 2];
+                let mut add = |h: f32| {
+                    if h >= 0.8 {
+                        sum[0] += h * 10.0;
+                        sum[1] += 10.0;
+                    } else if h >= 0.0 {
+                        sum[0] += h;
+                        sum[1] += 1.0;
+                    }
+                };
+                if h1 > 0.0 || h2 > 0.0 {
+                    let hc = height(corner);
+                    if hc >= 1.0 {
+                        return 1.0;
+                    }
+                    add(hc);
+                }
+                add(own);
+                add(h1);
+                add(h2);
+                sum[0] / sum[1]
+            };
+            ne = average(n, e, X_STEP - P_STEP);
+            nw = average(n, w, -X_STEP - P_STEP);
+            se = average(s, e, X_STEP + P_STEP);
+            sw = average(s, w, -X_STEP + P_STEP);
+        }
     }
     let light = |step: isize| {
         let i = (cell + step) as usize;
@@ -356,31 +373,48 @@ pub(super) fn tesselate(
     } else {
         (tables.lava_still, tables.lava_flow, None)
     };
-    let (target, sprite_layers) = if water {
-        (&mut out.translucent, &mut out.sprite_layers)
+    let (target, target_looks, sprite_layers) = if water {
+        (
+            &mut out.translucent,
+            &mut out.translucent_looks,
+            &mut out.sprite_layers,
+        )
     } else {
-        (&mut out.solid, &mut out.sprite_layers)
+        (&mut out.solid, &mut out.solid_looks, &mut out.sprite_layers)
     };
     let mut quad = |v: [([f32; 3], [f32; 2]); 4],
                     layer: u16,
-                    color: u32,
+                    shade: f32,
                     light: u16,
                     back: bool,
                     face: usize| {
         if tables.is_animated(layer) && !sprite_layers.contains(&layer) {
             sprite_layers.push(layer);
         }
+        if looks {
+            let look = super::QuadLook::new(tint, shade, face as u32, [1.0; 4]);
+            target_looks.resize(target.len() / 4, super::QuadLook::default());
+            target_looks.extend(std::iter::repeat_n(look, 1 + usize::from(back)));
+        }
+        let color = color(shade);
         let color = if separate_ao {
             color
+        } else if shader_pack {
+            crate::mesher::for_shaders_format(color, Some(face))
         } else {
-            fluid_face(color, face)
+            as_fluid(color)
         };
         let vertex = |(pos, uv)| TerrainVertex::new(pos, uv, layer, color, light);
-        target.extend([vertex(v[0]), vertex(v[1]), vertex(v[2]), vertex(v[3])]);
+        let v0 = vertex(v[0]);
+        let v1 = vertex(v[1]);
+        let v2 = vertex(v[2]);
+        let v3 = vertex(v[3]);
+        target.extend_from_slice(&[v0, v1, v2, v3]);
         if back {
-            target.extend([vertex(v[0]), vertex(v[3]), vertex(v[2]), vertex(v[1])]);
+            target.extend_from_slice(&[v0, v3, v2, v1]);
         }
     };
+    let mut center_light = None;
     let (fx, fy, fz) = (x as f32, y as f32, z as f32);
     let bottom = if render_down { EPSILON } else { 0.0 };
     if render_up && !occluded_by(Direction::Up, nw.min(sw).min(se.min(ne)), up) {
@@ -388,36 +422,50 @@ pub(super) fn tesselate(
         sw -= EPSILON;
         se -= EPSILON;
         ne -= EPSILON;
-        let flow_vector = flow_at(
-            &mut FlowView { pad, info },
-            me.fluid,
-            BlockPos::new(x, y, z),
-        )
-        .unwrap_or_else(|e| match e {});
-        let (layer, uv) = if flow_vector.x == 0.0 && flow_vector.z == 0.0 {
+        let my_id = pad.blocks[cell as usize];
+        let still_flat = !me.fluid.falling()
+            && me.fluid.own_height() > 0.0
+            && neighbor_id(Direction::North) == my_id
+            && neighbor_id(Direction::South) == my_id
+            && neighbor_id(Direction::West) == my_id
+            && neighbor_id(Direction::East) == my_id;
+        let (layer, uv) = if still_flat {
             (still, [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]])
         } else {
-            let angle =
-                atan2(flow_vector.z, flow_vector.x) as f32 - std::f64::consts::FRAC_PI_2 as f32;
-            let s = trig::sin(f64::from(angle)) * 0.25;
-            let c = trig::cos(f64::from(angle)) * 0.25;
-            (
-                flow,
-                [
-                    [0.5 + (-c - s), 0.5 + (-c + s)],
-                    [0.5 + (-c + s), 0.5 + (c + s)],
-                    [0.5 + (c + s), 0.5 + (c - s)],
-                    [0.5 + (c - s), 0.5 + (-c - s)],
-                ],
+            let flow_vector = flow_at(
+                &mut FlowView { pad, info },
+                me.fluid,
+                BlockPos::new(x, y, z),
             )
+            .unwrap_or_else(|e| match e {});
+            if flow_vector.x == 0.0 && flow_vector.z == 0.0 {
+                (still, [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]])
+            } else {
+                let angle =
+                    atan2(flow_vector.z, flow_vector.x) as f32 - std::f64::consts::FRAC_PI_2 as f32;
+                let s = trig::sin(f64::from(angle)) * 0.25;
+                let c = trig::cos(f64::from(angle)) * 0.25;
+                (
+                    flow,
+                    [
+                        [0.5 + (-c - s), 0.5 + (-c + s)],
+                        [0.5 + (-c + s), 0.5 + (c + s)],
+                        [0.5 + (c + s), 0.5 + (c - s)],
+                        [0.5 + (c - s), 0.5 + (-c - s)],
+                    ],
+                )
+            }
         };
         // FluidState.shouldRenderBackwardUpFace over the 3x3 cells above.
-        let backward = (-1..=1).any(|ox| {
-            (-1..=1).any(|oz| {
-                let s = at(UP + ox as isize * X_STEP + oz as isize * P_STEP);
-                !same(s) && !s.solid
-            })
-        });
+        let backward = !up.solid
+            || (-1..=1).any(|ox| {
+                (-1..=1).any(|oz| {
+                    (ox != 0 || oz != 0) && {
+                        let s = at(UP + ox as isize * X_STEP + oz as isize * P_STEP);
+                        !same(s) && !s.solid
+                    }
+                })
+            });
         let mut corners = [
             ([fx, fy + nw, fz], uv[0]),
             ([fx, fy + sw, fz + 1.0], uv[1]),
@@ -429,11 +477,12 @@ pub(super) fn tesselate(
         if shader_pack && splits_north_east(nw, ne, sw, se) {
             corners.rotate_left(1);
         }
+        let top_light = *center_light.get_or_insert_with(|| light(0));
         quad(
             corners,
             layer,
-            color(cardinal(D::Up)),
-            light(0),
+            cardinal(D::Up),
+            top_light,
             backward,
             Direction::Up as usize,
         );
@@ -448,13 +497,16 @@ pub(super) fn tesselate(
                 ([fx, y0, fz + 1.0], [0.0, 1.0]),
             ],
             still,
-            color(cardinal(D::Down)),
+            cardinal(D::Down),
             light(-UP),
             false,
             Direction::Down as usize,
         );
     }
-    let side_light = light(0);
+    if !any_side {
+        return;
+    }
+    let side_light = *center_light.get_or_insert_with(|| light(0));
     let up_shade = cardinal(D::Up);
     for (i, d) in [
         Direction::North,
@@ -465,6 +517,9 @@ pub(super) fn tesselate(
     .into_iter()
     .enumerate()
     {
+        if !sides[i] {
+            continue;
+        }
         let (h0, h1, [x0, z0], [x1, z1]) = match d {
             Direction::North => (nw, ne, [fx, fz + EPSILON], [fx + 1.0, fz + EPSILON]),
             Direction::South => (
@@ -482,7 +537,7 @@ pub(super) fn tesselate(
             ),
         };
         let face_state = neighbor(d);
-        if !sides[i] || occluded_by(d, h0.max(h1), face_state) {
+        if occluded_by(d, h0.max(h1), face_state) {
             continue;
         }
         let (layer, is_overlay) = match overlay {
@@ -508,7 +563,7 @@ pub(super) fn tesselate(
                 ([x0, fy + bottom, z0], [0.0, 0.5]),
             ],
             layer,
-            color(up_shade * side),
+            up_shade * side,
             side_light,
             !is_overlay,
             d as usize,
@@ -573,6 +628,7 @@ mod tests {
             ],
             solid: vec![],
             full_faces: vec![],
+            ao_info: vec![],
             visibility: horizon_world::block_render::FaceVisibility::empty(),
             water_still: 11,
             water_flow: 12,
@@ -605,9 +661,9 @@ mod tests {
             tesselate(
                 &tables,
                 &PartTables::NONE,
-                (false, false, true, false),
+                (false, false, true, false, false),
                 &pad,
-                0x00FF00,
+                || 0x00FF00,
                 &mut mesh,
                 [0, 0, 0],
             );
@@ -640,9 +696,9 @@ mod tests {
         tesselate(
             &tables,
             &PartTables::NONE,
-            (false, false, true, false),
+            (false, false, true, false, false),
             &pad,
-            0x00FF00,
+            || 0x00FF00,
             &mut mesh,
             [0, 0, 0],
         );
@@ -650,6 +706,111 @@ mod tests {
         layers.sort_unstable();
         layers.dedup();
         assert_eq!(layers, vec![11, 12, 13]);
+    }
+
+    /// A fluid side's look has the shade its colour has, the top's times the side's (0.72 and
+    /// 0.54 in the Nether), and so does a far tile's look of that side: a pack's `shade`
+    /// doesn't change where the far tiles begin.
+    #[test]
+    fn a_fluid_sides_look_has_the_far_tiles_shade() {
+        use horizon_assets::model::Direction as D;
+        let mut tables = super::super::part_tables_tests::tables(false);
+        let mut pad = Padded {
+            blocks: vec![0; super::super::P.pow(3)],
+            light: vec![0xF0; super::super::P.pow(3)],
+        };
+        pad.blocks[pi(0, 0, 0)] = 1;
+        for nether in [false, true] {
+            for kind in [FluidKind::Water, FluidKind::Lava] {
+                tables.info[1].fluid = FluidState::new(kind, 8, false);
+                let mut mesh = SectionMesh::default();
+                let keys = (nether, false, false, false, true);
+                tesselate(
+                    &tables,
+                    &PartTables::NONE,
+                    keys,
+                    &pad,
+                    || 0x3F76E4,
+                    &mut mesh,
+                    [0; 3],
+                );
+                let looks = [mesh.solid_looks, mesh.translucent_looks].concat();
+                for side in [D::North, D::South, D::West, D::East] {
+                    let far = crate::lod::far_look(1 + u8::from(nether), 0xFFFFFF, side, true);
+                    let shades: Vec<u32> = looks
+                        .iter()
+                        .filter(|l| l.0[0] >> 27 & 7 == side as u32)
+                        .map(|l| l.0[0] >> 24 & 7)
+                        .collect();
+                    assert!(!shades.is_empty(), "{kind:?} {side:?}");
+                    assert!(
+                        shades.iter().all(|&s| s == far[0] >> 24 & 7),
+                        "{kind:?} {side:?} nether {nether}: near {shades:?}, far {}",
+                        far[0] >> 24 & 7
+                    );
+                }
+            }
+        }
+    }
+
+    /// With a `shaders/` pack, a fluid's alpha is main's byte from before the light level and the
+    /// fluid flag: the tier's `15 - code` in the low four bits, 8 plus the quad's face in the high
+    /// four (`fluid_face`); else 6c's.
+    #[test]
+    fn a_fluids_alpha_is_the_old_byte_for_a_shaders_format_pack() {
+        let mut tables = super::super::part_tables_tests::tables(false);
+        let mut pad = Padded {
+            blocks: vec![0; super::super::P.pow(3)],
+            light: vec![0xF0; super::super::P.pow(3)],
+        };
+        pad.blocks[pi(0, 0, 0)] = 1;
+        for (kind, tier, level) in [
+            (FluidKind::Water, 0, 0u32),
+            (FluidKind::Lava, crate::mesher::hdr_tier("lava", 15), 15),
+        ] {
+            tables.info[1].fluid = FluidState::new(kind, 8, false);
+            let old = crate::mesher::emitting(0, tier) >> 24 | 0xF0;
+            for shader_pack in [false, true] {
+                let mut mesh = SectionMesh::default();
+                // With looks, for each quad's face; the vertices are the same without.
+                let keys = (false, false, false, shader_pack, true);
+                tesselate(
+                    &tables,
+                    &PartTables::NONE,
+                    keys,
+                    &pad,
+                    || 0x3F76E4,
+                    &mut mesh,
+                    [0; 3],
+                );
+                let quads = (mesh.solid.as_chunks::<4>().0.iter().zip(&mesh.solid_looks)).chain(
+                    mesh.translucent
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(&mesh.translucent_looks),
+                );
+                let mut faces = Vec::new();
+                for (quad, look) in quads {
+                    let face = look.0[0] >> 27 & 7;
+                    faces.push(face);
+                    // Main's `fluid_face(emitting(rgb, tier), face)`.
+                    let want = if shader_pack {
+                        0x80 | face << 4 | old & 0xF
+                    } else {
+                        (15 - level) << 4 | old & 0x7
+                    };
+                    let alphas = quad.map(|v| v.color >> 24);
+                    assert!(
+                        alphas.iter().all(|&a| a == want),
+                        "{kind:?} shader pack {shader_pack}, face {face}: {alphas:x?}, want {want:x}"
+                    );
+                }
+                faces.sort_unstable();
+                faces.dedup();
+                assert_eq!(faces, [0, 1, 2, 3, 4, 5], "{kind:?}");
+            }
+        }
     }
 
     #[test]

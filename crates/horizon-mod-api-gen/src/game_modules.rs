@@ -8,17 +8,22 @@ pub(crate) fn declarations(game: &Path) -> Result<String, String> {
     horizon_game_discovery::declarations(game, &["native_hooks", "host", "creatures"])
 }
 
+const NATIVE: &str = "include!(concat!(env!(\"OUT_DIR\"), \"/native_hook_modules.rs\"));";
+const LAN: &str = "include!(concat!(env!(\"OUT_DIR\"), \"/lan_action_modules.rs\"));";
+const HOST: &str = "include!(concat!(env!(\"OUT_DIR\"), \"/game_host_modules.rs\"));";
+
+/// Whether `source` holds an include [`expand`] replaces. Its module list comes from the folder
+/// beside the file, so such a file's items are not a function of its text alone.
+fn has_generated_include(source: &str) -> bool {
+    [INCLUDE, NATIVE, LAN, HOST]
+        .iter()
+        .any(|include| source.contains(include))
+}
+
 /// Expand the same directory-derived include before source traversal, without needing OUT_DIR.
 /// Other includes are left alone: source tools must not evaluate arbitrary build-time code.
 pub(crate) fn expand(path: &Path, source: &str) -> Result<String, String> {
-    const NATIVE: &str = "include!(concat!(env!(\"OUT_DIR\"), \"/native_hook_modules.rs\"));";
-    const LAN: &str = "include!(concat!(env!(\"OUT_DIR\"), \"/lan_action_modules.rs\"));";
-    const HOST: &str = "include!(concat!(env!(\"OUT_DIR\"), \"/game_host_modules.rs\"));";
-    if !source.contains(INCLUDE)
-        && !source.contains(NATIVE)
-        && !source.contains(LAN)
-        && !source.contains(HOST)
-    {
+    if !has_generated_include(source) {
         return Ok(source.to_owned());
     }
     let file = syn::parse_file(source).map_err(|e| e.to_string())?;
@@ -34,19 +39,20 @@ pub(crate) fn expand(path: &Path, source: &str) -> Result<String, String> {
                     let directory = path.parent().ok_or("LAN actions source has no parent")?;
                     horizon_game_discovery::lan_action_modules(
                         directory,
-                        Catalog::modules(directory).map_err(|e| e.to_string())?,
+                        Catalog::modules(directory)
+                            .map_err(|e| format!("{}: {e}", directory.display()))?,
                     )?
                 }
                 HOST => crate::build::game_host_modules(
                     path.canonicalize()
-                        .map_err(|e| e.to_string())?
+                        .map_err(|e| format!("{}: {e}", path.display()))?
                         .ancestors()
                         .nth(6)
                         .ok_or("game host source outside the game tree")?,
                 )?,
                 NATIVE => horizon_game_discovery::native_hook_modules(
                     path.canonicalize()
-                        .map_err(|e| e.to_string())?
+                        .map_err(|e| format!("{}: {e}", path.display()))?
                         .ancestors()
                         .nth(6)
                         .ok_or("native hook source outside the game tree")?,
@@ -59,7 +65,7 @@ pub(crate) fn expand(path: &Path, source: &str) -> Result<String, String> {
                 .parent()
                 .ok_or("game source has no parent")?
                 .canonicalize()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("{}: {e}", path.display()))?;
             let mut declarations = syn::parse_file(&declarations).map_err(|e| e.to_string())?;
             for item in &mut declarations.items {
                 let syn::Item::Mod(item) = item else { continue };
@@ -101,6 +107,11 @@ pub fn materialize_game_modules(root: &Path) -> Result<(), String> {
 
 pub(crate) fn parse(path: &Path, source: &str) -> Result<syn::File, String> {
     syn::parse_file(&expand(path, source)?).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// [`parse`], for a module walk.
+pub(crate) fn parse_layout(path: &Path, source: &str) -> Result<syn::File, String> {
+    parse(path, source)
 }
 
 #[cfg(test)]

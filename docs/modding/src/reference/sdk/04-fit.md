@@ -2,7 +2,8 @@
 
 A mod is **made for** the build it pins. A native mod on the mod API alone also **fits** another build when nothing
 it uses changed there, and the launcher then compiles it against that build on the player's computer. Only the built
-binary is exact to the build; the loader's build-id check is unchanged.
+binary is exact to the build; the loader's build-id check is unchanged. A wasm mod is never rebuilt: it loads on a
+later build that kept every call it makes ([Wasm mods on a later build](02-surface.md#wasm-mods-on-a-later-build)).
 
 ## The rule
 
@@ -22,10 +23,9 @@ The launcher asks, for each enabled native mod of an instance, in this order:
    - a hook whose version the manifest names still has that version;
    - a trait member the mod reaches through a trait it calls (a sub-host trait's method called on
      `&mut dyn ServerHost`) is still reached from that trait.
-5. **Do its `[[inject]]` points hold?** Each row's point must be the same in this build's `points.json`.
-6. **Do the mods it needs fit?** A mod whose library mod is left out is left out too: "it needs Corelib, which
+5. **Do the mods it needs fit?** A mod whose library mod is left out is left out too: "it needs Corelib, which
    doesn't fit".
-7. **Does it compile?** The compile against the build is the final check. A mod that fits and fails to compile is
+6. **Does it compile?** The compile against the build is the final check. A mod that fits and fails to compile is
    left out of that build, and the other mods build.
 
 A mod that doesn't fit stays installed and is left out of the build, with the changed items named (at most five; the

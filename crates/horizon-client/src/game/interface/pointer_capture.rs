@@ -1,6 +1,8 @@
 //! The mouse in play: the look it turns, the pointer grab (`MouseHandler.grabMouse` /
 //! `releaseMouse`), the cursor icon, and pausing a world whose window loses focus.
 use super::*;
+#[cfg(target_os = "linux")]
+use winit::platform::wayland::WindowExtWayland;
 
 fn studio_suppresses_focus_pause(replay_active: bool, freecam_active: bool) -> bool {
     replay_active || freecam_active
@@ -15,6 +17,18 @@ impl Game<'_> {
             scoping: self.camera_type.is_first_person() && self.scoping(),
             invert_x: self.settings.invert_x,
             invert_y: self.settings.invert_y,
+            // Horizon's polar spyglass look: the option's own policy lives in
+            // `spyglass_polar_look`, its own module of the Horizon layer, and is read here, at
+            // the call, so the engine's mouse only gets the plain scale. `cfg!` is the house
+            // gate for Horizon code (`docs/forking.md`), read beside the option it wraps. A
+            // studio freecam turns its own camera before the scale means anything, and the
+            // pitch here is the player's, not the freecam's.
+            yaw_scale: crate::spyglass_polar_look::yaw_scale(
+                self.pitch,
+                cfg!(feature = "horizon-extras")
+                    && self.settings.extras.spyglass_polar_look
+                    && !self.studio.flying(),
+            ),
         }
     }
     /// `MouseHandler.handleAccumulatedMovement` and `Entity.turn`, once per frame.
@@ -87,13 +101,17 @@ impl Game<'_> {
     }
     /// `Minecraft.pauseIfInactive`: a window without focus for more than 500 ms
     /// pauses the game. An open screen (books, signs, the pack prompt, a server
-    /// dialog) stays instead of pausing (`Gui.setPauseScreen`).
+    /// dialog) stays instead of pausing (`Gui.setPauseScreen`). So does the
+    /// level loading screen, drawn over `Screen::Playing` while a world's
+    /// terrain comes in: vanilla's `screen` is the `LevelLoadingScreen` then,
+    /// not null (#19952).
     pub(super) fn pause_if_inactive(&mut self) {
         if self
             .focus_lost
             .is_some_and(|t| t.elapsed() > Duration::from_millis(500))
             && self.control.is_none()
             && self.screen == Screen::Playing
+            && !self.remote_screen_up()
             && !studio_suppresses_focus_pause(self.replay.playing(), self.studio.flying())
             && self.player.is_some()
             && !self.options.no_pause
@@ -148,13 +166,23 @@ impl Game<'_> {
         }
         // MouseHandler.grabMouse never captures an inactive window, and vanilla
         // grabs only on `setScreen(null)`: the pack prompt and server dialogs
-        // are screens over the world that keep the pointer.
-        if capture
-            && ((!self.focused && !self.unclaimed_window && !self.scripted_run())
-                || self.server_packs.prompt.is_some()
+        // are screens over the world that keep the pointer. The title screen is
+        // a screen too. `focused` starts true and only follows Focused events,
+        // so a window that opened in the background (never focused, so never
+        // told it lost the focus) is asked itself (`Minecraft.isWindowActive`).
+        let window_focused = self.window.as_ref().is_none_or(|window| window.has_focus());
+        if grab_refused(Grab {
+            capture,
+            title_open: self.title.is_some(),
+            game_focused: self.focused,
+            window_focused,
+            internal_grab: self.internal_grab(),
+            unclaimed_window: self.unclaimed_window,
+            scripted_run: self.scripted_run(),
+            keeps_pointer: self.server_packs.prompt.is_some()
                 || self.dialog_open()
-                || self.command_prompt.is_some())
-        {
+                || self.command_prompt.is_some(),
+        }) {
             return;
         }
         // The container screen's press state belongs to the screen: a screen
@@ -345,11 +373,20 @@ impl Game<'_> {
             && !self.internal_grab()
             && let (Some(window), Some(mode)) = (&self.window, self.capture_mode)
         {
+            // The forced release/regrab workaround is specific to X11. Keep
+            // Wayland's pointer constraints on the existing path until that
+            // backend has equivalent validation.
+            if window.xdg_toplevel().is_some() {
+                return;
+            }
             let other = match mode {
                 CursorGrabMode::Locked => CursorGrabMode::Confined,
                 CursorGrabMode::Confined => CursorGrabMode::Locked,
                 CursorGrabMode::None => return,
             };
+            // winit skips an identical grab request on X11. Clear its recorded mode first so a
+            // compositor-released grab is actually requested again.
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
             self.capture_mode = if window.set_cursor_grab(mode).is_ok() {
                 Some(mode)
             } else if window.set_cursor_grab(other).is_ok() {
@@ -423,9 +460,69 @@ fn top_screen_pauses(dialog: Option<bool>, book: Option<bool>, screen: bool, win
     dialog.or(book).unwrap_or(screen || win)
 }
 
+/// What `MouseHandler.grabMouse` looks at before it takes the pointer.
+struct Grab {
+    capture: bool,
+    /// The title screen is up. `Gui.setScreen` grabs only for a null screen.
+    title_open: bool,
+    game_focused: bool,
+    /// `Minecraft.isWindowActive`: `window.isFocused`.
+    window_focused: bool,
+    /// Offscreen, unclaimed or scripted: nobody at the computer holds this pointer.
+    internal_grab: bool,
+    unclaimed_window: bool,
+    scripted_run: bool,
+    /// A pack prompt, a server dialog or the command prompt is a screen over the world.
+    keeps_pointer: bool,
+}
+
+/// Whether `MouseHandler.grabMouse` leaves the pointer free.
+fn grab_refused(grab: Grab) -> bool {
+    if !grab.capture {
+        return false;
+    }
+    if grab.title_open && !grab.internal_grab {
+        return true;
+    }
+    let focused = grab.game_focused && (grab.internal_grab || grab.window_focused);
+    (!focused && !grab.unclaimed_window && !grab.scripted_run) || grab.keeps_pointer
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{studio_suppresses_focus_pause, top_screen_pauses};
+    use super::{Grab, grab_refused, studio_suppresses_focus_pause, top_screen_pauses};
+
+    fn grab(
+        capture: bool,
+        title_open: bool,
+        game_focused: bool,
+        window_focused: bool,
+        internal_grab: bool,
+        keeps_pointer: bool,
+    ) -> Grab {
+        Grab {
+            capture,
+            title_open,
+            game_focused,
+            window_focused,
+            internal_grab,
+            unclaimed_window: false,
+            scripted_run: false,
+            keeps_pointer,
+        }
+    }
+
+    /// Closing options over the title screen, and a window that never had the
+    /// focus, must not hide the cursor. An in-game focused window still grabs.
+    #[test]
+    fn the_pointer_stays_free_on_the_title_screen_and_in_a_background_window() {
+        assert!(grab_refused(grab(true, true, true, true, false, false)));
+        assert!(grab_refused(grab(true, false, true, false, false, false)));
+        assert!(!grab_refused(grab(true, false, true, true, false, false)));
+        assert!(!grab_refused(grab(true, false, true, false, true, false)));
+        assert!(!grab_refused(grab(false, true, true, false, false, false)));
+        assert!(grab_refused(grab(true, false, true, true, false, true)));
+    }
 
     #[test]
     fn studio_replay_and_freecam_never_pause_on_focus_loss() {

@@ -4,10 +4,13 @@ import re
 
 import json
 import subprocess
+import sys
 import tempfile
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
+from tools.server_bench import drain, parse_args, spread, spread_points
 from tools.server_bench import (DONE, PERF, PUMPKIN_READY, RUN_RECORD, TICK_AVERAGE, TICK_PERCENTILES, finish_profile,
                                 pumpkin_config, report_line, start_profile, work)
 
@@ -113,6 +116,73 @@ class PumpkinConfigTests(unittest.TestCase):
         # Only its own section's keys change: Bedrock keeps its (it is off).
         self.assertIn('address = "0.0.0.0:19132"\nonline_mode = true', text)
 
+    def test_settings_absent_from_the_template_are_inserted(self):
+        # A trimmed template lacks encryption, max_players and simulation_distance. Keeping them out would
+        # leave Pumpkin's upstream defaults in place, so all declared values must still land in the output.
+        minimal = '''seed = "old"
+white_list = true
+
+[networking.java]
+address = "0.0.0.0:25565"
+online_mode = true
+view_distance = 16
+
+[telemetry]
+enabled = true
+'''
+        text = pumpkin_config(minimal, 25599, SimpleNamespace(seed=12345))
+        config = tomllib.loads(text)  # Duplicate inserted keys also make parsing fail.
+        java = config['networking']['java']
+        self.assertEqual(config['seed'], '12345')
+        self.assertFalse(config['white_list'])
+        for key, value in {'address': '127.0.0.1:25599', 'online_mode': False, 'encryption': False,
+                           'max_players': 200, 'view_distance': 10, 'simulation_distance': 10}.items():
+            self.assertEqual(java[key], value)
+        self.assertEqual(config['telemetry'], {'enabled': False, 'endpoint': ''})
+
+    def test_a_section_missing_from_the_template_is_created(self):
+        # No [networking.query] or [telemetry] at all: the whole section must be added with every key.
+        minimal = '''seed = "12345"
+
+[networking.java]
+address = "0.0.0.0:25565"
+'''
+        config = tomllib.loads(pumpkin_config(minimal, 25599, SimpleNamespace(seed=12345)))
+        self.assertEqual(config['networking']['java']['address'], '127.0.0.1:25599')
+        self.assertEqual(config['networking']['query'], {'enabled': False, 'address': '127.0.0.1:25600'})
+        self.assertEqual(config['telemetry'], {'enabled': False, 'endpoint': ''})
+        self.assertFalse(config['plugins']['enabled'])
+        self.assertFalse(config['networking']['java']['authentication']['enabled'])
+
+    def test_empty_sections_keep_the_next_header_on_its_own_line(self):
+        minimal = 'seed = "0"\n\n[networking.java]\n[telemetry]\n'
+        config = tomllib.loads(pumpkin_config(minimal, 25599, SimpleNamespace(seed=12345)))
+        self.assertEqual(config['seed'], '12345')
+        self.assertEqual(config['networking']['java']['address'], '127.0.0.1:25599')
+        self.assertEqual(config['networking']['java']['simulation_distance'], 10)
+        self.assertEqual(config['telemetry'], {'enabled': False, 'endpoint': ''})
+
+    def test_existing_keys_with_other_legal_spacing_are_replaced(self):
+        minimal = 'seed\t=\t"0"\n[networking.java]\n\tmax_players=20\n  online_mode\t=\ttrue\n'
+        config = tomllib.loads(pumpkin_config(minimal, 25599, SimpleNamespace(seed=12345)))
+        self.assertEqual(config['seed'], '12345')
+        self.assertEqual(config['networking']['java']['max_players'], 200)
+        self.assertFalse(config['networking']['java']['online_mode'])
+
+    def test_a_leading_table_keeps_inserted_root_settings_at_the_root(self):
+        minimal = '[networking.java]\naddress = "0.0.0.0:25565"\n'
+        config = tomllib.loads(pumpkin_config(minimal, 25599, SimpleNamespace(seed=12345)))
+        self.assertEqual(config['seed'], '12345')
+        self.assertNotIn('seed', config['networking']['java'])
+        self.assertEqual(config['networking']['java']['address'], '127.0.0.1:25599')
+
+    def test_commented_table_headers_are_not_appended_again(self):
+        minimal = ('seed = "0"\n[networking.java] # Java listener\naddress = "0.0.0.0:25565"\n'
+                   '[telemetry]\t# Telemetry\nenabled = true\n')
+        config = tomllib.loads(pumpkin_config(minimal, 25599, SimpleNamespace(seed=12345)))
+        self.assertEqual(config['networking']['java']['address'], '127.0.0.1:25599')
+        self.assertEqual(config['telemetry'], {'enabled': False, 'endpoint': ''})
+
 
 class FakeServer:
     """The console and the log of a server that prints what Horizon prints."""
@@ -194,6 +264,56 @@ class ServerBenchProfileTests(unittest.TestCase):
             finish_profile(FakeServer([SAVED_LINE]), Path(folder), result, run=fails)
         self.assertNotIn('profile', result)
         self.assertIn('profile_error', result)
+
+
+class SpreadTests(unittest.TestCase):
+    def test_spread_is_off_unless_asked_and_takes_the_side_of_the_square(self):
+        self.assertEqual(parse_args([]).spread, 0)
+        args = parse_args(['--spread', '2000', '--seed', '7'])
+        self.assertEqual((args.spread, args.seed), (2000, 7))
+        with self.assertRaises(SystemExit):
+            parse_args(['--spread', '-5'])
+
+    def test_the_points_repeat_with_the_seed_and_stay_in_the_square(self):
+        points = spread_points(200, 2000, 12345)
+        self.assertEqual(len(points), 200)
+        self.assertEqual(points, spread_points(200, 2000, 12345))
+        self.assertNotEqual(points, spread_points(200, 2000, 12346))
+        self.assertTrue(all(-1000 <= dx <= 1000 and -1000 <= dz <= 1000 for dx, dz in points))
+        # Spread over the square, not bunched near the spawn: every quarter of it gets bots.
+        self.assertEqual({(dx > 0, dz > 0) for dx, dz in points}, {(False, False), (False, True), (True, False),
+                                                                   (True, True)})
+
+    def test_every_bot_goes_to_its_point_around_the_first_spawn_at_its_flying_height(self):
+        lines = ['{"spawn":[8.5,71.0,-3.5]}\n', '{"t":3,"online":3,"failed":0,"chunks":0}\n']
+        server = FakeServer()
+        self.assertEqual(spread(server, lines, 3, 100, 12345, wait=0, height=24), 3)
+        self.assertEqual(len(server.typed), 3)
+        for i, line in enumerate(server.typed):
+            tp, name, x, y, z = line.split()
+            self.assertEqual((tp, name, float(y)), ('tp', f'Bot{i}', 95.0))
+            self.assertLessEqual(abs(float(x) - 8.5), 50)
+            self.assertLessEqual(abs(float(z) + 3.5), 50)
+
+    def test_no_spawned_bot_fails_the_run(self):
+        server = FakeServer()
+        with self.assertRaises(RuntimeError):
+            spread(server, ['{"t":1,"online":0,"failed":2}\n'], 2, 100, 12345, wait=0)
+        self.assertEqual(server.typed, [])
+
+
+class BotStderrTests(unittest.TestCase):
+    def test_a_chatty_process_never_blocks_and_its_last_lines_stay(self):
+        # Far more than a pipe holds: unread, the child blocks on its stderr and never exits.
+        code = "import sys\nfor i in range(20000):\n    print(f'line {i}', file=sys.stderr)\n"
+        process = subprocess.Popen([sys.executable, '-I', '-c', code], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE, text=True)
+        self.addCleanup(process.stderr.close)
+        self.addCleanup(process.kill)
+        tail, reader = drain(process.stderr, keep=3)
+        self.assertEqual(process.wait(timeout=30), 0)
+        reader.join(timeout=30)
+        self.assertEqual(list(tail), ['line 19997', 'line 19998', 'line 19999'])
 
 
 if __name__ == "__main__":

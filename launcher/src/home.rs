@@ -121,8 +121,16 @@ impl Launcher {
             .children(instance.map(|i| {
                 shell::text(night::UI, c(n.ink_soft)).child(instances_page::played_line(i))
             }));
-        // A Java instance (no Horizon tag) isn't offered Horizon's updates.
-        if let Some(release) = self.updates.horizon.as_ref().filter(|_| !tag.is_empty()) {
+        // A Java instance (no Horizon tag) isn't offered Horizon's updates; a Stable one is offered
+        // its channel's build, as in the glass look.
+        let stable = self
+            .selected_instance()
+            .is_some_and(|i| i.channel == horizon_launcher::instances::Channel::Stable);
+        let offer = match stable {
+            true => self.stable_update(tag),
+            false => self.updates.horizon.clone().filter(|_| !tag.is_empty()),
+        };
+        if let Some(release) = offer.clone() {
             let installing = self.installing.as_ref().filter(|(t, _)| *t == release.tag);
             let line = shell::text(night::CAPTION, c(n.muted))
                 .flex()
@@ -131,7 +139,7 @@ impl Launcher {
                 .child(div().size(px(6.)).bg(c(n.accent_hi)))
                 .child(trf(
                     "{version} available",
-                    &[("version", update_name(release))],
+                    &[("version", update_name(&release))],
                 ));
             hero = hero.child(match installing {
                 Some((_, p)) => line
@@ -142,6 +150,10 @@ impl Launcher {
                             .child(progress_bar(Some(self.bar), &t)),
                     )
                     .child(format!("{:.0}%", p * 100.)),
+                // A Stable update never replaces another download: it waits, and says so.
+                None if stable && self.stable_update_waits() => {
+                    line.child(tr("Waiting for another download"))
+                }
                 None => line.child(
                     div()
                         .id("install-update")
@@ -150,8 +162,11 @@ impl Launcher {
                         .cursor_pointer()
                         .hover(|s| s.opacity(0.8))
                         .child(tr("Install"))
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.install_update();
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            match offer.clone().filter(|_| stable) {
+                                Some(release) => this.install_stable_update(release),
+                                None => this.install_update(),
+                            }
                             cx.notify();
                         })),
                 ),
@@ -202,7 +217,31 @@ impl Launcher {
     /// `ready`: prepared, or a Java instance (its game comes with Play).
     pub(super) fn home_actions(&self, ready: bool, java: bool, cx: &mut Context<Self>) -> Div {
         let t = self.theme;
-        let running = self.client.is_some() || self.starting_client.is_some();
+        let state = self.selected_game_state();
+        let any_game_active = !matches!(state, SelectedGameState::Idle);
+        let is_selected_starting = matches!(state, SelectedGameState::SelectedStarting);
+        let other_starting_without_home = matches!(
+            state,
+            SelectedGameState::OtherStarting { id }
+                if !other_game_info(&self.instances.list, id).1
+        );
+        let other_game = match state {
+            SelectedGameState::OtherRunning { id } => {
+                let (name, _) = other_game_info(&self.instances.list, id);
+                Some((
+                    frame::RowPhase::Running,
+                    other_game_label(frame::RowPhase::Running, name),
+                ))
+            }
+            SelectedGameState::OtherStarting { id } => {
+                let (name, _) = other_game_info(&self.instances.list, id);
+                Some((
+                    frame::RowPhase::Starting,
+                    other_game_label(frame::RowPhase::Starting, name),
+                ))
+            }
+            _ => None,
+        };
         if self.preparing {
             // Play waits for the steps below it; a download can stop (the next one goes on from
             // there).
@@ -233,16 +272,34 @@ impl Launcher {
                         })
                 }));
         }
-        let mut play = action("play", Action::Main, &t)
-            .min_w(px(180.))
-            .child(
-                div()
-                    .relative()
-                    .child(blocks::icon("play", 20., c(t.night.on_accent))),
-            )
-            .child(label(
-                tr(if running { "Running" } else { "Play" }).to_string(),
-            ));
+        let mut play = if let Some((phase, status)) = other_game {
+            let dot = match phase {
+                frame::RowPhase::Running => t.success,
+                frame::RowPhase::Starting => t.warn,
+            };
+            action("play", Action::Main, &t)
+                .min_w(px(180.))
+                .max_w(px(360.))
+                .overflow_hidden()
+                .child(div().flex_none().size(px(6.)).bg(dot))
+                .child(label(status).min_w_0().truncate())
+        } else {
+            action("play", Action::Main, &t)
+                .min_w(px(180.))
+                .child(
+                    div()
+                        .relative()
+                        .child(blocks::icon("play", 20., c(t.night.on_accent))),
+                )
+                .child(label(match state {
+                    // The step a start is on, once it said one.
+                    SelectedGameState::SelectedStarting => {
+                        self.play_step.now().unwrap_or(tr("Starting")).to_owned()
+                    }
+                    SelectedGameState::SelectedRunning { .. } => tr("Running").to_string(),
+                    _ => tr("Play").to_string(),
+                }))
+        };
         match play_press(
             ready,
             if horizon_launcher::developer_offline::selected() {
@@ -250,7 +307,7 @@ impl Launcher {
             } else {
                 self.owner
             },
-            self.preparing || running,
+            self.preparing || any_game_active,
         ) {
             PlayPress::Nothing => play = disabled(play),
             PlayPress::Play => {
@@ -279,6 +336,18 @@ impl Launcher {
             .items_center()
             .gap(px(10.))
             .child(play)
+            .children(
+                ((is_selected_starting || other_starting_without_home)
+                    && self.pre_launch_stoppable())
+                .then(|| {
+                    action("pre-launch-cancel", Action::Quiet, &t)
+                        .child(label(tr("Cancel").to_string()))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.stop_pre_launch();
+                            cx.notify();
+                        }))
+                }),
+            )
             // Horizon's versions don't apply to a Java instance.
             .children((!java).then(|| self.picker(cx)))
             .child(

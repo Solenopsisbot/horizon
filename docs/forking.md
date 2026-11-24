@@ -1,29 +1,23 @@
-# Forking: Horizon's extras and this fork
+# Forking: Horizon's extras and the vanilla game
 
-Upstream introduced a `horizon-extras` Cargo feature in
-horizon-rust/horizon#12055 to group its cosmetics, emotes, presence, server-list
-promotions and settings pages. This fork deliberately differs: excluded features
-are removed, not compiled behind a switch.
+Horizon is the vanilla game plus a few things of its own: cosmetics, Play with Friends, the
+official server in the list, its settings pages. In the code they sit behind one Cargo feature,
+`horizon-extras`, on by default, so a fork can build without them or delete them. Players always
+get the full Horizon: there is no setting, flag or variable that turns the extras off.
+Optimizations are not extras; they are part of the game in every build.
 
-Cosmetics, wardrobe, emotes, partner ads, sponsor cards, telemetry and Discord
-presence are not part of this fork. No Cargo feature restores them. The Mods and
-Horizon Settings pages remain available independently of the client's default
-features; disabling audio or controllers does not hide mod management.
-
-## Build features
-
-The client's default features are `audio`, `controllers` and `friends`.
-Play with Friends remains independently selectable. For example, a client without
-audio or controllers can be built with:
+## Building without Horizon's extras
 
 ```sh
-cargo build --release -p horizon-game --no-default-features --features friends
+cargo build --release -p horizon-game --no-default-features --features audio,controllers
 ```
 
-The dedicated server uses `--no-default-features`. Neither build mode introduces
-a telemetry placeholder or an official-build promotion in the options screen.
+Best effort: CI builds and tests the default only. The server build (`--no-default-features`,
+docs/server.md) compiles the same gates, so the code keeps compiling, but nobody plays it as a
+client before a release. [horizon-rust/horizon-plain](https://github.com/horizon-rust/horizon-plain)
+builds it, unsigned, from the newest dated Nightly that is at least a week old.
 
-## Modding and rendering
+What changes in that build:
 
 | Extra | Where it lives | The gate |
 |---|---|---|
@@ -65,7 +59,7 @@ only. They do not pass to forks, ports or derived launchers, whatever their lice
 - Its builds must not ship, embed, download or otherwise fetch Horizon's client ID, and must not tell
   players to set `HORIZON_MSA_CLIENT_ID` to it. Sign-ins made with it would appear to Microsoft and
   Mojang as Horizon's, which the project does not accept.
-- The MIT licence covers the code, not the app registration: copying the code gives no right to use
+- Horizon's licence ([GNU LGPL-3.0-or-later](../LICENSE), and [MIT](../LICENSES/MIT.txt) for earlier code) covers the code, not the app registration: copying the code gives no right to use
   Horizon's client ID.
 - Horizon may restrict, rotate or revoke its client ID at any time, which breaks every build that
   uses it, and reports misuse to Microsoft, Mojang and the hosting platform.

@@ -7,6 +7,20 @@ fn worldgen_entry_reads_the_feature_folder() {
         worldgen_entry("data/zinc/worldgen/feature/ore_zinc.json"),
         Some(("worldgen/features.json", "zinc:ore_zinc".to_owned()))
     );
+    assert_eq!(
+        worldgen_entry("data/zinc/worldgen/biome/foo.json"),
+        Some(("worldgen/biomes.json", "zinc:foo".to_owned()))
+    );
+    // Vanilla's biomes are not read from mods.
+    assert_eq!(
+        worldgen_entry("data/minecraft/worldgen/biome/plains.json"),
+        None
+    );
+    // A NeoForge data map on biomes is not a biome.
+    assert_eq!(
+        worldgen_entry("data/zinc/data_maps/worldgen/biome/map_color.json"),
+        None
+    );
     for folder in ["configured_feature", "nope"] {
         assert_eq!(
             worldgen_entry(&format!("data/zinc/worldgen/{folder}/ore_zinc.json")),
@@ -83,6 +97,36 @@ fn registered_conditions_select_content_root_tags_and_structure_modifiers() {
         }
         previous = Some(out);
     }
+}
+
+#[test]
+fn code_only_mods_with_registered_conditions_reuse_their_root() {
+    let scratch = tempfile::tempdir().unwrap();
+    let base = scratch.path().join("base");
+    fs::create_dir_all(base.join("assets")).unwrap();
+    fs::write(base.join("horizon-resources.json"), b"{}").unwrap();
+    let inventory =
+        horizon_mod_package::enabled::EnabledMods::new([("codeonly".into(), mod_api::Side::Both)]);
+    let roots: Vec<PathBuf> = (0..2)
+        .map(|_| {
+            let conditions = LoadConditions::new(["codeonly"]).with_lookup(
+                BTreeMap::from([("codeonly".into(), "codeonly".into())]),
+                |_, _| Some(Ok(true)),
+            );
+            assert!(conditions.has_registered());
+            super::super::resource_root_with_conditions(
+                &base,
+                Path::new(""),
+                &[],
+                &scratch.path().join("cache"),
+                &inventory,
+                &conditions,
+            )
+            .unwrap()
+        })
+        .collect();
+    assert_ne!(roots[0], base);
+    assert_eq!(roots[0], roots[1]);
 }
 
 #[test]

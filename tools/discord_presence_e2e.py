@@ -33,8 +33,9 @@ import time
 from pathlib import Path
 
 try:
-    from . import lab
+    from . import fast_bins, lab
 except ImportError:
+    import fast_bins
     import lab
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -126,7 +127,7 @@ class Game:
     """One game started by horizon-ctl in a scratch home, with its own fake Discord."""
 
     def __init__(self, bins, name, args=(), extras=None, discord_running=True):
-        self.ctl = bins / 'horizon-ctl'
+        self.ctl = lab.binary(bins, 'horizon-ctl')
         self.home = Path(tempfile.mkdtemp(prefix=f'hzdp-{name}-'))
         if extras:
             (self.home / 'horizon-extras.txt').write_text(extras)
@@ -136,7 +137,7 @@ class Game:
             self.discord.start()
         extra = {'HORIZON_HOME': self.home, 'HORIZON_TELEMETRY_URL': 'off', 'HORIZON_DISCORD_IPC_DIR': self.discord.dir}
         self.env = lab.game_env(**extra)
-        self.ctl_run('launch', '--offscreen', '--game', str(bins / 'horizon-official'), '--resources',
+        self.ctl_run('launch', '--offscreen', '--game', str(lab.binary(bins, 'horizon-official')), '--resources',
                      str(lab.RESOURCES.resolve()), *args)
 
     def ctl_run(self, *words, timeout=600):
@@ -271,7 +272,7 @@ def main():
     if args.bin_dir:
         bins = Path(args.bin_dir).resolve()
     else:
-        subprocess.run(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-official', '-p', 'horizon-client-lib', '--bins'],
+        subprocess.run(fast_bins.command('horizon-official', 'horizon-ctl'),
                        cwd=ROOT, check=True)
         meta = json.loads(subprocess.run(['cargo', 'metadata', '--format-version', '1', '--no-deps'], cwd=ROOT,
                                          capture_output=True, text=True, check=True).stdout)

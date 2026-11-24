@@ -32,8 +32,8 @@ def main():
         lab.ROOT / 'mods/horizon/src/test/java/dev/horizonlab/parity/VanillaSourceSilenceOracle.java',
         *[lab.ROOT / 'crates/horizon-client/src' / p for p in (
             'game.rs', 'mobs.rs', 'mobs/hostile.rs', 'mobs/wither.rs', 'mobs/sulfur_cube.rs',
-            'game/explosion.rs', 'game/tnt.rs', 'game/potions.rs', 'game/persist.rs',
-            'game/creatures.rs', 'game/wither.rs', 'game/dragon.rs', 'game/minecarts.rs')]]
+            'game/entities/explosion.rs', 'game/entities/tnt.rs', 'game/items/potions.rs', 'game/world/persist.rs',
+            'game/mobs/creatures/mod.rs', 'game/mobs/wither.rs', 'game/mobs/dragon.rs', 'game/entities/minecarts.rs')]]
     hashes = h.base.source_hashes(sources)
     classes, dependencies, _ = h.compile_oracle(build, 'VanillaSourceSilenceOracle',
         jars, baking.client_libraries(), lock['minecraft']['java_major'])
@@ -43,8 +43,10 @@ def main():
             HORIZON_SOURCE_SILENCE_OUTPUT=scratch,
             CARGO_BUILD_JOBS=os.environ.get('CARGO_BUILD_JOBS', '2'),
             RUST_TEST_THREADS='2')
+        # The limit covers the build, and other harnesses' builds holding the shared target directory's lock.
         h.run_logged(['cargo', 'test', '--locked', '-p', 'horizon-client', '--lib',
-            'game::tnt::tests::silent_', '--', '--nocapture'], build, 'rust', env=env)
+            'game::tnt::tests::silent_', '--', '--ignored', '--nocapture'], build, 'rust',
+            timeout=3600, env=env)
         rust = build / 'rust.txt'
         rust.write_text(''.join((Path(scratch) / f'{name}.txt').read_text()
             for name in ('explosion', 'potions', 'bottles')), encoding='utf-8')

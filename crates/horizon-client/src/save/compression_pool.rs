@@ -52,7 +52,9 @@ pub fn pool() -> &'static CompressionPool {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(|| horizon_threads::worker_count().div_ceil(2).max(1));
+            .unwrap_or_else(|| {
+                horizon_threads::sizing::for_pool(horizon_threads::sizing::Pool::SaveCompression)
+            });
         CompressionPool::new(workers)
     })
 }
@@ -66,9 +68,11 @@ impl CompressionPool {
         });
         for i in 0..workers {
             let worker_weak = Arc::downgrade(&inner);
-            let _ = std::thread::Builder::new()
-                .name(format!("horizon-save-compression-{i}"))
-                .spawn(move || worker_loop(worker_weak));
+            // `Record::tag()` can enter a wasm mod, which needs the guest stack.
+            let _ =
+                horizon_guest_stack::spawn(format!("horizon-save-compression-{i}"), move || {
+                    worker_loop(worker_weak)
+                });
         }
         Self { inner, workers }
     }
@@ -133,6 +137,7 @@ fn run_job(batch: &Arc<Batch>, i: usize) {
 }
 
 fn worker_loop(weak_inner: Weak<Inner>) {
+    let mut release_seen = horizon_threads::release_seen();
     loop {
         let batch = {
             let inner = match weak_inner.upgrade() {
@@ -141,7 +146,18 @@ fn worker_loop(weak_inner: Weak<Inner>) {
             };
             let mut queue = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
             while queue.is_empty() && !inner.shutdown.load(Ordering::Relaxed) {
-                queue = inner.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
+                let (next, wait) = inner
+                    .wake
+                    .wait_timeout(queue, horizon_threads::RELEASE_POLL)
+                    .unwrap_or_else(|e| e.into_inner());
+                queue = next;
+                // Give back what the server freed into this thread's heap
+                // when it asks (`release_everywhere`).
+                if wait.timed_out() && horizon_threads::release_asked(&mut release_seen) {
+                    drop(queue);
+                    horizon_threads::release_free_memory();
+                    queue = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+                }
             }
             if inner.shutdown.load(Ordering::Relaxed) && queue.is_empty() {
                 return;
@@ -153,6 +169,11 @@ fn worker_loop(weak_inner: Weak<Inner>) {
             while let Some(i) = next_job(&batch) {
                 did_work = true;
                 run_job(&batch, i);
+            }
+            // Asked while batches keep coming (no gap for the timed check
+            // above): give it back between two.
+            if horizon_threads::release_asked(&mut release_seen) {
+                horizon_threads::release_free_memory();
             }
             if !did_work && let Some(inner) = weak_inner.upgrade() {
                 let mut queue = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -216,4 +237,21 @@ pub fn compress_records(
     timestamp: u32,
 ) -> Vec<io::Result<Option<ChunkRecord>>> {
     compress_records_with_pool(records, timestamp, pool())
+}
+
+/// `Compression::selected()` is one setting for the whole test process. A
+/// test that reads it more than once (two compressions compared, or one
+/// compared with the codec it reports) holds this for reading; the test that
+/// switches it holds it for writing, so the codec never changes between the
+/// reads (#18772).
+#[cfg(test)]
+pub(super) static SELECTED_CODEC: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// A read hold on [`SELECTED_CODEC`]: the selected codec stays as it is
+/// until the guard drops.
+#[cfg(test)]
+pub(super) fn holding_selected_codec() -> std::sync::RwLockReadGuard<'static, ()> {
+    SELECTED_CODEC
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
