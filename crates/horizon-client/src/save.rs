@@ -168,6 +168,23 @@ pub(crate) fn put(tag: &mut Tag, key: &str, value: Tag) {
         map.insert(key.into(), value);
     }
 }
+/// `LivingEntity`'s save keys for its impulse context: the grace time before the
+/// context may end, and the impact point fall damage is measured from.
+pub const IMPULSE_GRACE_KEY: &str = "current_impulse_context_reset_grace_time";
+pub const IMPACT_POS_KEY: &str = "current_explosion_impact_pos";
+/// `LivingEntity.readAdditionalSaveData`: `getIntOr(IMPULSE_GRACE_KEY, 0)` and
+/// `read(IMPACT_POS_KEY, Vec3.CODEC).orElse(null)`, from a saved player compound.
+pub fn saved_impulse(tag: Option<&Tag>) -> horizon_world::living_fall::ImpulseContext {
+    let tag = tag.filter(|t| matches!(t, Tag::Compound(_)));
+    horizon_world::living_fall::ImpulseContext {
+        reset_grace_time: tag
+            .and_then(|t| number(t.get(IMPULSE_GRACE_KEY)))
+            .unwrap_or(0) as i32,
+        impact_position: tag
+            .and_then(|t| read_doubles::<3>(t.get(IMPACT_POS_KEY)))
+            .map(|[x, y, z]| horizon_core::geometry::Vec3::new(x, y, z)),
+    }
+}
 fn compound_or_empty(tag: Option<Tag>) -> Tag {
     match tag {
         Some(t @ Tag::Compound(_)) => t,
@@ -313,12 +330,9 @@ pub fn upgrade_older_world_with(
     world: &Path,
     progress: &horizon_world::datafix::progress::UpgradeProgress,
 ) -> Result<()> {
-    let Some(root) = read_dat(&world.join("level.dat")) else {
+    let Some(version) = saved_data_version(world) else {
         return Ok(());
     };
-    let version = root.get("Data").map_or(i64::from(DATA_VERSION), |d| {
-        number(d.get("DataVersion")).unwrap_or(-1) // saves of 1.8 and before have none
-    });
     if version >= i64::from(DATA_VERSION) {
         return Ok(());
     }
@@ -334,6 +348,17 @@ pub fn upgrade_older_world_with(
     horizon_world::datafix::files::upgrade_world_with(world, progress)
         .map_err(|e| format!("upgrading {}: {e}", world.display()))?;
     Ok(())
+}
+/// Whether opening the world needs the data-fixer upgrade path. Saves of 1.8 and before have no
+/// DataVersion, which counts as an upgrade that currently fails with the supported-version error.
+pub fn needs_world_upgrade(world: &Path) -> bool {
+    saved_data_version(world).is_some_and(|version| version < i64::from(DATA_VERSION))
+}
+fn saved_data_version(world: &Path) -> Option<i64> {
+    let root = read_dat(&world.join("level.dat"))?;
+    Some(root.get("Data").map_or(i64::from(DATA_VERSION), |d| {
+        number(d.get("DataVersion")).unwrap_or(-1) // saves of 1.8 and before have none
+    }))
 }
 /// Whether opening the world runs file fixes, which vanilla asks for a backup
 /// first (`BackupStatus.FILE_FIXING_REQUIRED`). Saves of 1.8 and before have no
@@ -1627,7 +1652,54 @@ fn encode_with_palette_cache(
     shape: LevelShape,
     caches: SaveCaches<'_>,
 ) -> NamedTag {
-    let palette_cache = caches.palettes;
+    let sections = encode_sections(chunk, registry, biomes, tables, shape, caches.palettes);
+    encode_root(
+        chunk,
+        sections,
+        registry,
+        tables,
+        shape,
+        true,
+        caches.block_entities,
+    )
+}
+
+/// The chunk NBT of [`encode_with`] without sections, heightmaps or saved tick lists.
+/// A backend that stores sections and ticks in its own format keeps this beside them.
+pub fn encode_rest(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    _biomes: &Biomes,
+    tables: Option<&SaveTables>,
+    shape: LevelShape,
+) -> NamedTag {
+    encode_root(chunk, Vec::new(), registry, tables, shape, false, None)
+}
+
+/// [`encode_rest`] with the old chunk's calculated blending data, as [`encode_saved`] does.
+pub fn encode_rest_saved(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    biomes: &Biomes,
+    tables: Option<&SaveTables>,
+    shape: LevelShape,
+    blending: Option<&BlendingData>,
+) -> NamedTag {
+    let mut root = encode_rest(chunk, registry, biomes, tables, shape);
+    if let Some(data) = blending {
+        put_calculated_blending(&mut root, data);
+    }
+    root
+}
+
+fn encode_sections(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    biomes: &Biomes,
+    tables: Option<&SaveTables>,
+    shape: LevelShape,
+    palette_cache: Option<&Arc<SavedPaletteBudget>>,
+) -> Vec<Tag> {
     let sky_light = shape.sky_light;
     let mut sections = Vec::new();
     // Sky layers below the highest section with light other than 15 are
@@ -1660,6 +1732,18 @@ fn encode_with_palette_cache(
         }
         sections.push(Tag::compound(entries));
     }
+    sections
+}
+
+fn encode_root(
+    chunk: &Chunk,
+    sections: Vec<Tag>,
+    registry: &BlockRegistry,
+    tables: Option<&SaveTables>,
+    shape: LevelShape,
+    lists: bool,
+    block_entity_cache: Option<&block_entity_cache::BlockEntityCache>,
+) -> NamedTag {
     let extras = chunk.saved.as_deref();
     let block_name = |p: &(i32, i32, i32)| -> String {
         registry
@@ -1688,8 +1772,7 @@ fn encode_with_palette_cache(
                 name,
                 source,
             };
-            let reuse = caches
-                .block_entities
+            let reuse = block_entity_cache
                 .zip(chunk.block_entity_revision(index))
                 .filter(|_| block_entity_cache::eligible(e));
             let cached = reuse.and_then(|(cache, revision)| cache.get(*p, revision, &inputs));
@@ -1819,7 +1902,7 @@ fn encode_with_palette_cache(
         map.entry("PostProcessing".into())
             .or_insert_with(|| Tag::List(vec![Tag::List(Vec::new()); shape.section_count()]));
     }
-    if let Some(t) = tables {
+    if let Some(t) = tables.filter(|_| lists) {
         put(&mut root, "Heightmaps", heightmaps(chunk, t, shape));
         let names = |k: u32| t.block_names.get(k as usize).cloned();
         let (blocks, fluids) = extras.map_or((&[][..], &[][..]), |e| {
@@ -1897,19 +1980,7 @@ fn decode_column(
         return None;
     };
     let mut chunk = Chunk::with_layout(*x, *z, layout);
-    // structures.References: structure id -> packed start chunk positions.
-    if let Some(Tag::Compound(refs)) = tag.get("structures").and_then(|s| s.get("References")) {
-        for (id, v) in refs {
-            if let Tag::LongArray(starts) = v {
-                let id: Arc<str> = Arc::from(id.to_string_lossy());
-                for &p in starts {
-                    chunk
-                        .structure_refs
-                        .push((id.clone(), (p as i32, (p >> 32) as i32)));
-                }
-            }
-        }
-    }
+    decode_structure_refs(tag, &mut chunk);
     let air = registry.default_state("minecraft:air")?.0;
     let Some(Tag::List(sections)) = tag.get("sections") else {
         return Some(chunk);
@@ -1968,6 +2039,45 @@ fn decode_column(
             }
         }
     }
+    decode_after_sections(root, &mut chunk, registry, tables);
+    Some(chunk)
+}
+
+fn decode_structure_refs(tag: &Tag, chunk: &mut Chunk) {
+    if let Some(Tag::Compound(refs)) = tag.get("structures").and_then(|s| s.get("References")) {
+        for (id, v) in refs {
+            if let Tag::LongArray(starts) = v {
+                let id: Arc<str> = Arc::from(id.to_string_lossy());
+                for &p in starts {
+                    chunk
+                        .structure_refs
+                        .push((id.clone(), (p as i32, (p >> 32) as i32)));
+                }
+            }
+        }
+    }
+}
+
+/// Decode the part [`encode_rest`] saves into a chunk whose sections are ready.
+/// To decode saved ticks as well, restore their lists to `root` first.
+pub fn decode_rest(
+    root: &NamedTag,
+    chunk: &mut Chunk,
+    registry: &BlockRegistry,
+    tables: Option<&SaveTables>,
+) {
+    decode_structure_refs(&root.tag, chunk);
+    decode_after_sections(root, chunk, registry, tables);
+}
+
+fn decode_after_sections(
+    root: &NamedTag,
+    chunk: &mut Chunk,
+    registry: &BlockRegistry,
+    tables: Option<&SaveTables>,
+) {
+    let tag = &root.tag;
+    let (x, z) = (chunk.x, chunk.z);
     let mut extras = ChunkExtras {
         last_update: number(tag.get("LastUpdate")).unwrap_or(0),
         ..ChunkExtras::default()
@@ -2004,7 +2114,7 @@ fn decode_column(
                 );
             }
             let e = &entry;
-            if let Some(at) = block_entity_order::saved_at(e, [*x, *z]) {
+            if let Some(at) = block_entity_order::saved_at(e, [x, z]) {
                 extras.block_entity_order.push(at);
             }
             let int = |k: &str| number(e.get(k)).map(|v| v as i32);
@@ -2065,13 +2175,12 @@ fn decode_column(
             .collect();
     }
     if let Some(t) = tables {
-        extras.block_ticks = read_ticks(tag.get("block_ticks"), (*x, *z), |n| {
+        extras.block_ticks = read_ticks(tag.get("block_ticks"), (x, z), |n| {
             t.block_ids.get(n).map(|&i| u32::from(i))
         });
-        extras.fluid_ticks = read_ticks(tag.get("fluid_ticks"), (*x, *z), fluid_id);
+        extras.fluid_ticks = read_ticks(tag.get("fluid_ticks"), (x, z), fluid_id);
     }
     chunk.saved = Some(Arc::new(extras));
-    Some(chunk)
 }
 
 pub fn encode_proto(
@@ -2371,8 +2480,43 @@ fn write_region_records(
     root: &Path,
     cache: &RegionCache,
     folder: &str,
+    backend: Option<&dyn Backend>,
     records: &[((i32, i32), &Record)],
 ) -> Result<()> {
+    if let Some(backend) = backend {
+        let tags: Vec<_> = records
+            .iter()
+            .map(|(_, record)| match record {
+                Record::Chunk(..) | Record::Delete => None,
+                _ => record.tag(),
+            })
+            .collect();
+        let mut backend_records = Vec::with_capacity(records.len());
+        for ((key, record), tag) in records.iter().zip(&tags) {
+            let record = match record {
+                Record::Chunk(chunk, encoding, blending) => {
+                    encoding.biomes.ensure_saveable()?;
+                    BackendRecord::Chunk(
+                        chunk,
+                        BackendContext {
+                            registry: encoding.registry,
+                            biomes: &encoding.biomes,
+                            tables: encoding.tables.as_deref(),
+                            shape: encoding.shape,
+                        },
+                        blending.as_deref(),
+                    )
+                }
+                Record::Delete => BackendRecord::Delete,
+                Record::Tag(_) | Record::Proto(..) | Record::Poi(..) => match tag {
+                    Some(tag) => BackendRecord::Tag(tag),
+                    None => BackendRecord::Delete,
+                },
+            };
+            backend_records.push((*key, record));
+        }
+        return backend.write(folder, &backend_records);
+    }
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as u32);
@@ -2514,19 +2658,124 @@ impl Record {
         }
     }
 }
+
+/// Context a backend needs to decode or encode a full chunk.
+pub struct BackendContext<'a> {
+    pub registry: &'a BlockRegistry,
+    pub biomes: &'a Biomes,
+    pub tables: Option<&'a SaveTables>,
+    pub shape: LevelShape,
+}
+
+/// A record handed to a [`Backend`].
+pub enum BackendRecord<'a> {
+    /// A full chunk and the old-world blending data captured when it was saved.
+    Chunk(&'a Chunk, BackendContext<'a>, Option<&'a BlendingData>),
+    /// A complete vanilla NBT record, including proto chunks and synchronous saves.
+    Tag(&'a NamedTag),
+    Delete,
+}
+
+/// A saved chunk returned by a [`Backend`].
+pub enum BackendChunk {
+    /// A full chunk in the current version, including its saved light.
+    Chunk(Box<Chunk>),
+    /// A chunk record in vanilla NBT form.
+    Tag(NamedTag),
+}
+
+/// Replace the region-file storage for a dimension (`region`, `entities`, and `poi`).
+/// `SaveDir` still owns its write queue, writer thread, pending records, POI merge, and
+/// NBT data fixes. `carrier_store`, `horizon-server prune`, the world upgrader, and
+/// `intern_saved_fluids` still assume region files; PR 5 will route those paths.
+pub trait Backend: Send + Sync {
+    /// The saved chunk in native or complete NBT form, or `None` if absent.
+    fn load_chunk(
+        &self,
+        x: i32,
+        z: i32,
+        context: &BackendContext<'_>,
+    ) -> Result<Option<BackendChunk>>;
+    /// A record as NBT. For a native chunk this is its rest data ([`encode_rest`]), with an
+    /// empty `sections` list and without heightmaps or saved ticks, as saved: readers of
+    /// single fields need its `DataVersion`, `Status`, `blending_data` and
+    /// `structures.starts` (old-chunk detection, structure lookups). Other records are full
+    /// region-file NBT.
+    fn read_tag(&self, folder: &str, x: i32, z: i32) -> Result<Option<NamedTag>>;
+    /// Write records and make them durable before returning.
+    fn write(&self, folder: &str, records: &[((i32, i32), BackendRecord<'_>)]) -> Result<()>;
+    /// Chunk coordinates saved in region `rx rz`.
+    fn region_chunks(&self, rx: i32, rz: i32) -> Result<Vec<(i32, i32)>>;
+}
+
+/// Chooses a dimension folder's [`Backend`]: `Ok(None)` keeps its region files. An error
+/// means the folder is on a store that could not be opened.
+///
+/// [`SaveDir::new`] can run more than once for the same folder while another `SaveDir` of
+/// it is alive (the saved portal ticket probe, then the level itself), so a factory that
+/// locks its store must hand out the store it already opened rather than open it again.
+pub type BackendFactory =
+    Box<dyn Fn(&Path, LevelShape) -> Result<Option<Arc<dyn Backend>>> + Send + Sync>;
+static BACKEND_FACTORY: OnceLock<BackendFactory> = OnceLock::new();
+
+/// The backend a factory's answer gives `root`. A store that could not be opened becomes
+/// one that fails every call rather than the folder falling back to region files, so
+/// nothing is written over it. Its chunks then read as absent ([`SaveDir::load`]), so a
+/// level opened on it generates terrain it cannot save: the code that opens a world on a
+/// store has to check that the store opens before it opens the level.
+fn chosen_backend(
+    root: &Path,
+    chosen: Result<Option<Arc<dyn Backend>>>,
+) -> Option<Arc<dyn Backend>> {
+    match chosen {
+        Ok(backend) => backend,
+        Err(e) => {
+            let reason = format!(
+                "the chunk store of {} could not be opened: {e}",
+                root.display()
+            );
+            log::error!("Horizon: {reason}");
+            Some(Arc::new(Unavailable(reason)))
+        }
+    }
+}
+
+/// The backend of a folder whose store could not be opened: every call fails with why.
+struct Unavailable(String);
+impl Backend for Unavailable {
+    fn load_chunk(&self, _: i32, _: i32, _: &BackendContext<'_>) -> Result<Option<BackendChunk>> {
+        Err(self.0.clone().into())
+    }
+    fn read_tag(&self, _: &str, _: i32, _: i32) -> Result<Option<NamedTag>> {
+        Err(self.0.clone().into())
+    }
+    fn write(&self, _: &str, _: &[((i32, i32), BackendRecord<'_>)]) -> Result<()> {
+        Err(self.0.clone().into())
+    }
+    fn region_chunks(&self, _: i32, _: i32) -> Result<Vec<(i32, i32)>> {
+        Err(self.0.clone().into())
+    }
+}
+
+/// Register the factory used by [`SaveDir::new`]. It can be set once before a world opens.
+pub fn set_backend_factory(factory: BackendFactory) -> bool {
+    BACKEND_FACTORY.set(factory).is_ok()
+}
+
 /// A queued POI record as it is written: claims kept from the saved one, and
 /// a chunk that lost its last POI gets an empty one, as vanilla trusts a
 /// saved section. None when the chunk never had any.
 fn resolve_poi(
     root: &Path,
     cache: &RegionCache,
+    backend: Option<&dyn Backend>,
     (x, z): (i32, i32),
     record: &Record,
 ) -> Option<Record> {
     let Record::Poi(chunk, tables, professions) = record else {
         return Some(record.clone());
     };
-    let old = read_region_record(root, cache, "poi", x, z)
+    let old = read_region_record(root, cache, backend, "poi", x, z)
         .and_then(|old| {
             old.map(|mut old| {
                 upgrade_record(Folder::Poi, &mut old, || None)?;
@@ -2552,10 +2801,14 @@ fn resolve_poi(
 fn read_region_record(
     root: &Path,
     cache: &RegionCache,
+    backend: Option<&dyn Backend>,
     folder: &str,
     x: i32,
     z: i32,
 ) -> Result<Option<NamedTag>> {
+    if let Some(backend) = backend {
+        return backend.read_tag(folder, x, z);
+    }
     let key = (x >> 5, z >> 5);
     let path = region_path(root, folder, key.0, key.1);
     let Some(region) = cached_region(cache, key, &path, false)? else {
@@ -2669,6 +2922,8 @@ impl Folder {
 /// read lazily by worker threads.
 pub struct SaveDir {
     pub root: PathBuf,
+    /// This dimension's region-file replacement, when selected by the factory.
+    backend: Option<Arc<dyn Backend>>,
     regions: Arc<RegionCache>,
     entity_regions: Arc<RegionCache>,
     poi_regions: Arc<RegionCache>,
@@ -2834,7 +3089,25 @@ impl SaveDir {
 
     /// The saves of a level of `shape` at `root` (its dimension folder).
     pub fn new(root: PathBuf, shape: LevelShape) -> Self {
+        let backend = BACKEND_FACTORY
+            .get()
+            .and_then(|factory| chosen_backend(&root, factory(&root, shape)));
+        Self::with_optional_backend(root, shape, backend)
+    }
+
+    /// Construct a save folder with a specific backend, mainly for isolated tests.
+    /// Production registration should use [`set_backend_factory`].
+    pub fn with_backend(root: PathBuf, shape: LevelShape, backend: Arc<dyn Backend>) -> Self {
+        Self::with_optional_backend(root, shape, Some(backend))
+    }
+
+    fn with_optional_backend(
+        root: PathBuf,
+        shape: LevelShape,
+        backend: Option<Arc<dyn Backend>>,
+    ) -> Self {
         Self {
+            backend,
             root,
             regions: Default::default(),
             entity_regions: Default::default(),
@@ -3052,11 +3325,20 @@ impl SaveDir {
     /// before DataVersion 4997, or with `blending_data`.
     pub fn old_chunk_bits(&self, rx: i32, rz: i32) -> [u64; 16] {
         let mut bits = [0u64; 16];
-        let Ok(region) = RegionFile::open(self.region_path("region", rx, rz)) else {
-            return bits;
+        let present: Vec<ChunkPos> = match &self.backend {
+            Some(backend) => backend
+                .region_chunks(rx, rz)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(x, z)| ChunkPos::new(x, z))
+                .collect(),
+            None => {
+                let Ok(region) = RegionFile::open(self.region_path("region", rx, rz)) else {
+                    return bits;
+                };
+                region.chunks().map(|(pos, _)| pos).collect()
+            }
         };
-        let present: Vec<ChunkPos> = region.chunks().map(|(pos, _)| pos).collect();
-        drop(region);
         for pos in present {
             // `IOWorker` reads the record as saved, before any upgrade.
             let Some(root) = self.read_record_raw("region", pos.x, pos.z) else {
@@ -3124,18 +3406,20 @@ impl SaveDir {
             Folder::Entities => &self.entity_regions,
             Folder::Poi => &self.poi_regions,
         };
-        read_region_record(&self.root, cache, folder, x, z)
+        read_region_record(&self.root, cache, self.backend.as_deref(), folder, x, z)
             .inspect(|record| {
-                if self.trusted_fluid_load
-                    && folder == "region"
-                    && let Some(root) = record
-                {
-                    intern_saved_fluids(root);
+                if let Some(root) = record {
+                    self.intern_record_fluids(folder, root);
                 }
             })
             .map_err(|e| {
                 crate::chunk_io::report_load_failure(&self.root, x, z, &e);
             })
+    }
+    fn intern_record_fluids(&self, folder: &str, root: &NamedTag) {
+        if self.trusted_fluid_load && folder == "region" {
+            intern_saved_fluids(root);
+        }
     }
     /// A record brought to the current version (`upgrade_record`); `Err` when that failed.
     fn try_read_record(
@@ -3178,8 +3462,21 @@ impl SaveDir {
         registry: &BlockRegistry,
         biomes: &Biomes,
     ) -> std::result::Result<Option<Chunk>, ()> {
-        let Some(root) = self.try_read_record("region", x, z)? else {
-            return Ok(None);
+        let root = if let Some(backend) = &self.backend {
+            match self
+                .backend_chunk(backend.as_ref(), x, z, registry, biomes, false)
+                .map_err(|e| {
+                    crate::chunk_io::report_load_failure(&self.root, x, z, &e);
+                })? {
+                Some(BackendChunk::Chunk(chunk)) => return Ok(Some(*chunk)),
+                Some(BackendChunk::Tag(root)) => root,
+                None => return Ok(None),
+            }
+        } else {
+            let Some(root) = self.try_read_record("region", x, z)? else {
+                return Ok(None);
+            };
+            root
         };
         let tables = self.tables.get().map(|t| &**t);
         let Some(mut chunk) = decode_with(&root, registry, biomes, tables, self.shape.column())
@@ -3190,6 +3487,55 @@ impl SaveDir {
         chunk.entities = horizon_world::chunk::legacy_entities(&root.tag);
         Ok(Some(chunk))
     }
+    /// Read a pending snapshot instead of consulting the backend if a write is queued.
+    fn backend_chunk(
+        &self,
+        backend: &dyn Backend,
+        x: i32,
+        z: i32,
+        registry: &BlockRegistry,
+        biomes: &Biomes,
+        far: bool,
+    ) -> Result<Option<BackendChunk>> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| "pending writes poisoned")?
+            .get(&(Folder::Region, x, z))
+            .map(|(_, record)| record.clone());
+        if let Some(record) = pending {
+            return Ok(record.tag().map(|tag| BackendChunk::Tag((*tag).clone())));
+        }
+        let context = BackendContext {
+            registry,
+            biomes,
+            tables: self.tables.get().map(|tables| &**tables),
+            shape: self.shape,
+        };
+        let mut chunk = backend.load_chunk(x, z, &context)?;
+        if let Some(BackendChunk::Tag(root)) = &mut chunk {
+            if !far {
+                self.intern_record_fluids("region", root);
+            }
+            self.upgrade_record(Folder::Region, root)?;
+        }
+        Ok(chunk)
+    }
+
+    fn far_chunk(
+        &self,
+        x: i32,
+        z: i32,
+        registry: &BlockRegistry,
+        biomes: &Biomes,
+    ) -> Option<BackendChunk> {
+        match &self.backend {
+            Some(backend) => self
+                .backend_chunk(backend.as_ref(), x, z, registry, biomes, true)
+                .ok()?,
+            None => self.far_record(x, z).map(BackendChunk::Tag),
+        }
+    }
     /// A saved full chunk read for a player's far ring (`lan::far`), as `load` but past the gameplay
     /// region cache (`far_record`).
     pub fn load_far(
@@ -3199,7 +3545,10 @@ impl SaveDir {
         registry: &BlockRegistry,
         biomes: &Biomes,
     ) -> Option<Chunk> {
-        let root = self.far_record(x, z)?;
+        let root = match self.far_chunk(x, z, registry, biomes)? {
+            BackendChunk::Chunk(chunk) => return chunk.light_loaded.then_some(*chunk),
+            BackendChunk::Tag(root) => root,
+        };
         let tables = self.tables.get().map(|t| &**t);
         let mut chunk = decode_with(&root, registry, biomes, tables, self.shape.column())?;
         load_light(&root.tag, &mut chunk, self.shape.sky_light);
@@ -3956,9 +4305,10 @@ pub struct Level {
     /// `LivingEntity.addAdditionalSaveData`'s `FallFlying`: the player was
     /// gliding (shared flag 7), so the glide goes on after the load.
     pub fall_flying: bool,
-    /// Current body's save projection. None before a live body supplies it;
-    /// retained raw data stays intact until then.
-    pub player_impulse_grace: Option<i32>,
+    /// Current body's save projection: its impulse context (the grace time and the
+    /// wind charge's impact point). None before a live body supplies it; retained raw
+    /// data stays intact until then.
+    pub player_impulse: Option<horizon_world::living_fall::ImpulseContext>,
     pub player_fall_particles: Option<bool>,
     pub food_exhaustion: f32,
     pub food_tick_timer: i32,
@@ -4243,7 +4593,7 @@ impl Level {
         Some(level)
     }
     pub fn read_player(&mut self, p: &Tag) {
-        self.player_impulse_grace = None;
+        self.player_impulse = None;
         self.player_fall_particles = None;
         let n = |k: &str| number(p.get(k));
         let f = |k: &str| float(p.get(k));
@@ -4478,11 +4828,23 @@ impl Level {
                 .or_insert(Tag::Float(0.1f32.to_bits()));
             map.entry("flying".into()).or_insert(Tag::Byte(0));
         }
-        let impulse_grace = self
-            .player_impulse_grace
-            .map(Tag::Int)
-            .or_else(|| p.get("current_impulse_context_reset_grace_time").cloned())
-            .unwrap_or(Tag::Int(0));
+        // LivingEntity.addAdditionalSaveData: `putInt(IMPULSE_GRACE_KEY, ...)` and
+        // `storeNullable(IMPACT_POS_KEY, Vec3.CODEC, currentImpulseImpactPos)`. A body's
+        // context replaces the file's; a point the body no longer has leaves the key out.
+        let impulse_grace = match self.player_impulse {
+            Some(impulse) => {
+                match impulse.impact_position {
+                    Some(at) => put(&mut p, IMPACT_POS_KEY, doubles(&[at.x, at.y, at.z])),
+                    None => {
+                        if let Tag::Compound(map) = &mut p {
+                            map.remove(&JavaString::from(IMPACT_POS_KEY));
+                        }
+                    }
+                }
+                Tag::Int(impulse.reset_grace_time)
+            }
+            None => p.get(IMPULSE_GRACE_KEY).cloned().unwrap_or(Tag::Int(0)),
+        };
         let fall_particles = self
             .player_fall_particles
             .map(|v| Tag::Byte(i8::from(v)))
@@ -4506,7 +4868,7 @@ impl Level {
                 "Brain",
                 Tag::compound([("memories", Tag::Compound(Default::default()))]),
             ),
-            ("current_impulse_context_reset_grace_time", impulse_grace),
+            (IMPULSE_GRACE_KEY, impulse_grace),
             ("spawn_extra_particles_on_fall", fall_particles),
             ("AbsorptionAmount", Tag::Float(self.absorption.to_bits())),
             ("foodLevel", Tag::Int(self.food)),
@@ -5369,7 +5731,16 @@ impl SaveDir {
         assets: &crate::assets::Assets,
         biomes: &Biomes,
     ) -> Option<LodSurfaces> {
-        let root = self.far_record(x, z)?;
+        let root = match self.far_chunk(x, z, assets.registry, biomes)? {
+            BackendChunk::Chunk(chunk) => encode_with(
+                &chunk,
+                assets.registry,
+                biomes,
+                self.tables.get().map(|tables| &**tables),
+                self.shape,
+            ),
+            BackendChunk::Tag(root) => root,
+        };
         // Proto saves may still be missing decoration from their neighbors.
         if text(root.tag.get("Status"))
             .is_some_and(|status| status != "minecraft:full" && status != "full")
@@ -5608,6 +5979,8 @@ fn effect_details(e: &crate::effects::SavedEffect) -> Vec<(&'static str, Tag)> {
     details
 }
 
+#[cfg(test)]
+mod backend_tests;
 #[cfg(test)]
 mod tests;
 

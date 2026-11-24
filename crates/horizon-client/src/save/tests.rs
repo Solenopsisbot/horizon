@@ -1899,13 +1899,17 @@ fn older_worlds_are_upgraded_on_opening() {
     };
     for &old in olds {
         super::write_dat(&dir.join("level.dat"), level(old)).unwrap();
+        assert!(super::needs_world_upgrade(&dir));
         super::upgrade_older_world(&dir).unwrap();
         assert_eq!(version(&dir), Some(i64::from(super::DATA_VERSION)));
+        assert!(!super::needs_world_upgrade(&dir));
     }
     // 1.21.1: upgraded to the current version.
     super::write_dat(&dir.join("level.dat"), level(3955)).unwrap();
+    assert!(super::needs_world_upgrade(&dir));
     super::upgrade_older_world(&dir).unwrap();
     assert_eq!(version(&dir), Some(i64::from(super::DATA_VERSION)));
+    assert!(!super::needs_world_upgrade(&dir));
     super::upgrade_older_world(&dir).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4604,7 +4608,7 @@ fn write_old_record(save: &SaveDir, folder: &str, tag: Tag) {
         Folder::Entities => &save.entity_regions,
         Folder::Poi => &save.poi_regions,
     };
-    super::write_region_records(&save.root, cache, folder, &[((0, 0), &record)]).unwrap();
+    super::write_region_records(&save.root, cache, folder, None, &[((0, 0), &record)]).unwrap();
 }
 
 #[test]
@@ -4747,6 +4751,7 @@ fn old_chunks_are_found_in_the_saved_records_and_old_poi_upgrade() {
         &nether.root,
         &nether.regions,
         "region",
+        None,
         &[((1, 0), &current)],
     )
     .unwrap();

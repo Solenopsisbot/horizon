@@ -168,14 +168,20 @@ impl<'a> Reader<'a> {
     pub fn new(string: &'a str) -> Self {
         Self { string, cursor: 0 }
     }
+    #[inline]
     pub fn can_read(&self) -> bool {
         self.cursor < self.string.len()
     }
     pub fn can_read_n(&self, n: usize) -> bool {
         self.string[self.cursor..].chars().take(n).count() == n
     }
+    #[inline]
     pub fn peek(&self) -> char {
-        self.string[self.cursor..].chars().next().unwrap_or('\0')
+        match self.string.as_bytes().get(self.cursor) {
+            Some(&b) if b < 0x80 => char::from(b),
+            Some(_) => self.string[self.cursor..].chars().next().unwrap_or('\0'),
+            None => '\0',
+        }
     }
     pub fn peek_at(&self, offset: usize) -> char {
         self.string[self.cursor..]
@@ -183,20 +189,60 @@ impl<'a> Reader<'a> {
             .nth(offset)
             .unwrap_or('\0')
     }
+    #[inline]
     pub fn skip(&mut self) {
-        self.cursor += self.peek().len_utf8();
+        match self.string.as_bytes().get(self.cursor) {
+            Some(&b) if b < 0x80 => self.cursor += 1,
+            Some(_) => {
+                if let Some(c) = self.string[self.cursor..].chars().next() {
+                    self.cursor += c.len_utf8();
+                }
+            }
+            None => self.cursor += 1,
+        }
     }
+    #[inline]
     pub fn read(&mut self) -> char {
-        let c = self.peek();
-        self.skip();
-        c
+        match self.string.as_bytes().get(self.cursor) {
+            Some(&b) if b < 0x80 => {
+                self.cursor += 1;
+                char::from(b)
+            }
+            Some(_) => {
+                let c = self.string[self.cursor..].chars().next().unwrap_or('\0');
+                self.cursor += c.len_utf8();
+                c
+            }
+            None => {
+                self.cursor += 1;
+                '\0'
+            }
+        }
     }
+    #[inline]
     pub fn remaining(&self) -> &'a str {
         &self.string[self.cursor..]
     }
+    #[inline]
     pub fn skip_whitespace(&mut self) {
-        while self.can_read() && Self::is_java_whitespace(self.peek()) {
-            self.skip();
+        let bytes = self.string.as_bytes();
+        while let Some(&b) = bytes.get(self.cursor) {
+            if b < 0x80 {
+                if matches!(b, 0x09..=0x0d | 0x1c..=0x20) {
+                    self.cursor += 1;
+                } else {
+                    return;
+                }
+            } else {
+                let Some(c) = self.string[self.cursor..].chars().next() else {
+                    return;
+                };
+                if Self::is_java_whitespace(c) {
+                    self.cursor += c.len_utf8();
+                } else {
+                    return;
+                }
+            }
         }
     }
     pub fn is_java_whitespace(c: char) -> bool {
@@ -219,12 +265,19 @@ impl<'a> Reader<'a> {
     pub fn is_allowed_in_unquoted(c: char) -> bool {
         c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+')
     }
+    #[inline]
     fn read_number_text(&mut self) -> &'a str {
+        let bytes = self.string.as_bytes();
         let start = self.cursor;
-        while self.can_read() && Self::is_allowed_number(self.peek()) {
-            self.skip();
+        let mut end = start;
+        while let Some(&b) = bytes.get(end) {
+            if !b.is_ascii_digit() && b != b'.' && b != b'-' {
+                break;
+            }
+            end += 1;
         }
-        &self.string[start..self.cursor]
+        self.cursor = end;
+        &self.string[start..end]
     }
     fn number<T: std::str::FromStr>(&mut self, kind: &str) -> CmdResult<T> {
         let start = self.cursor;
@@ -258,20 +311,29 @@ impl<'a> Reader<'a> {
     pub fn read_float(&mut self) -> CmdResult<f32> {
         self.number("float")
     }
+    #[inline]
     pub fn read_unquoted_string(&mut self) -> &'a str {
+        let bytes = self.string.as_bytes();
         let start = self.cursor;
-        while self.can_read() && Self::is_allowed_in_unquoted(self.peek()) {
-            self.skip();
+        let mut end = start;
+        while let Some(&b) = bytes.get(end) {
+            if !b.is_ascii_alphanumeric() && !matches!(b, b'_' | b'-' | b'.' | b'+') {
+                break;
+            }
+            end += 1;
         }
-        &self.string[start..self.cursor]
+        self.cursor = end;
+        &self.string[start..end]
     }
     /// Every character up to the next space or the end of the line: a token that may hold `*`,
     /// `:` or `/`. Empty when the reader is at a space or at the end.
+    #[inline]
     pub fn read_token(&mut self) -> &'a str {
+        let bytes = self.string.as_bytes();
         let start = self.cursor;
-        while self.can_read() && self.peek() != ' ' {
-            self.skip();
-        }
+        let rest = &bytes[start..];
+        let len = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
+        self.cursor = start + len;
         &self.string[start..self.cursor]
     }
     pub fn read_string_until(&mut self, terminator: char) -> CmdResult<String> {
@@ -379,6 +441,9 @@ pub enum Suggests {
     /// SuggestionProviders.ASK_SERVER: the server completes the node
     /// (ClientSuggestionProvider.customSuggestion); nothing locally.
     AskServer,
+    /// TagCommand: the tags of the parsed `targets` (`getTags`), which only
+    /// the server can resolve; the answer comes as the server's reply.
+    EntityTags,
     /// OpCommand: the online players who are not operators.
     NonOperators,
     /// DeOpCommands: the operators' names (PlayerList.getOpNames).
@@ -827,7 +892,7 @@ impl Suggests {
             Suggests::Whitelisted => {
                 builder.suggest_matching(reg.whitelisted.iter().map(String::as_str))
             }
-            Suggests::Nothing | Suggests::AskServer => {}
+            Suggests::Nothing | Suggests::AskServer | Suggests::EntityTags => {}
         }
     }
 }
@@ -1272,6 +1337,22 @@ impl Dispatcher {
     ) -> (Range, Vec<Suggestion>, bool) {
         self.suggestions_within(parse, cursor, reg, reg.permission)
     }
+    /// The custom provider of the node the completion at `cursor` comes from,
+    /// for a source at `permission` (`suggestions_within` skips the others).
+    pub fn suggests_at(
+        &self,
+        parse: &ParseResults,
+        cursor: usize,
+        permission: u8,
+    ) -> Option<&Suggests> {
+        let (parent, _, _) = parse.context.suggestion_context(cursor);
+        self.nodes[parent].children.iter().find_map(|&child| {
+            let node = &self.nodes[child];
+            (node.permission <= permission)
+                .then_some(node.suggests.as_ref())
+                .flatten()
+        })
+    }
     fn suggestions_within(
         &self,
         parse: &ParseResults,
@@ -1288,6 +1369,8 @@ impl Dispatcher {
             if self.nodes[child].permission > permission {
                 continue;
             }
+            // EntityTags is a server-side provider; only a received
+            // AskServer node can send a request from the client tree.
             ask |= matches!(self.nodes[child].suggests, Some(Suggests::AskServer));
             let mut builder = SuggestionsBuilder::new(truncated, start);
             match &self.nodes[child].kind {

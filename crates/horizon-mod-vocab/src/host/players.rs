@@ -1171,6 +1171,16 @@ pub trait PlayersBackendMut {
     #[access(WorldOnly)]
     fn player_set_selected_slot(&mut self, player: PlayerRef, slot: usize) -> bool;
     /// Side: server.
+    /// Makes the player's crafting results again from their grids, as
+    /// `AbstractContainerMenu.slotsChanged` does after a change to a grid, and tells their client:
+    /// for a mod whose `crafting_recipe_choice` answer changed while the grid did not (Polymorph's
+    /// selection packet). Covers the inventory's grid, an open crafting table and an open mod
+    /// crafting menu; the mods' `prepare_item_craft` has its say as after a click. Returns false
+    /// for a stale or unavailable player and one whose state is swapped in for a turn (code
+    /// running in that player's own turn): call it from the next `server_tick` instead.
+    #[access(WorldOnly)]
+    fn player_crafting_changed(&mut self, player: PlayerRef) -> bool;
+    /// Side: server.
     /// `Player.drop(stack, false, thrown_by_player)`: `stack` is thrown from the player's eyes
     /// along their view as an item entity, with the main hand swinging and `item_toss` asked
     /// first. Nothing is taken from an inventory: the stack is the caller's, taken out through
@@ -1451,6 +1461,25 @@ pub trait PlayersBackendMut {
         player: PlayerRef,
         slot: u32,
         stack: Option<ItemStack>,
+    ) -> Result<(), PlayerDataRefusal>;
+    /// Side: server.
+    /// The stack in inventory slot `slot` (`player_inventory_slots`' numbers) changed in place,
+    /// as vanilla's and NeoForge mods' code edits the slot's own stack (`ItemStack.set`,
+    /// `hurtAndBreak`, an energy item being charged in an armour slot): when the slot holds the
+    /// same item as `stack`, the slot takes `stack` with no equip sound and no equip game event,
+    /// those being `setItemSlot`'s `onEquipItem`, so a worn stack rewritten every tick is not
+    /// heard or felt by sculk sensors every tick; its attribute modifiers and the client's slot
+    /// follow as `player_set_inventory_slot`'s do. A slot that holds another item or nothing is
+    /// not a change in place: `stack` goes in as `player_set_inventory_slot` puts it, equip
+    /// sound and game event included. Refuses as `player_set_inventory_slot` does. An open
+    /// transaction journals this write; an abort restores the previous value, and the
+    /// equipment modifiers wait for the outermost commit.
+    #[access(WorldOnly)]
+    fn player_update_inventory_slot(
+        &mut self,
+        player: PlayerRef,
+        slot: u32,
+        stack: ItemStack,
     ) -> Result<(), PlayerDataRefusal>;
     /// Side: server.
     /// `PlayerEnderChestContainer.setItem(slot, stack)`: `stack` (None empties it) in ender
